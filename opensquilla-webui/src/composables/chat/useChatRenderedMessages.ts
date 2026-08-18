@@ -843,7 +843,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       .filter((row): row is ChatEnsembleMetaModel => row !== null)
     const uniqueModels = new Set(models.map(row => `${row.role}:${row.provider}:${row.model}`))
     const rowCost = models.reduce((sum, row) => sum + row.costUsd, 0)
-    const explicitCost = numeric(usage.cost_usd ?? usage.costUsd)
+    // The ledger total is authoritative whenever it is present, including a
+    // legitimate 0. Probe for the field rather than for a positive number, or
+    // a settled $0 turn falls back to stale non-zero breakdown subtotals that
+    // a richer historical projection may still carry.
+    const rawCost = usage.cost_usd ?? usage.costUsd
+    const hasExplicitCost = rawCost !== undefined && rawCost !== null && Number.isFinite(Number(rawCost))
+    const explicitCost = numeric(rawCost)
     const savedUsd = Math.max(0, numeric(usage.total_savings_usd ?? usage.totalSavingsUsd ?? usage.savings_usd ?? usage.savingsUsd))
     const savedPct = Math.max(0, numeric(usage.total_savings_pct ?? usage.totalSavingsPct ?? usage.savings_pct ?? usage.savingsPct))
 
@@ -857,7 +863,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       requestCount: Math.max(0, numeric(trace?.llm_request_count), breakdown.length),
       fallbackUsed: trace?.fallback_used === true || trace?.fallbackUsed === true,
       fallbackReason: String(trace?.fallback_reason || trace?.fallbackReason || ''),
-      costUsd: explicitCost > 0 ? explicitCost : rowCost,
+      costUsd: hasExplicitCost ? explicitCost : rowCost,
       savedUsd,
       savedPct,
       models,

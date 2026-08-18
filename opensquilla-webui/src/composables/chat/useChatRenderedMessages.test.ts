@@ -2128,6 +2128,78 @@ describe('useChatRenderedMessages ensemble metadata', () => {
     ])
   })
 
+  it('keeps an authoritative zero ledger total over stale breakdown subtotals', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'settled free turn',
+      ts: 0,
+      usage: {
+        // Authoritative ledger total for the turn: genuinely $0.
+        cost_usd: 0,
+        // A richer historical projection can still carry non-zero per-row
+        // subtotals from an earlier receipt. They must not win.
+        model_usage_breakdown: [
+          {
+            role: 'proposer',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.01,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.02,
+            cost_source: 'provider_billed',
+          },
+        ],
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 2,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    expect(api.renderedMessages.value[0].meta?.ensemble?.costUsd).toBe(0)
+  })
+
+  it('falls back to breakdown subtotals when the ledger omits a cost field', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'legacy row without a ledger total',
+      ts: 0,
+      usage: {
+        // No cost_usd/costUsd key at all — legacy shape, so the per-row
+        // subtotals remain the only available signal.
+        model_usage_breakdown: [
+          {
+            role: 'proposer',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.01,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.02,
+            cost_source: 'provider_billed',
+          },
+        ],
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 2,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    expect(api.renderedMessages.value[0].meta?.ensemble?.costUsd).toBeCloseTo(0.03, 10)
+  })
+
   it('preserves candidate terminal status from the ensemble trace after settlement', () => {
     const api = renderedMessagesFor([
       {
