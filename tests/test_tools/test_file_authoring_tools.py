@@ -17,6 +17,7 @@ from opensquilla.tools.builtin.file_authoring import (
     create_pptx,
     create_xlsx,
 )
+from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import (
     CallerKind,
     RetryableToolInputError,
@@ -51,6 +52,17 @@ def _published_material(ctx: ToolContext, result: str) -> tuple[dict[str, object
         session_id=str(payload["artifact"]["session_id"]),
     )
     return payload["artifact"], path.read_bytes()
+
+
+def test_create_csv_schema_declares_gemini_compatible_string_cells() -> None:
+    definition = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+
+    rows = definition.input_schema.properties["rows"]
+    assert rows["items"] == {"type": "array", "items": {"type": "string"}}
 
 
 @pytest.mark.asyncio

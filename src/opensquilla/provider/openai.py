@@ -635,100 +635,6 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     return value
 
 
-def _schema_type_includes_array(declared: Any) -> bool:
-    if isinstance(declared, str):
-        return declared == "array"
-    if isinstance(declared, list):
-        return "array" in declared
-    return False
-
-
-_SINGLE_CHILD_SCHEMA_KEYWORDS = frozenset(
-    {
-        "additionalItems",
-        "additionalProperties",
-        "contains",
-        "contentSchema",
-        "else",
-        "if",
-        "items",
-        "not",
-        "propertyNames",
-        "then",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    }
-)
-_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
-_SCHEMA_MAP_KEYWORDS = frozenset(
-    {
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-        "patternProperties",
-        "properties",
-    }
-)
-
-
-def _ensure_array_items(value: Any) -> Any:
-    """Give every schema-level ``array`` node an ``items`` declaration.
-
-    JSON Schema treats ``items`` as optional (an itemless array accepts any
-    element), but Gemini's function-declaration validation rejects the whole
-    request with ``... items: missing field`` when any array — including a
-    nested one — omits it. Gemini accepts ``{"type": "string"}`` as a wire
-    placeholder. The original tool schema remains authoritative for local
-    argument validation.
-
-    Only keywords whose values are themselves schemas are traversed. Literal
-    values under keywords such as ``default``, ``enum``, and ``const`` may
-    contain schema-shaped dictionaries and must remain byte-for-byte semantic
-    data rather than being rewritten as schemas.
-    """
-
-    if not isinstance(value, dict):
-        return value
-
-    rebuilt = dict(value)
-    for key in _SINGLE_CHILD_SCHEMA_KEYWORDS:
-        child = rebuilt.get(key)
-        if isinstance(child, dict):
-            rebuilt[key] = _ensure_array_items(child)
-        elif key == "items" and isinstance(child, list):
-            rebuilt[key] = [
-                _ensure_array_items(item) if isinstance(item, dict) else item
-                for item in child
-            ]
-    for key in _SCHEMA_ARRAY_KEYWORDS:
-        children = rebuilt.get(key)
-        if isinstance(children, list):
-            rebuilt[key] = [
-                _ensure_array_items(item) if isinstance(item, dict) else item
-                for item in children
-            ]
-    for key in _SCHEMA_MAP_KEYWORDS:
-        children = rebuilt.get(key)
-        if isinstance(children, dict):
-            rebuilt[key] = {
-                name: _ensure_array_items(child) if isinstance(child, dict) else child
-                for name, child in children.items()
-            }
-
-    # Draft-07 ``dependencies`` may contain either a schema or an array of
-    # property names, so recurse only into mapping-valued entries.
-    dependencies = rebuilt.get("dependencies")
-    if isinstance(dependencies, dict):
-        rebuilt["dependencies"] = {
-            name: _ensure_array_items(child) if isinstance(child, dict) else child
-            for name, child in dependencies.items()
-        }
-
-    if _schema_type_includes_array(rebuilt.get("type")) and "items" not in rebuilt:
-        rebuilt["items"] = {"type": "string"}
-    return rebuilt
-
-
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
@@ -2212,12 +2118,9 @@ def _build_openai_tool(
     tool: ToolDefinition,
     *,
     unsupported_keywords: frozenset[str] = frozenset(),
-    require_array_items: bool = False,
 ) -> dict[str, Any]:
     schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
     schema = _strip_tool_schema_keywords(schema, unsupported_keywords)
-    if require_array_items:
-        schema = _ensure_array_items(schema)
     return {
         "type": "function",
         "function": {
@@ -3525,17 +3428,10 @@ class OpenAIProvider:
         if cfg.stop_sequences:
             payload["stop"] = cfg.stop_sequences
         if tools:
-            require_array_items = bool(
-                self._compat.tool_schema_requires_array_items
-                and self._compat.official_host
-                and _base_url_hostname(self._base_url)
-                == self._compat.official_host.lower()
-            )
             payload["tools"] = [
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
-                    require_array_items=require_array_items,
                 )
                 for tool in tools
             ]

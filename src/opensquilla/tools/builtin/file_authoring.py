@@ -320,10 +320,10 @@ async def _published_response(
         "rows": {
             "type": "array",
             "description": (
-                "Non-empty array of row arrays. Values may be strings, numbers, "
-                "booleans, null, arrays, or objects."
+                "Non-empty array of row arrays. Encode every cell as text; use an empty "
+                "string for a blank cell and JSON text for structured values."
             ),
-            "items": {"type": "array"},
+            "items": {"type": "array", "items": {"type": "string"}},
         },
     },
     required=["rows"],
