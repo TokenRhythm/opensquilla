@@ -1583,3 +1583,48 @@ async def test_second_provider_call_barrier_is_retryable_but_not_replay_safe() -
     assert caught.value.usage_call_index == 2
     assert caught.value.no_prior_provider_dispatch is False
     assert caught.value.replay_safe is False
+
+
+async def test_bind_usage_accounting_scope_resets_across_contexts() -> None:
+    """Closing a generator from a different asyncio context must not raise
+    ``ValueError: ContextVar token was created in a different Context``."""
+    from opensquilla.engine.usage_accounting import current_usage_accounting_scope
+
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(
+        sink=sink,
+        context=_context(),
+    )
+
+    async def generator_with_binding() -> AsyncIterator[int]:
+        with bind_usage_accounting_scope(scope):
+            assert current_usage_accounting_scope() is scope
+            yield 1
+            yield 2
+
+    stream = generator_with_binding()
+    first = asyncio.create_task(_next_value(stream))
+    await asyncio.sleep(0)
+    assert current_usage_accounting_scope() is None
+
+    # The generator's next advance and its eventual close run in a different
+    # task's context (the router-control replay shape from the issue).
+    second = asyncio.create_task(_close_after_next(stream))
+    await asyncio.sleep(0)
+    await second
+    await first
+    # The binding must not leak into the outer context.
+    assert current_usage_accounting_scope() is None
+
+
+async def _next_value(stream: AsyncIterator[int]) -> int:
+    return await stream.__anext__()
+
+
+async def _close_after_next(stream: AsyncIterator[int]) -> None:
+    try:
+        await stream.__anext__()
+    except StopAsyncIteration:
+        pass
+    finally:
+        await stream.aclose()

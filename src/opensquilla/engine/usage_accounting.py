@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Mapping
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Protocol, runtime_checkable
@@ -256,7 +256,27 @@ def bind_usage_accounting_scope(scope: UsageAccountingScope | None) -> Iterator[
     try:
         yield
     finally:
+        _reset_usage_scope_token(token, scope)
+
+
+def _reset_usage_scope_token(token: Token[UsageAccountingScope | None], scope: UsageAccountingScope) -> None:
+    """Reset a usage-scope ContextVar token across possible context changes.
+
+    An async generator created inside this binding can be closed later from a
+    different asyncio context (e.g. a ``router-control`` replay interrupts the
+    first turn attempt and its cleanup path closes the generator). Resetting a
+    token created in another context raises ``ValueError: ContextVar token was
+    created in a different Context``, so fall back to an unconditional set when
+    the token no longer belongs to this context. ``set`` cannot resurrect the
+    previous value, so only clear when this binding's value is still active —
+    that keeps the common in-context path byte-identical (token reset) and the
+    cross-context path safe.
+    """
+    try:
         _ACTIVE_USAGE_SCOPE.reset(token)
+    except ValueError:
+        if _ACTIVE_USAGE_SCOPE.get() is scope:
+            _ACTIVE_USAGE_SCOPE.set(None)
 
 
 def provider_accounts_physical_usage(provider: object) -> bool:
