@@ -7592,9 +7592,12 @@ async function findGatewayPort(): Promise<number> {
   throw new Error('No free OpenSquilla desktop gateway port found in 18791-18830.')
 }
 
-async function healthCheck(url: string): Promise<boolean> {
+async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   try {
-    const response = await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })
+    const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
+    const response = await fetch(`${url}/healthz`, {
+      signal: AbortSignal.timeout(boundedTimeoutMs),
+    })
     if (!response.ok) return false
     const payload = await response.json().catch(() => null)
     return Boolean(payload && payload.ok === true)
@@ -7666,7 +7669,7 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
 
 async function waitForGateway(url: string, earlyExitMessage?: () => string | null): Promise<void> {
   const result = await waitForGatewayReadiness({
-    probe: () => healthCheck(url),
+    probe: (remainingMs) => healthCheck(url, remainingMs),
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
     lateGraceMs: 15_000,
@@ -7754,6 +7757,28 @@ async function verifyOwnedGatewayLaunch(
   })
 }
 
+async function discardUnverifiedOwnedGatewayChild(
+  child: ChildProcessWithoutNullStreams,
+): Promise<boolean> {
+  if (gatewayProcess !== child) return false
+  trackStoppingGatewayProcess(child)
+  gatewayProcess = null
+  gatewayState.status = 'stopped'
+  gatewayState.error = undefined
+  // Do not issue any URL-based shutdown request: the listener just failed the
+  // exact launch proof. Signal only the ChildProcess tree created by Electron.
+  hardTerminateGatewayProcess(child)
+  const exited = await waitForGatewayProcessExit(child, 10_000)
+  if (!exited) {
+    // Restore the exact handle as current authority so the caller can surface
+    // the failed stop and a later retry can join it. The stopping-set admission
+    // gate prevents a successor from being spawned while this child is live.
+    if (!gatewayProcess) gatewayProcess = child
+    throw new Error(desktopGatewayStillRunningMessage())
+  }
+  return true
+}
+
 async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
   const child = gatewayProcess
   if (
@@ -7786,9 +7811,10 @@ async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
     throw new Error(childExitMessage() || 'Desktop gateway changed while startup resumed.')
   }
   if (!await verifyOwnedGatewayLaunch(child)) {
-    throw new Error(
-      'OPENSQUILLA_GATEWAY_IDENTITY_MISMATCH: The healthy listener is not the Desktop Gateway from this launch.',
-    )
+    if (!await discardUnverifiedOwnedGatewayChild(child)) {
+      throw new Error('Desktop gateway changed during ownership verification.')
+    }
+    return null
   }
   if (
     gatewayProcess !== child
@@ -8139,12 +8165,7 @@ async function startGateway(): Promise<GatewayState> {
     // Never send a shutdown request to the unverified listener. Terminate only
     // the exact child handle we spawned, then let port recovery choose another
     // loopback port once that child has released its profile writer lease.
-    if (gatewayProcess === child) {
-      trackStoppingGatewayProcess(child)
-      gatewayProcess = null
-      hardTerminateGatewayProcess(child)
-      await waitForGatewayProcessExit(child)
-    }
+    await discardUnverifiedOwnedGatewayChild(child)
     throw new Error(
       'OPENSQUILLA_GATEWAY_PORT_IN_USE: Gateway port is already in use by an unverified listener.',
     )
@@ -8656,19 +8677,27 @@ async function openOrResumeDesktopApp(): Promise<void> {
           }
         }
       } catch (error) {
-        if (gatewayState.status !== 'ready') {
-          gatewayState.status = 'error'
-          gatewayState.error = error instanceof Error ? error.message : String(error)
+        const authoritative = !isQuitting
+          && revision === desktopOpenFlowRevision
+          && requestedProfileKey === desktopProfileKey()
+        if (authoritative) {
+          if (gatewayState.status !== 'ready') {
+            gatewayState.status = 'error'
+            gatewayState.error = error instanceof Error ? error.message : String(error)
+          }
+          desktopLog('desktop_open_failed', {
+            profileKind: 'primary',
+            gatewayPid: gatewayProcess?.pid,
+            gatewayStatus: gatewayState.status,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          if (currentMainWindow()) sendBootError(error)
         }
-        desktopLog('desktop_open_failed', {
-          profileKind: 'primary',
-          gatewayPid: gatewayProcess?.pid,
-          gatewayStatus: gatewayState.status,
-          error: error instanceof Error ? error.message : String(error),
-        })
-        if (currentMainWindow()) sendBootError(error)
       }
-      if (revision === desktopOpenFlowRevision) return
+      if (
+        revision === desktopOpenFlowRevision
+        && requestedProfileKey === desktopProfileKey()
+      ) return
       if (gatewayProfileKey && gatewayProfileKey !== desktopProfileKey()) {
         if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
         else clearReusableGatewayState()
@@ -8733,9 +8762,11 @@ async function requestOwnedGatewayShutdown(
   ) {
     if (await requestVerifiedDesktopGatewayShutdown(loaded.record)) return true
   }
-  // Backward compatibility for a child from an older runtime that predates the
-  // Desktop ownership protocol. Failure falls back to signaling this exact
-  // ChildProcess handle, never to PID-file or port-based process discovery.
+  // A known launch context that cannot prove its listener must never send an
+  // unauthenticated shutdown request to that URL. The caller will signal only
+  // the exact ChildProcess handle. Keep the legacy URL path solely for handles
+  // created before this Electron process could attach a launch context.
+  if (context) return false
   return await requestGatewayShutdown(url)
 }
 

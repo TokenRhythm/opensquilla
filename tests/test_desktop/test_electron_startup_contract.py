@@ -371,9 +371,27 @@ def test_desktop_gateway_ready_requires_exact_launch_identity() -> None:
     assert "gatewayProcessOwnershipContexts.get(child)" in verifier
     assert "verifyDesktopGatewayLaunchOwnership" in verifier
     assert "await verifyOwnedGatewayLaunch(child)" in start
-    assert "hardTerminateGatewayProcess(child)" in start
     assert "requestGatewayShutdown" not in start
     assert "unverified listener" in start
+
+    discard = _section(
+        main_ts,
+        "async function discardUnverifiedOwnedGatewayChild",
+        "async function resumeOwnedGatewayStartup",
+    )
+    assert "gatewayProcess = null" in discard
+    assert "hardTerminateGatewayProcess(child)" in discard
+    assert "requestGatewayShutdown" not in discard
+
+    shutdown = _section(
+        main_ts,
+        "async function requestOwnedGatewayShutdown",
+        "async function downloadDiagnostics",
+    )
+    assert "if (context) return false" in shutdown
+    assert shutdown.index("if (context) return false") < shutdown.index(
+        "return await requestGatewayShutdown(url)"
+    )
 
 
 def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None:
@@ -410,6 +428,26 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
     final_fence = control_load.index("if (!isCurrent()) return false", load)
     ready = control_load.rindex("sendBootStatus('ready')")
     assert first_fence < load < final_fence < ready
+
+
+def test_desktop_open_flow_rejects_stale_start_errors() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    open_flow = _section(
+        main_ts,
+        "async function openOrResumeDesktopApp",
+        "const GATEWAY_SHUTDOWN_KILL_AFTER_MS",
+    )
+    catch = open_flow.index("} catch (error) {")
+    authority = open_flow.index("const authoritative = !isQuitting", catch)
+    status = open_flow.index("gatewayState.status = 'error'", authority)
+    state_error = open_flow.index("gatewayState.error =", status)
+    send_error = open_flow.index("sendBootError(error)", state_error)
+    loop_fence = open_flow.index("revision === desktopOpenFlowRevision", send_error)
+
+    assert catch < authority < status < state_error < send_error < loop_fence
+    assert "requestedProfileKey === desktopProfileKey()" in open_flow[
+        authority:status
+    ]
 
 
 def test_desktop_shared_spawn_gate_blocks_still_stopping_gateways() -> None:

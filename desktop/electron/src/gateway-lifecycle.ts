@@ -1,3 +1,5 @@
+import { performance } from 'node:perf_hooks'
+
 export interface LifecycleProcessDrainOptions<T> {
   currentProcess: () => T | null
   stopCurrentProcess: (process: T) => void
@@ -7,7 +9,7 @@ export interface LifecycleProcessDrainOptions<T> {
 }
 
 export interface GatewayReadinessWaitOptions {
-  probe: () => Promise<boolean>
+  probe: (remainingMs: number) => Promise<boolean>
   exitMessage?: () => string | null
   primaryTimeoutMs: number
   lateGraceMs: number
@@ -30,7 +32,7 @@ export type GatewayReadinessWaitResult =
 export async function waitForGatewayReadiness(
   options: GatewayReadinessWaitOptions,
 ): Promise<GatewayReadinessWaitResult> {
-  const now = options.now ?? Date.now
+  const now = options.now ?? (() => performance.now())
   const sleep = options.sleep ?? ((milliseconds: number) => (
     new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
   ))
@@ -44,14 +46,26 @@ export async function waitForGatewayReadiness(
     if (beforeProbeExit) return { status: 'exited', message: beforeProbeExit }
 
     const elapsedBeforeProbe = Math.max(0, now() - startedAt)
-    if (elapsedBeforeProbe > totalTimeoutMs) return { status: 'timeout' }
-    const ready = await options.probe()
+    const remainingBeforeProbeMs = totalTimeoutMs - elapsedBeforeProbe
+    if (remainingBeforeProbeMs <= 0) return { status: 'timeout' }
+
+    let probeTimeout: NodeJS.Timeout | null = null
+    const ready = await Promise.race<boolean | null>([
+      options.probe(remainingBeforeProbeMs),
+      new Promise<null>((resolveTimeout) => {
+        probeTimeout = setTimeout(() => resolveTimeout(null), remainingBeforeProbeMs)
+      }),
+    ]).finally(() => {
+      if (probeTimeout) clearTimeout(probeTimeout)
+    })
 
     const afterProbeExit = options.exitMessage?.()
     if (afterProbeExit) return { status: 'exited', message: afterProbeExit }
-    if (ready) return { status: 'ready', late: elapsedBeforeProbe >= primaryTimeoutMs }
 
     const elapsedAfterProbe = Math.max(0, now() - startedAt)
+    if (ready === null || elapsedAfterProbe >= totalTimeoutMs) return { status: 'timeout' }
+    if (ready) return { status: 'ready', late: elapsedAfterProbe >= primaryTimeoutMs }
+
     const remainingMs = totalTimeoutMs - elapsedAfterProbe
     if (remainingMs <= 0) return { status: 'timeout' }
     await sleep(Math.min(pollIntervalMs, remainingMs))
