@@ -1,9 +1,75 @@
+import { performance } from 'node:perf_hooks'
+
 export interface LifecycleProcessDrainOptions<T> {
   currentProcess: () => T | null
   stopCurrentProcess: (process: T) => void
   liveProcesses: () => T[]
   waitForExit: (process: T) => Promise<boolean>
   maxRounds?: number
+}
+
+export interface GatewayReadinessWaitOptions {
+  probe: (remainingMs: number) => Promise<boolean>
+  exitMessage?: () => string | null
+  primaryTimeoutMs: number
+  lateGraceMs: number
+  pollIntervalMs: number
+  now?: () => number
+  sleep?: (milliseconds: number) => Promise<void>
+}
+
+export type GatewayReadinessWaitResult =
+  | { status: 'ready'; late: boolean }
+  | { status: 'exited'; message: string }
+  | { status: 'timeout' }
+
+/**
+ * Wait for a spawned Gateway without turning the first readiness deadline into
+ * an irreversible failure. The late window remains bounded, and child exit is
+ * checked on both sides of every probe so a dead process never consumes the
+ * remainder of the startup budget.
+ */
+export async function waitForGatewayReadiness(
+  options: GatewayReadinessWaitOptions,
+): Promise<GatewayReadinessWaitResult> {
+  const now = options.now ?? (() => performance.now())
+  const sleep = options.sleep ?? ((milliseconds: number) => (
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+  ))
+  const primaryTimeoutMs = Math.max(0, options.primaryTimeoutMs)
+  const totalTimeoutMs = primaryTimeoutMs + Math.max(0, options.lateGraceMs)
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs)
+  const startedAt = now()
+
+  while (true) {
+    const beforeProbeExit = options.exitMessage?.()
+    if (beforeProbeExit) return { status: 'exited', message: beforeProbeExit }
+
+    const elapsedBeforeProbe = Math.max(0, now() - startedAt)
+    const remainingBeforeProbeMs = totalTimeoutMs - elapsedBeforeProbe
+    if (remainingBeforeProbeMs <= 0) return { status: 'timeout' }
+
+    let probeTimeout: NodeJS.Timeout | null = null
+    const ready = await Promise.race<boolean | null>([
+      options.probe(remainingBeforeProbeMs),
+      new Promise<null>((resolveTimeout) => {
+        probeTimeout = setTimeout(() => resolveTimeout(null), remainingBeforeProbeMs)
+      }),
+    ]).finally(() => {
+      if (probeTimeout) clearTimeout(probeTimeout)
+    })
+
+    const afterProbeExit = options.exitMessage?.()
+    if (afterProbeExit) return { status: 'exited', message: afterProbeExit }
+
+    const elapsedAfterProbe = Math.max(0, now() - startedAt)
+    if (ready === null || elapsedAfterProbe >= totalTimeoutMs) return { status: 'timeout' }
+    if (ready) return { status: 'ready', late: elapsedAfterProbe >= primaryTimeoutMs }
+
+    const remainingMs = totalTimeoutMs - elapsedAfterProbe
+    if (remainingMs <= 0) return { status: 'timeout' }
+    await sleep(Math.min(pollIntervalMs, remainingMs))
+  }
 }
 
 export function lifecycleAllowsProcessSpawn(

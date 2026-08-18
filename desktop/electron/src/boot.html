@@ -945,14 +945,17 @@
 
     let retryStartupInFlight = false;
     async function retryStartup() {
-      if (!api || typeof api.retryStartup !== 'function' || retryStartupInFlight) return null;
+      const resumeStartup = typeof api?.resumeStartup === 'function'
+        ? api.resumeStartup
+        : api?.retryStartup;
+      if (typeof resumeStartup !== 'function' || retryStartupInFlight) return null;
       const retryButton = document.getElementById('retry');
       const recoveryRetryButton = document.getElementById('recoveryRetry');
       retryStartupInFlight = true;
       retryButton.disabled = true;
       recoveryRetryButton.disabled = true;
       try {
-        const result = await api.retryStartup();
+        const result = await resumeStartup();
         if (result && result.ok === false) {
           applyError({ message: result.error || msg.errorDefault });
         }

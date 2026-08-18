@@ -35,8 +35,8 @@ def test_desktop_resume_is_visible_first_and_single_flight() -> None:
 
     assert resume.index("await createMainWindow()") < resume.index("ensureGatewayStarted()")
     assert "focusMainWindow()" in resume
-    assert "reuseHealthyGatewayState()" in resume
-    assert "loadControlUiIntoCurrentWindow(gateway.url)" in resume
+    assert "reuseHealthyGatewayState(" in resume
+    assert "loadControlUiIntoCurrentWindow(" in resume
 
 
 def test_desktop_gateway_completion_uses_current_live_window() -> None:
@@ -268,12 +268,10 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
         "ipcMain.handle('desktop:boot:quit'",
     )
 
-    # Retry backs both the boot-error button and the Control UI "Restart runtime"
-    # action, so it forces a real restart: an in-flight start is joined (clearing
-    # the stale error), otherwise every lifecycle-owned gateway is torn down and
-    # awaited before respawn rather than reused. The join result is a hard safety
-    # boundary: timing out must leave the old runtime authoritative and must not
-    # clear its reusable state or start a competing writer.
+    # The Control UI "Restart runtime" action forces a real restart: an in-flight
+    # start is joined, otherwise every lifecycle-owned gateway is torn down and
+    # awaited before respawn rather than reused. The boot page has a separate
+    # non-destructive resume path below.
     assert "if (gatewayStartPromise)" in retry
     join_call = "const exited = await stopAndJoinAllLifecycleOwnedGateways()"
     assert join_call in retry
@@ -304,6 +302,183 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
         "openOrResumeDesktopApp()"
     )
     assert success.index("openOrResumeDesktopApp()") < success.index("return { ok: true }")
+
+
+def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    resume_flow = _section(
+        main_ts,
+        "async function resumeBootStartup()",
+        "ipcMain.handle('desktop:boot:resume'",
+    )
+    resume_handler = _section(
+        main_ts,
+        "ipcMain.handle('desktop:boot:resume'",
+        "ipcMain.handle('desktop:boot:retry'",
+    )
+    start = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery()",
+    )
+    resume_owned = _section(
+        main_ts,
+        "async function resumeOwnedGatewayStartup",
+        "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS",
+    )
+
+    assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
+    assert "const pendingStart = gatewayStartPromise" in resume_flow
+    assert "await resumeOwnedGatewayStartup(" in resume_flow
+    assert "if (!gateway)" in resume_flow
+    assert "void openOrResumeDesktopApp()" in resume_flow
+    assert "await loadControlUiIntoCurrentWindow(" in resume_flow
+    assert "bootResumeAuthorityIsCurrent(authority)" in resume_flow
+    assert "if (pendingStart || !initialAuthority" in resume_flow
+    assert "stopAndJoinAllLifecycleOwnedGateways" not in resume_flow
+    assert "clearReusableGatewayState" not in resume_flow
+    assert "stopGateway()" not in resume_flow
+    assert "if (bootResumePromise) return await bootResumePromise" in resume_handler
+    assert "bootResumePromise = promise" in resume_handler
+    assert "bootResumePromise = null" in resume_handler
+
+    assert "await resumeOwnedGatewayStartup(isCurrent)" in start
+    assert start.index("await resumeOwnedGatewayStartup(isCurrent)") < start.index(
+        "if (gatewayProcess && gatewayState.owned)"
+    )
+    assert "gatewayProcess === child" in resume_owned
+    assert "gatewayProfileKey !== desktopProfileKey()" in resume_owned
+    assert "await waitForGateway(url, childExitMessage)" in resume_owned
+    assert "await waitForControlUi(url, childExitMessage)" in resume_owned
+    assert "await verifyOwnedGatewayLaunch(child)" in resume_owned
+    assert "|| !isCurrent()" in resume_owned
+    assert "gatewayState.status = 'ready'" in resume_owned
+
+
+def test_desktop_gateway_ready_requires_exact_launch_identity() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery()",
+    )
+    verifier = _section(
+        main_ts,
+        "async function verifyOwnedGatewayLaunch",
+        "async function resumeOwnedGatewayStartup",
+    )
+
+    assert "gatewayProcessOwnershipContexts.get(child)" in verifier
+    assert "verifyDesktopGatewayLaunchOwnership" in verifier
+    assert "await verifyOwnedGatewayLaunch(child)" in start
+    assert "requestGatewayShutdown" not in start
+    assert "unverified listener" in start
+
+    discard = _section(
+        main_ts,
+        "async function discardUnverifiedOwnedGatewayChild",
+        "async function resumeOwnedGatewayStartup",
+    )
+    assert "gatewayProcess = null" in discard
+    assert "hardTerminateGatewayProcess(child)" in discard
+    assert "requestGatewayShutdown" not in discard
+
+    shutdown = _section(
+        main_ts,
+        "async function requestOwnedGatewayShutdown",
+        "async function downloadDiagnostics",
+    )
+    assert "if (context) return false" in shutdown
+    assert shutdown.index("if (context) return false") < shutdown.index(
+        "return await requestGatewayShutdown(url)"
+    )
+
+
+def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    authority = _section(
+        main_ts,
+        "function bootResumeAuthorityIsCurrent",
+        "async function resumeBootStartup",
+    )
+    resume_flow = _section(
+        main_ts,
+        "async function resumeBootStartup",
+        "ipcMain.handle('desktop:boot:resume'",
+    )
+    control_load = _section(
+        main_ts,
+        "async function loadControlUiIntoCurrentWindow",
+        "async function restoreMainWindowToBootPage",
+    )
+
+    for fence in [
+        "!isQuitting",
+        "gatewayProcess === authority.child",
+        "gatewayProfileKey === authority.profileKey",
+        "desktopOpenFlowRevision === authority.openFlowRevision",
+    ]:
+        assert fence in authority
+    assert "if (initialAuthority && !bootResumeAuthorityIsCurrent" in resume_flow
+    assert "if (!authority || !bootResumeAuthorityIsCurrent" in resume_flow
+    assert "!bootResumeAuthorityIsCurrent(initialAuthority)" in resume_flow
+
+    first_fence = control_load.index("if (!isCurrent()) return false")
+    load = control_load.index("await loadControlUi(window, gatewayUrl)")
+    final_fence = control_load.index("if (!isCurrent()) return false", load)
+    ready = control_load.rindex("sendBootStatus('ready')")
+    assert first_fence < load < final_fence < ready
+
+    resume_owned = _section(
+        main_ts,
+        "async function resumeOwnedGatewayStartup",
+        "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS",
+    )
+    assert resume_owned.rindex("|| !isCurrent()") < resume_owned.index(
+        "gatewayState.status = 'ready'"
+    )
+
+    open_flow = _section(
+        main_ts,
+        "async function openOrResumeDesktopApp",
+        "const GATEWAY_SHUTDOWN_KILL_AFTER_MS",
+    )
+    load_index = open_flow.index("await loadControlUiIntoCurrentWindow(")
+    load_call = open_flow[load_index : load_index + 300]
+    assert "operationIsCurrent" in load_call
+
+    authority_capture = open_flow[
+        open_flow.index("const gatewayUrl = gateway.url") : load_index
+    ]
+    for exact_gateway_fence in [
+        "const expectedOwned = gateway.owned",
+        "const expectedChild = expectedOwned ? gatewayProcess : null",
+        "gatewayState.url === gatewayUrl",
+        "gatewayState.owned === expectedOwned",
+        "gatewayProcess === expectedChild",
+        "!hasGatewayProcessExited(expectedChild)",
+    ]:
+        assert exact_gateway_fence in authority_capture
+    assert "const authoritative = operationIsCurrent()" in open_flow
+
+
+def test_desktop_open_flow_rejects_stale_start_errors() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    open_flow = _section(
+        main_ts,
+        "async function openOrResumeDesktopApp",
+        "const GATEWAY_SHUTDOWN_KILL_AFTER_MS",
+    )
+    catch = open_flow.index("} catch (error) {")
+    authority = open_flow.index("const authoritative = operationIsCurrent()", catch)
+    status = open_flow.index("gatewayState.status = 'error'", authority)
+    state_error = open_flow.index("gatewayState.error =", status)
+    send_error = open_flow.index("sendBootError(error)", state_error)
+    loop_fence = open_flow.index("desktopOpenAuthorityIsCurrent", send_error)
+
+    assert catch < authority < status < state_error < send_error < loop_fence
+    assert "operationIsCurrent()" in open_flow[authority:status]
 
 
 def test_desktop_shared_spawn_gate_blocks_still_stopping_gateways() -> None:
@@ -348,7 +523,10 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
 
     assert "retryButton.disabled = true" in retry_flow
     assert "recoveryRetryButton.disabled = true" in retry_flow
-    assert "const result = await api.retryStartup()" in retry_flow
+    assert "typeof api?.resumeStartup === 'function'" in retry_flow
+    assert "api.resumeStartup" in retry_flow
+    assert "api?.retryStartup" in retry_flow
+    assert "const result = await resumeStartup()" in retry_flow
     assert "result && result.ok === false" in retry_flow
     assert "result.error || msg.errorDefault" in retry_flow
     assert "applyError({ message: result.error || msg.errorDefault })" in retry_flow
@@ -356,9 +534,9 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert "retryButton.disabled = false" in retry_flow
     assert "recoveryRetryButton.disabled = false" in retry_flow
     assert retry_flow.index("retryButton.disabled = true") < retry_flow.index(
-        "await api.retryStartup()"
+        "await resumeStartup()"
     )
-    assert retry_flow.index("await api.retryStartup()") < retry_flow.index(
+    assert retry_flow.index("await resumeStartup()") < retry_flow.index(
         "retryButton.disabled = false"
     )
     assert (
@@ -906,14 +1084,11 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
 
     assert "let forceOnboardingOnNextStartup = false" in main_ts
     assert "function clearReusableGatewayState(): void" in main_ts
-    reuse_guard = (
-        "const reusableGateway = forceOnboardingOnNextStartup ? null : "
-        "await reuseHealthyGatewayState()"
-    )
-    assert reuse_guard in start
+    assert "const reusableGateway = forceOnboardingOnNextStartup" in start
+    assert "await reuseHealthyGatewayState(isCurrent)" in start
     assert "forceOnboardingOnNextStartup = false" in start
     assert "forceOnboardingOnNextStartup" in resume
-    assert "await reuseHealthyGatewayState()" in resume
+    assert "await reuseHealthyGatewayState(" in resume
     assert "resetDesktopSettingsThroughCleanup()" in reset
     assert "inspectDesktopCleanup('reset-current-settings')" in cleanup_reset
     assert "desktopCleanupPreviews.consume(" in cleanup_reset
@@ -1181,11 +1356,9 @@ def test_start_gateway_reuses_healthy_gateway_before_spawn() -> None:
 
     assert "await healthCheck(gatewayState.url)" in reuse
     assert "gatewayState.status = 'ready'" in reuse
-    reuse_guard = (
-        "const reusableGateway = forceOnboardingOnNextStartup ? null : "
-        "await reuseHealthyGatewayState()"
-    )
+    reuse_guard = "const reusableGateway = forceOnboardingOnNextStartup"
     assert reuse_guard in start
+    assert "await reuseHealthyGatewayState(isCurrent)" in start
     assert start.index(reuse_guard) < start.index("const overrideUrl")
     assert "if (reusableGateway) return reusableGateway" in start
     assert "hasGatewayProcessExited(gatewayProcess)" in start
@@ -1315,8 +1488,11 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     assert "appendGatewayOutputTail(gatewayOutputTail, chunk)" in start
     assert "classifyGatewayExitMessage(exitMessage, gatewayOutputTail)" in start
     assert "await waitForGateway(url, () => childExitMessage)" in start
-    assert "earlyExitMessage?: () => string | null" in wait
-    assert "if (earlyExit) throw new Error(earlyExit)" in wait
+    assert "waitForGatewayReadiness({" in wait
+    assert "primaryTimeoutMs: 45_000" in wait
+    assert "lateGraceMs: 15_000" in wait
+    assert "exitMessage: earlyExitMessage" in wait
+    assert "if (result.status === 'exited') throw new Error(result.message)" in wait
 
 
 def test_start_gateway_enriches_child_path_for_code_task_builds() -> None:
