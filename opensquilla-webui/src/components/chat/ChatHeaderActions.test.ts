@@ -4,6 +4,7 @@ import { createApp, nextTick, type App, type ComponentPublicInstance } from 'vue
 import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
+import type { ContextWarning } from '@/composables/chat/useChatUsageWidget'
 
 type Action = 'deliverables' | 'share' | 'copy-session-key'
 type LayoutName = 'wide' | 'compact' | 'tight'
@@ -12,14 +13,24 @@ type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
 }
 
-const BASE_PROPS = {
+const BASE_PROPS: {
+  title: string
+  copyState: string | null
+  copyIcon: string
+  copyLiveText: string
+  deliverableCount: number
+  shareMode: boolean
+  shareableMessageCount: number
+  contextWarning: ContextWarning | null
+} = {
   title: 'Responsive header test',
   copyState: null,
-  copyIcon: 'copy' as const,
+  copyIcon: 'copy',
   copyLiveText: '',
   deliverableCount: 2,
   shareMode: false,
   shareableMessageCount: 3,
+  contextWarning: null,
 }
 
 const messages = {
@@ -32,6 +43,9 @@ const messages = {
     share: 'Share',
     shareSelectHint: 'Select messages to share',
     shareSendFirst: 'Send a message first to share',
+    contextPressure: 'Context {pct}%',
+    contextPressureInfoTitle: 'Context window {used}k / {window}k tokens',
+    contextPressureTitle: 'Context window {used}k / {window}k tokens — nearing compaction',
   },
 }
 
@@ -632,5 +646,46 @@ describe('ChatHeaderActions', () => {
     const tight = await mountHeader(120)
     expect(tight.instance.focusAction('deliverables')).toBe(true)
     expect(document.activeElement).toBe(trigger(tight.el))
+  })
+
+  describe('context-pressure chip', () => {
+    it('renders the percentage once context usage is known', async () => {
+      const { el } = await mountHeader(800, {
+        contextWarning: { pct: 42, usedK: 54, windowK: 128, warning: false },
+      })
+      const chip = el.querySelector<HTMLElement>('.chat-ctx-warn')!
+      expect(chip).not.toBeNull()
+      expect(chip.textContent).toBe('Context 42%')
+      expect(chip.classList.contains('chat-ctx-warn--active')).toBe(false)
+      expect(chip.getAttribute('title')).toBe('Context window 54k / 128k tokens')
+    })
+
+    it('stays hidden while context usage is unknown', async () => {
+      const { el } = await mountHeader(800, { contextWarning: null })
+      expect(el.querySelector('.chat-ctx-warn')).toBeNull()
+    })
+
+    it('switches to the warning style and copy at the warning ratio', async () => {
+      const { el } = await mountHeader(800, {
+        contextWarning: { pct: 87, usedK: 111, windowK: 128, warning: true },
+      })
+      const chip = el.querySelector<HTMLElement>('.chat-ctx-warn')!
+      expect(chip.textContent).toBe('Context 87%')
+      expect(chip.classList.contains('chat-ctx-warn--active')).toBe(true)
+      expect(chip.getAttribute('title'))
+        .toBe('Context window 111k / 128k tokens — nearing compaction')
+    })
+
+    it.each([
+      { layout: 'compact', width: 400 },
+      { layout: 'tight', width: 120 },
+    ] as const)('keeps the chip visible in the $layout header', async ({ width }) => {
+      const { el } = await mountHeader(width, {
+        contextWarning: { pct: 30, usedK: 38, windowK: 128, warning: false },
+      })
+      const chip = el.querySelector<HTMLElement>('.chat-ctx-warn')!
+      expect(chip).not.toBeNull()
+      expect(chip.textContent).toBe('Context 30%')
+    })
   })
 })

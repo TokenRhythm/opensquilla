@@ -59,6 +59,8 @@ export interface ContextWarning {
   pct: number
   usedK: number
   windowK: number
+  /** True when pressure has crossed the gateway warning ratio (0.85). */
+  warning: boolean
 }
 
 interface UsageStatusSession {
@@ -103,21 +105,23 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   const lastSavingsPopupIdentity = ref('')
   const contextStatus = ref<ContextStatus | null>(null)
 
-  // Surfaced as a topbar chip only once the session's context window crosses the
-  // gateway's warning ratio (0.85) — a proactive heads-up before compaction,
-  // independent of any compaction event. Null when below threshold or unknown.
+  // Surfaced as a topbar chip whenever the session's context window is known.
+  // `warning` is true once pressure crosses the gateway's warning ratio (0.85)
+  // — a proactive heads-up before compaction, independent of any compaction
+  // event. Null when the window or usage is unknown.
   const contextWarning = computed<ContextWarning | null>(() => {
     const cs = contextStatus.value
     if (!cs) return null
     const pressure = Number(cs.pressure ?? 0)
     const ratio = Number(cs.warningRatio ?? cs.warning_ratio ?? 0.85)
     const windowTokens = Number(cs.contextWindowTokens ?? cs.context_window_tokens ?? 0)
-    if (!(ratio > 0) || !(windowTokens > 0) || pressure < ratio) return null
+    if (!(pressure > 0) || !(windowTokens > 0)) return null
     const used = Number(cs.contextTokens ?? cs.context_tokens ?? 0)
     return {
       pct: Math.round(Math.min(1, pressure) * 100),
       usedK: Math.round(used / 1000),
       windowK: Math.round(windowTokens / 1000),
+      warning: ratio > 0 && pressure >= ratio,
     }
   })
 

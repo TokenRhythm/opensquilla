@@ -1662,6 +1662,7 @@ const chatUsageWidget = useChatUsageWidget({
 const {
   usageAccum,
   usageModel,
+  contextWarning,
   resetSavingsPopupCooldown,
   saveWidgetState,
   restoreWidgetState,
@@ -4295,6 +4296,7 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   deliverableCount: headerDeliverableCount,
   shareMode,
   shareableMessageCount,
+  contextWarning,
 }, {
   openDeliverables,
   startShare: startShareMode,

@@ -47,6 +47,7 @@ function owner(title: string): {
       deliverableCount: ref(0),
       shareMode: ref(false),
       shareableMessageCount: ref(1),
+      contextWarning: ref(null),
     },
     commands: {
       openDeliverables: vi.fn(),

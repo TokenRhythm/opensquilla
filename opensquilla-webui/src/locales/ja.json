@@ -3326,6 +3326,7 @@
     "deliverables": "成果物",
     "deliverablesCount": "成果物 ({count})",
     "contextPressure": "コンテキスト {pct}%",
+    "contextPressureInfoTitle": "コンテキストウィンドウ {used}k / {window}k トークン",
     "contextPressureTitle": "コンテキストウィンドウ {used}k / {window}k トークン — 圧縮しきい値に接近",
     "sessionDeliverables": "セッションの成果物",
     "noDeliverables": "成果物はまだありません。",

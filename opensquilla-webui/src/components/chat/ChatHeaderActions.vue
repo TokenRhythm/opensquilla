@@ -24,6 +24,17 @@
 
     <span class="chat-header__spacer" aria-hidden="true"></span>
 
+    <span
+      v-if="contextWarning"
+      class="chat-ctx-warn"
+      :class="{ 'chat-ctx-warn--active': contextWarning.warning }"
+      :title="t(contextWarning.warning ? 'chat.contextPressureTitle' : 'chat.contextPressureInfoTitle', {
+        used: contextWarning.usedK,
+        window: contextWarning.windowK,
+        pct: contextWarning.pct,
+      })"
+    >{{ t('chat.contextPressure', { pct: contextWarning.pct }) }}</span>
+
     <div v-if="layout === 'wide'" class="chat-header__actions">
       <button
         v-if="deliverableCount > 0"
@@ -171,6 +182,7 @@ import Icon from '@/components/Icon.vue'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import type { ContextWarning } from '@/composables/chat/useChatUsageWidget'
 import {
   resolveSessionHeaderLayout,
   type SessionHeaderLayout,
@@ -189,6 +201,7 @@ const props = defineProps<{
   deliverableCount: number
   shareMode: boolean
   shareableMessageCount: number
+  contextWarning: ContextWarning | null
 }>()
 
 const emit = defineEmits<{
@@ -573,6 +586,28 @@ defineExpose({ focusAction, closeMenu })
   background: var(--topbar-state-fill);
   border-color: var(--topbar-state-border);
   color: var(--topbar-state-channel);
+}
+
+.chat-ctx-warn {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  line-height: 1;
+  min-height: 26px;
+  padding: 0 0.625rem;
+  white-space: nowrap;
+}
+
+.chat-ctx-warn--active {
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--warn) 34%, var(--border));
+  color: var(--warn);
 }
 
 .chat-header__count-badge {

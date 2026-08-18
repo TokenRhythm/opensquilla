@@ -213,6 +213,7 @@
           :deliverable-count="chatRouteHeaderDeliverableCount"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
+          :context-warning="chatRouteHeaderContextWarning"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
           @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
@@ -546,6 +547,7 @@ const {
   deliverableCount: chatRouteHeaderDeliverableCount,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,
+  contextWarning: chatRouteHeaderContextWarning,
 } = chatRouteHeader.model
 const chatHeaderActionsRef = ref<ChatRouteHeaderHostHandle | null>(null)
 watch(chatHeaderActionsRef, host => chatRouteHeader.setHost(host), { flush: 'sync' })

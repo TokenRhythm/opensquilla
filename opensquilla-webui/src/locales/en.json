@@ -3379,6 +3379,7 @@
     "deliverables": "Deliverables",
     "deliverablesCount": "Deliverables ({count})",
     "contextPressure": "Context {pct}%",
+    "contextPressureInfoTitle": "Context window {used}k / {window}k tokens",
     "contextPressureTitle": "Context window {used}k / {window}k tokens — nearing compaction",
     "sessionDeliverables": "Session deliverables",
     "noDeliverables": "No deliverables yet.",
