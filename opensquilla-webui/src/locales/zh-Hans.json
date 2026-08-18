@@ -7,6 +7,8 @@
     "addSourceFolder": "添加 OpenSquilla 可读取和编辑的文件夹",
     "creatingProject": "正在创建…",
     "projectCreated": "已创建项目“{name}”",
+    "projectAlreadyExists": "项目“{name}”已存在，已使用现有项目",
+    "projectExistingRenamed": "项目已存在，名称已更新为“{name}”",
     "createProjectFailed": "无法创建项目：{error}",
     "noTasks": "无任务",
     "chooseProject": "选择项目",

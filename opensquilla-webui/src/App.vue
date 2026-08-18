@@ -1372,14 +1372,28 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
     return
   }
   projectCreateBusy.value = true
+  const existingWorkspaceIds = new Set(
+    projectWorkspaces.workspaces.value.map(workspace => workspace.id),
+  )
   try {
     const workspace = await projectWorkspaces.openWorkspace(path)
     if (!workspace) throw new Error('Gateway returned an empty project.')
+    const alreadyExists = existingWorkspaceIds.has(workspace.id)
+    const renamedExisting = alreadyExists && workspace.name !== name
     if (workspace.name !== name) {
       await projectWorkspaces.renameWorkspace(workspace.id, name)
     }
     resetProjectCreator()
-    pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    if (alreadyExists) {
+      pushToast(t(
+        renamedExisting
+          ? 'workspaces.projectExistingRenamed'
+          : 'workspaces.projectAlreadyExists',
+        { name },
+      ), { tone: 'info' })
+    } else {
+      pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    }
   } catch (err) {
     projectCreateBusy.value = false
     projectCreateConfirming.value = false

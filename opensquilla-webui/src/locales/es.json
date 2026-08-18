@@ -7,6 +7,8 @@
     "addSourceFolder": "Añadir una carpeta que OpenSquilla pueda leer y editar",
     "creatingProject": "Creando…",
     "projectCreated": "Proyecto «{name}» creado",
+    "projectAlreadyExists": "El proyecto «{name}» ya existe; se usará el proyecto existente",
+    "projectExistingRenamed": "El proyecto ya existía y se cambió su nombre a «{name}»",
     "createProjectFailed": "No se pudo crear el proyecto: {error}",
     "noTasks": "Sin tareas",
     "chooseProject": "Elegir proyecto",

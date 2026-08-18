@@ -7,6 +7,8 @@
     "addSourceFolder": "OpenSquilla が読み書きできるフォルダを追加",
     "creatingProject": "作成中…",
     "projectCreated": "プロジェクト「{name}」を作成しました",
+    "projectAlreadyExists": "プロジェクト「{name}」はすでに存在するため、既存のプロジェクトを使用します",
+    "projectExistingRenamed": "既存のプロジェクト名を「{name}」に更新しました",
     "createProjectFailed": "プロジェクトを作成できませんでした: {error}",
     "noTasks": "タスクなし",
     "chooseProject": "プロジェクトを選択",
