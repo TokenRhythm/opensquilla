@@ -1252,6 +1252,89 @@ async def test_publish_artifact_allows_delivery_ready_running_plan_run(
 
 
 @pytest.mark.asyncio
+async def test_publish_artifact_allows_cancelled_plan_run_with_all_steps_terminal(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            # User cancelled after the final checkpoint: every bounded step is
+            # terminal but a stale current_step_id still points at the last
+            # step. The delivery channel must not be sealed (issue #1112).
+            return SimpleNamespace(
+                status="cancelled",
+                current_step_id="publish",
+                active_task_id=None,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "completed"},
+                ],
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_rejects_cancelled_plan_run_with_unfinished_steps(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="cancelled",
+                current_step_id="build",
+                active_task_id=None,
+                step_states=[
+                    {"step_id": "build", "status": "in_progress"},
+                ],
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError) as exc_info:
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert "cancelled" in str(exc_info.value)
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
 async def test_publish_artifact_rejects_paused_plan_run_without_retry(
     tmp_path: Path,
 ) -> None:
@@ -1826,6 +1909,61 @@ async def test_publish_artifact_tool_is_idempotent_for_existing_turn_artifact(
     assert second["artifact"]["name"] == "generated-image.png"
     assert "already registered" in second["note"]
     assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_backstop_skips_file_explicitly_published_with_custom_name(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.engine.artifact_delivery import (
+        auto_publish_omitted_workspace_artifacts,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "index.html"
+    target.write_text("<title>World Countries</title>", encoding="utf-8")
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+    ctx.workspace_file_writes.append(
+        {
+            "created": True,
+            "path": str(target),
+            "relative_path": "index.html",
+            "name": target.name,
+        }
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        result = json.loads(
+            await publish_artifact(
+                path="index.html",
+                name="World Countries Overview",
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result["status"] == "published"
+    assert result["artifact"]["name"] == "World Countries Overview.html"
+    assert len(ctx.published_artifacts) == 1
+
+    publish_result = auto_publish_omitted_workspace_artifacts(
+        ctx,
+        final_text="I created index.html for you.",
+    )
+
+    assert publish_result.artifacts == []
+    assert publish_result.failure_summaries == []
+    assert len(ctx.published_artifacts) == 1
+    assert ctx.published_artifacts[0]["name"] == "World Countries Overview.html"
 
 
 @pytest.mark.asyncio
