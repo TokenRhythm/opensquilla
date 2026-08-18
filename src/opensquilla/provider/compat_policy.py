@@ -192,6 +192,12 @@ class OpenAICompatPolicy:
     # JSON Schema keywords the upstream rejects in tool definitions.
     tool_schema_unsupported_keywords: frozenset[str] = frozenset()
 
+    # Tool names whose itemless arrays may be projected to string items on
+    # this provider's official endpoint. This is deliberately allowlisted:
+    # an itemless JSON Schema array accepts arbitrary values, so a string
+    # fallback is safe only when the tool's wire semantics are textual.
+    tool_schema_string_item_fallback_tools: frozenset[str] = frozenset()
+
     # Whether the chat-completions endpoint reliably supports native
     # ``response_format.type=json_schema``.  When false, the OpenAI-compatible
     # adapter keeps the same provider/model and places the authoritative
@@ -445,7 +451,11 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
         require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
-    "gemini": OpenAICompatPolicy(display_name="Gemini"),
+    "gemini": OpenAICompatPolicy(
+        display_name="Gemini",
+        official_host="generativelanguage.googleapis.com",
+        tool_schema_string_item_fallback_tools=frozenset({"create_csv"}),
+    ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",
         text_tool_profile=TextToolCompatProfile(

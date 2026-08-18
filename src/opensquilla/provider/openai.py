@@ -635,6 +635,94 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     return value
 
 
+_SINGLE_CHILD_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+
+
+def _complete_itemless_arrays_with_string_items(value: Any) -> Any:
+    """Project itemless schema arrays to Gemini's typed wire format.
+
+    Callers must gate this lossy projection to tools whose values have safe
+    textual wire semantics. Only schema-bearing keywords are traversed, so
+    schema-shaped literal values under ``default``, ``enum``, or ``const``
+    remain unchanged.
+    """
+
+    if not isinstance(value, dict):
+        return value
+
+    rebuilt = dict(value)
+    for key in _SINGLE_CHILD_SCHEMA_KEYWORDS:
+        child = rebuilt.get(key)
+        if isinstance(child, dict):
+            rebuilt[key] = _complete_itemless_arrays_with_string_items(child)
+        elif key == "items" and isinstance(child, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in child
+            ]
+    for key in _SCHEMA_ARRAY_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in children
+            ]
+    for key in _SCHEMA_MAP_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, dict):
+            rebuilt[key] = {
+                name: _complete_itemless_arrays_with_string_items(child)
+                if isinstance(child, dict)
+                else child
+                for name, child in children.items()
+            }
+    dependencies = rebuilt.get("dependencies")
+    if isinstance(dependencies, dict):
+        rebuilt["dependencies"] = {
+            name: _complete_itemless_arrays_with_string_items(child)
+            if isinstance(child, dict)
+            else child
+            for name, child in dependencies.items()
+        }
+
+    declared_type = rebuilt.get("type")
+    is_array = declared_type == "array" or (
+        isinstance(declared_type, list) and "array" in declared_type
+    )
+    if is_array and "items" not in rebuilt:
+        rebuilt["items"] = {"type": "string"}
+    return rebuilt
+
+
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
@@ -2118,9 +2206,12 @@ def _build_openai_tool(
     tool: ToolDefinition,
     *,
     unsupported_keywords: frozenset[str] = frozenset(),
+    complete_itemless_arrays_with_string_items: bool = False,
 ) -> dict[str, Any]:
     schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
     schema = _strip_tool_schema_keywords(schema, unsupported_keywords)
+    if complete_itemless_arrays_with_string_items:
+        schema = _complete_itemless_arrays_with_string_items(schema)
     return {
         "type": "function",
         "function": {
@@ -3428,10 +3519,20 @@ class OpenAIProvider:
         if cfg.stop_sequences:
             payload["stop"] = cfg.stop_sequences
         if tools:
+            string_item_fallback_tools = (
+                self._compat.tool_schema_string_item_fallback_tools
+                if self._compat.official_host
+                and _base_url_hostname(self._base_url)
+                == self._compat.official_host.lower()
+                else frozenset()
+            )
             payload["tools"] = [
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
+                    complete_itemless_arrays_with_string_items=(
+                        tool.name in string_item_fallback_tools
+                    ),
                 )
                 for tool in tools
             ]

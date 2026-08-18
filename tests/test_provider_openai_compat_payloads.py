@@ -1855,6 +1855,104 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
+def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
+    monkeypatch: Any,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    original_rows = create_csv.input_schema.properties["rows"]
+    assert original_rows["items"] == {"type": "array"}
+    assert _tool_schema_accepts_arguments(
+        create_csv,
+        {"rows": [["text", 1, True, None, {"x": 1}, ["nested"]]]},
+    )
+
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+    _collect_events(provider, ChatConfig(), tools=[create_csv])
+
+    wire_rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert wire_rows["items"] == {"type": "array", "items": {"type": "string"}}
+    assert create_csv.input_schema.properties["rows"] == original_rows
+
+
+@pytest.mark.parametrize(
+    ("base_url", "tool_name"),
+    [
+        ("https://relay.example/v1", "create_csv"),
+        ("https://generativelanguage.googleapis.com/v1beta/openai", "mcp_csv"),
+    ],
+)
+def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
+    monkeypatch: Any,
+    base_url: str,
+    tool_name: str,
+) -> None:
+    tool = ToolDefinition(
+        name=tool_name,
+        description="Create a CSV-like artifact.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url=base_url,
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert rows["items"] == {"type": "array"}
+
+
+def test_string_item_projection_preserves_schema_shaped_literals() -> None:
+    literal = {"type": "array"}
+    tool = ToolDefinition(
+        name="create_csv",
+        description="Create a CSV file.",
+        input_schema=ToolInputSchema(
+            properties={
+                "value": {
+                    "anyOf": [{"type": "array"}],
+                    "default": literal,
+                    "enum": [literal],
+                    "const": literal,
+                }
+            }
+        ),
+    )
+
+    payload = _build_openai_tool(
+        tool,
+        complete_itemless_arrays_with_string_items=True,
+    )
+
+    value = payload["function"]["parameters"]["properties"]["value"]
+    assert value["anyOf"] == [{"type": "array", "items": {"type": "string"}}]
+    assert value["default"] == literal
+    assert value["enum"] == [literal]
+    assert value["const"] == literal
+
+
 def test_deepseek_thinking_uses_provider_thinking_field_not_openai_reasoning_effort(
     monkeypatch: Any,
 ) -> None:
