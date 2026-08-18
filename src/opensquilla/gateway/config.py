@@ -44,6 +44,7 @@ from opensquilla.router_tiers import (
     CUSTOM_B5_MIN_PROPOSERS,
     CUSTOM_B5_SELECTION_MODE,
     DEFAULT_TEXT_TIER,
+    ENSEMBLE_CANDIDATE_ROLES,
     LEGACY_OPENROUTER_MODEL_OPTIONS,
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
     STATIC_B5_SELECTION_MODE_PROVIDERS,  # noqa: F401 - legacy import surface
@@ -473,6 +474,10 @@ def _default_llm_ensemble_model_options() -> list[str]:
 
 # Candidate roles for the custom B5 lineup. "proposer" drafts independently;
 # "aggregator" fuses those drafts and produces the final answer.
+# Backward-compatible symbol for callers that imported the old gateway table.
+LLM_ENSEMBLE_CANDIDATE_ROLES = ENSEMBLE_CANDIDATE_ROLES
+
+
 class LlmEnsembleCandidateConfig(BaseModel):
     provider: str
     model: str
@@ -496,7 +501,7 @@ class LlmEnsembleCandidateConfig(BaseModel):
     @classmethod
     def _normalize_role(cls, value: object) -> str:
         normalized = str(value or "").strip().lower()
-        return "aggregator" if normalized == "aggregator" else "proposer"
+        return normalized if normalized in ENSEMBLE_CANDIDATE_ROLES else "proposer"
 
     @field_validator("thinking_level", mode="before")
     @classmethod

@@ -156,6 +156,17 @@ def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
     }
 
 
+def test_legacy_candidate_roles_alias_stays_importable_from_gateway_config() -> None:
+    # Released extensions import this name directly. It is an alias, not a
+    # second table, so it tracks the canonical two-role contract instead of
+    # resurrecting the retired advisory proposer labels.
+    from opensquilla.gateway.config import LLM_ENSEMBLE_CANDIDATE_ROLES
+    from opensquilla.router_tiers import ENSEMBLE_CANDIDATE_ROLES
+
+    assert LLM_ENSEMBLE_CANDIDATE_ROLES is ENSEMBLE_CANDIDATE_ROLES
+    assert LLM_ENSEMBLE_CANDIDATE_ROLES == ("proposer", "aggregator")
+
+
 def test_router_dynamic_ensemble_allows_empty_custom_model_options() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
