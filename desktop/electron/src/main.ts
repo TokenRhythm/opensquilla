@@ -39,6 +39,11 @@ import {
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from './gateway-lifecycle.js'
+import {
+  OnboardingFlowCoordinator,
+  type CoordinatedOnboardingFlow,
+} from './onboarding-flow-coordinator.js'
+import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
   cleanupSelectorArgs,
@@ -227,6 +232,25 @@ interface OnboardingProbeResult {
   failureKind: string
   message: string
   latencyMs: number
+}
+
+type OnboardingSaveErrorCode =
+  | 'onboarding_inactive'
+  | 'save_in_progress'
+  | 'recovery_required'
+  | 'lifecycle_deferred'
+
+type OnboardingSaveResult =
+  | { ok: true }
+  | { ok: false; code: OnboardingSaveErrorCode; error: string }
+
+interface OnboardingFlow extends CoordinatedOnboardingFlow<
+  OnboardingPayload,
+  OnboardingSaveResult
+> {
+  window: BrowserWindow | null
+  resolve: ((credential: DesktopConnection) => void) | null
+  reject: ((error: Error) => void) | null
 }
 
 interface DesktopSettingsPayload extends OnboardingPayload {}
@@ -468,8 +492,12 @@ function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): strin
 }
 
 let gatewayStartPromise: Promise<GatewayState> | null = null
-let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
-let rejectOnboarding: ((error: Error) => void) | null = null
+let onboardingSaveTelemetryAttempt = 0
+const onboardingFlows = new OnboardingFlowCoordinator<
+  OnboardingPayload,
+  OnboardingSaveResult,
+  OnboardingFlow
+>()
 let secretStorageBackendCache: SecretEncryption | null = null
 let macCodeSignatureDiagnosticCache: string | null = null
 let bootStatus: BootStatus = {
@@ -3900,6 +3928,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDirect: 'Direct model is required for Direct single model mode.',
     defaultTierRequiresModel: 'Default router tier requires a model.',
     searchApiKeyRequired: '{label} search API key is required.',
+    savingSetup: 'Saving setup…',
+    setupTakingLonger: 'First-time setup usually takes 10–20 seconds. Please keep this window open.',
     stepLabel: 'Step {n}',
   },
   'zh-Hans': {
@@ -3946,6 +3976,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDirect: '直连单模型模式需要直连模型。',
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
     searchApiKeyRequired: '需要 {label} 搜索 API 密钥。',
+    savingSetup: '正在保存设置…',
+    setupTakingLonger: '首次设置通常需要 10–20 秒，请保持此窗口打开。',
     stepLabel: '步骤 {n}',
   },
   ja: {
@@ -3992,6 +4024,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Smart Router を無効にする場合は直接モデルが必要です。',
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
+    savingSetup: '設定を保存しています…',
+    setupTakingLonger: '初回セットアップには通常10～20秒かかります。このウィンドウを開いたままお待ちください。',
     stepLabel: 'ステップ {n}',
   },
   fr: {
@@ -4038,6 +4072,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Un modèle direct est requis lorsque Smart Router est désactivé.',
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
+    savingSetup: 'Enregistrement…',
+    setupTakingLonger: 'La configuration initiale prend généralement 10 à 20 secondes. Gardez cette fenêtre ouverte.',
     stepLabel: 'Étape {n}',
   },
   de: {
@@ -4084,6 +4120,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Ein direktes Modell ist erforderlich, wenn Smart Router deaktiviert ist.',
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
+    savingSetup: 'Einrichtung wird gespeichert…',
+    setupTakingLonger: 'Die Ersteinrichtung dauert normalerweise 10–20 Sekunden. Lassen Sie dieses Fenster geöffnet.',
     stepLabel: 'Schritt {n}',
   },
   es: {
@@ -4130,6 +4168,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Se requiere un modelo directo cuando Smart Router está desactivado.',
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
+    savingSetup: 'Guardando la configuración…',
+    setupTakingLonger: 'La configuración inicial suele tardar entre 10 y 20 segundos. Mantén esta ventana abierta.',
     stepLabel: 'Paso {n}',
   },
 }
@@ -5626,6 +5666,16 @@ function onboardingHtml(
       border-top: 1px solid var(--line);
       padding-top: 16px;
     }
+    .actions > button { flex: 0 0 auto; }
+    .submit-status {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      text-align: center;
+    }
     button {
       min-height: 36px;
       border: 1px solid transparent;
@@ -5640,6 +5690,10 @@ function onboardingHtml(
     }
     .secondary:hover { color: var(--ink); }
     .primary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
       background: var(--primary);
       border-radius: 8px;
       color: #fff;
@@ -5650,6 +5704,19 @@ function onboardingHtml(
       background: var(--primary-hover);
     }
     .primary:disabled { opacity: 0.55; cursor: not-allowed; }
+    .primary.is-loading::before {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
+      border: 2px solid rgba(255, 255, 255, 0.45);
+      border-top-color: #fff;
+      border-radius: 50%;
+      content: "";
+      animation: onboarding-submit-spin 700ms linear infinite;
+    }
+    @keyframes onboarding-submit-spin {
+      to { transform: rotate(360deg); }
+    }
     .error {
       min-height: 18px;
       color: #b42318;
@@ -5692,6 +5759,9 @@ function onboardingHtml(
         transition-duration: 0.01ms !important;
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
+      }
+      .primary.is-loading::before {
+        animation: none !important;
       }
     }
   </style>
@@ -5784,10 +5854,11 @@ function onboardingHtml(
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
+          <span class="submit-status" id="submitStatus" role="status" aria-live="polite" aria-atomic="true"></span>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
-      <div class="error" id="error" role="alert" aria-live="assertive"></div>
+      <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
     </form>
   </main>
   <script>
@@ -5815,6 +5886,11 @@ function onboardingHtml(
     let searchSectionOpen = false;
     let routerTiers = clone(routerProfiles.openrouter);
     let modelEditorOpen = false;
+    let submitting = false;
+    const SUBMIT_SLOW_FEEDBACK_MS = 8_000;
+    let submitSlowTimer = null;
+    const setupForm = document.getElementById('setup-form');
+    const cardBody = document.querySelector('.card-body');
     const provider = document.getElementById('provider');
     const baseUrl = document.getElementById('baseUrl');
     const model = document.getElementById('model');
@@ -5835,6 +5911,7 @@ function onboardingHtml(
     const searchApiKey = document.getElementById('searchApiKey');
     const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
+    const submitStatus = document.getElementById('submitStatus');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
 	    const searchKeyLabel = document.getElementById('searchKeyLabel');
@@ -5850,6 +5927,26 @@ function onboardingHtml(
     const providerOptions = document.getElementById('providerOptions');
     function clone(value) {
       return JSON.parse(JSON.stringify(value || {}));
+    }
+    function deepFreeze(value) {
+      if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+      Object.values(value).forEach((item) => deepFreeze(item));
+      return Object.freeze(value);
+    }
+    function onboardingPayloadSnapshot() {
+      return deepFreeze({
+        provider: provider.value,
+        apiKey: apiKey.value,
+        baseUrl: baseUrl.value,
+        model: model.value,
+        modelRoutingMode: modelRoutingMode.value,
+        routerMode: routerMode.value,
+        routerDefaultTier: 'c1',
+        routerTiers: clone(routerTiers),
+        searchProvider: searchProvider.value,
+        searchApiKey: searchApiKey.value,
+        locale: activeLocale,
+      });
     }
     function currentProvider() {
       return providers.find((item) => item.id === provider.value) || providers[0];
@@ -6074,6 +6171,33 @@ function onboardingHtml(
       syncProviderDefaults(false);
       syncSearchProviderControls();
     }
+    function clearSubmitSlowTimer() {
+      if (submitSlowTimer !== null) clearTimeout(submitSlowTimer);
+      submitSlowTimer = null;
+    }
+    function setSubmitting(next) {
+      clearSubmitSlowTimer();
+      submitting = Boolean(next);
+      if (submitting) setProviderPickerOpen(false);
+      setupForm.setAttribute('aria-busy', String(submitting));
+      finish.setAttribute('aria-busy', String(submitting));
+      finish.disabled = submitting;
+      finish.classList.toggle('is-loading', submitting);
+      cardBody.inert = submitting;
+      onboardingLocale.disabled = submitting;
+      if (submitting) {
+        finish.textContent = t.savingSetup;
+        submitStatus.textContent = desktopMessage(activeLocale, 'boot.profile');
+        submitSlowTimer = setTimeout(() => {
+          submitSlowTimer = null;
+          if (submitting) submitStatus.textContent = t.setupTakingLonger;
+        }, SUBMIT_SLOW_FEEDBACK_MS);
+      } else {
+        finish.textContent = desktopMessage(activeLocale, 'onboarding.step5.finish');
+        submitStatus.textContent = '';
+      }
+    }
+    window.addEventListener('pagehide', clearSubmitSlowTimer);
 	    onboardingLocale.addEventListener('change', () => {
 	      applyLocale(onboardingLocale.value);
 	    });
@@ -6149,28 +6273,34 @@ function onboardingHtml(
       window.opensquillaDesktop.cancelOnboarding();
     });
     finish.addEventListener('click', async () => {
+      if (submitting) return;
       clearValidationErrors();
       const issue = validateStep();
       if (issue) {
         presentValidationIssue(issue);
         return;
       }
+      const payload = onboardingPayloadSnapshot();
+      setSubmitting(true);
+      let succeeded = false;
       try {
-        await window.opensquillaDesktop.saveOnboarding({
-          provider: provider.value,
-          apiKey: apiKey.value,
-          baseUrl: baseUrl.value,
-          model: model.value,
-          modelRoutingMode: modelRoutingMode.value,
-          routerMode: routerMode.value,
-          routerDefaultTier: 'c1',
-          routerTiers,
-          searchProvider: searchProvider.value,
-          searchApiKey: searchApiKey.value,
-          locale: activeLocale,
-        });
+        const result = await window.opensquillaDesktop.saveOnboarding(payload);
+        if (!result || result.ok !== true) {
+          throw new Error(
+            result && result.error
+              ? String(result.error)
+              : 'OpenSquilla setup could not be saved.',
+          );
+        }
+        succeeded = true;
+        clearSubmitSlowTimer();
       } catch (error) {
         errorBox.textContent = error && error.message ? error.message : String(error);
+      } finally {
+        if (!succeeded) {
+          setSubmitting(false);
+          errorBox.focus({ preventScroll: false });
+        }
       }
     });
     function applyMigrationPrefill(prefill) {
@@ -6200,7 +6330,24 @@ function onboardingHtml(
 </html>`
 }
 
+function abandonOnboardingFlow(
+  flow: OnboardingFlow,
+  error: Error,
+  closeWindow: boolean,
+): void {
+  if (!onboardingFlows.abandon(flow)) return
+  const reject = flow.reject
+  flow.resolve = null
+  flow.reject = null
+  const window = flow.window
+  if (closeWindow && window && !window.isDestroyed()) window.close()
+  reject?.(error)
+}
+
 async function runOnboarding(): Promise<DesktopConnection> {
+  // A detached save retains coordinator ownership until it settles, preventing
+  // Retry from opening a replacement flow that the old completion could affect.
+  await onboardingFlows.waitForAbandonedSave()
   const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
@@ -6233,10 +6380,13 @@ async function runOnboarding(): Promise<DesktopConnection> {
   }
 
   return new Promise((resolveCredential, rejectCredential) => {
-    resolveOnboarding = resolveCredential
-    rejectOnboarding = rejectCredential
+    if (onboardingFlows.active) {
+      focusOnboardingWindow()
+      rejectCredential(new Error('OpenSquilla setup is already in progress.'))
+      return
+    }
     const parentWindow = currentMainWindow()
-    onboardingWindow = new BrowserWindow({
+    const window = new BrowserWindow({
       width: 1040,
       height: 820,
       minWidth: 900,
@@ -6256,9 +6406,24 @@ async function runOnboarding(): Promise<DesktopConnection> {
         sandbox: true,
       },
     })
-    installEditingContextMenu(onboardingWindow)
+    const flow: OnboardingFlow = {
+      window,
+      state: 'editing',
+      resolve: resolveCredential,
+      reject: rejectCredential,
+      savePayload: null,
+      savePromise: null,
+    }
+    if (!onboardingFlows.activate(flow)) {
+      window.destroy()
+      focusOnboardingWindow()
+      rejectCredential(new Error('OpenSquilla setup is already in progress.'))
+      return
+    }
+    onboardingWindow = window
+    installEditingContextMenu(window)
 
-    onboardingWindow.webContents.setWindowOpenHandler(({ url }) => {
+    window.webContents.setWindowOpenHandler(({ url }) => {
       if (url === TOKENRHYTHM_REGISTER_URL) {
         void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
@@ -6274,32 +6439,34 @@ async function runOnboarding(): Promise<DesktopConnection> {
         void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
     }
-    onboardingWindow.webContents.on('will-navigate', guardOnboardingNavigation)
-    onboardingWindow.webContents.on('will-redirect', guardOnboardingNavigation)
+    window.webContents.on('will-navigate', guardOnboardingNavigation)
+    window.webContents.on('will-redirect', guardOnboardingNavigation)
     // Rebuild the app menu so View → Reload is disabled while onboarding is open.
     createApplicationMenu()
 
-    onboardingWindow.once('ready-to-show', () => {
-      if (!onboardingWindow || onboardingWindow.isDestroyed()) return
-      onboardingWindow.show()
-      onboardingWindow?.focus()
+    window.once('ready-to-show', () => {
+      if (flow.window !== window || window.isDestroyed() || flow.state === 'abandoned') return
+      window.show()
+      window.focus()
     })
-    onboardingWindow.on('closed', () => {
-      onboardingWindow = null
+    window.on('closed', () => {
+      if (onboardingWindow === window) onboardingWindow = null
+      if (flow.window === window) flow.window = null
       // Re-enable View → Reload now that the wizard is gone.
       createApplicationMenu()
-      if (rejectOnboarding) {
-        const reject = rejectOnboarding
-        resolveOnboarding = null
-        rejectOnboarding = null
-        reject(new Error('OpenSquilla setup was closed.'))
+      if (flow.state !== 'completed' && flow.state !== 'abandoned') {
+        abandonOnboardingFlow(flow, new Error('OpenSquilla setup was closed.'), false)
       }
     })
 
-    onboardingWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
+    window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
       pendingProviderSetup,
     ))}`).catch((error) => {
-      rejectCredential(error instanceof Error ? error : new Error(String(error)))
+      abandonOnboardingFlow(
+        flow,
+        error instanceof Error ? error : new Error(String(error)),
+        true,
+      )
     })
   })
 }
@@ -12360,10 +12527,150 @@ function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
   return gatewayState.owned && trustedMainWindowControlIpc(event)
 }
 
-function trustedOnboardingIpc(event: Electron.IpcMainInvokeEvent): boolean {
-  const window = currentOnboardingWindow()
-  if (!window || event.sender !== window.webContents) return false
+function trustedOnboardingIpc(
+  event: Electron.IpcMainInvokeEvent,
+  flow = onboardingFlows.active,
+): boolean {
+  const window = flow?.window
+  if (!flow || !onboardingFlows.isCurrent(flow) || !window || window.isDestroyed()) return false
+  if (event.sender !== window.webContents) return false
   return (event.senderFrame?.url || event.sender.getURL()).startsWith('data:text/html')
+}
+
+function onboardingSaveFailure(
+  code: OnboardingSaveErrorCode,
+  error: string,
+): OnboardingSaveResult {
+  return { ok: false, code, error }
+}
+
+function completeOnboardingFlow(flow: OnboardingFlow, credential: DesktopConnection): boolean {
+  const window = flow.window
+  if (
+    !window
+    || window.isDestroyed()
+    || !onboardingFlows.complete(flow)
+  ) return false
+
+  const resolve = flow.resolve
+  flow.resolve = null
+  flow.reject = null
+  window.close()
+  resolve?.(credential)
+  return true
+}
+
+async function performOnboardingSave(
+  flow: OnboardingFlow,
+  payload: OnboardingPayload,
+): Promise<OnboardingSaveResult> {
+  const telemetry = new OnboardingSaveTelemetry(
+    ++onboardingSaveTelemetryAttempt,
+    app.isPackaged,
+    (event, detail) => desktopLog(event, detail),
+  )
+  try {
+    // Keep the existing writer-admission boundary: lifecycle drains do not need
+    // to wait for an inspect that has not begun a settings write.
+    let recoveryRequired: boolean
+    try {
+      recoveryRequired = await telemetry.stage(
+        'primary_recovery_inspect',
+        () => refreshPrimaryRecoveryAfterImportAttempt(),
+      )
+    } catch (error) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      throw error
+    }
+    if (recoveryRequired) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'recovery_required',
+        'The primary profile requires recovery before setup can write to it.',
+      ))
+    }
+    if (!onboardingFlows.canComplete(flow)) {
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'onboarding_inactive',
+        'OpenSquilla setup is no longer active.',
+      ))
+    }
+
+    let finishWriter: (() => void) | null = null
+    try {
+      finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
+      telemetry.markWriterAdmitted()
+    } catch {
+      if (flow.state === 'saving') flow.state = 'editing'
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'lifecycle_deferred',
+        'OpenSquilla is finishing another profile or lifecycle operation.',
+      ))
+    }
+
+    let credential: DesktopConnection
+    try {
+      // Re-read the marker only after reserving the writer. Credential/config,
+      // locale, and marker removal then converge as one lifecycle operation that
+      // update/quit must drain. Imported .env bytes are deliberately untouched.
+      const pendingMigration = await telemetry.stage(
+        'pending_setup_read',
+        () => readPendingMigrationProviderSetup(),
+      )
+      credential = await telemetry.stage('settings_persist', async () => {
+        if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
+          return await saveImportedDesktopCredential(
+            pendingMigration,
+            pendingMigration.committedTransactionId,
+            String(payload.apiKey || ''),
+            true,
+          )
+        }
+        return await saveDesktopCredential(payload, true)
+      })
+      telemetry.markSettingsPersistedConfirmed()
+      await telemetry.stage('local_finalize', async () => {
+        applyDesktopLocaleChoice(payload.locale)
+        await clearPendingMigrationProviderSetup()
+      })
+    } catch (error) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      throw error
+    } finally {
+      finishWriter()
+    }
+
+    return telemetry.stageSync('flow_handoff', () => {
+      if (!onboardingFlows.canComplete(flow)) {
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'onboarding_inactive',
+          'OpenSquilla setup is no longer active.',
+        ))
+      }
+      // Quit deferral deliberately leaves isQuitting=false while it drains writers,
+      // so admission/exit phase are authoritative alongside the boolean latch.
+      if (desktopWriters.closed || isQuitting || appExitPhase !== 'running') {
+        abandonOnboardingFlow(
+          flow,
+          new Error('OpenSquilla setup completed, but startup was deferred by an active lifecycle operation.'),
+          true,
+        )
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'lifecycle_deferred',
+          'Setup was saved; startup was deferred by an active lifecycle operation.',
+        ))
+      }
+      if (!completeOnboardingFlow(flow, credential)) {
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'onboarding_inactive',
+          'OpenSquilla setup is no longer active.',
+        ))
+      }
+      return telemetry.recordReturned({ ok: true })
+    })
+  } finally {
+    telemetry.finish()
+  }
 }
 
 async function withRecoveryOperation<T>(
@@ -12745,7 +13052,8 @@ ipcMain.handle('desktop:onboarding:defaults', () => ({
   },
 }))
 ipcMain.handle('desktop:onboarding:probe', async (event, payload: OnboardingProbePayload) => {
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
+  const flow = onboardingFlows.active
+  if (!flow || flow.state !== 'editing' || !trustedOnboardingIpc(event, flow)) {
     return {
       ok: false,
       failureKind: 'unavailable',
@@ -12769,50 +13077,36 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   // same preload bridge is attached to the Control UI window, so without this
   // guard any script on the gateway-served page could rewrite the credential and
   // regenerate config.toml outside onboarding.
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted onboarding is in progress.' }
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
   }
-  if (await refreshPrimaryRecoveryAfterImportAttempt()) {
-    return {
-      ok: false,
-      error: 'The primary profile requires recovery before setup can write to it.',
-    }
+  const requestPayload = payload && typeof payload === 'object' ? payload : {}
+  const request = onboardingFlows.requestSave(
+    flow,
+    requestPayload,
+    () => performOnboardingSave(flow, requestPayload),
+  )
+  if (request.kind === 'conflict') {
+    return onboardingSaveFailure(
+      'save_in_progress',
+      'OpenSquilla is already saving a different setup request.',
+    )
   }
-  let credential: DesktopConnection
-  const finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
-  try {
-    // Re-read the marker only after reserving the writer. Credential/config,
-    // locale, and marker removal then converge as one lifecycle operation that
-    // update/quit must drain. Imported .env bytes are deliberately untouched.
-    const pendingMigration = await readPendingMigrationProviderSetup()
-    if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
-      credential = await saveImportedDesktopCredential(
-        pendingMigration,
-        pendingMigration.committedTransactionId,
-        String(payload.apiKey || ''),
-        true,
-      )
-    } else {
-      credential = await saveDesktopCredential(payload, true)
-    }
-    applyDesktopLocaleChoice(payload.locale)
-    await clearPendingMigrationProviderSetup()
-  } finally {
-    finishWriter()
+  if (request.kind === 'inactive') {
+    return onboardingSaveFailure('onboarding_inactive', 'OpenSquilla setup is no longer active.')
   }
-  const resolve = resolveOnboarding
-  resolveOnboarding = null
-  rejectOnboarding = null
-  onboardingWindow?.close()
-  resolve?.(credential)
-  return { ok: true }
+  return await request.promise
 })
-ipcMain.handle('desktop:onboarding:cancel', () => {
-  const reject = rejectOnboarding
-  resolveOnboarding = null
-  rejectOnboarding = null
-  onboardingWindow?.close()
-  reject?.(new Error('OpenSquilla setup was cancelled.'))
+ipcMain.handle('desktop:onboarding:cancel', (event) => {
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
+  }
+  // An admitted atomic save cannot be cancelled safely. Mark this flow
+  // abandoned so its late completion cannot resolve a replacement onboarding
+  // window; before-quit drains its writer before Electron exits.
+  abandonOnboardingFlow(flow, new Error('OpenSquilla setup was cancelled.'), true)
   // The onboarding "Quit" button routes here; it is a deliberate exit, so quit
   // the app instead of surfacing the cancellation as a boot failure panel.
   app.quit()

@@ -492,6 +492,8 @@ jobs:
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node scripts/test-onboarding-flow-coordinator.mjs
+          node scripts/test-onboarding-save-telemetry.mjs
           node ../../.github/scripts/verify-sandbox-package.mjs --source
 
   ubuntu-quality:
@@ -1212,9 +1214,15 @@ jobs:
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
+              if [[ "${RUNNER_OS}" == "macOS" ]]; then
+                entries+=(
+                  'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                )
+              fi
               ;;
             profiles)
               entries=(
+                'onboarding-flow:scripts/test-onboarding-flow.mjs'
                 'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
                 'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
                 'profile-import-flow:scripts/test-profile-import-flow.mjs'

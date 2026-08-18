@@ -520,11 +520,11 @@
         <p class="subtitle" data-i18n="subtitle">Starting the desktop control surface.</p>
       </section>
 
-      <section class="status" aria-live="polite">
+      <section class="status">
         <div class="status-line" aria-hidden="true"></div>
         <div class="status-copy">
-          <span class="phase" id="phase" data-i18n="phaseDefault">Preparing desktop profile</span>
-          <span class="timer" id="timer">00.0s</span>
+          <span class="phase" id="phase" data-i18n="phaseDefault" role="status" aria-live="polite" aria-atomic="true">Preparing desktop profile</span>
+          <span class="timer" id="timer" aria-hidden="true">00.0s</span>
         </div>
         <div class="steps" aria-hidden="true">
           <span class="step active" data-step="profile" data-i18n="stepProfile">Profile</span>
@@ -738,7 +738,8 @@
     };
     let msg = MESSAGES.en;
 
-    const started = performance.now();
+    let phaseStartedAt = performance.now();
+    let phaseStatusIdentity = '';
     const phase = document.getElementById('phase');
     const timer = document.getElementById('timer');
     const errorPanel = document.getElementById('errorPanel');
@@ -796,6 +797,17 @@
 
     function applyStatus(payload) {
       const phaseId = payload && payload.phaseId ? String(payload.phaseId) : 'profile';
+      const statusAt = payload && payload.at ? String(payload.at) : '';
+      const statusIdentity = phaseId + '\u0000' + statusAt;
+      if (statusIdentity !== phaseStatusIdentity) {
+        phaseStatusIdentity = statusIdentity;
+        const statusAtMs = Date.parse(statusAt);
+        const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0;
+        // Anchor once from the main-process wall-clock timestamp, then use the
+        // renderer's monotonic clock. Invalid or future timestamps start at zero.
+        phaseStartedAt = performance.now() - Math.max(0, wallAgeMs);
+        updateTimer();
+      }
       // The label is already localized by the main process; fall back to the
       // local default phase string only when no label was provided.
       phase.textContent = payload && payload.label ? String(payload.label) : msg.phaseDefault;
@@ -971,7 +983,7 @@
     }
 
     function updateTimer() {
-      timer.textContent = `${((performance.now() - started) / 1000).toFixed(1).padStart(4, '0')}s`;
+      timer.textContent = `${((performance.now() - phaseStartedAt) / 1000).toFixed(1).padStart(4, '0')}s`;
     }
     let timerInterval = setInterval(updateTimer, 100);
 

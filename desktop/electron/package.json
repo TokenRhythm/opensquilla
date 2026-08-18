@@ -50,6 +50,8 @@
     "test:preview-lease-broker": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs",
     "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
+    "test:onboarding-coordinator": "npm run build && node scripts/test-onboarding-flow-coordinator.mjs",
+    "test:onboarding-telemetry": "npm run build && node scripts/test-onboarding-save-telemetry.mjs",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
     "pack": "npm run build && electron-builder --dir && npm run verify:package",
