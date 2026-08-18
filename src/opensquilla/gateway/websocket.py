@@ -98,10 +98,11 @@ _DETACHED_RPC_METHODS: frozenset[str] = frozenset(
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS
 )
-# A fresh WebUI connection starts one draft read plus seven advertised optional
-# reads before the first responses can arrive. Keep that bootstrap fan-out and
-# one cancellable install detached while retaining a finite per-connection bound.
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = 9
+# Reserve one bounded slot for every method that may legitimately run detached.
+# A fresh WebUI can issue every optional metadata read plus draft recovery before
+# the first responses arrive; keeping this derived from the allowlist prevents a
+# newly advertised read from silently outgrowing the bootstrap budget again.
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = len(_DETACHED_RPC_METHODS)
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
