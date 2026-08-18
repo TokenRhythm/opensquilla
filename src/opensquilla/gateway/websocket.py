@@ -93,14 +93,29 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "workspaces.list",
     }
 )
-_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"}).union(
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
+    {"meta.drafts.list", "skills.install"}
+).union(
     _CONCURRENT_OPTIONAL_READ_METHODS
 )
 # A fresh WebUI connection starts one draft read plus seven advertised optional
-# reads before the first responses can arrive. Keep that bootstrap fan-out
-# detached while retaining a finite per-connection bound.
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = 8
+# reads before the first responses can arrive. Keep that bootstrap fan-out and
+# one cancellable install detached while retaining a finite per-connection bound.
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = 9
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
+
+
+def _should_detach_rpc_request(method: str, params: Any) -> bool:
+    if method not in _DETACHED_RPC_METHODS:
+        return False
+    if method != "skills.install":
+        return True
+    if not isinstance(params, dict):
+        return False
+    return any(
+        isinstance(params.get(key), str) and bool(params[key].strip())
+        for key in ("operationId", "operation_id")
+    )
 
 
 @dataclass(slots=True)
@@ -1344,7 +1359,11 @@ async def _message_loop(
                 meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 skill_management_service=skill_management_service,
-                skill_management_state=skill_management_state or {},
+                skill_management_state=(
+                    skill_management_state
+                    if skill_management_state is not None
+                    else {}
+                ),
                 cron_scheduler=cron_scheduler,
                 turn_runner=turn_runner,
                 task_runtime=task_runtime,
@@ -1359,7 +1378,7 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
-            if method in _DETACHED_RPC_METHODS:
+            if _should_detach_rpc_request(method, params):
                 if (
                     len(conn._detached_request_tasks)
                     >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
@@ -1368,7 +1387,7 @@ async def _message_loop(
                         make_error_res(
                             req_id,
                             ERROR_UNAVAILABLE,
-                            "Too many optional recovery requests are already running",
+                            "Too many detached requests are already running",
                             retryable=True,
                         )
                     )
