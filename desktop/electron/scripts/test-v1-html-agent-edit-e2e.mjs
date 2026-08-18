@@ -785,6 +785,7 @@ async function annotationOverlayState(electronApp) {
             body: body.value,
             focused: document.activeElement === body,
             target: document.getElementById('annotation-target')?.textContent || '',
+            newlineHint: document.getElementById('annotation-newline-hint')?.textContent || '',
           }
         })()`, true)
         if (state) return { id: contents.id, ...state }
@@ -830,12 +831,10 @@ async function typeAndSubmitAnnotation(electronApp, body) {
       contents.sendInputEvent({
         type: 'keyDown',
         keyCode: 'Enter',
-        modifiers: process.platform === 'darwin' ? ['meta'] : ['control'],
       })
       contents.sendInputEvent({
         type: 'keyUp',
         keyCode: 'Enter',
-        modifiers: process.platform === 'darwin' ? ['meta'] : ['control'],
       })
       return { accepted }
     }
@@ -912,22 +911,10 @@ try {
   page.on('console', message => {
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
-  await waitFor(
-    () => page.url().includes('/control/chat'),
-    'owned-Gateway Control UI',
-    STARTUP_TIMEOUT_MS,
-  )
-  await page.locator('.conn-pill.connected').waitFor({
-    state: 'visible',
-    timeout: STARTUP_TIMEOUT_MS,
-  })
-  await delay(500)
-  // Source startup can complete optional session-recovery probes just after the
-  // connection indicator appears. They are outside this feature journey; start
-  // the renderer-error assertion at the first user interaction boundary.
-  pageErrors.length = 0
-  consoleErrors.length = 0
-
+  // A fresh real-provider profile intentionally opens the native provider
+  // setup window before the Gateway-backed /control/chat page exists. Hand
+  // control to the tester at that first window instead of timing out while
+  // waiting for configuration that only the tester can enter.
   if (MANUAL_MODE && MANUAL_REAL_PROVIDER) {
     console.log(JSON.stringify({
       ready: true,
@@ -945,6 +932,21 @@ try {
     }
     break desktopJourney
   }
+  await waitFor(
+    () => page.url().includes('/control/chat'),
+    'owned-Gateway Control UI',
+    STARTUP_TIMEOUT_MS,
+  )
+  await page.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: STARTUP_TIMEOUT_MS,
+  })
+  await delay(500)
+  // Source startup can complete optional session-recovery probes just after the
+  // connection indicator appears. They are outside this feature journey; start
+  // the renderer-error assertion at the first user interaction boundary.
+  pageErrors.length = 0
+  consoleErrors.length = 0
 
   if (MANUAL_MODE && MANUAL_REUSE_PROFILE) {
     console.log(JSON.stringify({
@@ -1044,6 +1046,10 @@ try {
     TIMEOUT_MS,
   )
   assert.equal(overlay.target, '<p>')
+  assert.equal(
+    overlay.newlineHint,
+    process.platform === 'darwin' ? '⇧ Enter 换行' : 'Shift + Enter 换行',
+  )
   await typeAndSubmitAnnotation(app, ANNOTATION_BODY)
   await page.locator('.chat-prompt-annotation-chip').filter({
     hasText: ANNOTATION_BODY,

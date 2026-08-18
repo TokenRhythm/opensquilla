@@ -170,7 +170,7 @@
       "createFailed": "L’élément sélectionné n’a pas pu être joint.", "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.", "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.", "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.", "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.", "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.", "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
       "overlayFallback": "Continuez dans l’éditeur de confiance.",
       "fallbackTitle": "Continuer l’annotation", "fallbackDetail": "L’aperçu a été masqué car l’éditeur natif est indisponible. Votre brouillon reste enregistré.", "frozenPreview": "Aperçu figé de l’élément de page sélectionné",
-      "placeholder": "Décrivez la modification de cet élément…", "keepDraft": "Conserver l’annotation", "reselectHint": "Sélectionnez à nouveau l’élément pour actualiser cette instruction obsolète.", "reuseHint": "La demande de modification a été copiée. Sélectionnez à nouveau l’élément dans la version actuelle."
+      "placeholder": "Décrivez la modification de cet élément…", "newlineHint": "{shortcut} pour aller à la ligne", "keepDraft": "Conserver l’annotation", "reselectHint": "Sélectionnez à nouveau l’élément pour actualiser cette instruction obsolète.", "reuseHint": "La demande de modification a été copiée. Sélectionnez à nouveau l’élément dans la version actuelle."
     },
     "artifactPreview": {
       "refresh": "Actualiser l’aperçu",

@@ -532,6 +532,13 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       justify-content: flex-end;
       gap: 8px;
     }
+    .annotation-shortcut-hint {
+      margin: 0 auto 0 0;
+      color: var(--text-dim);
+      font-size: 10px;
+      line-height: 1;
+      white-space: nowrap;
+    }
     button {
       min-width: 56px;
       height: 32px;
@@ -577,6 +584,7 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
     </header>
     <textarea id="annotation-body" maxlength="16384" required aria-label="批注修改要求" placeholder="描述希望 AI 如何修改…"></textarea>
     <footer>
+      <span id="annotation-newline-hint" class="annotation-shortcut-hint"></span>
       <button id="annotation-cancel" type="button">取消</button>
       <button id="annotation-submit" type="submit">添加批注</button>
     </footer>

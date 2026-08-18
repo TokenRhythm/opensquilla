@@ -33,7 +33,8 @@ function bindUi(initialBody: string, tagName: string): void {
   const cancel = document.querySelector<HTMLButtonElement>('#annotation-cancel')
   const submitButton = document.querySelector<HTMLButtonElement>('#annotation-submit')
   const target = document.querySelector<HTMLElement>('#annotation-target')
-  if (!textarea || !form || !cancel || !submitButton || !target) {
+  const newlineHint = document.querySelector<HTMLElement>('#annotation-newline-hint')
+  if (!textarea || !form || !cancel || !submitButton || !target || !newlineHint) {
     send({ version: 1, type: 'cancel' })
     return
   }
@@ -43,6 +44,9 @@ function bindUi(initialBody: string, tagName: string): void {
   isComposing = false
   textarea.value = initialBody
   target.textContent = `<${tagName}>`
+  newlineHint.textContent = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent)
+    ? '⇧ Enter 换行'
+    : 'Shift + Enter 换行'
   const updateSubmitState = () => {
     submitButton.disabled = !textarea.value.trim() || boundedBody(textarea.value) === null
   }
@@ -83,7 +87,7 @@ function bindUi(initialBody: string, tagName: string): void {
       if (event.key === 'Escape') {
         event.preventDefault()
         send({ version: 1, type: 'cancel' })
-      } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      } else if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
         event.preventDefault()
         submit()
       }

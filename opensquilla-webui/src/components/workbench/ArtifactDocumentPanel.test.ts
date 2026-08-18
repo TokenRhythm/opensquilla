@@ -408,6 +408,9 @@ describe('ArtifactDocumentPanel', () => {
   })
 
   it('keeps annotation input available in the trusted Vue fallback', async () => {
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    )
     const onWorkbenchEvent = vi.fn()
     const mounted = mountPanel({
       artifact: officeArtifact,
@@ -427,6 +430,7 @@ describe('ArtifactDocumentPanel', () => {
     expect(dialog?.textContent).toContain('Continue annotation')
     expect(dialog?.querySelector<HTMLImageElement>('img')?.src).toContain('blob:frozen-preview')
     expect(input?.value).toBe('Initial draft')
+    expect(dialog?.textContent).toContain('Shift + Enter for a new line')
     if (input) {
       input.value = 'Updated draft'
       input.dispatchEvent(new Event('input', { bubbles: true }))
@@ -436,14 +440,51 @@ describe('ArtifactDocumentPanel', () => {
       type: 'artifact-annotation-fallback-update',
       payload: { annotationId: 'annotation-1', body: 'Updated draft' },
     })
-    dialog?.querySelector<HTMLFormElement>('form')?.dispatchEvent(new Event('submit', {
+    const shiftEnter = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      shiftKey: true,
       bubbles: true,
       cancelable: true,
+    })
+    input?.dispatchEvent(shiftEnter)
+    expect(shiftEnter.defaultPrevented).toBe(false)
+    expect(onWorkbenchEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'artifact-annotation-fallback-submit',
     }))
+
+    const enter = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    })
+    input?.dispatchEvent(enter)
+    expect(enter.defaultPrevented).toBe(true)
     expect(onWorkbenchEvent).toHaveBeenCalledWith({
       type: 'artifact-annotation-fallback-submit',
       payload: { annotationId: 'annotation-1', body: 'Updated draft' },
     })
+    mounted.unmount()
+  })
+
+  it('uses the compact macOS newline chord in the annotation fallback hint', async () => {
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
+    )
+    const mounted = mountPanel({
+      artifact: officeArtifact,
+      documentSnapshot: snapshot(),
+      annotationFallback: {
+        annotationId: 'annotation-mac',
+        body: '',
+        reason: 'overlay-crashed',
+        screenshotUrl: '',
+      },
+    })
+    await nextTick()
+
+    expect(mounted.element.querySelector(
+      '.artifact-document__annotation-shortcut-hint',
+    )?.textContent).toContain('⇧ Enter for a new line')
     mounted.unmount()
   })
 

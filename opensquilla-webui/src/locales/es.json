@@ -170,7 +170,7 @@
       "createFailed": "No se pudo adjuntar el elemento seleccionado.", "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.", "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.", "updateFailed": "No se pudo guardar el borrador de anotación.", "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.", "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.", "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
       "overlayFallback": "Continúa en el editor de confianza.",
       "fallbackTitle": "Continuar anotación", "fallbackDetail": "La vista previa se ocultó porque el editor nativo no está disponible. Tu borrador sigue guardado.", "frozenPreview": "Vista previa congelada del elemento seleccionado",
-      "placeholder": "Describe el cambio para este elemento…", "keepDraft": "Conservar anotación", "reselectHint": "Vuelve a seleccionar el elemento para actualizar esta instrucción obsoleta.", "reuseHint": "Se copió la solicitud de cambio. Vuelve a seleccionar el elemento en la versión actual."
+      "placeholder": "Describe el cambio para este elemento…", "newlineHint": "{shortcut} para una línea nueva", "keepDraft": "Conservar anotación", "reselectHint": "Vuelve a seleccionar el elemento para actualizar esta instrucción obsoleta.", "reuseHint": "Se copió la solicitud de cambio. Vuelve a seleccionar el elemento en la versión actual."
     },
     "artifactPreview": {
       "refresh": "Actualizar vista previa",

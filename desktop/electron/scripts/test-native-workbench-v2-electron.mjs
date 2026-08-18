@@ -1017,6 +1017,7 @@ try {
           const form = document.getElementById('annotation-form')
           const textarea = document.getElementById('annotation-body')
           const target = document.getElementById('annotation-target')
+          const newlineHint = document.getElementById('annotation-newline-hint')
           const cancel = document.getElementById('annotation-cancel')
           const submit = document.getElementById('annotation-submit')
           const cardStyle = getComputedStyle(form)
@@ -1028,6 +1029,7 @@ try {
             labelledBy: form.getAttribute('aria-labelledby'),
             textareaLabel: textarea.getAttribute('aria-label'),
             targetText: target.textContent,
+            newlineHint: newlineHint.textContent,
             initialBody: textarea.value,
             submitDisabled: submit.disabled,
             cardRadius: cardStyle.borderRadius,
@@ -1263,11 +1265,38 @@ try {
         },
         'rearmed annotation overlay input',
       )
+      const annotationRearmSubmitEventsBeforeNewline = events.filter(event =>
+        event.type === 'annotation-submit'
+        && event.detail?.annotationId === 'annotation_rearmed_fixture').length
+      const annotationRearmShiftEnter =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const textarea = document.getElementById('annotation-body')
+          const event = new KeyboardEvent('keydown', {
+            key: 'Enter',
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+          })
+          const defaultAllowed = textarea.dispatchEvent(event)
+          if (defaultAllowed) {
+            textarea.setRangeText('\\n', textarea.selectionStart, textarea.selectionEnd, 'end')
+            textarea.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              data: '\\n',
+              inputType: 'insertLineBreak',
+            }))
+          }
+          return { defaultAllowed, value: textarea.value }
+        })()`)
+      await new Promise(resolveWait => setTimeout(resolveWait, 50))
+      const annotationRearmShiftEnterDidNotSubmit = events.filter(event =>
+        event.type === 'annotation-submit'
+        && event.detail?.annotationId === 'annotation_rearmed_fixture').length
+        === annotationRearmSubmitEventsBeforeNewline
       await annotationOverlay.view.webContents.executeJavaScript(`(() => {
         const textarea = document.getElementById('annotation-body')
         textarea.dispatchEvent(new KeyboardEvent('keydown', {
           key: 'Enter',
-          ctrlKey: true,
           bubbles: true,
           cancelable: true,
         }))
@@ -1276,7 +1305,7 @@ try {
         () => events.some(event =>
           event.type === 'annotation-submit'
           && event.detail?.annotationId === 'annotation_rearmed_fixture'
-          && event.detail?.body === 'Rearmed input'),
+          && event.detail?.body === 'Rearmed input\n'),
         'reused trusted overlay IME state reset',
       )
       const annotationRearmOverlayClose = await closeAnnotationOverlayAndDrain({
@@ -2208,6 +2237,8 @@ try {
         annotationPickerRearm,
         annotationRearmOverlayResult,
         annotationRearmTypedValue,
+        annotationRearmShiftEnter,
+        annotationRearmShiftEnterDidNotSubmit,
         annotationRearmSubmitAfterInterruptedComposition,
         annotationRearmOverlayClose,
         annotationRearmFocusCycles,
@@ -2519,6 +2550,7 @@ try {
     labelledBy: 'annotation-title',
     textareaLabel: '批注修改要求',
     targetText: '<div>',
+    newlineHint: process.platform === 'darwin' ? '⇧ Enter 换行' : 'Shift + Enter 换行',
     initialBody: 'Initial annotation',
     submitDisabled: false,
     cardRadius: '12px',
@@ -2573,6 +2605,11 @@ try {
   assert.equal(result.annotationPickerRearm.ok, true)
   assert.equal(result.annotationRearmOverlayResult.ok, true)
   assert.equal(result.annotationRearmTypedValue, 'Rearmed input')
+  assert.deepEqual(result.annotationRearmShiftEnter, {
+    defaultAllowed: true,
+    value: 'Rearmed input\n',
+  })
+  assert.equal(result.annotationRearmShiftEnterDidNotSubmit, true)
   assert.equal(result.annotationRearmSubmitAfterInterruptedComposition, true)
   assert.equal(result.annotationRearmOverlayClose.ok, true)
   assert.equal(result.annotationRearmFocusCycles.length, 3)

@@ -70,12 +70,19 @@
         <textarea
           ref="annotationFallbackInput"
           v-model="annotationFallbackBody"
+          :aria-describedby="`${instanceId}-annotation-newline-hint`"
           :maxlength="promptAnnotationMaxBodyLength"
           :placeholder="t('workbench.artifactAnnotation.placeholder')"
           @input="updateAnnotationFallback"
-          @keydown.esc.prevent="cancelAnnotationFallback"
+          @keydown="onAnnotationFallbackKeydown"
         />
         <span class="artifact-document__annotation-fallback-actions">
+          <small
+            :id="`${instanceId}-annotation-newline-hint`"
+            class="artifact-document__annotation-shortcut-hint"
+          >
+            {{ annotationNewlineHint }}
+          </small>
           <button type="button" class="btn" @click="cancelAnnotationFallback">
             {{ t('common.cancel') }}
           </button>
@@ -272,6 +279,7 @@ import {
   PROMPT_ANNOTATION_MAX_BODY_LENGTH,
   promptAnnotationBodyWithinLimit,
 } from '@/types/promptAnnotations'
+import { isMacPlatform } from '@/utils/browser'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import type {
@@ -353,6 +361,10 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const instanceId = useId()
 const promptAnnotationMaxBodyLength = PROMPT_ANNOTATION_MAX_BODY_LENGTH
+const annotationNewlineHint = computed(() => t(
+  'workbench.artifactAnnotation.newlineHint',
+  { shortcut: isMacPlatform() ? '⇧ Enter' : 'Shift + Enter' },
+))
 const annotationFallbackBody = ref('')
 const annotationFallbackInput = ref<HTMLTextAreaElement | null>(null)
 const annotationFallbackTooLong = computed(() => (
@@ -404,6 +416,21 @@ function submitAnnotationFallback() {
     type: 'artifact-annotation-fallback-submit',
     payload: annotationFallbackPayload(),
   })
+}
+
+function onAnnotationFallbackKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    cancelAnnotationFallback()
+    return
+  }
+  // Keep the legacy Ctrl/Cmd+Enter path working while making plain Enter the
+  // primary action. Shift+Enter remains the cross-platform newline chord.
+  if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
+    event.preventDefault()
+    submitAnnotationFallback()
+  }
 }
 
 function cancelAnnotationFallback() {
@@ -688,8 +715,17 @@ defineExpose({ beforeClose, reload })
 
 .artifact-document__annotation-fallback-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.artifact-document__annotation-shortcut-hint {
+  margin-right: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
 }
 
 .artifact-document__tabs {

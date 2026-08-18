@@ -170,7 +170,7 @@
       "createFailed": "The selected element could not be attached.", "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.", "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.", "updateFailed": "The annotation draft could not be saved.", "discardFailed": "The annotation could not be discarded. It remains open so you can try again.", "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.", "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
       "overlayFallback": "The native annotation editor closed. Continue in the trusted editor.",
       "fallbackTitle": "Continue annotation", "fallbackDetail": "The preview was hidden because its native editor became unavailable. Your draft is still saved.", "frozenPreview": "Frozen preview of the selected page element",
-      "placeholder": "Describe the change for this element…", "keepDraft": "Keep annotation", "reselectHint": "Select the element again to refresh this stale instruction.", "reuseHint": "The modification request was copied. Select the element again in the current version."
+      "placeholder": "Describe the change for this element…", "newlineHint": "{shortcut} for a new line", "keepDraft": "Keep annotation", "reselectHint": "Select the element again to refresh this stale instruction.", "reuseHint": "The modification request was copied. Select the element again in the current version."
     },
     "artifactPreview": {
       "refresh": "Refresh preview",

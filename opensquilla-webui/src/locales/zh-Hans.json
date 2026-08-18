@@ -170,7 +170,7 @@
       "createFailed": "无法附加所选页面元素。", "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。", "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。", "updateFailed": "无法保存批注草稿。", "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。", "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。", "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
       "overlayFallback": "原生批注输入框已关闭，请在可信输入框中继续编辑。",
       "fallbackTitle": "继续编辑批注", "fallbackDetail": "原生输入框不可用，预览已隐藏；你的批注草稿仍已保存。", "frozenPreview": "所选页面元素的冻结预览",
-      "placeholder": "描述希望对此元素进行的修改…", "keepDraft": "保留批注", "reselectHint": "请重新选择页面元素以刷新这条已过期的批注。", "reuseHint": "已复制修改要求，请在当前版本重新选择元素。"
+      "placeholder": "描述希望对此元素进行的修改…", "newlineHint": "{shortcut} 换行", "keepDraft": "保留批注", "reselectHint": "请重新选择页面元素以刷新这条已过期的批注。", "reuseHint": "已复制修改要求，请在当前版本重新选择元素。"
     },
     "artifactPreview": {
       "refresh": "刷新预览",
