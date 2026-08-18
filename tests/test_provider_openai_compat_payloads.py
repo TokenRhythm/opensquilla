@@ -1902,6 +1902,83 @@ def test_require_array_items_defaults_off_and_preserves_existing_items() -> None
     }
 
 
+def test_require_array_items_only_rewrites_schema_nodes() -> None:
+    schema_shaped_literal = {"type": "array"}
+    tool = ToolDefinition(
+        name="inspect",
+        description="Inspect structured input.",
+        input_schema=ToolInputSchema(
+            properties={
+                "value": {
+                    "anyOf": [
+                        {"type": "array"},
+                        {"type": "object", "properties": {"nested": {"type": "array"}}},
+                    ],
+                    "default": schema_shaped_literal,
+                    "enum": [schema_shaped_literal],
+                    "const": schema_shaped_literal,
+                }
+            }
+        ),
+    )
+    original_schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
+
+    payload = _build_openai_tool(tool, require_array_items=True)
+
+    value = payload["function"]["parameters"]["properties"]["value"]
+    assert value["anyOf"][0] == {"type": "array", "items": {"type": "string"}}
+    assert value["anyOf"][1]["properties"]["nested"] == {
+        "type": "array",
+        "items": {"type": "string"},
+    }
+    assert value["default"] == schema_shaped_literal
+    assert value["enum"] == [schema_shaped_literal]
+    assert value["const"] == schema_shaped_literal
+    assert tool.input_schema.model_dump(exclude_none=True, by_alias=True) == original_schema
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_inner_items"),
+    [
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            {"type": "string"},
+        ),
+        ("https://relay.example/v1", None),
+    ],
+)
+def test_gemini_array_items_completion_is_scoped_to_official_host(
+    monkeypatch: Any,
+    base_url: str,
+    expected_inner_items: dict[str, str] | None,
+) -> None:
+    tool = ToolDefinition(
+        name="create_csv",
+        description="Create a CSV file from structured rows.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
+    )
+
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url=base_url,
+        provider_kind="gemini",
+    )
+    _collect_events(provider, ChatConfig(), tools=[tool])
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    if expected_inner_items is None:
+        assert rows["items"] == {"type": "array"}
+    else:
+        assert rows["items"] == {"type": "array", "items": expected_inner_items}
+
+
 def test_deepseek_thinking_uses_provider_thinking_field_not_openai_reasoning_effort(
     monkeypatch: Any,
 ) -> None:

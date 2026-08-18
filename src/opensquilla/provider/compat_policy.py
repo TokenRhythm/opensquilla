@@ -454,6 +454,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     ),
     "gemini": OpenAICompatPolicy(
         display_name="Gemini",
+        official_host="generativelanguage.googleapis.com",
         tool_schema_requires_array_items=True,
     ),
     "dashscope": OpenAICompatPolicy(
