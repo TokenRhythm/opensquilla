@@ -1374,7 +1374,7 @@ async def _message_loop(
                         make_error_res(
                             req_id,
                             ERROR_UNAVAILABLE,
-                            "Too many optional recovery requests are already running",
+                            "Too many detached requests are already running",
                             retryable=True,
                         )
                     )
