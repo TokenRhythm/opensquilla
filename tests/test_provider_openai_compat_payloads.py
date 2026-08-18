@@ -1855,6 +1855,53 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
+def test_require_array_items_completes_nested_itemless_arrays() -> None:
+    tool = ToolDefinition(
+        name="create_csv",
+        description="Create a CSV file from structured rows.",
+        input_schema=ToolInputSchema(
+            properties={
+                "name": {"type": "string"},
+                "rows": {"type": "array", "items": {"type": "array"}},
+            },
+            required=["rows"],
+        ),
+    )
+
+    payload = _build_openai_tool(tool, require_array_items=True)
+
+    rows = payload["function"]["parameters"]["properties"]["rows"]
+    # Gemini rejects the request with "properties[rows].items.items: missing
+    # field" unless every (nested) array declares items.
+    assert rows["items"] == {"type": "array", "items": {"type": "string"}}
+    name = payload["function"]["parameters"]["properties"]["name"]
+    assert name == {"type": "string"}
+
+
+def test_require_array_items_defaults_off_and_preserves_existing_items() -> None:
+    tool = ToolDefinition(
+        name="create_csv",
+        description="Create a CSV file from structured rows.",
+        input_schema=ToolInputSchema(
+            properties={
+                "rows": {"type": "array", "items": {"type": "array"}},
+                "tags": {"type": "array", "items": {"type": "integer"}},
+            },
+            required=["rows"],
+        ),
+    )
+
+    untouched = _build_openai_tool(tool)
+    assert untouched["function"]["parameters"]["properties"]["rows"]["items"] == {
+        "type": "array"
+    }
+
+    completed = _build_openai_tool(tool, require_array_items=True)
+    assert completed["function"]["parameters"]["properties"]["tags"]["items"] == {
+        "type": "integer"
+    }
+
+
 def test_deepseek_thinking_uses_provider_thinking_field_not_openai_reasoning_effort(
     monkeypatch: Any,
 ) -> None:

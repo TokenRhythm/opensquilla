@@ -192,6 +192,13 @@ class OpenAICompatPolicy:
     # JSON Schema keywords the upstream rejects in tool definitions.
     tool_schema_unsupported_keywords: frozenset[str] = frozenset()
 
+    # Whether the upstream requires every ``array`` schema node in a tool
+    # definition to declare ``items``.  JSON Schema treats ``items`` as
+    # optional, but Gemini's function-declaration validation rejects the
+    # whole request with ``... items: missing field`` when a (possibly
+    # nested) array leaves it out.
+    tool_schema_requires_array_items: bool = False
+
     # Whether the chat-completions endpoint reliably supports native
     # ``response_format.type=json_schema``.  When false, the OpenAI-compatible
     # adapter keeps the same provider/model and places the authoritative
@@ -445,7 +452,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
         require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
-    "gemini": OpenAICompatPolicy(display_name="Gemini"),
+    "gemini": OpenAICompatPolicy(
+        display_name="Gemini",
+        tool_schema_requires_array_items=True,
+    ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",
         text_tool_profile=TextToolCompatProfile(

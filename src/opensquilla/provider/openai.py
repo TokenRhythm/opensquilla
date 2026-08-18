@@ -635,6 +635,35 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     return value
 
 
+def _schema_type_includes_array(declared: Any) -> bool:
+    if isinstance(declared, str):
+        return declared == "array"
+    if isinstance(declared, list):
+        return "array" in declared
+    return False
+
+
+def _ensure_array_items(value: Any) -> Any:
+    """Give every ``array`` schema node an ``items`` declaration.
+
+    JSON Schema treats ``items`` as optional (an itemless array accepts any
+    element), but Gemini's function-declaration validation rejects the whole
+    request with ``... items: missing field`` when any array — including a
+    nested one — omits it.  ``{"type": "string"}`` is the least constraining
+    typed element Gemini accepts; tool implementations already coerce cell
+    values, so the widened declaration does not change execution.
+    """
+
+    if isinstance(value, dict):
+        rebuilt = {key: _ensure_array_items(item) for key, item in value.items()}
+        if _schema_type_includes_array(rebuilt.get("type")) and "items" not in rebuilt:
+            rebuilt["items"] = {"type": "string"}
+        return rebuilt
+    if isinstance(value, list):
+        return [_ensure_array_items(item) for item in value]
+    return value
+
+
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
@@ -2118,9 +2147,12 @@ def _build_openai_tool(
     tool: ToolDefinition,
     *,
     unsupported_keywords: frozenset[str] = frozenset(),
+    require_array_items: bool = False,
 ) -> dict[str, Any]:
     schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
     schema = _strip_tool_schema_keywords(schema, unsupported_keywords)
+    if require_array_items:
+        schema = _ensure_array_items(schema)
     return {
         "type": "function",
         "function": {
@@ -3432,6 +3464,7 @@ class OpenAIProvider:
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
+                    require_array_items=self._compat.tool_schema_requires_array_items,
                 )
                 for tool in tools
             ]
