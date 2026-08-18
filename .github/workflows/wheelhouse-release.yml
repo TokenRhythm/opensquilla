@@ -10,6 +10,7 @@ on:
         description: Optional existing tag to upload artifacts to
         required: false
         default: ""
+
 permissions:
   contents: read
 
