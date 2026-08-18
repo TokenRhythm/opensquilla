@@ -1690,14 +1690,6 @@ class SessionListPage:
     has_more: bool
 
 
-@dataclass(frozen=True, slots=True)
-class TurnHistoryUsageContext:
-    """Canonical history metadata needed to place one turn's usage receipt."""
-
-    terminal_message_id: str
-    structural_usage_candidates: tuple[dict[str, Any], ...]
-
-
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -3732,98 +3724,70 @@ class SessionStorage:
         return projections
 
     @_serialized_read
-    async def get_turn_history_usage_context(
+    async def get_turn_ids_continuing_after_cursor(
         self,
         *,
         session_id: str,
-        session_epoch: int,
+        created_at: int,
+        entry_id: int,
         turn_ids: Sequence[str],
-    ) -> dict[str, TurnHistoryUsageContext]:
-        """Locate each turn's terminal assistant row in canonical history.
+    ) -> set[str]:
+        """Return the turns whose assistant history continues past a page.
 
-        The epoch is accepted with ledger projection callers so the placement
-        contract is scoped the same way as usage totals. Transcript rows are
-        keyed by session identity, so no transcript filter can use the epoch.
+        Canonical history pages are contiguous keyset slices over
+        ``(created_at, id)``, so a turn with no assistant row after the page's
+        last cursor already holds its terminal row inside that page. Only rows
+        beyond the cursor can move terminality onto a later page, and the
+        newest page has none, so the common read is one empty index seek
+        rather than a scan of the whole session.
         """
 
         stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
         if not stable_turn_ids:
-            return {}
-        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE - 2:
-            raise ValueError("too many turn ids for one usage context page")
+            return set()
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE - 8:
+            raise ValueError("too many turn ids for one usage continuation probe")
         requested_rows = ", ".join("(?)" for _ in stable_turn_ids)
         sql = f"""
             WITH requested(turn_id) AS (
                 VALUES {requested_rows}
             ),
-            valid_session AS (
-                SELECT session_id
-                FROM sessions
-                WHERE session_id = ? AND epoch = ?
-            ),
-            canonical AS (
-                SELECT
-                    session_id,
-                    json_extract(turn_context, '$.turn_id') AS turn_id,
-                    COALESCE(original_entry_id, id) AS canonical_entry_id,
-                    id AS storage_entry_id,
-                    message_id,
-                    created_at,
-                    turn_usage
-                FROM compacted_transcript_entries
-                WHERE session_id = ?
-                  AND role = 'assistant'
-                  AND json_valid(turn_context)
-                  AND json_extract(turn_context, '$.turn_id') IN (
-                      SELECT turn_id FROM requested
-                  )
-                UNION ALL
-                SELECT
-                    session_id,
-                    json_extract(turn_context, '$.turn_id') AS turn_id,
-                    id AS canonical_entry_id,
-                    id AS storage_entry_id,
-                    message_id,
-                    created_at,
-                    turn_usage
+            continuing AS (
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
                 FROM transcript_entries
                 WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND id > ?))
                   AND role = 'assistant'
                   AND json_valid(turn_context)
-                  AND json_extract(turn_context, '$.turn_id') IN (
-                      SELECT turn_id FROM requested
-                  )
+                UNION ALL
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM compacted_transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND original_entry_id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
             )
-            SELECT turn_id, message_id, turn_usage
-            FROM canonical
-            JOIN valid_session ON valid_session.session_id = canonical.session_id
-            ORDER BY turn_id ASC, created_at ASC, canonical_entry_id ASC, storage_entry_id ASC
+            SELECT DISTINCT turn_id
+            FROM continuing
+            WHERE turn_id IN (SELECT turn_id FROM requested)
         """  # noqa: S608 - placeholders are generated from a bounded list
         async with self.conn.execute(
             sql,
-            (*stable_turn_ids, session_id, session_epoch, session_id, session_id),
+            (
+                *stable_turn_ids,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+            ),
         ) as cur:
             rows = await cur.fetchall()
 
-        grouped: dict[str, list[Any]] = {}
-        for row in rows:
-            turn_id = str(row["turn_id"] or "")
-            if turn_id:
-                grouped.setdefault(turn_id, []).append(row)
-
-        contexts: dict[str, TurnHistoryUsageContext] = {}
-        for turn_id, turn_rows in grouped.items():
-            terminal = turn_rows[-1]
-            candidates: list[dict[str, Any]] = []
-            for row in turn_rows:
-                usage = _json_object_or_none(row["turn_usage"])
-                if usage is not None:
-                    candidates.append(usage)
-            contexts[turn_id] = TurnHistoryUsageContext(
-                terminal_message_id=str(terminal["message_id"] or ""),
-                structural_usage_candidates=tuple(candidates),
-            )
-        return contexts
+        return {str(row["turn_id"] or "") for row in rows if row["turn_id"]}
 
     async def reconcile_session_usage_totals_from_ledger(
         self,

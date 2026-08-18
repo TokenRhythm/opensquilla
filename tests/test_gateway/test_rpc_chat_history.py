@@ -934,86 +934,6 @@ async def test_chat_history_usage_projection_is_independent_of_page_load_order(
 
 
 @pytest.mark.asyncio
-async def test_chat_history_moves_richer_receipt_to_terminal_across_pages(
-    tmp_path,
-) -> None:
-    storage = SessionStorage(str(tmp_path / "history-usage-richer-page.db"))
-    await storage.connect()
-    await storage.initialize_usage_ledger(1)
-    manager = SessionManager(storage, inject_time_prefix=False)
-    session_key = "agent:main:webchat:usage-richer-page"
-    session = await manager.create(session_key)
-    turn_id = "richer-page-turn"
-    richer_breakdown = [
-        {"role": "proposer", "provider": "proposal", "input_tokens": 4},
-        {"role": "aggregator", "provider": "aggregator", "input_tokens": 6},
-    ]
-    richer_trace = {
-        "profile": "custom_b5",
-        "physical_request_count": 2,
-        "final_request_role": "aggregator",
-    }
-    try:
-        with turn_context_scope({"turn_id": turn_id}):
-            await manager.append_message(
-                session_key,
-                "assistant",
-                "richer carrier",
-                turn_usage={
-                    "model_usage_breakdown": richer_breakdown,
-                    "ensemble_trace": richer_trace,
-                    "routing_source": "squilla_router",
-                    "cost_usd": 0.001,
-                },
-            )
-            await manager.append_message(
-                session_key,
-                "assistant",
-                "terminal carrier",
-                turn_usage={
-                    "model_usage_breakdown": [{"role": "aggregator"}],
-                    "ensemble_trace": {"physical_request_count": 1},
-                    "cost_usd": 0.002,
-                },
-            )
-        transcript = await manager.get_transcript(session_key)
-        terminal_cursor = f"{transcript[-1].created_at}|{transcript[-1].id}"
-        await _record_finalized_usage(
-            storage,
-            session_id=session.session_id,
-            session_epoch=session.epoch,
-            turn_id=turn_id,
-            event_id="usage-richer-page",
-        )
-
-        older = await _handle_chat_history(
-            {"sessionKey": session_key, "limit": 1, "before": terminal_cursor},
-            RpcContext(
-                conn_id="test",
-                principal=SimpleNamespace(role="operator"),
-                session_manager=manager,
-            ),
-        )
-        latest = await _handle_chat_history(
-            {"sessionKey": session_key, "limit": 1},
-            RpcContext(
-                conn_id="test",
-                principal=SimpleNamespace(role="operator"),
-                session_manager=manager,
-            ),
-        )
-
-        assert "usage" not in older["messages"][0]
-        usage = latest["messages"][0]["usage"]
-        assert usage["cost_usd"] == pytest.approx(0.03)
-        assert usage["model_usage_breakdown"] == richer_breakdown
-        assert usage["ensemble_trace"] == richer_trace
-        assert usage["routing_source"] == "squilla_router"
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
 async def test_chat_history_usage_projection_terminal_crosses_compacted_boundary(
     tmp_path,
 ) -> None:
@@ -1074,9 +994,59 @@ async def test_chat_history_usage_projection_terminal_crosses_compacted_boundary
         assert "usage" not in archived_page["messages"][0]
         assert [message["text"] for message in active_page["messages"]] == ["active terminal"]
         assert active_page["messages"][0]["usage"]["cost_usd"] == pytest.approx(0.03)
-        assert active_page["messages"][0]["usage"]["model_usage_breakdown"] == [
-            {"role": "proposer"}
-        ]
+        # Structural detail stranded on an earlier page stays there. Placement
+        # only guarantees the total is billed once; migrating a richer receipt
+        # across pages would cost a full-history scan on every read.
+        assert "model_usage_breakdown" not in active_page["messages"][0]["usage"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_continuation_probe_only_reports_rows_after_the_cursor(
+    tmp_path,
+) -> None:
+    """The probe answers 'does this turn continue past the page?' and no more.
+
+    Placement depends on the answer being false for the newest page, which is
+    what keeps that read from touching transcript rows at all.
+    """
+    storage = SessionStorage(str(tmp_path / "history-continuation-probe.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:continuation-probe"
+    session = await manager.create(session_key)
+    turn_id = "probe-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(session_key, "assistant", "carrier")
+            await manager.append_message(session_key, "assistant", "terminal")
+        transcript = await manager.get_transcript(session_key)
+        carrier, terminal = transcript[0], transcript[1]
+
+        # Cursor at the carrier: the terminal row still lies ahead.
+        assert await storage.get_turn_ids_continuing_after_cursor(
+            session_id=session.session_id,
+            created_at=carrier.created_at,
+            entry_id=carrier.id,
+            turn_ids=[turn_id],
+        ) == {turn_id}
+
+        # Cursor at the terminal row: nothing follows, so the page owns it.
+        assert await storage.get_turn_ids_continuing_after_cursor(
+            session_id=session.session_id,
+            created_at=terminal.created_at,
+            entry_id=terminal.id,
+            turn_ids=[turn_id],
+        ) == set()
+
+        # Turns that were never asked about are never reported.
+        assert await storage.get_turn_ids_continuing_after_cursor(
+            session_id=session.session_id,
+            created_at=carrier.created_at,
+            entry_id=carrier.id,
+            turn_ids=["unrelated-turn"],
+        ) == set()
     finally:
         await storage.close()
 
@@ -1110,206 +1080,6 @@ async def test_chat_history_usage_projection_failure_does_not_hide_history(
 
         assert [message["text"] for message in result["messages"]] == ["still visible"]
         assert "usage" not in result["messages"][0]
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_chat_history_usage_context_failure_does_not_use_page_terminal(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    storage = SessionStorage(str(tmp_path / "history-usage-context-failure.db"))
-    await storage.connect()
-    await storage.initialize_usage_ledger(1)
-    manager = SessionManager(storage, inject_time_prefix=False)
-    session_key = "agent:main:webchat:usage-context-failure"
-    session = await manager.create(session_key)
-    turn_id = "context-failure-turn"
-    try:
-        with turn_context_scope({"turn_id": turn_id}):
-            await manager.append_message(
-                session_key,
-                "assistant",
-                "older assistant",
-                turn_usage={"input_tokens": 1, "cost_usd": 0.01},
-            )
-            await manager.append_message(session_key, "assistant", "terminal assistant")
-        transcript = await manager.get_transcript(session_key)
-        terminal_cursor = f"{transcript[-1].created_at}|{transcript[-1].id}"
-        await _record_finalized_usage(
-            storage,
-            session_id=session.session_id,
-            session_epoch=session.epoch,
-            turn_id=turn_id,
-            event_id="usage-context-failure",
-        )
-
-        async def fail_context(**_kwargs):
-            raise RuntimeError("terminal context unavailable")
-
-        monkeypatch.setattr(storage, "get_turn_history_usage_context", fail_context)
-        result = await _handle_chat_history(
-            {"sessionKey": session_key, "limit": 1, "before": terminal_cursor},
-            RpcContext(
-                conn_id="test",
-                principal=SimpleNamespace(role="operator"),
-                session_manager=manager,
-            ),
-        )
-
-        assert [message["text"] for message in result["messages"]] == ["older assistant"]
-        assert "usage" not in result["messages"][0]
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_chat_history_clears_nonunique_terminal_message_matches() -> None:
-    turn_id = "duplicate-terminal-id-turn"
-
-    class _DuplicateTerminalStorage:
-        async def get_turn_usage_projections(self, **_kwargs):
-            return {turn_id: {"cost_usd": 0.03}}
-
-        async def get_turn_history_usage_context(self, **_kwargs):
-            return {
-                turn_id: SimpleNamespace(
-                    terminal_message_id="duplicate-terminal-id",
-                    structural_usage_candidates=(),
-                )
-            }
-
-    async def get_session(_session_key):
-        return SimpleNamespace(session_id="session-id", epoch=0)
-
-    entries = [
-        TranscriptEntry(
-            id=1,
-            session_id="session-id",
-            session_key="session-key",
-            role="assistant",
-            content="first copy",
-            created_at=1,
-            message_id="duplicate-terminal-id",
-            turn_context={"turn_id": turn_id},
-            turn_usage={"cost_usd": 0.01},
-        ),
-        TranscriptEntry(
-            id=2,
-            session_id="session-id",
-            session_key="session-key",
-            role="assistant",
-            content="last copy",
-            created_at=2,
-            message_id="duplicate-terminal-id",
-            turn_context={"turn_id": turn_id},
-            turn_usage={"cost_usd": 0.02},
-        ),
-    ]
-
-    projected = await rpc_chat_module._project_missing_history_usage(
-        SimpleNamespace(
-            storage=_DuplicateTerminalStorage(),
-            get_session=get_session,
-        ),
-        "session-key",
-        entries,
-    )
-
-    assert getattr(projected[0], "turn_usage") is None
-    assert getattr(projected[1], "turn_usage")["cost_usd"] == pytest.approx(0.03)
-
-
-@pytest.mark.asyncio
-async def test_chat_history_mixed_turn_missing_context_fails_closed() -> None:
-    valid_turn_id = "valid-context-turn"
-    missing_turn_id = "missing-context-turn"
-
-    class _MixedContextStorage:
-        async def get_turn_usage_projections(self, **_kwargs):
-            return {
-                valid_turn_id: {"cost_usd": 0.03},
-                missing_turn_id: {"cost_usd": 0.04},
-            }
-
-        async def get_turn_history_usage_context(self, **_kwargs):
-            return {
-                valid_turn_id: SimpleNamespace(
-                    terminal_message_id="valid-terminal",
-                    structural_usage_candidates=(),
-                )
-            }
-
-    async def get_session(_session_key):
-        return SimpleNamespace(session_id="session-id", epoch=0)
-
-    entries = [
-        TranscriptEntry(
-            id=1,
-            session_id="session-id",
-            session_key="session-key",
-            role="assistant",
-            content="valid",
-            created_at=1,
-            message_id="valid-terminal",
-            turn_context={"turn_id": valid_turn_id},
-            turn_usage={"cost_usd": 0.01},
-        ),
-        TranscriptEntry(
-            id=2,
-            session_id="session-id",
-            session_key="session-key",
-            role="assistant",
-            content="missing",
-            created_at=2,
-            message_id="missing-terminal",
-            turn_context={"turn_id": missing_turn_id},
-            turn_usage={"cost_usd": 0.02},
-        ),
-    ]
-
-    projected = await rpc_chat_module._project_missing_history_usage(
-        SimpleNamespace(
-            storage=_MixedContextStorage(),
-            get_session=get_session,
-        ),
-        "session-key",
-        entries,
-    )
-
-    assert getattr(projected[0], "turn_usage")["cost_usd"] == pytest.approx(0.03)
-    assert getattr(projected[1], "turn_usage") is None
-
-
-@pytest.mark.asyncio
-async def test_turn_history_usage_context_returns_empty_on_epoch_mismatch(tmp_path) -> None:
-    storage = SessionStorage(str(tmp_path / "history-usage-context-epoch.db"))
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    session_key = "agent:main:webchat:usage-context-epoch"
-    session = await manager.create(session_key)
-    turn_id = "epoch-context-turn"
-    try:
-        with turn_context_scope({"turn_id": turn_id}):
-            await manager.append_message(
-                session_key,
-                "assistant",
-                "epoch scoped",
-                turn_usage={"cost_usd": 0.01},
-            )
-
-        assert await storage.get_turn_history_usage_context(
-            session_id=session.session_id,
-            session_epoch=session.epoch + 1,
-            turn_ids=[turn_id],
-        ) == {}
-        contexts = await storage.get_turn_history_usage_context(
-            session_id=session.session_id,
-            session_epoch=session.epoch,
-            turn_ids=[turn_id],
-        )
-        assert contexts[turn_id].terminal_message_id
     finally:
         await storage.close()
 
