@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ChatComposerAddMenu from './ChatComposerAddMenu.vue'
 import addMenuSource from './ChatComposerAddMenu.vue?raw'
+import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPlacement'
 
 const chatViewStyles = readFileSync(
   'src/styles/chat-view.css',
@@ -73,13 +74,38 @@ afterEach(() => {
 })
 
 describe('ChatComposerAddMenu', () => {
-  it('escapes the Composer stacking context and renders above Goal progress', () => {
+  it('escapes the Composer stacking context and supports collision-aware placement', () => {
     expect(chatViewStyles).toContain('.chat-composer-dock > .chat-composer')
     expect(chatViewStyles).toContain('z-index: auto')
     expect(chatViewStyles).toContain('.goal-run-dock')
     expect(chatViewStyles).toContain('z-index: 3')
     expect(addMenuSource).toContain('.composer-add-menu')
     expect(addMenuSource).toContain('z-index: 30')
+    expect(addMenuSource).toContain('--composer-add-menu-lift')
+    expect(addMenuSource).toContain('avoidElement')
+  })
+
+  it('lifts above the Goal boundary and remains stable when remeasured', () => {
+    const initial = resolveComposerAddMenuPlacement({
+      menuBottom: 410,
+      currentLift: 0,
+      boundaryTop: 330,
+    })
+    expect(initial).toEqual({ lift: 88, maxHeight: 314 })
+
+    expect(resolveComposerAddMenuPlacement({
+      menuBottom: 322,
+      currentLift: initial.lift,
+      boundaryTop: 330,
+    })).toEqual(initial)
+  })
+
+  it('does not move a menu that already clears the Goal boundary', () => {
+    expect(resolveComposerAddMenuPlacement({
+      menuBottom: 280,
+      currentLift: 0,
+      boundaryTop: 330,
+    })).toEqual({ lift: 0, maxHeight: 314 })
   })
 
   it('offers file attachment plus on-demand Plan and Goal mode entries', async () => {

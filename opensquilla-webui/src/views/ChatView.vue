@@ -485,7 +485,7 @@
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
     <Transition name="goal-run-dock">
-      <div v-if="activeGoalRun" class="goal-run-dock">
+      <div v-if="activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
         <GoalRibbon
           :goal="activeGoalRun"
           :elapsed="goalElapsed"
@@ -594,6 +594,7 @@
       :goal-mode-available="goalUiAvailable"
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
       :goal-mode-existing="goalComposerExisting"
+      :add-menu-avoid-element="goalRunDockRef"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -1065,6 +1066,7 @@ const pendingAutoSendSessionKey = ref('')
 
 const chatRootRef = ref<HTMLElement | null>(null)
 const threadRef = ref<HTMLElement | null>(null)
+const goalRunDockRef = ref<HTMLElement | null>(null)
 const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
 const bottomSentinelRef = ref<HTMLElement | null>(null)
 let bottomIntersectionObserver: IntersectionObserver | null = null
