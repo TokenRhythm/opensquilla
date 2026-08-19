@@ -1546,6 +1546,9 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert '--grep "terminates stalled"' in session_recovery["run"]
     assert playwright_cache["uses"] == "actions/cache@v4"
     assert playwright_cache["with"]["path"] == "${{ env.PLAYWRIGHT_BROWSERS_PATH }}"
+    assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
+        "${{ github.workspace }}/.cache/ms-playwright"
+    )
     assert "${{ runner.arch }}" in playwright_cache["with"]["key"]
     assert "opensquilla-webui/package-lock.json" in playwright_cache["with"]["key"]
     assert "restore-keys" not in playwright_cache["with"]
