@@ -6,7 +6,7 @@ import ctypes
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,9 @@ _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _SE_FILE_OBJECT = 1
 _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_ID_INFO = 18
+_FILE_ALL_ACCESS = 0x001F01FF
 _WINDOWS_ACE_RE = re.compile(r"\(([^()]*)\)")
+_WINDOWS_HEX_ACCESS_MASK_RE = re.compile(r"0[xX][0-9A-Fa-f]{1,8}")
 
 
 class _WindowsFileAttributeTagInfo(ctypes.Structure):
@@ -99,32 +101,53 @@ def _windows_sddl_is_private(
     user_sid: str,
     directory: bool,
     require_protected: bool,
+    canonicalize_sid: Callable[[str], str] | None = None,
 ) -> bool:
     dacl_start = sddl.find("D:")
     first_ace = sddl.find("(", dacl_start)
     if not sddl.startswith("O:") or dacl_start < 0 or first_ace < 0:
         return False
-    owner = sddl[2:dacl_start].casefold()
-    normalized_user_sid = user_sid.casefold()
-    if normalized_user_sid == "s-1-5-18":
-        normalized_user_sid = "sy"
-    if owner == "s-1-5-18":
-        owner = "sy"
-    if owner == "s-1-5-32-544":
-        owner = "ba"
-    if owner not in {normalized_user_sid, "sy", "ba"}:
+    def canonical_sid(value: str) -> str | None:
+        if canonicalize_sid is not None:
+            try:
+                return canonicalize_sid(value).casefold()
+            except OSError:
+                return None
+        normalized = value.casefold()
+        return {
+            "sy": "s-1-5-18",
+            "ba": "s-1-5-32-544",
+        }.get(normalized, normalized)
+
+    owner = canonical_sid(sddl[2:dacl_start])
+    normalized_user_sid = canonical_sid(user_sid)
+    system_sid = canonical_sid("SY")
+    administrators_sid = canonical_sid("BA")
+    if (
+        owner is None
+        or normalized_user_sid is None
+        or system_sid is None
+        or administrators_sid is None
+        or owner not in {normalized_user_sid, system_sid, administrators_sid}
+    ):
         return False
     dacl_flags = sddl[dacl_start + 2 : first_ace]
     if require_protected and "P" not in dacl_flags:
         return False
     entries = _WINDOWS_ACE_RE.findall(sddl[first_ace:])
-    expected_principals = {normalized_user_sid, "sy"}
+    expected_principals = {normalized_user_sid, system_sid}
     if len(entries) != len(expected_principals):
         return False
     actual_principals: set[str] = set()
     for entry in entries:
         fields = entry.split(";")
-        if len(fields) != 6 or fields[0] != "A" or fields[2] != "FA":
+        if len(fields) != 6 or fields[0] != "A":
+            return False
+        access_mask = fields[2]
+        if access_mask != "FA" and (
+            _WINDOWS_HEX_ACCESS_MASK_RE.fullmatch(access_mask) is None
+            or int(access_mask, 16) != _FILE_ALL_ACCESS
+        ):
             return False
         ace_flags = fields[1]
         if (
@@ -135,9 +158,9 @@ def _windows_sddl_is_private(
             )
         ):
             return False
-        principal = fields[5].casefold()
-        if principal == "s-1-5-18":
-            principal = "sy"
+        principal = canonical_sid(fields[5])
+        if principal is None:
+            return False
         actual_principals.add(principal)
     return actual_principals == expected_principals
 
@@ -214,6 +237,61 @@ class _CtypesWindowsPrivateAcl:
                 local_free(string_sid)
         finally:
             close_handle(token)
+
+    def canonical_sid(self, value: str) -> str:
+        convert_descriptor = (
+            self.advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        )
+        get_owner = self.advapi32.GetSecurityDescriptorOwner
+        convert_to_string = self.advapi32.ConvertSidToStringSidW
+        local_free = self.kernel32.LocalFree
+        convert_descriptor.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        convert_descriptor.restype = ctypes.c_int
+        get_owner.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        get_owner.restype = ctypes.c_int
+        convert_to_string.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        convert_to_string.restype = ctypes.c_int
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+
+        descriptor = ctypes.c_void_p()
+        descriptor_size = ctypes.c_uint32()
+        if not convert_descriptor(
+            f"O:{value}",
+            _SDDL_REVISION_1,
+            ctypes.byref(descriptor),
+            ctypes.byref(descriptor_size),
+        ):
+            error_number = _windows_last_error()
+            raise OSError(error_number, "cannot parse a Windows SDDL principal")
+        try:
+            sid = ctypes.c_void_p()
+            defaulted = ctypes.c_int()
+            if (
+                not get_owner(descriptor, ctypes.byref(sid), ctypes.byref(defaulted))
+                or not sid.value
+            ):
+                error_number = _windows_last_error()
+                raise OSError(error_number, "Windows SDDL principal has no owner SID")
+            canonical = ctypes.c_void_p()
+            if not convert_to_string(sid, ctypes.byref(canonical)):
+                error_number = _windows_last_error()
+                raise OSError(error_number, "cannot canonicalize a Windows SDDL principal")
+            try:
+                return ctypes.wstring_at(canonical)
+            finally:
+                local_free(canonical)
+        finally:
+            local_free(descriptor)
 
     @contextmanager
     def open_bound(
@@ -489,6 +567,7 @@ def apply_windows_private_dacl(
             user_sid=user_sid,
             directory=directory,
             require_protected=True,
+            canonicalize_sid=getattr(api, "canonical_sid", None),
         ):
             raise OSError(0, "bound Windows path did not retain a private DACL")
 
@@ -533,4 +612,5 @@ def windows_path_has_private_dacl(
             user_sid=user_sid,
             directory=directory,
             require_protected=require_protected,
+            canonicalize_sid=getattr(api, "canonical_sid", None),
         )

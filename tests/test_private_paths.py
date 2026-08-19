@@ -107,6 +107,52 @@ def test_windows_private_acl_accepts_trusted_administrators_owner() -> None:
     )
 
 
+def test_windows_private_acl_canonicalizes_aliases_and_exact_hex_masks() -> None:
+    canonical_sids = {
+        "LA": "S-1-5-21-123-500",
+        "SY": "S-1-5-18",
+        "BA": "S-1-5-32-544",
+    }
+    canonicalized: list[str] = []
+
+    def canonicalize_sid(value: str) -> str:
+        canonicalized.append(value)
+        return canonical_sids.get(value, value)
+
+    assert private_paths._windows_sddl_is_private(
+        "O:LAD:P(A;CIOI;0x001f01ff;;;SY)(A;OICI;0x1F01FF;;;LA)",
+        user_sid="S-1-5-21-123-500",
+        directory=True,
+        require_protected=True,
+        canonicalize_sid=canonicalize_sid,
+    )
+    assert {"LA", "SY", "BA", "S-1-5-21-123-500"} <= set(canonicalized)
+
+
+def test_windows_private_acl_rejects_non_full_hex_access_mask() -> None:
+    assert not private_paths._windows_sddl_is_private(
+        "O:S-1-5-21-123D:P"
+        "(A;;0x001f01fe;;;S-1-5-21-123)"
+        "(A;;0x001f01ff;;;SY)",
+        user_sid="S-1-5-21-123",
+        directory=False,
+        require_protected=True,
+    )
+
+
+def test_windows_private_acl_rejects_unresolvable_principal() -> None:
+    def reject_sid(_value: str) -> str:
+        raise OSError("synthetic SID conversion failure")
+
+    assert not private_paths._windows_sddl_is_private(
+        "O:LAD:P(A;;FA;;;LA)(A;;FA;;;SY)",
+        user_sid="S-1-5-21-123-500",
+        directory=False,
+        require_protected=True,
+        canonicalize_sid=reject_sid,
+    )
+
+
 def test_windows_private_acl_deduplicates_system_service_identity() -> None:
     assert (
         private_paths._private_windows_sddl(

@@ -1317,6 +1317,7 @@
     "tests/test_skills_hash_consumers.py": 0.02,
     "tests/test_skills_tree.py": 0.02,
     "tests/test_gateway/test_p1a_exact_abort_contract.py": 0.01,
+    "tests/test_private_paths.py": 0.01,
     "tests/test_process_tree.py": 0.01,
     "tests/functional/test_gateway_stop_process_tree_e2e.py": 0.01
   }

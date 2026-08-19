@@ -348,6 +348,35 @@ def test_windows_private_acl_uses_current_sid_and_a_bound_handle() -> None:
     ]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows ACL APIs")
+def test_windows_acl_canonicalizer_resolves_sddl_principal_aliases() -> None:
+    from opensquilla import private_paths
+
+    native = private_paths._CtypesWindowsPrivateAcl()
+
+    assert native.canonical_sid("SY") == "S-1-5-18"
+    assert native.canonical_sid("BA") == "S-1-5-32-544"
+    local_administrator = native.canonical_sid("LA")
+    assert local_administrator.startswith("S-1-5-21-")
+    assert local_administrator.endswith("-500")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows ACL APIs")
+def test_profile_import_directory_round_trips_native_private_acl(tmp_path: Path) -> None:
+    from opensquilla import private_paths
+
+    private_root = tmp_path / "profile-imports"
+    private_root.mkdir()
+
+    profile_import_files.restrict_private_path(private_root, directory=True)
+
+    assert private_paths.windows_path_has_private_dacl(
+        private_root,
+        directory=True,
+        require_protected=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_invalid_json_is_retried_once_and_recovers_without_user_action(
     tmp_path: Path,

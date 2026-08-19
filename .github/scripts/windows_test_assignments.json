@@ -123,6 +123,7 @@
       "tests/test_onboarding/test_router_specs.py",
       "tests/test_onboarding/test_setup_engine.py",
       "tests/test_onboarding/test_status.py",
+      "tests/test_private_paths.py",
       "tests/test_process_tree.py",
       "tests/test_provider/test_capability_ladder_parity.py",
       "tests/test_provider/test_context_profile_parity.py",
