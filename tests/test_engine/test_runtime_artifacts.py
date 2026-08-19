@@ -1591,19 +1591,23 @@ async def test_goal_terminal_summary_preflight_failure_degrades_without_system_e
             fail_terminal_summary_assembly,
         )
     elif preflight_failure == "request_validation":
-        original_validate = agent_module.validate_provider_chat_request
+        original_validate = agent_module.validate_provider_chat_admission
 
-        def fail_terminal_summary_validation(provider: Any, messages: list[Message]) -> Any:
+        def fail_terminal_summary_validation(
+            provider: Any,
+            messages: list[Message],
+            config: Any,
+        ) -> Any:
             if getattr(provider, "calls", 0) == 3:
                 return ProviderError(
                     message="Synthetic terminal summary validation failure.",
                     code="synthetic_terminal_summary_validation_failure",
                 )
-            return original_validate(provider, messages)
+            return original_validate(provider, messages, config)
 
         monkeypatch.setattr(
             agent_module,
-            "validate_provider_chat_request",
+            "validate_provider_chat_admission",
             fail_terminal_summary_validation,
         )
     else:
