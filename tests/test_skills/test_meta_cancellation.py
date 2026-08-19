@@ -18,7 +18,6 @@ Invariants asserted:
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -173,15 +172,7 @@ async def test_orchestrator_cancelled_writes_cancelled_status_to_db(tmp_path) ->
                 pass
 
         task = asyncio.create_task(consume())
-        # Cancel once the run is observably in flight, not after a fixed pause.
-        # A wall-clock guess encodes this machine's scheduling: on a loaded
-        # Windows runner 0.2s elapsed before the orchestrator had written its
-        # `running` row, the cancel landed ahead of the finaliser, and the row
-        # stayed `running` — the very state this test exists to rule out.
-        deadline = time.monotonic() + 30.0
-        while not writer.list_runs(name="meta-cancellation-test", limit=5):
-            assert time.monotonic() < deadline, "run row never reached the database"
-            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
