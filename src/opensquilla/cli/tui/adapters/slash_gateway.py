@@ -149,7 +149,8 @@ class GatewayClientLike(Protocol):
 
     async def set_model_routing(self, mode: str) -> dict[str, Any]: ...
 
-    async def get_session_routing(self, key: str) -> dict[str, Any]: ...
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        pass
 
     async def set_session_routing(
         self,
@@ -157,7 +158,8 @@ class GatewayClientLike(Protocol):
         mode: str,
         *,
         expected_revision: int,
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any]:
+        pass
 
 class GatewayTurnStreamClient(Protocol):
     """Client surface consumed by the shared gateway stream renderer."""

@@ -149,7 +149,8 @@ class StandaloneFlushTranscript(Protocol):
 
 
 class StandaloneGetSessionRouting(Protocol):
-    def __call__(self, session_key: str) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
+    def __call__(self, session_key: str) -> Awaitable[dict[str, Any]] | dict[str, Any]:
+        pass
 
 
 class StandaloneSetSessionRouting(Protocol):
@@ -159,7 +160,8 @@ class StandaloneSetSessionRouting(Protocol):
         mode: str,
         *,
         expected_revision: int,
-    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]:
+        pass
 
 
 @dataclass
