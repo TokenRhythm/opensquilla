@@ -75,6 +75,9 @@ class RunPipelineRequest:
     prev_assistant_text: str | None = None
     prev_assistant_usage: dict[str, Any] | None = None
     history_user_texts: list[str] | None = None
+    history_capacity_estimated_tokens: int = 0
+    history_capacity_message_count: int = 0
+    history_capacity_estimate_complete: bool = True
     history_has_recent_image: bool = False
     history_image_turn_count: int = 0
     vision_sticky_remaining: int = 0
@@ -155,6 +158,7 @@ class RouterContextPort(Protocol):
         *,
         exclude_last_user: bool,
         bound_user_message_id: str | None = None,
+        include_capacity: bool = False,
     ) -> dict[str, Any]: ...
 
 @runtime_checkable
@@ -398,6 +402,7 @@ class PromptAssemblerStage:
                 inp.history_has_persisted_user or inp.persist_input
             ),
             bound_user_message_id=inp.bound_user_message_id,
+            include_capacity=bool(inp.attachments),
         )
 
         raw_history_image_turn_count = router_context.get("history_image_turn_count")
@@ -462,6 +467,18 @@ class PromptAssemblerStage:
             prev_assistant_text=router_context.get("prev_assistant_text"),
             prev_assistant_usage=router_context.get("prev_assistant_usage"),
             history_user_texts=router_context.get("history_user_texts"),
+            history_capacity_estimated_tokens=max(
+                0,
+                int(router_context.get("history_capacity_estimated_tokens") or 0),
+            ),
+            history_capacity_message_count=max(
+                0,
+                int(router_context.get("history_capacity_message_count") or 0),
+            ),
+            history_capacity_estimate_complete=(
+                not inp.attachments
+                or router_context.get("history_capacity_estimate_complete") is True
+            ),
             history_has_recent_image=bool(router_context.get("history_has_recent_image")),
             history_image_turn_count=history_image_turn_count,
             vision_sticky_remaining=vision_sticky_remaining,

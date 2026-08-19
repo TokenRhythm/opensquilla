@@ -12,6 +12,7 @@ replies are kept — with a positional-trim fallback when no id is supplied.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,13 @@ from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import ChatConfig, DoneEvent, Message, TextDeltaEvent
+from opensquilla.session.context_view import (
+    build_compaction_context_records,
+    build_provider_compaction_context,
+    format_compaction_summary_context,
+)
+from opensquilla.session.models import SessionContextState, SessionSummary
+from opensquilla.token_estimation import estimate_tokens
 
 
 @dataclass
@@ -47,6 +55,8 @@ class _FakeSessionManager:
     def __init__(self) -> None:
         self._nodes: dict[str, _SessionNode] = {}
         self._transcripts: dict[str, list[_TranscriptEntry]] = {}
+        self._summaries: dict[str, list[SessionSummary]] = {}
+        self._context_states: dict[str, list[SessionContextState]] = {}
         self._counter = 0
 
     async def create(self, session_key: str) -> _SessionNode:
@@ -67,8 +77,11 @@ class _FakeSessionManager:
     async def get_session(self, session_key: str) -> _SessionNode | None:
         return self._nodes.get(session_key)
 
-    async def get_context_states(self, session_key: str) -> list[Any]:  # noqa: ARG002
-        return []
+    async def get_context_states(self, session_key: str) -> list[SessionContextState]:
+        return list(self._context_states.get(session_key, []))
+
+    async def get_summaries(self, session_key: str) -> list[SessionSummary]:
+        return list(self._summaries.get(session_key, []))
 
 
 class _CapturingProvider:
@@ -266,3 +279,187 @@ async def test_router_context_excludes_queued_prompts_when_last_entry_is_assista
     )
 
     assert ctx.get("history_user_texts") == ["Prior question Z"]
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_does_not_double_count_bound_attachment_across_compaction() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-compaction"
+    node = await manager.create(key)
+    await manager.append_message(key, "user", "u" * 8_000)
+    await manager.append_message(key, "assistant", "a" * 8_000)
+    attachment_envelope = (
+        '{"text":"current","attachments":['
+        '{"type":"text/plain","data":"' + ("Z" * 12_000) + '"}]}'
+    )
+    current = await manager.append_message(key, "user", attachment_envelope)
+
+    before = await _new_runner(manager)._router_previous_assistant_context(
+        key,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        include_capacity=True,
+    )
+
+    summary_text = "checkpoint " + ("s" * 1_000)
+    manager._transcripts[key] = [current]
+    manager._summaries[key] = [
+        SessionSummary(
+            session_id=node.session_id,
+            session_key=key,
+            summary_text=summary_text,
+            covered_through_id=2,
+        )
+    ]
+    manager._context_states[key] = [
+        SessionContextState(
+            session_id=node.session_id,
+            session_key=key,
+            provider="portable",
+            state_kind="structured_summary_v1",
+            payload={
+                "schema_version": 1,
+                "current_status": summary_text,
+            },
+            covered_through_id=2,
+            portable=True,
+            cacheable=True,
+        )
+    ]
+    after = await _new_runner(manager)._router_previous_assistant_context(
+        key,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        include_capacity=True,
+    )
+
+    records = build_compaction_context_records(
+        context_states=manager._context_states[key],
+        summaries=manager._summaries[key],
+    )
+    assert len(records) == 1
+    expected_summary = format_compaction_summary_context([records[0].text])
+    assert expected_summary is not None
+    assert after["history_capacity_estimated_tokens"] == estimate_tokens(
+        expected_summary
+    )
+    assert after["history_capacity_message_count"] == 1
+    assert (
+        after["history_capacity_estimated_tokens"]
+        < before["history_capacity_estimated_tokens"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_adds_native_state_and_uncovered_portable_summary() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-mixed-compaction"
+    node = await manager.create(key)
+    current = await manager.append_message(key, "user", "synthetic current")
+    manager._context_states[key] = [
+        SessionContextState(
+            session_id=node.session_id,
+            session_key=key,
+            provider="anthropic",
+            model="synthetic-model",
+            state_kind="anthropic_compaction_block",
+            payload={"content": "native checkpoint"},
+            covered_through_id=2,
+            portable=False,
+            cacheable=True,
+        )
+    ]
+    manager._summaries[key] = [
+        SessionSummary(
+            session_id=node.session_id,
+            session_key=key,
+            summary_text="newer portable checkpoint",
+            covered_through_id=4,
+        )
+    ]
+
+    context = await _new_runner(manager)._router_previous_assistant_context(
+        key,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        include_capacity=True,
+    )
+
+    native = build_provider_compaction_context(
+        context_states=manager._context_states[key],
+        provider_kind="anthropic",
+    )
+    native_payload = [
+        message.model_dump(mode="json", exclude_none=True)
+        for message in native.messages
+    ]
+    residual = build_compaction_context_records(
+        context_states=manager._context_states[key],
+        summaries=manager._summaries[key],
+        skip_covered_through_ids=native.covered_through_ids,
+    )
+    rendered_residual = format_compaction_summary_context(
+        [record.text for record in residual]
+    )
+    assert rendered_residual is not None
+    expected = estimate_tokens(
+        json.dumps(native_payload, ensure_ascii=False, sort_keys=True, default=str)
+    ) + estimate_tokens(rendered_residual)
+    assert context["history_capacity_estimated_tokens"] == expected
+    assert context["history_capacity_message_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_marks_transcript_read_failure_incomplete() -> None:
+    class _FailingTranscriptManager(_FakeSessionManager):
+        async def get_transcript(self, session_key: str) -> list[_TranscriptEntry]:
+            raise RuntimeError("synthetic transcript failure")
+
+    manager = _FailingTranscriptManager()
+    context = await _new_runner(manager)._router_previous_assistant_context(
+        "agent:main:failed-transcript",
+        include_capacity=True,
+    )
+
+    assert context == {"history_capacity_estimate_complete": False}
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_without_session_manager_is_known_empty() -> None:
+    runner = TurnRunner(
+        provider_selector=MagicMock(),
+        session_manager=None,
+        config=GatewayConfig(),
+    )
+
+    context = await runner._router_previous_assistant_context(
+        "agent:main:no-session-manager",
+        include_capacity=True,
+    )
+
+    assert context == {
+        "history_capacity_estimated_tokens": 0,
+        "history_capacity_message_count": 0,
+        "history_capacity_estimate_complete": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_marks_compaction_state_read_failure_incomplete() -> None:
+    class _FailingCompactionManager(_FakeSessionManager):
+        async def get_summaries(self, session_key: str) -> list[SessionSummary]:
+            raise RuntimeError("synthetic compaction failure")
+
+    manager = _FailingCompactionManager()
+    key = "agent:main:failed-compaction"
+    await manager.create(key)
+    current = await manager.append_message(key, "user", "synthetic current")
+
+    context = await _new_runner(manager)._router_previous_assistant_context(
+        key,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        include_capacity=True,
+    )
+
+    assert context["history_capacity_estimate_complete"] is False

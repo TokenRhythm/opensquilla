@@ -78,7 +78,12 @@ class _RecordingRouterContext:
     bound_user_message_ids: list[str | None] = field(default_factory=list)
 
     async def fetch_router_context(
-        self, session_key, *, exclude_last_user, bound_user_message_id=None
+        self,
+        session_key,
+        *,
+        exclude_last_user,
+        bound_user_message_id=None,
+        include_capacity=False,
     ):
         self.calls.append((session_key, exclude_last_user))
         self.bound_user_message_ids.append(bound_user_message_id)
@@ -365,6 +370,21 @@ async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context
 
     assert router_context.calls == [("agent:main:s1", True)]
     assert router_context.bound_user_message_ids == ["msg-bound"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_context_missing_capacity_proof_is_incomplete() -> None:
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    stage = _make_stage(
+        router=_RecordingRouterContext(context={}),
+        executor=executor,
+    )
+
+    await stage.run(
+        _make_input(attachments=[{"type": "text/plain", "data": "synthetic"}])
+    )
+
+    assert executor.requests[0].history_capacity_estimate_complete is False
 
 
 @pytest.mark.asyncio

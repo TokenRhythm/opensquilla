@@ -8438,6 +8438,9 @@ class TurnRunner:
         prev_assistant_text: str | None = None,
         prev_assistant_usage: dict[str, Any] | None = None,
         history_user_texts: list[str] | None = None,
+        history_capacity_estimated_tokens: int = 0,
+        history_capacity_message_count: int = 0,
+        history_capacity_estimate_complete: bool = True,
         history_has_recent_image: bool = False,
         history_image_turn_count: int = 0,
         vision_sticky_remaining: int = 0,
@@ -8469,6 +8472,7 @@ class TurnRunner:
             apply_vision_followup_gate,
             enforce_coding_mode,
             filter_skills,
+            finalize_squilla_router_capacity,
             inject_platform_hint,
             inject_subagent_grounding,
             meta_command_launch,
@@ -8675,6 +8679,17 @@ class TurnRunner:
             initial_metadata["router_prev_assistant_usage"] = dict(prev_assistant_usage)
         if history_user_texts:
             initial_metadata["router_history_user_texts"] = list(history_user_texts)
+        initial_metadata["routing_history_capacity_estimated_tokens"] = max(
+            0,
+            int(history_capacity_estimated_tokens),
+        )
+        initial_metadata["routing_history_capacity_message_count"] = max(
+            0,
+            int(history_capacity_message_count),
+        )
+        initial_metadata["routing_history_capacity_estimate_complete"] = bool(
+            history_capacity_estimate_complete
+        )
         if history_has_recent_image:
             initial_metadata["router_history_has_recent_image"] = True
             initial_metadata["router_history_image_turn_count"] = max(
@@ -8769,6 +8784,11 @@ class TurnRunner:
         if not planning_turn:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
+        # Capacity admission is safety-critical: it runs at the finalized
+        # prompt/tool boundary outside the generic fail-open pipeline wrapper.
+        # An unexpected estimator failure must stop the turn rather than leave
+        # an attachment route with unbounded selector fallbacks.
+        turn = await finalize_squilla_router_capacity(turn)
 
         # Image routing is a capability boundary, not an Ensemble activation.
         # This applies to the dedicated image row and to any text tier selected
@@ -9244,26 +9264,177 @@ class TurnRunner:
 
         return turn, provider
 
+    async def _router_history_capacity_context(
+        self,
+        session_key: str,
+        entries: list[Any],
+        *,
+        exclude_last_user: bool,
+        bound_user_message_id: str | None,
+        bound_index: int | None,
+    ) -> dict[str, Any]:
+        """Measure the pre-current replay projection for attachment routing."""
+
+        excluded_user_indexes: set[int] = set()
+        if bound_index is not None:
+            excluded_user_indexes = {
+                index
+                for index, entry in enumerate(entries)
+                if index >= bound_index and getattr(entry, "role", None) == "user"
+            }
+        elif (
+            exclude_last_user
+            and entries
+            and getattr(entries[-1], "role", None) == "user"
+        ):
+            excluded_user_indexes.add(len(entries) - 1)
+
+        from opensquilla.session.compaction import estimate_entry_model_replay_tokens
+
+        capacity_tokens = 0
+        capacity_message_count = 0
+        legacy_summary_markers: list[str] = []
+        for index, entry in enumerate(entries):
+            if index in excluded_user_indexes:
+                continue
+            role = getattr(entry, "role", None)
+            content = getattr(entry, "content", None)
+            if (
+                role == "system"
+                and isinstance(content, str)
+                and content.startswith(_CONTEXT_SUMMARY_MARKER)
+            ):
+                legacy_summary_markers.append(_strip_context_summary_marker(content))
+                continue
+            if role not in {"user", "assistant"}:
+                continue
+            capacity_tokens += estimate_entry_model_replay_tokens(entry)
+            tool_calls = getattr(entry, "tool_calls", None)
+            capacity_message_count += 1 + (
+                2 * len(tool_calls) if isinstance(tool_calls, list) else 0
+            )
+
+        summaries: list[Any] = []
+        context_states: list[Any] = []
+        get_summaries = getattr(self._session_manager, "get_summaries", None)
+        get_context_states = getattr(self._session_manager, "get_context_states", None)
+        capacity_estimate_complete = (
+            bound_user_message_id is None or bound_index is not None
+        )
+        try:
+            pending: list[Any] = []
+            if callable(get_summaries):
+                pending.append(get_summaries(session_key))
+            if callable(get_context_states):
+                pending.append(get_context_states(session_key))
+            results = await asyncio.gather(*pending) if pending else []
+            result_index = 0
+            if callable(get_summaries):
+                summaries = list(results[result_index] or [])
+                result_index += 1
+            if callable(get_context_states):
+                context_states = list(results[result_index] or [])
+        except Exception:  # noqa: BLE001 - final capacity gate fails closed
+            summaries = []
+            context_states = []
+            capacity_estimate_complete = False
+
+        def _summary_projection(
+            skip_covered_through_ids: set[int] | None = None,
+        ) -> tuple[int, int]:
+            records = build_compaction_context_records(
+                context_states=context_states,
+                summaries=summaries,
+                legacy_summary_markers=legacy_summary_markers,
+                skip_covered_through_ids=skip_covered_through_ids,
+            )
+            rendered = format_compaction_summary_context(
+                [record.text for record in records if record.text]
+            )
+            return (
+                estimate_tokens(rendered) if rendered else 0,
+                1 if rendered else 0,
+            )
+
+        best_compaction_tokens, best_compaction_messages = _summary_projection()
+        provider_kinds = {
+            str(getattr(state, "provider", "") or "").strip()
+            for state in context_states
+            if str(getattr(state, "provider", "") or "").strip()
+        }
+        for provider_kind in provider_kinds:
+            native_context = build_provider_compaction_context(
+                context_states=context_states,
+                provider_kind=provider_kind,
+            )
+            if not native_context.messages:
+                continue
+            payload = [
+                message.model_dump(mode="json", exclude_none=True)
+                for message in native_context.messages
+            ]
+            projected_tokens = estimate_tokens(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            residual_tokens, residual_messages = _summary_projection(
+                native_context.covered_through_ids
+            )
+            provider_view_tokens = projected_tokens + residual_tokens
+            provider_view_messages = len(native_context.messages) + residual_messages
+            if provider_view_tokens > best_compaction_tokens:
+                best_compaction_tokens = provider_view_tokens
+                best_compaction_messages = provider_view_messages
+        capacity_tokens += best_compaction_tokens
+        capacity_message_count += best_compaction_messages
+
+        return {
+            "history_capacity_estimated_tokens": max(0, capacity_tokens),
+            "history_capacity_message_count": max(0, capacity_message_count),
+            "history_capacity_estimate_complete": capacity_estimate_complete,
+        }
+
     async def _router_previous_assistant_context(
         self,
         session_key: str,
         *,
         exclude_last_user: bool = False,
         bound_user_message_id: str | None = None,
+        include_capacity: bool = False,
     ) -> dict[str, Any]:
         """Return transcript context for the V4 router, excluding the current user turn."""
         if self._session_manager is None:
-            return {}
+            return (
+                {
+                    "history_capacity_estimated_tokens": 0,
+                    "history_capacity_message_count": 0,
+                    "history_capacity_estimate_complete": True,
+                }
+                if include_capacity
+                else {}
+            )
         get_transcript = getattr(self._session_manager, "get_transcript", None)
         if not callable(get_transcript):
-            return {}
+            return (
+                {"history_capacity_estimate_complete": False}
+                if include_capacity
+                else {}
+            )
         try:
             transcript = get_transcript(session_key)
             if inspect.isawaitable(transcript):
                 transcript = await transcript
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
-            return {}
+            return (
+                {"history_capacity_estimate_complete": False}
+                if include_capacity
+                else {}
+            )
         entries = list(transcript or [])
         # When the turn is bound to a specific user message id (queued-sends
         # path), exclude the bound current prompt AND every later user entry
@@ -9277,15 +9448,38 @@ class TurnRunner:
                 if getattr(entry, "message_id", None) == bound_user_message_id:
                     bound_index = idx
                     break
+        excluded_user_indexes: set[int] = set()
+        if bound_index is not None:
+            excluded_user_indexes = {
+                index
+                for index, entry in enumerate(entries)
+                if index >= bound_index and getattr(entry, "role", None) == "user"
+            }
+        elif (
+            exclude_last_user
+            and entries
+            and getattr(entries[-1], "role", None) == "user"
+        ):
+            excluded_user_indexes.add(len(entries) - 1)
+
+        capacity_context: dict[str, Any] = {}
+        if include_capacity:
+            capacity_context = await self._router_history_capacity_context(
+                session_key,
+                entries,
+                exclude_last_user=exclude_last_user,
+                bound_user_message_id=bound_user_message_id,
+                bound_index=bound_index,
+            )
+
         user_texts: list[str] = []
         user_contents: list[str] = []
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) != "user":
                 continue
-            if bound_index is not None and index >= bound_index:
-                # The bound current prompt and any later (queued) user entry.
-                continue
-            if bound_index is None and exclude_last_user and index == len(entries) - 1:
+            if index in excluded_user_indexes:
+                # The bound current prompt and any later queued user entry, or
+                # the positional current prompt on the simple path.
                 continue
             content = getattr(entry, "content", None)
             if not isinstance(content, str) or not content.strip():
@@ -9297,7 +9491,7 @@ class TurnRunner:
                 text = text[-_ROUTER_HISTORY_USER_MAX_CHARS:]
             user_texts.append(text)
 
-        context: dict[str, Any] = {}
+        context: dict[str, Any] = dict(capacity_context)
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
         router_cfg = getattr(self._turn_config(), "squilla_router", None)

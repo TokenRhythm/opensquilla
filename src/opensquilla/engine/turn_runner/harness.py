@@ -289,6 +289,13 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "prev_assistant_text": request.prev_assistant_text,
             "prev_assistant_usage": request.prev_assistant_usage,
             "history_user_texts": request.history_user_texts,
+            "history_capacity_estimated_tokens": (
+                request.history_capacity_estimated_tokens
+            ),
+            "history_capacity_message_count": request.history_capacity_message_count,
+            "history_capacity_estimate_complete": (
+                request.history_capacity_estimate_complete
+            ),
             "history_has_recent_image": request.history_has_recent_image,
             "history_image_turn_count": request.history_image_turn_count,
             "vision_sticky_remaining": request.vision_sticky_remaining,
@@ -332,11 +339,22 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
         *,
         exclude_last_user: bool,
         bound_user_message_id: str | None = None,
+        include_capacity: bool = False,
     ) -> dict[str, Any]:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        kwargs: dict[str, Any] = {
+            "exclude_last_user": exclude_last_user,
+            "bound_user_message_id": bound_user_message_id,
+        }
+        if _accepts_keyword_arg(
+            self._runner._router_previous_assistant_context,
+            "include_capacity",
+        ):
+            kwargs["include_capacity"] = include_capacity
         return await self._runner._router_previous_assistant_context(
             session_key,
-            exclude_last_user=exclude_last_user,
-            bound_user_message_id=bound_user_message_id,
+            **kwargs,
         )
 
 class _TurnRunnerPromptConfigResolverAdapter(PromptConfigResolverPort):
