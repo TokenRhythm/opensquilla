@@ -1007,7 +1007,7 @@ import {
 } from '@/utils/chat/toolDisplay'
 import {
   collectClipboardFiles,
-  hasSendableModelInputImageAttachment,
+  hasModelInputImageAttachment,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -1865,6 +1865,8 @@ const {
   routerEnabled,
   modelRoutingMode,
   modelRoutingSettingsBusy,
+  imageInputAdmission,
+  imageInputAdmissionReason,
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
@@ -1876,14 +1878,17 @@ const {
   bindFeatureRefresh,
 } = chatFeatureToggles
 isQueuedDeliveryBlocked = () => (
-  modelRoutingSettingsBusy.value
-  && hasSendableModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+  hasModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+  && (
+    modelRoutingSettingsBusy.value
+    || imageInputAdmission.value === 'blocked'
+  )
 )
 watch(
-  [modelRoutingMode, modelRoutingSettingsBusy],
-  ([mode, busy], [previousMode, wasBusy]) => {
+  [imageInputAdmission, modelRoutingSettingsBusy],
+  ([admission, busy], [previousAdmission, wasBusy]) => {
     const routingUnblocked = (
-      (previousMode === 'llm_ensemble' && mode !== 'llm_ensemble')
+      (previousAdmission === 'blocked' && admission !== 'blocked')
       || (wasBusy && !busy)
     )
     if (!routingUnblocked || pendingQueue.value.length === 0) return
@@ -2803,6 +2808,7 @@ const chatSend = useChatSend({
   busySendMode,
   modelRoutingMode,
   modelRoutingSettingsBusy,
+  imageInputAdmission,
   elevatedMode,
   runMode,
   pendingAttachments,
@@ -3795,13 +3801,14 @@ const queuedImageSendBlockedMessage = computed(() => {
   if (modelRoutingSettingsBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
-  return modelRoutingMode.value === 'llm_ensemble'
+  if (imageInputAdmission.value !== 'blocked') return ''
+  return imageInputAdmissionReason.value === 'ensemble_mode_unsupported'
     ? t('chat.composer.ensembleImageUnsupported')
-    : ''
+    : t('chat.composer.imageInputUnsupported')
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasSendableModelInputImageAttachment(pendingAttachments.value)
+  return hasModelInputImageAttachment(pendingAttachments.value)
     ? queuedImageSendBlockedMessage.value
     : ''
 })

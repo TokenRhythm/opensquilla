@@ -736,7 +736,7 @@ async def test_linux_helper_payload_times_out_outer_helper(
             return b"", b""
 
     async def fake_create_subprocess_exec(*argv, **kwargs):
-        assert kwargs["start_new_session"] is True
+        assert "start_new_session" not in kwargs
         return _Proc()
 
     async def fake_terminate(proc):
@@ -744,8 +744,8 @@ async def test_linux_helper_payload_times_out_outer_helper(
         return b"", b""
 
     monkeypatch.setattr(
-        bubblewrap_mod.asyncio,
-        "create_subprocess_exec",
+        bubblewrap_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(
@@ -783,7 +783,7 @@ async def test_linux_helper_payload_caller_cancel_terminates_outer_process_group
             await asyncio.Event().wait()
 
     async def fake_create_subprocess_exec(*argv, **kwargs):
-        assert kwargs["start_new_session"] is True
+        assert "start_new_session" not in kwargs
         return _Proc()
 
     async def fake_terminate(proc):
@@ -791,8 +791,8 @@ async def test_linux_helper_payload_caller_cancel_terminates_outer_process_group
         return b"", b""
 
     monkeypatch.setattr(
-        bubblewrap_mod.asyncio,
-        "create_subprocess_exec",
+        bubblewrap_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(bubblewrap_mod, "_terminate_process_group", fake_terminate)

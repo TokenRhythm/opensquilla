@@ -8,6 +8,7 @@ rely on them.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from opensquilla.skills.loader import SkillLoader
+from opensquilla.skills.meta.executors import skill_exec
 from opensquilla.skills.meta.executors.skill_exec import run_skill_exec_step
 from opensquilla.skills.meta.parser import parse_meta_plan
 from opensquilla.skills.runtime_env import managed_skill_env
@@ -147,12 +149,20 @@ async def test_meta_paper_artifact_operations_spawn_platform_neutral_python_argv
     step = next(candidate for candidate in plan.steps if candidate.id == operation)
     captured: dict[str, Any] = {}
 
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    class FakeProcess:
+        pid = 4242
+        returncode = 0
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            captured["stdin"] = input
+            return b"fixture output\n", b""
+
+    async def fake_spawn(*argv: str, **kwargs: Any) -> FakeProcess:
         captured["argv"] = list(argv)
         captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(argv, 0, b"fixture output\n", b"")
+        return FakeProcess()
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(skill_exec, "create_owned_subprocess_exec", fake_spawn)
     outputs = {
         "section_abstract": "abstract",
         "section_introduction": "introduction",
@@ -187,7 +197,12 @@ async def test_meta_paper_artifact_operations_spawn_platform_neutral_python_argv
     ]
     kwargs = captured["kwargs"]
     assert "shell" not in kwargs
-    payload = json.loads(kwargs["input"].decode("utf-8"))
+    assert kwargs["cwd"] == str(tmp_path)
+    assert kwargs["stdin"] is asyncio.subprocess.PIPE
+    assert kwargs["stdout"] is asyncio.subprocess.PIPE
+    assert kwargs["stderr"] is asyncio.subprocess.PIPE
+    assert isinstance(kwargs["env"], dict)
+    payload = json.loads(captured["stdin"].decode("utf-8"))
     assert payload["operation"] == operation
     assert payload["meta_run_id"] == TEST_META_RUN_ID
     assert result == "fixture output"

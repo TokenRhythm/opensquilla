@@ -289,18 +289,19 @@ describe('catalog parity', () => {
 
   it('explains the Ensemble image limit with actionable routing choices', () => {
     const locales = [
-      { messages: en, imagePattern: /image input/i },
-      { messages: zhHans, imagePattern: /图片输入/ },
-      { messages: de, imagePattern: /Bildeingaben/i },
-      { messages: es, imagePattern: /im[aá]gen/i },
-      { messages: fr, imagePattern: /images en entrée/i },
-      { messages: ja, imagePattern: /画像入力/ },
+      { messages: en, imagePattern: /image input/i, unsupportedImagePattern: /image input/i },
+      { messages: zhHans, imagePattern: /图片输入/, unsupportedImagePattern: /图片输入/ },
+      { messages: de, imagePattern: /Bildeingaben/i, unsupportedImagePattern: /Bilder/i },
+      { messages: es, imagePattern: /im[aá]gen/i, unsupportedImagePattern: /imágenes/i },
+      { messages: fr, imagePattern: /images en entrée/i, unsupportedImagePattern: /images/i },
+      { messages: ja, imagePattern: /画像入力/, unsupportedImagePattern: /画像/ },
     ]
 
-    for (const { messages, imagePattern } of locales) {
+    for (const { messages, imagePattern, unsupportedImagePattern } of locales) {
       const composer = messages.chat.composer
       expect(composer.modelRoutingEnsembleDesc).toMatch(imagePattern)
       expect(composer.ensembleImageUnsupported).toMatch(imagePattern)
+      expect(composer.imageInputUnsupported).toMatch(unsupportedImagePattern)
       expect(composer.ensembleImageUnsupported).toContain(composer.modelRouting)
       expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingSquillaRouter)
       expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingOff)

@@ -62,13 +62,13 @@ from .model_catalog import resolve_effective_context_window, shared_catalog
 from .protocol import (
     LLMProvider,
     ProviderMetadata,
+    count_provider_image_blocks,
     project_provider_final_request,
     project_provider_message_count,
 )
 from .selector import ModelSelector, ProviderConfig, SelectorConfig
 from .types import (
     ChatConfig,
-    ContentBlockImage,
     ContentBlockToolResult,
     DoneEvent,
     EnsembleProgressEvent,
@@ -920,6 +920,15 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
         str(cfg.provider or "").strip().lower(),
         str(cfg.model or "").strip().lower(),
         str(cfg.base_url or "").strip().rstrip("/").lower(),
+    )
+
+
+def _proposer_provider_config(member: EnsembleMemberConfig) -> ProviderConfig:
+    """Return the provider boundary used by every proposer-side operation."""
+
+    return replace(
+        member.provider_config,
+        replay_provider_state=False,
     )
 
 
@@ -2177,25 +2186,12 @@ class EnsembleProvider:
     def validate_chat_request(self, messages: list[Message]) -> ErrorEvent | None:
         """Reject typed image input before any ensemble leg can start."""
 
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            for block in message.content:
-                if isinstance(block, ContentBlockImage):
-                    return ErrorEvent(
-                        message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-                        code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-                    )
-                if not isinstance(block, ContentBlockToolResult):
-                    continue
-                if isinstance(block.content, list) and any(
-                    isinstance(item, ContentBlockImage) for item in block.content
-                ):
-                    return ErrorEvent(
-                        message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-                        code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-                    )
-        return None
+        if count_provider_image_blocks(messages) <= 0:
+            return None
+        return ErrorEvent(
+            message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
+            code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         models: list[ModelInfo] = []
@@ -2262,7 +2258,7 @@ class EnsembleProvider:
                 role="proposer",
             ).model_copy(update=proposer_updates)
             _require_projection(
-                _build_provider(member.provider_config),
+                _build_provider(_proposer_provider_config(member)),
                 member_config,
                 synthetic_messages=additional_messages,
             )
@@ -3007,7 +3003,11 @@ class EnsembleProvider:
                     ),
                 )
             return result
-        provider = _build_provider(member.provider_config)
+        # Proposers consume the visible conversation as independent candidate
+        # generators. Provider-private continuity state (reasoning_content,
+        # thinking blocks, thought signatures) belongs to the model that
+        # minted it and must not be replayed into any proposer physical call.
+        provider = _build_provider(_proposer_provider_config(member))
         text_parts: list[str] = []
         got_done = False
 

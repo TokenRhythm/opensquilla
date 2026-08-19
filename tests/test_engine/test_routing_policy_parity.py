@@ -30,6 +30,11 @@ entries include the capacity-required marker, material estimate, thinking
 reserve, and capacity-filtered fallback chain. Non-attachment cases retain
 their prior byte-identical behavior.
 
+The missing image-tier case was intentionally recaptured after Router image
+admission began returning a structured rejection instead of raising a runtime
+configuration exception. Its golden pins the stable rejection metadata while
+the later provider admission layer owns the user-facing error event.
+
 Classifier outputs are injected through a fake strategy: the corpus never
 loads the LightGBM/ONNX bundle, touches the network, or needs credentials.
 All tier/model/provider names and messages are synthetic dummy data; tier

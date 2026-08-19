@@ -192,6 +192,22 @@ def test_ensemble_multimodal_reply_is_actionable_and_stable() -> None:
     )
 
 
+def test_image_input_unsupported_reply_is_actionable_and_stable() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": "image_input_unsupported",
+            "error_message": "provider-specific detail must not win",
+        }
+    )
+
+    assert reply == (
+        "The selected model cannot process image input. Choose an image-capable "
+        "model or remove the image and try again."
+    )
+
+
 def test_human_silent_reply_failure_has_actionable_terminal_message() -> None:
     reply = build_terminal_reply(
         {

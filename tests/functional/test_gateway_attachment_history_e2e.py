@@ -21,7 +21,6 @@ import pytest
 import opensquilla.engine.steps.squilla_router as squilla_router_step
 from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.engine import Agent, AgentConfig
-from opensquilla.engine.agent import UNSUPPORTED_IMAGE_INPUT_REPLY
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import rpc_sessions as _rpc_sessions  # noqa: F401
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
@@ -36,6 +35,10 @@ from opensquilla.gateway.uploads import (
 )
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
 from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabilities
+from opensquilla.provider.protocol import (
+    IMAGE_INPUT_UNSUPPORTED_CODE,
+    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+)
 from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
@@ -136,6 +139,15 @@ class _FakeModelCatalog:
         base_url: str = "",  # noqa: ARG002
     ) -> ModelCapabilities:
         return ModelCapabilities(supports_vision=model_id == _VISION_MODEL)
+
+    def resolve_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider_name: str = "openrouter",  # noqa: ARG002
+        base_url: str = "",  # noqa: ARG002
+    ) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
 
 
 class _EventSink:
@@ -254,6 +266,7 @@ async def _send_session_turn(
     sink: _EventSink,
     message: str,
     attachments: list[dict[str, Any]] | None = None,
+    expected_error_code: str | None = None,
 ) -> None:
     done_before = sum(1 for event, _payload in sink.events if event == "session.event.done")
     event_count_before = len(sink.events)
@@ -291,6 +304,16 @@ async def _send_session_turn(
             if event == "session.event.error"
         ]
         if new_errors:
+            if (
+                expected_error_code
+                and new_errors[-1].get("code") == expected_error_code
+            ):
+                if task is not None:
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=_TURN_TASK_DRAIN_TIMEOUT_SECONDS,
+                    )
+                return
             raise AssertionError(f"turn emitted error events: {sink.events!r}")
         if task is not None and task.done():
             if task.cancelled():
@@ -416,7 +439,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_gateway_single_text_model_returns_friendly_reply_without_provider_call(
+async def test_gateway_single_text_model_returns_structured_error_without_provider_call(
     _e2e_stack: dict[str, Any],
 ) -> None:
     config: GatewayConfig = _e2e_stack["config"]
@@ -448,6 +471,7 @@ async def test_gateway_single_text_model_returns_friendly_reply_without_provider
         sink=sink,
         message="请分析这张图片。",
         attachments=[_file_uuid_attachment(file_uuid)],
+        expected_error_code=IMAGE_INPUT_UNSUPPORTED_CODE,
     )
 
     assert len(gate_provider.calls) == gate_calls_before
@@ -456,16 +480,14 @@ async def test_gateway_single_text_model_returns_friendly_reply_without_provider
     assert len(usage_sink.started) == usage_started_before
     assert len(usage_sink.finalized) == usage_finalized_before
     assert len(usage_sink.unknown) == usage_unknown_before
-    deltas = _event_payloads(sink, "session.event.text_delta")
-    assert deltas[-1]["text"] == UNSUPPORTED_IMAGE_INPUT_REPLY
-    assert _event_payloads(sink, "session.event.error") == []
-    done = _event_payloads(sink, "session.event.done")[-1]
-    assert done["text"] == UNSUPPORTED_IMAGE_INPUT_REPLY
-    assert done["input_tokens"] == 0
-    assert done["output_tokens"] == 0
+    assert _event_payloads(sink, "session.event.text_delta") == []
+    errors = _event_payloads(sink, "session.event.error")
+    assert errors[-1]["code"] == IMAGE_INPUT_UNSUPPORTED_CODE
+    assert errors[-1]["message"] == IMAGE_INPUT_UNSUPPORTED_MESSAGE
+    assert _event_payloads(sink, "session.event.done") == []
     transcript = await manager.get_transcript(key)
-    assert transcript[-1].role == "assistant"
-    assert transcript[-1].content == UNSUPPORTED_IMAGE_INPUT_REPLY
+    assert transcript[-1].role == "system"
+    assert IMAGE_INPUT_UNSUPPORTED_MESSAGE in str(transcript[-1].content or "")
 
 
 @pytest.mark.asyncio

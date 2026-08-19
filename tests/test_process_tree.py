@@ -1,19 +1,50 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import ctypes
 import ctypes.wintypes as wintypes
 import io
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
 
-from opensquilla import process_tree
+from opensquilla import private_paths, process_tree
+
+
+def _synthetic_owner_reference(
+    database_path,
+    *,
+    owner_id: str = "a" * 32,
+    session_digest: str = "b" * 64,
+    task_digest: str = "c" * 64,
+    parent_session_digest: str | None = None,
+    parent_task_digest: str | None = None,
+    platform: str = "posix",
+    controller_pid: int = 4242,
+    controller_start_identity: str = "synthetic-start-identity",
+):
+    return process_tree._PersistedOwnerRef(
+        database_path=database_path,
+        record=process_tree._PersistedOwnerRecord(
+            owner_id=owner_id,
+            session_digest=session_digest,
+            task_digest=task_digest,
+            parent_session_digest=parent_session_digest,
+            parent_task_digest=parent_task_digest,
+            platform=platform,
+            controller_pid=controller_pid,
+            controller_start_identity=controller_start_identity,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -121,17 +152,50 @@ async def test_immediate_stop_after_ready_cannot_kill_anchor_before_ignored_targ
         assert survived.exists() is False
 
 
+@pytest.mark.skipif(os.name != "posix", reason="exec error pipe is POSIX-specific")
+@pytest.mark.asyncio
+async def test_posix_controlled_launch_preserves_missing_executable_error(tmp_path) -> None:
+    with process_tree.task_process_scope(
+        tmp_path,
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(FileNotFoundError):
+            await process_tree.create_owned_subprocess_exec(
+                "opensquilla-synthetic-command-that-does-not-exist"
+            )
+
+    assert process_tree._load_owner_records(tmp_path) == ()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="PGID lifecycle is POSIX-specific")
-def test_posix_anchor_prevents_signals_after_ownership_lifecycle_closes(
+@pytest.mark.asyncio
+async def test_posix_anchor_owns_signalling_and_closes_with_its_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    signals: list[tuple[int, int]] = []
+    gateway_signals: list[tuple[int, int]] = []
     monkeypatch.setattr(
         process_tree.os,
         "killpg",
-        lambda pgid, sig: signals.append((pgid, sig)),
+        lambda pgid, sig: gateway_signals.append((pgid, sig)),
     )
+
+    class Input:
+        def __init__(self) -> None:
+            self.commands: list[bytes] = []
+            self.closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            self.commands.append(command)
+
+        async def drain(self) -> None:
+            return None
+
     anchor_process = SimpleNamespace(returncode=None)
+    anchor_process.stdin = Input()
     owner = process_tree.ProcessTreeOwner(
         process=SimpleNamespace(returncode=0),
         pid=4242,
@@ -143,16 +207,19 @@ def test_posix_anchor_prevents_signals_after_ownership_lifecycle_closes(
     )
 
     assert owner.is_active() is True
-    owner._signal_posix_group(process_tree.signal.SIGTERM)
-    assert signals == [(4242, process_tree.signal.SIGTERM)]
+    assert await owner.posix_anchor.request_signal(
+        process_tree._POSIX_ANCHOR_TERMINATE
+    )
+    assert anchor_process.stdin.commands == [process_tree._POSIX_ANCHOR_TERMINATE]
+    assert gateway_signals == []
 
     # Reaping the parent-owned anchor permanently closes this owner. Even if a
     # later unrelated group receives the same numeric PGID, it is never probed
     # or signalled through the expired ownership token.
     anchor_process.returncode = 0
     assert owner.is_active() is False
-    owner._signal_posix_group(process_tree.signal.SIGKILL)
-    assert signals == [(4242, process_tree.signal.SIGTERM)]
+    assert not await owner.posix_anchor.request_signal(process_tree._POSIX_ANCHOR_KILL)
+    assert gateway_signals == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PGID lifecycle is POSIX-specific")
@@ -314,7 +381,7 @@ async def test_failed_ps_snapshot_keeps_real_leaderless_descendant_owned(
     )
     owner = process_tree.capture_process_tree_owner(leader, isolated=True)
     try:
-        for _attempt in range(200):
+        for _attempt in range(500):
             if failed_probe.exists() and child_pid.exists():
                 break
             await asyncio.sleep(0.01)
@@ -328,6 +395,7 @@ async def test_failed_ps_snapshot_keeps_real_leaderless_descendant_owned(
     finally:
         if owner.is_active():
             await owner.terminate(graceful_timeout=0.05, kill_timeout=1.0)
+        await asyncio.wait_for(leader.wait(), timeout=2.0)
 
 
 @pytest.mark.asyncio
@@ -516,6 +584,82 @@ async def test_windows_controlled_launcher_waits_for_helper_ready_before_release
 
 
 @pytest.mark.asyncio
+async def test_windows_named_job_is_persisted_before_target_release(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    job_names: list[str] = []
+    reference = _synthetic_owner_reference(
+        tmp_path / "registry.sqlite3",
+        platform="windows",
+    )
+
+    class Gate:
+        gate_name = "synthetic-gate"
+        ready_name = "synthetic-ready"
+
+        def wait_ready(self, _timeout: float) -> None:
+            events.append("helper-ready")
+
+        def release(self) -> None:
+            events.append("target-released")
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    class Job:
+        def assign_pid(self, _pid: int) -> None:
+            events.append("job-assigned")
+
+        def close(self) -> None:
+            events.append("job-closed")
+
+    async def spawn(*_argv: str, **_kwargs: object):
+        events.append("gated-helper-spawned")
+        return SimpleNamespace(pid=7475, returncode=None)
+
+    def create_job(_cls: object, name: str | None = None) -> Job:
+        assert name is not None
+        job_names.append(name)
+        events.append("named-job-created")
+        return Job()
+
+    def persist(*_args: object, **_kwargs: object):
+        events.append("owner-persisted")
+        return reference
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(
+        process_tree._WindowsLaunchGate,
+        "create",
+        classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(process_tree._WindowsJob, "create", classmethod(create_job))
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        await process_tree.create_owned_subprocess_exec("synthetic.exe")
+
+    assert len(job_names) == 1
+    assert job_names[0].startswith(process_tree._WINDOWS_JOB_PREFIX)
+    assert events == [
+        "named-job-created",
+        "gated-helper-spawned",
+        "job-assigned",
+        "helper-ready",
+        "owner-persisted",
+        "target-released",
+        "gate-closed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_windows_async_helper_ready_timeout_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -576,6 +720,87 @@ async def test_windows_async_helper_ready_timeout_fails_closed(
         "job-closed",
         "gate-closed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_windows_launch_cancellation_cleans_before_reraising_same_exception(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    cancelled = asyncio.CancelledError("synthetic caller cancellation")
+    reference = _synthetic_owner_reference(
+        tmp_path / "synthetic-registry.sqlite3",
+        platform="windows",
+    )
+
+    class Gate:
+        gate_name = "synthetic-gate"
+        ready_name = "synthetic-ready"
+
+        def wait_ready(self, _timeout: float) -> None:
+            events.append("helper-ready")
+
+        def release(self) -> None:
+            events.append("release-cancelled")
+            raise cancelled
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    class Job:
+        def assign_pid(self, _pid: int) -> None:
+            events.append("job-assigned")
+
+        def close(self) -> None:
+            events.append("job-closed")
+
+    class Process:
+        pid = 7677
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            events.append("target-stopped")
+            self.returncode = -15
+
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    async def spawn(*_argv: str, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(
+        process_tree._WindowsLaunchGate,
+        "create",
+        classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(
+        process_tree._WindowsJob,
+        "create",
+        classmethod(lambda _cls, _name=None: Job()),
+    )
+    monkeypatch.setattr(process_tree, "_insert_owner_record", lambda *_args, **_kwargs: reference)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda _ref: events.append("row-deleted"),
+    )
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await process_tree.create_owned_subprocess_exec("synthetic.exe")
+
+    assert exc_info.value is cancelled
+    assert events.index("target-stopped") < events.index("row-deleted")
+    assert events.index("job-closed") < events.index("row-deleted")
+    assert "release-cancelled" in events
+    assert "gate-closed" in events
 
 
 def test_windows_sync_launcher_waits_for_helper_ready_before_release(
@@ -781,6 +1006,60 @@ async def test_windows_owned_launch_boots_helper_with_restricted_target_env() ->
     assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job crash semantics")
+@pytest.mark.asyncio
+async def test_windows_gateway_crash_kills_job_and_reconcile_removes_stale_row(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    child_pid = tmp_path / "synthetic-child-pid"
+    child = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    crashed_gateway = textwrap.dedent(
+        f"""\
+        import asyncio
+        import os
+        import sys
+        from pathlib import Path
+        from opensquilla import process_tree
+
+        async def run():
+            with process_tree.task_process_scope(
+                {str(state_dir)!r},
+                session_key="synthetic-session",
+                task_id="synthetic-task",
+            ):
+                await process_tree.create_owned_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    {child!r},
+                )
+            for _attempt in range(500):
+                if Path({str(child_pid)!r}).exists():
+                    break
+                await asyncio.sleep(0.01)
+            os._exit(0)
+
+        asyncio.run(run())
+        """
+    )
+
+    worker = await asyncio.create_subprocess_exec(sys.executable, "-c", crashed_gateway)
+    await asyncio.wait_for(worker.wait(), timeout=15.0)
+    pid = int(child_pid.read_text())
+    for _attempt in range(500):
+        if process_tree._strict_process_start_identity(pid) is None:
+            break
+        await asyncio.sleep(0.01)
+    assert process_tree._strict_process_start_identity(pid) is None
+    assert len(process_tree._load_owner_records(state_dir)) == 1
+    assert await process_tree.reconcile_persisted_processes(state_dir) == 0
+    assert process_tree._load_owner_records(state_dir) == ()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")
 def test_windows_owned_popen_boots_helper_with_restricted_target_env() -> None:
     process = process_tree.create_owned_popen(
@@ -803,6 +1082,999 @@ def test_windows_owned_popen_boots_helper_with_restricted_target_env() -> None:
 
     assert process.returncode == 0, stderr.decode(errors="replace")
     assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
+
+
+def test_owner_registry_is_private_and_stores_only_stable_digests(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    monkeypatch.setattr(
+        process_tree,
+        "_strict_process_start_identity",
+        lambda _pid: "synthetic-start-identity",
+    )
+    with process_tree.task_process_scope(
+        state_dir,
+        session_key="synthetic-session-raw",
+        task_id="synthetic-task-raw",
+        parent_session_key="synthetic-parent-session-raw",
+        parent_task_id="synthetic-parent-task-raw",
+    ):
+        scope = process_tree._CURRENT_TASK_PROCESS_SCOPE.get()
+        assert scope is not None
+        process_tree._insert_owner_record(
+            scope,
+            owner_id="1" * 32,
+            platform="posix",
+            controller_pid=4242,
+        )
+
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+    raw_database = database_path.read_bytes()
+    if os.name == "nt":
+        assert private_paths.windows_path_has_private_dacl(
+            state_dir,
+            directory=True,
+            require_protected=True,
+        )
+        assert private_paths.windows_path_has_private_dacl(
+            database_path,
+            directory=False,
+            require_protected=True,
+        )
+    else:
+        assert database_path.stat().st_mode & 0o777 == 0o600
+        assert state_dir.stat().st_mode & 0o777 == 0o700
+    for forbidden in (
+        b"synthetic-session-raw",
+        b"synthetic-task-raw",
+        b"synthetic-parent-session-raw",
+        b"synthetic-parent-task-raw",
+        b"synthetic-command",
+        b"synthetic-prompt",
+        b"SYNTHETIC_SECRET_VALUE",
+        os.fsencode(tmp_path),
+    ):
+        assert forbidden not in raw_database
+    records = process_tree._load_owner_records(state_dir)
+    assert len(records) == 1
+    assert records[0].record.session_digest == process_tree._owner_digest(
+        "session", "synthetic-session-raw"
+    )
+    assert records[0].record.task_digest == process_tree._owner_digest(
+        "task", "synthetic-task-raw"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows DACL inheritance")
+def test_windows_owner_registry_sidecar_inherits_private_dacl(tmp_path) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+
+    with process_tree._connect_owner_database(database_path) as connection:
+        connection.execute("CREATE TABLE synthetic_values (value INTEGER NOT NULL)")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("INSERT INTO synthetic_values VALUES (1)")
+        journal_path = database_path.with_name(f"{database_path.name}-journal")
+        assert journal_path.is_file()
+        assert private_paths.windows_path_has_private_dacl(
+            state_dir,
+            directory=True,
+            require_protected=True,
+        )
+        assert private_paths.windows_path_has_private_dacl(
+            database_path,
+            directory=False,
+            require_protected=True,
+        )
+        assert private_paths.windows_path_has_private_dacl(
+            journal_path,
+            directory=False,
+            require_protected=False,
+        )
+        connection.rollback()
+
+    assert not journal_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX symlink semantics")
+def test_owner_registry_refuses_preexisting_symlink(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    state_dir.mkdir()
+    unrelated = tmp_path / "synthetic-unrelated-file"
+    unrelated.write_text("unchanged", encoding="utf-8")
+    (state_dir / process_tree._OWNER_DATABASE_FILENAME).symlink_to(unrelated)
+    monkeypatch.setattr(
+        process_tree,
+        "_strict_process_start_identity",
+        lambda _pid: "synthetic-start-identity",
+    )
+
+    with process_tree.task_process_scope(
+        state_dir,
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        scope = process_tree._CURRENT_TASK_PROCESS_SCOPE.get()
+        assert scope is not None
+        with pytest.raises(
+            process_tree.ProcessTreeOwnershipError,
+            match="private regular file",
+        ):
+            process_tree._insert_owner_record(
+                scope,
+                owner_id="9" * 32,
+                platform="posix",
+                controller_pid=4242,
+            )
+
+    assert unrelated.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_owner_registry_supports_concurrent_process_writers(tmp_path) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    worker = textwrap.dedent(
+        """\
+        import os
+        import sys
+        from pathlib import Path
+        from opensquilla import process_tree
+
+        state_dir = Path(sys.argv[1])
+        owner_id = sys.argv[2]
+        with process_tree.task_process_scope(
+            state_dir,
+            session_key="synthetic-session",
+            task_id=owner_id,
+        ):
+            scope = process_tree._CURRENT_TASK_PROCESS_SCOPE.get()
+            process_tree._insert_owner_record(
+                scope,
+                owner_id=owner_id,
+                platform=process_tree._platform_kind(),
+                controller_pid=os.getpid(),
+            )
+        """
+    )
+
+    def write(index: int) -> None:
+        subprocess.run(
+            [sys.executable, "-c", worker, str(state_dir), f"{index + 1:032x}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(write, range(12)))
+
+    assert len(process_tree._load_owner_records(state_dir)) == 12
+
+
+def test_windows_registry_retries_only_transient_file_sharing_failures(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def prepare(_path: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = PermissionError("synthetic sharing violation")
+            error.winerror = 32
+            raise error
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_private_file(tmp_path / "synthetic-registry.sqlite3")
+
+    assert attempts == 3
+
+
+def test_windows_registry_retries_transient_directory_acl_sharing_failures(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    state_dir.mkdir()
+    directory_attempts = 0
+
+    def apply_acl(
+        *_args: object,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal directory_attempts
+        if not directory:
+            return
+        directory_attempts += 1
+        if directory_attempts < 3:
+            error = PermissionError("synthetic sharing violation")
+            error.winerror = 32
+            raise error
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", apply_acl)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+    process_tree._prepare_private_file(database_path)
+
+    assert directory_attempts == 3
+    assert database_path.is_file()
+
+
+def test_owner_registry_hardens_preexisting_sqlite_sidecars(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "synthetic-registry.sqlite3"
+    existing = [
+        database_path,
+        *(
+            database_path.with_name(f"{database_path.name}{suffix}")
+            for suffix in ("-journal", "-shm")
+        ),
+    ]
+    for path in existing:
+        path.touch()
+    prepared_main: list[object] = []
+    prepared_sidecars: list[object] = []
+    monkeypatch.setattr(process_tree, "_prepare_private_file", prepared_main.append)
+    monkeypatch.setattr(
+        process_tree,
+        "_prepare_existing_private_file",
+        prepared_sidecars.append,
+    )
+
+    process_tree._prepare_owner_database_paths(database_path)
+
+    assert prepared_main == [database_path]
+    assert prepared_sidecars == existing[1:]
+
+
+def test_owner_registry_never_recreates_disappeared_sqlite_sidecar(tmp_path) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert not sidecar.exists()
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_windows_owner_registry_file_acl_failure_is_fail_closed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    state_dir.mkdir()
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+    if preexisting:
+        database_path.write_bytes(b"synthetic-existing-registry")
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+
+    def fail_file_acl(
+        *_args: object,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        if not directory:
+            raise OSError("synthetic ACL failure")
+
+    monkeypatch.setattr(
+        process_tree,
+        "apply_windows_private_dacl",
+        fail_file_acl,
+    )
+
+    with pytest.raises(OSError, match="synthetic ACL failure"):
+        process_tree._prepare_private_file_once(database_path)
+
+    if preexisting:
+        assert database_path.read_bytes() == b"synthetic-existing-registry"
+    else:
+        assert not database_path.exists()
+
+
+def test_windows_new_private_directory_acl_failure_removes_empty_directory(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(
+        process_tree,
+        "create_windows_private_directory",
+        lambda path: path.mkdir(),
+    )
+    monkeypatch.setattr(
+        process_tree,
+        "apply_windows_private_dacl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic ACL failure")),
+    )
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="could not be prepared",
+    ):
+        process_tree._prepare_private_directory(state_dir)
+
+    assert not state_dir.exists()
+
+
+def test_owner_claim_serializes_concurrent_cleanup_and_reclaims_dead_claimant(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    database_path = process_tree._owner_database_path(state_dir)
+    reference = _synthetic_owner_reference(database_path)
+    current_pid = os.getpid()
+    monkeypatch.setattr(
+        process_tree,
+        "_strict_process_start_identity",
+        lambda pid: "live-claimant" if pid == current_pid else None,
+    )
+    with process_tree._connect_owner_database(database_path) as connection:
+        connection.execute(
+            "INSERT INTO task_process_owners VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reference.record.owner_id,
+                process_tree._OWNER_SCHEMA_VERSION,
+                reference.record.session_digest,
+                reference.record.task_digest,
+                None,
+                None,
+                reference.record.platform,
+                reference.record.controller_pid,
+                reference.record.controller_start_identity,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_process_owner_claims VALUES (?, ?, ?, ?)",
+            (reference.record.owner_id, "stale-claim", 999999, "dead-claimant"),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(
+            executor.map(
+                lambda _index: process_tree._claim_owner_record(reference),
+                range(2),
+            )
+        )
+
+    acquired = [claim for claim in claims if claim is not None]
+    assert len(acquired) == 1
+    assert acquired[0].claim_id != "stale-claim"
+    process_tree._release_owner_claim(acquired[0])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX launch containment")
+@pytest.mark.asyncio
+async def test_posix_registry_failure_prevents_target_spawn(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Anchor:
+        pgid = 5151
+        process = SimpleNamespace(pid=5151, returncode=None)
+
+        async def arm(self) -> None:
+            events.append("armed")
+
+        def bind(self, _owner: object) -> None:
+            events.append("bound")
+
+    async def create_anchor(*_args: object, **_kwargs: object) -> Anchor:
+        events.append("anchor-ready")
+        return Anchor()
+
+    def fail_persist(*_args: object, **_kwargs: object) -> None:
+        events.append("persist-failed")
+        raise process_tree.ProcessTreeOwnershipError("synthetic registry failure")
+
+    async def stop_anchor(_anchor: object) -> None:
+        events.append("anchor-stopped")
+
+    async def target_spawn(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("target helper must remain unspawned")
+
+    monkeypatch.setattr(process_tree, "_create_posix_anchor", create_anchor)
+    monkeypatch.setattr(process_tree, "_insert_owner_record", fail_persist)
+    monkeypatch.setattr(process_tree, "_stop_unarmed_posix_anchor", stop_anchor)
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", target_spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(
+            process_tree.ProcessTreeOwnershipError,
+            match="failed closed",
+        ):
+            await process_tree.create_owned_subprocess_exec("synthetic-executable")
+
+    assert events == ["anchor-ready", "persist-failed", "anchor-stopped"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX launch containment")
+@pytest.mark.asyncio
+async def test_posix_target_is_released_only_after_persist_and_anchor_arm(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    reference = _synthetic_owner_reference(tmp_path / "registry.sqlite3")
+
+    class Anchor:
+        pgid = 5252
+        process = SimpleNamespace(pid=5252, returncode=None)
+
+        async def arm(self) -> None:
+            events.append("anchor-armed")
+
+        def bind(self, _owner: object) -> None:
+            events.append("owner-bound")
+
+    class Gate:
+        read_fd = 91
+
+        def child_pass_fds(self, _existing: object) -> tuple[int, ...]:
+            return (91,)
+
+        def close_child_end(self) -> None:
+            events.append("child-gate-closed")
+
+        def release(self) -> None:
+            events.append("target-released")
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    async def create_anchor(*_args: object, **_kwargs: object) -> Anchor:
+        events.append("anchor-ready")
+        return Anchor()
+
+    def persist(*_args: object, **_kwargs: object):
+        events.append("owner-persisted")
+        return reference
+
+    async def spawn(*_args: object, **_kwargs: object):
+        events.append("gated-helper-spawned")
+        return SimpleNamespace(pid=5353, returncode=None)
+
+    monkeypatch.setattr(process_tree, "_create_posix_anchor", create_anchor)
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    monkeypatch.setattr(
+        process_tree._PosixLaunchGate,
+        "create",
+        classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        await process_tree.create_owned_subprocess_exec("synthetic-executable")
+
+    assert events == [
+        "anchor-ready",
+        "owner-persisted",
+        "gated-helper-spawned",
+        "child-gate-closed",
+        "owner-bound",
+        "anchor-armed",
+        "target-released",
+        "gate-closed",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX launch containment")
+@pytest.mark.asyncio
+async def test_posix_launch_cancellation_cleans_before_reraising_same_exception(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    cancelled = asyncio.CancelledError("synthetic caller cancellation")
+    reference = _synthetic_owner_reference(tmp_path / "synthetic-registry.sqlite3")
+
+    class Process:
+        pid = 5353
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            events.append("target-stopped")
+            self.returncode = -15
+
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    class Anchor:
+        pgid = 5252
+        process = SimpleNamespace(pid=5252, returncode=None)
+
+        async def arm(self) -> None:
+            events.append("anchor-arm-cancelled")
+            raise cancelled
+
+        def bind(self, _owner: object) -> None:
+            events.append("owner-bound")
+
+    class Gate:
+        read_fd = 91
+
+        def child_pass_fds(self, _existing: object) -> tuple[int, ...]:
+            return (91,)
+
+        def close_child_end(self) -> None:
+            events.append("child-gate-closed")
+
+        def release(self) -> None:
+            raise AssertionError("cancelled target must not be released")
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    async def create_anchor(*_args: object, **_kwargs: object) -> Anchor:
+        return Anchor()
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        events.append("target-spawned")
+        return Process()
+
+    async def stop_anchor(_anchor: object) -> None:
+        events.append("anchor-stopped")
+
+    monkeypatch.setattr(process_tree, "_create_posix_anchor", create_anchor)
+    monkeypatch.setattr(process_tree, "_insert_owner_record", lambda *_args, **_kwargs: reference)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda _ref: events.append("row-deleted"),
+    )
+    monkeypatch.setattr(process_tree, "_stop_unarmed_posix_anchor", stop_anchor)
+    monkeypatch.setattr(
+        process_tree._PosixLaunchGate,
+        "create",
+        classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await process_tree.create_owned_subprocess_exec("synthetic-executable")
+
+    assert exc_info.value is cancelled
+    assert events.index("target-stopped") < events.index("row-deleted")
+    assert events.index("anchor-stopped") < events.index("row-deleted")
+    assert "owner-bound" in events
+    assert "target-spawned" in events
+    assert "child-gate-closed" in events
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX owner lifecycle")
+@pytest.mark.asyncio
+async def test_natural_process_tree_exit_reclaims_persisted_row(tmp_path) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    with process_tree.task_process_scope(
+        state_dir,
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        process = await process_tree.create_owned_subprocess_exec(
+            sys.executable,
+            "-c",
+            "pass",
+        )
+    owner = process_tree.capture_process_tree_owner(process, isolated=True)
+    await asyncio.wait_for(process.wait(), timeout=5.0)
+    for _attempt in range(300):
+        if not process_tree._load_owner_records(state_dir):
+            break
+        await asyncio.sleep(0.01)
+    assert process_tree._load_owner_records(state_dir) == ()
+    assert await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_windows_job_completion_monitor_reclaims_persisted_row(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted: list[str] = []
+
+    class Job:
+        def __init__(self) -> None:
+            self.counts = iter((1, 0))
+            self.closed = False
+
+        def active_process_count(self) -> int:
+            return next(self.counts)
+
+        def close_if_empty(self) -> bool:
+            self.closed = True
+            return True
+
+    job = Job()
+    reference = _synthetic_owner_reference(
+        tmp_path / "registry.sqlite3",
+        platform="windows",
+    )
+    monkeypatch.setattr(process_tree, "_WindowsJob", Job)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=0),
+        pid=reference.record.controller_pid,
+        windows_job=job,
+        persisted_owner=reference,
+    )
+
+    owner.start_completion_monitor()
+    assert owner._completion_monitor is not None
+    await asyncio.wait_for(owner._completion_monitor, timeout=1.0)
+
+    assert job.closed is True
+    assert deleted == [reference.record.owner_id]
+
+
+def test_pid_identity_mismatch_reclaims_stale_row_without_signalling(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _synthetic_owner_reference(tmp_path / "registry.sqlite3")
+    deleted: list[str] = []
+    monkeypatch.setattr(process_tree, "_posix_controller_matches", lambda _record: False)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+    monkeypatch.setattr(
+        process_tree.socket,
+        "socket",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale PID must not reach process control")
+        ),
+    )
+
+    assert process_tree._terminate_persisted_posix_owner_sync(reference) is False
+    assert deleted == [reference.record.owner_id]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="AF_UNIX control endpoint is POSIX-specific")
+def test_live_posix_owner_with_unavailable_control_endpoint_retains_row(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _synthetic_owner_reference(tmp_path / "registry.sqlite3")
+    deleted: list[str] = []
+    monkeypatch.setattr(process_tree, "_posix_controller_matches", lambda _record: True)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+
+    assert process_tree._terminate_persisted_posix_owner_sync(reference) is False
+    assert deleted == []
+
+
+def test_windows_controller_identity_mismatch_reclaims_row_without_opening_job(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _synthetic_owner_reference(
+        tmp_path / "registry.sqlite3",
+        platform="windows",
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(process_tree, "_controller_identity_matches", lambda _record: False)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+    monkeypatch.setattr(
+        process_tree._WindowsJob,
+        "open",
+        classmethod(
+            lambda _cls, _name: (_ for _ in ()).throw(
+                AssertionError("reused PID must not open a named Job")
+            )
+        ),
+    )
+
+    assert process_tree._terminate_persisted_windows_owner_sync(reference) is False
+    assert deleted == [reference.record.owner_id]
+
+
+@pytest.mark.parametrize(
+    ("mode", "stopped", "row_deleted"),
+    [
+        ("unavailable", False, False),
+        ("membership-mismatch", False, False),
+        ("terminated", True, True),
+    ],
+)
+def test_windows_recovered_job_cleanup_is_fail_safe(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    stopped: bool,
+    row_deleted: bool,
+) -> None:
+    reference = _synthetic_owner_reference(
+        tmp_path / "registry.sqlite3",
+        platform="windows",
+    )
+    deleted: list[str] = []
+
+    class Job:
+        def contains_pid(self, _pid: int) -> bool:
+            return mode != "membership-mismatch"
+
+        def terminate(self) -> None:
+            return None
+
+        def active_process_count(self) -> int:
+            return 0
+
+        def close(self) -> None:
+            return None
+
+    def open_job(_cls: object, _name: str) -> Job:
+        if mode == "unavailable":
+            raise OSError("synthetic unavailable job")
+        return Job()
+
+    monkeypatch.setattr(process_tree, "_controller_identity_matches", lambda _row: True)
+    monkeypatch.setattr(process_tree._WindowsJob, "open", classmethod(open_job))
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+
+    assert process_tree._terminate_persisted_windows_owner_sync(reference) is stopped
+    assert bool(deleted) is row_deleted
+
+
+def test_task_lineage_requires_parent_session_and_task_identity(tmp_path) -> None:
+    root_session = "1" * 64
+    root_task = "2" * 64
+    child_session = "3" * 64
+    child_task = "4" * 64
+    references = (
+        _synthetic_owner_reference(
+            tmp_path / "registry.sqlite3",
+            owner_id="1" * 32,
+            session_digest=root_session,
+            task_digest=root_task,
+        ),
+        _synthetic_owner_reference(
+            tmp_path / "registry.sqlite3",
+            owner_id="2" * 32,
+            session_digest=child_session,
+            task_digest=child_task,
+            parent_session_digest=root_session,
+            parent_task_digest=root_task,
+        ),
+        _synthetic_owner_reference(
+            tmp_path / "registry.sqlite3",
+            owner_id="3" * 32,
+            session_digest="5" * 64,
+            task_digest="6" * 64,
+            parent_session_digest="7" * 64,
+            parent_task_digest=root_task,
+        ),
+    )
+
+    selected = process_tree._task_owned_records(
+        references,
+        session_digest=root_session,
+        task_digest=root_task,
+    )
+
+    assert [row.record.owner_id for row in selected] == ["1" * 32, "2" * 32]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_platform_record_is_retained_fail_safe(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _synthetic_owner_reference(
+        tmp_path / "registry.sqlite3",
+        platform="windows",
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(process_tree, "_platform_kind", lambda: "posix")
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+
+    assert await process_tree._terminate_persisted_owner(reference) is False
+    assert deleted == []
+
+
+@pytest.mark.asyncio
+async def test_absent_and_newer_owner_registry_are_upgrade_safe(tmp_path) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    assert (
+        await process_tree.cancel_persisted_processes_for_task(
+            state_dir,
+            "synthetic-session",
+            "synthetic-task",
+        )
+        == 0
+    )
+    database_path = process_tree._owner_database_path(state_dir)
+    reference = _synthetic_owner_reference(database_path)
+    with process_tree._connect_owner_database(database_path) as connection:
+        connection.execute(
+            "INSERT INTO task_process_owners VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reference.record.owner_id,
+                process_tree._OWNER_SCHEMA_VERSION + 1,
+                reference.record.session_digest,
+                reference.record.task_digest,
+                None,
+                None,
+                reference.record.platform,
+                reference.record.controller_pid,
+                reference.record.controller_start_identity,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_process_owners VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "d" * 32,
+                "synthetic-invalid-version",
+                reference.record.session_digest,
+                reference.record.task_digest,
+                None,
+                None,
+                reference.record.platform,
+                reference.record.controller_pid,
+                reference.record.controller_start_identity,
+            ),
+        )
+
+    assert process_tree._load_owner_records(state_dir) == ()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM task_process_owners").fetchone() == (2,)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX crash recovery")
+@pytest.mark.asyncio
+async def test_concurrent_stop_after_gateway_crash_kills_deep_tree_and_isolates_other_task(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    pid_file = tmp_path / "synthetic-owned-pids"
+    grandchild = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        "time.sleep(30)"
+    )
+    child = (
+        "import os,pathlib,subprocess,sys,time; "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r}]); "
+        "time.sleep(30)"
+    )
+    target = (
+        "import os,pathlib,subprocess,sys,time; "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        f"subprocess.Popen([sys.executable,'-c',{child!r}]); "
+        "time.sleep(30)"
+    )
+    crashed_gateway = textwrap.dedent(
+        f"""\
+        import asyncio
+        import os
+        import sys
+        from pathlib import Path
+        from opensquilla import process_tree
+
+        async def run():
+            with process_tree.task_process_scope(
+                {str(state_dir)!r},
+                session_key="synthetic-session",
+                task_id="synthetic-task",
+            ):
+                await process_tree.create_owned_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    {target!r},
+                )
+            for _attempt in range(500):
+                path = Path({str(pid_file)!r})
+                if path.exists() and len(path.read_text().splitlines()) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            os._exit(0)
+
+        asyncio.run(run())
+        """
+    )
+    worker = await asyncio.create_subprocess_exec(sys.executable, "-c", crashed_gateway)
+    other_process = None
+    owned_pids: list[int] = []
+    try:
+        await asyncio.wait_for(worker.wait(), timeout=10.0)
+        owned_pids = [int(value) for value in pid_file.read_text().splitlines()]
+        assert len(owned_pids) == 3
+        with process_tree.task_process_scope(
+            state_dir,
+            session_key="synthetic-other-session",
+            task_id="synthetic-other-task",
+        ):
+            other_process = await process_tree.create_owned_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            )
+
+        results = await asyncio.gather(
+            process_tree.cancel_persisted_processes_for_task(
+                state_dir,
+                "synthetic-session",
+                "synthetic-task",
+            ),
+            process_tree.cancel_persisted_processes_for_task(
+                state_dir,
+                "synthetic-session",
+                "synthetic-task",
+            ),
+        )
+        assert sum(results) == 1
+        assert other_process.returncode is None
+        for _attempt in range(300):
+            if all(not process_tree._strict_process_start_identity(pid) for pid in owned_pids):
+                break
+            await asyncio.sleep(0.01)
+        assert all(not process_tree._strict_process_start_identity(pid) for pid in owned_pids)
+        remaining = process_tree._load_owner_records(state_dir)
+        assert len(remaining) == 1
+        assert remaining[0].record.session_digest == process_tree._owner_digest(
+            "session", "synthetic-other-session"
+        )
+    finally:
+        await process_tree.reconcile_persisted_processes(state_dir)
+        if other_process is not None and other_process.returncode is None:
+            other_owner = process_tree.capture_process_tree_owner(other_process, isolated=True)
+            await other_owner.terminate(graceful_timeout=0.1, kill_timeout=1.0)
+        if other_process is not None:
+            await asyncio.wait_for(other_process.wait(), timeout=2.0)
+        for pid in owned_pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")

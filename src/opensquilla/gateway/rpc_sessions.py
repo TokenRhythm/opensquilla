@@ -1245,12 +1245,14 @@ async def _cancel_task_owned_auxiliary_work(
     session_key: str,
     task_id: str,
     deadline_at_monotonic: float,
+    process_state_dir: str | Path | None = None,
 ) -> int:
     """Stop task-owned completion delivery and registered background processes."""
 
     from opensquilla.gateway.subagent_announce import (
         cancel_background_completion_for_task,
     )
+    from opensquilla.process_tree import cancel_persisted_processes_for_task
     from opensquilla.tools.builtin.shell import cancel_background_processes_for_task
 
     completion_task = asyncio.create_task(
@@ -1258,6 +1260,9 @@ async def _cancel_task_owned_auxiliary_work(
     )
     process_task = asyncio.create_task(
         cancel_background_processes_for_task(session_key, task_id)
+    )
+    persisted_process_task = asyncio.create_task(
+        cancel_persisted_processes_for_task(process_state_dir, session_key, task_id)
     )
     cancelled_completions = await _await_abort_operation(
         completion_task,
@@ -1271,7 +1276,17 @@ async def _cancel_task_owned_auxiliary_work(
         operation="cancel_task_background_processes",
         default=0,
     )
-    return int(cancelled_completions) + int(cancelled_processes)
+    cancelled_persisted_processes = await _await_abort_background_task(
+        persisted_process_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_persisted_processes",
+        default=0,
+    )
+    return (
+        int(cancelled_completions)
+        + int(cancelled_processes)
+        + int(cancelled_persisted_processes)
+    )
 
 
 async def _cancel_task_owned_descendants(
@@ -1282,6 +1297,7 @@ async def _cancel_task_owned_descendants(
     source: str,
     reason: str,
     deadline_at_monotonic: float,
+    process_state_dir: str | Path | None = None,
 ) -> int:
     """Cancel active subagent descendants proven to belong to one exact task."""
 
@@ -1361,6 +1377,7 @@ async def _cancel_task_owned_descendants(
                         session_key=session_key,
                         task_id=task_id,
                         deadline_at_monotonic=deadline_at_monotonic,
+                        process_state_dir=process_state_dir,
                     )
                 )
             )
@@ -8488,6 +8505,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         return {"aborted": False, "key": key}
 
     requested_task_id = _optional_string_param(params, "task_id", "taskId")
+    process_state_dir = getattr(getattr(ctx, "config", None), "state_dir", None)
     abort_scope = _optional_string_param(params, "scope")
     task_scoped = bool(abort_scope and abort_scope.lower() == "task")
     if task_scoped and requested_task_id is None:
@@ -8539,6 +8557,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 session_key=key,
                 task_id=requested_task_id,
                 deadline_at_monotonic=cleanup_deadline,
+                process_state_dir=process_state_dir,
             )
         )
         exact_descendant_cleanup = asyncio.create_task(
@@ -8549,6 +8568,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 source=exact_cancel_source,
                 reason="user_abort",
                 deadline_at_monotonic=cleanup_deadline,
+                process_state_dir=process_state_dir,
             )
         )
         for cleanup_task in (
@@ -8603,6 +8623,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         from opensquilla.gateway.subagent_announce import (
             cancel_background_completion_for_session,
         )
+        from opensquilla.process_tree import cancel_persisted_processes_for_session
 
         if requested_task_id is not None:
             assert exact_runtime_cleanup is not None
@@ -8735,6 +8756,15 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                         cancel_background_completion_for_session(session_key),
                         deadline_at_monotonic=abort_deadline,
                         operation="cancel_background_completion",
+                        default=0,
+                    )
+                    cancelled_groups += await _await_abort_operation(
+                        cancel_persisted_processes_for_session(
+                            process_state_dir,
+                            session_key,
+                        ),
+                        deadline_at_monotonic=abort_deadline,
+                        operation="cancel_persisted_session_processes",
                         default=0,
                     )
                 active_task_ids = await _await_abort_operation(

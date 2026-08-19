@@ -17,6 +17,11 @@ ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
     "Ensemble does not support image input yet. "
     "Switch to a single-model routing mode and try again."
 )
+IMAGE_INPUT_UNSUPPORTED_CODE = "image_input_unsupported"
+IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
+    "The selected model cannot process image input. Choose an image-capable "
+    "model or remove the image and try again."
+)
 
 # Non-context budget-exhaustion codes. Context-window exhaustion has its own,
 # more specific message via ``is_context_payload_too_large`` and is intentionally
@@ -57,6 +62,7 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "context_overflow",
         "empty_response",
         "ensemble_multimodal_unsupported",
+        "image_input_unsupported",
         "incomplete_stream",
         "incomplete_tool_call",
         "incomplete_tool_stream",
@@ -176,6 +182,8 @@ def build_terminal_reply(
         or reason == ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE
     ):
         return ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE
+    if error_class == IMAGE_INPUT_UNSUPPORTED_CODE or reason == IMAGE_INPUT_UNSUPPORTED_CODE:
+        return IMAGE_INPUT_UNSUPPORTED_MESSAGE
     if error_class == "sandbox_threshold_exceeded" or reason == "sandbox_threshold_exceeded":
         return (
             "Automatic execution paused after repeated sandbox denials. Approve the "

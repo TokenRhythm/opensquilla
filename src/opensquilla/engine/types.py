@@ -765,6 +765,9 @@ class AgentConfig:
     # while Artifact mutations require an authoritative tools declaration for
     # every physical selector leg.
     model_tools_capability_verified: bool = False
+    # Runtime-only tri-state evidence; synthesized capability defaults remain
+    # ``unknown`` instead of becoming an authoritative vision denial.
+    model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
     # Legacy compression knobs remain as compatibility shims for meta_invoke

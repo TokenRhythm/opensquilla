@@ -376,6 +376,9 @@ class QuotaStatus:
     abort_reason: str | None = None
 
 
+VisionSupport = Literal["supported", "unsupported", "unknown"]
+
+
 @dataclass(frozen=True)
 class ModelCapabilities:
     """Per-model capability flags resolved from ModelCatalog."""
@@ -563,6 +566,14 @@ class ChatConfig(BaseModel):
     output_json_schema: dict[str, Any] | None = None
     output_json_schema_strict: bool = True
     model_capabilities: ModelCapabilities | None = None
+    # Runtime-only evidence for the vision field.  ``ModelCapabilities`` keeps
+    # its long-standing boolean contract, while this sidecar distinguishes an
+    # authoritative false value from a synthesized catalog default.
+    model_vision_support: VisionSupport = Field(
+        default="unknown",
+        exclude=True,
+        repr=False,
+    )
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
     # Runtime-only provenance for an explicit global

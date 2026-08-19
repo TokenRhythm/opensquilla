@@ -14,9 +14,11 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine import ToolResult
-from opensquilla.engine.agent import UNSUPPORTED_IMAGE_INPUT_REPLY, Agent
+from opensquilla.engine.agent import Agent
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
@@ -41,6 +43,7 @@ from opensquilla.provider import (
     ToolUseStartEvent,
 )
 from opensquilla.provider.openai import OpenAIProvider
+from opensquilla.provider.protocol import IMAGE_INPUT_UNSUPPORTED_CODE
 from opensquilla.provider.types import ContentBlockImage
 from opensquilla.tools.types import CallerKind, ToolContext
 
@@ -1029,6 +1032,9 @@ async def test_unknown_primary_uses_known_vision_fallback_for_image() -> None:
     wrapper.configure_fallback_deployment_limits(
         [(fallback_config, 0, 0, ModelCapabilities(supports_vision=True))]
     )
+    wrapper.configure_fallback_deployment_vision_support(
+        [(fallback_config, "supported")]
+    )
     messages = [
         Message(
             role="user",
@@ -1045,7 +1051,11 @@ async def test_unknown_primary_uses_known_vision_fallback_for_image() -> None:
     ]
 
 
-async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("fallback_vision_support", ["unsupported", "unknown"])
+async def test_image_request_does_not_call_text_only_fallback(
+    monkeypatch: Any,
+    fallback_vision_support: str,
+) -> None:
     class _Catalog:
         def get_capabilities(
             self,
@@ -1055,6 +1065,10 @@ async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) 
         ) -> ModelCapabilities:
             del model_id, provider_name, base_url
             return ModelCapabilities(supports_vision=False)
+
+        def resolve_deployment_vision_support(self, *args, **kwargs):
+            del args, kwargs
+            return fallback_vision_support
 
     class _Provider:
         provider_name = "openrouter"
@@ -1141,16 +1155,18 @@ async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) 
         and event.phase in {"retry_wait", "fallback"}
         for event in events
     )
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
-        UNSUPPORTED_IMAGE_INPUT_REPLY
+    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
+        IMAGE_INPUT_UNSUPPORTED_CODE
     ]
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.model == "vision-primary"
-    assert done.input_tokens == 0
-    assert done.output_tokens == 0
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
     assert metadata["image_input_mode"] == "rejected"
-    assert metadata["image_input_reason"] == "fallback_vision_unsupported"
+    assert metadata["image_input_reason"] == (
+        "capability_unknown"
+        if fallback_vision_support == "unknown"
+        else "model_vision_unsupported"
+    )
+    assert metadata["image_input_stage"] == "fallback"
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"
     assert "router_fallback_hops" not in metadata
@@ -1173,6 +1189,10 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
         ) -> ModelCapabilities:
             del model_id, provider_name, base_url
             return ModelCapabilities(supports_vision=False)
+
+        def resolve_deployment_vision_support(self, *args, **kwargs):
+            del args, kwargs
+            return "unsupported"
 
     class _Provider:
         provider_name = "openrouter"
@@ -1248,6 +1268,7 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
             max_turn_llm_calls=1,
             model_id="vision-primary",
             model_capabilities=ModelCapabilities(supports_vision=True),
+            model_vision_support="supported",
         ),
     )
     image_message = Message(
@@ -1267,17 +1288,23 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
     assert selector.fallback.calls == 0
     assert selector.primary.validation_calls == 2
     assert selector.fallback.validation_calls == 0
-    assert not any(event.kind == "error" for event in events)
     assert any(
-        event.kind == "warning" and event.code == "provider_empty_retry"
+        getattr(event, "kind", "") == "error"
+        and getattr(event, "code", "") == IMAGE_INPUT_UNSUPPORTED_CODE
         for event in events
     )
-    done = next(event for event in events if isinstance(event, EngineDoneEvent))
-    assert done.text == UNSUPPORTED_IMAGE_INPUT_REPLY
-    assert done.input_tokens == 3
-    assert done.output_tokens == 0
+    assert any(
+        getattr(event, "kind", "") == "warning"
+        and getattr(event, "code", "") == "provider_empty_retry"
+        for event in events
+    )
+    done_events = [event for event in events if isinstance(event, EngineDoneEvent)]
+    if done_events:
+        assert done_events[-1].input_tokens == 3
+        assert done_events[-1].output_tokens == 0
     assert metadata["image_input_mode"] == "rejected"
-    assert metadata["image_input_reason"] == "fallback_vision_unsupported"
+    assert metadata["image_input_reason"] == "model_vision_unsupported"
+    assert metadata["image_input_stage"] == "fallback"
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"
     assert "router_fallback_hops" not in metadata

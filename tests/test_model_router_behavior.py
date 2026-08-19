@@ -1396,8 +1396,11 @@ async def test_c3_fusion_rejects_image_input_when_no_independent_image_tier_is_a
         },
     }
 
-    with pytest.raises(RuntimeError, match="while C3 multi-model fusion is selected"):
-        await apply_squilla_router(ctx)
+    result = await apply_squilla_router(ctx)
+
+    assert result.metadata["image_input_forced_rejection_reason"] == (
+        "router_image_route_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -1423,8 +1426,11 @@ async def test_global_fusion_rejects_c3_as_the_only_image_fallback(
         },
     }
 
-    with pytest.raises(RuntimeError, match="while C3 multi-model fusion is selected"):
-        await apply_squilla_router(ctx)
+    result = await apply_squilla_router(ctx)
+
+    assert result.metadata["image_input_forced_rejection_reason"] == (
+        "router_image_route_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -1538,8 +1544,11 @@ async def test_image_route_rejects_when_every_image_tier_has_blank_model(
         },
     }
 
-    with pytest.raises(RuntimeError, match="non-empty model"):
-        await apply_squilla_router(ctx)
+    result = await apply_squilla_router(ctx)
+
+    assert result.metadata["image_input_forced_rejection_reason"] == (
+        "router_image_route_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -1904,11 +1913,11 @@ async def test_image_attachment_without_image_tier_fails_locally(
     )
     ctx.config.squilla_router.tiers["image_model"]["supports_image"] = False
 
-    with pytest.raises(
-        RuntimeError,
-        match="No image-capable SquillaRouter tier is configured",
-    ):
-        await apply_squilla_router(ctx)
+    result = await apply_squilla_router(ctx)
+
+    assert result.metadata["image_input_forced_rejection_reason"] == (
+        "router_image_route_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -1949,11 +1958,11 @@ async def test_caption_less_image_attachment_without_image_tier_fails_locally(
     )
     ctx.config.squilla_router.tiers["image_model"]["supports_image"] = False
 
-    with pytest.raises(
-        RuntimeError,
-        match="No image-capable SquillaRouter tier is configured",
-    ):
-        await apply_squilla_router(ctx)
+    result = await apply_squilla_router(ctx)
+
+    assert result.metadata["image_input_forced_rejection_reason"] == (
+        "router_image_route_unavailable"
+    )
 
 
 @pytest.mark.asyncio

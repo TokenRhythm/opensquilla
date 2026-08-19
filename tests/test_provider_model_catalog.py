@@ -311,6 +311,27 @@ def test_get_capabilities_honors_user_vision_override_on_live_reasoning_model() 
 
     assert caps.supports_reasoning is True
     assert caps.supports_vision is False
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="openrouter",
+    ) == "unsupported"
+
+
+def test_vision_support_distinguishes_live_evidence_from_synthesized_default() -> None:
+    catalog = _catalog_with_live_reasoning_model()
+
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="openrouter",
+    ) == "supported"
+    assert catalog.resolve_vision_support(
+        "vendor/unknown-model",
+        provider_name="openrouter",
+    ) == "unknown"
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="synthetic-provider",
+    ) == "unknown"
 
 
 @pytest.mark.parametrize(

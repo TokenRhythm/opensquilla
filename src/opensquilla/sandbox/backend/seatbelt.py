@@ -18,15 +18,17 @@ import logging
 import os
 import re
 import shutil
-import signal
 import sys
 import sysconfig
 import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
-from typing import Any, cast
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
@@ -1147,14 +1149,13 @@ class SeatbeltBackend(Backend):
             wall = request.policy.limits.wall_timeout_s
             started = time.monotonic()
             try:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await create_owned_subprocess_exec(
                     *argv,
                     stdin=asyncio.subprocess.PIPE if request.stdin is not None else None,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(request.cwd),
                     env=env,
-                    start_new_session=True,
                 )
             except FileNotFoundError as exc:
                 raise SandboxBackendError(f"seatbelt launch failed: {exc}") from exc
@@ -1172,6 +1173,13 @@ class SeatbeltBackend(Backend):
             except TimeoutError:
                 timed_out = True
                 stdout_bytes, stderr_bytes = await _terminate_process_group(proc)
+            else:
+                owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+                if owner is not None:
+                    await owner.terminate(
+                        graceful_timeout=0.0,
+                        kill_timeout=_TERMINATE_GRACE_S,
+                    )
 
             elapsed = time.monotonic() - started
             stdout, trunc_out = _decode_capped(stdout_bytes)
@@ -1226,24 +1234,13 @@ def _decode_capped(raw: bytes | None) -> tuple[str, bool]:
 async def _terminate_process_group(
     proc: asyncio.subprocess.Process,
 ) -> tuple[bytes, bytes]:
-    pid = proc.pid
-    os_mod = cast(Any, os)
-    signal_mod = cast(Any, signal)
-    try:
-        os_mod.killpg(pid, signal_mod.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_S)
-    except TimeoutError:
-        try:
-            os_mod.killpg(pid, signal_mod.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+    owner = capture_process_tree_owner(proc, isolated=True)
+    await owner.terminate(
+        graceful_timeout=_TERMINATE_GRACE_S,
+        kill_timeout=_TERMINATE_GRACE_S,
+    )
+    with contextlib.suppress(ProcessLookupError):
+        await proc.wait()
 
     stdout = b""
     stderr = b""
