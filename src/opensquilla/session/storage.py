@@ -1554,6 +1554,10 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
+    return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
+
+
 def _py_lower(value: Any) -> Any:
     """Unicode-aware lowercase for the ``py_lower`` SQL function.
 
@@ -1715,8 +1719,11 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._transcript_reader: Any | None = None
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
+        self._transcript_reader_lock = asyncio.Lock()
+        self._transcript_reader_fallback_warned = False
         self._usage_backfill_index_lock = asyncio.Lock()
         self._usage_backfill_indexes_ready = False
         self._legacy_project_adoption_lock = asyncio.Lock()
@@ -1774,6 +1781,13 @@ class SessionStorage:
         *,
         goal_pause_reason: str = "process_restart",
     ) -> None:
+        if (
+            self._conn is not None
+            or self._transcript_reader is not None
+            or self._meta_launch_draft_gc_task is not None
+        ):
+            await self.close()
+        self._poisoned = False
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
@@ -1792,10 +1806,17 @@ class SessionStorage:
             await self._conn.create_function(  # type: ignore[attr-defined]
                 name, arity, function, deterministic=True
             )
-        await self._conn.execute("PRAGMA journal_mode=WAL")
+        async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
+            journal_mode_row = await cur.fetchone()
+        journal_mode = (
+            str(journal_mode_row[0]).strip().lower()
+            if journal_mode_row is not None
+            else ""
+        )
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+        await self._open_transcript_reader(journal_mode)
         self._meta_launch_draft_gc_task = asyncio.create_task(
             self._run_meta_launch_draft_gc(),
             name="session-storage-meta-launch-draft-gc",
@@ -1814,9 +1835,96 @@ class SessionStorage:
             with contextlib.suppress(asyncio.CancelledError):
                 await gc_task
         async with self._operation_lock:
-            if self._conn:
-                await self._conn.close()
-                self._conn = None
+            async with self._transcript_reader_lock:
+                reader, self._transcript_reader = self._transcript_reader, None
+                conn, self._conn = self._conn, None
+                try:
+                    if reader is not None:
+                        await reader.close()
+                finally:
+                    if conn is not None:
+                        await conn.close()
+
+    def _warn_transcript_reader_fallback_once(
+        self,
+        reason: str,
+        journal_mode: str,
+    ) -> None:
+        if self._transcript_reader_fallback_warned:
+            return
+        self._transcript_reader_fallback_warned = True
+        safe_reason = (
+            reason
+            if reason in {"journal_mode_not_wal", "memory_database", "open_failed"}
+            else "unknown"
+        )
+        safe_journal_mode = (
+            journal_mode
+            if journal_mode in {"delete", "memory", "off", "persist", "truncate", "wal"}
+            else "unknown"
+        )
+        log.warning(
+            "session_storage.transcript_reader_fallback reason=%s journal_mode=%s",
+            safe_reason,
+            safe_journal_mode,
+            extra={
+                "event": "session_storage.transcript_reader_fallback",
+                "reason": safe_reason,
+                "journal_mode": safe_journal_mode,
+            },
+        )
+
+    async def _open_transcript_reader(self, journal_mode: str) -> None:
+        if self._db_path == ":memory:":
+            self._warn_transcript_reader_fallback_once("memory_database", journal_mode)
+            return
+        if journal_mode != "wal":
+            self._warn_transcript_reader_fallback_once(
+                "journal_mode_not_wal",
+                journal_mode,
+            )
+            return
+
+        reader: Any | None = None
+        try:
+            reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+            reader.row_factory = aiosqlite.Row
+            async with reader.execute("PRAGMA query_only=ON"):
+                pass
+            async with reader.execute(
+                f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}"
+            ):
+                pass
+            async with reader.execute("PRAGMA journal_mode") as cur:
+                reader_journal_mode_row = await cur.fetchone()
+            reader_journal_mode = (
+                str(reader_journal_mode_row[0]).strip().lower()
+                if reader_journal_mode_row is not None
+                else ""
+            )
+            if reader_journal_mode != "wal":
+                await reader.close()
+                self._warn_transcript_reader_fallback_once(
+                    "journal_mode_not_wal",
+                    reader_journal_mode,
+                )
+                return
+            async with reader.execute("PRAGMA query_only") as cur:
+                query_only_row = await cur.fetchone()
+            if query_only_row is None or int(query_only_row[0]) != 1:
+                raise RuntimeError("transcript reader query-only mode unavailable")
+        except asyncio.CancelledError:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            raise
+        except Exception:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            self._warn_transcript_reader_fallback_once("open_failed", journal_mode)
+            return
+        self._transcript_reader = reader
 
     async def _run_meta_launch_draft_gc(self) -> None:
         """Physically enforce raw-draft retention while the Gateway stays up."""
@@ -1843,10 +1951,15 @@ class SessionStorage:
 
     async def _retire_poisoned_connection(self) -> None:
         self._poisoned = True
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            with contextlib.suppress(BaseException):
-                await conn.close()
+        async with self._transcript_reader_lock:
+            reader, self._transcript_reader = self._transcript_reader, None
+            conn, self._conn = self._conn, None
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            if conn is not None:
+                with contextlib.suppress(BaseException):
+                    await conn.close()
 
     async def _finish_sqlite_call(self, awaitable: Awaitable[Any]) -> Any:
         """Do not release the operation gate while a cancelled DB call is still queued."""
@@ -13252,19 +13365,129 @@ class SessionStorage:
             )
         return acceptance_result
 
-    @_serialized_read
-    async def get_transcript(
-        self, session_id: str, limit: int | None = None, offset: int = 0
-    ) -> list[TranscriptEntry]:
+    async def _fetchall_transcript_rows(self, cursor: Any) -> list[Any]:
+        return cast(
+            list[Any],
+            await self._finish_sqlite_call(cursor.fetchall()),
+        )
+
+    async def _fetch_transcript_rows(
+        self,
+        conn: Any,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
         # SQLite requires LIMIT before OFFSET; use -1 for unlimited
         limit_val = limit if limit is not None else -1
         sql = (
             "SELECT * FROM transcript_entries WHERE session_id = ? "
             "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"
         )
-        async with self.conn.execute(sql, (session_id, limit_val, offset)) as cur:
-            rows = await cur.fetchall()
-        return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
+        async with conn.execute(sql, (session_id, limit_val, offset)) as cur:
+            return await self._fetchall_transcript_rows(cur)
+
+    async def _fetch_transcript_rows_on_writer(
+        self,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            async with self._operation_lock:
+                self._raise_if_poisoned()
+                return cast(
+                    list[Any],
+                    await self._finish_sqlite_call(
+                        self._fetch_transcript_rows(
+                            self.conn,
+                            session_id,
+                            limit,
+                            offset,
+                        )
+                    )
+                )
+
+        started = self._monotonic()
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._operation_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_operation_lock",
+                ) from exc
+            acquired = True
+            self._raise_if_poisoned()
+            return cast(
+                list[Any],
+                await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        self.conn,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            )
+        finally:
+            if acquired:
+                self._operation_lock.release()
+
+    @asynccontextmanager
+    async def _transcript_reader_access(self) -> AsyncIterator[Any | None]:
+        acquired = False
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            await self._transcript_reader_lock.acquire()
+            acquired = True
+        else:
+            started = self._monotonic()
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._transcript_reader_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_transcript_reader_lock",
+                ) from exc
+            acquired = True
+        try:
+            self._raise_if_poisoned()
+            yield self._transcript_reader
+        finally:
+            if acquired:
+                self._transcript_reader_lock.release()
+
+    async def get_transcript(
+        self, session_id: str, limit: int | None = None, offset: int = 0
+    ) -> list[TranscriptEntry]:
+        async with self._transcript_reader_access() as reader:
+            if reader is not None:
+                rows = await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        reader,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            else:
+                rows = None
+        if rows is None:
+            rows = await self._fetch_transcript_rows_on_writer(
+                session_id,
+                limit,
+                offset,
+            )
+        return await asyncio.to_thread(_decode_transcript_rows, rows)
 
     @_serialized_read
     async def get_canonical_transcript(
