@@ -105,6 +105,8 @@
       "tests/test_engine/turn_runner/test_router_control_replay_event.py",
       "tests/test_engine/turn_runner/test_stream_consumer_stage_snapshot.py",
       "tests/test_engine/turn_runner/test_tool_surface_levers_bootstrap_unit.py",
+      "tests/test_engine/turn_runner/test_transcript_snapshot.py",
+      "tests/test_engine/turn_runner/test_transcript_snapshot_runtime.py",
       "tests/test_engine/turn_runner/test_turn_identity_finalizer.py",
       "tests/test_execution_status_contract.py",
       "tests/test_github_issue_link_sync.py",

@@ -441,6 +441,8 @@
     "tests/test_engine/turn_runner/test_stream_consumer_stage_snapshot.py": 1.134,
     "tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py": 5.648,
     "tests/test_engine/turn_runner/test_tool_surface_levers_bootstrap_unit.py": 0.011,
+    "tests/test_engine/turn_runner/test_transcript_snapshot.py": 0.01,
+    "tests/test_engine/turn_runner/test_transcript_snapshot_runtime.py": 0.01,
     "tests/test_engine/turn_runner/test_turn_finalizer_paused.py": 0.01,
     "tests/test_engine/turn_runner/test_turn_finalizer_paused_im_layout.py": 0.026,
     "tests/test_engine/turn_runner/test_turn_finalizer_stage_snapshot.py": 0.105,
