@@ -475,6 +475,16 @@ export interface SessionProjectWorkspaceSnapshot {
   availabilityReason?: string
 }
 
+/** Durable, session-owned model routing selection. */
+export interface SessionRoutingSnapshot {
+  key?: string
+  sessionKey?: string
+  session_key?: string
+  mode?: import('./modelRouting').GatewayModelRoutingMode
+  revision?: number
+  source?: 'session' | 'legacy_initialized' | string
+}
+
 export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
   hydration_complete?: boolean
@@ -499,6 +509,9 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   }
   workspaceId?: string
   projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+  routing?: SessionRoutingSnapshot
+  modelRouting?: SessionRoutingSnapshot
+  model_routing?: SessionRoutingSnapshot
   collaboration?: import('./plans').CollaborationSnapshot
   currentPlan?: import('./plans').PlanRevisionSnapshot | null
   current_plan?: unknown
@@ -530,6 +543,8 @@ export interface ChatSendParams {
   intent?: string
   workspaceId?: string
   collaborationMode?: import('./plans').CollaborationMode
+  /** Session routing mode atomically captured when a new chat is materialized. */
+  initialRoutingMode?: import('./modelRouting').GatewayModelRoutingMode
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]

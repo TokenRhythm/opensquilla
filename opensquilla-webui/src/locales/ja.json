@@ -3805,8 +3805,11 @@
       "routerAnimationOn": "ルーターアニメーション オン",
       "routerAnimationOff": "ルーターアニメーション オフ",
       "modelRouting": "モデルルーティング",
+      "sessionModelRouting": "このチャットのモデルルーティング",
+      "modelRoutingSessionScope": "変更はこのチャットにのみ適用されます。実行中のターンは現在のモードを維持します。",
       "ensembleImageUnsupported": "Ensemble はまだ画像入力に対応していません。「モデルルーティング」で、画像モデルを設定した「AI搭載シングルモデルルーター」、または「オフ」と画像対応モデルを選択してください。",
       "imageInputUnsupported": "選択したモデルは画像を処理できません。画像対応モデルを選択するか、画像を削除してください。",
+      "routingUpdateBlocked": "モデルルーティングを更新しています。送信する前にお待ちください。",
       "routingUpdateImageBlocked": "モデルルーティングを更新しています。画像を送信する前にお待ちください。",
       "modelRoutingOff": "オフ",
       "modelRoutingOffDesc": "各ターンを選択中のモデルへ送信します。",
@@ -4057,7 +4060,8 @@
       "unknownProviderCalls": "{count} 件のプロバイダー呼び出しの使用量が不明"
     },
     "modelRouting": {
-      "updateFailed": "モデルルーティングを切り替えられませんでした。元に戻しました。ゲートウェイ接続を確認して再試行してください。"
+      "updateFailed": "モデルルーティングを切り替えられませんでした。元に戻しました。ゲートウェイ接続を確認して再試行してください。",
+      "sessionUpdateFailed": "このチャットのモデルルーティングを更新できませんでした: {error}"
     },
     "routeFeedback": {
       "up": "このターンのモデル選択は適切だった",

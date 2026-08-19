@@ -3805,8 +3805,11 @@
       "routerAnimationOn": "Router-Animation ein",
       "routerAnimationOff": "Router-Animation aus",
       "modelRouting": "Modell-Routing",
+      "sessionModelRouting": "Modellrouting dieses Chats",
+      "modelRoutingSessionScope": "Änderungen gelten nur für diesen Chat. Ein laufender Durchlauf behält seinen aktuellen Modus.",
       "ensembleImageUnsupported": "Ensemble unterstützt derzeit keine Bildeingaben. Wählen Sie unter „Modell-Routing“ „AI-gestützter Einzelmodell-Router“ mit konfiguriertem Bildmodell oder „Aus“ mit einem bildfähigen Modell.",
       "imageInputUnsupported": "Das ausgewählte Modell kann keine Bilder verarbeiten. Wählen Sie ein bildfähiges Modell oder entfernen Sie das Bild.",
+      "routingUpdateBlocked": "Das Modell-Routing wird aktualisiert. Warten Sie, bevor Sie senden.",
       "routingUpdateImageBlocked": "Das Modell-Routing wird aktualisiert. Warten Sie, bevor Sie Bilder senden.",
       "modelRoutingOff": "Aus",
       "modelRoutingOffDesc": "Jeden Durchlauf an das ausgewählte Modell senden.",
@@ -4057,7 +4060,8 @@
       "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
-      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut."
+      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut.",
+      "sessionUpdateFailed": "Das Modellrouting dieses Chats konnte nicht aktualisiert werden: {error}"
     },
     "routeFeedback": {
       "up": "Richtige Modellwahl für diesen Zug",

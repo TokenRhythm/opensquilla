@@ -597,8 +597,9 @@
       :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
-      :model-routing-mode="modelRoutingMode"
-      :model-routing-settings-busy="modelRoutingSettingsBusy"
+      :session-routing-mode="modelRoutingMode"
+      :session-routing-busy="modelRoutingSettingsBusy"
+      :session-routing-available="sessionRoutingAvailable"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
       :goal-draft-armed="goalDraftArmed"
@@ -635,7 +636,7 @@
       @retry-attachment="retryAttachment"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
-      @set-model-routing-mode="setComposerModelRoutingMode"
+      @set-session-routing-mode="setComposerSessionRoutingMode"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
@@ -774,6 +775,7 @@ import {
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
+import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -1000,6 +1002,9 @@ type Message = ChatMessage
 
 interface RpcAuthPayload {
   runModePolicy?: RunModePolicy
+  principal?: {
+    authState?: string
+  }
 }
 
 /* ── Constants ─────────────────────────────────────────────────────── */
@@ -1303,6 +1308,14 @@ const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
 const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
+
+function isProvisionalDraftSession(): boolean {
+  return pendingSessionIntent.value === 'new_chat'
+}
+
+function isDraftSurface(): boolean {
+  return isDraftRoute() || isProvisionalDraftSession()
+}
 
 async function refreshPromptCacheKeepaliveStatus() {
   const key = sessionKey.value
@@ -1687,6 +1700,20 @@ const {
   loadCurrentSessionUsage,
 } = chatUsageWidget
 
+const chatSessionRoute = useChatSessionRoute(sessionKey)
+const {
+  route,
+  createSessionKey,
+  draftAgentId,
+  goToDraft,
+  hasLegacyNewChatQuery,
+  isDraftRoute,
+  persistSession,
+  readProjectFromUrl,
+  readSessionFromUrl,
+  resolveInitialSession,
+} = chatSessionRoute
+
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
   readCallOptions: optionalSessionRpcCallOptions,
@@ -1696,9 +1723,7 @@ const chatFeatureToggles = useChatFeatureToggles({
 const {
   routerSlots,
   routerModels,
-  routerEnabled,
-  modelRoutingMode,
-  modelRoutingSettingsBusy,
+  modelRoutingMode: globalModelRoutingMode,
   imageInputAdmission,
   imageInputAdmissionReason,
   routerVisualEffectsEnabled,
@@ -1707,15 +1732,42 @@ const {
   codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
-  setModelRoutingMode,
   setCodingModeEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+
+const sessionRoutingAvailable = computed(() => {
+  const auth = rpc.auth as RpcAuthPayload | null
+  return rpc.state === 'connected'
+    && auth?.principal?.authState === 'authenticated'
+    && rpc.supportsMethod('sessions.routing.get')
+    && rpc.supportsMethod('sessions.routing.set')
+})
+const chatSessionRouting = useChatSessionRouting({
+  rpc,
+  sessionKey,
+  globalMode: globalModelRoutingMode,
+  available: sessionRoutingAvailable,
+  isStreaming,
+  isDraft: isDraftSurface,
+  notifyError: message => pushToast(
+    t('chat.modelRouting.sessionUpdateFailed', { error: message }),
+    { tone: 'danger', duration: 8000 },
+  ),
+})
+const {
+  mode: modelRoutingMode,
+  busy: modelRoutingSettingsBusy,
+  initialRoutingMode,
+} = chatSessionRouting
+const sessionRoutingSendBlockedReason = computed(() => (
+  modelRoutingSettingsBusy.value ? t('chat.composer.routingUpdateBlocked') : ''
+))
 isQueuedDeliveryBlocked = () => (
-  hasModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
-  && (
-    modelRoutingSettingsBusy.value
-    || imageInputAdmission.value === 'blocked'
+  modelRoutingSettingsBusy.value
+  || (
+    hasModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+    && imageInputAdmission.value === 'blocked'
   )
 )
 watch(
@@ -1761,24 +1813,10 @@ const {
 // composable's onScopeDispose.
 const { answerRevealOpen, revealNow } = useChatAnswerReveal({
   isStreaming,
-  routerEnabled,
+  routerEnabled: computed(() => modelRoutingMode.value !== 'off'),
   routerVisualEffectsEnabled,
   routerDecided: () => pendingDecision.value,
 })
-
-const chatSessionRoute = useChatSessionRoute(sessionKey)
-const {
-  route,
-  createSessionKey,
-  draftAgentId,
-  goToDraft,
-  hasLegacyNewChatQuery,
-  isDraftRoute,
-  persistSession,
-  readProjectFromUrl,
-  readSessionFromUrl,
-  resolveInitialSession,
-} = chatSessionRoute
 
 let switchToPlanSession: (key: string) => void | Promise<unknown> = () => {}
 let planMutationAccepted: () => void = () => {}
@@ -1797,7 +1835,7 @@ const chatPlans = useChatPlans({
     { tone: 'danger', duration: 8000 },
   ),
   onMutationAccepted: () => planMutationAccepted(),
-  isDraft: () => isDraftRoute() && pendingSessionIntent.value === 'new_chat',
+  isDraft: isDraftSurface,
 })
 const {
   collaboration,
@@ -1947,10 +1985,13 @@ const chatMessageActions = useChatMessageActions({
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
   aiGeneratedLabel: () => aiGeneratedLabel.value,
-  canDeliver: () => !composerSendBlockedMessage.value,
+  canDeliver: () => (
+    !composerSendBlockedMessage.value
+    && !deliveryBlockedReason.value
+  ),
   notifyDeliveryBlocked: () => {
-    if (liveSendBlockedReason.value) {
-      pushToast(liveSendBlockedReason.value, { tone: 'info' })
+    if (deliveryBlockedReason.value) {
+      pushToast(deliveryBlockedReason.value, { tone: 'info' })
     }
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
@@ -2026,6 +2067,7 @@ const chatSessionSubscription = useChatSessionSubscription({
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
   onSnapshot: snapshot => {
+    chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
@@ -2166,6 +2208,9 @@ const liveSendBlockedReason = computed<string | null>(() => {
       : 'chat.liveSendBlockedConnecting',
   )
 })
+const deliveryBlockedReason = computed<string | null>(() => (
+  sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
+))
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
   livePhase,
@@ -2639,19 +2684,20 @@ const chatSend = useChatSend({
   modelRoutingMode,
   modelRoutingSettingsBusy,
   imageInputAdmission,
+  initialRoutingMode,
   elevatedMode,
   runMode,
   pendingAttachments,
   composerRevision,
   pendingSessionIntent,
   pendingWorkspaceId,
-  sendBlockedReason: liveSendBlockedReason,
+  sendBlockedReason: deliveryBlockedReason,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
   pendingForkBeforeMessageId,
   materializeDraftSession: key => {
-    if (!isDraftRoute()) return
+    if (!isProvisionalDraftSession()) return
     const workspaceId = pendingWorkspaceId.value
     if (workspaceId) {
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
@@ -2936,9 +2982,9 @@ async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
   if (composerSendBlockedMessage.value) return
-  // Serialize an existing-session mode mutation before accepting another
-  // composer turn, so the send cannot race the collaboration CAS update.
-  if (planModeBusy.value) return
+  // Serialize session-routing and plan mutations before accepting another
+  // composer turn, so the send cannot race either CAS update.
+  if (modelRoutingSettingsBusy.value || planModeBusy.value) return
   // Goal draft mode: the composer text is the durable objective and the set
   // mutation atomically accepts its first ordinary user turn.
   if (goalDraftArmed.value) {
@@ -3821,9 +3867,8 @@ function runComposerSandboxSetupInBackground(): void {
   composerSandboxSetupOpen.value = false
 }
 
-async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
-  await setModelRoutingMode(mode)
-  scheduleHistorySync()
+async function setComposerSessionRoutingMode(mode: ModelRoutingMode) {
+  await chatSessionRouting.setMode(mode)
 }
 
 async function setComposerCodingModeEnabled(enabled: boolean) {
@@ -4832,7 +4877,7 @@ function draftProjectHydrationIsCurrent(
   workspaceId: string | null,
 ): boolean {
   return draftProjectHydration.isCurrent(generation)
-    && isDraftRoute()
+    && isDraftSurface()
     && readProjectFromUrl() === workspaceId
 }
 
@@ -4972,6 +5017,7 @@ onMounted(async () => {
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
   unsubs.push(metaRuns.subscribe())
+  unsubs.push(chatSessionRouting.subscribe())
   unsubs.push(chatPlans.subscribe())
   const sessionBootstrap = startSessionBootstrap({
     includeHistory: !initialSession.draft,

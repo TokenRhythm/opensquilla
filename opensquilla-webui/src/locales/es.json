@@ -3805,8 +3805,11 @@
       "routerAnimationOn": "Animación del enrutador activada",
       "routerAnimationOff": "Animación del enrutador desactivada",
       "modelRouting": "Enrutamiento de modelos",
+      "sessionModelRouting": "Enrutamiento de modelos de este chat",
+      "modelRoutingSessionScope": "Los cambios solo se aplican a este chat. Un turno en curso conserva su modo actual.",
       "ensembleImageUnsupported": "Ensemble aún no admite entradas de imagen. En «Enrutamiento de modelos», usa «Enrutador monomodelo con IA» configurado para imágenes o «Desactivado» con un modelo compatible con imágenes.",
       "imageInputUnsupported": "El modelo seleccionado no puede procesar imágenes. Elige un modelo compatible o elimina la imagen.",
+      "routingUpdateBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar.",
       "routingUpdateImageBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar imágenes.",
       "modelRoutingOff": "Desactivado",
       "modelRoutingOffDesc": "Envía cada turno al modelo seleccionado.",
@@ -4057,7 +4060,8 @@
       "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
-      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo."
+      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo.",
+      "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}"
     },
     "routeFeedback": {
       "up": "Buena elección de modelo para este turno",
