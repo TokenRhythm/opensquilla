@@ -12,6 +12,64 @@ from opensquilla.gateway.boot import GatewayServer, ServiceContainer
 from opensquilla.gateway.config import GatewayConfig
 
 
+class _CancellationResistantConnection:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def close(self) -> None:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self.release.wait()
+        finally:
+            self.finished.set()
+
+
+class _ImmediateConnection:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _SelfCancellingConnection:
+    async def close(self) -> None:
+        raise asyncio.CancelledError
+
+
+def _gateway_server_for_ws_close_test() -> tuple[
+    GatewayServer,
+    MagicMock,
+    MagicMock,
+    MagicMock,
+]:
+    fake_server = MagicMock()
+    fake_server.should_exit = False
+
+    mock_services = MagicMock()
+    mock_services.goal_service = None
+    mock_services.task_runtime = None
+    mock_services.close = AsyncMock()
+
+    mock_pid_lock = MagicMock()
+    serve_task = asyncio.create_task(asyncio.sleep(0))
+    server = GatewayServer(
+        app=MagicMock(),
+        config=GatewayConfig(),
+        _server=fake_server,
+        _task=serve_task,
+        _services=mock_services,
+        _pid_lock=mock_pid_lock,
+    )
+    return server, fake_server, mock_services, mock_pid_lock
+
+
 @pytest.mark.asyncio
 async def test_runtime_drained_before_channel_stop() -> None:
     """task_runtime.shutdown() must complete before channel_manager.stop_all()."""
@@ -105,6 +163,138 @@ async def test_close_stops_server_even_if_teardown_raises() -> None:
     mock_services.close.assert_awaited_once()
     mock_pid_lock.release.assert_called_once()  # pid lock always released
     assert server._task.done()  # serve task awaited, not leaked
+
+
+@pytest.mark.asyncio
+async def test_close_bounds_cancellation_resistant_websocket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    monkeypatch.setattr(boot, "_WS_SHUTDOWN_CLOSE_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(boot, "_WS_SHUTDOWN_CANCEL_GRACE_S", 0.01)
+    connection = _CancellationResistantConnection()
+    server, fake_server, mock_services, mock_pid_lock = _gateway_server_for_ws_close_test()
+    mock_registry = MagicMock()
+    mock_registry.broadcast = AsyncMock()
+    mock_registry.all.return_value = [connection]
+
+    try:
+        with patch("opensquilla.gateway.boot.get_registry", return_value=mock_registry):
+            await asyncio.wait_for(server.close(reason="test"), timeout=0.5)
+
+        assert connection.started.is_set()
+        assert connection.cancelled.is_set()
+        assert fake_server.should_exit is True
+        mock_services.close.assert_awaited_once()
+        mock_pid_lock.release.assert_called_once()
+    finally:
+        connection.release.set()
+        if connection.started.is_set():
+            await asyncio.wait_for(connection.finished.wait(), timeout=0.5)
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_close_uses_one_shared_websocket_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    monkeypatch.setattr(boot, "_WS_SHUTDOWN_CLOSE_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(boot, "_WS_SHUTDOWN_CANCEL_GRACE_S", 0.01)
+    blocked_connections = [_CancellationResistantConnection() for _ in range(10)]
+    immediate_connection = _ImmediateConnection()
+    server, fake_server, mock_services, mock_pid_lock = _gateway_server_for_ws_close_test()
+    mock_registry = MagicMock()
+    mock_registry.broadcast = AsyncMock()
+    mock_registry.all.return_value = [*blocked_connections, immediate_connection]
+    close_task: asyncio.Task[None] | None = None
+
+    try:
+        with patch("opensquilla.gateway.boot.get_registry", return_value=mock_registry):
+            close_task = asyncio.create_task(server.close(reason="test"))
+            await asyncio.wait_for(
+                asyncio.gather(*(conn.started.wait() for conn in blocked_connections)),
+                timeout=1.0,
+            )
+            await asyncio.wait_for(close_task, timeout=2.0)
+
+        assert immediate_connection.closed is True
+        assert all(conn.cancelled.is_set() for conn in blocked_connections)
+        assert fake_server.should_exit is True
+        mock_services.close.assert_awaited_once()
+        mock_pid_lock.release.assert_called_once()
+    finally:
+        for connection in blocked_connections:
+            connection.release.set()
+        if close_task is not None and not close_task.done():
+            close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+        started_connections = [
+            connection for connection in blocked_connections if connection.started.is_set()
+        ]
+        if started_connections:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(connection.finished.wait() for connection in started_connections)
+                ),
+                timeout=1.0,
+            )
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_close_cancellation_detaches_websocket_tasks_and_runs_finally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    monkeypatch.setattr(boot, "_WS_SHUTDOWN_CLOSE_TIMEOUT_S", 10.0)
+    connection = _CancellationResistantConnection()
+    server, fake_server, mock_services, mock_pid_lock = _gateway_server_for_ws_close_test()
+    mock_registry = MagicMock()
+    mock_registry.broadcast = AsyncMock()
+    mock_registry.all.return_value = [connection]
+    close_task: asyncio.Task[None] | None = None
+
+    try:
+        with patch("opensquilla.gateway.boot.get_registry", return_value=mock_registry):
+            close_task = asyncio.create_task(server.close(reason="test"))
+            await asyncio.wait_for(connection.started.wait(), timeout=0.5)
+            close_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+
+        assert connection.cancelled.is_set()
+        assert fake_server.should_exit is True
+        mock_services.close.assert_awaited_once()
+        mock_pid_lock.release.assert_called_once()
+    finally:
+        connection.release.set()
+        if close_task is not None and not close_task.done():
+            close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+        if connection.started.is_set():
+            await asyncio.wait_for(connection.finished.wait(), timeout=0.5)
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_close_preserves_connection_cancellation_semantics() -> None:
+    connection = _SelfCancellingConnection()
+    server, fake_server, mock_services, mock_pid_lock = _gateway_server_for_ws_close_test()
+    mock_registry = MagicMock()
+    mock_registry.broadcast = AsyncMock()
+    mock_registry.all.return_value = [connection]
+
+    with patch("opensquilla.gateway.boot.get_registry", return_value=mock_registry):
+        with pytest.raises(asyncio.CancelledError):
+            await server.close(reason="test")
+
+    assert fake_server.should_exit is True
+    mock_services.close.assert_awaited_once()
+    mock_pid_lock.release.assert_called_once()
 
 
 @pytest.mark.parametrize(

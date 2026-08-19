@@ -83,6 +83,8 @@ log = structlog.get_logger(__name__)
 GATEWAY_GRACEFUL_TIMEOUT_ENV = "OPENSQUILLA_GATEWAY_GRACEFUL_TIMEOUT"
 _DEFAULT_GRACEFUL_TIMEOUT_S = 30.0
 _MAX_GRACEFUL_TIMEOUT_S = 120.0
+_WS_SHUTDOWN_CLOSE_TIMEOUT_S = 2.0
+_WS_SHUTDOWN_CANCEL_GRACE_S = 0.05
 
 
 def _elapsed_monotonic_ms(started_at: float, ended_at: float | None = None) -> int:
@@ -2213,6 +2215,66 @@ class _GatewayShutdownRelay:
             handler(pending_reason)
 
 
+def _consume_websocket_close_task(task: asyncio.Future[Any]) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        return
+
+
+def _cancel_and_detach_websocket_close_tasks(
+    tasks: set[asyncio.Task[None]],
+) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            task.add_done_callback(_consume_websocket_close_task)
+        else:
+            _consume_websocket_close_task(task)
+
+
+async def _close_gateway_websocket_connections(connections: list[Any]) -> None:
+    tasks: set[asyncio.Task[None]] = set()
+    try:
+        for index, connection in enumerate(connections):
+            tasks.add(
+                asyncio.create_task(
+                    connection.close(),
+                    name=f"gateway-ws-shutdown-close-{index}",
+                )
+            )
+        if not tasks:
+            return
+
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=_WS_SHUTDOWN_CLOSE_TIMEOUT_S,
+        )
+        for task in done:
+            task.result()
+        if not pending:
+            return
+
+        log.warning(
+            "gateway.ws_shutdown_close_timeout",
+            pending_count=len(pending),
+            timeout_seconds=_WS_SHUTDOWN_CLOSE_TIMEOUT_S,
+        )
+        for task in pending:
+            task.cancel()
+        cancelled, lingering = await asyncio.wait(
+            pending,
+            timeout=_WS_SHUTDOWN_CANCEL_GRACE_S,
+        )
+        for task in cancelled:
+            _consume_websocket_close_task(task)
+        for task in lingering:
+            task.add_done_callback(_consume_websocket_close_task)
+    except BaseException:
+        _cancel_and_detach_websocket_close_tasks(tasks)
+        raise
+
+
 @dataclass
 class GatewayServer:
     """Handle returned after gateway startup. Provides close() method."""
@@ -2337,8 +2399,7 @@ class GatewayServer:
             await registry.broadcast("shutdown", {"reason": reason})
 
             # Close all active WS connections
-            for conn in registry.all():
-                await conn.close()
+            await _close_gateway_websocket_connections(registry.all())
 
             # Close MCP clients
             if runtime_shutdown_clean:
