@@ -73,7 +73,11 @@ async def test_emit_stamps_task_id_on_every_stream_event() -> None:
 
     async def _stream():
         yield ToolUseStartEvent(tool_use_id="t1", tool_name="create_pdf.py")
-        yield TextDeltaEvent(text="partial output")
+        yield TextDeltaEvent(
+            text="partial output",
+            model_call_id="1.2",
+            iteration=1,
+        )
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
@@ -92,6 +96,8 @@ async def test_emit_stamps_task_id_on_every_stream_event() -> None:
         "session.event.text_delta",
     ]
     assert all(payload.get("task_id") == "task-A" for _, _, payload in emitted)
+    assert emitted[-1][2]["model_call_id"] == "1.2"
+    assert emitted[-1][2]["iteration"] == 1
 
 
 @pytest.mark.asyncio
@@ -99,7 +105,12 @@ async def test_emit_preserves_thinking_start_time() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
 
     async def _stream():
-        yield ThinkingEvent(text="checking", started_at=1_234_567)
+        yield ThinkingEvent(
+            text="checking",
+            started_at=1_234_567,
+            model_call_id="2.0",
+            iteration=2,
+        )
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
@@ -116,7 +127,13 @@ async def test_emit_preserves_thinking_start_time() -> None:
         (
             SESSION,
             "session.event.thinking",
-            {"text": "checking", "started_at": 1_234_567, "generation_epoch": 0},
+            {
+                "text": "checking",
+                "started_at": 1_234_567,
+                "generation_epoch": 0,
+                "model_call_id": "2.0",
+                "iteration": 2,
+            },
         )
     ]
 
@@ -131,6 +148,8 @@ async def test_emit_preserves_typed_silent_reply_done_contract() -> None:
             text_snapshot="",
             delivery="suppressed",
             suppression_reason="no_reply",
+            router_model_call_id="3.0",
+            router_iteration=3,
         )
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
@@ -151,6 +170,8 @@ async def test_emit_preserves_typed_silent_reply_done_contract() -> None:
     assert payload["text_snapshot"] == ""
     assert payload["delivery"] == "suppressed"
     assert payload["suppression_reason"] == "no_reply"
+    assert payload["router_model_call_id"] == "3.0"
+    assert payload["router_iteration"] == 3
     assert payload["input_mode"] == "system_event"
     assert payload["run_kind"] == "goal"
 

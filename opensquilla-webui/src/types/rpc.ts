@@ -378,6 +378,9 @@ export interface TextDeltaPayload extends SessionEventPayload {
   text?: string
   /** Gateway-owned semantic role for this text span. */
   presentation?: 'intermediate' | 'answer'
+  model_call_id?: string
+  modelCallId?: string
+  iteration?: number
 }
 
 export type AssistantDelivery = 'visible' | 'suppressed'

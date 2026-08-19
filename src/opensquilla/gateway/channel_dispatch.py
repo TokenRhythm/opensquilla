@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -2622,6 +2622,14 @@ def _text_delta_from_event(event: Any) -> str:
     return ""
 
 
+def _text_delta_event_payload(event: TextDeltaEvent) -> dict[str, Any]:
+    """Serialize a channel-origin text delta through the full public contract."""
+
+    payload = asdict(event)
+    payload.pop("kind", None)
+    return payload
+
+
 def _generation_reset_snapshot(event: Any) -> tuple[bool, str] | None:
     """Return the public reset terminal flag and authoritative replacement."""
 
@@ -4122,10 +4130,7 @@ async def _run_turn_batch_path(
                     await event_bridge.emit(
                         session_key,
                         "session.event.text_delta",
-                        {
-                            "text": event.text,
-                            "presentation": getattr(event, "presentation", "answer"),
-                        },
+                        _text_delta_event_payload(event),
                     )
             elif isinstance(event, DoneEvent):
                 snapshot_present, snapshot_text = done_text_snapshot(event)
@@ -4360,10 +4365,7 @@ async def _run_turn_streaming_path(
                     await event_bridge.emit(
                         session_key,
                         "session.event.text_delta",
-                        {
-                            "text": event.text,
-                            "presentation": getattr(event, "presentation", "answer"),
-                        },
+                        _text_delta_event_payload(event),
                     )
             elif isinstance(event, DoneEvent):
                 snapshot_present, snapshot_text = done_text_snapshot(event)

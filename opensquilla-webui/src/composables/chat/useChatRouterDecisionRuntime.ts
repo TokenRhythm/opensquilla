@@ -75,28 +75,42 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     return undefined
   }
 
+  function bindRouterDecisionToModelCall(
+    modelCallId: string,
+    iteration = 0,
+    targetTurnId = latestExplicitTurnId(),
+  ) {
+    const normalizedCallId = String(modelCallId || '').trim()
+    if (!normalizedCallId) return
+    for (let i = options.messages.value.length - 1; i >= 0; i--) {
+      const message = options.messages.value[i]
+      if (
+        message.role === 'router'
+        && message.provenanceKind === 'router_decision'
+        && (!targetTurnId || message.turnId === targetTurnId)
+      ) {
+        if (message.routerModelCallId === normalizedCallId) return
+        if (!message.routerModelCallId) {
+          message.routerModelCallId = normalizedCallId
+          if (iteration > 0) message.routerIteration = iteration
+          return
+        }
+      }
+      if (
+        message.role === 'user'
+        && (!targetTurnId || !message.turnId || message.turnId !== targetTurnId)
+      ) break
+    }
+  }
+
   function appendRouterDecision(payload: RouterDecisionPayload, decision = normalizeRouterDecision(payload)) {
     if (!decision) return
     const messageId = payload?.stream_seq
       ? `router-${options.sessionKey.value}-${payload.stream_seq}`
       : `router-${options.sessionKey.value}-${Date.now()}`
-    const last = options.messages.value[options.messages.value.length - 1]
-    if (last?.messageId === messageId) return
+    if (options.messages.value.some(message => message.messageId === messageId)) return
 
     const turnId = payloadTurnId(payload)
-    if (options.isStreaming.value) {
-      const message = findRouterMessageForTurn(turnId)
-      if (message) {
-        message.routerDecision = decision
-        message.messageId = messageId
-        message.ts = new Date().toISOString()
-        message.routerSettled = true
-        if (turnId) message.turnId = turnId
-        scrollToBottomIfFollowing()
-        return
-      }
-    }
-
     options.messages.value.push({
       role: 'router',
       text: '',
@@ -276,5 +290,6 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     clearPendingRouterDecision,
     appendEnsembleProgress,
     markEnsembleHandoff,
+    bindRouterDecisionToModelCall,
   }
 }

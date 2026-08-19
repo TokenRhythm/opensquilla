@@ -87,6 +87,10 @@ class ThinkingEvent:
     block_id: str = ""
     block_index: int = -1
     generation_epoch: int = 0
+    # Physical provider-call identity for stable presentation ownership.
+    # Additive defaults preserve legacy producers and positional construction.
+    model_call_id: str = ""
+    iteration: int = 0
 
 
 @dataclass
@@ -110,6 +114,10 @@ class TextDeltaEvent:
     # producer that does not set it keeps the pre-existing card behavior.
     presentation: Literal["intermediate", "answer"] = "answer"
     generation_epoch: int = 0
+    # Physical provider-call identity for stable presentation ownership.
+    # Additive defaults preserve legacy producers and positional construction.
+    model_call_id: str = ""
+    iteration: int = 0
 
 
 @dataclass
@@ -366,6 +374,10 @@ class DoneEvent:
     delivery: Literal["visible", "suppressed"] = "visible"
     suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
     generation_epoch: int = 0
+    # First physical provider call that emitted visible output for the route
+    # plan. Clients use this to keep its route card on the same answer segment.
+    router_model_call_id: str = ""
+    router_iteration: int = 0
 
     @property
     def upstream_cost_usd(self) -> float:

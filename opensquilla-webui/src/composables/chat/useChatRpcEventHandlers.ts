@@ -132,6 +132,11 @@ export interface UseChatRpcEventHandlersOptions {
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   queueRouterDecision: (payload: RouterDecisionPayload) => void
+  bindRouterDecisionToModelCall?: (
+    modelCallId: string,
+    iteration?: number,
+    turnId?: string,
+  ) => void
   appendEnsembleProgress: (payload: EnsembleProgressPayload) => void
   markEnsembleHandoff: () => void
   flushPendingRouterDecision: () => void
@@ -1384,6 +1389,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.resetStreamIdleTimer()
     const taskId = payloadTaskId(payload) || activeStreamTaskId.value
     if (taskId && options.taskOwnership?.stopRequestedTaskId.value === taskId) return
+    options.bindRouterDecisionToModelCall?.(
+      String(payload.model_call_id || payload.modelCallId || ''),
+      Number(payload.iteration || 0),
+      String(payload.turn_id || payload.turnId || ''),
+    )
     options.markEnsembleHandoff()
     const presentation = payload.presentation
     if (presentation === 'intermediate' || presentation === 'answer') {
@@ -2034,9 +2044,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
     if (event === 'session.event.thinking') {
       if (aborted.value) return
-      const thinkingText = (payload as SessionEventPayload).text
+      const thinkingPayload = payload as SessionEventPayload
+      const thinkingText = thinkingPayload.text
       if (typeof thinkingText !== 'string' || !thinkingText) return
       stream.resetStreamIdleTimer()
+      options.bindRouterDecisionToModelCall?.(
+        String(thinkingPayload.model_call_id || thinkingPayload.modelCallId || ''),
+        Number(thinkingPayload.iteration || 0),
+        String(thinkingPayload.turn_id || thinkingPayload.turnId || ''),
+      )
       appendThinkingDelta(thinkingText, payload)
       return
     }

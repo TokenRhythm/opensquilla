@@ -254,11 +254,38 @@ function rehomeCompletedSessionCards(
 }
 
 export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions) {
+  // A live route card exists before the first provider delta reveals its
+  // physical call id. Preserve the event key while teaching that call (and a
+  // later history projection) to reuse it, so Vue never remounts the card.
+  const stableRouterKeys = new Map<string, string>()
+
+  function stableRouterStripRenderKey(
+    turnIdentity: string,
+    message: Pick<ChatMessage, 'routerModelCallId' | 'messageId'>
+      | Pick<ChatRenderedMessage, 'routerModelCallId' | 'messageId' | 'sourceIndex' | 'id'>,
+    messageId?: string,
+    index = 0,
+  ): string {
+    const sessionIdentity = options.sessionKey.value || 'session'
+    const identityPrefix = `${sessionIdentity}\u0000${turnIdentity}\u0000`
+    const callId = String(message.routerModelCallId || '').trim()
+    const eventId = routerStripEventId(message, messageId, index)
+    const eventIdentity = `${identityPrefix}event:${eventId}`
+    const callIdentity = callId ? `${identityPrefix}call:${callId}` : ''
+    const key = (callIdentity ? stableRouterKeys.get(callIdentity) : undefined)
+      || stableRouterKeys.get(eventIdentity)
+      || routerStripRenderKey(turnIdentity, message, messageId, index)
+    stableRouterKeys.set(eventIdentity, key)
+    if (callIdentity) stableRouterKeys.set(callIdentity, key)
+    return key
+  }
+
   const renderedMessages = computed((): ChatRenderedMessage[] => {
     const result: ChatRenderedMessage[] = []
     let prevDay = ''
     let prevRole = ''
-    let turnRouterIdx = -1
+    let turnRouterIndexes = new Map<string, number>()
+    let turnRouterOrder: number[] = []
     let turnIdx = 0
     let turnIdentity = 'turn-0'
     let explicitTurnId = ''
@@ -300,15 +327,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       if (adoptsLegacyTurnId) {
         turnIdentity = messageTurnId
         const adoptedTurnKey = `turn:${messageTurnId}`
-        const adoptedRouterKey = `router-turn:${messageTurnId}`
         for (let index = turnResultStartIndex; index < result.length; index++) {
           result[index]!.turnKey = adoptedTurnKey
           if (result[index]!.isRouterStrip) {
-            result[index]!.routerTurnKey = adoptedRouterKey
+            result[index]!.routerTurnKey = stableRouterStripRenderKey(
+              messageTurnId,
+              result[index]!,
+            )
           }
         }
       } else if (explicitTurnChanged || legacyUserStartsTurn) {
-        turnRouterIdx = -1
+        turnRouterIndexes = new Map()
+        turnRouterOrder = []
         turnRouterDecision = null
         lastAssistantResultIndex = -1
         turnRequestKind = msg.role === 'user'
@@ -372,7 +402,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           turnRequestKind,
           turnIdentity,
         )
-        if (stripItem) turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx)
+        if (stripItem) {
+          upsertRouterStrip(result, stripItem, turnRouterIndexes, turnRouterOrder)
+        }
         prevRole = ''
         continue
       }
@@ -386,7 +418,14 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           ...msg,
           routerSettled: msg.routerSettled === true || !inLiveTurn,
         }
-        const priorStrip = turnRouterIdx >= 0 ? result[turnRouterIdx] : undefined
+        const callIdentity = routerModelCallIdFromMessage(msg)
+        const priorIndex = routerSettlementCandidateIndex(
+          result,
+          turnRouterIndexes,
+          turnRouterOrder,
+          callIdentity,
+        )
+        const priorStrip = priorIndex === undefined ? undefined : result[priorIndex]
         const stripItem = turnRouterDecision
           && shouldCombineRouterAndEnsemble(turnRouterDecision, true, msg.restoredFromHistory === true)
           ? renderedCombinedRouterStrip(
@@ -408,7 +447,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
               turnIdentity,
             )
         if (stripItem) {
-          turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx, {
+          upsertRouterStrip(result, stripItem, turnRouterIndexes, turnRouterOrder, {
+            settlement: true,
             settleReplacement: false,
           })
         }
@@ -426,7 +466,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
             turnRequestKind,
             turnIdentity,
           )
-          if (stripItem) turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx)
+          if (stripItem) {
+            upsertRouterStrip(result, stripItem, turnRouterIndexes, turnRouterOrder, {
+              settlement: true,
+            })
+          }
           prevRole = ''
         }
       }
@@ -624,8 +668,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       showHeader: false,
       sourceIndex: index,
       isRouterStrip: true,
-      routerTurnKey: `router-turn:${turnIdentity}`,
+      routerTurnKey: stableRouterStripRenderKey(
+        turnIdentity,
+        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId },
+        messageId,
+        index,
+      ),
       turnKey: `turn:${turnIdentity}`,
+      routerModelCallId: routerModelCallIdFromMessage(msg) || undefined,
+      routerIteration: routerIterationFromMessage(msg) || undefined,
       routerState: routerDecisionState(decision),
       routerSource: decision.source || 'none',
       routerObserve: decision.routing_applied === false,
@@ -731,8 +782,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       showHeader: false,
       sourceIndex: index,
       isRouterStrip: true,
-      routerTurnKey: `router-turn:${turnIdentity}`,
+      routerTurnKey: stableRouterStripRenderKey(
+        turnIdentity,
+        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId },
+        messageId,
+        index,
+      ),
       turnKey: `turn:${turnIdentity}`,
+      routerModelCallId: routerModelCallIdFromMessage(msg) || undefined,
+      routerIteration: routerIterationFromMessage(msg) || undefined,
       routerState: msg.routerSettled === true ? 'settled' : 'pending',
       routerSource: 'llm_ensemble',
       routerObserve: false,
@@ -873,7 +931,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   }
 
   function ensembleMetaFromMessage(msg: ChatMessage): ChatEnsembleMeta | undefined {
-    const usage = msg.usage || msg.turn_usage
+    const usage = msg.routerUsage || msg.usage || msg.turn_usage
     return usage ? ensembleMeta(usage) : undefined
   }
 
@@ -1367,19 +1425,116 @@ function sameMultiset(a: Map<string, number>, b: Map<string, number>): boolean {
   return true
 }
 
+function routerUsageFromMessage(msg: ChatMessage): ChatMessage['usage'] {
+  return msg.routerUsage || msg.usage || msg.turn_usage
+}
+
+function routerModelCallIdFromMessage(msg: ChatMessage): string {
+  const usage = routerUsageFromMessage(msg)
+  return String(
+    msg.routerModelCallId
+    || usage?.router_model_call_id
+    || usage?.routerModelCallId
+    || '',
+  ).trim()
+}
+
+function routerIterationFromMessage(msg: ChatMessage): number {
+  const usage = routerUsageFromMessage(msg)
+  return Number(
+    msg.routerIteration
+    || usage?.router_iteration
+    || usage?.routerIteration
+    || 0,
+  ) || 0
+}
+
+function routerStripIdentity(strip: ChatRenderedMessage): string {
+  if (strip.routerModelCallId) return `call:${strip.routerModelCallId}`
+  return `event:${strip.messageId || strip.sourceIndex || strip.id || 'router'}`
+}
+
+function routerStripRenderKey(
+  turnIdentity: string,
+  message: Pick<ChatMessage, 'routerModelCallId' | 'messageId'>
+    | Pick<ChatRenderedMessage, 'routerModelCallId' | 'messageId' | 'sourceIndex' | 'id'>,
+  messageId?: string,
+  index = 0,
+): string {
+  const callId = String(message.routerModelCallId || '').trim()
+  const eventId = routerStripEventId(message, messageId, index)
+  return callId
+    ? `router-call:${turnIdentity}:${callId}`
+    : `router-event:${turnIdentity}:${eventId}`
+}
+
+function routerStripEventId(
+  message: Pick<ChatMessage, 'messageId'>
+    | Pick<ChatRenderedMessage, 'messageId' | 'sourceIndex' | 'id'>,
+  messageId?: string,
+  index = 0,
+): string | number {
+  return messageId
+    || message.messageId
+    || ('sourceIndex' in message ? message.sourceIndex : undefined)
+    || ('id' in message ? message.id : undefined)
+    || index
+}
+
+function routerSettlementCandidateIndex(
+  result: ChatRenderedMessage[],
+  indexes: Map<string, number>,
+  order: number[],
+  modelCallId: string | undefined,
+): number | undefined {
+  const normalizedCallId = String(modelCallId || '').trim()
+  if (normalizedCallId) {
+    const exactIndex = indexes.get(`call:${normalizedCallId}`)
+    if (exactIndex !== undefined) return exactIndex
+  }
+  for (let cursor = order.length - 1; cursor >= 0; cursor--) {
+    const candidateIndex = order[cursor]!
+    const candidate = result[candidateIndex]
+    if (!candidate?.isRouterStrip) continue
+    if (
+      !normalizedCallId
+      || !candidate.routerModelCallId
+      || candidate.routerModelCallId === normalizedCallId
+    ) {
+      return candidateIndex
+    }
+  }
+  return undefined
+}
+
 function upsertRouterStrip(
   result: ChatRenderedMessage[],
   stripItem: ChatRenderedMessage,
-  previousIndex: number,
-  options: { settleReplacement?: boolean } = {},
-): number {
+  indexes: Map<string, number>,
+  order: number[],
+  options: { settlement?: boolean; settleReplacement?: boolean } = {},
+): void {
+  const identity = routerStripIdentity(stripItem)
+  let previousIndex = indexes.get(identity) ?? -1
+  if (previousIndex < 0 && options.settlement === true) {
+    previousIndex = routerSettlementCandidateIndex(
+      result,
+      indexes,
+      order,
+      stripItem.routerModelCallId,
+    ) ?? -1
+  }
   if (previousIndex >= 0) {
     if (options.settleReplacement !== false) stripItem.routerSettled = true
+    stripItem.routerTurnKey = result[previousIndex]?.routerTurnKey || stripItem.routerTurnKey
     result[previousIndex] = stripItem
-    return previousIndex
+    indexes.set(identity, previousIndex)
+    return
   }
   result.push(stripItem)
-  return result.length - 1
+  const index = result.length - 1
+  indexes.set(identity, index)
+  order.push(index)
 }
 
 function routerRequestKindFromAttachments(attachments: ChatMessage['attachments']): ChatRouterRequestKind {
@@ -1425,7 +1580,7 @@ function routerDecisionFromUsage(
   msg: ChatMessage,
   inheritedRoute: NormalizedRouterDecision | null = null,
 ): NormalizedRouterDecision | null {
-  const usage = msg.usage || msg.turn_usage
+  const usage = msg.routerUsage || msg.usage || msg.turn_usage
   if (!usage) return inheritedRoute
   if (usage.routing_source === 'none') return inheritedRoute
   const routePlan = usage.route_plan

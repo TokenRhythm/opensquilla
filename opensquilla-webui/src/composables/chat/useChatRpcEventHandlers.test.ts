@@ -66,6 +66,7 @@ function createHarness(options: {
     useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
+  const bindRouterDecisionToModelCall = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -104,6 +105,7 @@ function createHarness(options: {
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
     queueRouterDecision: vi.fn(),
+    bindRouterDecisionToModelCall,
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
     flushPendingRouterDecision: vi.fn(),
@@ -135,6 +137,7 @@ function createHarness(options: {
     pendingQueue,
     applySessionRunState,
     markEnsembleHandoff,
+    bindRouterDecisionToModelCall,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showCompactionToast,
@@ -148,6 +151,55 @@ function createHarness(options: {
     stop: () => scope.stop(),
   }
 }
+
+describe('useChatRpcEventHandlers route-card ownership', () => {
+  it('binds text and thinking events to their physical provider calls', () => {
+    const { api, bindRouterDecisionToModelCall, stop } = createHarness()
+    try {
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 1,
+        generation_epoch: 0,
+        text: 'answer',
+        model_call_id: '1.0',
+        iteration: 1,
+      })
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 2,
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+      })
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 3,
+        generation_epoch: 0,
+        text: 'stale answer',
+        model_call_id: 'stale-call',
+        iteration: 99,
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 4,
+        generation_epoch: 1,
+        text: 'reasoning',
+        model_call_id: '2.0',
+        iteration: 2,
+      })
+
+      expect(bindRouterDecisionToModelCall.mock.calls).toEqual([
+        ['1.0', 1, 'turn-1'],
+        ['2.0', 2, 'turn-1'],
+      ])
+    } finally {
+      stop()
+    }
+  })
+})
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
   it('replays a committed tool timeline including its authoritative end', () => {

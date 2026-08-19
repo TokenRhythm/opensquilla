@@ -6921,6 +6921,8 @@ class Agent:
         terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
+        router_model_call_id = ""
+        router_iteration = 0
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -8860,6 +8862,9 @@ class Agent:
                                 )
 
                             elif isinstance(raw_ev, ProviderTextDelta):
+                                if raw_ev.text and not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if raw_ev.text:
                                     reasoning_end = _finish_reasoning_block("completed")
                                     if reasoning_end is not None:
@@ -8875,6 +8880,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="intermediate",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
                                 else:
                                     # No tool has appeared yet. Stream the text live,
@@ -8891,6 +8898,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="answer",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
@@ -8900,6 +8909,9 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if not raw_ev.text:
                                     continue
+                                if not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if not reasoning_block_id:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
                                     active_reasoning_block_index = reasoning_block_index
@@ -8947,6 +8959,8 @@ class Agent:
                                     block_id=reasoning_block_id,
                                     block_index=active_reasoning_block_index,
                                     generation_epoch=generation_epoch,
+                                    model_call_id=call_id,
+                                    iteration=iterations,
                                 )
                                 if (
                                     wrapup_margin_seconds > 0
@@ -15483,6 +15497,8 @@ class Agent:
                 missing_cost_entries=missing_cost_entries,
                 model_call_segments=model_call_segments,
                 generation_epoch=generation_epoch,
+                router_model_call_id=router_model_call_id,
+                router_iteration=router_iteration,
             )
             yield done_event
         # Reset for next turn

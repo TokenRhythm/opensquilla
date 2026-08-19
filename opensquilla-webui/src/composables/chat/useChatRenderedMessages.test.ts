@@ -656,6 +656,84 @@ describe('useChatRenderedMessages silent sentinel compatibility', () => {
 })
 
 describe('useChatRenderedMessages immutable route history', () => {
+  it('keeps a restored steered route card on its physical answer segment', () => {
+    const routerUsage = {
+      routed_tier: 'c1',
+      routed_model: 'provider/initial',
+      routing_source: 'squilla_router',
+      router_model_call_id: '1.0',
+      router_iteration: 1,
+      input_tokens: 12,
+      output_tokens: 3,
+      cost_usd: 0.004,
+    }
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-steer' },
+        {
+          role: 'assistant',
+          text: 'first segment',
+          ts: 2,
+          turnId: 'turn-steer',
+          clientId: 'history-prefix',
+          routerUsage,
+          routerModelCallId: '1.0',
+          restoredFromHistory: true,
+        },
+        {
+          role: 'user',
+          text: 'guide it',
+          ts: 3,
+          turnId: 'turn-steer',
+          inputDisposition: 'applied',
+        },
+        {
+          role: 'assistant',
+          text: 'continued segment',
+          ts: 4,
+          turnId: 'turn-steer',
+          messageId: 'assistant-final',
+          usage: routerUsage,
+          restoredFromHistory: true,
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:steer-router'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'provider/fast', c1: 'provider/initial' }),
+      routerTierConfigs: ref({
+        c0: { model: 'provider/fast', supportsImage: false, imageOnly: false },
+        c1: { model: 'provider/initial', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const rendered = api.renderedMessages.value
+    expect(rendered.map(message => message.displayRole)).toEqual([
+      'user',
+      'router',
+      'assistant',
+      'user',
+      'assistant',
+    ])
+    expect(rendered.filter(message => message.isRouterStrip)).toHaveLength(1)
+    expect(rendered[1]).toMatchObject({
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+      routerTurnKey: 'router-call:turn-steer:1.0',
+    })
+    expect(rendered[2]?.meta).toBeUndefined()
+    expect(rendered[4]?.meta).toMatchObject({
+      input: 12,
+      output: 3,
+      costUsd: 0.004,
+    })
+  })
+
   it('keeps the logical RoutePlan model after a provider fallback leg', () => {
     const api = useChatRenderedMessages({
       messages: ref<ChatMessage[]>([
@@ -1262,6 +1340,7 @@ describe('useChatRenderedMessages router visual mode', () => {
         role: 'user',
         text: 'compare candidates',
         ts: 1,
+        turnId: 'turn-live',
         clientId: 'local-user-turn',
         messageId: 'server-user-turn',
       },
@@ -1269,6 +1348,7 @@ describe('useChatRenderedMessages router visual mode', () => {
         role: 'router',
         text: '',
         ts: 2,
+        turnId: 'turn-live',
         messageId: 'router-live-event',
         provenanceKind: 'router_decision',
         routerDecision: {
@@ -1297,12 +1377,21 @@ describe('useChatRenderedMessages router visual mode', () => {
 
     const liveKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
 
+    Object.assign(messages.value[1]!, {
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+    })
+    const boundKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
+
     messages.value.push({
       role: 'assistant',
       text: 'Settled answer.',
       ts: 3,
+      turnId: 'turn-live',
       messageId: 'assistant-settled',
       usage: {
+        router_model_call_id: '1.0',
+        router_iteration: 1,
         model_usage_breakdown: [
           { role: 'proposer', provider: 'openrouter', model: 'qwen/qwen3.7-plus' },
           { role: 'aggregator', provider: 'openrouter', model: 'z-ai/glm-5.2' },
@@ -1317,8 +1406,250 @@ describe('useChatRenderedMessages router visual mode', () => {
     isStreaming.value = false
 
     const settledKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
-    expect(liveKey).toBe('router-turn:local-user-turn')
+    expect(liveKey).toBe('router-event:turn-live:router-live-event')
+    expect(boundKey).toBe(liveKey)
     expect(settledKey).toBe(liveKey)
+
+    messages.value = [
+      {
+        role: 'user',
+        text: 'compare candidates',
+        ts: 1,
+        turnId: 'turn-live',
+        messageId: 'server-user-turn',
+      },
+      {
+        role: 'assistant',
+        text: 'Partial answer.',
+        ts: 2,
+        turnId: 'turn-live',
+        clientId: 'history-prefix',
+        routerUsage: messages.value[2]!.usage,
+        routerModelCallId: '1.0',
+        restoredFromHistory: true,
+      },
+      {
+        role: 'user',
+        text: 'guide it',
+        ts: 2.5,
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+      },
+      {
+        role: 'assistant',
+        text: 'Settled answer.',
+        ts: 3,
+        turnId: 'turn-live',
+        messageId: 'assistant-settled',
+        usage: messages.value[2]!.usage,
+        restoredFromHistory: true,
+      },
+    ]
+    const restoredKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
+    expect(restoredKey).toBe(liveKey)
+  })
+
+  it('settles the exact physical route card without replacing another card in the turn', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-multi' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-multi',
+          messageId: 'router-first',
+          provenanceKind: 'router_decision',
+          routerModelCallId: '1.0',
+          routerDecision: { tier: 'c1', model: 'provider/first', source: 'squilla_router' },
+        },
+        { role: 'assistant', text: 'first segment', ts: 3, turnId: 'turn-multi' },
+        {
+          role: 'user',
+          text: 'guide it',
+          ts: 4,
+          turnId: 'turn-multi',
+          inputDisposition: 'applied',
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 5,
+          turnId: 'turn-multi',
+          messageId: 'router-second',
+          provenanceKind: 'router_decision',
+          routerModelCallId: '2.0',
+          routerDecision: { tier: 'c2', model: 'provider/second', source: 'squilla_router' },
+        },
+        {
+          role: 'assistant',
+          text: 'settled first call',
+          ts: 6,
+          turnId: 'turn-multi',
+          messageId: 'assistant-terminal',
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'provider/first',
+            routing_source: 'squilla_router',
+            router_model_call_id: '1.0',
+          },
+        },
+      ]),
+      sessionKey: ref('router-exact-settlement-test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'provider/first', c2: 'provider/second' }),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/first', supportsImage: false, imageOnly: false },
+        c2: { model: 'provider/second', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(2)
+    expect(strips.map(strip => strip.routerModelCallId)).toEqual(['1.0', '2.0'])
+    expect(strips.map(strip => strip.routerTurnKey)).toEqual([
+      'router-call:turn-multi:1.0',
+      'router-call:turn-multi:2.0',
+    ])
+    expect(strips.map(strip => strip.gridCells?.[strip.winnerIdx ?? -1]?.model)).toEqual([
+      'provider/first',
+      'provider/second',
+    ])
+    expect(strips.map(strip => strip.routerSettled)).toEqual([true, false])
+  })
+
+  it('does not reuse an incompatible card key for an anchored ensemble settlement', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-ensemble-anchor' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-ensemble-anchor',
+          messageId: 'router-second-call',
+          provenanceKind: 'router_decision',
+          routerModelCallId: '2.0',
+          routerDecision: { tier: 'c2', model: 'provider/second', source: 'squilla_router' },
+        },
+        {
+          role: 'assistant',
+          text: 'settled ensemble call',
+          ts: 3,
+          turnId: 'turn-ensemble-anchor',
+          messageId: 'assistant-terminal',
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'provider/first',
+            routing_source: 'squilla_router',
+            router_model_call_id: '1.0',
+            model_usage_breakdown: [
+              { role: 'proposer', provider: 'provider', model: 'member/one' },
+              { role: 'aggregator', provider: 'provider', model: 'member/final' },
+            ],
+            ensemble_trace: {
+              profile: 'default',
+              total_candidates: 1,
+              llm_request_count: 2,
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('router-ensemble-anchor-test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'provider/first', c2: 'provider/second' }),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/first', supportsImage: false, imageOnly: false },
+        c2: { model: 'provider/second', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(2)
+    expect(strips.map(strip => strip.routerModelCallId)).toEqual(['2.0', '1.0'])
+    expect(strips.map(strip => strip.routerTurnKey)).toEqual([
+      'router-call:turn-ensemble-anchor:2.0',
+      'router-call:turn-ensemble-anchor:1.0',
+    ])
+    expect(new Set(strips.map(strip => strip.routerTurnKey)).size).toBe(2)
+    expect(strips[1]?.routerPanel).toBe('router-ensemble-sequence')
+  })
+
+  it('uses latest-unresolved fallback settlement for gateway events without call anchors', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-legacy' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-legacy',
+          messageId: 'router-first',
+          provenanceKind: 'router_decision',
+          routerDecision: { tier: 'c1', model: 'provider/first', source: 'squilla_router' },
+        },
+        { role: 'assistant', text: 'first segment', ts: 3, turnId: 'turn-legacy' },
+        {
+          role: 'router',
+          text: '',
+          ts: 4,
+          turnId: 'turn-legacy',
+          messageId: 'router-second',
+          provenanceKind: 'router_decision',
+          routerDecision: { tier: 'c2', model: 'provider/second', source: 'squilla_router' },
+        },
+        {
+          role: 'assistant',
+          text: 'legacy terminal',
+          ts: 5,
+          turnId: 'turn-legacy',
+          messageId: 'assistant-terminal',
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'provider/second',
+            routing_source: 'squilla_router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-fallback-settlement-test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'provider/first', c2: 'provider/second' }),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/first', supportsImage: false, imageOnly: false },
+        c2: { model: 'provider/second', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(2)
+    expect(strips.map(strip => strip.routerTurnKey)).toEqual([
+      'router-event:turn-legacy:router-first',
+      'router-event:turn-legacy:router-second',
+    ])
+    expect(strips.map(strip => strip.gridCells?.[strip.winnerIdx ?? -1]?.model)).toEqual([
+      'provider/first',
+      'provider/second',
+    ])
+    expect(strips.map(strip => strip.routerSettled)).toEqual([false, true])
   })
 
   it('keeps same-turn steer rows under one explicit turn and one Router strip', () => {
@@ -1336,6 +1667,8 @@ describe('useChatRenderedMessages router visual mode', () => {
         messageId: 'router-turn-1',
         turnId: 'turn-1',
         provenanceKind: 'router_decision',
+        routerModelCallId: '1.0',
+        routerIteration: 1,
         routerDecision: {
           tier: 'c1',
           model: 'qwen/qwen3.7-plus',
@@ -1384,7 +1717,19 @@ describe('useChatRenderedMessages router visual mode', () => {
     })
 
     const rendered = api.renderedMessages.value
+    expect(rendered.map(message => message.displayRole)).toEqual([
+      'user',
+      'router',
+      'assistant',
+      'user',
+      'assistant',
+    ])
     expect(rendered.filter(message => message.isRouterStrip)).toHaveLength(1)
+    expect(rendered[1]).toMatchObject({
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+      routerTurnKey: 'router-call:turn-1:1.0',
+    })
     expect(rendered.filter(message => !message.isRouterStrip).map(message => message.turnKey))
       .toEqual([
         'turn:turn-1',
@@ -1507,7 +1852,9 @@ describe('useChatRenderedMessages router visual mode', () => {
       'turn:turn-server',
       'turn:turn-server',
     ])
-    expect(api.renderedMessages.value[1]?.routerTurnKey).toBe('router-turn:turn-server')
+    expect(api.renderedMessages.value[1]?.routerTurnKey).toBe(
+      'router-event:turn-server:router-server',
+    )
   })
 })
 

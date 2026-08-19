@@ -88,7 +88,15 @@ function syntheticAssistantSegment(
   source: ChatMessage,
   text: string,
   segmentKey: string,
+  projectRouter = false,
 ): ChatMessage {
+  const routerUsage = projectRouter ? source.usage || source.turn_usage : undefined
+  const routerModelCallId = String(
+    routerUsage?.router_model_call_id || routerUsage?.routerModelCallId || '',
+  ).trim()
+  const routerIteration = Number(
+    routerUsage?.router_iteration || routerUsage?.routerIteration || 0,
+  ) || 0
   return {
     role: 'assistant',
     text,
@@ -96,6 +104,9 @@ function syntheticAssistantSegment(
     clientId: `history-model-call-segment:${source.messageId || source.clientId || 'assistant'}:${segmentKey}`,
     turnId: source.turnId,
     restoredFromHistory: true,
+    ...(routerUsage ? { routerUsage } : {}),
+    ...(routerModelCallId ? { routerModelCallId } : {}),
+    ...(routerIteration ? { routerIteration } : {}),
   }
 }
 
@@ -153,6 +164,7 @@ function interleaveAssistantAt(
         assistant,
         codepoints.slice(0, firstStart).join(''),
         `prefix-${firstStart}`,
+        true,
       ),
     )
   }

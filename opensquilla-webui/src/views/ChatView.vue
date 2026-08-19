@@ -1748,6 +1748,7 @@ const {
   markEnsembleHandoff,
   flushPendingRouterDecision,
   clearPendingRouterDecision,
+  bindRouterDecisionToModelCall,
 } = chatRouterDecisionRuntime
 
 // Gate the live answer's reveal to a [MIN,MAX] window so the model-router panel
@@ -3052,6 +3053,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   sessionRunStatus,
   applySessionRunState,
   queueRouterDecision,
+  bindRouterDecisionToModelCall,
   appendEnsembleProgress,
   markEnsembleHandoff,
   flushPendingRouterDecision,

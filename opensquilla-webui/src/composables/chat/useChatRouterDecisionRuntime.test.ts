@@ -29,6 +29,47 @@ function makeRuntime(
   return { runtime, messagesRef, scrollToBottom }
 }
 
+describe('router decision identity', () => {
+  it('keeps emitted same-turn cards immutable and binds each physical call', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    runtime.queueRouterDecision({
+      stream_seq: 10,
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    })
+    runtime.bindRouterDecisionToModelCall('1.0', 1, 'turn-1')
+    runtime.queueRouterDecision({
+      stream_seq: 20,
+      turn_id: 'turn-1',
+      tier: 'c2',
+      model: 'provider/replay',
+      source: 'squilla_router',
+    })
+    runtime.bindRouterDecisionToModelCall('2.0', 2, 'turn-1')
+    runtime.flushPendingRouterDecision()
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(2)
+    expect(routers.map(message => [
+      message.messageId,
+      message.routerDecision?.model,
+      message.routerModelCallId,
+      message.routerIteration,
+    ])).toEqual([
+      ['router-sess-10', 'provider/first', '1.0', 1],
+      ['router-sess-20', 'provider/replay', '2.0', 2],
+    ])
+  })
+})
+
 describe('appendEnsembleProgress', () => {
   it('normalizes every internal candidate label to the public Proposer role', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])

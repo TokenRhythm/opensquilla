@@ -281,6 +281,10 @@ def _turn_usage_payload(
             done_event,
             persisted_text=persisted_text,
         ),
+        "router_model_call_id": str(
+            getattr(done_event, "router_model_call_id", "") or ""
+        ),
+        "router_iteration": int(getattr(done_event, "router_iteration", 0) or 0),
     }
     optional_fields = {
         "provider": getattr(done_event, "provider", None),

@@ -175,12 +175,22 @@ def test_live_turn_snapshot_compacts_high_frequency_deltas_without_losing_state(
     registry.record(
         session_key,
         "session.event.thinking",
-        {"task_id": task_id, "text": "Plan"},
+        {
+            "task_id": task_id,
+            "text": "Plan",
+            "model_call_id": "1.0",
+            "iteration": 1,
+        },
     )
     registry.record(
         session_key,
         "session.event.thinking",
-        {"task_id": task_id, "text": "ning"},
+        {
+            "task_id": task_id,
+            "text": "ning",
+            "model_call_id": "1.0",
+            "iteration": 1,
+        },
     )
     registry.record(
         session_key,
@@ -210,12 +220,22 @@ def test_live_turn_snapshot_compacts_high_frequency_deltas_without_losing_state(
     registry.record(
         session_key,
         "session.event.text_delta",
-        {"task_id": task_id, "text": "Hello"},
+        {
+            "task_id": task_id,
+            "text": "Hello",
+            "model_call_id": "2.0",
+            "iteration": 2,
+        },
     )
     registry.record(
         session_key,
         "session.event.text_delta",
-        {"task_id": task_id, "text": " world"},
+        {
+            "task_id": task_id,
+            "text": " world",
+            "model_call_id": "2.0",
+            "iteration": 2,
+        },
     )
 
     replay = registry.replay(session_key, 0)
@@ -235,8 +255,12 @@ def test_live_turn_snapshot_compacts_high_frequency_deltas_without_losing_state(
         "session.event.text_delta",
     ]
     assert snapshot.events[1].payload["text"] == "Planning"
+    assert snapshot.events[1].payload["model_call_id"] == "1.0"
+    assert snapshot.events[1].payload["iteration"] == 1
     assert snapshot.events[3].payload["json_fragment"] == '{"cmd":"pwd"}'
     assert snapshot.events[5].payload["text"] == "Hello world"
+    assert snapshot.events[5].payload["model_call_id"] == "2.0"
+    assert snapshot.events[5].payload["iteration"] == 2
 
 
 def test_live_turn_snapshot_compacts_thinking_per_block_and_preserves_boundaries() -> None:

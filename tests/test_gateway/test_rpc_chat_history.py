@@ -1986,6 +1986,8 @@ async def test_chat_history_exposes_persisted_turn_usage() -> None:
             "routed_tier": "economy",
             "routing_source": "squilla_router",
             "total_savings_pct": 42.0,
+            "router_model_call_id": "1.0",
+            "router_iteration": 1,
         },
     )
 
@@ -2002,6 +2004,8 @@ async def test_chat_history_exposes_persisted_turn_usage() -> None:
     assert msg["usage"]["input_tokens"] == 11
     assert msg["usage"]["output_tokens"] == 5
     assert msg["usage"]["cost_usd"] == 0.0123
+    assert msg["usage"]["router_model_call_id"] == "1.0"
+    assert msg["usage"]["router_iteration"] == 1
     assert msg["model"] == "openai/gpt-test"
     assert msg["input"] == 11
     assert msg["output"] == 5
