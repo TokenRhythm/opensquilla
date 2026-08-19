@@ -70,9 +70,12 @@ describe('PendingQueue', () => {
     _source: { runMode: 'safe' as const },
   }
 
-  it('keeps the original steer affordance visible but disabled when capability is unavailable', async () => {
+  it('keeps the original steer affordance disabled and visibly explains queue-only delivery', async () => {
     const reason = 'Steer unavailable: the active task identity has not synchronized yet.'
-    const { app, el } = await mountQueue({}, undefined, {
+    const { app, el } = await mountQueue({}, [
+      { text: 'Follow the latest instruction' },
+      { text: 'Use the concise version' },
+    ], {
       steerAvailable: false,
       steerUnavailableMessage: reason,
     })
@@ -82,7 +85,11 @@ describe('PendingQueue', () => {
     expect(steer?.disabled).toBe(true)
     expect(steer?.title).toBe(reason)
     expect(steer?.getAttribute('aria-describedby')).toBeNull()
-    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
+    const status = el.querySelector<HTMLElement>('.chat-pending-steer-status')
+    expect(el.querySelectorAll('.chat-pending-steer-status')).toHaveLength(1)
+    expect(status?.getAttribute('role')).toBe('status')
+    expect(status?.getAttribute('aria-live')).toBe('polite')
+    expect(status?.textContent).toContain(reason)
     expect(el.querySelector('[aria-label="Remove pending message 1"]')).not.toBeNull()
     app.unmount()
   })
@@ -194,14 +201,76 @@ describe('PendingQueue', () => {
     const { app, el } = await mountQueue({}, [{
       text: steerRequest.message,
       steerAttempt: { phase: 'acceptance_unknown', request: steerRequest },
-    }], { steerAvailable: false })
+    }], {
+      steerAvailable: false,
+      steerUnavailableMessage: 'New messages will queue after the current response.',
+    })
 
     const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
     expect(el.querySelector('.chat-pending-card')?.getAttribute('data-delivery-state'))
       .toBe('attention')
     expect(retry?.textContent).toContain(action)
     expect(retry?.disabled).toBe(false)
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
     expect(el.querySelector<HTMLButtonElement>(`[aria-label="${remove}"]`)).not.toBeNull()
+    app.unmount()
+  })
+
+  it('keeps a rejected steer retry available without showing queue-only status', async () => {
+    const { app, el } = await mountQueue({}, [{
+      text: steerRequest.message,
+      steerAttempt: { phase: 'retryable_rejected', request: steerRequest },
+    }], {
+      steerAvailable: false,
+      steerUnavailableMessage: 'New messages will queue after the current response.',
+    })
+
+    const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(retry?.textContent).toContain('Not sent · Retry')
+    expect(retry?.disabled).toBe(false)
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
+    app.unmount()
+  })
+
+  it('does not show queue-only status beside steer confirmation retries', async () => {
+    const { app, el } = await mountQueue({}, [
+      { text: 'Ordinary queued follow-up' },
+      {
+        text: steerRequest.message,
+        steerAttempt: { phase: 'acceptance_unknown', request: steerRequest },
+      },
+    ], {
+      steerAvailable: false,
+      steerUnavailableMessage: 'New messages will queue after the current response.',
+    })
+
+    const steerButtons = [...el.querySelectorAll<HTMLButtonElement>(
+      '.chat-pending-action--steer',
+    )]
+    expect(steerButtons[0]?.disabled).toBe(true)
+    expect(steerButtons[1]?.disabled).toBe(false)
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
+    app.unmount()
+  })
+
+  it('does not show queue-only status beside a rejected steer retry', async () => {
+    const { app, el } = await mountQueue({}, [
+      { text: 'Ordinary queued follow-up' },
+      {
+        text: 'Rejected steer retry',
+        steerAttempt: { phase: 'retryable_rejected', request: steerRequest },
+      },
+    ], {
+      steerAvailable: false,
+      steerUnavailableMessage: 'New messages will queue after the current response.',
+    })
+
+    const steerButtons = [...el.querySelectorAll<HTMLButtonElement>(
+      '.chat-pending-action--steer',
+    )]
+    expect(steerButtons[0]?.disabled).toBe(true)
+    expect(steerButtons[1]?.disabled).toBe(false)
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
     app.unmount()
   })
 
@@ -211,13 +280,17 @@ describe('PendingQueue', () => {
     const { app, el } = await mountQueue({
       onSteer: () => { steered += 1 },
       onEdit: () => { edited += 1 },
-    }, [{ text: 'Retry this steer', deliveryState: 'retryable' }])
+    }, [{ text: 'Retry this steer', deliveryState: 'retryable' }], {
+      steerAvailable: false,
+      steerUnavailableMessage: 'New messages will queue after the current response.',
+    })
 
     expect(el.querySelector('.chat-pending-card')?.hasAttribute('aria-busy')).toBe(false)
     const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.includes('Retry'))
     expect(retry?.disabled).toBe(false)
     expect(retry?.title).toBe('Retry')
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
     retry?.click()
     expect(steered).toBe(1)
 

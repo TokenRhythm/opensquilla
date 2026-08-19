@@ -119,6 +119,15 @@
         </div>
       </div>
     </article>
+    <p
+      v-if="showSteerUnavailableStatus"
+      key="steer-unavailable"
+      class="chat-pending-steer-status"
+      role="status"
+      aria-live="polite"
+    >
+      {{ steerUnavailableMessage }}
+    </p>
     <span key="reorder-announcement" class="chat-pending-announcement" aria-live="polite">
       {{ reorderAnnouncement }}
     </span>
@@ -204,6 +213,18 @@ const effectiveMaxPending = computed(() => (
       ? 1
       : 0
   )
+))
+const showSteerUnavailableStatus = computed(() => (
+  props.steerAvailable === false
+  && Boolean(props.steerUnavailableMessage?.trim())
+  && !props.items.some(item => (
+    isSteering(item)
+    || item.deliveryState === 'retryable'
+    || isSteerRetry(item)
+  ))
+  && props.items.some(item => (
+    !item.hiddenControl
+  ))
 ))
 
 function displayText(item: PendingQueueItem): string {
@@ -642,6 +663,13 @@ onBeforeUnmount(() => {
   margin-top: 2px;
   line-height: 1.35;
   white-space: normal;
+}
+
+.chat-pending-steer-status {
+  margin: -2px 4px 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
 }
 
 .chat-pending-actions {
