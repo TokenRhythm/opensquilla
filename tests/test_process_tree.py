@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla import process_tree
+from opensquilla import private_paths, process_tree
 
 
 def _synthetic_owner_reference(
@@ -722,6 +722,87 @@ async def test_windows_async_helper_ready_timeout_fails_closed(
     ]
 
 
+@pytest.mark.asyncio
+async def test_windows_launch_cancellation_cleans_before_reraising_same_exception(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    cancelled = asyncio.CancelledError("synthetic caller cancellation")
+    reference = _synthetic_owner_reference(
+        tmp_path / "synthetic-registry.sqlite3",
+        platform="windows",
+    )
+
+    class Gate:
+        gate_name = "synthetic-gate"
+        ready_name = "synthetic-ready"
+
+        def wait_ready(self, _timeout: float) -> None:
+            events.append("helper-ready")
+
+        def release(self) -> None:
+            events.append("release-cancelled")
+            raise cancelled
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    class Job:
+        def assign_pid(self, _pid: int) -> None:
+            events.append("job-assigned")
+
+        def close(self) -> None:
+            events.append("job-closed")
+
+    class Process:
+        pid = 7677
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            events.append("target-stopped")
+            self.returncode = -15
+
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    async def spawn(*_argv: str, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(
+        process_tree._WindowsLaunchGate,
+        "create",
+        classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(
+        process_tree._WindowsJob,
+        "create",
+        classmethod(lambda _cls, _name=None: Job()),
+    )
+    monkeypatch.setattr(process_tree, "_insert_owner_record", lambda *_args, **_kwargs: reference)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda _ref: events.append("row-deleted"),
+    )
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await process_tree.create_owned_subprocess_exec("synthetic.exe")
+
+    assert exc_info.value is cancelled
+    assert events.index("target-stopped") < events.index("row-deleted")
+    assert events.index("job-closed") < events.index("row-deleted")
+    assert "release-cancelled" in events
+    assert "gate-closed" in events
+
+
 def test_windows_sync_launcher_waits_for_helper_ready_before_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1031,8 +1112,20 @@ def test_owner_registry_is_private_and_stores_only_stable_digests(
 
     database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
     raw_database = database_path.read_bytes()
-    assert database_path.stat().st_mode & 0o777 == 0o600
-    assert state_dir.stat().st_mode & 0o777 == 0o700
+    if os.name == "nt":
+        assert private_paths.windows_path_has_private_dacl(
+            state_dir,
+            directory=True,
+            require_protected=True,
+        )
+        assert private_paths.windows_path_has_private_dacl(
+            database_path,
+            directory=False,
+            require_protected=True,
+        )
+    else:
+        assert database_path.stat().st_mode & 0o777 == 0o600
+        assert state_dir.stat().st_mode & 0o777 == 0o700
     for forbidden in (
         b"synthetic-session-raw",
         b"synthetic-task-raw",
@@ -1052,6 +1145,37 @@ def test_owner_registry_is_private_and_stores_only_stable_digests(
     assert records[0].record.task_digest == process_tree._owner_digest(
         "task", "synthetic-task-raw"
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows DACL inheritance")
+def test_windows_owner_registry_sidecar_inherits_private_dacl(tmp_path) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+
+    with process_tree._connect_owner_database(database_path) as connection:
+        connection.execute("CREATE TABLE synthetic_values (value INTEGER NOT NULL)")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("INSERT INTO synthetic_values VALUES (1)")
+        journal_path = database_path.with_name(f"{database_path.name}-journal")
+        assert journal_path.is_file()
+        assert private_paths.windows_path_has_private_dacl(
+            state_dir,
+            directory=True,
+            require_protected=True,
+        )
+        assert private_paths.windows_path_has_private_dacl(
+            database_path,
+            directory=False,
+            require_protected=True,
+        )
+        assert private_paths.windows_path_has_private_dacl(
+            journal_path,
+            directory=False,
+            require_protected=False,
+        )
+        connection.rollback()
+
+    assert not journal_path.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX symlink semantics")
@@ -1155,6 +1279,138 @@ def test_windows_registry_retries_only_transient_file_sharing_failures(
     assert attempts == 3
 
 
+def test_windows_registry_retries_transient_directory_acl_sharing_failures(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    state_dir.mkdir()
+    directory_attempts = 0
+
+    def apply_acl(
+        *_args: object,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal directory_attempts
+        if not directory:
+            return
+        directory_attempts += 1
+        if directory_attempts < 3:
+            error = PermissionError("synthetic sharing violation")
+            error.winerror = 32
+            raise error
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", apply_acl)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+    process_tree._prepare_private_file(database_path)
+
+    assert directory_attempts == 3
+    assert database_path.is_file()
+
+
+def test_owner_registry_hardens_preexisting_sqlite_sidecars(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "synthetic-registry.sqlite3"
+    existing = [
+        database_path,
+        *(
+            database_path.with_name(f"{database_path.name}{suffix}")
+            for suffix in ("-journal", "-shm")
+        ),
+    ]
+    for path in existing:
+        path.touch()
+    prepared_main: list[object] = []
+    prepared_sidecars: list[object] = []
+    monkeypatch.setattr(process_tree, "_prepare_private_file", prepared_main.append)
+    monkeypatch.setattr(
+        process_tree,
+        "_prepare_existing_private_file",
+        prepared_sidecars.append,
+    )
+
+    process_tree._prepare_owner_database_paths(database_path)
+
+    assert prepared_main == [database_path]
+    assert prepared_sidecars == existing[1:]
+
+
+def test_owner_registry_never_recreates_disappeared_sqlite_sidecar(tmp_path) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert not sidecar.exists()
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_windows_owner_registry_file_acl_failure_is_fail_closed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    state_dir.mkdir()
+    database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
+    if preexisting:
+        database_path.write_bytes(b"synthetic-existing-registry")
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+
+    def fail_file_acl(
+        *_args: object,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        if not directory:
+            raise OSError("synthetic ACL failure")
+
+    monkeypatch.setattr(
+        process_tree,
+        "apply_windows_private_dacl",
+        fail_file_acl,
+    )
+
+    with pytest.raises(OSError, match="synthetic ACL failure"):
+        process_tree._prepare_private_file_once(database_path)
+
+    if preexisting:
+        assert database_path.read_bytes() == b"synthetic-existing-registry"
+    else:
+        assert not database_path.exists()
+
+
+def test_windows_new_private_directory_acl_failure_removes_empty_directory(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "synthetic-runtime-state"
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(
+        process_tree,
+        "create_windows_private_directory",
+        lambda path: path.mkdir(),
+    )
+    monkeypatch.setattr(
+        process_tree,
+        "apply_windows_private_dacl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic ACL failure")),
+    )
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="could not be prepared",
+    ):
+        process_tree._prepare_private_directory(state_dir)
+
+    assert not state_dir.exists()
+
+
 def test_owner_claim_serializes_concurrent_cleanup_and_reclaims_dead_claimant(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1202,6 +1458,7 @@ def test_owner_claim_serializes_concurrent_cleanup_and_reclaims_dead_claimant(
     process_tree._release_owner_claim(acquired[0])
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX launch containment")
 @pytest.mark.asyncio
 async def test_posix_registry_failure_prevents_target_spawn(
     tmp_path,
@@ -1252,6 +1509,7 @@ async def test_posix_registry_failure_prevents_target_spawn(
     assert events == ["anchor-ready", "persist-failed", "anchor-stopped"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX launch containment")
 @pytest.mark.asyncio
 async def test_posix_target_is_released_only_after_persist_and_anchor_arm(
     tmp_path,
@@ -1323,6 +1581,94 @@ async def test_posix_target_is_released_only_after_persist_and_anchor_arm(
         "target-released",
         "gate-closed",
     ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX launch containment")
+@pytest.mark.asyncio
+async def test_posix_launch_cancellation_cleans_before_reraising_same_exception(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    cancelled = asyncio.CancelledError("synthetic caller cancellation")
+    reference = _synthetic_owner_reference(tmp_path / "synthetic-registry.sqlite3")
+
+    class Process:
+        pid = 5353
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            events.append("target-stopped")
+            self.returncode = -15
+
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    class Anchor:
+        pgid = 5252
+        process = SimpleNamespace(pid=5252, returncode=None)
+
+        async def arm(self) -> None:
+            events.append("anchor-arm-cancelled")
+            raise cancelled
+
+        def bind(self, _owner: object) -> None:
+            events.append("owner-bound")
+
+    class Gate:
+        read_fd = 91
+
+        def child_pass_fds(self, _existing: object) -> tuple[int, ...]:
+            return (91,)
+
+        def close_child_end(self) -> None:
+            events.append("child-gate-closed")
+
+        def release(self) -> None:
+            raise AssertionError("cancelled target must not be released")
+
+        def close(self) -> None:
+            events.append("gate-closed")
+
+    async def create_anchor(*_args: object, **_kwargs: object) -> Anchor:
+        return Anchor()
+
+    async def spawn(*_args: object, **_kwargs: object) -> Process:
+        events.append("target-spawned")
+        return Process()
+
+    async def stop_anchor(_anchor: object) -> None:
+        events.append("anchor-stopped")
+
+    monkeypatch.setattr(process_tree, "_create_posix_anchor", create_anchor)
+    monkeypatch.setattr(process_tree, "_insert_owner_record", lambda *_args, **_kwargs: reference)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda _ref: events.append("row-deleted"),
+    )
+    monkeypatch.setattr(process_tree, "_stop_unarmed_posix_anchor", stop_anchor)
+    monkeypatch.setattr(
+        process_tree._PosixLaunchGate,
+        "create",
+        classmethod(lambda _cls: Gate()),
+    )
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+
+    with process_tree.task_process_scope(
+        tmp_path / "synthetic-runtime-state",
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await process_tree.create_owned_subprocess_exec("synthetic-executable")
+
+    assert exc_info.value is cancelled
+    assert events.index("target-stopped") < events.index("row-deleted")
+    assert events.index("anchor-stopped") < events.index("row-deleted")
+    assert "owner-bound" in events
+    assert "target-spawned" in events
+    assert "child-gate-closed" in events
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX owner lifecycle")

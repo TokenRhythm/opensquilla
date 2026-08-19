@@ -311,6 +311,10 @@ def test_windows_private_acl_uses_current_sid_and_a_bound_handle() -> None:
         def set_protected_dacl(self, handle: object, sddl: str) -> None:
             events.append(("set", handle, sddl))
 
+        def read_dacl_sddl(self, handle: object) -> str:
+            events.append(("read", handle))
+            return "O:S-1-5-21-123D:P(A;;FA;;;S-1-5-21-123)(A;;FA;;;SY)"
+
         def create_directory(self, path: Path, sddl: str) -> None:
             events.append(("create", path, sddl))
 
@@ -334,6 +338,7 @@ def test_windows_private_acl_uses_current_sid_and_a_bound_handle() -> None:
             "bound-handle",
             "D:P(A;;FA;;;S-1-5-21-123)(A;;FA;;;SY)",
         ),
+        ("read", "bound-handle"),
         ("close", "bound-handle"),
         (
             "create",

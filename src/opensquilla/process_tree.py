@@ -22,6 +22,7 @@ import select
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -32,6 +33,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from opensquilla.private_paths import apply_windows_private_dacl, create_windows_private_directory
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +60,7 @@ _OWNER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _OWNER_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OWNER_IDENTITY_MAX_CHARS = 256
 _OWNER_DATABASE_TIMEOUT_SECONDS = 5.0
+_OWNER_DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 
@@ -179,15 +183,79 @@ def _owner_control_path(database_path: Path, owner_id: str) -> Path:
     return candidate
 
 
+def _remove_created_private_path(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    directory: bool,
+) -> None:
+    with contextlib.suppress(OSError):
+        current = os.lstat(path)
+        expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        if (
+            expected_type(current.st_mode)
+            and not stat.S_ISLNK(current.st_mode)
+            and bool(metadata.st_ino)
+            and (int(current.st_dev), int(current.st_ino))
+            == (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            (os.rmdir if directory else os.unlink)(path)
+
+
 def _prepare_private_directory(path: Path) -> None:
+    created = False
+    metadata: os.stat_result | None = None
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.is_symlink() or not path.is_dir():
+        if not os.path.lexists(path):
+            if os.name == "nt":
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                try:
+                    create_windows_private_directory(path)
+                    created = True
+                except FileExistsError:
+                    pass
+            else:
+                path.mkdir(mode=0o700, parents=True, exist_ok=True)
+                created = True
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ProcessTreeOwnershipError(
                 "task process owner control root is not a private directory"
             )
+        if os.name == "nt":
+            apply_windows_private_dacl(
+                path,
+                directory=True,
+                expected_device=int(metadata.st_dev),
+                expected_inode=int(metadata.st_ino),
+            )
+            current = os.lstat(path)
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or (
+                    metadata.st_ino
+                    and (int(current.st_dev), int(current.st_ino))
+                    != (int(metadata.st_dev), int(metadata.st_ino))
+                )
+            ):
+                raise ProcessTreeOwnershipError(
+                    "task process owner control root changed during privacy hardening"
+                )
         _enforce_private_posix_path(path, mode=0o700, kind="control root")
+    except ProcessTreeOwnershipError:
+        if created and metadata is not None:
+            _remove_created_private_path(path, metadata, directory=True)
+        raise
     except OSError as exc:
+        if created and metadata is not None:
+            _remove_created_private_path(path, metadata, directory=True)
+        if (
+            os.name == "nt"
+            and isinstance(exc, PermissionError)
+            and getattr(exc, "winerror", None) in _WINDOWS_TRANSIENT_FILE_ERRORS
+        ):
+            raise
         raise ProcessTreeOwnershipError(
             "task process owner control root could not be prepared"
         ) from exc
@@ -207,26 +275,50 @@ def _enforce_private_posix_path(path: Path, *, mode: int, kind: str) -> None:
 
 
 def _prepare_private_file_once(path: Path) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.parent.is_symlink() or not path.parent.is_dir():
-        raise ProcessTreeOwnershipError(
-            "task process owner registry root is not a private directory"
-        )
-    _enforce_private_posix_path(path.parent, mode=0o700, kind="registry root")
+    _prepare_private_directory(path.parent)
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    created = False
     try:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError:
-        if not path.is_file() or path.is_symlink():
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ProcessTreeOwnershipError(
                 "task process owner registry is not a private regular file"
             ) from None
-        _enforce_private_posix_path(path, mode=0o600, kind="registry")
-        return
     else:
+        created = True
         os.close(descriptor)
-        _enforce_private_posix_path(path, mode=0o600, kind="registry")
+        metadata = os.lstat(path)
+    try:
+        if os.name == "nt":
+            apply_windows_private_dacl(
+                path,
+                directory=False,
+                expected_device=int(metadata.st_dev),
+                expected_inode=int(metadata.st_ino),
+            )
+            current = os.lstat(path)
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (
+                    metadata.st_ino
+                    and (int(current.st_dev), int(current.st_ino))
+                    != (int(metadata.st_dev), int(metadata.st_ino))
+                )
+            ):
+                raise ProcessTreeOwnershipError(
+                    "task process owner registry changed during privacy hardening"
+                )
+        else:
+            _enforce_private_posix_path(path, mode=0o600, kind="registry")
+    except BaseException:
+        if created:
+            _remove_created_private_path(path, metadata, directory=False)
+        raise
 
 
 def _prepare_private_file(path: Path) -> None:
@@ -246,8 +338,63 @@ def _prepare_private_file(path: Path) -> None:
             time.sleep(delay)
 
 
-def _connect_owner_database(path: Path) -> sqlite3.Connection:
+def _prepare_existing_private_file(path: Path) -> None:
+    """Harden an existing SQLite sidecar without ever recreating it."""
+
+    for delay in (*_WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS, None):
+        try:
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ProcessTreeOwnershipError(
+                    "task process owner registry sidecar is not a private regular file"
+                )
+            if os.name == "nt":
+                apply_windows_private_dacl(
+                    path,
+                    directory=False,
+                    expected_device=int(metadata.st_dev),
+                    expected_inode=int(metadata.st_ino),
+                )
+                current = os.lstat(path)
+                if (
+                    stat.S_ISLNK(current.st_mode)
+                    or not stat.S_ISREG(current.st_mode)
+                    or (
+                        metadata.st_ino
+                        and (int(current.st_dev), int(current.st_ino))
+                        != (int(metadata.st_dev), int(metadata.st_ino))
+                    )
+                ):
+                    raise ProcessTreeOwnershipError(
+                        "task process owner registry sidecar changed during privacy hardening"
+                    )
+            else:
+                _enforce_private_posix_path(path, mode=0o600, kind="registry sidecar")
+            return
+        except FileNotFoundError:
+            # Rollback journals are intentionally ephemeral. A replacement can
+            # only be created inside the already-hardened registry directory.
+            return
+        except PermissionError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in _WINDOWS_TRANSIENT_FILE_ERRORS
+                or delay is None
+            ):
+                raise
+            time.sleep(delay)
+
+
+def _prepare_owner_database_paths(path: Path) -> None:
     _prepare_private_file(path)
+    for suffix in _OWNER_DATABASE_SIDECAR_SUFFIXES:
+        sidecar = path.with_name(f"{path.name}{suffix}")
+        if os.path.lexists(sidecar):
+            _prepare_existing_private_file(sidecar)
+
+
+def _connect_owner_database(path: Path) -> sqlite3.Connection:
+    _prepare_owner_database_paths(path)
     connection = sqlite3.connect(
         f"{path.as_uri()}?mode=rwc&nofollow=1",
         timeout=_OWNER_DATABASE_TIMEOUT_SECONDS,
@@ -1329,6 +1476,53 @@ def _windows_target_env_from_helper(helper_env: Mapping[str, str]) -> dict[str, 
     return target_env
 
 
+async def _cleanup_failed_posix_launch(
+    *,
+    gate: _PosixLaunchGate,
+    persisted_owner: _PersistedOwnerRef | None,
+    process: Any | None,
+    anchor: _PosixGroupAnchor,
+) -> None:
+    with contextlib.suppress(BaseException):
+        gate.close()
+    if process is not None:
+        with contextlib.suppress(BaseException):
+            await _stop_failed_async_process(process)
+    with contextlib.suppress(BaseException):
+        await _stop_unarmed_posix_anchor(anchor)
+    if persisted_owner is not None:
+        with contextlib.suppress(BaseException):
+            await asyncio.to_thread(_delete_owner_record, persisted_owner)
+
+
+async def _cleanup_failed_windows_launch(
+    *,
+    persisted_owner: _PersistedOwnerRef | None,
+    process: Any | None,
+    job: _WindowsJob,
+) -> None:
+    if process is not None:
+        with contextlib.suppress(BaseException):
+            await _stop_failed_async_process(process)
+    with contextlib.suppress(BaseException):
+        job.close()
+    if persisted_owner is not None:
+        with contextlib.suppress(BaseException):
+            await asyncio.to_thread(_delete_owner_record, persisted_owner)
+
+
+async def _await_cleanup_before_cancellation(cleanup: asyncio.Task[None]) -> None:
+    """Finish an isolated cleanup task despite repeated caller cancellation."""
+
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    with contextlib.suppress(BaseException):
+        cleanup.result()
+
+
 async def _create_owned_posix_subprocess(
     argv: tuple[str, ...],
     kwargs: dict[str, Any],
@@ -1398,12 +1592,18 @@ async def _create_owned_posix_subprocess(
             raise _PosixTargetExecError(error_number, argv[0])
         return process
     except BaseException as exc:
-        gate.close()
-        if persisted_owner is not None:
-            _delete_owner_record(persisted_owner)
-        if process is not None:
-            await _stop_failed_async_process(process)
-        await _stop_unarmed_posix_anchor(anchor)
+        cleanup = asyncio.create_task(
+            _cleanup_failed_posix_launch(
+                gate=gate,
+                persisted_owner=persisted_owner,
+                process=process,
+                anchor=anchor,
+            )
+        )
+        if isinstance(exc, asyncio.CancelledError):
+            await _await_cleanup_before_cancellation(cleanup)
+            raise
+        await cleanup
         if isinstance(exc, _PosixTargetExecError):
             raise OSError(
                 exc.error_number,
@@ -1484,11 +1684,17 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             owner.start_completion_monitor()
             return windows_process
         except BaseException as exc:
-            if persisted_owner is not None:
-                _delete_owner_record(persisted_owner)
-            if windows_process is not None:
-                await _stop_failed_async_process(windows_process)
-            job.close()
+            cleanup = asyncio.create_task(
+                _cleanup_failed_windows_launch(
+                    persisted_owner=persisted_owner,
+                    process=windows_process,
+                    job=job,
+                )
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                await _await_cleanup_before_cancellation(cleanup)
+                raise
+            await cleanup
             raise ProcessTreeOwnershipError(
                 "Windows controlled process launch failed closed"
             ) from exc

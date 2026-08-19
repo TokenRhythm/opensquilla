@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -20,6 +23,55 @@ class _Loader:
 
     def get_by_name(self, name: str) -> SkillSpec | None:
         return self._spec if name == self._spec.name else None
+
+
+class _FakeOwnedProcess:
+    pid = 4242
+
+    def __init__(self, *, returncode: int, stdout: bytes, stderr: bytes) -> None:
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self.stdin: bytes | None = None
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        self.stdin = input
+        return self._stdout, self._stderr
+
+
+def _mock_owned_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    returncode: int,
+    stdout: bytes,
+    stderr: bytes,
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    async def fake_spawn(*argv: str, **kwargs: Any) -> _FakeOwnedProcess:
+        process = _FakeOwnedProcess(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        captured.update(argv=argv, kwargs=kwargs, process=process)
+        return process
+
+    monkeypatch.setattr(skill_exec, "create_owned_subprocess_exec", fake_spawn)
+    return captured
+
+
+def _assert_canonical_spawn(captured: dict[str, Any], base_dir: Path) -> None:
+    assert captured["argv"] == (sys.executable, str(base_dir / "unused.py"))
+    kwargs = captured["kwargs"]
+    assert kwargs["cwd"] == str(base_dir)
+    assert kwargs["stdout"] is asyncio.subprocess.PIPE
+    assert kwargs["stderr"] is asyncio.subprocess.PIPE
+    assert kwargs["stdin"] is None
+    assert isinstance(kwargs["env"], dict)
+    process = captured["process"]
+    assert isinstance(process, _FakeOwnedProcess)
+    assert process.stdin is None
 
 
 def _spec(
@@ -142,16 +194,19 @@ async def test_skill_exec_decodes_legacy_gbk_stdout(
         decoded.append(raw)
         return subprocess_encoding.decode_subprocess_output(raw, fallback_encoding="gbk")
 
-    def fake_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
-
     monkeypatch.setattr(skill_exec, "decode_subprocess_output", decode_gbk)
-    monkeypatch.setattr(skill_exec.subprocess, "run", fake_run)
+    captured = _mock_owned_launcher(
+        monkeypatch,
+        returncode=0,
+        stdout=stdout,
+        stderr=b"",
+    )
 
     output = await _run(_spec(tmp_path, parse="json"), tmp_path)
 
     assert json.loads(output) == payload
     assert decoded == [stdout, b""]
+    _assert_canonical_spawn(captured, tmp_path)
 
 
 @pytest.mark.asyncio
@@ -164,14 +219,17 @@ async def test_skill_exec_decodes_legacy_gbk_stderr(
     def decode_gbk(raw: bytes | None) -> str:
         return subprocess_encoding.decode_subprocess_output(raw, fallback_encoding="gbk")
 
-    def fake_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(returncode=7, stdout=b"", stderr=stderr)
-
     monkeypatch.setattr(skill_exec, "decode_subprocess_output", decode_gbk)
-    monkeypatch.setattr(skill_exec.subprocess, "run", fake_run)
+    captured = _mock_owned_launcher(
+        monkeypatch,
+        returncode=7,
+        stdout=b"",
+        stderr=stderr,
+    )
 
     with pytest.raises(RuntimeError, match="检索失败：上游不可用"):
         await _run(_spec(tmp_path), tmp_path)
+    _assert_canonical_spawn(captured, tmp_path)
 
 
 @pytest.mark.parametrize("source", ["ambient", "entrypoint"])
@@ -194,15 +252,18 @@ async def test_skill_exec_preserves_explicit_python_encoding_env(
         entrypoint_env = explicit
     monkeypatch.setattr(subprocess_encoding, "os", SimpleNamespace(name="nt"))
 
-    def fake_run(*_args: object, **kwargs: object) -> SimpleNamespace:
-        child_env = kwargs["env"]
-        assert isinstance(child_env, dict)
-        captured.update(child_env)
-        return SimpleNamespace(returncode=0, stdout=b"ok\n", stderr=b"")
-
-    monkeypatch.setattr(skill_exec.subprocess, "run", fake_run)
+    spawned = _mock_owned_launcher(
+        monkeypatch,
+        returncode=0,
+        stdout=b"ok\n",
+        stderr=b"",
+    )
 
     output = await _run(_spec(tmp_path, env=entrypoint_env), tmp_path)
 
+    child_env = spawned["kwargs"]["env"]
+    assert isinstance(child_env, dict)
+    captured.update(child_env)
     assert output == "ok"
     assert {key: captured[key] for key in explicit} == explicit
+    _assert_canonical_spawn(spawned, tmp_path)
