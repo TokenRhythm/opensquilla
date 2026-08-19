@@ -14,6 +14,7 @@ import contextlib
 import contextvars
 import ctypes
 import ctypes.wintypes as wintypes
+import errno
 import hashlib
 import logging
 import os
@@ -31,6 +32,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +45,14 @@ _CONTROL_READY_TIMEOUT_SECONDS = 2.0
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
+_POSIX_ANCHOR_CAPTURED = b"C"
+_POSIX_ANCHOR_INCOMPLETE = b"I"
+_POSIX_ANCHOR_KILL_CAPTURED = b"D"
+_POSIX_ANCHOR_KILL_INCOMPLETE = b"J"
 _POSIX_ANCHOR_RELEASE = b"R"
 _POSIX_ANCHOR_TERMINATE = b"T"
 _POSIX_ANCHOR_KILL = b"K"
-_POSIX_ANCHOR_TERMINATED = b"K"
+_POSIX_ANCHOR_LEGACY_TERMINATED = b"K"
 _POSIX_TARGET_RELEASE = b"X"
 _WINDOWS_LAUNCH_GATE_PREFIX = "Local\\OpenSquillaTaskLaunch-"
 _WINDOWS_JOB_PREFIX = "Local\\OpenSquillaTaskJob-"
@@ -63,6 +69,8 @@ _OWNER_DATABASE_TIMEOUT_SECONDS = 5.0
 _OWNER_DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
+_POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
+_DARWIN_PROC_PIDTBSDINFO = 3
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,57 @@ class _TaskProcessScope:
     task_digest: str
     parent_session_digest: str | None = None
     parent_task_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class _PosixProcessInfo:
+    pid: int
+    ppid: int
+    pgid: int
+    uid: int
+    start_identity: str
+
+
+@dataclass(frozen=True)
+class _CapturedPosixProcess:
+    pid: int
+    uid: int
+    start_identity: str
+    depth: int
+    pidfd: int | None = None
+
+
+@dataclass(frozen=True)
+class _PosixDescendantCapture:
+    processes: tuple[_CapturedPosixProcess, ...]
+    complete: bool
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 _CURRENT_TASK_PROCESS_SCOPE: contextvars.ContextVar[_TaskProcessScope | None] = (
@@ -538,6 +597,317 @@ def _strict_process_start_identity(pid: int) -> str | None:
     if os.name == "posix":
         return _posix_process_start_identity(pid)
     return None
+
+
+def _linux_process_info(pid: int) -> _PosixProcessInfo | None:
+    proc_path = Path(f"/proc/{pid}")
+    try:
+        raw = (proc_path / "stat").read_text(encoding="utf-8")
+        closing_paren = raw.rfind(")")
+        if closing_paren < 0:
+            return None
+        suffix = raw[closing_paren + 1 :].split()
+        return _PosixProcessInfo(
+            pid=pid,
+            ppid=int(suffix[1]),
+            pgid=int(suffix[2]),
+            uid=int(proc_path.stat().st_uid),
+            start_identity=f"linux-proc-start-ticks:{suffix[19]}",
+        )
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _linux_process_snapshot() -> dict[int, _PosixProcessInfo] | None:
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return None
+    snapshot: dict[int, _PosixProcessInfo] = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        info = _linux_process_info(int(name))
+        if info is not None:
+            snapshot[info.pid] = info
+    return snapshot
+
+
+@lru_cache(maxsize=1)
+def _darwin_libproc() -> Any | None:
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    library.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    library.proc_listallpids.restype = ctypes.c_int
+    library.proc_listpgrppids.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    library.proc_listpgrppids.restype = ctypes.c_int
+    library.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    library.proc_pidinfo.restype = ctypes.c_int
+    return library
+
+
+def _darwin_process_info(pid: int, library: Any | None = None) -> _PosixProcessInfo | None:
+    library = library or _darwin_libproc()
+    if library is None:
+        return None
+    raw = _DarwinProcBsdInfo()
+    size = ctypes.sizeof(raw)
+    if library.proc_pidinfo(
+        int(pid),
+        _DARWIN_PROC_PIDTBSDINFO,
+        0,
+        ctypes.byref(raw),
+        size,
+    ) != size:
+        return None
+    return _PosixProcessInfo(
+        pid=int(raw.pbi_pid),
+        ppid=int(raw.pbi_ppid),
+        pgid=int(raw.pbi_pgid),
+        uid=int(raw.pbi_uid),
+        start_identity=(
+            f"darwin-libproc-start:{int(raw.pbi_start_tvsec)}:"
+            f"{int(raw.pbi_start_tvusec)}"
+        ),
+    )
+
+
+def _darwin_process_snapshot() -> dict[int, _PosixProcessInfo] | None:
+    library = _darwin_libproc()
+    if library is None:
+        return None
+    estimated = library.proc_listallpids(None, 0)
+    if estimated <= 0:
+        return None
+    pids: Any = None
+    count = 0
+    for _attempt in range(3):
+        capacity = max(estimated + 64, 128)
+        pids = (ctypes.c_int * capacity)()
+        count = library.proc_listallpids(pids, ctypes.sizeof(pids))
+        if count < 0:
+            return None
+        if count < capacity:
+            break
+        estimated = capacity * 2
+    if pids is None or count >= len(pids):
+        return None
+    snapshot: dict[int, _PosixProcessInfo] = {}
+    for raw_pid in pids[:count]:
+        pid = int(raw_pid)
+        if pid <= 1:
+            continue
+        info = _darwin_process_info(pid, library)
+        if info is not None:
+            snapshot[pid] = info
+    return snapshot
+
+
+def _darwin_group_members(pgid: int) -> tuple[int, ...] | None:
+    library = _darwin_libproc()
+    if library is None:
+        return None
+    estimated = library.proc_listpgrppids(int(pgid), None, 0)
+    if estimated <= 0:
+        return None
+    pids: Any = None
+    count = 0
+    for _attempt in range(3):
+        capacity = max(estimated + 8, 16)
+        pids = (ctypes.c_int * capacity)()
+        count = library.proc_listpgrppids(int(pgid), pids, ctypes.sizeof(pids))
+        if count < 0:
+            return None
+        if count < capacity:
+            break
+        estimated = capacity * 2
+    if pids is None or count >= len(pids):
+        return None
+    members = tuple(int(pid) for pid in pids[:count] if int(pid) > 1)
+    if pgid not in members:
+        return None
+    return members
+
+
+def _posix_process_info(pid: int) -> _PosixProcessInfo | None:
+    if sys.platform.startswith("linux"):
+        return _linux_process_info(pid)
+    if sys.platform == "darwin":
+        return _darwin_process_info(pid)
+    return None
+
+
+def _posix_process_snapshot() -> dict[int, _PosixProcessInfo] | None:
+    if sys.platform.startswith("linux"):
+        return _linux_process_snapshot()
+    if sys.platform == "darwin":
+        return _darwin_process_snapshot()
+    return None
+
+
+def _captured_posix_process_matches(
+    info: _PosixProcessInfo | None,
+    captured: _CapturedPosixProcess,
+) -> bool:
+    return (
+        info is not None
+        and info.pid == captured.pid
+        and info.uid == captured.uid
+        and info.start_identity == captured.start_identity
+    )
+
+
+def _capture_posix_group_descendants(
+    pgid: int,
+    anchor_pid: int,
+) -> _PosixDescendantCapture:
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        return _PosixDescendantCapture((), True)
+    snapshot = _posix_process_snapshot()
+    if snapshot is None:
+        return _PosixDescendantCapture((), False)
+    anchor = snapshot.get(anchor_pid)
+    if anchor is None or anchor.pgid != pgid or anchor.uid != os.geteuid():
+        return _PosixDescendantCapture((), False)
+    roots = tuple(
+        info for info in snapshot.values() if info.pgid == pgid and info.pid != anchor_pid
+    )
+    if not roots:
+        return _PosixDescendantCapture((), False)
+    children: dict[int, list[_PosixProcessInfo]] = {}
+    for info in snapshot.values():
+        children.setdefault(info.ppid, []).append(info)
+    seen = {root.pid for root in roots}
+    pending = [(root.pid, 0) for root in roots]
+    candidates: list[tuple[_PosixProcessInfo, int]] = []
+    complete = True
+    while pending:
+        parent_pid, parent_depth = pending.pop(0)
+        for child in children.get(parent_pid, ()):
+            if child.pid in seen:
+                continue
+            seen.add(child.pid)
+            if len(seen) > _POSIX_DESCENDANT_CAPTURE_LIMIT:
+                return _PosixDescendantCapture((), False)
+            if child.uid != anchor.uid:
+                complete = False
+                continue
+            depth = parent_depth + 1
+            pending.append((child.pid, depth))
+            if child.pgid != pgid:
+                candidates.append((child, depth))
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    captured: list[_CapturedPosixProcess] = []
+    for candidate, depth in sorted(candidates, key=lambda item: item[1]):
+        current = _posix_process_info(candidate.pid)
+        if current is None or current.start_identity != candidate.start_identity:
+            continue
+        if current.uid != candidate.uid:
+            complete = False
+            continue
+        pidfd: int | None = None
+        if sys.platform.startswith("linux"):
+            if not callable(pidfd_open) or not callable(pidfd_send_signal):
+                complete = False
+                continue
+            else:
+                try:
+                    pidfd = int(pidfd_open(candidate.pid, 0))
+                except OSError as exc:
+                    if exc.errno == errno.ESRCH:
+                        continue
+                    complete = False
+                    continue
+                if pidfd is not None and not _captured_posix_process_matches(
+                    _posix_process_info(candidate.pid),
+                    _CapturedPosixProcess(
+                        pid=candidate.pid,
+                        uid=candidate.uid,
+                        start_identity=candidate.start_identity,
+                        depth=depth,
+                    ),
+                ):
+                    os.close(pidfd)
+                    continue
+        captured.append(
+            _CapturedPosixProcess(
+                pid=candidate.pid,
+                uid=candidate.uid,
+                start_identity=candidate.start_identity,
+                depth=depth,
+                pidfd=pidfd,
+            )
+        )
+    return _PosixDescendantCapture(tuple(captured), complete)
+
+
+def _signal_captured_posix_processes(
+    captured: tuple[_CapturedPosixProcess, ...],
+    sig: int,
+) -> bool:
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    complete = True
+    for process in captured:
+        try:
+            if process.pidfd is not None and callable(pidfd_send_signal):
+                pidfd_send_signal(process.pidfd, sig, None, 0)
+            elif _captured_posix_process_matches(
+                _posix_process_info(process.pid),
+                process,
+            ):
+                os.kill(process.pid, sig)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            complete = False
+    return complete
+
+
+def _captured_posix_processes_alive(
+    captured: tuple[_CapturedPosixProcess, ...],
+) -> bool:
+    pidfds = tuple(process.pidfd for process in captured if process.pidfd is not None)
+    exited_pidfds: set[int] = set()
+    if pidfds:
+        try:
+            poller = select.poll()
+            for pidfd in pidfds:
+                poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            exited_pidfds = {int(pidfd) for pidfd, _events in poller.poll(0)}
+        except (AttributeError, OSError, ValueError):
+            return True
+    for process in captured:
+        if process.pidfd is not None:
+            if process.pidfd not in exited_pidfds:
+                return True
+        elif _captured_posix_process_matches(
+            _posix_process_info(process.pid),
+            process,
+        ):
+            return True
+    return False
+
+
+def _close_captured_posix_processes(
+    captured: tuple[_CapturedPosixProcess, ...],
+) -> None:
+    for process in captured:
+        if process.pidfd is not None:
+            with contextlib.suppress(OSError):
+                os.close(process.pidfd)
 
 
 def _valid_owner_record(record: _PersistedOwnerRecord) -> bool:
@@ -1106,8 +1476,12 @@ class _PosixGroupAnchor:
     pgid: int
     control_path: Path | None = None
     empty: bool = False
+    cleanup_incomplete: bool = False
     _owner: ProcessTreeOwner | None = field(default=None, repr=False)
     _monitor_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _term_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
+    _kill_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
+    _kill_reported: bool = field(default=False, repr=False)
 
     @property
     def alive(self) -> bool:
@@ -1142,15 +1516,37 @@ class _PosixGroupAnchor:
         self._owner = owner
 
     async def _watch_empty(self, stdout: Any) -> None:
-        try:
-            marker = await stdout.read(1)
-        except (BrokenPipeError, ConnectionResetError):
-            marker = b""
-        if marker == _POSIX_ANCHOR_EMPTY:
-            self.empty = True
-            owner = self._owner
-            if owner is not None:
-                await owner._close_empty_posix_owner()
+        while True:
+            try:
+                marker = await stdout.read(1)
+            except (BrokenPipeError, ConnectionResetError):
+                marker = b""
+            if marker == _POSIX_ANCHOR_CAPTURED:
+                self._term_reports.put_nowait(True)
+                continue
+            if marker == _POSIX_ANCHOR_INCOMPLETE:
+                self.cleanup_incomplete = True
+                self._term_reports.put_nowait(True)
+                continue
+            if marker == _POSIX_ANCHOR_KILL_CAPTURED:
+                self._kill_reported = True
+                self._kill_reports.put_nowait(True)
+                continue
+            if marker == _POSIX_ANCHOR_KILL_INCOMPLETE:
+                self.cleanup_incomplete = True
+                self._kill_reported = True
+                self._kill_reports.put_nowait(True)
+                continue
+            if marker == _POSIX_ANCHOR_EMPTY:
+                self.empty = True
+                owner = self._owner
+                if owner is not None:
+                    await owner._close_empty_posix_owner()
+            elif not self._kill_reported:
+                self.cleanup_incomplete = True
+                self._term_reports.put_nowait(False)
+                self._kill_reports.put_nowait(False)
+            break
         with contextlib.suppress(Exception):
             await self.process.wait()
 
@@ -1167,12 +1563,33 @@ class _PosixGroupAnchor:
         if command not in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
             raise ValueError("invalid POSIX anchor signal command")
         if stdin is None or stdin.is_closing() or not self.alive:
+            if not self.empty and not self._kill_reported:
+                self.cleanup_incomplete = True
             return False
+        reports = (
+            self._term_reports
+            if command == _POSIX_ANCHOR_TERMINATE
+            else self._kill_reports
+        )
+        while not reports.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                reports.get_nowait()
         try:
             stdin.write(command)
             await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
+            self.cleanup_incomplete = True
             return False
+        if self._monitor_task is not None:
+            try:
+                acknowledged = await asyncio.wait_for(
+                    reports.get(), timeout=_CONTROL_READY_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                self.cleanup_incomplete = True
+                return False
+            if not acknowledged:
+                return False
         return True
 
     async def settle(self, timeout: float) -> None:
@@ -1281,30 +1698,33 @@ class ProcessTreeOwner:
                 await self._mark_closed()
                 if self.posix_anchor is not None:
                     await self.posix_anchor.settle(kill_timeout)
+                    return not self.posix_anchor.cleanup_incomplete
                 return True
             if self.pgid is not None:
                 assert self.posix_anchor is not None
                 if not await self.posix_anchor.request_signal(_POSIX_ANCHOR_TERMINATE):
                     if not self.is_active():
                         await self._mark_closed()
-                        return True
+                        await self.posix_anchor.settle(kill_timeout)
+                        return not self.posix_anchor.cleanup_incomplete
                     return False
                 if await self._wait_inactive(graceful_timeout):
                     await self._mark_closed()
                     if self.posix_anchor is not None:
                         await self.posix_anchor.settle(kill_timeout)
-                    return True
+                    return not self.posix_anchor.cleanup_incomplete
                 if not await self.posix_anchor.request_signal(_POSIX_ANCHOR_KILL):
                     if not self.is_active():
                         await self._mark_closed()
-                        return True
+                        await self.posix_anchor.settle(kill_timeout)
+                        return not self.posix_anchor.cleanup_incomplete
                     return False
                 stopped = await self._wait_inactive(kill_timeout)
                 if stopped:
                     await self._mark_closed()
                     if self.posix_anchor is not None:
                         await self.posix_anchor.settle(kill_timeout)
-                return stopped
+                return stopped and not self.posix_anchor.cleanup_incomplete
             if self.windows_job is not None:
                 try:
                     await asyncio.to_thread(self.windows_job.terminate)
@@ -1823,6 +2243,10 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
         if not members or pgid not in members:
             return None
         return tuple(members)
+    if sys.platform == "darwin":
+        members = _darwin_group_members(pgid)
+        if members is not None:
+            return members
     try:
         result = subprocess.run(
             ["ps", "-axo", "pid=,pgid="],
@@ -1861,6 +2285,61 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
         return 125
     control_path = Path(control_path_raw) if control_path_raw != "-" else None
     server: socket.socket | None = None
+    captured: tuple[_CapturedPosixProcess, ...] = ()
+    capture_attempted = False
+    cleanup_complete = True
+
+    def prepare_capture() -> bytes:
+        nonlocal captured, capture_attempted, cleanup_complete
+        if not capture_attempted:
+            try:
+                result = _capture_posix_group_descendants(pgid, own_pid)
+            except Exception:
+                result = _PosixDescendantCapture((), False)
+            captured = result.processes
+            capture_attempted = True
+            cleanup_complete = cleanup_complete and result.complete
+        return _POSIX_ANCHOR_CAPTURED if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
+
+    def report_capture(command: bytes, marker: bytes) -> None:
+        pipe_marker = marker
+        if command == _POSIX_ANCHOR_KILL:
+            pipe_marker = (
+                _POSIX_ANCHOR_KILL_CAPTURED
+                if marker == _POSIX_ANCHOR_CAPTURED
+                else _POSIX_ANCHOR_KILL_INCOMPLETE
+            )
+        try:
+            sys.stdout.buffer.write(pipe_marker)
+            sys.stdout.buffer.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def signal_owned(command: bytes) -> bytes:
+        nonlocal cleanup_complete
+        prepare_capture()
+        if command == _POSIX_ANCHOR_TERMINATE:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                cleanup_complete = False
+            signal_complete = _signal_captured_posix_processes(
+                captured,
+                signal.SIGTERM,
+            )
+            cleanup_complete = cleanup_complete and signal_complete
+            marker = _POSIX_ANCHOR_CAPTURED if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
+            report_capture(command, marker)
+            return marker
+        signal_complete = _signal_captured_posix_processes(
+            captured,
+            getattr(signal, "SIGKILL", signal.SIGTERM),
+        )
+        cleanup_complete = cleanup_complete and signal_complete
+        marker = _POSIX_ANCHOR_CAPTURED if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
+        report_capture(command, marker)
+        return marker
+
     try:
         if control_path is not None:
             if control_path.exists() or control_path.is_symlink():
@@ -1881,7 +2360,12 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
         poll_cap = 0.25 if os.path.isdir("/proc") else 1.0
         while True:
             members = _posix_group_members(pgid)
-            if members is not None and len(members) == 1 and members[0] == own_pid:
+            if (
+                members is not None
+                and len(members) == 1
+                and members[0] == own_pid
+                and not _captured_posix_processes_alive(captured)
+            ):
                 try:
                     sys.stdout.buffer.write(_POSIX_ANCHOR_EMPTY)
                     sys.stdout.buffer.flush()
@@ -1910,12 +2394,18 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
                 if not pipe_command:
                     stdin_open = False
             if pipe_command == _POSIX_ANCHOR_TERMINATE:
-                os.killpg(pgid, signal.SIGTERM)
+                signal_owned(pipe_command)
+                poll_delay = _POLL_INTERVAL_SECONDS
             elif pipe_command == _POSIX_ANCHOR_KILL:
-                # The anchor signals its own still-live group, eliminating a
-                # Gateway-side probe/signal window around numeric PGID reuse.
-                os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
-                return 0
+                signal_owned(pipe_command)
+                try:
+                    os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                except OSError:
+                    cleanup_complete = False
+                    report_capture(pipe_command, _POSIX_ANCHOR_INCOMPLETE)
+                    poll_delay = _POLL_INTERVAL_SECONDS
+                else:
+                    return 0
             connection: socket.socket | None = None
             if server is not None and server in readable:
                 connection, _address = server.accept()
@@ -1932,14 +2422,28 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
                     }:
                         continue
                     if command == _POSIX_ANCHOR_TERMINATE:
-                        os.killpg(pgid, signal.SIGTERM)
+                        marker = signal_owned(command)
                         with contextlib.suppress(OSError):
-                            connection.sendall(_POSIX_ANCHOR_TERMINATED)
+                            connection.sendall(marker)
+                        poll_delay = _POLL_INTERVAL_SECONDS
                     else:
-                        os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
-                        return 0
+                        marker = signal_owned(command)
+                        with contextlib.suppress(OSError):
+                            connection.sendall(marker)
+                        try:
+                            os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                        except OSError:
+                            cleanup_complete = False
+                            marker = _POSIX_ANCHOR_INCOMPLETE
+                            report_capture(command, marker)
+                            with contextlib.suppress(OSError):
+                                connection.sendall(marker)
+                            poll_delay = _POLL_INTERVAL_SECONDS
+                        else:
+                            return 0
             poll_delay = min(poll_cap, poll_delay * 1.5)
     finally:
+        _close_captured_posix_processes(captured)
         if server is not None:
             server.close()
         if control_path is not None:
@@ -2082,7 +2586,8 @@ def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool
         return False
     control_path = _owner_control_path(reference.database_path, record.owner_id)
 
-    def request(command: bytes) -> None:
+    def request(command: bytes) -> bytes:
+        response = b""
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(1.5)
             client.connect(str(control_path))
@@ -2091,22 +2596,35 @@ def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool
             client.sendall(command)
             if command == _POSIX_ANCHOR_TERMINATE:
                 with contextlib.suppress(OSError, TimeoutError):
-                    client.recv(1)
+                    response = client.recv(1)
+            elif command == _POSIX_ANCHOR_KILL:
+                with contextlib.suppress(OSError, TimeoutError):
+                    markers = bytearray()
+                    while len(markers) < 2:
+                        marker = client.recv(1)
+                        if not marker:
+                            break
+                        markers.extend(marker)
+                    response = bytes(markers[-1:])
+        return response
 
     try:
-        request(_POSIX_ANCHOR_TERMINATE)
+        capture_marker = request(_POSIX_ANCHOR_TERMINATE)
     except OSError:
         if not _posix_controller_matches(record):
             _delete_owner_record(reference)
         else:
             log.warning("process_tree_persisted_posix_control_unavailable")
         return False
+    legacy_anchor = capture_marker == _POSIX_ANCHOR_LEGACY_TERMINATED
     graceful_deadline = time.monotonic() + 0.2
     while _posix_controller_matches(record) and time.monotonic() < graceful_deadline:
         time.sleep(_POLL_INTERVAL_SECONDS)
     if _posix_controller_matches(record):
         try:
-            request(_POSIX_ANCHOR_KILL)
+            kill_marker = request(_POSIX_ANCHOR_KILL)
+            if not legacy_anchor and kill_marker != _POSIX_ANCHOR_CAPTURED:
+                capture_marker = _POSIX_ANCHOR_INCOMPLETE
         except OSError:
             if not _posix_controller_matches(record):
                 _delete_owner_record(reference)
@@ -2120,7 +2638,10 @@ def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool
         log.warning("process_tree_persisted_posix_stop_timeout")
         return False
     _delete_owner_record(reference)
-    return True
+    return capture_marker in {
+        _POSIX_ANCHOR_CAPTURED,
+        _POSIX_ANCHOR_LEGACY_TERMINATED,
+    }
 
 
 def _terminate_persisted_windows_owner_sync(reference: _PersistedOwnerRef) -> bool:

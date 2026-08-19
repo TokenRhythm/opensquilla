@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import ctypes
 import ctypes.wintypes as wintypes
+import errno
 import io
 import os
 import shutil
@@ -222,6 +223,80 @@ async def test_posix_anchor_owns_signalling_and_closes_with_its_lifecycle(
     assert gateway_signals == []
 
 
+@pytest.mark.asyncio
+async def test_posix_incomplete_cleanup_remains_failed_after_anchor_exit() -> None:
+    anchor = process_tree._PosixGroupAnchor(
+        process=SimpleNamespace(returncode=0),
+        pgid=4242,
+        cleanup_incomplete=True,
+    )
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=0),
+        pid=4242,
+        pgid=4242,
+        posix_anchor=anchor,
+    )
+
+    assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0) is False
+    assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0) is False
+
+
+@pytest.mark.asyncio
+async def test_posix_unacknowledged_anchor_exit_fails_closed() -> None:
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            self.returncode = 1
+            return 1
+
+    class Stream:
+        async def read(self, _size: int) -> bytes:
+            return b""
+
+    anchor = process_tree._PosixGroupAnchor(process=Process(), pgid=4242)
+    await anchor._watch_empty(Stream())
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None),
+        pid=4242,
+        pgid=4242,
+        posix_anchor=anchor,
+    )
+
+    assert anchor.cleanup_incomplete is True
+    assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0) is False
+    assert owner.process.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_posix_anchor_transport_failure_fails_closed() -> None:
+    anchor_process = SimpleNamespace(returncode=None)
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, _command: bytes) -> None:
+            anchor_process.returncode = 1
+            raise BrokenPipeError
+
+        async def drain(self) -> None:
+            return None
+
+    anchor_process.stdin = Input()
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None),
+        pid=4242,
+        pgid=4242,
+        posix_anchor=anchor,
+    )
+
+    assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0) is False
+    assert anchor.cleanup_incomplete is True
+    assert owner.process.returncode is None
+
+
 @pytest.mark.skipif(os.name != "posix", reason="PGID lifecycle is POSIX-specific")
 @pytest.mark.asyncio
 async def test_posix_anchor_outlives_leader_and_excludes_unrelated_group(tmp_path) -> None:
@@ -274,6 +349,201 @@ async def test_posix_anchor_outlives_leader_and_excludes_unrelated_group(tmp_pat
         if sibling.returncode is None:
             sibling.kill()
             await sibling.wait()
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform == "darwin"),
+    reason="process ancestry capture is Linux/macOS-specific",
+)
+@pytest.mark.asyncio
+async def test_posix_stop_kills_new_session_descendants_and_preserves_sentinel(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    pid_file = tmp_path / "owned-pids"
+    sleeper = "import time; time.sleep(30)"
+    grandchild = (
+        "import os,pathlib,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        "time.sleep(30)"
+    )
+    child = (
+        "import os,pathlib,signal,subprocess,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r}],start_new_session=True); "
+        "time.sleep(30)"
+    )
+    background = (
+        "import os,pathlib,signal,subprocess,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        f"subprocess.Popen([sys.executable,'-c',{child!r}],start_new_session=True); "
+        "time.sleep(30)"
+    )
+    foreground = (
+        "import os,pathlib,subprocess,sys,time; "
+        f"pathlib.Path({str(pid_file)!r}).open('a').write(str(os.getpid())+'\\n'); "
+        f"subprocess.Popen([sys.executable,'-c',{background!r}],start_new_session=True); "
+        "time.sleep(30)"
+    )
+    with process_tree.task_process_scope(
+        state_dir,
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        owned = await process_tree.create_owned_subprocess_exec(
+            sys.executable,
+            "-c",
+            foreground,
+        )
+    owner = process_tree.capture_process_tree_owner(owned, isolated=True)
+    sentinel = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        sleeper,
+        start_new_session=True,
+    )
+    owned_pids: list[int] = []
+    owned_identities: dict[int, process_tree._PosixProcessInfo] = {}
+    try:
+        for _attempt in range(500):
+            if pid_file.exists():
+                owned_pids = [int(value) for value in pid_file.read_text().splitlines()]
+                if len(owned_pids) == 4:
+                    break
+            await asyncio.sleep(0.01)
+        assert len(owned_pids) == 4
+        owned_identities = {
+            pid: info
+            for pid in owned_pids
+            if (info := process_tree._posix_process_info(pid)) is not None
+        }
+
+        owner_stopped, persisted_stopped = await asyncio.gather(
+            owner.terminate(graceful_timeout=0.2, kill_timeout=1.0),
+            process_tree.cancel_persisted_processes_for_task(
+                state_dir,
+                "synthetic-session",
+                "synthetic-task",
+            ),
+        )
+        assert owner_stopped is True
+        assert persisted_stopped in {0, 1}
+        await asyncio.wait_for(owned.wait(), timeout=2.0)
+        for _attempt in range(300):
+            if all(
+                process_tree._strict_process_start_identity(pid) is None
+                for pid in owned_pids
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        assert all(
+            process_tree._strict_process_start_identity(pid) is None
+            for pid in owned_pids
+        )
+        assert sentinel.returncode is None
+    finally:
+        if owner.is_active():
+            await owner.terminate(graceful_timeout=0.1, kill_timeout=1.0)
+        if sentinel.returncode is None:
+            sentinel.kill()
+            await sentinel.wait()
+        for pid, captured_info in owned_identities.items():
+            current_info = process_tree._posix_process_info(pid)
+            if (
+                current_info is not None
+                and current_info.uid == captured_info.uid
+                and current_info.start_identity == captured_info.start_identity
+            ):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+def test_posix_captured_pid_identity_change_is_not_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = process_tree._CapturedPosixProcess(
+        pid=4242,
+        uid=501,
+        start_identity="original-start",
+        depth=1,
+    )
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        process_tree,
+        "_posix_process_info",
+        lambda _pid: process_tree._PosixProcessInfo(
+            pid=4242,
+            ppid=1,
+            pgid=4242,
+            uid=501,
+            start_identity="replacement-start",
+        ),
+    )
+    monkeypatch.setattr(
+        process_tree.os,
+        "kill",
+        lambda pid, sig: signalled.append((pid, sig)),
+    )
+
+    process_tree._signal_captured_posix_processes((captured,), signal.SIGTERM)
+
+    assert signalled == []
+
+
+def test_linux_descendant_capture_does_not_fall_back_to_numeric_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    root = process_tree._PosixProcessInfo(101, 100, 100, uid, "root")
+    escaped = process_tree._PosixProcessInfo(102, 101, 102, uid, "escaped")
+    monkeypatch.setattr(process_tree.sys, "platform", "linux")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(
+        process_tree,
+        "_posix_process_snapshot",
+        lambda: {100: anchor, 101: root, 102: escaped},
+    )
+    monkeypatch.setattr(
+        process_tree,
+        "_posix_process_info",
+        lambda pid: {100: anchor, 101: root, 102: escaped}.get(pid),
+    )
+    monkeypatch.setattr(
+        process_tree.os,
+        "pidfd_open",
+        lambda _pid, _flags: (_ for _ in ()).throw(OSError(errno.EMFILE, "full")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        process_tree.signal,
+        "pidfd_send_signal",
+        lambda *_args: None,
+        raising=False,
+    )
+
+    capture = process_tree._capture_posix_group_descendants(100, 100)
+
+    assert capture.complete is False
+    assert capture.processes == ()
+
+
+def test_other_posix_descendant_capture_preserves_group_only_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_tree.sys, "platform", "freebsd")
+    monkeypatch.setattr(
+        process_tree,
+        "_posix_process_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported native snapshot")),
+    )
+
+    capture = process_tree._capture_posix_group_descendants(100, 100)
+
+    assert capture == process_tree._PosixDescendantCapture((), True)
 
 
 @pytest.mark.parametrize(
@@ -334,7 +604,7 @@ def test_posix_proc_ignores_unrelated_pid_disappearing_during_snapshot(
 
 
 @pytest.mark.skipif(
-    os.name != "posix" or os.path.isdir("/proc"),
+    os.name != "posix" or os.path.isdir("/proc") or sys.platform == "darwin",
     reason="requires the POSIX ps fallback",
 )
 @pytest.mark.asyncio
@@ -1761,6 +2031,88 @@ def test_pid_identity_mismatch_reclaims_stale_row_without_signalling(
     )
 
     assert process_tree._terminate_persisted_posix_owner_sync(reference) is False
+    assert deleted == [reference.record.owner_id]
+
+
+@pytest.mark.parametrize(
+    ("term_markers", "kill_markers", "stop_command", "expected"),
+    [
+        (
+            [process_tree._POSIX_ANCHOR_LEGACY_TERMINATED],
+            [],
+            process_tree._POSIX_ANCHOR_KILL,
+            True,
+        ),
+        (
+            [process_tree._POSIX_ANCHOR_CAPTURED],
+            [process_tree._POSIX_ANCHOR_CAPTURED, process_tree._POSIX_ANCHOR_INCOMPLETE],
+            process_tree._POSIX_ANCHOR_KILL,
+            False,
+        ),
+    ],
+)
+def test_persisted_posix_stop_handles_anchor_cleanup_markers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    term_markers: list[bytes],
+    kill_markers: list[bytes],
+    stop_command: bytes,
+    expected: bool,
+) -> None:
+    reference = _synthetic_owner_reference(tmp_path / "registry.sqlite3")
+    deleted: list[str] = []
+    stopped = False
+    responses = {
+        process_tree._POSIX_ANCHOR_TERMINATE: list(term_markers),
+        process_tree._POSIX_ANCHOR_KILL: list(kill_markers),
+    }
+
+    class Socket:
+        command = b""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.command = b""
+
+        def __enter__(self) -> Socket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def connect(self, _path: str) -> None:
+            return None
+
+        def sendall(self, command: bytes) -> None:
+            nonlocal stopped
+            self.command = command
+            if command == stop_command and not responses[command]:
+                stopped = True
+
+        def recv(self, _size: int) -> bytes:
+            nonlocal stopped
+            markers = responses[self.command]
+            if not markers:
+                return b""
+            marker = markers.pop(0)
+            if self.command == stop_command and not markers:
+                stopped = True
+            return marker
+
+    monkeypatch.setattr(process_tree.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(process_tree.socket, "socket", Socket)
+    monkeypatch.setattr(process_tree, "_posix_controller_matches", lambda _record: not stopped)
+    monkeypatch.setattr(
+        process_tree,
+        "_delete_owner_record",
+        lambda row: deleted.append(row.record.owner_id),
+    )
+    monotonic_values = iter(float(value) for value in range(10))
+    monkeypatch.setattr(process_tree.time, "monotonic", lambda: next(monotonic_values))
+
+    assert process_tree._terminate_persisted_posix_owner_sync(reference) is expected
     assert deleted == [reference.record.owner_id]
 
 
