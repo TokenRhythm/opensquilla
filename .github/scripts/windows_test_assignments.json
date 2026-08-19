@@ -31,6 +31,7 @@
       "tests/test_ci/test_pr_body_lint.py",
       "tests/test_ci/test_router_artifact_manifest.py",
       "tests/test_ci/test_windows_duration_governance.py",
+      "tests/test_cli/test_agent_event_stream.py",
       "tests/test_cli/test_chat_cmd.py",
       "tests/test_cli/test_chat_file_command.py",
       "tests/test_cli/test_chat_path_command.py",
@@ -148,6 +149,7 @@
       "tests/test_provider_request_proof_levers.py",
       "tests/test_provider_selector.py",
       "tests/test_provider_terminal_evidence.py",
+      "tests/test_provider_tokenrhythm_v4_wire_policy.py",
       "tests/test_provider_tool_stream_accumulator.py",
       "tests/test_provider_trace_recorder.py",
       "tests/test_redaction.py",
@@ -475,6 +477,7 @@
       "tests/test_gateway/test_pidfile_lock.py",
       "tests/test_gateway/test_plan_rpc.py",
       "tests/test_gateway/test_project_workspace_execution.py",
+      "tests/test_gateway/test_prompt_cache_keepalive.py",
       "tests/test_gateway/test_provider_stats.py",
       "tests/test_gateway/test_python_client_transport_limits.py",
       "tests/test_gateway/test_rate_limit_approvals.py",
@@ -485,6 +488,7 @@
       "tests/test_gateway/test_routing_interaction_mode.py",
       "tests/test_gateway/test_rpc_agents.py",
       "tests/test_gateway/test_rpc_approvals.py",
+      "tests/test_gateway/test_rpc_artifacts.py",
       "tests/test_gateway/test_rpc_capability_reset.py",
       "tests/test_gateway/test_rpc_catchall_logging.py",
       "tests/test_gateway/test_rpc_channels.py",
@@ -1324,5 +1328,72 @@
       "tests/unit/test_ui.py"
     ]
   },
-  "overrides": []
+  "overrides": [
+    {
+      "path": "tests/test_gateway/test_goal_rpc.py",
+      "from": "gateway-sqlite",
+      "to": "desktop-installer-contracts",
+      "affinity_exception": true,
+      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_gateway/test_project_workspace_execution.py",
+      "from": "gateway-sqlite",
+      "to": "desktop-installer-contracts",
+      "affinity_exception": true,
+      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_gateway/test_rpc_meta_runs.py",
+      "from": "gateway-sqlite",
+      "to": "desktop-installer-contracts",
+      "affinity_exception": true,
+      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_gateway/test_rpc_router_decisions.py",
+      "from": "gateway-sqlite",
+      "to": "desktop-installer-contracts",
+      "affinity_exception": true,
+      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_live_long_task_case_driver.py",
+      "from": "gateway-sqlite",
+      "to": "recovery-migration",
+      "reason": "Rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_live_multi_provider_matrix.py",
+      "from": "gateway-sqlite",
+      "to": "recovery-migration",
+      "reason": "Rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_observability/test_bundle.py",
+      "from": "gateway-sqlite",
+      "to": "desktop-installer-contracts",
+      "affinity_exception": true,
+      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_persistence/test_router_decision_writer.py",
+      "from": "gateway-sqlite",
+      "to": "core",
+      "affinity_exception": true,
+      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_sandbox/test_windows_default_capability.py",
+      "from": "gateway-sqlite",
+      "to": "recovery-migration",
+      "reason": "Rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_skills/test_meta_resume.py",
+      "from": "gateway-sqlite",
+      "to": "recovery-migration",
+      "reason": "Rebalance the measured Windows critical path using three comparable successful runs."
+    }
+  ]
 }

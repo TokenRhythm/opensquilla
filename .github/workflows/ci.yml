@@ -26,12 +26,13 @@ env:
 jobs:
   queue-attestation:
     name: Verify reusable PR CI evidence
+    if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       reusable: ${{ steps.verify.outputs.reusable || 'false' }}
-      reason: ${{ steps.verify.outputs.reason || steps.context.outputs.reason || steps.mode.outputs.reason }}
-      reason_code: ${{ steps.verify.outputs.reason_code || steps.context.outputs.reason_code || steps.mode.outputs.reason_code }}
+      reason: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
+      reason_code: ${{ steps.verify.outputs.reason_code || steps.mode.outputs.reason_code }}
       source_run_id: ${{ steps.verify.outputs.source_run_id }}
       candidate_count: ${{ steps.verify.outputs.candidate_count || '0' }}
       artifact_name: ${{ steps.verify.outputs.artifact_name }}
@@ -54,13 +55,6 @@ jobs:
             echo "reason_code=legacy_mode" >> "${GITHUB_OUTPUT}"
             echo "reason=legacy mode always runs queue CI" >> "${GITHUB_OUTPUT}"
           fi
-
-      - name: Record non-queue context
-        id: context
-        if: ${{ github.event_name != 'merge_group' }}
-        run: |
-          echo "reason_code=invalid_context" >> "${GITHUB_OUTPUT}"
-          echo "reason=not a merge-group event" >> "${GITHUB_OUTPUT}"
 
       - name: Check out merge-group commit
         if: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
@@ -236,6 +230,7 @@ jobs:
   workflow-lint:
     name: Validate GitHub Actions workflows
     needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -258,7 +253,7 @@ jobs:
     needs: classify-changes
     # This job owns the generated package input. Source-only Python tests stay
     # parallel; only packaging/browser/desktop consumers wait for this artifact.
-    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -377,7 +372,7 @@ jobs:
   webui-chat-recovery:
     name: WebUI chat recovery
     needs: [classify-changes, frontend-check]
-    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-check.result == 'success' && (needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -447,7 +442,7 @@ jobs:
   tui-check:
     name: OpenTUI package tests
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.tui_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.tui_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -493,7 +488,7 @@ jobs:
   desktop-check:
     name: Desktop Electron unit tests
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -545,7 +540,7 @@ jobs:
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -667,7 +662,7 @@ jobs:
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.python_full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.python_full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -747,7 +742,7 @@ jobs:
   windows-compat:
     name: Windows compatibility smoke (3.12)
     needs: classify-changes
-    if: ${{ (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true') && needs.classify-changes.outputs.windows_full_required != 'true' && needs.classify-changes.outputs.full_required != 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true') && needs.classify-changes.outputs.windows_full_required != 'true' && needs.classify-changes.outputs.full_required != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -795,7 +790,7 @@ jobs:
   windows-full:
     name: Windows high-risk (${{ matrix.shard }})
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.windows_full_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.windows_full_required == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -1001,7 +996,7 @@ jobs:
   macos-recovery:
     name: macOS profile recovery and native no-replace (3.12)
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -1090,7 +1085,7 @@ jobs:
     # contract, which is useful for their native recovery coverage.
     name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [classify-changes, frontend-check]
-    if: ${{ needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-check.result == 'success' && (needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -1337,7 +1332,7 @@ jobs:
   release-packaging:
     name: Release packaging contracts
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -1381,6 +1376,7 @@ jobs:
   readme-locale-check:
     name: README locale parity
     needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1399,7 +1395,7 @@ jobs:
   managed-toolchain-artifacts:
     name: Managed Toolchain Artifact E2E
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
     uses: ./.github/workflows/managed-toolchain-artifacts.yml
 
   main-canary:

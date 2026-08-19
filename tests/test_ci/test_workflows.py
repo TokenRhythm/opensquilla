@@ -249,11 +249,36 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         "${{ vars.CI_OPTIMIZATION_MODE || 'enforce' }}"
     )
     assert jobs["queue-attestation"]["name"] == "Verify reusable PR CI evidence"
-    assert "if" not in jobs["queue-attestation"]
-    assert "not a merge-group event" in str(jobs["queue-attestation"])
+    assert jobs["queue-attestation"]["if"] == (
+        "${{ github.event_name == 'merge_group' }}"
+    )
+    assert "not a merge-group event" not in str(jobs["queue-attestation"])
     assert "fetch-depth" in str(jobs["queue-attestation"])
     assert "verify-queue" in str(jobs["queue-attestation"])
     assert "reason_code" in str(jobs["queue-attestation"])
+    assert jobs["classify-changes"]["needs"] == "queue-attestation"
+    assert "always()" in jobs["classify-changes"]["if"]
+    assert "github.event_name != 'merge_group'" in jobs["classify-changes"]["if"]
+    classify_consumers = {
+        job_name: job
+        for job_name, job in jobs.items()
+        if job_name != "ci-result"
+        and "classify-changes"
+        in (
+            [job.get("needs")]
+            if isinstance(job.get("needs"), str)
+            else job.get("needs", [])
+        )
+    }
+    assert classify_consumers
+    for job_name, job in classify_consumers.items():
+        condition = str(job.get("if", ""))
+        assert "always()" in condition, job_name
+        assert "needs.classify-changes.result == 'success'" in condition, job_name
+    for job_name in ("webui-chat-recovery", "desktop-recovery-e2e"):
+        assert "needs.frontend-check.result == 'success'" in str(
+            jobs[job_name]["if"]
+        )
     queue_checkout = next(
         step
         for step in jobs["queue-attestation"]["steps"]
@@ -1405,7 +1430,8 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
     assert "python_full_required == 'true'" in jobs["ubuntu-full"]["if"]
     assert jobs["windows-compat"]["if"] == (
-        "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
+        "${{ always() && needs.classify-changes.result == 'success' && "
+        "(needs.classify-changes.outputs.python_changed == 'true' || "
         "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
         "needs.classify-changes.outputs.dependency_changed == 'true' || "
         "needs.classify-changes.outputs.release_changed == 'true') && "

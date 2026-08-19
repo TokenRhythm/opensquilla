@@ -282,19 +282,42 @@ def test_windows_shards_are_balanced_by_historical_duration() -> None:
     assert max(estimated_seconds) / min(estimated_seconds) < 1.05
 
 
-def test_windows_assignment_snapshot_freezes_current_mapping_without_movement() -> None:
+def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     baseline, assignments, guardrails, overrides = assignment_governance()
     report = assignment_governance_summary(Path.cwd())
 
-    assert baseline == assignments
+    expected_moved_paths = {
+        "tests/test_gateway/test_goal_rpc.py",
+        "tests/test_gateway/test_project_workspace_execution.py",
+        "tests/test_gateway/test_rpc_meta_runs.py",
+        "tests/test_gateway/test_rpc_router_decisions.py",
+        "tests/test_live_long_task_case_driver.py",
+        "tests/test_live_multi_provider_matrix.py",
+        "tests/test_observability/test_bundle.py",
+        "tests/test_persistence/test_router_decision_writer.py",
+        "tests/test_sandbox/test_windows_default_capability.py",
+        "tests/test_skills/test_meta_resume.py",
+    }
+    moved_paths = {
+        path for path, shard in assignments.items() if baseline[path] != shard
+    }
+
+    assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
-    assert overrides == ()
+    assert {str(override["path"]) for override in overrides} == expected_moved_paths
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
         "minimum_predicted_max_shard_improvement_seconds": 60.0,
     }
-    assert report["predicted_max_shard_improvement_seconds"] == 0.0
+    assert len(moved_paths) <= guardrails["max_moved_files"]
+    assert len(moved_paths) / len(baseline) <= guardrails["max_moved_fraction"]
+    assert report["predicted_max_shard_improvement_seconds"] >= (
+        guardrails["minimum_predicted_max_shard_improvement_seconds"]
+    )
+    proposed_seconds = list(report["current_predicted_seconds"].values())
+    assert max(proposed_seconds) / min(proposed_seconds) < 1.05
     assert report["assignment_sha256"] == assignment_snapshot_fingerprint()
     assert len(str(report["assignment_sha256"])) == 64
 
@@ -436,14 +459,23 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
         and shard_for_test(path) != matches[0]
     }
 
-    # These two long-running files need no shard-specific setup. Releasing them
-    # keeps every other known domain-affinity file on its named responsibility
-    # shard while restoring an even critical path.
+    # These reviewed files need no shard-specific setup. Releasing them keeps
+    # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
         "tests/test_ci/test_migrations_packaged.py": "core",
+        "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
+        "tests/test_gateway/test_project_workspace_execution.py": (
+            "desktop-installer-contracts"
+        ),
+        "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
+        "tests/test_gateway/test_rpc_router_decisions.py": (
+            "desktop-installer-contracts"
+        ),
+        "tests/test_observability/test_bundle.py": "desktop-installer-contracts",
         "tests/test_persistence/test_meta_run_writer.py": (
             "desktop-installer-contracts"
         ),
+        "tests/test_persistence/test_router_decision_writer.py": "core",
     }
     assert shard_for_test("tests/test_recovery/test_atomic_and_locking.py") == (
         "recovery-migration"
