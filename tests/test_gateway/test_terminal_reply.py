@@ -208,6 +208,80 @@ def test_image_input_unsupported_reply_is_actionable_and_stable() -> None:
     )
 
 
+def test_reasoning_only_output_budget_empty_response_reply_is_actionable_and_stable() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": "empty_response",
+            "error_message": (
+                "The provider used the configured output budget for reasoning without "
+                "returning a visible answer. Increase llm.max_tokens or choose another "
+                "model or provider."
+            ),
+        }
+    )
+
+    assert reply == (
+        "The model used its output budget for reasoning without returning a visible answer. "
+        "Increase llm.max_tokens or choose another model or provider."
+    )
+
+
+def test_reasoning_only_empty_response_reply_is_actionable_and_stable() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": "empty_response",
+            "error_message": (
+                "The provider returned reasoning without a visible answer. "
+                "Try again or choose another model or provider."
+            ),
+        }
+    )
+
+    assert reply == (
+        "The model returned reasoning without a visible answer. "
+        "Try again or choose another model or provider."
+    )
+
+
+@pytest.mark.parametrize(
+    ("error_class", "error_message"),
+    [
+        ("empty_response", "Provider returned an empty response"),
+        (
+            "empty_response",
+            "private provider detail: increase llm.max_tokens or choose another model",
+        ),
+        (
+            "RuntimeError",
+            (
+                "The provider used the configured output budget for reasoning without "
+                "returning a visible answer. Increase llm.max_tokens or choose another "
+                "model or provider."
+            ),
+        ),
+    ],
+)
+def test_other_empty_or_provider_errors_keep_generic_terminal_reply(
+    error_class: str,
+    error_message: str,
+) -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": error_class,
+            "error_message": error_message,
+        }
+    )
+
+    assert reply == "The task failed before it could finish."
+    assert error_message not in reply
+
+
 def test_human_silent_reply_failure_has_actionable_terminal_message() -> None:
     reply = build_terminal_reply(
         {

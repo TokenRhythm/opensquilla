@@ -2789,6 +2789,48 @@ class _SelectorFallbackProvider:
         self._skip_benched_fallbacks()
         return True
 
+    def fallback_after_invalid_response_with_capabilities(
+        self,
+        reason: str,
+        *,
+        requires_vision: bool,
+    ) -> bool:
+        """Select an invalid-response fallback with exact capability evidence.
+
+        Image-bearing retries fail closed unless bootstrap installed
+        deployment-scoped ``supported`` vision evidence. The selector applies
+        plugin, replay, and capacity policy before filtering and atomically
+        installs only the matching chain.
+        """
+
+        if not requires_vision:
+            return self.fallback_after_invalid_response(reason)
+
+        matching_fallback = getattr(
+            self._selector,
+            "next_fallback_after_failure_matching",
+            None,
+        )
+        if not callable(matching_fallback):
+            return False
+        try:
+            self._provider = matching_fallback(
+                RuntimeError(reason),
+                predicate=lambda candidate: (
+                    self._fallback_deployment_vision_support.get(
+                        _fallback_deployment_identity(candidate),
+                        "unknown",
+                    )
+                    == "supported"
+                ),
+            )
+        except Exception:  # noqa: BLE001 - fallback support is optional
+            return False
+
+        self._note_fallback_hop()
+        self._skip_benched_fallbacks()
+        return True
+
     def _reject_unsupported_image_input(
         self,
         messages: list[Any],

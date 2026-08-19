@@ -723,6 +723,42 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
 
 
 @pytest.mark.asyncio
+async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_terminal_message(
+) -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    engine_message = (
+        "The provider used the configured output budget for reasoning without returning a "
+        "visible answer. Increase llm.max_tokens or choose another model or provider."
+    )
+
+    async def _stream():
+        yield ErrorEvent(message=engine_message, code="empty_response")
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError) as exc_info:
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert exc_info.value.code == "empty_response"
+    payload = emitted[-1][2]
+    assert payload["code"] == "empty_response"
+    assert payload["message"] == (
+        "The model used its output budget for reasoning without returning a visible answer. "
+        "Increase llm.max_tokens or choose another model or provider."
+    )
+    assert payload["terminal_message"] == payload["message"]
+    assert payload["error_message"] == engine_message
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_stream_error_terminal_message_carries_error_ref() -> None:
     # Additive: when the turn loop stamped an error_id, the stream emitter
     # suffixes the user-facing text with the durable turn_errors reference.

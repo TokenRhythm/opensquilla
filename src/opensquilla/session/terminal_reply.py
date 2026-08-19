@@ -22,6 +22,22 @@ IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
     "The selected model cannot process image input. Choose an image-capable "
     "model or remove the image and try again."
 )
+_REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE = (
+    "the provider used the configured output budget for reasoning without returning a visible "
+    "answer. increase llm.max_tokens or choose another model or provider."
+)
+_REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE = (
+    "The model used its output budget for reasoning without returning a visible answer. "
+    "Increase llm.max_tokens or choose another model or provider."
+)
+_REASONING_ONLY_EMPTY_ERROR_MESSAGE = (
+    "the provider returned reasoning without a visible answer. try again or choose another "
+    "model or provider."
+)
+_REASONING_ONLY_EMPTY_TERMINAL_MESSAGE = (
+    "The model returned reasoning without a visible answer. "
+    "Try again or choose another model or provider."
+)
 
 # Non-context budget-exhaustion codes. Context-window exhaustion has its own,
 # more specific message via ``is_context_payload_too_large`` and is intentionally
@@ -163,6 +179,16 @@ def build_terminal_reply(
             "preserved the recoverable state; retry with a narrower request "
             "or a larger-context model."
         )
+    if (
+        error_class == "empty_response"
+        and error_message == _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE
+    ):
+        return _REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE
+    if (
+        error_class == "empty_response"
+        and error_message == _REASONING_ONLY_EMPTY_ERROR_MESSAGE
+    ):
+        return _REASONING_ONLY_EMPTY_TERMINAL_MESSAGE
     if reason == "output_truncated" or error_class == "provider_output_truncated":
         return "The provider stopped because the output limit was reached before the task finished."
     if (

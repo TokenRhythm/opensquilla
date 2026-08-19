@@ -4115,7 +4115,36 @@ class Agent:
             **payload,
         )
 
-    def _switch_to_invalid_response_fallback(self, reason: str) -> bool:
+    def _switch_to_invalid_response_fallback(
+        self,
+        reason: str,
+        *,
+        requires_vision: bool = False,
+    ) -> bool:
+        if requires_vision:
+            constrained_fallback = getattr(
+                self.provider,
+                "fallback_after_invalid_response_with_capabilities",
+                None,
+            )
+            if not callable(constrained_fallback):
+                return False
+            try:
+                return bool(
+                    constrained_fallback(
+                        reason,
+                        requires_vision=True,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - fallback support is optional
+                logger.warning(
+                    "provider.invalid_response_fallback_failed",
+                    session_key=self._session_key,
+                    reason=reason,
+                    requires_vision=True,
+                    error=str(exc),
+                )
+                return False
         fallback = getattr(self.provider, "fallback_after_invalid_response", None)
         if not callable(fallback):
             return False
@@ -4129,6 +4158,68 @@ class Agent:
                 error=str(exc),
             )
             return False
+
+    def _new_reasoning_only_act_now_message(
+        self,
+        *,
+        iteration: int,
+        attempt: int,
+        reasoning_content: str | None,
+        provider_default_reasoning: bool,
+    ) -> Message:
+        message = Message(
+            role="user",
+            content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+        )
+        append_runtime_event(
+            self.config.runtime_events_path,
+            {
+                "feature": "reasoning_only_act_now",
+                "name": "reasoning_only_act_now.injected",
+                "action": "retry_with_act_now_directive",
+                "reason": "provider_reasoning_only",
+                "provider_default_reasoning": provider_default_reasoning,
+                "iteration": iteration,
+                "attempt": attempt,
+                "reasoning_chars": len(reasoning_content or ""),
+                "session_key": self._session_key,
+                "agent_id": (
+                    self.config.tool_result_store_agent_id
+                    or self.config.metadata.get("agent_id")
+                ),
+            },
+        )
+        return message
+
+    def _provider_log_identity(self, observed_provider: str = "") -> str:
+        return (
+            str(getattr(self.provider, "active_provider_id", "") or "").strip()
+            or str(observed_provider or "").strip()
+            or str(self.config.provider_id or "").strip()
+            or str(getattr(self.provider, "provider_name", "") or "").strip()
+            or type(self.provider).__name__
+        )
+
+    def _log_reasoning_output_budget_exhausted(
+        self,
+        *,
+        model: str,
+        observed_provider: str,
+        configured_max_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        reasoning_content: str | None,
+    ) -> None:
+        logger.warning(
+            "provider.reasoning_output_budget_exhausted",
+            session_key=self._session_key,
+            model=model,
+            provider=self._provider_log_identity(observed_provider),
+            configured_max_tokens=configured_max_tokens,
+            iter_output_tokens=output_tokens,
+            iter_reasoning_tokens=reasoning_tokens,
+            reasoning_chars=len(reasoning_content or ""),
+        )
 
     @staticmethod
     def _tool_call_string_arg(
@@ -8019,6 +8110,7 @@ class Agent:
                         active_protected_turn_start_index = current_turn_start_index
 
                     request_suffix_messages: list[Message] = []
+                    reasoning_only_act_now_for_call: Message | None = None
                     if goal_terminal_final_response_pending:
                         # The terminal Goal ToolResult is sufficient context for
                         # one ordinary summary. Do not splice work/recovery
@@ -8043,6 +8135,7 @@ class Agent:
                         # request. Withheld on an assistant tail for the same
                         # reasoning-prefill reason as below.
                         request_suffix_messages = [reasoning_only_act_now_message]
+                        reasoning_only_act_now_for_call = reasoning_only_act_now_message
                     elif deadline_wrapup_message is not None and (
                         not turn_messages or turn_messages[-1].role != "assistant"
                     ):
@@ -10034,6 +10127,17 @@ class Agent:
                                 usage_call,
                                 usage_unknown_reason,
                             )
+                        if (
+                            reasoning_only_act_now_for_call is not None
+                            and not bool(
+                                getattr(
+                                    self.config,
+                                    "reasoning_only_act_now",
+                                    False,
+                                )
+                            )
+                        ):
+                            reasoning_only_act_now_message = None
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     _notify_call_outcome(
@@ -10204,9 +10308,9 @@ class Agent:
                                 and request_turn_messages[-1] is deadline_wrapup_message
                             )
                             or (
-                                reasoning_only_act_now_message is not None
+                                reasoning_only_act_now_for_call is not None
                                 and request_turn_messages[-1]
-                                is reasoning_only_act_now_message
+                                is reasoning_only_act_now_for_call
                             )
                         )
                     ):
@@ -10304,7 +10408,7 @@ class Agent:
                             "provider.invalid_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             classification=attempt_classification.kind.value,
                             iteration=iterations,
                             call_attempt=_call_attempt,
@@ -10317,7 +10421,6 @@ class Agent:
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
-
                         large_context_invalid = _is_large_context_invalid_response(
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
@@ -10537,10 +10640,14 @@ class Agent:
                             if (
                                 not _invalid_response_fallback_done
                                 and self._switch_to_invalid_response_fallback(
-                                    attempt_classification.kind.value
+                                    attempt_classification.kind.value,
+                                    requires_vision=(
+                                        self._count_image_blocks(request_messages) > 0
+                                    ),
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                reasoning_only_act_now_message = None
                                 fallback_reason = _provider_activity_reason_for_attempt(
                                     attempt_classification.kind
                                 )
@@ -10565,17 +10672,33 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                                and (
-                                    thinking_enabled
-                                    or (attempt_classification.stop_reason or "").lower()
-                                    == "length"
-                                )
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
+                                if (
+                                    (
+                                        not thinking_enabled
+                                        or bool(
+                                            getattr(
+                                                self.config,
+                                                "reasoning_only_act_now",
+                                                False,
+                                            )
+                                        )
+                                    )
+                                    and reasoning_only_act_now_message is None
+                                ):
+                                    reasoning_only_act_now_message = (
+                                        self._new_reasoning_only_act_now_message(
+                                            iteration=iterations,
+                                            attempt=_call_attempt,
+                                            reasoning_content=iter_reasoning_content,
+                                            provider_default_reasoning=not thinking_enabled,
+                                        )
+                                    )
                                 disable_thinking = (
                                     (attempt_classification.stop_reason or "").lower()
                                     == "length"
@@ -10594,7 +10717,9 @@ class Agent:
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
                                     model=last_actual_model or self.config.model_id or "",
-                                    provider=type(self.provider).__name__,
+                                    provider=self._provider_log_identity(
+                                        last_actual_provider
+                                    ),
                                     classification=attempt_classification.kind.value,
                                     iteration=iterations,
                                     call_attempt=_call_attempt,
@@ -10609,19 +10734,60 @@ class Agent:
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
                                     thinking_disabled=disable_thinking,
-                                )
-                                yield WarningEvent(
-                                    code="provider_large_context_visible_retry",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content for a large input; "
-                                        + (
-                                            "retrying once with thinking disabled."
-                                            if disable_thinking
-                                            else "retrying once to request visible content."
-                                        )
+                                    configured_max_tokens=max(
+                                        0,
+                                        int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
                                     ),
                                 )
+                                reasoning_output_budget_exhausted = (
+                                    attempt_classification.stop_reason or ""
+                                ).lower() == "length"
+                                if reasoning_output_budget_exhausted:
+                                    self._log_reasoning_output_budget_exhausted(
+                                        model=(
+                                            last_actual_model
+                                            or self.config.model_id
+                                            or ""
+                                        ),
+                                        observed_provider=last_actual_provider,
+                                        configured_max_tokens=max(
+                                            0,
+                                            int(
+                                                getattr(
+                                                    call_chat_cfg,
+                                                    "max_tokens",
+                                                    0,
+                                                )
+                                                or 0
+                                            ),
+                                        ),
+                                        output_tokens=iter_output_tokens,
+                                        reasoning_tokens=iter_reasoning_tokens,
+                                        reasoning_content=iter_reasoning_content,
+                                    )
+                                    yield WarningEvent(
+                                        code="provider_reasoning_only_retry",
+                                        message=(
+                                            "The provider used the configured output budget "
+                                            "for reasoning without returning visible content; "
+                                            "retrying once without changing max_tokens."
+                                        ),
+                                    )
+                                else:
+                                    yield WarningEvent(
+                                        code="provider_large_context_visible_retry",
+                                        message=(
+                                            "The provider returned reasoning without visible "
+                                            "content for a large input; "
+                                            + (
+                                                "retrying once with thinking disabled."
+                                                if disable_thinking
+                                                else (
+                                                    "retrying once to request visible content."
+                                                )
+                                            )
+                                        ),
+                                    )
                                 next_provider_activity_reason = "reasoning_only"
                                 yield ProviderActivityEvent(
                                     activity_id=provider_activity_id,
@@ -10639,21 +10805,38 @@ class Agent:
                                 continue
 
                             yield self._transition(AgentState.ERROR)
-                            if self.config.metadata.get("had_attachments"):
+                            if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                                if (attempt_classification.stop_reason or "").lower() == "length":
+                                    large_context_message = (
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning a visible answer. Increase "
+                                        "llm.max_tokens or choose another model or provider."
+                                    )
+                                else:
+                                    large_context_message = (
+                                        "The provider returned reasoning without a visible "
+                                        "answer. Try again or choose another model or provider."
+                                    )
+                            elif self.config.metadata.get("had_attachments"):
                                 recovery_guidance = (
                                     "Split, summarize, or shorten the attached material, "
                                     "or use a stronger model."
+                                )
+                                large_context_message = (
+                                    "Provider returned no visible response for a large input. "
+                                    + recovery_guidance
                                 )
                             else:
                                 recovery_guidance = (
                                     "Send the material as an attachment, summarize or "
                                     "shorten the prompt, or use a stronger model."
                                 )
-                            terminal_error = ErrorEvent(
-                                message=(
+                                large_context_message = (
                                     "Provider returned no visible response for a large input. "
                                     + recovery_guidance
-                                ),
+                                )
+                            terminal_error = ErrorEvent(
+                                message=large_context_message,
                                 code="empty_response",
                             )
                             yield terminal_error
@@ -10661,7 +10844,6 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                            and thinking_enabled
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.REASONING_ONLY,
                                 _attempt_retries_used,
@@ -10669,44 +10851,51 @@ class Agent:
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                             if (
-                                bool(
-                                    getattr(
-                                        self.config, "reasoning_only_act_now", False
+                                (
+                                    not thinking_enabled
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_act_now",
+                                            False,
+                                        )
                                     )
                                 )
                                 and reasoning_only_act_now_message is None
                             ):
-                                # Today's bare retry re-sends the identical
-                                # request; the model that just answered it with
-                                # reasoning only usually does so again. Splice
-                                # in an explicit act-now instruction so the
-                                # retry differs where it matters.
-                                reasoning_only_act_now_message = Message(
-                                    role="user",
-                                    content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+                                reasoning_only_act_now_message = (
+                                    self._new_reasoning_only_act_now_message(
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                        reasoning_content=iter_reasoning_content,
+                                        provider_default_reasoning=not thinking_enabled,
+                                    )
                                 )
-                                append_runtime_event(
-                                    self.config.runtime_events_path,
-                                    {
-                                        "feature": "reasoning_only_act_now",
-                                        "name": "reasoning_only_act_now.injected",
-                                        "action": "retry_with_act_now_directive",
-                                        "reason": "provider_reasoning_only",
-                                        "iteration": iterations,
-                                        "attempt": _call_attempt,
-                                        "reasoning_chars": len(
-                                            iter_reasoning_content or ""
-                                        ),
-                                        "session_key": self._session_key,
-                                        "agent_id": (
-                                            self.config.tool_result_store_agent_id
-                                            or self.config.metadata.get("agent_id")
-                                        ),
-                                    },
+                            disable_thinking = bool(
+                                thinking_enabled
+                                and getattr(
+                                    self.config,
+                                    "reasoning_only_thinking_fallback",
+                                    False,
                                 )
-                            if getattr(
-                                self.config, "reasoning_only_thinking_fallback", False
-                            ):
+                            )
+                            reasoning_output_budget_exhausted = (
+                                attempt_classification.stop_reason or ""
+                            ).lower() == "length"
+                            if reasoning_output_budget_exhausted:
+                                configured_max_tokens = max(
+                                    0,
+                                    int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                                )
+                                self._log_reasoning_output_budget_exhausted(
+                                    model=last_actual_model or self.config.model_id or "",
+                                    observed_provider=last_actual_provider,
+                                    configured_max_tokens=configured_max_tokens,
+                                    output_tokens=iter_output_tokens,
+                                    reasoning_tokens=iter_reasoning_tokens,
+                                    reasoning_content=iter_reasoning_content,
+                                )
+                            if disable_thinking:
                                 _thinking_fallback_done = True
                                 _disable_thinking_for_next_provider_call = True
                                 yield WarningEvent(
@@ -10714,6 +10903,15 @@ class Agent:
                                     message=(
                                         "The provider returned reasoning without visible "
                                         "content; retrying once with thinking disabled."
+                                    ),
+                                )
+                            elif reasoning_output_budget_exhausted:
+                                yield WarningEvent(
+                                    code="provider_reasoning_only_retry",
+                                    message=(
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning visible content; retrying "
+                                        "once without changing max_tokens."
                                     ),
                                 )
                             else:
@@ -10891,10 +11089,14 @@ class Agent:
                             }
                             and not _invalid_response_fallback_done
                             and self._switch_to_invalid_response_fallback(
-                                attempt_classification.kind.value
+                                attempt_classification.kind.value,
+                                requires_vision=(
+                                    self._count_image_blocks(request_messages) > 0
+                                ),
                             )
                         ):
                             _invalid_response_fallback_done = True
+                            reasoning_only_act_now_message = None
                             fallback_reason = _provider_activity_reason_for_attempt(
                                 attempt_classification.kind
                             )
@@ -10967,7 +11169,7 @@ class Agent:
                             "provider.empty_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             iteration=iterations,
                             retry_attempt=_call_attempt,
                             post_tool_turn=post_tool_turn,
@@ -10977,6 +11179,10 @@ class Agent:
                             iter_output_tokens=iter_output_tokens,
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
+                            configured_max_tokens=max(
+                                0,
+                                int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                            ),
                         )
                         self._record_tool_loop_runtime_event(
                             reason="provider_empty_response_terminal",
@@ -10992,8 +11198,22 @@ class Agent:
                             reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
+                        if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                            if (attempt_classification.stop_reason or "").lower() == "length":
+                                terminal_message = (
+                                    "The provider used the configured output budget for "
+                                    "reasoning without returning a visible answer. Increase "
+                                    "llm.max_tokens or choose another model or provider."
+                                )
+                            else:
+                                terminal_message = (
+                                    "The provider returned reasoning without a visible answer. "
+                                    "Try again or choose another model or provider."
+                                )
+                        else:
+                            terminal_message = "Provider returned an empty response"
                         terminal_error = ErrorEvent(
-                            message="Provider returned an empty response",
+                            message=terminal_message,
                             code="empty_response",
                         )
                         yield terminal_error

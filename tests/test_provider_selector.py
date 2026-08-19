@@ -85,6 +85,288 @@ def test_turn_clone_disables_replay_for_plugin_fallback_without_mutating_shared_
     assert shared.current_config.replay_provider_state is True
 
 
+def test_matching_fallback_filters_plugin_chain_before_build(monkeypatch) -> None:
+    text_fallback = ProviderConfig(
+        "openrouter",
+        "text-fallback",
+        api_key="plugin-test-key",
+    )
+    unknown_fallback = ProviderConfig(
+        "openrouter",
+        "unknown-fallback",
+        api_key="plugin-test-key",
+    )
+    vision_fallback = ProviderConfig(
+        "openrouter",
+        "vision-fallback",
+        api_key="plugin-test-key",
+    )
+    second_vision_fallback = ProviderConfig(
+        "openrouter",
+        "second-vision-fallback",
+        api_key="plugin-test-key",
+    )
+    observed_failures: list[Exception] = []
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            observed_failures.append(primary_failure)
+            return [
+                text_fallback,
+                unknown_fallback,
+                vision_fallback,
+                second_vision_fallback,
+            ]
+
+    built: list[ProviderConfig] = []
+
+    def fake_build_provider(cfg: ProviderConfig) -> ProviderConfig:
+        built.append(cfg)
+        return cfg
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", fake_build_provider)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openrouter",
+                "primary",
+                api_key="primary-test-key",
+            ),
+            fallbacks=[
+                ProviderConfig(
+                    "openrouter",
+                    "static-fallback-must-not-run",
+                    api_key="static-test-key",
+                )
+            ],
+        ),
+        plugin=_Plugin(),
+    )
+    failure = RuntimeError("classified failure")
+
+    fallback = selector.next_fallback_after_failure_matching(
+        failure,
+        predicate=lambda cfg: cfg.model in {
+            "vision-fallback",
+            "second-vision-fallback",
+        },
+    )
+
+    assert observed_failures == [failure]
+    assert fallback is vision_fallback
+    assert built == [vision_fallback]
+    assert [cfg.model for cfg in selector.remaining_chain()] == [
+        "vision-fallback",
+        "second-vision-fallback",
+    ]
+
+
+def test_matching_fallback_honors_empty_plugin_veto_atomically(monkeypatch) -> None:
+    static_fallback = ProviderConfig(
+        "openrouter",
+        "static-vision-fallback",
+        api_key="static-test-key",
+    )
+    plugin_calls = 0
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            nonlocal plugin_calls
+            del primary_failure
+            plugin_calls += 1
+            return []
+
+    built: list[ProviderConfig] = []
+
+    def fake_build_provider(cfg: ProviderConfig) -> ProviderConfig:
+        built.append(cfg)
+        return cfg
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", fake_build_provider)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openrouter",
+                "primary",
+                api_key="primary-test-key",
+            ),
+            fallbacks=[static_fallback],
+        ),
+        plugin=_Plugin(),
+    )
+    original_chain = selector.remaining_chain()
+
+    with pytest.raises(IndexError, match="No fallback chain available"):
+        selector.next_fallback_after_failure_matching(
+            RuntimeError("classified failure"),
+            predicate=lambda cfg: cfg.model == "static-vision-fallback",
+        )
+
+    assert plugin_calls == 1
+    assert built == []
+    assert selector.current_config is original_chain[0]
+    assert selector.remaining_chain() == original_chain
+
+
+def test_matching_fallback_applies_replay_and_capacity_before_predicate(
+    monkeypatch,
+) -> None:
+    approved = ProviderConfig(
+        "tokenrhythm",
+        "vision-model",
+        api_key="approved-key",
+        base_url="https://approved.example/v1",
+        replay_provider_state=True,
+    )
+    unapproved_endpoint = ProviderConfig(
+        "tokenrhythm",
+        "vision-model",
+        api_key="other-key",
+        base_url="https://unapproved.example/v1",
+        replay_provider_state=True,
+    )
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            del primary_failure
+            return [unapproved_endpoint, approved]
+
+    predicate_inputs: list[ProviderConfig] = []
+    built: list[ProviderConfig] = []
+
+    def predicate(cfg: ProviderConfig) -> bool:
+        predicate_inputs.append(cfg)
+        return True
+
+    def fake_build_provider(cfg: ProviderConfig) -> ProviderConfig:
+        built.append(cfg)
+        return cfg
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", fake_build_provider)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openrouter",
+                "baseline",
+                api_key="primary-test-key",
+            ),
+            fallbacks=[approved],
+        ),
+        plugin=_Plugin(),
+    )
+    selector.override_model_with_bounded_fallback_chain(
+        HIGH_TIER_MODEL,
+        [approved],
+    )
+    selector.disable_provider_state_replay()
+
+    fallback = selector.next_fallback_after_failure_matching(
+        RuntimeError("classified failure"),
+        predicate=predicate,
+    )
+
+    assert [cfg.base_url for cfg in predicate_inputs] == [
+        "https://approved.example/v1"
+    ]
+    assert all(cfg.replay_provider_state is False for cfg in predicate_inputs)
+    assert fallback.base_url == "https://approved.example/v1"
+    assert fallback.replay_provider_state is False
+    assert built == [fallback]
+    assert approved.replay_provider_state is True
+    assert unapproved_endpoint.replay_provider_state is True
+
+
+def test_matching_fallback_build_failure_does_not_advance_selector(monkeypatch) -> None:
+    primary = ProviderConfig(
+        "openrouter",
+        "primary",
+        api_key="primary-test-key",
+    )
+    text_fallback = ProviderConfig(
+        "openrouter",
+        "text-fallback",
+        api_key="text-test-key",
+    )
+    vision_fallback = ProviderConfig(
+        "openrouter",
+        "vision-fallback",
+        api_key="vision-test-key",
+    )
+    built: list[ProviderConfig] = []
+
+    def failing_build_provider(cfg: ProviderConfig):
+        built.append(cfg)
+        raise ProviderBuildError("synthetic build failure")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        failing_build_provider,
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=primary,
+            fallbacks=[text_fallback, vision_fallback],
+        )
+    )
+    original_chain = selector.remaining_chain()
+
+    with pytest.raises(ProviderBuildError, match="synthetic build failure"):
+        selector.next_fallback_after_failure_matching(
+            RuntimeError("classified failure"),
+            predicate=lambda cfg: cfg.model == "vision-fallback",
+        )
+
+    assert built == [vision_fallback]
+    assert selector.current_config is primary
+    assert selector.remaining_chain() == original_chain
+
+
+def test_next_fallback_build_failure_keeps_active_matching_candidate(monkeypatch) -> None:
+    primary = ProviderConfig("openrouter", "primary", api_key="primary-test-key")
+    first_vision = ProviderConfig(
+        "openrouter",
+        "first-vision",
+        api_key="first-vision-test-key",
+    )
+    second_vision = ProviderConfig(
+        "openrouter",
+        "second-vision",
+        api_key="second-vision-test-key",
+    )
+    built: list[ProviderConfig] = []
+
+    def build_provider(cfg: ProviderConfig) -> ProviderConfig:
+        built.append(cfg)
+        if cfg is second_vision:
+            raise ProviderBuildError("synthetic second-candidate build failure")
+        return cfg
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", build_provider)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=primary,
+            fallbacks=[first_vision, second_vision],
+        )
+    )
+
+    active_provider = selector.next_fallback_after_failure_matching(
+        RuntimeError("classified failure"),
+        predicate=lambda cfg: cfg.model in {"first-vision", "second-vision"},
+    )
+
+    assert active_provider is first_vision
+    assert selector.current_config is first_vision
+    with pytest.raises(
+        ProviderBuildError,
+        match="synthetic second-candidate build failure",
+    ):
+        selector.next_fallback()
+
+    assert built == [first_vision, second_vision]
+    assert selector.current_config is first_vision
+    assert selector.remaining_chain() == [first_vision, second_vision]
+
+
 def test_override_model_keeps_original_primary_as_first_fallback(monkeypatch) -> None:
     built: list[ProviderConfig] = []
 
