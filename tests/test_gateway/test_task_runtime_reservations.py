@@ -16,8 +16,11 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway.config import GatewayConfig, LlmEnsembleCandidateConfig
+from opensquilla.gateway.model_routing import capture_model_routing_config
 from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+from opensquilla.gateway.session_model_routing import accepted_model_routing_audit
 from opensquilla.gateway.task_runtime import (
     PendingOverflowPolicy,
     TaskQueueFullError,
@@ -328,6 +331,128 @@ async def test_freeze_acceptance_attaches_audit_before_commit_without_storage_up
     assert committed.details["accepted_model_routing"] == audit
     assert storage.update_calls == []
 
+    await runtime.abort_reservation(reservation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["router", "ensemble"])
+async def test_durable_routing_recovery_restores_exact_accepted_details(mode: str) -> None:
+    storage = _TrackingStorage()
+    accepted_live = GatewayConfig()
+    accepted_live.squilla_router.tiers["c0"]["model"] = "accepted-router-model"
+    if mode == "ensemble":
+        accepted_live.llm_ensemble.selection_mode = "custom_b5"
+        accepted_live.llm_ensemble.enabled = True
+        accepted_live.llm_ensemble.candidates = [
+            LlmEnsembleCandidateConfig(
+                provider="openai",
+                model="accepted-proposer-one",
+                role="primary",
+            ),
+            LlmEnsembleCandidateConfig(
+                provider="anthropic",
+                model="accepted-proposer-two",
+                role="contrast",
+            ),
+            LlmEnsembleCandidateConfig(
+                provider="openai",
+                model="accepted-aggregator",
+                role="aggregator",
+            ),
+        ]
+        accepted_live.llm_ensemble = type(accepted_live.llm_ensemble).model_validate(
+            accepted_live.llm_ensemble.model_dump(mode="python")
+        )
+
+    accepted = capture_model_routing_config(
+        accepted_live,
+        session_mode=mode,
+        session_routing_revision=23,
+        session_routing_source="session",
+    )
+    audit = accepted_model_routing_audit(accepted, run_kind="web_turn")
+    assert audit is not None
+    assert "config_snapshot" in audit
+
+    def reject_current_config(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("new durable records must not read current routing details")
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_noop_turn_handler,
+        accepted_config_provider=reject_current_config,
+    )
+    reservation = await runtime.reserve(
+        _envelope(f"agent-1::durable-{mode}"),
+        "accepted",
+        run_kind="web_turn",
+    )
+    reservation.task_record.details = {"accepted_model_routing": audit}
+
+    await runtime._restore_durable_accepted_model_routing(  # noqa: SLF001
+        reservation,
+        reservation.task_record,
+    )
+
+    restored = reservation.runtime_task.accepted_config
+    assert restored.squilla_router.model_dump(mode="json") == (
+        accepted.squilla_router.model_dump(mode="json")
+    )
+    assert restored.llm_ensemble.model_dump(mode="json") == (
+        accepted.llm_ensemble.model_dump(mode="json")
+    )
+    assert restored.session_mode == mode
+    assert restored.session_routing_revision == 23
+    await runtime.abort_reservation(reservation)
+
+
+@pytest.mark.asyncio
+async def test_legacy_durable_routing_audit_uses_compatible_current_details() -> None:
+    storage = _TrackingStorage()
+    accepted_live = GatewayConfig()
+    accepted = capture_model_routing_config(
+        accepted_live,
+        session_mode="router",
+        session_routing_revision=5,
+        session_routing_source="session",
+    )
+    audit = accepted_model_routing_audit(accepted, run_kind="web_turn")
+    assert audit is not None
+    audit.pop("config_snapshot")
+
+    current_live = GatewayConfig()
+    current_live.squilla_router.tiers["c0"]["model"] = "current-compatible-model"
+    current = capture_model_routing_config(current_live)
+    provider_calls: list[tuple[str, str]] = []
+
+    def current_config_provider(*, session_key: str, run_kind: str) -> Any:
+        provider_calls.append((session_key, run_kind))
+        return current
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_noop_turn_handler,
+        accepted_config_provider=current_config_provider,
+    )
+    reservation = await runtime.reserve(
+        _envelope("agent-1::legacy-durable-routing"),
+        "accepted",
+        run_kind="web_turn",
+    )
+    reservation.task_record.details = {"accepted_model_routing": audit}
+
+    await runtime._restore_durable_accepted_model_routing(  # noqa: SLF001
+        reservation,
+        reservation.task_record,
+    )
+
+    restored = reservation.runtime_task.accepted_config
+    assert provider_calls == [
+        ("agent-1::legacy-durable-routing", "recovery_model_routing_base")
+    ]
+    assert restored.session_mode == "router"
+    assert restored.session_routing_revision == 5
+    assert restored.squilla_router.tiers["c0"]["model"] == "current-compatible-model"
     await runtime.abort_reservation(reservation)
 
 

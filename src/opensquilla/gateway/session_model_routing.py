@@ -15,6 +15,7 @@ from typing import Any, cast
 from opensquilla.gateway.model_routing import (
     ModelRoutingMode,
     capture_model_routing_config,
+    durable_model_routing_config_snapshot,
     model_routing_snapshot,
 )
 from opensquilla.gateway.session_services import get_session_storage
@@ -232,7 +233,7 @@ def accepted_model_routing_audit(
         getattr(accepted_config, "session_routing_source", "global_policy")
         or "global_policy"
     )
-    return {
+    audit = {
         "scope": "session" if session_mode is not None else "global",
         "session_mode": session_mode,
         "session_revision": revision,
@@ -244,6 +245,10 @@ def accepted_model_routing_audit(
         "selection_mode": routing["selection_mode"],
         "run_kind": run_kind,
     }
+    config_snapshot = durable_model_routing_config_snapshot(accepted_config)
+    if config_snapshot is not None:
+        audit["config_snapshot"] = config_snapshot
+    return audit
 
 
 async def accepted_model_routing_stream(

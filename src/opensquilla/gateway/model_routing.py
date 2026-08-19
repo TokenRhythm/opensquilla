@@ -8,6 +8,7 @@ surface observes and mutates the same state machine.
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -156,6 +157,31 @@ def _image_input_routing_snapshot(
             "reason": "model_vision_unsupported",
         }
     return {"admission": "unknown", "reason": "capability_unknown"}
+
+
+_DURABLE_ROUTER_TIER_TEXT_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "description",
+        "thinking_level",
+        "thinkingLevel",
+        "ensemble_selection_mode",
+        "ensembleSelectionMode",
+    }
+)
+_DURABLE_ROUTER_TIER_BOOL_FIELDS = frozenset(
+    {
+        "supports_image",
+        "supportsImage",
+        "supports_thinking",
+        "image_only",
+        "imageOnly",
+        "ensemble_enabled",
+        "ensembleEnabled",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _ModelRoutingConfigSnapshot:
@@ -710,6 +736,95 @@ def capture_model_routing_config(
     )
 
 
+def durable_model_routing_config_snapshot(config: Any) -> dict[str, Any] | None:
+    """Serialize one accepted routing snapshot for exact restart recovery.
+
+    Persisting a strict, non-secret projection keeps Router tiers and Ensemble
+    lineups frozen for already-accepted work without extending that freeze to
+    live safety, tool, channel, or approval policy.
+    """
+
+    if not isinstance(config, _ModelRoutingConfigSnapshot):
+        return None
+    payload: dict[str, Any] = {}
+    for field_name in ("squilla_router", "llm_ensemble"):
+        value = getattr(config, field_name)
+        if value is None:
+            return None
+        model_dump = getattr(value, "model_dump", None)
+        if not callable(model_dump):
+            return None
+        dumped = model_dump(mode="json")
+        if not isinstance(dumped, dict):
+            return None
+        if field_name == "squilla_router":
+            dumped["tiers"] = _durable_router_tier_snapshot(dumped.get("tiers"))
+        payload[field_name] = dumped
+    return payload
+
+
+def _durable_router_tier_snapshot(value: object) -> dict[str, dict[str, Any]]:
+    from opensquilla.router_tiers import normalize_tier_id, normalize_tier_mapping
+
+    if not isinstance(value, Mapping):
+        return {}
+    snapshot: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_tier in normalize_tier_mapping(value).items():
+        tier_name = normalize_tier_id(raw_name)
+        if tier_name is None or not isinstance(raw_tier, Mapping):
+            continue
+        tier: dict[str, Any] = {}
+        for field_name in _DURABLE_ROUTER_TIER_TEXT_FIELDS:
+            field_value = raw_tier.get(field_name)
+            if isinstance(field_value, str):
+                tier[field_name] = field_value
+        thinking = raw_tier.get("thinking")
+        if isinstance(thinking, (str, bool)):
+            tier["thinking"] = thinking
+        for field_name in _DURABLE_ROUTER_TIER_BOOL_FIELDS:
+            field_value = raw_tier.get(field_name)
+            if isinstance(field_value, bool):
+                tier[field_name] = field_value
+        snapshot[tier_name] = tier
+    return snapshot
+
+
+def restore_durable_model_routing_config_snapshot(
+    payload: dict[str, Any],
+    *,
+    session_mode: ModelRoutingMode | str | None,
+    session_routing_revision: int | None,
+    session_routing_source: str,
+) -> Any:
+    """Validate and restore a server-written durable routing snapshot."""
+
+    if set(payload) != {"squilla_router", "llm_ensemble"}:
+        raise ValueError("invalid durable model-routing config snapshot")
+    router_payload = payload.get("squilla_router")
+    ensemble_payload = payload.get("llm_ensemble")
+    if not isinstance(router_payload, dict) or not isinstance(ensemble_payload, dict):
+        raise ValueError("invalid durable model-routing config snapshot")
+    if router_payload.get("tiers") != _durable_router_tier_snapshot(
+        router_payload.get("tiers")
+    ):
+        raise ValueError("invalid durable model-routing tier snapshot")
+
+    from opensquilla.gateway.config import LlmEnsembleConfig, SquillaRouterConfig
+
+    normalized_mode = _clean(session_mode)
+    if normalized_mode and normalized_mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("invalid durable model-routing session mode")
+    return _ModelRoutingConfigSnapshot(
+        squilla_router=SquillaRouterConfig.model_validate(router_payload),
+        llm_ensemble=LlmEnsembleConfig.model_validate(ensemble_payload),
+        session_mode=(
+            cast(ModelRoutingMode, normalized_mode) if normalized_mode else None
+        ),
+        session_routing_revision=session_routing_revision,
+        session_routing_source=session_routing_source,
+    )
+
+
 async def broadcast_model_routing_changed(
     ctx: Any,
     *,
@@ -771,8 +886,10 @@ __all__ = [
     "broadcast_model_routing_changed",
     "broadcast_model_routing_changed_if_needed",
     "capture_model_routing_config",
+    "durable_model_routing_config_snapshot",
     "model_routing_mode_for_write",
     "model_routing_patches",
     "model_routing_snapshot",
     "reconcile_model_routing_write",
+    "restore_durable_model_routing_config_snapshot",
 ]

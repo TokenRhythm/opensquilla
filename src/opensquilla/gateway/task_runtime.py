@@ -271,6 +271,7 @@ class _DurableAcceptedModelRouting:
     mode: str
     revision: int | None
     source: str
+    config_snapshot: dict[str, Any] | None
     audit: dict[str, Any]
 
 
@@ -302,6 +303,7 @@ def _validated_durable_accepted_model_routing(
     ensemble_enabled = raw.get("ensemble_enabled")
     rollout_phase = raw.get("rollout_phase")
     selection_mode = raw.get("selection_mode")
+    config_snapshot = raw.get("config_snapshot")
 
     if scope not in {"session", "global"}:
         raise ValueError("invalid durable accepted model-routing scope")
@@ -344,12 +346,15 @@ def _validated_durable_accepted_model_routing(
             raise ValueError("invalid durable accepted session routing revision")
     elif session_mode is not None or revision is not None or source != "global_policy":
         raise ValueError("invalid durable accepted global routing coordinates")
+    if config_snapshot is not None and not isinstance(config_snapshot, dict):
+        raise ValueError("invalid durable accepted model-routing config snapshot")
 
     return _DurableAcceptedModelRouting(
         scope=scope,
         mode=effective_mode,
         revision=revision,
         source=source,
+        config_snapshot=(dict(config_snapshot) if config_snapshot is not None else None),
         audit=dict(raw),
     )
 
@@ -2426,44 +2431,49 @@ class TaskRuntime:
     ) -> None:
         """Restore a restart task's server-recorded routing coordinates.
 
-        The compact audit intentionally does not persist the full Router tier
-        or Ensemble lineup subtrees.  Recovery therefore starts with the
-        provider's current non-secret routing snapshot and reapplies the
-        persisted effective mode, revision, and source.  This preserves the
-        accepted strategy boundary without pretending the audit can recreate
-        detailed configuration that it never stored.
-
-        Missing audits retain the pre-feature compatibility path and are
-        captured normally by :meth:`activate`.  A present but malformed audit
-        is rejected instead of becoming execution authority.
+        New records carry the exact non-secret Router and Ensemble subtrees
+        captured at acceptance.  Older records retain the compatibility path
+        that rebuilds their mode over the current global detail snapshot.  A
+        present but malformed audit is rejected instead of becoming execution
+        authority.
         """
 
         durable = _validated_durable_accepted_model_routing(durable_task)
         if durable is None:
             return
-        if self._accepted_config_provider is None:
-            raise ValueError("cannot restore durable model routing without a provider")
-
-        current = await _capture_accepted_config(
-            self._accepted_config_provider,
-            session_key=durable_task.session_key,
-            # Deliberately use a non-session run kind.  The Gateway provider
-            # returns the current global detail subtrees without consulting
-            # today's Session mode; the durable audit below is the sole mode
-            # authority for this already-accepted task.
-            run_kind=_ROUTING_RECOVERY_BASE_RUN_KIND,
-        )
         from opensquilla.gateway.model_routing import (
             capture_model_routing_config,
             model_routing_snapshot,
+            restore_durable_model_routing_config_snapshot,
         )
 
-        restored = capture_model_routing_config(
-            current,
-            session_mode=durable.mode,
-            session_routing_revision=durable.revision,
-            session_routing_source=durable.source,
-        )
+        if durable.config_snapshot is not None:
+            restored = restore_durable_model_routing_config_snapshot(
+                durable.config_snapshot,
+                session_mode=(durable.mode if durable.scope == "session" else None),
+                session_routing_revision=durable.revision,
+                session_routing_source=durable.source,
+            )
+        else:
+            if self._accepted_config_provider is None:
+                raise ValueError(
+                    "cannot restore legacy durable model routing without a provider"
+                )
+            current = await _capture_accepted_config(
+                self._accepted_config_provider,
+                session_key=durable_task.session_key,
+                # Deliberately use a non-session run kind.  The Gateway provider
+                # returns the current global detail subtrees without consulting
+                # today's Session mode; the durable audit below is the sole mode
+                # authority for this already-accepted task.
+                run_kind=_ROUTING_RECOVERY_BASE_RUN_KIND,
+            )
+            restored = capture_model_routing_config(
+                current,
+                session_mode=durable.mode,
+                session_routing_revision=durable.revision,
+                session_routing_source=durable.source,
+            )
         if restored is None:
             raise ValueError("accepted model-routing provider returned no config")
         if durable.scope == "global":
@@ -2473,8 +2483,18 @@ class TaskRuntime:
                 session_routing_revision=None,
                 session_routing_source="global_policy",
             )
-        if model_routing_snapshot(restored)["mode"] != durable.mode:
+        restored_routing = model_routing_snapshot(restored)
+        if restored_routing["mode"] != durable.mode:
             raise ValueError("could not rebuild durable accepted model-routing mode")
+        if durable.config_snapshot is not None:
+            for audit_field in (
+                "router_enabled",
+                "ensemble_enabled",
+                "rollout_phase",
+                "selection_mode",
+            ):
+                if restored_routing[audit_field] != durable.audit[audit_field]:
+                    raise ValueError("durable accepted model-routing snapshot changed")
 
         async with self._state_lock:
             if reservation.aborted or reservation.activated:
