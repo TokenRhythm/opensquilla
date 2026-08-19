@@ -1049,6 +1049,7 @@
     "modelStrategy": {
       "title": "Model routing",
       "desc": "Choose how models are picked for each request.",
+      "newSessionDefault": "This is the default for new chats. Existing chats keep their own routing mode.",
       "modeTitle": "Choose how models are used",
       "providerFirstTitle": "Add a model provider to start",
       "providerFirst": "Model routing needs at least one saved provider.",

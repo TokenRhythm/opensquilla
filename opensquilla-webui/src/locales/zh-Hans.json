@@ -1049,6 +1049,7 @@
     "modelStrategy": {
       "title": "模型路由",
       "desc": "选择每次请求如何挑选模型。",
+      "newSessionDefault": "此设置是新会话的默认值；已有会话会保留各自的路由模式。",
       "modeTitle": "选择模型使用方式",
       "providerFirstTitle": "先添加模型服务商",
       "providerFirst": "模型路由需要至少一个已保存的供应商。",

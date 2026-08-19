@@ -969,6 +969,7 @@
     "modelStrategy": {
       "title": "Routage des modèles",
       "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
+      "newSessionDefault": "C’est la valeur par défaut des nouveaux chats. Les chats existants conservent leur propre mode de routage.",
       "modeTitle": "Choisir l’utilisation des modèles",
       "providerFirstTitle": "Ajouter d’abord un service de modèles",
       "providerFirst": "Le routage de modèles nécessite au moins un fournisseur enregistré.",

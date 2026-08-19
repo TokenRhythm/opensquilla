@@ -969,6 +969,7 @@
     "modelStrategy": {
       "title": "Enrutamiento de modelos",
       "desc": "Elige cómo se selecciona el modelo para cada solicitud.",
+      "newSessionDefault": "Este es el valor predeterminado de los chats nuevos. Los chats existentes conservan su propio modo de enrutamiento.",
       "modeTitle": "Elige cómo usar los modelos",
       "providerFirstTitle": "Añade primero un servicio de modelos",
       "providerFirst": "El enrutado de modelos necesita al menos un proveedor guardado.",

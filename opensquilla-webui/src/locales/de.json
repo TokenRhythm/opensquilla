@@ -969,6 +969,7 @@
     "modelStrategy": {
       "title": "Modellrouting",
       "desc": "Lege fest, wie Modelle für jede Anfrage ausgewählt werden.",
+      "newSessionDefault": "Dies ist die Vorgabe für neue Chats. Bestehende Chats behalten ihren eigenen Routing-Modus.",
       "modeTitle": "Modellnutzung auswählen",
       "providerFirstTitle": "Zuerst einen Modelldienst hinzufügen",
       "providerFirst": "Modell-Routing benötigt mindestens einen gespeicherten Anbieter.",
