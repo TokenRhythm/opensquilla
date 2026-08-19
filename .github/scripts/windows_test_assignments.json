@@ -207,6 +207,7 @@
       "tests/test_skills/test_hub_management_service.py",
       "tests/test_skills/test_hub_scanner.py",
       "tests/test_skills/test_hub_transaction_process_gates.py",
+      "tests/test_skills/test_loader_turn_snapshot.py",
       "tests/test_skills/test_managed_toolchains.py",
       "tests/test_skills/test_meta_clarify_defaults.py",
       "tests/test_skills/test_meta_dsl_extensions.py",

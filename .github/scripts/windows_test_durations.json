@@ -1149,6 +1149,7 @@
     "tests/test_skills/test_injector_budget.py": 0.032,
     "tests/test_skills/test_injector_meta_kind.py": 0.01,
     "tests/test_skills/test_loader_list_meta_specs.py": 3.264,
+    "tests/test_skills/test_loader_turn_snapshot.py": 0.01,
     "tests/test_skills/test_managed_toolchains.py": 4.983,
     "tests/test_skills/test_meta_arxiv_daily_digest_deck.py": 3.156,
     "tests/test_skills/test_meta_auto_trigger_enabled.py": 0.01,
