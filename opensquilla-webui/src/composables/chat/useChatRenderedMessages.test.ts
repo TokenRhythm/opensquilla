@@ -909,24 +909,25 @@ describe('useChatRenderedMessages router visual mode', () => {
     expect((strip?.gridCells || []).length).toBeGreaterThan(1)
   })
 
-  it('shows the ensemble strip for the live turn while ensemble mode is on', () => {
-    // Live (non-history) squilla_router decision + active ensemble mode → the
-    // ensemble panel immediately, not the tier grid.
-    const withMessages = useChatRenderedMessages({
-      messages: ref<ChatMessage[]>([
-        { role: 'user', text: 'hard question', ts: 0 },
-        {
-          role: 'router',
-          text: '',
-          ts: 1,
-          provenanceKind: 'router_decision',
-          routerDecision: {
-            tier: 'balanced',
-            model: 'anthropic/claude-sonnet-4.6',
-            source: 'squilla_router',
-          },
+  it('keeps the accepted ensemble strip stable when the next-turn mode changes', () => {
+    const nextTurnMode = ref<ModelRoutingMode>('llm_ensemble')
+    const messages = ref<ChatMessage[]>([
+      { role: 'user', text: 'hard question', ts: 0 },
+      {
+        role: 'router',
+        text: '',
+        ts: 1,
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'balanced',
+          model: 'anthropic/claude-sonnet-4.6',
+          source: 'squilla_router',
+          accepted_routing_mode: 'ensemble',
         },
-      ]),
+      },
+    ])
+    const withMessages = useChatRenderedMessages({
+      messages,
       sessionKey: ref('router-ensemble-live-test'),
       routerSlots: ref(['fast', 'balanced', 'strong']),
       routerModels: ref({}),
@@ -941,12 +942,66 @@ describe('useChatRenderedMessages router visual mode', () => {
       stripGeneratedArtifactMarkers: text => text,
       stripTimePrefix: text => text,
       isSubagentCompletionMessage: () => false,
-      modelRoutingMode: ref('llm_ensemble'),
+      modelRoutingMode: nextTurnMode,
     })
 
-    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
-    expect(strip?.routerPanel).toBe('llm-ensemble')
-    expect(strip?.gridCells || []).toHaveLength(0)
+    const before = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+    nextTurnMode.value = 'off'
+    messages.value[1].restoredFromHistory = true
+    const after = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+
+    expect(before?.routerPanel).toBe('llm-ensemble')
+    expect(before?.gridCells || []).toHaveLength(0)
+    expect(after?.routerPanel).toBe('llm-ensemble')
+    expect(after?.routerTurnKey).toBe(before?.routerTurnKey)
+  })
+
+  it('does not reclassify a live router turn from the next-turn session mode', () => {
+    const nextTurnMode = ref<ModelRoutingMode>('squilla_router')
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'balanced',
+            model: 'anthropic/claude-sonnet-4.6',
+            source: 'squilla_router',
+            accepted_routing_mode: 'router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-next-turn-change-test'),
+      routerSlots: ref(['fast', 'balanced', 'strong']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
+        balanced: { model: 'anthropic/claude-sonnet-4.6', supportsImage: false, imageOnly: false },
+        strong: { model: 'openai/gpt-5.5', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: nextTurnMode,
+    })
+
+    const before = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+    nextTurnMode.value = 'llm_ensemble'
+    const after = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+
+    expect(before?.routerPanel).toBe('real-candidates')
+    expect(after?.routerPanel).toBe('real-candidates')
+    expect(after?.routerTurnKey).toBe(before?.routerTurnKey)
   })
 
   it('keeps the tier router and appends ensemble execution when C3 owns fusion', () => {

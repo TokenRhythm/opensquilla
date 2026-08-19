@@ -495,6 +495,110 @@ function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage
   })
 }
 
+type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
+
+function acceptedEnsembleMode(message: ChatMessage): AcceptedEnsembleMode | null {
+  if (message.role !== 'router' || !message.routerDecision) return null
+  const raw = String(
+    message.routerDecision.accepted_routing_mode
+    || message.routerDecision.acceptedRoutingMode
+    || '',
+  ).trim().toLowerCase()
+  return raw === 'ensemble' || raw === 'llm_ensemble' ? raw : null
+}
+
+function exactMessageTurnId(message: ChatMessage): string {
+  return String(message.turnId || '').trim()
+}
+
+/**
+ * A live router strip is a presentation row rather than a transcript row, so
+ * terminal canonical history can legitimately replace the rest of its turn
+ * without returning that strip. Preserve an accepted ensemble strip only when
+ * the same refresh independently proves the exact server turn id still exists.
+ * Never use transcript position, text, or a neighbouring turn as a fallback.
+ */
+function preserveAcceptedEnsembleRouterRows(
+  previous: ChatMessage[],
+  reconciled: ChatMessage[],
+  authoritative: ChatMessage[],
+): ChatMessage[] {
+  const authoritativeTurnIds = new Set(
+    authoritative.map(exactMessageTurnId).filter(Boolean),
+  )
+  if (authoritativeTurnIds.size === 0) return reconciled
+
+  const acceptedByTurn = new Map<
+    string,
+    { message: ChatMessage; mode: AcceptedEnsembleMode }
+  >()
+  for (const message of previous) {
+    const turnId = exactMessageTurnId(message)
+    const mode = acceptedEnsembleMode(message)
+    if (!turnId || !mode || !authoritativeTurnIds.has(turnId)) continue
+    // Router events update one same-turn strip in place. If a compatibility
+    // client left more than one row behind, the newest row is the richest one.
+    acceptedByTurn.set(turnId, { message, mode })
+  }
+  if (acceptedByTurn.size === 0) return reconciled
+
+  const merged = reconciled.slice()
+  for (const [turnId, accepted] of acceptedByTurn) {
+    let existingRouterIndex = -1
+    for (let index = 0; index < merged.length; index++) {
+      const candidate = merged[index]
+      if (candidate?.role === 'router' && exactMessageTurnId(candidate) === turnId) {
+        existingRouterIndex = index
+      }
+    }
+
+    const acceptedDecision = {
+      ...accepted.message.routerDecision,
+      accepted_routing_mode: accepted.mode,
+    }
+    if (existingRouterIndex >= 0) {
+      const canonical = merged[existingRouterIndex]!
+      merged[existingRouterIndex] = {
+        ...accepted.message,
+        ...canonical,
+        routerDecision: {
+          ...acceptedDecision,
+          ...canonical.routerDecision,
+          accepted_routing_mode: accepted.mode,
+        },
+        ensemble: canonical.ensemble ?? accepted.message.ensemble,
+        routerState: canonical.routerState ?? accepted.message.routerState,
+        routerSettled: canonical.routerSettled ?? accepted.message.routerSettled ?? true,
+        restoredFromHistory: true,
+      }
+      continue
+    }
+
+    const preserved: ChatMessage = {
+      ...accepted.message,
+      turnId,
+      routerDecision: acceptedDecision,
+      routerSettled: accepted.message.routerSettled ?? true,
+      restoredFromHistory: true,
+    }
+    const firstUserIndex = merged.findIndex(message =>
+      message.role === 'user' && exactMessageTurnId(message) === turnId,
+    )
+    const firstAssistantIndex = merged.findIndex(message =>
+      message.role === 'assistant' && exactMessageTurnId(message) === turnId,
+    )
+    const firstTurnIndex = merged.findIndex(message => exactMessageTurnId(message) === turnId)
+    const insertAt = firstUserIndex >= 0
+      && (firstAssistantIndex < 0 || firstUserIndex < firstAssistantIndex)
+      ? firstUserIndex + 1
+      : firstAssistantIndex >= 0
+        ? firstAssistantIndex
+        : firstTurnIndex >= 0 ? firstTurnIndex : merged.length
+    merged.splice(insertAt, 0, preserved)
+  }
+  return merged
+}
+
 export interface UseChatHistoryOptions {
   rpc: RpcClient
   sessionKey: Ref<string>
@@ -1039,6 +1143,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         } else {
           nextMessages = refreshedWindow
         }
+        nextMessages = preserveAcceptedEnsembleRouterRows(
+          previousTranscript,
+          nextMessages,
+          mapped,
+        )
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
             dedupeSyntheticUsageBarrierErrors(

@@ -1783,12 +1783,25 @@ watch(
   },
 )
 
+const activeSteerCapability = computed<ChatSteerCapability | null>(() => {
+  const task = runStatus.value.task
+  return task?.steer_capability || task?.steerCapability || null
+})
+const activeTurnUsesEnsemble = computed(() => (
+  String(activeSteerCapability.value?.reason || '').trim()
+    === 'ensemble_requires_followup_turn'
+))
+const activeTurnId = computed(() => (
+  String(activeSteerCapability.value?.expected_turn_id || '').trim()
+))
+
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
   sessionKey,
   isStreaming,
   autoScroll,
-  modelRoutingMode,
+  activeTurnUsesEnsemble,
+  activeTurnId,
   streamBubble,
   streamHasVisibleOutput,
   startStreaming,
@@ -1806,7 +1819,20 @@ const {
   flushPendingRouterDecision,
   clearPendingRouterDecision,
   bindRouterDecisionToModelCall,
+  freezeActiveTurnRoutingMode,
 } = chatRouterDecisionRuntime
+
+watch(
+  [
+    activeTurnUsesEnsemble,
+    activeTurnId,
+    () => messages.value.length,
+  ],
+  ([usesEnsemble, expectedTurnId]) => {
+    if (usesEnsemble) freezeActiveTurnRoutingMode(expectedTurnId)
+  },
+  { immediate: true },
+)
 
 // Gate the live answer's reveal to a [MIN,MAX] window so the model-router panel
 // decides (and animates) first, then the answer follows. Self-cleans via the
@@ -1860,7 +1886,6 @@ const chatRenderedMessages = useChatRenderedMessages({
   routerTierConfigs,
   routerVisualEffectsEnabled,
   routerVisualMode,
-  modelRoutingMode,
   isStreaming,
   currentPlanRevisionId,
   renderMarkdown,
@@ -2664,11 +2689,6 @@ const {
   onTextareaKeydown,
 } = chatComposerShortcuts
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
-
-const activeSteerCapability = computed<ChatSteerCapability | null>(() => {
-  const task = runStatus.value.task
-  return task?.steer_capability || task?.steerCapability || null
-})
 
 const chatSend = useChatSend({
   rpc,

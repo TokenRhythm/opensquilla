@@ -1842,6 +1842,15 @@ describe('useChatSend attachment payloads', () => {
     expect(options.enqueuePendingInput).toHaveBeenCalledWith('hello', undefined)
   })
 
+  it('keeps the accepted same-turn steer after the next-turn mode becomes Ensemble', () => {
+    const { api } = makeOptions({
+      ...sameTurnSteerOptions(),
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+    })
+
+    expect(api.supportsSameTurnSteer()).toBe(true)
+  })
+
   it.each([
     {
       name: 'an old gateway',
