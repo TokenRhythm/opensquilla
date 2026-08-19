@@ -1815,7 +1815,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["applied_model"] = ctx.model
         ctx.metadata["routing_confidence"] = decision.confidence
         ctx.metadata["routing_source"] = decision.source
-        if attachment_capacity_required:
+        if attachment_capacity_required or minimum_context_tier is not None:
             ctx.metadata["router_fallback_chain"] = [
                 entry
                 for entry in _router_text_fallback_chain(
@@ -1841,7 +1841,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         # mismatch telemetry is emitted.
         _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
         _record_thinking_metadata(ctx, router_cfg, image_tiers[tier_name])
-        if attachment_capacity_required:
+        if attachment_capacity_required or minimum_context_tier is not None:
             ctx.metadata["large_context_thinking_budget_tokens"] = (
                 _route_thinking_budget_tokens(
                     ctx,
@@ -1857,7 +1857,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # Empty-text guard for the ML text classifier: only reached for non-image
     # turns (the vision bypass above already handled empty-caption images).
     if not routing_message.strip():
-        if not attachment_capacity_required:
+        if not attachment_capacity_required and minimum_context_tier is None:
             return ctx
         capacity_tier = _capacity_safe_tier(
             ctx,
@@ -1917,7 +1917,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # that list tiers out of order. Unknown/custom tier names (tier_index == -1)
     # sort after the canonical ones, preserving their relative order (stable).
     if not valid_tiers:
-        if attachment_capacity_required:
+        if attachment_capacity_required or minimum_context_tier is not None:
             return _block_large_context_route(
                 ctx,
                 "No text-capable SquillaRouter deployment has proven capacity "
@@ -1983,7 +1983,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ctx.metadata.update(_compute_savings(decision.model, tiers))
             _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
             _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier])
-            if attachment_capacity_required:
+            if attachment_capacity_required or minimum_context_tier is not None:
                 ctx.metadata["large_context_thinking_budget_tokens"] = (
                     _route_thinking_budget_tokens(
                         ctx,
@@ -2161,7 +2161,11 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     ctx.metadata.update(policy_result.metadata_updates)
     _log_budget_outcome(ctx)
 
-    routing_applied = rollout_phase != "observe" or attachment_capacity_required
+    routing_applied = (
+        rollout_phase != "observe"
+        or minimum_context_tier is not None
+        or attachment_capacity_required
+    )
     decision, thinking_mode, prompt_policy = _apply_provider_mismatch_veto(
         ctx,
         router_cfg,
@@ -2255,7 +2259,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     except Exception:
         log.warning("squilla_router.controller_apply_error", exc_info=True)
         _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier])
-    if attachment_capacity_required:
+    if attachment_capacity_required or minimum_context_tier is not None:
         ctx.metadata["large_context_thinking_budget_tokens"] = (
             _route_thinking_budget_tokens(
                 ctx,
