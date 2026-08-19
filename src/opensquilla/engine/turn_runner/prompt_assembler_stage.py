@@ -33,6 +33,9 @@ if TYPE_CHECKING:
         AttachmentMaterializationStats,
     )
     from opensquilla.engine.turn_runner.outcome import StageOutcome
+    from opensquilla.engine.turn_runner.transcript_snapshot import (
+        TurnTranscriptSnapshot,
+    )
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
     from opensquilla.provider.types import ProviderRequestCorrelation
@@ -159,6 +162,7 @@ class RouterContextPort(Protocol):
         exclude_last_user: bool,
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> dict[str, Any]: ...
 
 @runtime_checkable
@@ -266,6 +270,10 @@ class PromptAssemblerStageInput:
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
     provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    transcript_snapshot: TurnTranscriptSnapshot[Any] | None = field(
         default=None,
         repr=False,
     )
@@ -396,13 +404,18 @@ class PromptAssemblerStage:
         )
 
         # 2. Fetch router context (transcript-driven)
-        router_context = await self._router_context.fetch_router_context(
-            inp.session_key,
-            exclude_last_user=(
+        router_context_kwargs: dict[str, Any] = {
+            "exclude_last_user": (
                 inp.history_has_persisted_user or inp.persist_input
             ),
-            bound_user_message_id=inp.bound_user_message_id,
-            include_capacity=bool(inp.attachments),
+            "bound_user_message_id": inp.bound_user_message_id,
+            "include_capacity": bool(inp.attachments),
+        }
+        if inp.transcript_snapshot is not None:
+            router_context_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+        router_context = await self._router_context.fetch_router_context(
+            inp.session_key,
+            **router_context_kwargs,
         )
 
         raw_history_image_turn_count = router_context.get("history_image_turn_count")

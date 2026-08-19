@@ -30,6 +30,7 @@ from opensquilla.session.compaction import (
     await_compaction_phase,
     compact_context,
     compaction_remaining_seconds,
+    effective_protected_recent_messages,
     require_compaction_time,
 )
 from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
@@ -2238,6 +2239,7 @@ class SessionManager:
         session_key: str,
         *,
         boundary_message_id: str | None = None,
+        transcript_entries: Sequence[TranscriptEntry] | None = None,
     ) -> CompactionSourceSnapshot:
         """Freeze the exact durable prefix visible to the active turn.
 
@@ -2246,7 +2248,11 @@ class SessionManager:
         boundary cannot be found.
         """
 
-        transcript = await self.get_transcript(session_key)
+        transcript = (
+            list(transcript_entries)
+            if transcript_entries is not None
+            else await self.get_transcript(session_key)
+        )
         source_entries = transcript
         if boundary_message_id is not None:
             boundary_index = next(
@@ -2646,6 +2652,7 @@ class SessionManager:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
         consumer_admission_fingerprint: str = "",
+        protected_boundary_message_id: str | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -2674,6 +2681,28 @@ class SessionManager:
                 effective_config,
                 phase="snapshotting",
             )
+            if protected_boundary_message_id is not None:
+                protected_boundary_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if entry.message_id == protected_boundary_message_id
+                    ),
+                    None,
+                )
+                if protected_boundary_index is None:
+                    return CompactionResult(
+                        summary="",
+                        kept_entries=_compaction_entry_payloads(entries),
+                        removed_count=0,
+                        chunks_processed=0,
+                        summary_source="skipped",
+                        skip_reason="protected_boundary_missing",
+                    )
+                effective_config.protected_recent_messages = max(
+                    effective_protected_recent_messages(effective_config),
+                    len(entries) - protected_boundary_index,
+                )
             summaries = await await_compaction_phase(
                 self._storage.get_all_summaries(node.session_id),
                 effective_config,

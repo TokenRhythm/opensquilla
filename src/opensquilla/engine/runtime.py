@@ -135,6 +135,7 @@ from opensquilla.engine.turn_runner import (
     StreamConsumerStageInput,
     TurnFinalizerStage,
     TurnFinalizerStageInput,
+    TurnTranscriptSnapshot,
     rebind_attachment_prompt,
 )
 from opensquilla.engine.turn_runner.context import (
@@ -5138,6 +5139,19 @@ class TurnRunner:
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
 
+            async def _load_turn_transcript() -> Sequence[Any]:
+                if self._session_manager is None:
+                    return ()
+                get_transcript = getattr(self._session_manager, "get_transcript", None)
+                if not callable(get_transcript):
+                    return ()
+                entries = get_transcript(session_key)
+                if inspect.isawaitable(entries):
+                    entries = await entries
+                return entries or ()
+
+            transcript_snapshot = TurnTranscriptSnapshot[Any](_load_turn_transcript)
+
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -5275,6 +5289,7 @@ class TurnRunner:
                         input_provenance=input_provenance,
                         skill_catalog=skill_catalog,
                         usage_execution_context=pipeline_usage_context,
+                        transcript_snapshot=transcript_snapshot,
                         provider_request_correlation=provider_request_correlation,
                     )
                 )
@@ -5870,6 +5885,7 @@ class TurnRunner:
                             consumer_admission_fingerprint
                         ),
                         skip_compaction=image_input_preflight_blocked,
+                        transcript_snapshot=transcript_snapshot,
                     )
                 )
             ch_out = ch_outcome.require_output()
@@ -5886,6 +5902,14 @@ class TurnRunner:
             )
             if callable(capture_compaction_source):
                 try:
+                    capture_kwargs: dict[str, Any] = {}
+                    if _accepts_keyword_arg(
+                        capture_compaction_source,
+                        "transcript_entries",
+                    ):
+                        capture_kwargs["transcript_entries"] = (
+                            await transcript_snapshot.get_entries()
+                        )
                     source_snapshot = await capture_compaction_source(
                         session_key,
                         boundary_message_id=(
@@ -5893,6 +5917,7 @@ class TurnRunner:
                             if history_has_persisted_user
                             else None
                         ),
+                        **capture_kwargs,
                     )
                 except Exception as exc:  # noqa: BLE001 - inline path fails closed
                     log.warning(
@@ -9524,6 +9549,7 @@ class TurnRunner:
         exclude_last_user: bool = False,
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> dict[str, Any]:
         """Return transcript context for the V4 router, excluding the current user turn."""
         if self._session_manager is None:
@@ -9544,9 +9570,12 @@ class TurnRunner:
                 else {}
             )
         try:
-            transcript = get_transcript(session_key)
-            if inspect.isawaitable(transcript):
-                transcript = await transcript
+            if transcript_snapshot is not None:
+                transcript = await transcript_snapshot.get_entries()
+            else:
+                transcript = get_transcript(session_key)
+                if inspect.isawaitable(transcript):
+                    transcript = await transcript
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
             return (
@@ -10296,6 +10325,7 @@ class TurnRunner:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> str:
         """Flush memory and compact transcript when the router upgrades into t3.
 
@@ -10378,7 +10408,11 @@ class TurnRunner:
             return _T3_HANDLED
 
         try:
-            transcript = await self._session_manager.get_transcript(session_key)
+            transcript = (
+                list(await transcript_snapshot.get_entries())
+                if transcript_snapshot is not None
+                else await self._session_manager.get_transcript(session_key)
+            )
         except KeyError:
             return _T3_HANDLED
         (
@@ -10414,6 +10448,7 @@ class TurnRunner:
             CompactionConfig,
             arm_compaction_deadline,
             await_compaction_phase,
+            effective_protected_recent_messages,
             estimate_entries_model_replay_chars,
             estimate_entry_model_replay_chars,
             estimate_entry_model_replay_tokens,
@@ -10511,7 +10546,7 @@ class TurnRunner:
             return _T3_HANDLED
         compaction_config = compaction_config or CompactionConfig()
         compaction_config.protected_recent_messages = max(
-            int(compaction_config.protected_recent_messages or 0),
+            effective_protected_recent_messages(compaction_config),
             protected_suffix_count,
         )
         if self._compaction_circuit_open(session_key):
@@ -10741,6 +10776,17 @@ class TurnRunner:
                     compact_kwargs["consumer_admission_fingerprint"] = (
                         consumer_admission_fingerprint
                     )
+                if (
+                    history_has_persisted_user
+                    and bound_user_message_id is not None
+                    and _accepts_keyword_arg(
+                        compact_method,
+                        "protected_boundary_message_id",
+                    )
+                ):
+                    compact_kwargs["protected_boundary_message_id"] = (
+                        bound_user_message_id
+                    )
                 compaction_result = await await_compaction_phase(
                     self._session_manager.compact_with_result(
                         session_key,
@@ -10791,6 +10837,15 @@ class TurnRunner:
                         **observed_payload,
                     )
             if result:
+                durable_transcript_changed = (
+                    compaction_result is None
+                    or (
+                        int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                        and bool(getattr(compaction_result, "summary", "") or "")
+                    )
+                )
+                if durable_transcript_changed and transcript_snapshot is not None:
+                    transcript_snapshot.invalidate()
                 self.mark_compacted_this_turn(session_key)
                 self._record_compaction_success(session_key)
                 completed_payload = {"summary_len": len(result)}
@@ -10933,6 +10988,7 @@ class TurnRunner:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> None:
         """Compact proactively if session history exceeds token budget.
 
@@ -10982,6 +11038,7 @@ class TurnRunner:
             arm_compaction_deadline,
             await_compaction_phase,
             build_compaction_config_from_provider,
+            effective_protected_recent_messages,
         )
 
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
@@ -11007,7 +11064,11 @@ class TurnRunner:
             )
             return
         try:
-            transcript = await self._session_manager.get_transcript(session_key)
+            transcript = (
+                list(await transcript_snapshot.get_entries())
+                if transcript_snapshot is not None
+                else await self._session_manager.get_transcript(session_key)
+            )
         except KeyError:
             return  # session doesn't exist yet
         (
@@ -11123,7 +11184,7 @@ class TurnRunner:
             )
             return
         compaction_config.protected_recent_messages = max(
-            int(compaction_config.protected_recent_messages or 0),
+            effective_protected_recent_messages(compaction_config),
             protected_suffix_count,
         )
         if self._compaction_circuit_open(session_key):
@@ -11366,6 +11427,17 @@ class TurnRunner:
                     compact_kwargs["consumer_admission_fingerprint"] = (
                         consumer_admission_fingerprint
                     )
+                if (
+                    history_has_persisted_user
+                    and bound_user_message_id is not None
+                    and _accepts_keyword_arg(
+                        compact_method,
+                        "protected_boundary_message_id",
+                    )
+                ):
+                    compact_kwargs["protected_boundary_message_id"] = (
+                        bound_user_message_id
+                    )
                 compaction_result = await await_compaction_phase(
                     self._session_manager.compact_with_result(
                         session_key,
@@ -11530,6 +11602,15 @@ class TurnRunner:
             if emergency_applied:
                 return
         if result:
+            durable_transcript_changed = (
+                compaction_result is None
+                or (
+                    int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                    and bool(getattr(compaction_result, "summary", "") or "")
+                )
+            )
+            if durable_transcript_changed and transcript_snapshot is not None:
+                transcript_snapshot.invalidate()
             self.mark_compacted_this_turn(session_key)
             self._record_compaction_success(session_key)
             completed_payload = {"tokens_before": total_tokens}
@@ -12144,6 +12225,7 @@ class TurnRunner:
         *,
         trim_last_user: bool = True,
         bound_user_message_id: str | None = None,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> str | None:
         """Load existing transcript as agent history.
 
@@ -12161,7 +12243,11 @@ class TurnRunner:
         if self._session_manager is None:
             return None
 
-        transcript = await self._session_manager.get_transcript(session_key)
+        transcript = (
+            list(await transcript_snapshot.get_entries())
+            if transcript_snapshot is not None
+            else await self._session_manager.get_transcript(session_key)
+        )
 
         from opensquilla.engine.history import reconstruct_messages_from_entry
         from opensquilla.provider import Message

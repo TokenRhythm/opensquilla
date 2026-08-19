@@ -76,6 +76,7 @@ class _RecordingRouterContext:
     context: dict[str, Any] = field(default_factory=dict)
     calls: list[tuple[str, bool]] = field(default_factory=list)
     bound_user_message_ids: list[str | None] = field(default_factory=list)
+    transcript_snapshots: list[Any | None] = field(default_factory=list)
 
     async def fetch_router_context(
         self,
@@ -84,9 +85,11 @@ class _RecordingRouterContext:
         exclude_last_user,
         bound_user_message_id=None,
         include_capacity=False,
+        transcript_snapshot=None,
     ):
         self.calls.append((session_key, exclude_last_user))
         self.bound_user_message_ids.append(bound_user_message_id)
+        self.transcript_snapshots.append(transcript_snapshot)
         return dict(self.context)
 
 
@@ -232,6 +235,7 @@ def _make_input(
     ingress_pipeline_steps=None,
     input_provenance=None,
     skill_catalog=None,
+    transcript_snapshot=None,
 ):
     return PromptAssemblerStageInput(
         runtime_message=runtime_message,
@@ -255,6 +259,7 @@ def _make_input(
         ingress_pipeline_steps=ingress_pipeline_steps,
         input_provenance=input_provenance,
         skill_catalog=skill_catalog,
+        transcript_snapshot=transcript_snapshot,
     )
 
 
@@ -370,6 +375,17 @@ async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context
 
     assert router_context.calls == [("agent:main:s1", True)]
     assert router_context.bound_user_message_ids == ["msg-bound"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_assembler_forwards_turn_transcript_snapshot() -> None:
+    router_context = _RecordingRouterContext()
+    stage = _make_stage(router=router_context)
+    transcript_snapshot = SimpleNamespace()
+
+    await stage.run(_make_input(transcript_snapshot=transcript_snapshot))
+
+    assert router_context.transcript_snapshots == [transcript_snapshot]
 
 
 @pytest.mark.asyncio

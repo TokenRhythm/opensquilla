@@ -340,6 +340,7 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
         exclude_last_user: bool,
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
+        transcript_snapshot: Any | None = None,
     ) -> dict[str, Any]:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -352,6 +353,11 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
             "include_capacity",
         ):
             kwargs["include_capacity"] = include_capacity
+        if transcript_snapshot is not None and _accepts_keyword_arg(
+            self._runner._router_previous_assistant_context,
+            "transcript_snapshot",
+        ):
+            kwargs["transcript_snapshot"] = transcript_snapshot
         return await self._runner._router_previous_assistant_context(
             session_key,
             **kwargs,
@@ -1071,6 +1077,7 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         provider_request_correlation: Any | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        transcript_snapshot: Any | None = None,
     ) -> str:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1121,6 +1128,11 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
             correlation_kwargs["consumer_admission_fingerprint"] = (
                 consumer_admission_fingerprint
             )
+        if transcript_snapshot is not None and _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "transcript_snapshot",
+        ):
+            correlation_kwargs["transcript_snapshot"] = transcript_snapshot
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
             turn,
@@ -1155,6 +1167,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         provider_request_correlation: Any | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        transcript_snapshot: Any | None = None,
     ) -> None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1205,6 +1218,11 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
             correlation_kwargs["consumer_admission_fingerprint"] = (
                 consumer_admission_fingerprint
             )
+        if transcript_snapshot is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "transcript_snapshot",
+        ):
+            correlation_kwargs["transcript_snapshot"] = transcript_snapshot
         await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
@@ -1232,12 +1250,23 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
+        transcript_snapshot: Any | None = None,
     ) -> str | None:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        kwargs: dict[str, Any] = {
+            "trim_last_user": trim_last_user,
+            "bound_user_message_id": bound_user_message_id,
+        }
+        if transcript_snapshot is not None and _accepts_keyword_arg(
+            self._runner._load_history,
+            "transcript_snapshot",
+        ):
+            kwargs["transcript_snapshot"] = transcript_snapshot
         return await self._runner._load_history(
             agent,
             session_key,
-            trim_last_user=trim_last_user,
-            bound_user_message_id=bound_user_message_id,
+            **kwargs,
         )
 
 class _RequestContextPrependAdapter(RequestContextPrependPort):

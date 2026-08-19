@@ -50,6 +50,9 @@ if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.hooks.types import CompactionHook
     from opensquilla.engine.turn_runner.outcome import StageOutcome
+    from opensquilla.engine.turn_runner.transcript_snapshot import (
+        TurnTranscriptSnapshot,
+    )
     from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.session.compaction_deployment import CompactionExecutionPlan
 
@@ -102,6 +105,7 @@ class T3UpgradeCompactionPort(Protocol):
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> str: ...
 
 @runtime_checkable
@@ -134,6 +138,7 @@ class PreflightCompactionPort(Protocol):
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> None: ...
 
 @runtime_checkable
@@ -160,6 +165,7 @@ class HistoryLoaderPort(Protocol):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
     ) -> str | None: ...
 
 @runtime_checkable
@@ -228,6 +234,10 @@ class CompactionAndHistoryStageInput:
     consumer_admission: Any | None = field(default=None, repr=False)
     consumer_admission_fingerprint: str = ""
     skip_compaction: bool = False
+    transcript_snapshot: TurnTranscriptSnapshot[Any] | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageOutput:
@@ -333,6 +343,9 @@ class CompactionAndHistoryStage:
                 extra={"phase": "t3_upgrade"},
             )
             await self._fire_before_compact(t3_state)
+            t3_kwargs: dict[str, Any] = {}
+            if inp.transcript_snapshot is not None:
+                t3_kwargs["transcript_snapshot"] = inp.transcript_snapshot
             t3_status = await self._t3_upgrade.maybe_compact(
                 session_key=inp.session_key,
                 turn=inp.turn,
@@ -347,6 +360,7 @@ class CompactionAndHistoryStage:
                 provider_request_correlation=inp.provider_request_correlation,
                 consumer_admission=inp.consumer_admission,
                 consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
+                **t3_kwargs,
             )
             await self._fire_after_compact(t3_state, {"status": t3_status})
 
@@ -361,6 +375,9 @@ class CompactionAndHistoryStage:
                     extra={"phase": "preflight"},
                 )
                 await self._fire_before_compact(preflight_state)
+                preflight_kwargs: dict[str, Any] = {}
+                if inp.transcript_snapshot is not None:
+                    preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
                 await self._preflight.maybe_compact(
                     session_key=inp.session_key,
                     context_window_tokens=compaction_context_window_tokens,
@@ -374,15 +391,20 @@ class CompactionAndHistoryStage:
                     provider_request_correlation=inp.provider_request_correlation,
                     consumer_admission=inp.consumer_admission,
                     consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
+                    **preflight_kwargs,
                 )
                 await self._fire_after_compact(preflight_state, {"status": "ran"})
 
         # 3. Load history (transcript + reconstructed messages + durable summary).
+        history_kwargs: dict[str, Any] = {}
+        if inp.transcript_snapshot is not None:
+            history_kwargs["transcript_snapshot"] = inp.transcript_snapshot
         compaction_summary_context = await self._history_loader.load(
             agent=inp.agent,
             session_key=inp.session_key,
             trim_last_user=inp.history_has_persisted_user,
             bound_user_message_id=inp.bound_user_message_id,
+            **history_kwargs,
         )
 
         # 4. Prepend compaction summary context to request_context_prompt (pure).
