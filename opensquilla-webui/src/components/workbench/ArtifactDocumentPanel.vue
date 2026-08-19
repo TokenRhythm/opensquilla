@@ -523,7 +523,7 @@ function panelId(tab: DocumentTab): string {
 function onTabKeydown(event: KeyboardEvent, current: DocumentTab) {
   const order = tabs.value.map(tab => tab.id)
   const index = order.indexOf(current)
-  let next = index
+  let next: number
   if (event.key === 'ArrowLeft') next = (index - 1 + order.length) % order.length
   else if (event.key === 'ArrowRight') next = (index + 1) % order.length
   else if (event.key === 'Home') next = 0

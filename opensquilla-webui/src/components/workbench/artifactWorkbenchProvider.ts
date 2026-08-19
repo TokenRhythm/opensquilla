@@ -1310,7 +1310,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
             screenshotUrl: this.annotationScreenshotUrl,
           },
         })
-        takeoverCommitted = true
         await commitReplacement()
       }
       if (created) {
