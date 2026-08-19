@@ -9,7 +9,10 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.types import DoneEvent, ErrorEvent, TextDeltaEvent
 from opensquilla.provider import ChatConfig, Message, ModelCapabilities
-from opensquilla.provider.protocol import IMAGE_INPUT_UNSUPPORTED_CODE
+from opensquilla.provider.protocol import (
+    IMAGE_INPUT_UNSUPPORTED_CODE,
+    validate_provider_chat_admission,
+)
 from opensquilla.provider.types import ContentBlockImage, ContentBlockToolResult
 
 
@@ -49,6 +52,14 @@ def _image_message() -> Message:
             )
         ],
     )
+
+
+def test_provider_admission_without_config_preserves_unknown_capability() -> None:
+    assert (
+        validate_provider_chat_admission(None, [Message(role="user", content="hi")], None)
+        is None
+    )
+    assert validate_provider_chat_admission(None, [_image_message()], None) is None
 
 
 @pytest.mark.asyncio

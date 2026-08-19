@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from .types import (
     ChatConfig,
@@ -309,13 +309,19 @@ def image_input_admission_error(
 def validate_provider_chat_admission(
     provider: object | None,
     messages: list[Message],
-    config: ChatConfig,
+    config: ChatConfig | None,
 ) -> ErrorEvent | None:
     """Run typed admission, then the legacy request validator as a fallback."""
 
+    raw_vision_support = getattr(config, "model_vision_support", "unknown")
+    vision_support: VisionSupport = (
+        cast(VisionSupport, raw_vision_support)
+        if raw_vision_support in {"supported", "unsupported", "unknown"}
+        else "unknown"
+    )
     capability_error = image_input_admission_error(
         messages,
-        vision_support=config.model_vision_support,
+        vision_support=vision_support,
     )
     if capability_error is not None:
         return capability_error
