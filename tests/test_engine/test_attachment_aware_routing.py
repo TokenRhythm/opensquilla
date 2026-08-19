@@ -25,7 +25,7 @@ from opensquilla.engine.turn_runner.attachment_stage import (
 )
 from opensquilla.gateway.input_normalization import normalize_incoming_text
 from opensquilla.provider.types import ContentBlockText
-from opensquilla.token_estimation import estimate_material_text_tokens, estimate_tokens
+from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -190,8 +190,7 @@ async def test_stats_measure_exact_provider_visible_text_for_rendered_formats(
     assert material.splitlines()[0] in visible_text
     assert output.stats.provider_visible_text_chars == len(visible_text)
     assert output.stats.estimated_tokens == sum(
-        max(estimate_material_text_tokens(block.text), estimate_tokens(block.text))
-        for block in visible_blocks
+        estimate_attachment_text_tokens(block.text) for block in visible_blocks
     )
 
 
@@ -313,10 +312,7 @@ async def test_image_workspace_marker_does_not_shift_following_attachment_accoun
         len(block.text) for block in text_blocks
     )
     assert output.stats.generated_normalization_estimated_tokens == (
-        max(
-            estimate_material_text_tokens(generated_block.text),
-            estimate_tokens(generated_block.text),
-        )
+        estimate_attachment_text_tokens(generated_block.text)
     )
 
 

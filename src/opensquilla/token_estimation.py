@@ -6,6 +6,7 @@ import math
 import os
 import threading
 from collections.abc import Iterator
+from typing import Any
 
 import structlog
 
@@ -14,6 +15,11 @@ log = structlog.get_logger(__name__)
 _ENCODING_UNAVAILABLE = object()
 _encoding = None
 _TOKENIZER_CHUNK_CHARS = 100_000
+_ATTACHMENT_TOKENIZER_CHUNK_CHARS = 16_384
+# Encoding chunks independently prevents a BPE token from spanning a cut and
+# therefore normally rounds upward. Keep one additional token at every cut as
+# an explicit boundary reserve without materially skewing format parity.
+_ATTACHMENT_TOKENIZER_CHUNK_BOUNDARY_RESERVE_TOKENS = 1
 _ENCODING_LOAD_TIMEOUT_SECONDS = 5.0
 _ENCODING_LOAD_TIMEOUT_MAX_SECONDS = min(60.0, threading.TIMEOUT_MAX)
 _ENCODING_LOAD_TIMEOUT_ENV = "OPENSQUILLA_TIKTOKEN_LOAD_TIMEOUT_SECONDS"
@@ -161,9 +167,32 @@ def _get_encoding():
         return None
 
 
-def _text_chunks(text: str) -> Iterator[str]:
-    for offset in range(0, len(text), _TOKENIZER_CHUNK_CHARS):
-        yield text[offset : offset + _TOKENIZER_CHUNK_CHARS]
+def _text_chunks(
+    text: str,
+    *,
+    chunk_chars: int = _TOKENIZER_CHUNK_CHARS,
+) -> Iterator[str]:
+    for offset in range(0, len(text), chunk_chars):
+        yield text[offset : offset + chunk_chars]
+
+
+def _bounded_tokenizer_count(
+    encoding: Any,
+    text: str,
+    *,
+    chunk_chars: int,
+    boundary_reserve_tokens: int,
+) -> int:
+    """Encode long text with bounded work and conservative cut reserves."""
+
+    count = 0
+    for chunk_index, chunk in enumerate(
+        _text_chunks(text, chunk_chars=chunk_chars)
+    ):
+        if chunk_index:
+            count += boundary_reserve_tokens
+        count += len(encoding.encode(chunk, disallowed_special=()))
+    return count
 
 
 def _conservative_utf8_estimate(text: str) -> int:
@@ -180,26 +209,68 @@ def _conservative_utf8_estimate(text: str) -> int:
     return max(1, (utf8_bytes + control_chars + 1) // 2)
 
 
-def estimate_tokens_with_source(text: str) -> tuple[int, TokenEstimateSource]:
-    """Return a bounded token estimate and the estimator used."""
-
+def _estimate_tokens_with_policy(
+    text: str,
+    *,
+    tokenizer_chunk_chars: int,
+    boundary_reserve_tokens: int,
+    chunked_source: TokenEstimateSource,
+) -> tuple[int, TokenEstimateSource]:
     enc = _get_encoding()
     if enc is not None:
         try:
-            if len(text) <= _TOKENIZER_CHUNK_CHARS:
+            if len(text) <= tokenizer_chunk_chars:
                 count = len(enc.encode(text, disallowed_special=()))
                 return max(1, count), "tiktoken_cl100k_base"
-            count = sum(
-                len(enc.encode(chunk, disallowed_special=()))
-                for chunk in _text_chunks(text)
+            count = _bounded_tokenizer_count(
+                enc,
+                text,
+                chunk_chars=tokenizer_chunk_chars,
+                boundary_reserve_tokens=boundary_reserve_tokens,
             )
-            return max(1, count), "tiktoken_cl100k_base_chunked"
+            return max(1, count), chunked_source
         except Exception as exc:  # noqa: BLE001
             log.warning("tiktoken_estimate_failed_fallback", error=str(exc))
     return _conservative_utf8_estimate(text), "utf8_unicode_conservative"
+
+
+def estimate_tokens_with_source(text: str) -> tuple[int, TokenEstimateSource]:
+    """Return the legacy shared estimate and its source.
+
+    The 100k chunk contract is intentionally stable for pure text, history,
+    and compaction callers. Attachment material uses the separately bounded
+    estimator below so its extraction workload cannot change those budgets.
+    """
+
+    return _estimate_tokens_with_policy(
+        text,
+        tokenizer_chunk_chars=_TOKENIZER_CHUNK_CHARS,
+        boundary_reserve_tokens=0,
+        chunked_source="tiktoken_cl100k_base_chunked",
+    )
 
 
 def estimate_tokens(text: str) -> int:
     """Estimate token count while keeping the historical integer-only API."""
 
     return estimate_tokens_with_source(text)[0]
+
+
+def estimate_attachment_text_tokens(text: str) -> int:
+    """Conservatively estimate a provider-visible attachment text block.
+
+    Long extracted/replayed file content uses smaller tokenizer chunks to
+    avoid platform-sensitive superlinear runs. A one-token reserve per cut
+    prevents boundary rounding from lowering admission, while the material
+    heuristic preserves the existing cross-format routing floor.
+    """
+
+    tokenizer_tokens, _source = _estimate_tokens_with_policy(
+        text,
+        tokenizer_chunk_chars=_ATTACHMENT_TOKENIZER_CHUNK_CHARS,
+        boundary_reserve_tokens=(
+            _ATTACHMENT_TOKENIZER_CHUNK_BOUNDARY_RESERVE_TOKENS
+        ),
+        chunked_source="tiktoken_cl100k_base_attachment_chunked",
+    )
+    return max(estimate_material_text_tokens(text), tokenizer_tokens)

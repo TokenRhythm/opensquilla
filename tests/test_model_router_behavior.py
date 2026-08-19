@@ -489,6 +489,30 @@ async def test_large_material_estimate_floors_low_router_tier(
     assert routed.metadata["routing_extra"]["final_tier"] == "c2"
 
 
+@pytest.mark.parametrize(
+    ("character_count", "expected_tier", "expected_floor"),
+    [
+        (99_996, "c0", None),
+        (100_000, "c2", "c2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_plain_text_large_context_floor_boundary_keeps_legacy_parity(
+    monkeypatch: pytest.MonkeyPatch,
+    character_count: int,
+    expected_tier: str,
+    expected_floor: str | None,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    ctx = make_context("a" * character_count)
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == expected_tier
+    assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
+    assert "large_context_capacity_required" not in routed.metadata
+
+
 @pytest.mark.asyncio
 async def test_large_material_ratio_floors_low_router_tier_to_t3(
     monkeypatch: pytest.MonkeyPatch,

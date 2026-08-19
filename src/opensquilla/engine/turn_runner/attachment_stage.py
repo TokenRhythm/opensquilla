@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
-from opensquilla.token_estimation import estimate_material_text_tokens, estimate_tokens
+from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
@@ -116,10 +116,7 @@ def _materialization_stats(
         block_tokens = 0
         if isinstance(block, ContentBlockText):
             provider_visible_text_chars += len(block.text)
-            block_tokens = max(
-                estimate_material_text_tokens(block.text),
-                estimate_tokens(block.text),
-            )
+            block_tokens = estimate_attachment_text_tokens(block.text)
             parse_failure_count += block.text.count(_UNAVAILABLE_MARKER)
         elif isinstance(block, ContentBlockImage):
             image_count += 1
