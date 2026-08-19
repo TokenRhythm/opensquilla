@@ -396,7 +396,11 @@ def test_artifact_listing_retries_visibility_and_paginates(
         return {"total_count": 1, "artifacts": [{"id": 1}]}
 
     monkeypatch.setitem(list_attestation_artifacts.__globals__, "_request_json", fake_json)
-    monkeypatch.setitem(list_attestation_artifacts.__globals__, "time", type("Clock", (), {"sleep": staticmethod(sleeps.append)}))
+    monkeypatch.setitem(
+        list_attestation_artifacts.__globals__,
+        "time",
+        type("Clock", (), {"sleep": staticmethod(sleeps.append)}),
+    )
 
     result = list_attestation_artifacts(
         api_url="https://api.github.com",
