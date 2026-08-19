@@ -228,6 +228,13 @@
   scrollbar-gutter: stable;
 }
 
+/* Native anchoring preserves a non-virtualized reader's visible paragraph
+   across width reflow. Live following and virtualized history keep their
+   existing application-owned pin/correction so the two systems never stack. */
+.chat-thread--reading-history:has(.chat-message-list[data-virtualized="false"]) {
+  overflow-anchor: auto;
+}
+
 /* Floating composer (existing conversation, toggle on): reserve the dock's
    measured height in the body itself. This shortens the scroll viewport so no
    visible transcript text can enter the glass panel, including while the

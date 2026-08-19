@@ -160,6 +160,7 @@ import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -420,7 +421,9 @@ function queueAnchorAdjustment(delta: number) {
     const adjustment = pendingAnchorAdjustment
     pendingAnchorAdjustment = 0
     if (!props.scrollContainer || props.scrollContainer !== container) return
-    container.scrollTop += adjustment
+    applyProgrammaticScroll(container, () => {
+      container.scrollTop += adjustment
+    })
     scheduleViewportMeasure()
   })
 }
@@ -432,7 +435,9 @@ function queueLiveEdgePin() {
   void nextTick(() => {
     liveEdgePinScheduled = false
     if (!props.followLiveEdge || props.scrollContainer !== container) return
-    container.scrollTop = container.scrollHeight
+    applyProgrammaticScroll(container, () => {
+      container.scrollTop = container.scrollHeight
+    })
     scheduleViewportMeasure()
   })
 }
@@ -542,7 +547,15 @@ function attachContainer(container: HTMLElement | null | undefined) {
   container.addEventListener('focusin', onContainerFocusIn)
   container.addEventListener('focusout', onContainerFocusOut)
   if (typeof ResizeObserver !== 'undefined') {
-    viewportResizeObserver = new ResizeObserver(scheduleViewportMeasure)
+    viewportResizeObserver = new ResizeObserver(entries => {
+      scheduleViewportMeasure()
+      // A container-height change has no new stream event to trigger the
+      // ordinary bottom pin. Keep a reader already following the live edge at
+      // the true bottom; historical readers retain their existing anchor.
+      if (props.followLiveEdge && entries.some(entry => entry.target === container)) {
+        queueLiveEdgePin()
+      }
+    })
     viewportResizeObserver.observe(container)
     if (listRootRef.value) viewportResizeObserver.observe(listRootRef.value)
   }
