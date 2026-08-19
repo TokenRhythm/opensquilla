@@ -8907,6 +8907,7 @@ class TestSessionsMessagesSubscribe:
 
         manager._storage.get_session = _hanging_metadata
         manager._storage.list_agent_tasks = _hanging_metadata
+        manager.get_session_routing = _hanging_metadata
         monkeypatch.setattr(
             rpc_sessions,
             "project_workspace_snapshot",
@@ -8943,6 +8944,8 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["workspaceId"] is None
         assert response.payload["projectWorkspace"] is None
         assert response.payload["hydration_complete"] is False
+        assert response.payload["routing"] is None
+        assert "routing" in response.payload["deferred_fields"]
         assert snapshot.ok is True
         assert metadata_called is False
 

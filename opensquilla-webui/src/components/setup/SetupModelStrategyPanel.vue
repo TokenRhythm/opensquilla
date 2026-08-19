@@ -98,6 +98,7 @@ interface ModelStrategyPanelContract {
 
 const props = defineProps<{
   panel: ModelStrategyPanelContract
+  routingModeBusy?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -707,6 +708,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
       <h3 class="control-section__title">{{ t('setup.modelStrategy.title') }}</h3>
       <div class="setup-model-strategy__page-meta">
         <p class="control-section__desc">{{ t('setup.modelStrategy.desc') }}</p>
+        <p class="control-section__desc">{{ t('setup.modelStrategy.newSessionDefault') }}</p>
         <button
           type="button"
           class="setup-inline-link setup-model-strategy__page-action"
@@ -752,6 +754,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               name="setup_model_strategy"
               :value="card.id"
               :checked="card.enabled"
+              :disabled="routingModeBusy === true"
               @change="emit('updateStrategy', card.id)"
             >
             <span class="setup-model-strategy__card-heading">

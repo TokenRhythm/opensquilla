@@ -8,8 +8,9 @@ surface observes and mutates the same state machine.
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
@@ -157,6 +158,31 @@ def _image_input_routing_snapshot(
         }
     return {"admission": "unknown", "reason": "capability_unknown"}
 
+
+_DURABLE_ROUTER_TIER_TEXT_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "description",
+        "thinking_level",
+        "thinkingLevel",
+        "ensemble_selection_mode",
+        "ensembleSelectionMode",
+    }
+)
+_DURABLE_ROUTER_TIER_BOOL_FIELDS = frozenset(
+    {
+        "supports_image",
+        "supportsImage",
+        "supports_thinking",
+        "image_only",
+        "imageOnly",
+        "ensemble_enabled",
+        "ensembleEnabled",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _ModelRoutingConfigSnapshot:
     """Acceptance-time values for the two routing-owned config subtrees.
@@ -170,6 +196,17 @@ class _ModelRoutingConfigSnapshot:
 
     squilla_router: Any
     llm_ensemble: Any
+    # ``None`` means the snapshot came from the global policy.  Interactive
+    # session snapshots carry the persisted, explicit mode that was resolved
+    # at acceptance.  This remains diagnostic metadata only: TurnRunner uses
+    # the two routing subtrees above and never consults this field to mutate
+    # live configuration.
+    session_mode: ModelRoutingMode | None = None
+    # Resolution metadata is frozen with the effective mode so task audit can
+    # explain whether a turn used a persisted session choice or the global
+    # policy.  It is never used by the execution overlay itself.
+    session_routing_revision: int | None = None
+    session_routing_source: str = "global_policy"
 
     def overlay_live_config(self, live_config: Any) -> Any:
         """Overlay only routing fields onto the latest live Gateway config."""
@@ -634,7 +671,13 @@ def reconcile_model_routing_write(
     return {"squilla_router.enabled": required}
 
 
-def capture_model_routing_config(config: Any) -> Any:
+def capture_model_routing_config(
+    config: Any,
+    *,
+    session_mode: ModelRoutingMode | str | None = None,
+    session_routing_revision: int | None = None,
+    session_routing_source: str | None = None,
+) -> Any:
     """Freeze model-routing inputs at the turn acceptance boundary.
 
     Gateway config writes update the long-lived config object in place.  A
@@ -647,9 +690,138 @@ def capture_model_routing_config(config: Any) -> Any:
 
     if config is None:
         return None
+    normalized_mode = _clean(session_mode)
+    if not normalized_mode:
+        return _ModelRoutingConfigSnapshot(
+            squilla_router=copy.deepcopy(getattr(config, "squilla_router", None)),
+            llm_ensemble=copy.deepcopy(getattr(config, "llm_ensemble", None)),
+            session_routing_revision=session_routing_revision,
+            session_routing_source=(
+                session_routing_source or "global_policy"
+            ),
+        )
+    if normalized_mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("session_mode must be direct, router, ensemble, or None")
+
+    # Do not apply the per-session control to the shared GatewayConfig.  A
+    # small config-like copy is sufficient because ``apply_model_routing_mode``
+    # only owns these two subtrees; it also retains the normal Ensemble
+    # activation planner through ``activation_config``.
+    class _RoutingOverlay:
+        squilla_router: Any
+        llm_ensemble: Any
+
+        def __init__(self) -> None:
+            self.squilla_router = copy.deepcopy(
+                getattr(config, "squilla_router", None)
+            )
+            self.llm_ensemble = copy.deepcopy(
+                getattr(config, "llm_ensemble", None)
+            )
+
+    overlay = _RoutingOverlay()
+    apply_model_routing_mode(
+        overlay,
+        normalized_mode,
+        activation_config=config,
+    )
     return _ModelRoutingConfigSnapshot(
-        squilla_router=copy.deepcopy(getattr(config, "squilla_router", None)),
-        llm_ensemble=copy.deepcopy(getattr(config, "llm_ensemble", None)),
+        squilla_router=overlay.squilla_router,
+        llm_ensemble=overlay.llm_ensemble,
+        session_mode=cast(ModelRoutingMode, normalized_mode),
+        session_routing_revision=session_routing_revision,
+        session_routing_source=(
+            session_routing_source or "session_persisted"
+        ),
+    )
+
+
+def durable_model_routing_config_snapshot(config: Any) -> dict[str, Any] | None:
+    """Serialize one accepted routing snapshot for exact restart recovery.
+
+    Persisting a strict, non-secret projection keeps Router tiers and Ensemble
+    lineups frozen for already-accepted work without extending that freeze to
+    live safety, tool, channel, or approval policy.
+    """
+
+    if not isinstance(config, _ModelRoutingConfigSnapshot):
+        return None
+    payload: dict[str, Any] = {}
+    for field_name in ("squilla_router", "llm_ensemble"):
+        value = getattr(config, field_name)
+        if value is None:
+            return None
+        model_dump = getattr(value, "model_dump", None)
+        if not callable(model_dump):
+            return None
+        dumped = model_dump(mode="json")
+        if not isinstance(dumped, dict):
+            return None
+        if field_name == "squilla_router":
+            dumped["tiers"] = _durable_router_tier_snapshot(dumped.get("tiers"))
+        payload[field_name] = dumped
+    return payload
+
+
+def _durable_router_tier_snapshot(value: object) -> dict[str, dict[str, Any]]:
+    from opensquilla.router_tiers import normalize_tier_id, normalize_tier_mapping
+
+    if not isinstance(value, Mapping):
+        return {}
+    snapshot: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_tier in normalize_tier_mapping(value).items():
+        tier_name = normalize_tier_id(raw_name)
+        if tier_name is None or not isinstance(raw_tier, Mapping):
+            continue
+        tier: dict[str, Any] = {}
+        for field_name in _DURABLE_ROUTER_TIER_TEXT_FIELDS:
+            field_value = raw_tier.get(field_name)
+            if isinstance(field_value, str):
+                tier[field_name] = field_value
+        thinking = raw_tier.get("thinking")
+        if isinstance(thinking, (str, bool)):
+            tier["thinking"] = thinking
+        for field_name in _DURABLE_ROUTER_TIER_BOOL_FIELDS:
+            field_value = raw_tier.get(field_name)
+            if isinstance(field_value, bool):
+                tier[field_name] = field_value
+        snapshot[tier_name] = tier
+    return snapshot
+
+
+def restore_durable_model_routing_config_snapshot(
+    payload: dict[str, Any],
+    *,
+    session_mode: ModelRoutingMode | str | None,
+    session_routing_revision: int | None,
+    session_routing_source: str,
+) -> Any:
+    """Validate and restore a server-written durable routing snapshot."""
+
+    if set(payload) != {"squilla_router", "llm_ensemble"}:
+        raise ValueError("invalid durable model-routing config snapshot")
+    router_payload = payload.get("squilla_router")
+    ensemble_payload = payload.get("llm_ensemble")
+    if not isinstance(router_payload, dict) or not isinstance(ensemble_payload, dict):
+        raise ValueError("invalid durable model-routing config snapshot")
+    if router_payload.get("tiers") != _durable_router_tier_snapshot(
+        router_payload.get("tiers")
+    ):
+        raise ValueError("invalid durable model-routing tier snapshot")
+
+    from opensquilla.gateway.config import LlmEnsembleConfig, SquillaRouterConfig
+
+    normalized_mode = _clean(session_mode)
+    if normalized_mode and normalized_mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("invalid durable model-routing session mode")
+    return _ModelRoutingConfigSnapshot(
+        squilla_router=SquillaRouterConfig.model_validate(router_payload),
+        llm_ensemble=LlmEnsembleConfig.model_validate(ensemble_payload),
+        session_mode=(
+            cast(ModelRoutingMode, normalized_mode) if normalized_mode else None
+        ),
+        session_routing_revision=session_routing_revision,
+        session_routing_source=session_routing_source,
     )
 
 
@@ -714,8 +886,10 @@ __all__ = [
     "broadcast_model_routing_changed",
     "broadcast_model_routing_changed_if_needed",
     "capture_model_routing_config",
+    "durable_model_routing_config_snapshot",
     "model_routing_mode_for_write",
     "model_routing_patches",
     "model_routing_snapshot",
     "reconcile_model_routing_write",
+    "restore_durable_model_routing_config_snapshot",
 ]

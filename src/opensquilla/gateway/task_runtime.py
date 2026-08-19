@@ -105,8 +105,26 @@ TaskActivationListener = Callable[
     Awaitable[Mapping[str, Any] | None],
 ]
 RuntimeIdleListener = Callable[[str], Awaitable[None]]
+AcceptedConfigProvider = Callable[..., Any]
 _CollectResult = TypeVar("_CollectResult")
 _MISSING_GOAL_ACCEPTANCE = object()
+_USE_ACCEPTED_CONFIG_PROVIDER = object()
+_DURABLE_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
+_ROUTING_RECOVERY_BASE_RUN_KIND = "recovery_model_routing_base"
+_DURABLE_ROUTING_AUDIT_FIELDS = frozenset(
+    {
+        "scope",
+        "session_mode",
+        "session_revision",
+        "source",
+        "effective_mode",
+        "router_enabled",
+        "ensemble_enabled",
+        "rollout_phase",
+        "selection_mode",
+        "run_kind",
+    }
+)
 
 
 async def _complete_terminal_settlement[T](awaitable: Awaitable[T]) -> T:
@@ -151,6 +169,194 @@ def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
     if isinstance(override.run_mode_source, str) and override.run_mode_source:
         payload["run_mode_source"] = override.run_mode_source
     return payload
+
+
+async def _capture_accepted_config(
+    provider: AcceptedConfigProvider | None,
+    *,
+    session_key: str,
+    run_kind: str,
+) -> Any:
+    """Call old and contextual acceptance providers without hiding errors.
+
+    Existing embeddings supplied a zero-argument provider.  New providers
+    receive the durable task's canonical session key and run kind so they can
+    resolve an interactive session override without making every entry point
+    invent its own snapshot timing.
+    """
+
+    if provider is None:
+        return None
+    try:
+        signature = inspect.signature(provider)
+    except (TypeError, ValueError):
+        result = provider()
+    else:
+        try:
+            signature.bind(session_key=session_key, run_kind=run_kind)
+        except TypeError:
+            try:
+                signature.bind(session_key, run_kind)
+            except TypeError:
+                signature.bind()
+                result = provider()
+            else:
+                result = provider(session_key, run_kind)
+        else:
+            result = provider(session_key=session_key, run_kind=run_kind)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _attach_accepted_config_audit(
+    *,
+    task_record: AgentTaskRecord,
+    accepted_config: Any,
+    run_kind: str,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Attach one compact routing snapshot to an uncommitted task record."""
+
+    if accepted_config is None:
+        return False, None
+    from opensquilla.gateway.session_model_routing import accepted_model_routing_audit
+
+    audit = accepted_model_routing_audit(accepted_config, run_kind=run_kind)
+    if audit is None:
+        return False, None
+    details = dict(task_record.details or {})
+    changed = details.get("accepted_model_routing") != audit
+    details["accepted_model_routing"] = audit
+    task_record.details = details
+    return changed, audit
+
+
+async def _record_accepted_config_audit(
+    storage: Any,
+    *,
+    task_record: AgentTaskRecord,
+    accepted_config: Any,
+    run_kind: str,
+) -> None:
+    """Backfill a routing audit for compatibility callers that committed first."""
+
+    _changed, audit = _attach_accepted_config_audit(
+        task_record=task_record,
+        accepted_config=accepted_config,
+        run_kind=run_kind,
+    )
+    if audit is None:
+        return
+    details = dict(task_record.details or {})
+    updater = getattr(storage, "update_agent_task", None)
+    if not callable(updater):
+        return
+    try:
+        result = updater(task_record.task_id, details=details)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001 - accepted work must still start.
+        log.warning(
+            "task_runtime.accepted_routing_audit_persist_failed",
+            task_id=task_record.task_id,
+            exc_info=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _DurableAcceptedModelRouting:
+    """Strict internal projection of a server-written acceptance audit."""
+
+    scope: str
+    mode: str
+    revision: int | None
+    source: str
+    config_snapshot: dict[str, Any] | None
+    audit: dict[str, Any]
+
+
+def _validated_durable_accepted_model_routing(
+    task_record: AgentTaskRecord,
+) -> _DurableAcceptedModelRouting | None:
+    """Validate recovery-only routing coordinates from the durable task row.
+
+    The audit is deliberately not accepted through ``reserve`` or any ingress
+    request.  Only restart paths hand an already-persisted task record to this
+    parser, and every execution-relevant value is type-checked and
+    cross-checked before it can select a mode.
+    """
+
+    details = task_record.details
+    if not isinstance(details, dict) or "accepted_model_routing" not in details:
+        return None
+    raw = details.get("accepted_model_routing")
+    if not isinstance(raw, dict) or not _DURABLE_ROUTING_AUDIT_FIELDS.issubset(raw):
+        raise ValueError("invalid durable accepted model-routing audit")
+
+    scope = raw.get("scope")
+    effective_mode = raw.get("effective_mode")
+    session_mode = raw.get("session_mode")
+    run_kind = raw.get("run_kind")
+    source = raw.get("source")
+    revision = raw.get("session_revision")
+    router_enabled = raw.get("router_enabled")
+    ensemble_enabled = raw.get("ensemble_enabled")
+    rollout_phase = raw.get("rollout_phase")
+    selection_mode = raw.get("selection_mode")
+    config_snapshot = raw.get("config_snapshot")
+
+    if scope not in {"session", "global"}:
+        raise ValueError("invalid durable accepted model-routing scope")
+    if effective_mode not in _DURABLE_ROUTING_MODES:
+        raise ValueError("invalid durable accepted model-routing mode")
+    if run_kind != task_record.run_kind:
+        raise ValueError("durable accepted model-routing run kind changed")
+    if (
+        not isinstance(source, str)
+        or not source
+        or len(source) > 64
+        or not source.isascii()
+    ):
+        raise ValueError("invalid durable accepted model-routing source")
+    if not source.replace("_", "").isalnum() or not source[0].isalpha():
+        raise ValueError("invalid durable accepted model-routing source")
+    if not isinstance(router_enabled, bool) or not isinstance(ensemble_enabled, bool):
+        raise ValueError("invalid durable accepted model-routing flags")
+    if not isinstance(rollout_phase, str) or len(rollout_phase) > 64:
+        raise ValueError("invalid durable accepted model-routing rollout phase")
+    if not isinstance(selection_mode, str) or len(selection_mode) > 128:
+        raise ValueError("invalid durable accepted model-routing selection mode")
+    if effective_mode == "ensemble" and not ensemble_enabled:
+        raise ValueError("incoherent durable accepted ensemble routing audit")
+    if effective_mode == "router" and (
+        not router_enabled or ensemble_enabled or rollout_phase == "observe"
+    ):
+        raise ValueError("incoherent durable accepted router routing audit")
+    if effective_mode == "direct" and (
+        ensemble_enabled or (router_enabled and rollout_phase != "observe")
+    ):
+        raise ValueError("incoherent durable accepted direct routing audit")
+
+    if scope == "session":
+        if session_mode != effective_mode:
+            raise ValueError("durable accepted session routing mode changed")
+        if revision is not None and (
+            isinstance(revision, bool) or not isinstance(revision, int) or revision < 0
+        ):
+            raise ValueError("invalid durable accepted session routing revision")
+    elif session_mode is not None or revision is not None or source != "global_policy":
+        raise ValueError("invalid durable accepted global routing coordinates")
+    if config_snapshot is not None and not isinstance(config_snapshot, dict):
+        raise ValueError("invalid durable accepted model-routing config snapshot")
+
+    return _DurableAcceptedModelRouting(
+        scope=scope,
+        mode=effective_mode,
+        revision=revision,
+        source=source,
+        config_snapshot=(dict(config_snapshot) if config_snapshot is not None else None),
+        audit=dict(raw),
+    )
 
 
 def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
@@ -435,6 +641,14 @@ class _RuntimeTask:
         repr=False,
     )
     accepted_config_captured: bool = False
+    accepted_config_capture_task: asyncio.Task[Any] | None = field(
+        default=None,
+        repr=False,
+    )
+    accepted_config_audit_task: asyncio.Task[None] | None = field(
+        default=None,
+        repr=False,
+    )
     accepted_run_mode_override: Any | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     # Claimed synchronously before terminal persistence begins. This closes
@@ -971,7 +1185,7 @@ class TaskRuntime:
         subagent_reserved_slots: int = 0,
         turn_hard_deadline_s: float | None = None,
         running_heartbeat_interval_s: float | None = 30.0,
-        accepted_config_provider: Callable[[], Any] | None = None,
+        accepted_config_provider: AcceptedConfigProvider | None = None,
         pending_overflow_policy: PendingOverflowPolicy | str = (
             PendingOverflowPolicy.REJECT_NEWEST
         ),
@@ -1188,6 +1402,10 @@ class TaskRuntime:
                         fresh_user_session=bool(details.get("fresh_user_session", False)),
                         turn_id=task.task_id,
                         bypass_pending_limit=True,
+                    )
+                    await self._restore_durable_accepted_model_routing(
+                        reservation,
+                        task,
                     )
                     await self.activate(
                         reservation,
@@ -1719,6 +1937,8 @@ class TaskRuntime:
             overflow_policy=overflow_policy,
         )
         try:
+            if self._accepted_config_provider is not None:
+                await self.freeze_acceptance(reservation)
             await self._storage.create_agent_task(reservation.task_record)
         except asyncio.CancelledError:
             # The shared storage layer may finish COMMIT after its caller is
@@ -1890,6 +2110,11 @@ class TaskRuntime:
             stream_event_sink=stream_event_sink,
             accepted_run_mode_override=accepted_run_mode_override,
             provider_request_correlation=provider_request_correlation,
+            # Embedded/test runtimes without a config provider have no
+            # acceptance snapshot or audit to capture. Mark that settled at
+            # reservation construction so the pre-commit compatibility path
+            # stays as cheap as the historical direct activation path.
+            accepted_config_captured=self._accepted_config_provider is None,
             primary_input_pending=bool(
                 (persisted_user_message_id or envelope.metadata.get("client_message_id"))
                 and envelope.metadata.get("turn_context_disposition", "queued") == "queued"
@@ -2072,6 +2297,223 @@ class TaskRuntime:
             )
         )
 
+    async def freeze_acceptance(
+        self,
+        reservation: TaskReservation,
+        *,
+        accepted_config: Any = _USE_ACCEPTED_CONFIG_PROVIDER,
+    ) -> None:
+        """Freeze execution config onto ``task_record`` before its durable commit.
+
+        This method deliberately performs no task-ledger write. Durable ingress
+        callers own the transaction and persist the augmented record atomically
+        with the rest of acceptance. A prepared new/forked Session may supply
+        its provisional config because its Session row does not exist yet.
+        """
+
+        await self._freeze_acceptance(
+            reservation,
+            persist_late_audit=False,
+            accepted_config=accepted_config,
+        )
+
+    async def _freeze_acceptance(
+        self,
+        reservation: TaskReservation,
+        *,
+        persist_late_audit: bool,
+        accepted_config: Any = _USE_ACCEPTED_CONFIG_PROVIDER,
+    ) -> None:
+        """Capture once, optionally backfilling callers that already committed."""
+
+        if (
+            accepted_config is _USE_ACCEPTED_CONFIG_PROVIDER
+            and self._accepted_config_provider is None
+        ):
+            # There is no routing snapshot to attach. Avoid two runtime-wide
+            # lock acquisitions per task for provider-less embedders; this is
+            # material under the 10k-task leak/performance contract.
+            if reservation.aborted:
+                raise RuntimeError("Cannot freeze an aborted task reservation")
+            return
+
+        capture_task: asyncio.Task[Any] | None = None
+        audit_task: asyncio.Task[None] | None = None
+        async with self._state_lock:
+            if reservation.aborted:
+                raise RuntimeError("Cannot freeze an aborted task reservation")
+            runtime_task = reservation.runtime_task
+            if reservation.activated:
+                return
+            if (
+                accepted_config is not _USE_ACCEPTED_CONFIG_PROVIDER
+                and not runtime_task.accepted_config_captured
+            ):
+                if runtime_task.accepted_config_capture_task is not None:
+                    raise RuntimeError("accepted config capture already started")
+                runtime_task.accepted_config = accepted_config
+                runtime_task.accepted_config_captured = True
+            if runtime_task.accepted_config_captured:
+                audit_changed, _audit = _attach_accepted_config_audit(
+                    task_record=reservation.task_record,
+                    accepted_config=runtime_task.accepted_config,
+                    run_kind=runtime_task.run_kind,
+                )
+                if persist_late_audit and audit_changed:
+                    audit_task = runtime_task.accepted_config_audit_task
+                    if audit_task is None:
+                        audit_task = asyncio.create_task(
+                            _record_accepted_config_audit(
+                                self._storage,
+                                task_record=reservation.task_record,
+                                accepted_config=runtime_task.accepted_config,
+                                run_kind=runtime_task.run_kind,
+                            )
+                        )
+                        runtime_task.accepted_config_audit_task = audit_task
+                elif persist_late_audit:
+                    audit_task = runtime_task.accepted_config_audit_task
+            elif self._accepted_config_provider is None:
+                runtime_task.accepted_config_captured = True
+            else:
+                capture_task = runtime_task.accepted_config_capture_task
+                if capture_task is None:
+                    capture_task = asyncio.create_task(
+                        _capture_accepted_config(
+                            self._accepted_config_provider,
+                            session_key=runtime_task.envelope.session_key,
+                            run_kind=runtime_task.run_kind,
+                        )
+                    )
+                    runtime_task.accepted_config_capture_task = capture_task
+
+        if capture_task is not None:
+            accepted_config = await asyncio.shield(capture_task)
+            async with self._state_lock:
+                if reservation.aborted:
+                    raise RuntimeError("Cannot freeze an aborted task reservation")
+                runtime_task = reservation.runtime_task
+                if reservation.activated:
+                    return
+                if not runtime_task.accepted_config_captured:
+                    runtime_task.accepted_config = accepted_config
+                    runtime_task.accepted_config_captured = True
+                audit_changed, _audit = _attach_accepted_config_audit(
+                    task_record=reservation.task_record,
+                    accepted_config=runtime_task.accepted_config,
+                    run_kind=runtime_task.run_kind,
+                )
+                audit_task = runtime_task.accepted_config_audit_task
+                if persist_late_audit and audit_changed and audit_task is None:
+                    audit_task = asyncio.create_task(
+                        _record_accepted_config_audit(
+                            self._storage,
+                            task_record=reservation.task_record,
+                            accepted_config=runtime_task.accepted_config,
+                            run_kind=runtime_task.run_kind,
+                        )
+                    )
+                    runtime_task.accepted_config_audit_task = audit_task
+
+        if audit_task is not None:
+            await asyncio.shield(audit_task)
+
+    async def _ensure_accepted_config_captured(
+        self,
+        reservation: TaskReservation,
+    ) -> None:
+        """Compatibility capture for embedders that activate a committed record."""
+
+        await self._freeze_acceptance(
+            reservation,
+            persist_late_audit=True,
+            accepted_config=_USE_ACCEPTED_CONFIG_PROVIDER,
+        )
+
+    async def _restore_durable_accepted_model_routing(
+        self,
+        reservation: TaskReservation,
+        durable_task: AgentTaskRecord,
+    ) -> None:
+        """Restore a restart task's server-recorded routing coordinates.
+
+        New records carry the exact non-secret Router and Ensemble subtrees
+        captured at acceptance.  Older records retain the compatibility path
+        that rebuilds their mode over the current global detail snapshot.  A
+        present but malformed audit is rejected instead of becoming execution
+        authority.
+        """
+
+        durable = _validated_durable_accepted_model_routing(durable_task)
+        if durable is None:
+            return
+        from opensquilla.gateway.model_routing import (
+            capture_model_routing_config,
+            model_routing_snapshot,
+            restore_durable_model_routing_config_snapshot,
+        )
+
+        if durable.config_snapshot is not None:
+            restored = restore_durable_model_routing_config_snapshot(
+                durable.config_snapshot,
+                session_mode=(durable.mode if durable.scope == "session" else None),
+                session_routing_revision=durable.revision,
+                session_routing_source=durable.source,
+            )
+        else:
+            if self._accepted_config_provider is None:
+                raise ValueError(
+                    "cannot restore legacy durable model routing without a provider"
+                )
+            current = await _capture_accepted_config(
+                self._accepted_config_provider,
+                session_key=durable_task.session_key,
+                # Deliberately use a non-session run kind.  The Gateway provider
+                # returns the current global detail subtrees without consulting
+                # today's Session mode; the durable audit below is the sole mode
+                # authority for this already-accepted task.
+                run_kind=_ROUTING_RECOVERY_BASE_RUN_KIND,
+            )
+            restored = capture_model_routing_config(
+                current,
+                session_mode=durable.mode,
+                session_routing_revision=durable.revision,
+                session_routing_source=durable.source,
+            )
+        if restored is None:
+            raise ValueError("accepted model-routing provider returned no config")
+        if durable.scope == "global":
+            restored = replace(
+                restored,
+                session_mode=None,
+                session_routing_revision=None,
+                session_routing_source="global_policy",
+            )
+        restored_routing = model_routing_snapshot(restored)
+        if restored_routing["mode"] != durable.mode:
+            raise ValueError("could not rebuild durable accepted model-routing mode")
+        if durable.config_snapshot is not None:
+            for audit_field in (
+                "router_enabled",
+                "ensemble_enabled",
+                "rollout_phase",
+                "selection_mode",
+            ):
+                if restored_routing[audit_field] != durable.audit[audit_field]:
+                    raise ValueError("durable accepted model-routing snapshot changed")
+
+        async with self._state_lock:
+            if reservation.aborted or reservation.activated:
+                raise RuntimeError("cannot restore routing on a settled reservation")
+            runtime_task = reservation.runtime_task
+            if runtime_task.accepted_config_capture_task is not None:
+                raise RuntimeError("accepted routing capture already started")
+            runtime_task.accepted_config = restored
+            runtime_task.accepted_config_captured = True
+            details = dict(reservation.task_record.details or {})
+            details["accepted_model_routing"] = dict(durable.audit)
+            reservation.task_record.details = details
+
     async def activate(
         self,
         reservation: TaskReservation,
@@ -2083,6 +2525,8 @@ class TaskRuntime:
     ) -> TaskHandle:
         """Idempotently activate a reservation after its DB transaction commits."""
 
+        if not reservation.runtime_task.accepted_config_captured:
+            await self._ensure_accepted_config_captured(reservation)
         interrupt_targets: list[_RuntimeTask] = []
         victim: _RuntimeTask | None = None
         async with self._state_lock:
@@ -2124,15 +2568,6 @@ class TaskRuntime:
                     runtime_task.goal_candidate = None
                 elif accepted_goal_candidate is not None:
                     runtime_task.goal_candidate = accepted_goal_candidate.as_task_detail()
-            if not runtime_task.accepted_config_captured:
-                accepted_config = (
-                    self._accepted_config_provider()
-                    if self._accepted_config_provider is not None
-                    else None
-                )
-                runtime_task.accepted_config = accepted_config
-                runtime_task.accepted_config_captured = True
-
             reservations.remove(reservation)
             if not reservations:
                 self._reservations_by_session.pop(reservation.session_key, None)
@@ -2940,6 +3375,7 @@ class TaskRuntime:
             _reusable_route_envelope(routed),
             message,
             mode="followup",
+            run_kind="runtime_send",
             stream_event_sink=stream_event_sink,
             accepted_run_mode_override=accepted_run_mode_override,
             update_envelope_cache=False,
@@ -4420,6 +4856,7 @@ class TaskRuntime:
                 continue
             details = task.details if isinstance(task.details, dict) else {}
             message_ids = [entry.message_id for entry in entries]
+            reservation: TaskReservation | None = None
             try:
                 reservation = await self.reserve(
                     envelope,
@@ -4435,9 +4872,17 @@ class TaskRuntime:
                     task_id=task.task_id,
                     update_envelope_cache=False,
                 )
+                await self._restore_durable_accepted_model_routing(
+                    reservation,
+                    task,
+                )
             except TaskQueueFullError:
                 result["rejected"] += len(entries)
                 continue
+            except BaseException:
+                if reservation is not None and not reservation.activated:
+                    await self.abort_reservation(reservation)
+                raise
             if not await requeue(task.task_id):
                 await self.abort_reservation(reservation)
                 continue
@@ -4565,51 +5010,78 @@ class TaskRuntime:
             details = (
                 target_task.details if isinstance(target_task.details, dict) else {}
             )
-            try:
-                reservation = await self.reserve(
-                    envelope,
-                    "\n\n".join(texts),
-                    mode="followup",
-                    run_kind=target_task.run_kind,
-                    no_memory_capture=bool(details.get("no_memory_capture", False)),
-                    semantic_message="\n\n".join(texts),
-                    persisted_user_message_id=message_ids[0],
-                    persisted_user_message_ids=message_ids,
-                    message_count=len(message_ids),
-                    fresh_user_session=False,
-                    update_envelope_cache=False,
-                )
-            except TaskQueueFullError:
-                changed = await close_inputs(
-                    target_task_id=target_task_id,
-                    message_ids=message_ids,
-                    disposition="rejected",
-                    failure_code="STEER_PROMOTION_QUEUE_FULL",
-                    retryable=True,
-                    recovery="resend_after_queue_drains",
-                )
-                result["rejected"] += len(changed)
-                continue
+            async with self.collect_admission(envelope.session_key):
+                try:
+                    reservation = await self.reserve(
+                        envelope,
+                        "\n\n".join(texts),
+                        mode="followup",
+                        run_kind=target_task.run_kind,
+                        no_memory_capture=bool(details.get("no_memory_capture", False)),
+                        semantic_message="\n\n".join(texts),
+                        persisted_user_message_id=message_ids[0],
+                        persisted_user_message_ids=message_ids,
+                        message_count=len(message_ids),
+                        fresh_user_session=False,
+                        update_envelope_cache=False,
+                    )
+                except TaskQueueFullError:
+                    changed = await close_inputs(
+                        target_task_id=target_task_id,
+                        message_ids=message_ids,
+                        disposition="rejected",
+                        failure_code="STEER_PROMOTION_QUEUE_FULL",
+                        retryable=True,
+                        recovery="resend_after_queue_drains",
+                    )
+                    result["rejected"] += len(changed)
+                    continue
 
-            claimed = await promote_inputs(
-                target_task_id=target_task_id,
-                message_ids=message_ids,
-                task_record=reservation.task_record,
-            )
-            if len(claimed) != len(message_ids):
-                await self.abort_reservation(reservation)
-                continue
-            try:
-                handle = await self.activate(reservation)
-            except BaseException:
-                if not reservation.activated:
+                try:
+                    await self.freeze_acceptance(reservation)
+                    claimed = await promote_inputs(
+                        target_task_id=target_task_id,
+                        message_ids=message_ids,
+                        task_record=reservation.task_record,
+                    )
+                except BaseException:
+                    if not reservation.activated:
+                        await self.abort_reservation(reservation)
+                    raise
+                if len(claimed) != len(message_ids):
                     await self.abort_reservation(reservation)
-                raise
+                    continue
+                try:
+                    handle = await self.activate(reservation)
+                except BaseException:
+                    if not reservation.activated:
+                        await self.abort_reservation(reservation)
+                    raise
             result["promoted"] += len(claimed)
             result["task_ids"].append(handle.task_id)
         return result
 
     async def _promote_undrained_steers(
+        self,
+        completed_task: _RuntimeTask,
+        items: Sequence[_SteeredInput],
+        *,
+        activate: bool = True,
+        defer_queued_notification: bool = False,
+    ) -> _SteerPromotionResult | None:
+        """Serialize a late-steer durable acceptance with session settings."""
+
+        if not items:
+            return None
+        async with self.collect_admission(completed_task.envelope.session_key):
+            return await self._promote_undrained_steers_under_admission(
+                completed_task,
+                items,
+                activate=activate,
+                defer_queued_notification=defer_queued_notification,
+            )
+
+    async def _promote_undrained_steers_under_admission(
         self,
         completed_task: _RuntimeTask,
         items: Sequence[_SteeredInput],
@@ -4717,6 +5189,7 @@ class TaskRuntime:
                 # startup recovery.
                 _allow_during_shutdown=True,
             )
+            await self.freeze_acceptance(reservation)
             if atomic_promotion:
                 promote_inputs_fn = cast(
                     Callable[..., Awaitable[builtins.list[str]]],

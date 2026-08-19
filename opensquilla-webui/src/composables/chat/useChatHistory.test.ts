@@ -2104,6 +2104,7 @@ describe('useChatHistory optimistic local rows', () => {
           status: 'cancelled',
           started_at: 1_000,
           finished_at: 2_000,
+          accepted_routing_mode: 'ensemble',
           outcome: {
             kind: 'cancelled',
             cancellation_source: 'webui_stop',
@@ -2125,6 +2126,7 @@ describe('useChatHistory optimistic local rows', () => {
       turnId: 'turn-1',
       status: 'cancelled',
       cancellationSource: 'webui_stop',
+      acceptedRoutingMode: 'ensemble',
     })
   })
 
@@ -2669,5 +2671,196 @@ describe('useChatHistory optimistic local rows', () => {
       ['user', prompt],
     ])
     expect(messages.value.some(message => message.stopNotice)).toBe(false)
+  })
+})
+
+describe('useChatHistory accepted ensemble reconciliation', () => {
+  function acceptedRouter(turnId: string | undefined): ChatMessage {
+    return {
+      role: 'router',
+      text: '',
+      ts: '2026-07-07T10:00:00.500Z',
+      ...(turnId ? { turnId } : {}),
+      messageId: 'router-live',
+      provenanceKind: 'router_decision',
+      routerDecision: {
+        tier: 'c1',
+        model: 'anthropic/claude-sonnet-4.6',
+        source: 'squilla_router',
+        accepted_routing_mode: 'ensemble',
+      },
+      ensemble: {
+        profile: 'llm_ensemble',
+        modelCount: 1,
+        totalCandidates: 1,
+        requestCount: 1,
+        fallbackUsed: false,
+        fallbackReason: '',
+        costUsd: 0,
+        savedUsd: 0,
+        savedPct: 0,
+        models: [{
+          role: 'proposer_1',
+          label: 'proposer_1',
+          provider: 'anthropic',
+          model: 'claude-sonnet-4.6',
+          modelShort: 'claude-sonnet-4.6',
+          input: 10,
+          output: 20,
+          costUsd: 0,
+          status: 'done',
+        }],
+      },
+    }
+  }
+
+  const canonicalTurn = (turnId = 'turn-current'): ChatHistoryResponse => ({
+    messages: [
+      {
+        id: `user-${turnId}`,
+        message_id: `user-${turnId}`,
+        role: 'user',
+        text: `question ${turnId}`,
+        timestamp: '2026-07-07T10:00:00Z',
+        turn_context: { turn_id: turnId },
+      },
+      {
+        id: `assistant-${turnId}`,
+        message_id: `assistant-${turnId}`,
+        role: 'assistant',
+        text: `answer ${turnId}`,
+        timestamp: '2026-07-07T10:00:01Z',
+        turn_context: { turn_id: turnId },
+      },
+    ],
+    has_more: false,
+    canonical_available: true,
+    canonical_complete: true,
+  })
+
+  it('keeps the live accepted ensemble strip through done and canonical replacement', async () => {
+    const response = canonicalTurn()
+    const { api, messages } = makeHistory(false, {
+      messages: [
+        {
+          role: 'user',
+          text: 'question turn-current',
+          ts: '2026-07-07T10:00:00Z',
+          messageId: 'user-turn-current',
+          turnId: 'turn-current',
+        },
+        acceptedRouter('turn-current'),
+        {
+          role: 'assistant',
+          text: 'answer turn-current',
+          ts: '2026-07-07T10:00:01Z',
+          turnId: 'turn-current',
+        },
+      ],
+      response,
+      preserveLiveTail: false,
+    })
+
+    await api.loadHistory()
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'router', 'assistant'])
+    const routers = messages.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({
+      turnId: 'turn-current',
+      routerSettled: true,
+      restoredFromHistory: true,
+      routerDecision: { accepted_routing_mode: 'ensemble' },
+      ensemble: {
+        models: [expect.objectContaining({ model: 'claude-sonnet-4.6' })],
+      },
+    })
+  })
+
+  it('merges the marker and live members into an existing same-turn canonical router', async () => {
+    const response = canonicalTurn()
+    response.messages?.splice(1, 0, {
+      id: 'router-canonical',
+      message_id: 'router-canonical',
+      role: 'router',
+      text: '',
+      timestamp: '2026-07-07T10:00:00.750Z',
+      turn_context: { turn_id: 'turn-current' },
+      router_decision: {
+        tier: 'c1',
+        model: 'anthropic/claude-sonnet-4.6',
+        source: 'squilla_router',
+      },
+    })
+    const { api, messages } = makeHistory(false, {
+      messages: [
+        {
+          role: 'user',
+          text: 'question turn-current',
+          ts: 0,
+          messageId: 'user-turn-current',
+          turnId: 'turn-current',
+        },
+        acceptedRouter('turn-current'),
+      ],
+      response,
+    })
+
+    await api.loadHistory()
+
+    const routers = messages.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({
+      messageId: 'router-canonical',
+      turnId: 'turn-current',
+      routerDecision: { accepted_routing_mode: 'ensemble' },
+      ensemble: { modelCount: 1 },
+    })
+  })
+
+  it('never copies an accepted marker to an adjacent turn or past compaction', async () => {
+    const current = canonicalTurn('turn-current')
+    const adjacent = canonicalTurn('turn-adjacent')
+    const replacement = canonicalTurn('turn-after-compaction')
+    adjacent.messages?.splice(1, 0, {
+      id: 'router-adjacent',
+      message_id: 'router-adjacent',
+      role: 'router',
+      text: '',
+      timestamp: '2026-07-07T10:01:00.500Z',
+      turn_context: { turn_id: 'turn-adjacent' },
+      router_decision: {
+        tier: 'c1',
+        model: 'openai/gpt-5.4-mini',
+        source: 'squilla_router',
+      },
+    })
+    const { api, rpc, messages } = makeHistory(false, {
+      messages: [acceptedRouter('turn-current'), acceptedRouter(undefined)],
+    })
+    rpc.call
+      .mockResolvedValueOnce({
+        ...current,
+        messages: [...(current.messages || []), ...(adjacent.messages || [])],
+      })
+      .mockResolvedValueOnce(replacement)
+
+    await api.loadHistory()
+
+    const adjacentRouter = messages.value.find(message => message.messageId === 'router-adjacent')
+    expect(adjacentRouter?.routerDecision?.accepted_routing_mode).toBeUndefined()
+    expect(messages.value.filter(message =>
+      message.role === 'router' && message.turnId === 'turn-current',
+    )).toHaveLength(1)
+
+    await api.loadHistory()
+
+    expect(messages.value.some(message =>
+      message.role === 'router' && message.turnId === 'turn-current',
+    )).toBe(false)
+    expect(messages.value.some(message => ['ensemble', 'llm_ensemble'].includes(
+      String(message.routerDecision?.accepted_routing_mode || '').toLowerCase(),
+    ))).toBe(false)
   })
 })

@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+_MODEL_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,6 +497,19 @@ def _entry_turn_id(entry: TranscriptEntry) -> str | None:
     return turn_id_from_context(entry.turn_context)
 
 
+def _accepted_routing_mode_from_task_details(details: object) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    accepted_routing = details.get("accepted_model_routing")
+    if not isinstance(accepted_routing, dict):
+        return None
+    mode = accepted_routing.get("effective_mode")
+    if not isinstance(mode, str):
+        return None
+    normalized = mode.strip().lower()
+    return normalized if normalized in _MODEL_ROUTING_MODES else None
+
+
 def _is_promoted_turn_entry(entry: TranscriptEntry) -> bool:
     return isinstance(entry.turn_context, dict) and (
         entry.turn_context.get("disposition") == "promoted"
@@ -591,6 +605,7 @@ class SessionManager:
         task_runtime: Any = None,
         checkpoint_workspace_dir: str | Path | None = None,
         media_root: str | Path | None = None,
+        model_routing_mode_provider: Callable[[], str] | None = None,
     ) -> None:
         self._storage = storage
         self._memory_sync_notify = memory_sync_notify
@@ -606,6 +621,7 @@ class SessionManager:
         # Attachment/artifact media root, used to carry material into forked
         # children; None disables the copy (e.g. in tests that never touch disk).
         self._media_root = Path(media_root).expanduser() if media_root is not None else None
+        self._model_routing_mode_provider = model_routing_mode_provider
         # In-process epoch cache so _emit_to_subscribers can
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
@@ -650,6 +666,58 @@ class SessionManager:
             now = datetime.now(tz=UTC)
             tz_name = "UTC"
         return _stamp_time_prefix(content, now, tz_name)
+
+    def _default_model_routing_mode(self) -> str:
+        """Return the global mode used to initialize a new session."""
+
+        provider = self._model_routing_mode_provider
+        raw = provider() if callable(provider) else "direct"
+        mode = str(raw or "").strip().lower()
+        if mode not in _MODEL_ROUTING_MODES:
+            # A malformed provider must not create a session with an implicit
+            # inherit state. Direct is the established safe global fallback.
+            return "direct"
+        return mode
+
+    def _prepare_new_session_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(kwargs)
+        supplied = prepared.get("model_routing_mode")
+        if supplied is None:
+            prepared["model_routing_mode"] = self._default_model_routing_mode()
+            return prepared
+        mode = str(supplied).strip().lower()
+        if mode not in _MODEL_ROUTING_MODES:
+            raise ValueError("model_routing_mode must be direct, router, or ensemble")
+        prepared["model_routing_mode"] = mode
+        return prepared
+
+    async def get_session_routing(
+        self,
+        session_key: str,
+        *,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Resolve the durable session mode, materializing a legacy NULL once."""
+
+        return await self._storage.resolve_model_routing_mode(
+            canonicalize_session_key(session_key),
+            fallback_mode,
+        )
+
+    async def set_session_routing(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set the user-selected routing strategy for one session."""
+
+        return await self._storage.set_model_routing_mode(
+            canonicalize_session_key(session_key),
+            mode,
+            expected_revision=expected_revision,
+        )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -722,6 +790,7 @@ class SessionManager:
         if resolved is SessionIntent.NEW_CHAT and existing is not None:
             raise ValueError("session_key conflict")
         if existing is None:
+            create_kwargs = self._prepare_new_session_kwargs(create_kwargs)
             node = self._build_session_node(
                 session_key,
                 agent_id=agent_id,
@@ -760,7 +829,11 @@ class SessionManager:
         if existing is not None:
             raise ValueError(f"Session already exists: {session_key}")
 
-        node = self._build_session_node(session_key, agent_id=agent_id, **kwargs)
+        node = self._build_session_node(
+            session_key,
+            agent_id=agent_id,
+            **self._prepare_new_session_kwargs(kwargs),
+        )
         await self._storage.upsert_session(node)
         return node
 
@@ -1354,6 +1427,7 @@ class SessionManager:
                         started_at=snapshot.get("started_at"),
                         finished_at=snapshot.get("finished_at"),
                         outcome=snapshot["outcome"],
+                        accepted_routing_mode=snapshot.get("accepted_routing_mode"),
                     )
                     continue
 
@@ -1381,6 +1455,9 @@ class SessionManager:
                     "finished_at": getattr(row, "finished_at", None),
                     "outcome": outcome,
                 }
+                accepted_routing_mode = _accepted_routing_mode_from_task_details(details)
+                if accepted_routing_mode is not None:
+                    snapshot["accepted_routing_mode"] = accepted_routing_mode
             elif turn_id not in invalid_turn_ids:
                 snapshot = source_projections.get(turn_id)
 
@@ -1395,6 +1472,7 @@ class SessionManager:
                 started_at=snapshot.get("started_at"),
                 finished_at=snapshot.get("finished_at"),
                 outcome=snapshot["outcome"],
+                accepted_routing_mode=snapshot.get("accepted_routing_mode"),
             )
 
         return _ForkTerminalOutcomeResolution(
@@ -1466,6 +1544,13 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        # A fork must never inherit a legacy NULL into the future.  Resolve the
+        # parent under its durable row first, then give the child an independent
+        # CAS generation for its copied concrete selection.
+        parent_routing = await self.get_session_routing(
+            parent_session_key,
+            fallback_mode=self._default_model_routing_mode(),
+        )
 
         now = _now_ms()
         child = SessionNode(
@@ -1486,6 +1571,8 @@ class SessionManager:
             display_name=display_name,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            model_routing_mode=str(parent_routing["mode"]),
+            model_routing_revision=0,
         )
 
         if fork_transcript:
@@ -1733,6 +1820,10 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        parent_routing = await self.get_session_routing(
+            parent_session_key,
+            fallback_mode=self._default_model_routing_mode(),
+        )
         parent_coverage = await self._storage.get_canonical_transcript_coverage(
             parent.session_id
         )
@@ -1771,6 +1862,8 @@ class SessionManager:
             forked_from_parent=True,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            model_routing_mode=str(parent_routing["mode"]),
+            model_routing_revision=0,
         )
         child.compaction_count = (
             0

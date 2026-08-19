@@ -1,6 +1,5 @@
 import { ref, type Ref } from 'vue'
 import type { ChatEnsembleMeta, ChatEnsembleMetaModel, ChatMessage } from '@/types/chat'
-import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { EnsembleProgressPayload, RouterDecisionPayload } from '@/types/rpc'
 import { normalizeEnsembleMemberRole } from '@/utils/ensembleRoles'
 import {
@@ -17,7 +16,8 @@ export interface UseChatRouterDecisionRuntimeOptions {
   sessionKey: Ref<string>
   isStreaming: Ref<boolean>
   autoScroll: Ref<boolean>
-  modelRoutingMode: Ref<ModelRoutingMode>
+  activeTurnUsesEnsemble: Readonly<Ref<boolean>>
+  activeTurnId: Readonly<Ref<string>>
   streamBubble: Ref<boolean>
   streamHasVisibleOutput: Ref<boolean>
   startStreaming: () => void
@@ -103,19 +103,54 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     }
   }
 
+  function freezeAcceptedRoutingMode(
+    decision: NormalizedRouterDecision,
+    turnId: string,
+  ): NormalizedRouterDecision {
+    const acceptedMode = String(
+      decision.accepted_routing_mode || decision.acceptedRoutingMode || '',
+    ).trim()
+    const expectedTurnId = String(options.activeTurnId.value || '').trim()
+    if (
+      acceptedMode
+      || !options.activeTurnUsesEnsemble.value
+      || !expectedTurnId
+      || !turnId
+      || turnId !== expectedTurnId
+    ) return decision
+    return { ...decision, accepted_routing_mode: 'ensemble' }
+  }
+
+  function freezeActiveTurnRoutingMode(targetTurnId: string): boolean {
+    const expectedTurnId = String(options.activeTurnId.value || '').trim()
+    if (
+      !options.activeTurnUsesEnsemble.value
+      || !targetTurnId
+      || targetTurnId !== expectedTurnId
+    ) return false
+    const message = findRouterMessageForTurn(targetTurnId)
+    const decision = message?.routerDecision
+      ? normalizeRouterDecision(message.routerDecision)
+      : null
+    if (!message || !decision) return false
+    message.routerDecision = freezeAcceptedRoutingMode(decision, targetTurnId)
+    return true
+  }
+
   function appendRouterDecision(payload: RouterDecisionPayload, decision = normalizeRouterDecision(payload)) {
     if (!decision) return
+    const turnId = payloadTurnId(payload)
+    const acceptedDecision = freezeAcceptedRoutingMode(decision, turnId)
     const messageId = payload?.stream_seq
       ? `router-${options.sessionKey.value}-${payload.stream_seq}`
       : `router-${options.sessionKey.value}-${Date.now()}`
     if (options.messages.value.some(message => message.messageId === messageId)) return
 
-    const turnId = payloadTurnId(payload)
     options.messages.value.push({
       role: 'router',
       text: '',
       ts: new Date().toISOString(),
-      routerDecision: decision,
+      routerDecision: acceptedDecision,
       provenanceKind: 'router_decision',
       messageId,
       ...(turnId ? { turnId } : {}),
@@ -124,8 +159,12 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   }
 
   function queueRouterDecision(payload: RouterDecisionPayload) {
-    const decision = normalizeRouterDecision(payload)
-    if (!decision) return
+    const normalizedDecision = normalizeRouterDecision(payload)
+    if (!normalizedDecision) return
+    const decision = freezeAcceptedRoutingMode(
+      normalizedDecision,
+      payloadTurnId(payload),
+    )
     if (options.isStreaming.value && options.streamBubble.value && !options.streamHasVisibleOutput.value) {
       const model = shortModelName(decision.model || decision.routed_model || '')
       options.setStreamActivity(model ? `Router selected · ${model}` : 'Router selected')
@@ -213,7 +252,13 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   function isEnsembleRouterMessage(message: ChatMessage): boolean {
     const decision = message.routerDecision || null
     const source = String(decision?.source || decision?.routing_source || '').toLowerCase()
-    return source.includes('ensemble') || options.modelRoutingMode.value === 'llm_ensemble' || Boolean(message.ensemble)
+    const acceptedMode = String(
+      decision?.accepted_routing_mode || decision?.acceptedRoutingMode || '',
+    ).toLowerCase()
+    return source.includes('ensemble')
+      || acceptedMode === 'ensemble'
+      || acceptedMode === 'llm_ensemble'
+      || Boolean(message.ensemble)
   }
 
   function findLiveRouterMessage(targetTurnId = latestExplicitTurnId()): ChatMessage | undefined {
@@ -241,8 +286,22 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     if (!options.isStreaming.value) return
     let target = findLiveRouterMessage()
     if (!target) {
-      if (options.modelRoutingMode.value !== 'llm_ensemble') return
+      const expectedTurnId = String(options.activeTurnId.value || '').trim()
+      if (
+        !options.activeTurnUsesEnsemble.value
+        || !expectedTurnId
+        || latestExplicitTurnId() !== expectedTurnId
+      ) return
       target = synthesizeHandoffRouterMessage()
+    }
+    if (options.activeTurnUsesEnsemble.value && target.routerDecision) {
+      const decision = normalizeRouterDecision(target.routerDecision)
+      if (decision) {
+        target.routerDecision = freezeAcceptedRoutingMode(
+          decision,
+          String(target.turnId || '').trim(),
+        )
+      }
     }
     if (!isEnsembleRouterMessage(target)) return
     target.routerState = 'handoff'
@@ -291,5 +350,6 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     appendEnsembleProgress,
     markEnsembleHandoff,
     bindRouterDecisionToModelCall,
+    freezeActiveTurnRoutingMode,
   }
 }

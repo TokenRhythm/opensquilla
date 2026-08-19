@@ -149,6 +149,18 @@ class GatewayClientLike(Protocol):
 
     async def set_model_routing(self, mode: str) -> dict[str, Any]: ...
 
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        pass
+
+    async def set_session_routing(
+        self,
+        key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        pass
+
 class GatewayTurnStreamClient(Protocol):
     """Client surface consumed by the shared gateway stream renderer."""
 
@@ -761,6 +773,71 @@ async def _dispatch_gateway_slash_command(
 
     if _slash_parts(cmd, "/theme"):
         await dispatch_theme_command(cmd, tui_output)
+        return True
+
+    if parts := _slash_parts(cmd, "/routing"):
+        argument = parts[1].strip().lower() if len(parts) > 1 else ""
+        if argument not in {"", "direct", "router", "ensemble"}:
+            console.print("[red]Usage: /routing [direct|router|ensemble][/red]")
+            return True
+
+        try:
+            snapshot = await client.get_session_routing(state.session_key)
+        except Exception as exc:
+            console.print(
+                "[yellow]Session routing controls are unavailable on this Gateway.[/yellow] "
+                f"[dim]{exc}[/dim]"
+            )
+            return True
+
+        if not argument:
+            send = getattr(tui_output, "send_message", None)
+            if bool(getattr(tui_output, "supports_send_message", False)) and callable(send):
+                await send(
+                    "model.routing.picker",
+                    {
+                        "current": snapshot.get("mode", "direct"),
+                        "options": ["direct", "router", "ensemble"],
+                        "command": "/routing",
+                        "title": "session model routing",
+                    },
+                )
+                return True
+            console.print(
+                "[dim]session routing[/dim] "
+                f"[bold]{snapshot.get('mode', 'direct')}[/bold]"
+            )
+            return True
+
+        try:
+            revision = int(snapshot.get("revision") or 0)
+            snapshot = await client.set_session_routing(
+                state.session_key,
+                argument,
+                expected_revision=revision,
+            )
+        except Exception as exc:
+            console.print(
+                "[red]Session routing change failed.[/red] "
+                f"[dim]{exc}[/dim]"
+            )
+            return True
+
+        mode = str(snapshot.get("mode") or argument)
+        await send_model_routing_state(
+            tui_output,
+            {
+                **snapshot,
+                "mode": mode,
+                "router_enabled": mode == "router",
+                "ensemble_enabled": mode == "ensemble",
+                "applies_to": snapshot.get("appliesTo", "next_accepted_turn"),
+            },
+        )
+        console.print(
+            f"[green]session routing:[/green] {mode} "
+            "[dim](applies to the next accepted turn)[/dim]"
+        )
         return True
 
     if parts := _slash_parts_any(cmd, "/strategy", "/router", "/ensemble"):

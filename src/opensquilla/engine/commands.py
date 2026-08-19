@@ -386,6 +386,24 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=90,
     ),
     CommandDef(
+        name="/routing",
+        usage="/routing [direct|router|ensemble]",
+        description="Choose or inspect the current session's model routing.",
+        execution={
+            _T: _local("session.routing"),
+            _S: _local("session.routing"),
+        },
+        argument_choices=(
+            ArgumentChoice("direct", "Use the selected model directly from the next turn."),
+            ArgumentChoice("router", "Use Squilla Router from the next turn."),
+            ArgumentChoice("ensemble", "Use Model Ensemble from the next turn."),
+        ),
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.NEXT_TURN,
+        presentation=CommandPresentation.PICKER,
+        order=19,
+    ),
+    CommandDef(
         name="/strategy",
         usage="/strategy [direct|router|ensemble|status]",
         description="Choose or inspect the shared model strategy.",

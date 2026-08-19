@@ -9,7 +9,11 @@ import type {
   ChatPendingItem,
   ChatSteerCapability,
 } from '@/types/chat'
-import type { ImageInputAdmission, ModelRoutingMode } from '@/types/modelRouting'
+import type {
+  GatewayModelRoutingMode,
+  ImageInputAdmission,
+  ModelRoutingMode,
+} from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { SandboxRunMode } from '@/types/sandbox'
@@ -94,6 +98,7 @@ interface SendAttempt {
   attachments: SendableAttachment[]
   intent: string | null
   initialCollaborationMode: CollaborationMode | null
+  initialRoutingMode: GatewayModelRoutingMode | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
   restoreComposerOnHandoffFailure?: boolean
@@ -128,6 +133,7 @@ interface ExplicitSendPayload {
   workspaceId?: string | null
   initialCollaborationMode?: CollaborationMode | null
   documentContext?: ChatDocumentContext | null
+  initialRoutingMode?: GatewayModelRoutingMode | null
 }
 
 interface ComposerSnapshot {
@@ -141,6 +147,7 @@ interface ComposerSnapshot {
   forkBeforeMessageId: string | null
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
+  initialRoutingMode: GatewayModelRoutingMode | null
   queueOwnerRequestId: string | null
 }
 
@@ -368,6 +375,7 @@ function matchesRecoveredDraft(
     attachments: SendableAttachment[]
     intent: string | null
     initialCollaborationMode: CollaborationMode | null
+    initialRoutingMode: GatewayModelRoutingMode | null
     forkBeforeMessageId: string | null
     workspaceId: string | null
   },
@@ -379,6 +387,7 @@ function matchesRecoveredDraft(
     attempt.text === input.text &&
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
+    attempt.initialRoutingMode === input.initialRoutingMode &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
     attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
@@ -413,6 +422,7 @@ export interface UseChatSendOptions {
   composerRevision?: Readonly<Ref<number>>
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
+  initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
   pendingForkBeforeMessageId: Ref<string | null>
   promptAnnotationIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
@@ -675,6 +685,7 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
+      initialRoutingMode: initialRoutingModeForIntent(intent),
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
@@ -722,6 +733,7 @@ export function useChatSend(options: UseChatSendOptions) {
       workspaceId: snapshot.workspaceId,
       initialCollaborationMode: snapshot.initialCollaborationMode,
       documentContext: snapshot.documentContext,
+      initialRoutingMode: snapshot.initialRoutingMode,
     }
   }
 
@@ -799,7 +811,6 @@ export function useChatSend(options: UseChatSendOptions) {
       && expectedTurnId
       && activeTaskId === expectedTurnId
       && (!inputKinds?.length || inputKinds.includes('text'))
-      && options.modelRoutingMode.value !== 'llm_ensemble',
     )
   }
 
@@ -1110,6 +1121,10 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function initialModeForIntent(intent: string | null): CollaborationMode | null {
     return intent === 'new_chat' ? options.initialCollaborationMode.value : null
+  }
+
+  function initialRoutingModeForIntent(intent: string | null): GatewayModelRoutingMode | null {
+    return intent === 'new_chat' ? options.initialRoutingMode.value : null
   }
 
   function consumeAcceptedSessionIntent(attempt: SendAttempt): void {
@@ -2224,6 +2239,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: sendableAttachments,
         intent: composerSnapshot.intent,
         initialCollaborationMode: composerSnapshot.initialCollaborationMode,
+        initialRoutingMode: composerSnapshot.initialRoutingMode,
         forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
         workspaceId: composerSnapshot.workspaceId,
       })
@@ -2587,6 +2603,12 @@ export function useChatSend(options: UseChatSendOptions) {
     )
       ? sendOpts.payload.initialCollaborationMode ?? null
       : initialModeForIntent(intent)
+    const initialRoutingMode = (
+      sendOpts.payload
+      && 'initialRoutingMode' in sendOpts.payload
+    )
+      ? sendOpts.payload.initialRoutingMode ?? null
+      : initialRoutingModeForIntent(intent)
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
     const requestedDocumentContext = intent === null
       ? sendOpts.payload
@@ -2620,6 +2642,7 @@ export function useChatSend(options: UseChatSendOptions) {
           attachments: initialSendableAttachments,
           intent,
           initialCollaborationMode,
+          initialRoutingMode,
           forkBeforeMessageId,
           workspaceId,
         })
@@ -2809,6 +2832,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (initialCollaborationMode === 'plan') {
         params.collaborationMode = initialCollaborationMode
       }
+      if (initialRoutingMode) params.initialRoutingMode = initialRoutingMode
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
@@ -2827,6 +2851,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
         intent,
         initialCollaborationMode,
+        initialRoutingMode,
         forkBeforeMessageId,
         workspaceId,
         ...(sendOpts.acceptedVisibleReplay
@@ -3349,6 +3374,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: [],
         intent: null,
         initialCollaborationMode: null,
+        initialRoutingMode: null,
         forkBeforeMessageId,
         workspaceId: null,
       },
@@ -3363,6 +3389,7 @@ export function useChatSend(options: UseChatSendOptions) {
           forkBeforeMessageId,
           workspaceId: null,
           initialCollaborationMode: null,
+          initialRoutingMode: null,
         },
         preserveComposer: true,
         retryAttempt: usageBarrierReplayAttempt,
@@ -3697,7 +3724,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
       ? options.pendingSessionIntent.value
       : null
+    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
+    if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
     if (displayText && displayText !== providerText) params.displayText = displayText
     params._source = chatSourceMetadata(options)
 
@@ -3717,6 +3746,7 @@ export function useChatSend(options: UseChatSendOptions) {
       attachments: [],
       intent: hiddenSessionIntent,
       initialCollaborationMode: null,
+      initialRoutingMode: hiddenInitialRoutingMode,
       forkBeforeMessageId: null,
       workspaceId: null,
       params,

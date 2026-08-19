@@ -46,6 +46,7 @@ from opensquilla.gateway.config import (
     is_public_bind,
 )
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
@@ -3017,6 +3018,7 @@ async def build_services(
             agent_registry=agent_registry,
             checkpoint_workspace_dir=config.workspace_dir,
             media_root=media_root_from_config(config),
+            model_routing_mode_provider=lambda: model_routing_snapshot(config)["mode"],
         )
 
     # Wire session manager into tool layer (like set_scheduler, set_gateway_config)
@@ -4234,7 +4236,9 @@ async def start_gateway_server(
 
     from opensquilla.gateway.background_completion import BackgroundCompletionManager
     from opensquilla.gateway.event_bridge import EventBridge
-    from opensquilla.gateway.model_routing import capture_model_routing_config
+    from opensquilla.gateway.session_model_routing import (
+        capture_accepted_model_routing_config,
+    )
     from opensquilla.gateway.subagent_announce import set_background_completion_manager
     from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 
@@ -4325,6 +4329,18 @@ async def start_gateway_server(
             event_emitter=runtime_event_bridge.emit,
         )
 
+    async def _capture_task_accepted_config(
+        *,
+        session_key: str,
+        run_kind: str,
+    ) -> Any:
+        return await capture_accepted_model_routing_config(
+            config,
+            svc.session_manager,
+            session_key=session_key,
+            run_kind=run_kind,
+        )
+
     session_lifecycle_listener = _make_task_session_lifecycle_listener(
         session_manager=svc.session_manager,
         event_emitter=runtime_event_bridge.emit,
@@ -4341,7 +4357,7 @@ async def start_gateway_server(
             getattr(getattr(config, "subagents", None), "subagent_reserved_slots", 0)
         ),
         turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
-        accepted_config_provider=lambda: capture_model_routing_config(config),
+        accepted_config_provider=_capture_task_accepted_config,
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),

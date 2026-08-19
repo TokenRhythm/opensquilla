@@ -21,6 +21,7 @@ create_attestation = MODULE["create_attestation"]
 policy_digest = MODULE["policy_digest"]
 validate_candidate = MODULE["validate_candidate"]
 verify_queue = MODULE["verify_queue"]
+list_attestation_artifacts = MODULE["_list_attestation_artifacts"]
 
 
 def _artifact_redirect(newurl: str) -> urllib.request.Request:
@@ -260,24 +261,54 @@ def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path)
                 pull_request_head_is_ancestor=True,
             )
 
-    wrong_base = dict(run)
-    wrong_base["pull_requests"] = [
+    stale_base = dict(run)
+    stale_base["pull_requests"] = [
         {
             "number": 42,
             "head": {"sha": attestation["head_sha"]},
             "base": {"ref": "main", "sha": "0" * 40},
         }
     ]
+    validate_candidate(
+        attestation=attestation,
+        run=stale_base,
+        repository="opensquilla/opensquilla",
+        queue_tree_sha=str(attestation["tested_tree_sha"]),
+        queue_base_sha=base_sha,
+        queue_policy_digest=str(attestation["policy_digest"]),
+        pull_request_head_is_ancestor=True,
+    )
+
+    wrong_ref = dict(run)
+    wrong_ref["pull_requests"] = [
+        {
+            "number": 42,
+            "head": {"sha": attestation["head_sha"]},
+            "base": {"ref": "release", "sha": base_sha},
+        }
+    ]
     with pytest.raises(AttestationError):
         validate_candidate(
             attestation=attestation,
-            run=wrong_base,
+            run=wrong_ref,
             repository="opensquilla/opensquilla",
             queue_tree_sha=str(attestation["tested_tree_sha"]),
             queue_base_sha=base_sha,
             queue_policy_digest=str(attestation["policy_digest"]),
             pull_request_head_is_ancestor=True,
         )
+
+    merge_sha_run = dict(run)
+    merge_sha_run["head_sha"] = attestation["tested_merge_sha"]
+    validate_candidate(
+        attestation=attestation,
+        run=merge_sha_run,
+        repository="opensquilla/opensquilla",
+        queue_tree_sha=str(attestation["tested_tree_sha"]),
+        queue_base_sha=base_sha,
+        queue_policy_digest=str(attestation["policy_digest"]),
+        pull_request_head_is_ancestor=True,
+    )
 
 
 def test_verify_queue_reuses_only_exact_trusted_evidence(
@@ -316,6 +347,7 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
         verify_queue.__globals__, "_request_bytes", lambda _url, _token: _archive(attestation)
     )
 
+    details: dict[str, object] = {}
     reusable, reason, source_run = verify_queue(
         repo=repo,
         repository="opensquilla/opensquilla",
@@ -323,11 +355,15 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
         token="synthetic-token",
         api_url="https://api.github.com",
         current_run_id=999,
+        details=details,
     )
 
     assert reusable is True
     assert reason == "matching trusted PR CI attestation"
     assert source_run == 123
+    assert details["reason_code"] == "reusable_exact"
+    assert details["candidate_count"] == 1
+    assert details["artifact_name"].startswith("ci-attestation-")
 
     _write(repo, ".github/workflows/ci.yml", "name: Changed CI\n")
     _git(repo, "add", ".github/workflows/ci.yml")
@@ -345,3 +381,50 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
     assert reusable is False
     assert "CI policy changed" in reason
     assert source_run is None
+
+
+def test_artifact_listing_retries_visibility_and_paginates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    sleeps: list[int] = []
+
+    def fake_json(url: str, _token: str) -> dict[str, Any]:
+        calls.append(url)
+        if len(calls) < 3:
+            return {"artifacts": []}
+        return {"total_count": 1, "artifacts": [{"id": 1}]}
+
+    monkeypatch.setitem(list_attestation_artifacts.__globals__, "_request_json", fake_json)
+    monkeypatch.setitem(
+        list_attestation_artifacts.__globals__,
+        "time",
+        type("Clock", (), {"sleep": staticmethod(sleeps.append)}),
+    )
+
+    result = list_attestation_artifacts(
+        api_url="https://api.github.com",
+        repository="opensquilla/opensquilla",
+        encoded_name="ci-attestation-tree",
+        token="synthetic-token",
+    )
+
+    assert result == [{"id": 1}]
+    assert sleeps == [10, 20]
+    assert "page=1" in calls[-1]
+
+
+def test_artifact_listing_fails_closed_at_candidate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_json(_url: str, _token: str) -> dict[str, Any]:
+        return {"total_count": 301, "artifacts": []}
+
+    monkeypatch.setitem(list_attestation_artifacts.__globals__, "_request_json", fake_json)
+    with pytest.raises(AttestationError, match="candidate limit"):
+        list_attestation_artifacts(
+            api_url="https://api.github.com",
+            repository="opensquilla/opensquilla",
+            encoded_name="ci-attestation-tree",
+            token="synthetic-token",
+        )

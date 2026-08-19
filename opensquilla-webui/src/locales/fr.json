@@ -1058,6 +1058,7 @@
     "modelStrategy": {
       "title": "Routage des modèles",
       "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
+      "newSessionDefault": "C’est la valeur par défaut des nouveaux chats. Les chats existants conservent leur propre mode de routage.",
       "modeTitle": "Choisir l’utilisation des modèles",
       "providerFirstTitle": "Ajouter d’abord un service de modèles",
       "providerFirst": "Le routage de modèles nécessite au moins un fournisseur enregistré.",
@@ -3908,8 +3909,11 @@
       "routerAnimationOn": "Animation du routeur activée",
       "routerAnimationOff": "Animation du routeur désactivée",
       "modelRouting": "Routage des modèles",
+      "sessionModelRouting": "Routage des modèles de ce chat",
+      "modelRoutingSessionScope": "Les changements ne s’appliquent qu’à ce chat. Un tour en cours conserve son mode actuel.",
       "ensembleImageUnsupported": "Ensemble ne prend pas encore en charge les images en entrée. Dans « Routage des modèles », utilisez « Routeur mono-modèle avec IA » configuré pour les images ou « Désactivé » avec un modèle compatible avec les images en entrée.",
       "imageInputUnsupported": "Le modèle sélectionné ne peut pas traiter les images. Choisissez un modèle compatible ou retirez l’image.",
+      "routingUpdateBlocked": "Le routage des modèles est en cours de mise à jour. Attendez avant d’envoyer.",
       "routingUpdateImageBlocked": "Le routage des modèles est en cours de mise à jour. Attendez avant d’envoyer des images.",
       "modelRoutingOff": "Désactivé",
       "modelRoutingOffDesc": "Envoie chaque tour au modèle sélectionné.",
@@ -4163,7 +4167,8 @@
       "unknownProviderCalls": "{count} appel fournisseur a une utilisation inconnue | {count} appels fournisseur ont une utilisation inconnue"
     },
     "modelRouting": {
-      "updateFailed": "Impossible de changer le routage des modèles — rétabli. Vérifiez la connexion à la passerelle et réessayez."
+      "updateFailed": "Impossible de changer le routage des modèles — rétabli. Vérifiez la connexion à la passerelle et réessayez.",
+      "sessionUpdateFailed": "Impossible de mettre à jour le routage des modèles de ce chat : {error}"
     },
     "routeFeedback": {
       "up": "Bon choix de modèle pour ce tour",

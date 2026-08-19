@@ -84,6 +84,14 @@ export interface EnsembleCandidateConfig {
   role?: string
 }
 
+export interface EnsembleRoutingModeState {
+  enabled: boolean
+  selectionMode: string
+  modelOptions: string[]
+  candidates: EnsembleCandidateConfig[]
+  lineupDirty: boolean
+}
+
 export interface EnsembleCredentialStatus {
   provider: string
   available: boolean
@@ -473,6 +481,90 @@ export function useSetupEnsembleForm() {
 
   function setEnabled(value: boolean) {
     enabled.value = Boolean(value)
+  }
+
+  function captureRoutingModeState(): EnsembleRoutingModeState {
+    return {
+      enabled: enabled.value,
+      selectionMode: selectionMode.value,
+      modelOptions: [...modelOptions.value],
+      candidates: candidates.value.map(candidate => ({ ...candidate })),
+      lineupDirty: (
+        selectionModeDirty.value
+        || modelOptionsDirty.value
+        || candidatesDirty.value
+      ),
+    }
+  }
+
+  function routingModeDetailsMatch(state: EnsembleRoutingModeState): boolean {
+    return selectionMode.value === state.selectionMode
+      && JSON.stringify(modelOptions.value) === JSON.stringify(state.modelOptions)
+      && JSON.stringify(candidates.value) === JSON.stringify(state.candidates)
+  }
+
+  function restoreRoutingModeDetails(state: EnsembleRoutingModeState) {
+    selectionMode.value = state.selectionMode
+    modelOptions.value = [...state.modelOptions]
+    candidates.value = state.candidates.map(candidate => ({ ...candidate }))
+  }
+
+  function restoreRoutingModeState(state: EnsembleRoutingModeState) {
+    const detailsUnchanged = routingModeDetailsMatch(state)
+    enabled.value = state.enabled
+    if (detailsUnchanged) restoreRoutingModeDetails(state)
+  }
+
+  /**
+   * `models.routing.set` owns the global mode transition and may materialize a
+   * first-use Ensemble plan. Rebase clean lineup fields from that response,
+   * while retaining any lineup draft that existed before the switch.
+   */
+  function acceptRoutingModeChange(
+    state: EnsembleRoutingModeState,
+    serverSnapshot: unknown,
+  ) {
+    const response = serverSnapshot && typeof serverSnapshot === 'object'
+      ? serverSnapshot as Record<string, unknown>
+      : null
+    const responseMode = String(response?.mode || '').trim()
+    const responseSelectionMode = String(response?.selection_mode || '').trim()
+    const hasResponseSelectionMode = (
+      responseMode === 'ensemble'
+      && (ENSEMBLE_SELECTION_MODES as readonly string[]).includes(responseSelectionMode)
+    )
+    const preview = response?.activation_preview
+    const previewRecord = preview && typeof preview === 'object'
+      ? preview as Record<string, unknown>
+      : null
+    const previewCandidates = (
+      responseMode === 'ensemble'
+      && responseSelectionMode === CUSTOM_B5_SELECTION_MODE
+      && Array.isArray(previewRecord?.candidates)
+    )
+      ? normalizeCandidates(previewRecord.candidates)
+      : null
+
+    const detailsUnchanged = routingModeDetailsMatch(state)
+    const nextBaseline = {
+      ...baseline.value,
+      enabled: enabled.value,
+    }
+    if (hasResponseSelectionMode) {
+      nextBaseline.selectionMode = responseSelectionMode
+    }
+    if (previewCandidates !== null) {
+      nextBaseline.candidates = JSON.stringify(previewCandidates)
+    }
+    baseline.value = nextBaseline
+
+    if (state.lineupDirty || !detailsUnchanged) return
+    if (hasResponseSelectionMode) {
+      selectionMode.value = responseSelectionMode
+    }
+    if (previewCandidates !== null) {
+      candidates.value = previewCandidates
+    }
   }
 
   function setSelectionMode(value: string) {
@@ -1019,6 +1111,10 @@ export function useSetupEnsembleForm() {
     isDirty,
     initFromConfig,
     setEnabled,
+    captureRoutingModeState,
+    restoreRoutingModeDetails,
+    restoreRoutingModeState,
+    acceptRoutingModeChange,
     setSelectionMode,
     addModelOption,
     removeModelOption,

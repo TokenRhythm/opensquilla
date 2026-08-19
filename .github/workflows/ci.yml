@@ -31,7 +31,13 @@ jobs:
     outputs:
       reusable: ${{ steps.verify.outputs.reusable || 'false' }}
       reason: ${{ steps.verify.outputs.reason || steps.context.outputs.reason || steps.mode.outputs.reason }}
+      reason_code: ${{ steps.verify.outputs.reason_code || steps.context.outputs.reason_code || steps.mode.outputs.reason_code }}
       source_run_id: ${{ steps.verify.outputs.source_run_id }}
+      candidate_count: ${{ steps.verify.outputs.candidate_count || '0' }}
+      artifact_name: ${{ steps.verify.outputs.artifact_name }}
+      queue_base_sha: ${{ steps.verify.outputs.queue_base_sha }}
+      queue_head_sha: ${{ steps.verify.outputs.queue_head_sha }}
+      queue_tree_sha: ${{ steps.verify.outputs.queue_tree_sha }}
     steps:
       - name: Validate optimization mode
         id: mode
@@ -45,18 +51,22 @@ jobs:
               ;;
           esac
           if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
+            echo "reason_code=legacy_mode" >> "${GITHUB_OUTPUT}"
             echo "reason=legacy mode always runs queue CI" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Record non-queue context
         id: context
         if: ${{ github.event_name != 'merge_group' }}
-        run: echo "reason=not a merge-group event" >> "${GITHUB_OUTPUT}"
+        run: |
+          echo "reason_code=invalid_context" >> "${GITHUB_OUTPUT}"
+          echo "reason=not a merge-group event" >> "${GITHUB_OUTPUT}"
 
       - name: Check out merge-group commit
         if: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.merge_group.head_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -78,7 +88,13 @@ jobs:
         env:
           REUSABLE: ${{ steps.verify.outputs.reusable || 'false' }}
           REASON: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
+          REASON_CODE: ${{ steps.verify.outputs.reason_code || steps.mode.outputs.reason_code }}
           SOURCE_RUN_ID: ${{ steps.verify.outputs.source_run_id }}
+          CANDIDATE_COUNT: ${{ steps.verify.outputs.candidate_count || '0' }}
+          ARTIFACT_NAME: ${{ steps.verify.outputs.artifact_name }}
+          QUEUE_BASE_SHA: ${{ steps.verify.outputs.queue_base_sha }}
+          QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
+          QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
         shell: bash
         run: |
           {
@@ -86,12 +102,18 @@ jobs:
             echo
             echo "- Mode: \`${CI_OPTIMIZATION_MODE}\`"
             echo "- Reusable: \`${REUSABLE}\`"
-            echo "- Reason: ${REASON}"
+            echo "- Reason: \`${REASON_CODE}\` - ${REASON}"
+            echo "- Candidates: \`${CANDIDATE_COUNT}\`"
+            echo "- Artifact: \`${ARTIFACT_NAME}\`"
+            echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
+            if [[ "${CI_OPTIMIZATION_MODE}" == "enforce" && "${REUSABLE}" == "true" ]]; then
+              echo "- Decision: \`attestation_reuse\`"
+            fi
             if [[ "${CI_OPTIMIZATION_MODE}" == "shadow" && "${REUSABLE}" == "true" ]]; then
-              echo "- Shadow decision: evidence matched, but the normal queue matrix still runs."
+              echo "- Shadow decision: evidence matched, but the classifier-selected queue matrix still runs."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -158,17 +180,17 @@ jobs:
             merge_group)
               base="${{ github.event.merge_group.base_sha }}"
               head="${{ github.event.merge_group.head_sha }}"
-              if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" \
-                || "${CI_OPTIMIZATION_MODE}" == "enforce" ]]; then
-                echo "Queue evidence was unavailable; running the full fail-closed matrix." >&2
+              if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
+                echo "Legacy mode runs the full fail-closed matrix." >&2
                 printf '.ci/run-all\n' > "${changed_files}"
               elif [[ -n "${base}" && -n "${head}" ]] \
                 && git cat-file -e "${base}^{commit}" \
                 && git cat-file -e "${head}^{commit}" \
-                && git diff --name-only "${base}" "${head}" > "${changed_files}"; then
-                :
+                && git diff --name-only "${base}" "${head}" > "${changed_files}" \
+                && [[ -s "${changed_files}" ]]; then
+                echo "Queue evidence was unavailable; classifying the exact merge-group diff." >&2
               else
-                echo "Merge-group diff is unavailable; running the full CI matrix." >&2
+                echo "Merge-group diff is unavailable or empty; running the full CI matrix." >&2
                 printf '.ci/run-all\n' > "${changed_files}"
               fi
               ;;
@@ -195,6 +217,22 @@ jobs:
         shell: bash
         run: bash .github/scripts/classify-ci-changes.sh "${CHANGED_FILES}"
 
+      - name: Summarize merge-group fallback decision
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          FULL_REQUIRED: ${{ steps.classify.outputs.full_required }}
+        shell: bash
+        run: |
+          decision="queue_diff_targeted"
+          if [[ "${FULL_REQUIRED}" == "true" ]]; then
+            decision="full_fail_closed"
+          fi
+          {
+            echo "## Merge queue fallback"
+            echo
+            echo "- Decision: \`${decision}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   workflow-lint:
     name: Validate GitHub Actions workflows
     needs: classify-changes
@@ -203,6 +241,14 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Cache actionlint Go build inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: actionlint-${{ runner.os }}-${{ runner.arch }}-v1.7.12
 
       - name: Run actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color=false
@@ -1066,6 +1112,7 @@ jobs:
       UV_PYTHON: "3.12"
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
 
     steps:
       - name: Prepare Desktop recovery report
@@ -1128,6 +1175,12 @@ jobs:
         working-directory: opensquilla-webui
         shell: bash
         run: npm ci
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('opensquilla-webui/package-lock.json') }}
 
       - name: Install WebUI recovery browser
         working-directory: opensquilla-webui

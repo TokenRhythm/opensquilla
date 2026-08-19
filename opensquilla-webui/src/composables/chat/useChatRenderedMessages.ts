@@ -62,6 +62,8 @@ export interface NormalizedRouterDecision extends Record<string, unknown> {
   messageId?: string
   confidence?: number
   rollout_phase?: string
+  accepted_routing_mode?: string
+  acceptedRoutingMode?: string
 }
 
 export interface UseChatRenderedMessagesOptions {
@@ -73,6 +75,7 @@ export interface UseChatRenderedMessagesOptions {
   routerTierConfigs: Ref<Record<string, ChatRouterTierConfig>>
   routerVisualEffectsEnabled: Ref<boolean>
   routerVisualMode: Ref<RouterVisualMode>
+  /** Next-turn session state; retained for compatibility and never used to classify a turn. */
   modelRoutingMode?: Ref<ModelRoutingMode>
   isStreaming?: Ref<boolean>
   currentPlanRevisionId?: Readonly<Ref<string>>
@@ -618,7 +621,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   ): ChatRenderedMessage | null {
     if (!options.routerVisualEffectsEnabled.value) return null
     const restoredFromHistory = msg.restoredFromHistory === true
-    if (isDirectEnsembleRouterDecision(decision, restoredFromHistory)) {
+    if (isDirectEnsembleRouterDecision(decision)) {
       return renderedEnsembleRouterStrip(
         msg,
         msg.ensemble,
@@ -943,11 +946,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
   function isDirectEnsembleRouterDecision(
     decision: NormalizedRouterDecision,
-    restoredFromHistory: boolean,
   ): boolean {
     const source = String(decision.source || decision.routing_source || '').toLowerCase()
     if (source.includes('ensemble')) return true
-    return !restoredFromHistory && options.modelRoutingMode?.value === 'llm_ensemble'
+    const acceptedMode = String(
+      decision.accepted_routing_mode || decision.acceptedRoutingMode || '',
+    ).toLowerCase()
+    return acceptedMode === 'ensemble' || acceptedMode === 'llm_ensemble'
   }
 
   function shouldCombineRouterAndEnsemble(
@@ -955,7 +960,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     hasEnsembleEvidence: boolean,
     restoredFromHistory: boolean,
   ): boolean {
-    if (isDirectEnsembleRouterDecision(decision, restoredFromHistory)) return false
+    if (isDirectEnsembleRouterDecision(decision)) return false
     if (hasEnsembleEvidence) return true
     // Current tier configuration is only authoritative for a live decision.
     // Restored history combines the two stages only when its own usage proves
@@ -1634,6 +1639,7 @@ function routerDecisionFromUsage(
       ? immutablePlan.routing_applied
       : usage.routing_applied !== false,
     rollout_phase: usage.rollout_phase || 'full',
+    accepted_routing_mode: msg.turnOutcome?.acceptedRoutingMode,
   })
 }
 

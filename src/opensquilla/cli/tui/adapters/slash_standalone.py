@@ -35,6 +35,7 @@ from opensquilla.cli.tui.adapters.slash_common import (
     slash_parts as _slash_parts,
 )
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
+from opensquilla.cli.tui.opentui.context import send_model_routing_state
 from opensquilla.cli.ui import ACCENT, console, error_panel
 from opensquilla.engine.commands import Surface
 from opensquilla.observability.network_policy import (
@@ -147,6 +148,22 @@ class StandaloneFlushTranscript(Protocol):
     ) -> Awaitable[Any]: ...
 
 
+class StandaloneGetSessionRouting(Protocol):
+    def __call__(self, session_key: str) -> Awaitable[dict[str, Any]] | dict[str, Any]:
+        pass
+
+
+class StandaloneSetSessionRouting(Protocol):
+    def __call__(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]:
+        pass
+
+
 @dataclass
 class StandaloneSlashServices:
     create_session: StandaloneCreateSession | None = None
@@ -156,6 +173,8 @@ class StandaloneSlashServices:
     compact_session: StandaloneCompactSession | None = None
     compact_with_result: CompactWithResult | None = None
     flush_transcript: StandaloneFlushTranscript | None = None
+    get_session_routing: StandaloneGetSessionRouting | None = None
+    set_session_routing: StandaloneSetSessionRouting | None = None
     config: object | None = None
     provider_selector: object | None = None
 
@@ -481,6 +500,11 @@ async def _replace_with_new_session(
     if create_session is None:
         raise RuntimeError("standalone chat requires session manager")
     await create_session(session_key, agent_id="main")
+    if context.slash_services.get_session_routing is not None:
+        # Materialize the global default at session creation time.  Without
+        # this read a global change between /new and the first message would
+        # incorrectly change the new session's initial routing mode.
+        await _maybe_await(context.slash_services.get_session_routing(session_key))
     state = ChatSessionState(session_key=session_key, model=context.model)
     tool_ctx = context.build_tool_ctx(session_key)
 
@@ -703,6 +727,72 @@ async def handle_standalone_slash_command(
 
     if _slash_parts(cmd, "/theme"):
         await dispatch_theme_command(cmd, context.tui_output)
+        return True
+
+    if parts := _slash_parts(cmd, "/routing"):
+        argument = parts[1].strip().lower() if len(parts) > 1 else ""
+        if argument not in {"", "direct", "router", "ensemble"}:
+            console.print("[red]Usage: /routing [direct|router|ensemble][/red]")
+            return True
+        get_routing = context.slash_services.get_session_routing
+        set_routing = context.slash_services.set_session_routing
+        if get_routing is None or set_routing is None:
+            console.print("[yellow]Session routing service is unavailable.[/yellow]")
+            return True
+        try:
+            snapshot = await _maybe_await(get_routing(context.session_key))
+        except Exception as exc:  # noqa: BLE001 - keep the TUI recoverable.
+            console.print(f"[red]Could not read session routing.[/red] [dim]{exc}[/dim]")
+            return True
+
+        if not argument:
+            send = getattr(context.tui_output, "send_message", None)
+            if bool(
+                getattr(context.tui_output, "supports_send_message", False)
+            ) and callable(send):
+                await send(
+                    "model.routing.picker",
+                    {
+                        "current": snapshot.get("mode", "direct"),
+                        "options": ["direct", "router", "ensemble"],
+                        "command": "/routing",
+                        "title": "session model routing",
+                    },
+                )
+                return True
+            console.print(
+                "[dim]session routing[/dim] "
+                f"[bold]{snapshot.get('mode', 'direct')}[/bold]"
+            )
+            return True
+
+        try:
+            snapshot = await _maybe_await(
+                set_routing(
+                    context.session_key,
+                    argument,
+                    expected_revision=int(snapshot.get("revision") or 0),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the TUI recoverable.
+            console.print(f"[red]Session routing change failed.[/red] [dim]{exc}[/dim]")
+            return True
+
+        mode = str(snapshot.get("mode") or argument)
+        await send_model_routing_state(
+            context.tui_output,
+            {
+                **snapshot,
+                "mode": mode,
+                "router_enabled": mode == "router",
+                "ensemble_enabled": mode == "ensemble",
+                "applies_to": snapshot.get("appliesTo", "next_accepted_turn"),
+            },
+        )
+        console.print(
+            f"[green]session routing:[/green] {mode} "
+            "[dim](applies to the next accepted turn)[/dim]"
+        )
         return True
 
     if (

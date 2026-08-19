@@ -18,6 +18,8 @@ TERMINAL_AGENT_TASK_STATUSES = frozenset(
         "abandoned",
     }
 )
+_ACCEPTED_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
+_MISSING = object()
 
 
 def turn_id_from_context(turn_context: object) -> str | None:
@@ -70,10 +72,19 @@ def build_fork_terminal_outcome_projection(
     started_at: int | None,
     finished_at: int | None,
     outcome: Mapping[str, Any],
+    accepted_routing_mode: str | None = None,
 ) -> dict[str, Any]:
     """Build a projection bound to one fork child identity."""
 
-    return {
+    if accepted_routing_mode is not None and (
+        not isinstance(accepted_routing_mode, str)
+        or accepted_routing_mode not in _ACCEPTED_ROUTING_MODES
+    ):
+        raise ValueError(
+            "accepted_routing_mode must be direct, router, ensemble, or None"
+        )
+
+    projection = {
         "version": FORK_TERMINAL_OUTCOME_VERSION,
         "session_id": session_id,
         "session_key": session_key,
@@ -84,6 +95,9 @@ def build_fork_terminal_outcome_projection(
         "finished_at": finished_at,
         "outcome": deepcopy(dict(outcome)),
     }
+    if accepted_routing_mode is not None:
+        projection["accepted_routing_mode"] = accepted_routing_mode
+    return projection
 
 
 def extract_fork_terminal_outcome_projection(
@@ -111,6 +125,7 @@ def extract_fork_terminal_outcome_projection(
     status = raw.get("status")
     started_at = raw.get("started_at")
     finished_at = raw.get("finished_at")
+    accepted_routing_mode = raw.get("accepted_routing_mode", _MISSING)
     if not isinstance(task_id, str) or not task_id.strip():
         return None
     if not isinstance(status, str) or status not in TERMINAL_AGENT_TASK_STATUSES:
@@ -123,10 +138,15 @@ def extract_fork_terminal_outcome_projection(
         not isinstance(finished_at, int) or isinstance(finished_at, bool)
     ):
         return None
+    if accepted_routing_mode is not _MISSING and (
+        not isinstance(accepted_routing_mode, str)
+        or accepted_routing_mode not in _ACCEPTED_ROUTING_MODES
+    ):
+        return None
     outcome = terminal_turn_outcome(status, raw.get("outcome"))
     if outcome is None:
         return None
-    return {
+    projection: dict[str, Any] = {
         "turn_id": turn_id,
         "task_id": task_id.strip(),
         "status": status,
@@ -134,6 +154,9 @@ def extract_fork_terminal_outcome_projection(
         "finished_at": finished_at,
         "outcome": outcome,
     }
+    if accepted_routing_mode is not _MISSING:
+        projection["accepted_routing_mode"] = accepted_routing_mode
+    return projection
 
 
 def attach_fork_terminal_outcome_projection(

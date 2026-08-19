@@ -93,6 +93,12 @@ class _StubGatewayClient:
             "selection_mode": "router_dynamic",
             "applies_to": "next_accepted_turn",
         }
+        self.session_routing: dict[str, Any] = {
+            "sessionKey": "agent:main:test:0",
+            "mode": "direct",
+            "revision": 0,
+            "appliesTo": "next_accepted_turn",
+        }
 
     def _maybe_raise(self, method: str) -> None:
         exc = self.raise_map.get(method)
@@ -270,6 +276,29 @@ class _StubGatewayClient:
         )
         return dict(self.model_routing)
 
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        self._maybe_raise("get_session_routing")
+        self.calls.append(("get_session_routing", key))
+        return {**self.session_routing, "sessionKey": key}
+
+    async def set_session_routing(
+        self,
+        key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        self._maybe_raise("set_session_routing")
+        self.calls.append(
+            ("set_session_routing", (key, mode, expected_revision))
+        )
+        assert expected_revision == self.session_routing["revision"]
+        if mode != self.session_routing["mode"]:
+            self.session_routing["revision"] += 1
+            self.session_routing["mode"] = mode
+        self.session_routing["sessionKey"] = key
+        return dict(self.session_routing)
+
 
 def _gateway_context(
     client: _StubGatewayClient | None = None,
@@ -348,6 +377,11 @@ class _StandaloneHarness:
     def __init__(self) -> None:
         self.transcripts: dict[str, list[Any]] = {}
         self.read_errors: dict[str, Exception] = {}
+        self.session_routing = {
+            "mode": "direct",
+            "revision": 0,
+            "appliesTo": "next_accepted_turn",
+        }
 
     async def create_session(self, session_key: str, *, agent_id: str = "main") -> object:
         return SimpleNamespace(session_key=session_key, agent_id=agent_id)
@@ -387,6 +421,22 @@ class _StandaloneHarness:
             obligation_missing_ids=[],
         )
 
+    async def get_session_routing(self, session_key: str) -> dict[str, Any]:
+        return {**self.session_routing, "sessionKey": session_key}
+
+    async def set_session_routing(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        assert expected_revision == self.session_routing["revision"]
+        if mode != self.session_routing["mode"]:
+            self.session_routing["revision"] += 1
+            self.session_routing["mode"] = mode
+        return {**self.session_routing, "sessionKey": session_key}
+
 
 def _standalone_context(
     harness: _StandaloneHarness | None = None,
@@ -407,6 +457,8 @@ def _standalone_context(
             truncate_session=harness.truncate_session,
             compact_session=harness.compact_session,
             flush_transcript=harness.flush_transcript,
+            get_session_routing=harness.get_session_routing,
+            set_session_routing=harness.set_session_routing,
         ),
         turn_runner=object(),
         build_tool_ctx=lambda _session_key: object(),
@@ -1274,6 +1326,62 @@ def test_classify_model_strategy_as_immediate_control(command: str) -> None:
 @pytest.mark.parametrize("command", ["/strategy", "/router on", "/ensemble", "/meta foo"])
 def test_standalone_gateway_only_commands_stay_off_the_turn_plane(command: str) -> None:
     assert classify(command, surface=Surface.CLI_STANDALONE) is SlashCategory.COMMAND
+
+
+async def test_gateway_session_routing_command_only_updates_current_session() -> None:
+    client = _StubGatewayClient()
+
+    handled = await handle_gateway_slash_command(
+        "/routing ensemble",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert (
+        "set_session_routing",
+        ("agent:main:test:0", "ensemble", 0),
+    ) in client.calls
+    assert not any(name == "set_model_routing" for name, _value in client.calls)
+    assert client.session_routing["mode"] == "ensemble"
+    assert client.model_routing["mode"] == "direct"
+
+
+async def test_gateway_session_routing_bare_command_opens_session_picker() -> None:
+    client = _StubGatewayClient()
+    client.session_routing.update(mode="router", revision=2)
+    output = _StructuredOutput()
+
+    handled = await handle_gateway_slash_command(
+        "/routing",
+        _gateway_context(client, tui_output=output),
+    )
+
+    assert handled is True
+    assert output.messages == [
+        (
+            "model.routing.picker",
+            {
+                "current": "router",
+                "options": ["direct", "router", "ensemble"],
+                "command": "/routing",
+                "title": "session model routing",
+            },
+        )
+    ]
+
+
+async def test_standalone_session_routing_query_and_set_are_persistent() -> None:
+    harness = _StandaloneHarness()
+    context = _standalone_context(harness)
+
+    assert await handle_standalone_slash_command("/routing", context) is True
+    assert await handle_standalone_slash_command("/routing router", context) is True
+
+    assert harness.session_routing == {
+        "mode": "router",
+        "revision": 1,
+        "appliesTo": "next_accepted_turn",
+    }
 
 
 async def test_gateway_model_strategy_bare_command_opens_shared_picker() -> None:

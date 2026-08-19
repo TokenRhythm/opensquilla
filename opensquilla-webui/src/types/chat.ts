@@ -315,6 +315,7 @@ export interface ChatTurnOutcome {
   noPriorProviderDispatch?: boolean
   replaySafe?: boolean
   userMessageId?: string
+  acceptedRoutingMode?: 'direct' | 'router' | 'ensemble'
 }
 
 export interface ChatRunTask {

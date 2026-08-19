@@ -51,6 +51,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     pendingAttachments: ref([]),
     pendingSessionIntent: ref(null),
     initialCollaborationMode: ref('default'),
+    initialRoutingMode: ref(null),
     pendingForkBeforeMessageId: ref(null),
     aborted: ref(false),
     activeStreamTaskId: ref(''),

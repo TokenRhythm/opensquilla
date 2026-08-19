@@ -54,6 +54,7 @@ function mockConfigSequence(configs: Array<Record<string, unknown>>) {
     if (method === 'channels.status') return { channels: [] }
     if (method === 'config.get') return queue.shift() ?? configs[configs.length - 1] ?? {}
     if (method === 'config.patch.safe') return { restartRequired: false }
+    if (method === 'models.routing.set') return {}
     throw new Error(`Unexpected RPC method: ${method}`)
   })
 }
@@ -1140,7 +1141,7 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
-  it('marks Model Strategy dirty when selecting the single-model strategy', async () => {
+  it('persists the global new-chat default when selecting the single-model strategy', async () => {
     mockConfigSequence([
       {
         llm: { provider: 'openrouter', model: 'openrouter/auto' },
@@ -1150,11 +1151,175 @@ describe('useSetupCatalog model strategy IA', () => {
     ])
     const { api, app } = await mountCatalog()
 
-    api.setModelStrategy('single')
+    await api.setModelStrategy('single')
 
     expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'direct' })
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    app.unmount()
+  })
+
+  it('rebases a fresh Ensemble activation without losing existing detail drafts', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') {
+        return {
+          mode: 'ensemble',
+          selection_mode: 'static_tokenrhythm_b5',
+          activation_preview: {
+            selection_mode: 'static_tokenrhythm_b5',
+            candidates: [],
+          },
+        }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.setEnsembleMinSuccessful(2)
+
+    await api.setModelStrategy('ensemble')
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
+    expect(api.modelStrategyPanel.value.ensemble.selectionMode).toBe('static_tokenrhythm_b5')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual([])
+    expect(api.modelStrategyPanel.value.ensemble.minSuccessfulProposers).toBe(2)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
-    expect(api.dirtySections.value.map(s => s.id)).toContain('modelStrategy')
+
+    api.setEnsembleMinSuccessful(1)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    app.unmount()
+  })
+
+  it('rolls back a failed fresh Ensemble activation without synthetic lineup dirtiness', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') throw new Error('routing write failed')
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.setEnsembleMinSuccessful(2)
+
+    await api.setModelStrategy('ensemble')
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+    expect(api.modelStrategyPanel.value.ensemble.selectionMode).toBe('custom_b5')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual([])
+    expect(api.modelStrategyPanel.value.ensemble.minSuccessfulProposers).toBe(2)
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+
+    api.setEnsembleMinSuccessful(1)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('routing write failed'),
+      { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('preserves Ensemble lineup edits made while the mode write is pending', async () => {
+    let resolveRouting!: (value: Record<string, unknown>) => void
+    const routingRequest = new Promise<Record<string, unknown>>(resolve => {
+      resolveRouting = resolve
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') return routingRequest
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    const mutation = api.setModelStrategy('ensemble')
+    await vi.waitFor(() => {
+      expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
+    })
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    resolveRouting({
+      mode: 'ensemble',
+      selection_mode: 'custom_b5',
+      activation_preview: {
+        candidates: [
+          { provider: 'openrouter', model: 'server/preview', role: 'primary' },
+        ],
+      },
+    })
+    await mutation
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
+    ]))
+    expect(api.modelStrategyPanel.value.ensemble.candidates).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'server/preview' }),
+    ]))
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    app.unmount()
+  })
+
+  it('preserves Ensemble lineup edits when a pending mode write fails', async () => {
+    let rejectRouting!: (error: Error) => void
+    const routingRequest = new Promise<Record<string, unknown>>((_resolve, reject) => {
+      rejectRouting = reject
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') return routingRequest
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    const mutation = api.setModelStrategy('ensemble')
+    await vi.waitFor(() => {
+      expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
+    })
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    rejectRouting(new Error('routing write failed'))
+    await mutation
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
+    ]))
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('routing write failed'),
+      { tone: 'danger' },
+    )
     app.unmount()
   })
 
@@ -1306,13 +1471,10 @@ describe('useSetupCatalog model strategy IA', () => {
     ])
     const { api, app } = await mountCatalog()
 
-    api.setModelStrategy('single')
-    expect(api.sectionDirty('modelStrategy')).toBe(true)
-
-    await api.discardChanges()
+    await api.setModelStrategy('single')
     expect(api.sectionDirty('modelStrategy')).toBe(false)
 
-    api.setEnsembleEnabled(false)
+    api.setEnsembleEnabled(true)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     expect(api.dirtySections.value.map(s => s.id)).toContain('modelStrategy')
     app.unmount()
@@ -1340,17 +1502,19 @@ describe('useSetupCatalog model strategy IA', () => {
         ensembleSaved = true
         return {}
       }
+      if (method === 'models.routing.set') return {}
       if (method === 'config.patch.safe') return { restartRequired: false }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
     const { api, app } = await mountCatalog()
 
-    api.setModelStrategy('single')
-    api.setEnsembleEnabled(true)
+    await api.setModelStrategy('single')
+    api.setRouterDefaultTier('c2')
+    api.setEnsembleMinSuccessful(2)
     await api.saveDirtySections()
 
     expect(rpcCall).toHaveBeenCalledWith('onboarding.router.configure', expect.any(Object))
-    expect(rpcCall).toHaveBeenCalledWith('onboarding.ensemble.configure', { enabled: true })
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.ensemble.configure', { minSuccessfulProposers: 2 })
     app.unmount()
   })
 

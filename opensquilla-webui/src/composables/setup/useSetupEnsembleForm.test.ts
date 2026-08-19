@@ -94,6 +94,42 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
+  it('does not overwrite lineup edits made while a routing mode write is pending', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(SAVED)
+    const state = f.captureRoutingModeState()
+
+    f.setEnabled(true)
+    f.addCandidate('openrouter', 'openai/gpt-5.5', 'proposer')
+    f.acceptRoutingModeChange(state, {
+      mode: 'ensemble',
+      selection_mode: CUSTOM_B5_SELECTION_MODE,
+      activation_preview: {
+        candidates: [
+          { provider: 'openrouter', model: 'server/preview', role: 'primary' },
+        ],
+      },
+    })
+
+    expect(f.candidates.value.some(candidate => candidate.model === 'openai/gpt-5.5')).toBe(true)
+    expect(f.candidates.value.some(candidate => candidate.model === 'server/preview')).toBe(false)
+    expect(f.isDirty.value).toBe(true)
+  })
+
+  it('does not roll back lineup edits made while a routing mode write is pending', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(SAVED)
+    const state = f.captureRoutingModeState()
+
+    f.setEnabled(true)
+    f.addCandidate('openrouter', 'openai/gpt-5.5', 'proposer')
+    f.restoreRoutingModeState(state)
+
+    expect(f.enabled.value).toBe(false)
+    expect(f.candidates.value.some(candidate => candidate.model === 'openai/gpt-5.5')).toBe(true)
+    expect(f.isDirty.value).toBe(true)
+  })
+
   it('falls back to the shipped defaults for an empty or invalid config slice', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ selection_mode: 'bogus', all_failed_policy: 'bogus', min_successful_proposers: -3 })

@@ -6,6 +6,9 @@ from typing import Any
 import pytest
 
 from opensquilla.gateway import boot
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.model_routing import capture_model_routing_config
+from opensquilla.gateway.session_model_routing import accepted_model_routing_audit
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -417,6 +420,17 @@ async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
         persisted_user_message_ids=[message_id],
         update_envelope_cache=False,
     )
+    gateway_config = GatewayConfig(workspace_dir=str(tmp_path / "workspace"))
+    accepted_routing = capture_model_routing_config(
+        gateway_config,
+        session_mode="router",
+        session_routing_revision=12,
+        session_routing_source="session",
+    )
+    assert reservation.task_record.details is not None
+    reservation.task_record.details["accepted_model_routing"] = (
+        accepted_model_routing_audit(accepted_routing, run_kind="web_turn")
+    )
     claimed = await first.promote_stranded_steer_inputs(
         target_task_id=old_task_id,
         message_ids=[message_id],
@@ -429,19 +443,38 @@ async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
 
     second = SessionStorage(str(db_path))
     await second.connect()
-    runs: list[str] = []
+    runs: list[tuple[str, Any]] = []
 
     async def _handler(run: Any) -> None:
-        runs.append(run.message)
+        runs.append((run.message, run.accepted_config))
 
-    runtime = TaskRuntime(storage=second, turn_handler=_handler)
+    def _current_routing_provider(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == "agent:main:webchat:steer-double-restart"
+        assert run_kind == "recovery_model_routing_base"
+        return capture_model_routing_config(
+            gateway_config,
+            session_mode="direct",
+            session_routing_revision=13,
+            session_routing_source="session",
+        )
+
+    runtime = TaskRuntime(
+        storage=second,
+        turn_handler=_handler,
+        accepted_config_provider=_current_routing_provider,
+    )
     recovery = await runtime.recover_stranded_steers()
     assert recovery["promoted"] == 0
     assert recovery["resumed"] == 1
     assert recovery["task_ids"] == [promoted_task_id]
     record = await runtime.wait(promoted_task_id, timeout=2)
     assert record.status == AgentTaskStatus.SUCCEEDED
-    assert runs == ["recover this only once"]
+    assert len(runs) == 1
+    recovered_message, recovered_routing = runs[0]
+    assert recovered_message == "recover this only once"
+    assert recovered_routing.session_mode == "router"
+    assert recovered_routing.session_routing_revision == 12
+    assert recovered_routing.session_routing_source == "session"
     tasks = await second.list_agent_tasks(session_key=session_key)
     assert {task.task_id for task in tasks} == {old_task_id, promoted_task_id}
     await second.close()

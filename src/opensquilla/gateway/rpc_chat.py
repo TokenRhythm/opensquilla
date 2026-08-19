@@ -170,6 +170,24 @@ def _requested_initial_collaboration_mode(params: dict[str, Any]) -> str | None:
     return mode
 
 
+def _requested_initial_routing_mode(params: dict[str, Any]) -> str | None:
+    """Read the first-turn-only durable model-routing selection."""
+
+    mode = params.get("initialRoutingMode")
+    snake_mode = params.get("initial_routing_mode")
+    if mode is not None and snake_mode is not None and mode != snake_mode:
+        raise ValueError("initialRoutingMode and initial_routing_mode must match")
+    if mode is None:
+        mode = snake_mode
+    if mode is None:
+        return None
+    if not isinstance(mode, str) or mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("initialRoutingMode must be direct, router, or ensemble")
+    if params.get("intent") != "new_chat":
+        raise ValueError("initialRoutingMode requires explicit new_chat intent")
+    return mode
+
+
 def _require_chat_session_manager(ctx: RpcContext):
     if ctx.session_manager is None:
         raise RpcUnavailableError("Chat session manager not available")
@@ -282,30 +300,28 @@ async def _chat_history_turn_outcomes(
         )
         return outcomes
 
-    missing_turn_ids = turn_ids - outcomes_by_turn.keys()
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
     get_task = getattr(storage, "get_agent_task", None)
     list_tasks = getattr(storage, "list_agent_tasks", None)
     rows: list[Any] = []
-    if missing_turn_ids:
-        try:
-            if callable(exact_tasks):
-                rows = await exact_tasks(sorted(missing_turn_ids))
-            elif callable(get_task):
-                rows = [
-                    row
-                    for turn_id in sorted(missing_turn_ids)
-                    if (row := await get_task(turn_id)) is not None
-                ]
-            elif callable(list_tasks):
-                rows = await list_tasks(session_key=session_key)
-        except Exception:  # noqa: BLE001 - history remains readable without outcomes.
-            log.warning(
-                "chat.history.turn_outcomes_failed",
-                session_key=session_key,
-                exc_info=True,
-            )
+    try:
+        if callable(exact_tasks):
+            rows = await exact_tasks(sorted(turn_ids))
+        elif callable(get_task):
+            rows = [
+                row
+                for turn_id in sorted(turn_ids)
+                if (row := await get_task(turn_id)) is not None
+            ]
+        elif callable(list_tasks):
+            rows = await list_tasks(session_key=session_key)
+    except Exception:  # noqa: BLE001 - history remains readable without outcomes.
+        log.warning(
+            "chat.history.turn_outcomes_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
 
     attempts: tuple[MutationAttempt, ...] = ()
     if storage is not None and callable(getattr(storage, "_write_transaction", None)):
@@ -370,32 +386,49 @@ async def _chat_history_turn_outcomes(
         details = getattr(row, "details", None)
         details = details if isinstance(details, dict) else {}
         turn_id = details.get("turn_id") or task_id
-        if not isinstance(turn_id, str) or turn_id not in missing_turn_ids:
+        if not isinstance(turn_id, str) or turn_id not in turn_ids:
             continue
         attempt = attempts_by_turn_id.pop(turn_id, None)
         status = getattr(row, "status", None)
         status = str(getattr(status, "value", status) or "")
+        projected = outcomes_by_turn.get(turn_id)
         outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
-        if outcome is None:
-            if attempt is None:
-                continue
-            outcome = {
-                "kind": "unknown",
-                "reason": "mutation_ledger_with_nonterminal_task",
+        if projected is None:
+            if outcome is None:
+                if attempt is None:
+                    continue
+                outcome = {
+                    "kind": "unknown",
+                    "reason": "mutation_ledger_with_nonterminal_task",
+                }
+            if attempt is not None:
+                outcome = with_ledger_facts(attempt, outcome)
+            projected = {
+                "turn_id": turn_id,
+                "task_id": task_id,
+                "status": status,
+                "started_at": getattr(row, "started_at", None),
+                "finished_at": getattr(row, "finished_at", None),
+                "outcome": outcome,
             }
-        if attempt is not None:
-            outcome = with_ledger_facts(attempt, outcome)
-        outcomes_by_turn[turn_id] = {
-            "turn_id": turn_id,
-            "task_id": task_id,
-            "status": status,
-            "started_at": getattr(row, "started_at", None),
-            "finished_at": getattr(row, "finished_at", None),
-            "outcome": outcome,
-        }
+            outcomes_by_turn[turn_id] = projected
+        elif attempt is not None:
+            existing_outcome = projected.get("outcome")
+            projected["outcome"] = with_ledger_facts(
+                attempt,
+                existing_outcome if isinstance(existing_outcome, dict) else {},
+            )
+        accepted_routing = details.get("accepted_model_routing")
+        if isinstance(accepted_routing, dict):
+            accepted_mode = str(accepted_routing.get("effective_mode") or "").strip().lower()
+            if accepted_mode in {"direct", "router", "ensemble"}:
+                projected["accepted_routing_mode"] = accepted_mode
         error_class = getattr(row, "error_class", None)
         if is_usage_accounting_barrier(error_class):
-            projected = outcomes_by_turn[turn_id]
+            if outcome is None:
+                outcome = terminal_turn_outcome(status, projected.get("outcome"))
+            if outcome is None:
+                continue
             replay_proof = usage_barrier_replay_proof(
                 usage_call_index=details.get("usage_call_index"),
                 no_prior_provider_dispatch=details.get(
@@ -1041,6 +1074,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
     initial_collaboration_mode = _requested_initial_collaboration_mode(params)
+    initial_routing_mode = _requested_initial_routing_mode(params)
     prompt_annotation_ids = params.get(
         "promptAnnotationIds",
         params.get("prompt_annotation_ids"),
@@ -1063,8 +1097,10 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     if ctx.session_manager is None:
         if prompt_annotation_ids or document_context is not None:
             raise RpcUnavailableError("Artifact context requires durable session storage")
-        if initial_collaboration_mode is not None:
-            raise RpcUnavailableError("Initial collaboration mode requires atomic turn acceptance")
+        if initial_collaboration_mode is not None or initial_routing_mode is not None:
+            raise RpcUnavailableError(
+                "Initial session controls require atomic turn acceptance"
+            )
         return {"ok": True, "sessionKey": session_key, "instant_accept": True}
 
     mgr = _require_chat_session_manager(ctx)
@@ -1144,6 +1180,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("prompt_annotation_ids", "promptAnnotationIds"),
             ("documentContext", "documentContext"),
             ("document_context", "documentContext"),
+            ("initialRoutingMode", "initialRoutingMode"),
+            ("initial_routing_mode", "initial_routing_mode"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]
@@ -1180,6 +1218,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             # Both public spellings represent the same logical request. Keep
             # one canonical field in the durable idempotency fingerprint.
             fingerprint_params["initialCollaborationMode"] = initial_collaboration_mode
+        if initial_routing_mode is not None:
+            fingerprint_params["initialRoutingMode"] = initial_routing_mode
         if prompt_annotation_ids is not None:
             send_params["promptAnnotationIds"] = prompt_annotation_ids
             fingerprint_params["promptAnnotationIds"] = prompt_annotation_ids
@@ -1188,6 +1228,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ctx,
             fingerprint_params=fingerprint_params,
             initial_collaboration_mode=initial_collaboration_mode,
+            initial_routing_mode=initial_routing_mode,
         )
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}

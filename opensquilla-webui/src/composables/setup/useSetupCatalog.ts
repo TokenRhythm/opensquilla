@@ -34,7 +34,10 @@ import {
   STATIC_B5_PROFILES,
   staticB5ModeForProvider,
 } from '@/types/generated/router_tier_contract'
-import { useSetupModelStrategyForm } from '@/composables/setup/useSetupModelStrategyForm'
+import {
+  useSetupModelStrategyForm,
+  type ModelStrategy,
+} from '@/composables/setup/useSetupModelStrategyForm'
 import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
@@ -465,6 +468,7 @@ const disableNetworkObservability = ref(false)
 const capabilityResetPending = ref<CapabilityId | ''>('')
 const saveAllPending = ref(false)
 const providerSavePending = ref(false)
+const modelStrategyRoutingBusy = ref(false)
 // The reactive flag drives UI feedback; this synchronous guard closes the
 // same-microtask double-click window before the first save RPC can yield.
 let saveAllRequestPending = false
@@ -2338,7 +2342,7 @@ const dirtySections = computed(() => SETTINGS_SECTIONS.filter(s => sectionDirty(
 const hasUnsavedChanges = computed(() => dirtySections.value.length > 0)
 
 async function saveDirtySections() {
-  if (saveAllRequestPending) return
+  if (saveAllRequestPending || modelStrategyRoutingBusy.value) return
   saveAllRequestPending = true
   saveAllPending.value = true
   try {
@@ -2402,7 +2406,7 @@ async function saveDirtySections() {
 }
 
 async function discardChanges() {
-  if (saveAllRequestPending) return
+  if (saveAllRequestPending || modelStrategyRoutingBusy.value) return
   if (providerInteractionLocked()) return
   await loadData()
 }
@@ -3020,6 +3024,55 @@ function envRecoveryCommand(section: string): string {
 
 function setRouterMode(value: string) {
   routerForm.setRouterMode(value)
+}
+
+function routingModeForStrategy(strategy: ModelStrategy): 'direct' | 'router' | 'ensemble' {
+  if (strategy === 'router') return 'router'
+  if (strategy === 'ensemble') return 'ensemble'
+  return 'direct'
+}
+
+async function setModelStrategy(strategy: ModelStrategy) {
+  if (modelStrategyRoutingBusy.value || strategy === modelStrategyForm.activeStrategy.value) return
+  const routerRoutingState = routerForm.captureRoutingModeState()
+  const ensembleRoutingState = ensembleForm.captureRoutingModeState()
+
+  // Keep the panel responsive while the mode transition is in flight. The
+  // dedicated routing RPC is authoritative for this global, new-session
+  // default; detailed tier and ensemble drafts still use their existing save
+  // endpoints below.
+  modelStrategyForm.setStrategy(strategy)
+  // Activation may provision a useful local preview. The Gateway owns the
+  // actual first-use lineup, so retain the pre-switch detail draft until its
+  // response identifies what was persisted.
+  ensembleForm.restoreRoutingModeDetails(ensembleRoutingState)
+  routerForm.setEnsembleContext(
+    ensembleForm.selectionMode.value,
+    ensembleForm.enabled.value,
+  )
+  modelStrategyRoutingBusy.value = true
+  try {
+    await rpc.waitForConnection()
+    const response = await rpc.call('models.routing.set', {
+      mode: routingModeForStrategy(strategy),
+    })
+    ensembleForm.acceptRoutingModeChange(ensembleRoutingState, response)
+    routerForm.setEnsembleContext(
+      ensembleForm.selectionMode.value,
+      ensembleForm.enabled.value,
+    )
+    routerForm.acceptRoutingModeChange()
+  } catch (err) {
+    ensembleForm.restoreRoutingModeState(ensembleRoutingState)
+    routerForm.restoreRoutingModeState(routerRoutingState)
+    routerForm.setEnsembleContext(
+      ensembleForm.selectionMode.value,
+      ensembleForm.enabled.value,
+    )
+    pushToast(saveFailedMessage(err), { tone: 'danger' })
+  } finally {
+    modelStrategyRoutingBusy.value = false
+  }
 }
 
 function setRouterDefaultTier(value: string) {
@@ -3972,6 +4025,7 @@ async function copyConfigPath() {
     hasUnsavedChanges,
     saveAllPending,
     providerSavePending,
+    modelStrategyRoutingBusy,
     saveDirtySections,
     discardChanges,
     selectProvider,
@@ -3984,7 +4038,7 @@ async function copyConfigPath() {
     setNetworkReportingEnabled,
     setMemoryAutoCapture,
     setProviderImageGenerationOptIn,
-    setModelStrategy: modelStrategyForm.setStrategy,
+    setModelStrategy,
     setFixedProvider,
     setFixedModel,
     setRouterMode,

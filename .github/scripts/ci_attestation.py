@@ -11,6 +11,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -22,6 +24,9 @@ SCHEMA_VERSION: Final = 1
 VALIDATION_PROFILE: Final = "precise-v1"
 WORKFLOW_PATH: Final = ".github/workflows/ci.yml"
 MAX_ATTESTATION_ARCHIVE_BYTES: Final = 64 * 1024
+MAX_ARTIFACT_PAGES: Final = 3
+ARTIFACTS_PER_PAGE: Final = 100
+ARTIFACT_VISIBILITY_DELAYS: Final = (0, 10, 30)
 SHA_RE: Final = re.compile(r"^[0-9a-f]{40}$")
 POLICY_PREFIXES: Final = (
     ".github/scripts/",
@@ -252,6 +257,70 @@ def _artifact_attestation(archive: bytes) -> Mapping[str, Any]:
     return value
 
 
+def _reason_code(reason: str, *, api_error: bool = False) -> str:
+    lowered = reason.lower()
+    if api_error:
+        return "api_error"
+    if "candidate limit" in lowered:
+        return "candidate_limit"
+    if "no pr ci attestation" in lowered or "expired" in lowered:
+        return "artifact_unavailable"
+    if "associated with the attested pull request" in lowered:
+        return "pr_association_invalid"
+    if "workflow run" in lowered:
+        return "source_run_invalid"
+    if "base_sha" in lowered or "base does not match" in lowered:
+        return "base_mismatch"
+    if "tree" in lowered:
+        return "tree_mismatch"
+    if "policy" in lowered:
+        return "policy_mismatch"
+    if "not in the queue commit" in lowered:
+        return "head_not_ancestor"
+    if "queue" in lowered or "merge_group" in lowered or "checkout" in lowered:
+        return "invalid_context"
+    return "artifact_invalid"
+
+
+def _list_attestation_artifacts(
+    *, api_url: str, repository: str, encoded_name: str, token: str
+) -> list[Mapping[str, Any]]:
+    """List a bounded artifact set, retrying only temporary visibility misses."""
+
+    previous_delay = 0
+    for scheduled_delay in ARTIFACT_VISIBILITY_DELAYS:
+        if scheduled_delay:
+            time.sleep(scheduled_delay - previous_delay)
+        previous_delay = scheduled_delay
+        candidates: list[Mapping[str, Any]] = []
+        try:
+            for page in range(1, MAX_ARTIFACT_PAGES + 1):
+                listing = _request_json(
+                    f"{api_url}/repos/{repository}/actions/artifacts"
+                    f"?name={encoded_name}&per_page={ARTIFACTS_PER_PAGE}&page={page}",
+                    token,
+                )
+                total_count = listing.get("total_count")
+                if isinstance(total_count, int) and total_count > (
+                    MAX_ARTIFACT_PAGES * ARTIFACTS_PER_PAGE
+                ):
+                    raise AttestationError("artifact candidate limit exceeded")
+                page_items = listing.get("artifacts")
+                if not isinstance(page_items, list):
+                    raise AttestationError("artifact listing is invalid")
+                candidates.extend(item for item in page_items if isinstance(item, dict))
+                if len(page_items) < ARTIFACTS_PER_PAGE:
+                    break
+            if len(candidates) > MAX_ARTIFACT_PAGES * ARTIFACTS_PER_PAGE:
+                raise AttestationError("artifact candidate limit exceeded")
+            if candidates:
+                return candidates
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+    raise AttestationError("no PR CI attestation exists for the queue tree")
+
+
 def validate_candidate(
     *,
     attestation: Mapping[str, Any],
@@ -288,7 +357,9 @@ def validate_candidate(
     if not isinstance(pr_number, int) or pr_number <= 0:
         raise AttestationError("attestation pull_request_number is invalid")
     head_sha = _require_sha(attestation.get("head_sha"), "attested head SHA")
-    _require_sha(attestation.get("tested_merge_sha"), "attested merge SHA")
+    tested_merge_sha = _require_sha(
+        attestation.get("tested_merge_sha"), "attested merge SHA"
+    )
 
     run_repository = run.get("repository")
     run_repository_name = (
@@ -300,12 +371,13 @@ def validate_candidate(
         "event": "pull_request",
         "status": "completed",
         "conclusion": "success",
-        "head_sha": head_sha,
         "path": WORKFLOW_PATH,
     }
     for key, expected_value in authoritative.items():
         if run.get(key) != expected_value:
             raise AttestationError(f"workflow run {key} is not authoritative")
+    if run.get("head_sha") not in {head_sha, tested_merge_sha}:
+        raise AttestationError("workflow run head_sha is not authoritative")
     if run_repository_name != repository:
         raise AttestationError("workflow run belongs to another repository")
 
@@ -323,7 +395,6 @@ def validate_candidate(
             and isinstance(item_base, dict)
             and item_head.get("sha") == head_sha
             and item_base.get("ref") == "main"
-            and item_base.get("sha") == queue_base_sha
         ):
             matching_pr = True
             break
@@ -341,33 +412,40 @@ def verify_queue(
     token: str,
     api_url: str,
     current_run_id: int,
+    details: dict[str, object] | None = None,
 ) -> tuple[bool, str, int | None]:
+    details = details if details is not None else {}
+    details.update(candidate_count=0, artifact_name="")
     merge_group = event.get("merge_group")
     if not isinstance(merge_group, dict):
+        details["reason_code"] = "invalid_context"
         return False, "not a merge_group event", None
     try:
         queue_head_sha = _require_sha(merge_group.get("head_sha"), "queue head SHA")
         queue_base_sha = _require_sha(merge_group.get("base_sha"), "queue base SHA")
+        details.update(queue_head_sha=queue_head_sha, queue_base_sha=queue_base_sha)
         checked_out_sha = _require_sha(_git("rev-parse", "HEAD", cwd=repo), "checkout SHA")
         if checked_out_sha != queue_head_sha:
             raise AttestationError("checked out commit is not the merge-group head")
         queue_tree_sha = _require_sha(
             _git("rev-parse", "HEAD^{tree}", cwd=repo), "queue tree SHA"
         )
+        details["queue_tree_sha"] = queue_tree_sha
         queue_policy = policy_digest(repo)
         base_policy = policy_digest(repo, queue_base_sha)
         if queue_policy != base_policy:
             raise AttestationError("CI policy changed relative to the queue base")
 
         name = f"ci-attestation-{queue_tree_sha}"
+        details["artifact_name"] = name
         encoded_name = urllib.parse.quote(name, safe="")
-        listing = _request_json(
-            f"{api_url}/repos/{repository}/actions/artifacts?name={encoded_name}&per_page=100",
-            token,
+        artifacts = _list_attestation_artifacts(
+            api_url=api_url,
+            repository=repository,
+            encoded_name=encoded_name,
+            token=token,
         )
-        artifacts = listing.get("artifacts")
-        if not isinstance(artifacts, list) or not artifacts:
-            raise AttestationError("no PR CI attestation exists for the queue tree")
+        details["candidate_count"] = len(artifacts)
 
         reasons: list[str] = []
         for artifact in sorted(
@@ -417,13 +495,16 @@ def verify_queue(
                     queue_policy_digest=queue_policy,
                     pull_request_head_is_ancestor=head_is_ancestor,
                 )
+                details["reason_code"] = "reusable_exact"
                 return True, "matching trusted PR CI attestation", run_id
             except (AttestationError, OSError, ValueError, zipfile.BadZipFile) as exc:
                 reasons.append(str(exc))
         detail = "; ".join(reasons[:3]) or "no usable attestation artifacts"
         raise AttestationError(detail)
     except (AttestationError, OSError, subprocess.CalledProcessError, ValueError) as exc:
-        return False, str(exc), None
+        reason = str(exc)
+        details["reason_code"] = _reason_code(reason, api_error=isinstance(exc, OSError))
+        return False, reason, None
 
 
 def _create_command(args: argparse.Namespace) -> int:
@@ -456,6 +537,7 @@ def _verify_queue_command(args: argparse.Namespace) -> int:
     if not token:
         print("GH_TOKEN is required", file=sys.stderr)
         return 2
+    details: dict[str, object] = {}
     reusable, reason, source_run_id = verify_queue(
         repo=Path(args.repo).resolve(),
         repository=args.repository,
@@ -463,13 +545,20 @@ def _verify_queue_command(args: argparse.Namespace) -> int:
         token=token,
         api_url=args.api_url.rstrip("/"),
         current_run_id=args.run_id,
+        details=details,
     )
     _write_outputs(
         Path(args.github_output) if args.github_output else None,
         {
             "reusable": str(reusable).lower(),
             "reason": reason,
+            "reason_code": details.get("reason_code", "artifact_invalid"),
             "source_run_id": source_run_id or "",
+            "candidate_count": details.get("candidate_count", 0),
+            "artifact_name": details.get("artifact_name", ""),
+            "queue_base_sha": details.get("queue_base_sha", ""),
+            "queue_head_sha": details.get("queue_head_sha", ""),
+            "queue_tree_sha": details.get("queue_tree_sha", ""),
         },
     )
     print(f"reusable={str(reusable).lower()} reason={reason}")

@@ -155,6 +155,7 @@
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
+              :routing-mode-busy="modelStrategyRoutingBusy"
               @update-strategy="setModelStrategy"
               @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
@@ -290,6 +291,7 @@ const {
   hasUnsavedChanges,
   saveAllPending,
   providerSavePending,
+  modelStrategyRoutingBusy,
   saveDirtySections,
   discardChanges,
   selectProvider,
@@ -427,7 +429,10 @@ const hasSettingsExitDraft = computed(() => (
   hasUnsavedChanges.value || providerDraftDirty.value
 ))
 const hasPendingSettingsWrite = computed(() => (
-  saveAllPending.value || providerSavePending.value || closeSavePending.value
+  saveAllPending.value
+  || providerSavePending.value
+  || modelStrategyRoutingBusy.value
+  || closeSavePending.value
 ))
 const settingsInteractionLocked = computed(() => (
   saveAllPending.value || closeSavePending.value

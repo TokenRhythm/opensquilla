@@ -73,6 +73,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     pendingAttachments: ref([]),
     pendingSessionIntent: ref(null),
     initialCollaborationMode: ref('default'),
+    initialRoutingMode: ref(null),
     pendingForkBeforeMessageId: ref(null),
     promptAnnotationIds: ref(['annotation-2', 'annotation-1']),
     promptAnnotationSnapshots: ids => ids.map((id, index) => snapshot(id, index)),

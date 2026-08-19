@@ -175,6 +175,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     pendingAttachments: ref<Attachment[]>([]),
     pendingSessionIntent: ref(null),
     initialCollaborationMode: ref<CollaborationMode>('default'),
+    initialRoutingMode: ref<'direct'>('direct'),
     pendingForkBeforeMessageId: ref(null),
     aborted: ref(false),
     activeStreamTaskId: ref(''),
@@ -1395,7 +1396,10 @@ describe('useChatSend attachment payloads', () => {
 
   it('materializes a provisional draft when its recovered hidden turn is accepted', async () => {
     const pendingSessionIntent = ref<string | null>('new_chat')
-    const { api, rpc } = makeOptions({ pendingSessionIntent })
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent,
+      initialRoutingMode: ref<'ensemble'>('ensemble'),
+    })
 
     await api.dispatchHiddenSend(
       '/meta meta-paper-write -- recovered after reopen',
@@ -1406,6 +1410,7 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       clientRequestId: 'recovered-provisional-request',
       intent: 'new_chat',
+      initialRoutingMode: 'ensemble',
     }))
     expect(pendingSessionIntent.value).toBeNull()
   })
@@ -1841,6 +1846,15 @@ describe('useChatSend attachment payloads', () => {
     expect(options.enqueuePendingInput).toHaveBeenCalledWith('hello', undefined)
   })
 
+  it('keeps the accepted same-turn steer after the next-turn mode becomes Ensemble', () => {
+    const { api } = makeOptions({
+      ...sameTurnSteerOptions(),
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+    })
+
+    expect(api.supportsSameTurnSteer()).toBe(true)
+  })
+
   it.each([
     {
       name: 'an old gateway',
@@ -2019,6 +2033,18 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).not.toHaveBeenCalled()
     expect(options.inputText.value).toBe('hello')
     expect(options.pendingAttachments.value).toEqual([attachment])
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('preserves an ordinary text draft while session routing is updating', async () => {
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: ref('Model routing is being updated. Wait before sending.'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
     expect(options.messages.value).toEqual([])
   })
 
@@ -4046,6 +4072,7 @@ describe('useChatSend attachment payloads', () => {
     expect(firstParams).toMatchObject({
       collaborationMode: 'plan',
       intent: 'new_chat',
+      initialRoutingMode: 'direct',
     })
     expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
     expect(secondParams).not.toHaveProperty('collaborationMode')
@@ -4081,6 +4108,7 @@ describe('useChatSend attachment payloads', () => {
     expect(secondParams).toMatchObject({
       collaborationMode: 'plan',
       intent: 'new_chat',
+      initialRoutingMode: 'direct',
     })
   })
 
@@ -6978,7 +7006,7 @@ describe('useChatSend Ensemble image guard', () => {
     })
   })
 
-  it('sends the draft Plan mode atomically with intent=new_chat', async () => {
+  it('sends draft Plan and routing modes atomically with intent=new_chat', async () => {
     const { api, rpc } = makeOptions({
       pendingSessionIntent: ref('new_chat'),
       initialCollaborationMode: ref<CollaborationMode>('plan'),
@@ -6989,10 +7017,11 @@ describe('useChatSend Ensemble image guard', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       intent: 'new_chat',
       collaborationMode: 'plan',
+      initialRoutingMode: 'direct',
     }))
   })
 
-  it('keeps the default draft compatible with gateways that predate initial modes', async () => {
+  it('sends direct routing atomically for a default new chat', async () => {
     const { api, rpc } = makeOptions({
       pendingSessionIntent: ref('new_chat'),
       initialCollaborationMode: ref<CollaborationMode>('default'),
@@ -7001,7 +7030,10 @@ describe('useChatSend Ensemble image guard', () => {
     await api.onSend()
 
     const params = rpc.call.mock.calls[0]?.[1]
-    expect(params).toEqual(expect.objectContaining({ intent: 'new_chat' }))
+    expect(params).toEqual(expect.objectContaining({
+      intent: 'new_chat',
+      initialRoutingMode: 'direct',
+    }))
     expect(params).not.toHaveProperty('collaborationMode')
   })
 
@@ -7068,6 +7100,21 @@ describe('useChatSend Ensemble image guard', () => {
 
     const params = rpc.call.mock.calls[0]?.[1]
     expect(params).not.toHaveProperty('collaborationMode')
+    expect(params).not.toHaveProperty('initialRoutingMode')
+  })
+
+  it('captures the selected draft routing mode on the first send', async () => {
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent: ref('new_chat'),
+      initialRoutingMode: ref<'ensemble'>('ensemble'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      intent: 'new_chat',
+      initialRoutingMode: 'ensemble',
+    }))
   })
 })
 

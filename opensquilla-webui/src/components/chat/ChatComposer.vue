@@ -239,16 +239,21 @@
               <span>{{ t('chat.codingMode.activeLabel') }}</span>
               <Icon name="x" :size="12" aria-hidden="true" />
             </button>
-            <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
+            <div
+              v-if="sessionRoutingAvailable"
+              ref="modelRoutingAnchorEl"
+              class="chat-settings-anchor"
+            >
               <button
                 class="btn btn--icon btn--ghost chat-model-routing-btn"
                 :class="[
-                  `chat-model-routing-btn--${modelRoutingMode}`,
-                  { 'is-active': modelRoutingOpen || modelRoutingMode !== 'off' },
+                  `chat-model-routing-btn--${sessionRoutingMode}`,
+                  { 'is-active': modelRoutingOpen || sessionRoutingMode !== 'off' },
                 ]"
-                :title="t('chat.composer.modelRouting')"
-                :aria-label="t('chat.composer.modelRouting')"
+                :title="t('chat.composer.sessionModelRouting')"
+                :aria-label="t('chat.composer.sessionModelRouting')"
                 :aria-expanded="modelRoutingOpen ? 'true' : 'false'"
+                :aria-disabled="sessionRoutingControlBlocked ? 'true' : 'false'"
                 @click="toggleModelRouting"
               >
                 <Icon name="router" :size="17" />
@@ -260,10 +265,10 @@
               </button>
               <ChatComposerModelRouting
                 v-if="modelRoutingOpen"
-                :model-routing-mode="modelRoutingMode"
-                :busy="modelRoutingSettingsBusy"
+                :model-routing-mode="sessionRoutingMode"
+                :busy="sessionRoutingBusy || sessionRoutingControlBlocked"
                 @close="modelRoutingOpen = false"
-                @set-model-routing-mode="emit('setModelRoutingMode', $event)"
+                @set-session-routing-mode="emit('setSessionRoutingMode', $event)"
               />
             </div>
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
@@ -401,10 +406,12 @@
                 key="send"
                 class="btn btn--icon btn--primary chat-send-btn"
                 :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
-                :title="sendBlockedMessage || sendButtonTitle"
+                :title="sendBlockedMessage
+                  || (sessionRoutingBusy ? t('chat.composer.routingUpdateBlocked') : sendButtonTitle)"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                 :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-                :disabled="Boolean(sendBlockedMessage) || inputDisabled"
+                :aria-busy="sessionRoutingBusy ? 'true' : 'false'"
+                :disabled="Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
               >
                 <Icon name="arrowUp" :size="17" />
@@ -485,8 +492,10 @@ const props = withDefaults(defineProps<{
   safeSetupAvailable?: boolean
   runModeLocked: boolean
   runModeLockMessage: string
-  modelRoutingMode: ModelRoutingMode
-  modelRoutingSettingsBusy: boolean
+  sessionRoutingMode: ModelRoutingMode
+  sessionRoutingBusy: boolean
+  sessionRoutingControlBlocked?: boolean
+  sessionRoutingAvailable?: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
   addMenuAvoidElement?: HTMLElement | null
@@ -521,6 +530,8 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  sessionRoutingAvailable: true,
+  sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
   inputDisabled: false,
   safeSetupAvailable: false,
@@ -539,7 +550,7 @@ const emit = defineEmits<{
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
-  setModelRoutingMode: [mode: ModelRoutingMode]
+  setSessionRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
@@ -1858,6 +1869,13 @@ defineExpose<ChatComposerExpose>({
 .chat-send-btn.btn--primary.is-ready:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
+}
+
+/* A routing CAS is usually shorter than a visual transition. Keep the send
+   button stable while native disabled semantics prevent submission. */
+.chat-send-btn[aria-busy='true']:disabled {
+  cursor: progress;
+  opacity: 1;
 }
 
 @keyframes spin {
