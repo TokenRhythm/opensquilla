@@ -129,7 +129,7 @@ async def cancel_task[T](
                 return True
             park_background_task(task, operation=operation)
             raise
-        except BaseException as exc:
+        except Exception as exc:
             log.debug(
                 "cancellation.task_settled_with_error",
                 operation=operation,
