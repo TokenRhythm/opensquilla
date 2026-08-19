@@ -1618,7 +1618,7 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     )
 
     assert windows_full["name"] == "Windows high-risk (${{ matrix.shard }})"
-    assert windows_full["timeout-minutes"] == 45
+    assert windows_full["timeout-minutes"] == 60
     assert windows_full["strategy"] == {
         "fail-fast": False,
         "matrix": {
