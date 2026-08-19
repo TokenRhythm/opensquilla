@@ -497,6 +497,12 @@ export function useSetupEnsembleForm() {
     }
   }
 
+  function routingModeDetailsMatch(state: EnsembleRoutingModeState): boolean {
+    return selectionMode.value === state.selectionMode
+      && JSON.stringify(modelOptions.value) === JSON.stringify(state.modelOptions)
+      && JSON.stringify(candidates.value) === JSON.stringify(state.candidates)
+  }
+
   function restoreRoutingModeDetails(state: EnsembleRoutingModeState) {
     selectionMode.value = state.selectionMode
     modelOptions.value = [...state.modelOptions]
@@ -504,8 +510,9 @@ export function useSetupEnsembleForm() {
   }
 
   function restoreRoutingModeState(state: EnsembleRoutingModeState) {
+    const detailsUnchanged = routingModeDetailsMatch(state)
     enabled.value = state.enabled
-    restoreRoutingModeDetails(state)
+    if (detailsUnchanged) restoreRoutingModeDetails(state)
   }
 
   /**
@@ -538,6 +545,7 @@ export function useSetupEnsembleForm() {
       ? normalizeCandidates(previewRecord.candidates)
       : null
 
+    const detailsUnchanged = routingModeDetailsMatch(state)
     const nextBaseline = {
       ...baseline.value,
       enabled: enabled.value,
@@ -550,7 +558,7 @@ export function useSetupEnsembleForm() {
     }
     baseline.value = nextBaseline
 
-    if (state.lineupDirty) return
+    if (state.lineupDirty || !detailsUnchanged) return
     if (hasResponseSelectionMode) {
       selectionMode.value = responseSelectionMode
     }

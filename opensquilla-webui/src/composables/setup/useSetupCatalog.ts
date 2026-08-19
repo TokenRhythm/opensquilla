@@ -3065,6 +3065,10 @@ async function setModelStrategy(strategy: ModelStrategy) {
   } catch (err) {
     ensembleForm.restoreRoutingModeState(ensembleRoutingState)
     routerForm.restoreRoutingModeState(routerRoutingState)
+    routerForm.setEnsembleContext(
+      ensembleForm.selectionMode.value,
+      ensembleForm.enabled.value,
+    )
     pushToast(saveFailedMessage(err), { tone: 'danger' })
   } finally {
     modelStrategyRoutingBusy.value = false
