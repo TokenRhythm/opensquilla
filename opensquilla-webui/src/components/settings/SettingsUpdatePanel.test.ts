@@ -110,7 +110,7 @@ describe('SettingsUpdatePanel', () => {
     app.unmount()
   })
 
-  it('shows the verified Windows installer again without a relaunch action', async () => {
+  it('offers relaunch handoff alongside the verified Windows installer', async () => {
     const api = desktopUpdateApi({
       status: 'downloaded',
       canNativeInstall: false,
@@ -125,11 +125,16 @@ describe('SettingsUpdatePanel', () => {
     expect(el.textContent).toContain('verified against the canonical GitHub checksum')
     const show = el.querySelector('[data-testid="settings-update-download"]') as HTMLButtonElement
     expect(show.textContent).toContain('Show installer')
-    show.click()
+
+    // The manual flow hands off through the same relaunch action as native:
+    // the desktop drains its gateway, starts the installer, and exits.
+    // (Click before the mocked download response replaces the state.)
+    const relaunch = el.querySelector('[data-testid="settings-update-relaunch"]') as HTMLButtonElement
+    expect(relaunch).not.toBeNull()
+    relaunch.click()
     await settle()
 
-    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
-    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
     app.unmount()
   })
 })

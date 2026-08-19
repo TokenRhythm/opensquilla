@@ -77,7 +77,7 @@
       "availableDesc": "你准备好时再下载。OpenSquilla 只会在你重新启动后安装更新。",
       "manualAvailableDesc": "下载此版本对应的 Windows 安装程序。Windows 将提示你完成安装。",
       "manualDownloadedTitle": "已验证的安装包已就绪",
-      "manualDownloadedDesc": "OpenSquilla {version} 已通过 GitHub 官方校验和验证，并已在文件夹中显示。准备好后请手动运行安装程序。",
+      "manualDownloadedDesc": "OpenSquilla {version} 已通过 GitHub 官方校验和验证。点击“重新启动”会自动退出 OpenSquilla 并运行安装程序，也可以自行在文件夹中运行。",
       "downloadedTitle": "可以安装了",
       "downloadedDesc": "重新启动 OpenSquilla 以完成更新到 {version}。",
       "downloadingTitle": "正在下载更新",

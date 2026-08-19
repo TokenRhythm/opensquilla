@@ -77,7 +77,7 @@
       "availableDesc": "準備ができたらダウンロードしてください。OpenSquilla は再起動後にだけインストールします。",
       "manualAvailableDesc": "このバージョン専用の Windows インストーラーをダウンロードします。Windows の案内に従ってインストールを完了してください。",
       "manualDownloadedTitle": "検証済みインストーラの準備完了",
-      "manualDownloadedDesc": "OpenSquilla {version} は GitHub の正規チェックサムで検証され、フォルダに表示されました。準備ができたらインストーラを手動で実行してください。",
+      "manualDownloadedDesc": "OpenSquilla {version} は GitHub の正規チェックサムで検証されました。「再起動」で OpenSquilla を終了してインストーラを自動実行します。フォルダから手動で実行することもできます。",
       "downloadedTitle": "インストール準備完了",
       "downloadedDesc": "OpenSquilla を再起動して {version} への更新を完了します。",
       "downloadingTitle": "更新をダウンロード中",

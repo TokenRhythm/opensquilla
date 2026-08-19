@@ -77,7 +77,7 @@
       "availableDesc": "Lade es herunter, wenn du bereit bist. OpenSquilla installiert es erst nach dem Neustart.",
       "manualAvailableDesc": "Lade das versionsgebundene Windows-Installationsprogramm herunter. Windows führt dich durch die Installation.",
       "manualDownloadedTitle": "Geprüfter Installer bereit",
-      "manualDownloadedDesc": "OpenSquilla {version} wurde mit der offiziellen GitHub-Prüfsumme verifiziert und im Ordner angezeigt. Starte das Installationsprogramm, wenn du bereit bist.",
+      "manualDownloadedDesc": "OpenSquilla {version} wurde mit der offiziellen GitHub-Prüfsumme verifiziert. „Neu starten“ beendet OpenSquilla und startet das Installationsprogramm; alternativ kannst du es selbst aus dem Ordner ausführen.",
       "downloadedTitle": "Bereit zur Installation",
       "downloadedDesc": "Starte OpenSquilla neu, um das Update auf {version} abzuschließen.",
       "downloadingTitle": "Update wird heruntergeladen",
