@@ -7,7 +7,7 @@
 - OpenSquilla 分支 `feature/multi-llm-ensemble-routing2`，commit `797987b705d8e484e9c7975f56964631fd8752b4`。
 - 经评审的 Python 源码树共 948 个文件，SHA-256 为 `5e5bf150fbf70384a24c02b9972f8f56d2fce4d7639afef0006eaabb3542c57e`。
 - vendored wheel `opensquilla-0.5.0-py3-none-any.whl` 的 SHA-256 为 `329df29aeafff963447e18d2b5109e7bc00e70f0e53a8928726d06cb85e4d731`。
-- ranking config 为 `step2-ranking-2026-08-18.4`；模型画像 snapshot 为 `curated-openrouter-step2-2026-08-18.2-reliability-20260818T121632Z-a04f8e2167bf`。
+- ranking config 为 `step2-ranking-2026-08-18.4`；模型画像 snapshot 为 `curated-openrouter-step2-2026-08-19.1-reliability-20260818T121632Z-01580c6982b4`。
 
 ## 1. 设计结论
 

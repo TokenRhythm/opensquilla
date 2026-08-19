@@ -55,9 +55,8 @@ log = structlog.get_logger(__name__)
 class CacheAffinityUnavailableReason(StrEnum):
     """Safe, replayable reasons why cache evidence could not affect ranking."""
 
-    EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE = (
-        "exact_cache_price_quote_unavailable"
-    )
+    EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE = "exact_cache_price_quote_unavailable"
+
 
 RANKING_VERSION = "step2-ranking-v4"
 SINGLE_MODEL_RANKING_VERSION = "router-single-ranking-v1"
@@ -98,12 +97,18 @@ _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
         _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
     }
 )
-_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.2"
+_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-19.1"
+_PRE_STATUS_DISABLE_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.2"
+_PRE_STATUS_DISABLE_REGISTRY_SNAPSHOT_VERSION = (
+    "curated-openrouter-step2-2026-08-18.2-reliability-20260818T121632Z-a04f8e2167bf"
+)
+_PRE_STATUS_DISABLE_REGISTRY_RESOURCE = "router_dynamic_model_profiles_20260818_a04f8e2167bf.json"
 _PREVIOUS_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.1"
 _LEGACY_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-07-31.1"
 _HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
     {
         _CURRENT_REGISTRY_BASE_VERSION,
+        _PRE_STATUS_DISABLE_REGISTRY_BASE_VERSION,
         _PREVIOUS_REGISTRY_BASE_VERSION,
         _LEGACY_REGISTRY_BASE_VERSION,
     }
@@ -133,7 +138,7 @@ _POST_BASE_REGISTRY_FACT_OVERRIDES = {
             "input_per_million": 0.8246,
             "output_per_million": 2.5916,
         }
-    }
+    },
 }
 _POST_BASE_STATIC_PROFILE_OVERRIDES = {
     "anthropic/claude-sonnet-5": {
@@ -185,6 +190,15 @@ _POST_BASE_DISABLED_MODEL_IDS = frozenset(
         "z-ai/glm-5.1",
     }
 )
+_POST_CURRENT_BASE_DISABLED_MODEL_IDS = frozenset(
+    {
+        "mistralai/mistral-large-2512",
+        "mistralai/mistral-medium-3-5",
+        "mistralai/mistral-small-2603",
+        "mistralai/ministral-14b-2512",
+        "mistralai/voxtral-small-24b-2507",
+    }
+)
 _ROLE_RELIABILITY_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
     {"role-reliability-snapshot-v1", "role-reliability-snapshot-v2"}
 )
@@ -197,9 +211,7 @@ TASK_ANALYZER_PROVIDER_ID = "openrouter"
 TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
 TASK_ANALYZER_UPSTREAM_PROVIDER = "anthropic"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
-TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL = (
-    "opensquilla.task-analyzer-fallback-chain/v1"
-)
+TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL = "opensquilla.task-analyzer-fallback-chain/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
 FROZEN_TASK_ANALYSIS_SCHEMA_V3 = "opensquilla.draco.frozen-task-analysis/v3"
@@ -333,9 +345,7 @@ class TaskAnalyzerPhysicalEvidenceError(TaskAnalyzerStreamCleanupError):
     """Raised when analyzer physical-request evidence is contradictory."""
 
 
-_TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON = (
-    "TaskAnalyzerAbsoluteDeadlineError"
-)
+_TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON = "TaskAnalyzerAbsoluteDeadlineError"
 
 
 class TaskAnalyzerSchemaError(ValueError):
@@ -453,9 +463,11 @@ def _immutable_ranking_config_types() -> tuple[Any, ...]:
             return iter(registered_values(self))
 
         def __eq__(self, other: object) -> bool:
-            return isinstance(other, Sequence) and not isinstance(
-                other, (str, bytes, bytearray)
-            ) and list(self) == list(other)
+            return (
+                isinstance(other, Sequence)
+                and not isinstance(other, (str, bytes, bytearray))
+                and list(self) == list(other)
+            )
 
         def __repr__(self) -> str:
             return repr(list(self))
@@ -528,9 +540,7 @@ def _immutable_ranking_config_types() -> tuple[Any, ...]:
         registered, plain = registered_plain_value(value)
         if registered:
             return plain
-        raise TypeError(
-            f"Object of type {type(value).__name__} is not JSON serializable"
-        )
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
     def wrap_validated_builder(builder: Callable[..., Mapping[str, Any]]) -> Any:
         """Authenticate only the checked plain mapping returned by ``builder``."""
@@ -573,8 +583,7 @@ def _immutable_ranking_config_types() -> tuple[Any, ...]:
         if (
             not upstream_provider
             or upstream_provider != upstream_provider.strip().casefold()
-            or _TASK_ANALYZER_UPSTREAM_PROVIDER_RE.fullmatch(upstream_provider)
-            is None
+            or _TASK_ANALYZER_UPSTREAM_PROVIDER_RE.fullmatch(upstream_provider) is None
         ):
             raise DynamicRankingError(
                 "router_dynamic task_analyzer.upstream_provider must be a lowercase "
@@ -593,9 +602,7 @@ def _immutable_ranking_config_types() -> tuple[Any, ...]:
             )
         analyzer = temporary.get("task_analyzer")
         if not isinstance(analyzer, dict):
-            raise DynamicRankingError(
-                "router_dynamic task_analyzer must be a JSON object"
-            )
+            raise DynamicRankingError("router_dynamic task_analyzer must be a JSON object")
         if not {
             "provider",
             "model",
@@ -620,9 +627,7 @@ def _immutable_ranking_config_types() -> tuple[Any, ...]:
     def is_authentic(value: Any) -> bool:
         current = immutable_values.get(id(value))
         return type(value) is ValidatedRankingConfig and (
-            id(value) in authentic_roots
-            and current is not None
-            and current[0]() is value
+            id(value) in authentic_roots and current is not None and current[0]() is value
         )
 
     def registry_size() -> int:
@@ -709,9 +714,7 @@ class TaskAnalyzerCandidate:
                 "task analyzer candidate upstream_provider must be non-empty, "
                 "lowercase, and trimmed"
             )
-        if self.provider is not None and not callable(
-            getattr(self.provider, "chat", None)
-        ):
+        if self.provider is not None and not callable(getattr(self.provider, "chat", None)):
             raise ValueError(
                 "task analyzer candidate provider must implement the LLMProvider interface"
             )
@@ -1248,9 +1251,7 @@ def _ranking_number(config: Mapping[str, Any], *path: str) -> float:
         number = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
         dotted = ".".join(path)
-        raise DynamicRankingError(
-            f"router_dynamic ranking config {dotted} must be finite"
-        ) from exc
+        raise DynamicRankingError(f"router_dynamic ranking config {dotted} must be finite") from exc
     if not math.isfinite(number):
         dotted = ".".join(path)
         raise DynamicRankingError(f"router_dynamic ranking config {dotted} must be finite")
@@ -1375,15 +1376,17 @@ def _validate_cache_affinity_config(config: Mapping[str, Any]) -> None:
             "router_dynamic ranking config session.kv_cache_affinity.topologies "
             "must be a non-empty unique list of single or multiple"
         )
-    if _ranking_number(
-        config,
-        "session",
-        "kv_cache_affinity",
-        "ttl_seconds",
-    ) <= 0.0:
+    if (
+        _ranking_number(
+            config,
+            "session",
+            "kv_cache_affinity",
+            "ttl_seconds",
+        )
+        <= 0.0
+    ):
         raise DynamicRankingError(
-            "router_dynamic ranking config session.kv_cache_affinity.ttl_seconds "
-            "must be positive"
+            "router_dynamic ranking config session.kv_cache_affinity.ttl_seconds must be positive"
         )
     age_decay = _ranking_string(
         config,
@@ -1441,9 +1444,7 @@ def _thinking_assignment_policy(
     """Return the strictly validated, versioned unified-thinking policy."""
 
     thinking_assignment = _ranking_mapping(config, "thinking_assignment")
-    legacy_external_switch = (
-        allow_legacy_external_switch and "enabled" not in thinking_assignment
-    )
+    legacy_external_switch = allow_legacy_external_switch and "enabled" not in thinking_assignment
 
     _require_exact_config_keys(
         config,
@@ -1460,9 +1461,7 @@ def _thinking_assignment_policy(
     )
 
     enabled = (
-        True
-        if legacy_external_switch
-        else _ranking_bool(config, "thinking_assignment", "enabled")
+        True if legacy_external_switch else _ranking_bool(config, "thinking_assignment", "enabled")
     )
     _require_exact_config_keys(
         config,
@@ -1619,8 +1618,7 @@ def _validate_ranking_config(
     if has_thinking_policy and schema_version == RANKING_CONFIG_SCHEMA_VERSION:
         thinking_assignment = _ranking_mapping(config, "thinking_assignment")
         legacy_external_thinking_switch = (
-            allow_legacy_external_thinking_switch
-            and "enabled" not in thinking_assignment
+            allow_legacy_external_thinking_switch and "enabled" not in thinking_assignment
         )
     if schema_version == RANKING_CONFIG_SCHEMA_VERSION and not has_thinking_policy:
         raise DynamicRankingError("router_dynamic ranking config v4 requires thinking_assignment")
@@ -1631,9 +1629,7 @@ def _validate_ranking_config(
     config_version = _ranking_string(config, "config_version")
     penalties_config = _ranking_mapping(config, "penalties")
     has_latency_penalty_policy = "latency_penalty_enabled" in penalties_config
-    predates_resource_aware_rerank = _is_pre_resource_aware_rerank_config_version(
-        config_version
-    )
+    predates_resource_aware_rerank = _is_pre_resource_aware_rerank_config_version(config_version)
     if has_latency_penalty_policy and predates_resource_aware_rerank:
         raise DynamicRankingError(
             "router_dynamic historical ranking config cannot declare "
@@ -1644,9 +1640,7 @@ def _validate_ranking_config(
             "router_dynamic ranking config lacks the versioned latency penalty policy"
         )
     has_role_reliability = "role_reliability" in config
-    if not has_role_reliability and not _is_pre_role_reliability_config_version(
-        config_version
-    ):
+    if not has_role_reliability and not _is_pre_role_reliability_config_version(config_version):
         raise DynamicRankingError(
             "router_dynamic ranking config lacks the versioned role_reliability policy"
         )
@@ -2676,8 +2670,7 @@ def _normalize_ranking_config_override(
             if not isinstance(raw_key, str):
                 location = ".".join(path) or "<root>"
                 raise DynamicRankingError(
-                    "router_dynamic ranking config override must use string keys at "
-                    f"{location}"
+                    f"router_dynamic ranking config override must use string keys at {location}"
                 )
             normalized[raw_key] = _normalize_ranking_config_override(
                 child,
@@ -2695,8 +2688,7 @@ def _normalize_ranking_config_override(
         return value
     location = ".".join(path) or "<root>"
     raise DynamicRankingError(
-        "router_dynamic ranking config override must contain only JSON values at "
-        f"{location}"
+        f"router_dynamic ranking config override must contain only JSON values at {location}"
     )
 
 
@@ -2895,9 +2887,7 @@ def ranking_config_resolution(
     full_base = _detached_ranking_config(packaged_base)
     full_base["thinking_assignment"]["enabled"] = compatibility_enabled
     base = _validate_ranking_config(
-        full_base
-        if compatibility_enabled
-        else _legacy_ranking_config_projection(full_base)
+        full_base if compatibility_enabled else _legacy_ranking_config_projection(full_base)
     )
     base_config = _detached_ranking_config(base)
     base_sha256 = _canonical_hash(base_config)
@@ -2912,9 +2902,7 @@ def ranking_config_resolution(
             "thinking_assignment_enabled": compatibility_enabled,
         }
     if not isinstance(override, Mapping):
-        raise DynamicRankingError(
-            "router_dynamic ranking config override must be a JSON object"
-        )
+        raise DynamicRankingError("router_dynamic ranking config override must be a JSON object")
     normalized_override = _normalize_ranking_config_override(override)
     if not normalized_override:
         return {
@@ -2942,8 +2930,7 @@ def ranking_config_resolution(
         raw_override_enabled = thinking_override["enabled"]
         if not isinstance(raw_override_enabled, bool):
             raise DynamicRankingError(
-                "router_dynamic ranking config thinking_assignment.enabled "
-                "must be boolean"
+                "router_dynamic ranking config thinking_assignment.enabled must be boolean"
             )
         explicit_override_enabled = raw_override_enabled
     if (
@@ -2964,10 +2951,7 @@ def ranking_config_resolution(
     if (
         isinstance(analyzer_override, Mapping)
         and "fallback_chain" not in analyzer_override
-        and any(
-            key in analyzer_override
-            for key in ("provider", "model", "upstream_provider")
-        )
+        and any(key in analyzer_override for key in ("provider", "model", "upstream_provider"))
     ):
         # Sparse overrides historically changed only the single Analyzer route.
         # With the packaged chain, retain the remaining backups but never replay
@@ -3003,9 +2987,7 @@ def ranking_config_resolution(
         "enabled",
     )
     effective = (
-        validated_full
-        if effective_enabled
-        else _legacy_ranking_config_projection(validated_full)
+        validated_full if effective_enabled else _legacy_ranking_config_projection(validated_full)
     )
     validated_effective = _validate_ranking_config(effective)
     effective_config = _detached_ranking_config(validated_effective)
@@ -3089,10 +3071,7 @@ def _prepare_effective_ranking_config(
             return _validate_ranking_config(ranking_config)
         source_config = _detached_ranking_config(ranking_config)
         thinking_section = source_config.get("thinking_assignment")
-        if (
-            isinstance(thinking_section, dict)
-            and thinking_section.get("enabled") is False
-        ):
+        if isinstance(thinking_section, dict) and thinking_section.get("enabled") is False:
             # Compatibility adapter for callers that still pass the old
             # out-of-band switch together with the packaged v4 template.
             thinking_section["enabled"] = True
@@ -3100,17 +3079,10 @@ def _prepare_effective_ranking_config(
             source_config,
             allow_legacy_external_thinking_switch=True,
         )
-    source_config = (
-        ranking_config if ranking_config is not None else _packaged_ranking_config()
-    )
-    if (
-        source_config.get("schema_version")
-        == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
-    ):
+    source_config = ranking_config if ranking_config is not None else _packaged_ranking_config()
+    if source_config.get("schema_version") == LEGACY_RANKING_CONFIG_SCHEMA_VERSION:
         return _validate_ranking_config(source_config)
-    return _validate_ranking_config(
-        _legacy_ranking_config_projection(source_config)
-    )
+    return _validate_ranking_config(_legacy_ranking_config_projection(source_config))
 
 
 def _resolve_ranking_config(
@@ -3590,9 +3562,7 @@ def _event_reported_physical_attempt_ids(event: object) -> list[str]:
     raw_ids = [str(getattr(event, "physical_attempt_id", "") or "").strip()]
     provider_usage = getattr(event, "provider_usage", None)
     if isinstance(provider_usage, Mapping):
-        raw_ids.append(
-            str(provider_usage.get("physical_attempt_id") or "").strip()
-        )
+        raw_ids.append(str(provider_usage.get("physical_attempt_id") or "").strip())
     return raw_ids
 
 
@@ -3619,10 +3589,7 @@ def _task_analyzer_reported_physical_attempt_ids(
             row_conflict = True
         raw_ids.extend((direct, nested))
     nonempty_ids = [value.casefold() for value in raw_ids if value]
-    invalid = any(
-        _PHYSICAL_ATTEMPT_ID_RE.fullmatch(value) is None
-        for value in nonempty_ids
-    )
+    invalid = any(_PHYSICAL_ATTEMPT_ID_RE.fullmatch(value) is None for value in nonempty_ids)
     unique_ids = list(dict.fromkeys(nonempty_ids))
     return unique_ids, bool(invalid or row_conflict or len(unique_ids) > 1)
 
@@ -3653,13 +3620,10 @@ def _task_analyzer_attempt_usage(
             if isinstance(raw_provider_usage, Mapping)
             else {}
         )
-        nested_physical_attempt_id = str(
-            provider_usage.get("physical_attempt_id") or ""
-        ).strip()
+        nested_physical_attempt_id = str(provider_usage.get("physical_attempt_id") or "").strip()
         if (
             nested_physical_attempt_id
-            and nested_physical_attempt_id.casefold()
-            != physical_attempt_id.casefold()
+            and nested_physical_attempt_id.casefold() != physical_attempt_id.casefold()
         ):
             raise TaskAnalyzerPhysicalEvidenceError(
                 "task analyzer physical_attempt_id mirror is contradictory"
@@ -3743,9 +3707,7 @@ def _merge_task_analyzer_error_evidence(
         physical_attempt_id = (
             str(reported_physical_attempt_ids[offset])
             if offset < len(reported_physical_attempt_ids)
-            and _PHYSICAL_ATTEMPT_ID_RE.fullmatch(
-                str(reported_physical_attempt_ids[offset])
-            )
+            and _PHYSICAL_ATTEMPT_ID_RE.fullmatch(str(reported_physical_attempt_ids[offset]))
             is not None
             else _task_analyzer_physical_attempt_id(
                 decision_id=decision_id,
@@ -3779,9 +3741,7 @@ def _merge_task_analyzer_error_evidence(
                     if isinstance(provider_usage, Mapping)
                     else {}
                 )
-                normalized_provider_usage[
-                    "reported_physical_attempt_ids"
-                ] = conflicting_ids
+                normalized_provider_usage["reported_physical_attempt_ids"] = conflicting_ids
                 normalized_provider_usage.pop(
                     "physical_attempt_id",
                     None,
@@ -3957,9 +3917,7 @@ def mock_user_profile(
     """Return the replaceable Step2 chapter-4 global default profile."""
 
     effective_config = _resolve_ranking_config(ranking_config)
-    return _detached_ranking_config(
-        _ranking_mapping(effective_config, "mock_user_profile")
-    )
+    return _detached_ranking_config(_ranking_mapping(effective_config, "mock_user_profile"))
 
 
 def validate_user_profile(
@@ -4045,9 +4003,7 @@ def _legacy_fusion_last_route(
     """Project the existing B5 P/A route memory without changing its contract."""
 
     metadata = dict(turn_metadata or {})
-    supplied = metadata.get("router_dynamic_request_context") or metadata.get(
-        "request_context"
-    )
+    supplied = metadata.get("router_dynamic_request_context") or metadata.get("request_context")
     supplied_map = supplied if isinstance(supplied, Mapping) else {}
     supplied_last_route = supplied_map.get("last_route")
     if not isinstance(supplied_last_route, Mapping):
@@ -4306,9 +4262,7 @@ def build_request_context(
         include_previous_candidates=True,
         effective_config=effective_config,
     )
-    minimum_tokens = _ranking_int(
-        effective_config, "context", "output_budget", "minimum_tokens"
-    )
+    minimum_tokens = _ranking_int(effective_config, "context", "output_budget", "minimum_tokens")
     context["routing_budget"].update(
         {
             "candidate_output_tokens": max(minimum_tokens, candidate_output_tokens),
@@ -4329,11 +4283,7 @@ def build_single_model_request_context(
 ) -> dict[str, Any]:
     """Build direct-routing context without exposing fusion output budgets."""
 
-    if (
-        isinstance(output_tokens, bool)
-        or not isinstance(output_tokens, int)
-        or output_tokens <= 0
-    ):
+    if isinstance(output_tokens, bool) or not isinstance(output_tokens, int) or output_tokens <= 0:
         raise DynamicRankingError(
             "router_dynamic single-model output_tokens must be a positive integer"
         )
@@ -4346,12 +4296,8 @@ def build_single_model_request_context(
         include_previous_candidates=False,
         effective_config=effective_config,
     )
-    minimum_tokens = _ranking_int(
-        effective_config, "context", "output_budget", "minimum_tokens"
-    )
-    context["routing_budget"]["direct_output_tokens"] = max(
-        minimum_tokens, output_tokens
-    )
+    minimum_tokens = _ranking_int(effective_config, "context", "output_budget", "minimum_tokens")
+    context["routing_budget"]["direct_output_tokens"] = max(minimum_tokens, output_tokens)
     context["snapshot_hash"] = _request_context_hash(context)
     return context
 
@@ -4417,9 +4363,7 @@ def normalize_task_profile(
     """Validate and normalize a task-analyzer payload into the Step2 schema."""
 
     if not isinstance(cache_continuity_available, bool):
-        raise DynamicRankingError(
-            "router_dynamic cache_continuity_available must be a boolean"
-        )
+        raise DynamicRankingError("router_dynamic cache_continuity_available must be a boolean")
     effective_config = _resolve_ranking_config(ranking_config)
     fallback = fallback_task_profile(
         routed_tier=routed_tier,
@@ -4557,8 +4501,7 @@ def normalize_task_profile(
     last_route = request_context.get("last_route")
     cache_can_preserve_continue = (
         cache_continuity_available
-        and _cache_affinity_policy_for_topology(effective_config, "single")
-        is not None
+        and _cache_affinity_policy_for_topology(effective_config, "single") is not None
         and intent_type == "continue"
         and intent_confidence
         >= _ranking_number(
@@ -4734,11 +4677,9 @@ def frozen_task_analysis_contract_reasons(
             validated_task_analyzer_execution_contract,
         )
 
-        execution_contract = value.get(
-            "source_task_analyzer_execution_contract"
-        )
-        validated_execution_contract = (
-            validated_task_analyzer_execution_contract(execution_contract)
+        execution_contract = value.get("source_task_analyzer_execution_contract")
+        validated_execution_contract = validated_task_analyzer_execution_contract(
+            execution_contract
         )
         if (
             validated_execution_contract is None
@@ -4747,23 +4688,13 @@ def frozen_task_analysis_contract_reasons(
                 source_config if isinstance(source_config, Mapping) else {},
             )
             or _canonical_hash(execution_contract)
-            != str(
-                value.get(
-                    "source_task_analyzer_execution_contract_sha256"
-                )
-                or ""
-            )
+            != str(value.get("source_task_analyzer_execution_contract_sha256") or "")
         ):
-            reasons.append(
-                "invalid_frozen_task_analyzer_execution_contract"
-            )
+            reasons.append("invalid_frozen_task_analyzer_execution_contract")
             authorized_routes = None
         else:
             authorized_routes = [
-                {
-                    key: str(route[key])
-                    for key in ("provider", "model", "upstream_provider")
-                }
+                {key: str(route[key]) for key in ("provider", "model", "upstream_provider")}
                 for route in validated_execution_contract["routes"]
             ]
     entries = value.get("entries")
@@ -4781,21 +4712,15 @@ def frozen_task_analysis_contract_reasons(
         reasons.append("wrong_frozen_task_analysis_task_set")
     expected_entry_fields = (
         _FROZEN_TASK_ANALYSIS_V2_ENTRY_FIELDS
-        if schema
-        in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
+        if schema in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
         else _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS
     )
     for raw_entry in entries.values():
-        if (
-            not isinstance(raw_entry, Mapping)
-            or set(raw_entry) != expected_entry_fields
-        ):
+        if not isinstance(raw_entry, Mapping) or set(raw_entry) != expected_entry_fields:
             reasons.append("invalid_frozen_task_analysis_entry")
             continue
         profile = raw_entry.get("task_profile_pre_escalation")
-        profile_hash = str(
-            raw_entry.get("task_profile_pre_escalation_sha256") or ""
-        )
+        profile_hash = str(raw_entry.get("task_profile_pre_escalation_sha256") or "")
         analyzer = raw_entry.get("task_analyzer")
         task_input_hash = str(raw_entry.get("task_input_sha256") or "")
         prompt_hash = str(raw_entry.get("prompt_sha256") or "")
@@ -4813,18 +4738,14 @@ def frozen_task_analysis_contract_reasons(
             or _canonical_hash(profile) != profile_hash
         ):
             reasons.append("invalid_frozen_task_profile_hash")
-        if (
-            not isinstance(analyzer, Mapping)
-            or set(analyzer) != _FROZEN_TASK_ANALYZER_TRACE_FIELDS
-        ):
+        if not isinstance(analyzer, Mapping) or set(analyzer) != _FROZEN_TASK_ANALYZER_TRACE_FIELDS:
             reasons.append("invalid_frozen_task_analyzer_trace")
             continue
         confidence = analyzer.get("confidence")
         warnings = analyzer.get("normalization_warnings")
         origin_outcome = (
             raw_entry.get("origin_outcome")
-            if schema
-            in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
+            if schema in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
             else FROZEN_TASK_ANALYSIS_LIVE_SUCCESS
         )
         outcome_valid = (
@@ -4832,8 +4753,7 @@ def frozen_task_analysis_contract_reasons(
             and analyzer.get("schema_valid") is True
             and analyzer.get("fallback_reason") == ""
         ) or (
-            schema
-            in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
+            schema in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
             and origin_outcome == FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK
             and analyzer.get("schema_valid") is False
             and bool(str(analyzer.get("fallback_reason") or "").strip())
@@ -4860,10 +4780,7 @@ def frozen_task_analysis_contract_reasons(
                 str(analyzer.get("provider") or ""),
                 str(analyzer.get("model") or ""),
             )
-            not in {
-                (route["provider"], route["model"])
-                for route in authorized_routes
-            }
+            not in {(route["provider"], route["model"]) for route in authorized_routes}
             or str(analyzer.get("analyzer_version") or "") != TASK_ANALYZER_VERSION
         ):
             reasons.append("wrong_frozen_task_analyzer_identity")
@@ -4923,15 +4840,11 @@ def frozen_task_analysis_plan_reasons(
         "source_experiment": contract["source_experiment"],
         "source_manifest_sha256": contract["source_manifest_sha256"],
         "source_results_sha256": contract["source_results_sha256"],
-        "source_task_analyzer_config_sha256": contract[
-            "source_task_analyzer_config_sha256"
-        ],
+        "source_task_analyzer_config_sha256": contract["source_task_analyzer_config_sha256"],
         "entries_sha256": contract["entries_sha256"],
         "task_input_sha256": entry["task_input_sha256"],
         "prompt_sha256": entry["prompt_sha256"],
-        "task_profile_pre_escalation_sha256": entry[
-            "task_profile_pre_escalation_sha256"
-        ],
+        "task_profile_pre_escalation_sha256": entry["task_profile_pre_escalation_sha256"],
         "physical_request_count": 0,
     }
     if contract_schema in {
@@ -4940,9 +4853,9 @@ def frozen_task_analysis_plan_reasons(
     }:
         expected_proof["origin_outcome"] = entry["origin_outcome"]
     if contract_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
-        expected_proof[
+        expected_proof["source_task_analyzer_execution_contract_sha256"] = contract[
             "source_task_analyzer_execution_contract_sha256"
-        ] = contract["source_task_analyzer_execution_contract_sha256"]
+        ]
     if dict(proof) != expected_proof:
         reasons.append("wrong_frozen_task_analysis_replay_proof")
     expected_analyzer = copy.deepcopy(dict(entry["task_analyzer"]))
@@ -4954,19 +4867,15 @@ def frozen_task_analysis_plan_reasons(
     if (
         not isinstance(profile, Mapping)
         or dict(profile) != dict(entry["task_profile_pre_escalation"])
-        or _canonical_hash(profile)
-        != entry["task_profile_pre_escalation_sha256"]
+        or _canonical_hash(profile) != entry["task_profile_pre_escalation_sha256"]
     ):
         reasons.append("wrong_frozen_task_profile")
     ranking_parameters = plan.get("ranking_parameters")
     analyzer_config = (
-        ranking_parameters.get("task_analyzer")
-        if isinstance(ranking_parameters, Mapping)
-        else None
+        ranking_parameters.get("task_analyzer") if isinstance(ranking_parameters, Mapping) else None
     )
-    if (
-        not isinstance(analyzer_config, Mapping)
-        or dict(analyzer_config) != dict(contract["source_task_analyzer_config"])
+    if not isinstance(analyzer_config, Mapping) or dict(analyzer_config) != dict(
+        contract["source_task_analyzer_config"]
     ):
         reasons.append("wrong_frozen_task_analysis_source_analyzer_config")
     return list(dict.fromkeys(reasons))
@@ -5015,8 +4924,7 @@ def frozen_task_analysis_result(
         not schema_valid
         or not isinstance(profile, Mapping)
         or normalized != dict(profile)
-        or _canonical_hash(normalized)
-        != str(entry.get("task_profile_pre_escalation_sha256") or "")
+        or _canonical_hash(normalized) != str(entry.get("task_profile_pre_escalation_sha256") or "")
     ):
         raise DynamicRankingError(
             f"frozen task analysis profile {task_id!r} is invalid for this request"
@@ -5039,15 +4947,11 @@ def frozen_task_analysis_result(
         "source_experiment": contract["source_experiment"],
         "source_manifest_sha256": contract["source_manifest_sha256"],
         "source_results_sha256": contract["source_results_sha256"],
-        "source_task_analyzer_config_sha256": contract[
-            "source_task_analyzer_config_sha256"
-        ],
+        "source_task_analyzer_config_sha256": contract["source_task_analyzer_config_sha256"],
         "entries_sha256": contract["entries_sha256"],
         "task_input_sha256": entry["task_input_sha256"],
         "prompt_sha256": entry["prompt_sha256"],
-        "task_profile_pre_escalation_sha256": entry[
-            "task_profile_pre_escalation_sha256"
-        ],
+        "task_profile_pre_escalation_sha256": entry["task_profile_pre_escalation_sha256"],
         "physical_request_count": 0,
     }
     if contract.get("schema") in {
@@ -5056,9 +4960,9 @@ def frozen_task_analysis_result(
     }:
         proof["origin_outcome"] = origin_outcome
     if contract.get("schema") == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
-        proof[
+        proof["source_task_analyzer_execution_contract_sha256"] = contract[
             "source_task_analyzer_execution_contract_sha256"
-        ] = contract["source_task_analyzer_execution_contract_sha256"]
+        ]
     return TaskAnalysisResult(
         profile=copy.deepcopy(normalized),
         source=FROZEN_TASK_ANALYZER_SOURCE,
@@ -5097,9 +5001,7 @@ async def _bounded_close_task_analyzer_stream(
     *,
     timeout_seconds: float,
     require_aclose: bool,
-    pending_cleanup_tracker: (
-        Callable[[asyncio.Future[Any], str], None] | None
-    ) = None,
+    pending_cleanup_tracker: (Callable[[asyncio.Future[Any], str], None] | None) = None,
 ) -> bool:
     """Close an analyzer stream without allowing provider cleanup to block routing."""
 
@@ -5162,14 +5064,9 @@ def _compact_task_analyzer_request_context(
     if direct_routing:
         routing_budget_keys.append("direct_output_tokens")
     else:
-        routing_budget_keys.extend(
-            ["candidate_output_tokens", "aggregator_output_tokens"]
-        )
+        routing_budget_keys.extend(["candidate_output_tokens", "aggregator_output_tokens"])
     routing_budget = (
-        {
-            key: max(0, _as_int(routing_budget_raw.get(key), 0))
-            for key in routing_budget_keys
-        }
+        {key: max(0, _as_int(routing_budget_raw.get(key), 0)) for key in routing_budget_keys}
         if isinstance(routing_budget_raw, Mapping)
         else {}
     )
@@ -5343,9 +5240,7 @@ async def analyze_task_with_provider(
     """Use the caller-supplied dedicated provider as the task analyzer."""
 
     if not isinstance(cache_continuity_available, bool):
-        raise DynamicRankingError(
-            "router_dynamic cache_continuity_available must be a boolean"
-        )
+        raise DynamicRankingError("router_dynamic cache_continuity_available must be a boolean")
     effective_config = _resolve_ranking_config(ranking_config)
     configured_policy = task_analyzer_policy(effective_config)
     configured_provider_id = str(configured_policy["provider"])
@@ -5519,10 +5414,7 @@ async def analyze_task_with_provider(
         provider=provider_id or "unknown",
         model=model_id,
         input_chars=len(message),
-        input_truncated=(
-            len(analysis_message) < len(message)
-            or payload_metrics["task_truncated"]
-        ),
+        input_truncated=(len(analysis_message) < len(message) or payload_metrics["task_truncated"]),
         request_context_hash=request_context.get("snapshot_hash"),
         user_profile_enabled=user_profile_enabled,
         attempt=_attempt,
@@ -5602,10 +5494,7 @@ async def analyze_task_with_provider(
                 # A grant at the deadline boundary is still not permission to
                 # start a physical request. Release the zero-request lease and
                 # fail open to the normal Analyzer fallback without retrying.
-                if (
-                    admission_deadline is not None
-                    and time.monotonic() >= admission_deadline
-                ):
+                if admission_deadline is not None and time.monotonic() >= admission_deadline:
                     wait_ms = admission_lease.wait_ms
                     admission_guard.finish()
                     admission_guard = None
@@ -5638,9 +5527,7 @@ async def analyze_task_with_provider(
                 )
             request_timeout = min(request_timeout, remaining_to_deadline)
         if _absolute_deadline is not None:
-            final_deadline_remaining = (
-                _absolute_deadline - asyncio.get_running_loop().time()
-            )
+            final_deadline_remaining = _absolute_deadline - asyncio.get_running_loop().time()
             if final_deadline_remaining <= cleanup_reserve:
                 count_current_request = False
                 raise TaskAnalyzerDeadlineError(
@@ -5651,9 +5538,7 @@ async def analyze_task_with_provider(
                 max(0.000001, final_deadline_remaining - cleanup_reserve),
             )
         attempt_timeout = request_timeout
-        analyzer_config = analyzer_config.model_copy(
-            update={"timeout": request_timeout}
-        )
+        analyzer_config = analyzer_config.model_copy(update={"timeout": request_timeout})
         try:
             stream = (
                 provider.chat(analyzer_messages, tools=None, config=analyzer_config)
@@ -5685,9 +5570,7 @@ async def analyze_task_with_provider(
         try:
             iteration_timeout = request_timeout
             if admission_deadline is not None:
-                remaining_to_deadline = (
-                    admission_deadline - time.monotonic()
-                )
+                remaining_to_deadline = admission_deadline - time.monotonic()
                 if remaining_to_deadline <= 0:
                     raise TimeoutError
                 iteration_timeout = min(
@@ -5705,44 +5588,27 @@ async def analyze_task_with_provider(
                         got_done = True
                         terminal_observed = True
                         usage = _task_analyzer_usage_from_done(event)
-                        usage["provider"] = str(
-                            usage.get("provider") or configured_provider_id
-                        )
-                        usage["model"] = str(
-                            usage.get("model") or configured_model_id
-                        )
+                        usage["provider"] = str(usage.get("provider") or configured_provider_id)
+                        usage["model"] = str(usage.get("model") or configured_model_id)
                         usage["requested_provider"] = str(
                             event.requested_provider or configured_provider_id
                         )
-                        usage["requested_model"] = str(
-                            event.requested_model or configured_model_id
-                        )
-                        done_reported_ids = (
-                            _event_reported_physical_attempt_ids(event)
-                        )
+                        usage["requested_model"] = str(event.requested_model or configured_model_id)
+                        done_reported_ids = _event_reported_physical_attempt_ids(event)
                         done_nonempty_ids = [
-                            value.casefold()
-                            for value in done_reported_ids
-                            if value
+                            value.casefold() for value in done_reported_ids if value
                         ]
-                        done_unique_ids = list(
-                            dict.fromkeys(done_nonempty_ids)
-                        )
+                        done_unique_ids = list(dict.fromkeys(done_nonempty_ids))
                         done_id_conflict = bool(
                             any(
-                                _PHYSICAL_ATTEMPT_ID_RE.fullmatch(value)
-                                is None
+                                _PHYSICAL_ATTEMPT_ID_RE.fullmatch(value) is None
                                 for value in done_nonempty_ids
                             )
                             or len(done_unique_ids) > 1
                         )
                         if done_id_conflict:
-                            provider_usage = copy.deepcopy(
-                                dict(usage["provider_usage"])
-                            )
-                            provider_usage[
-                                "reported_physical_attempt_ids"
-                            ] = done_unique_ids
+                            provider_usage = copy.deepcopy(dict(usage["provider_usage"]))
+                            provider_usage["reported_physical_attempt_ids"] = done_unique_ids
                             provider_usage.pop(
                                 "physical_attempt_id",
                                 None,
@@ -5755,13 +5621,10 @@ async def analyze_task_with_provider(
                                 physical_attempt_id=physical_attempt_id,
                                 provider_id=provider_id,
                                 model_id=model_id,
-                                unknown_reason=(
-                                    "TaskAnalyzerPhysicalEvidenceError"
-                                ),
+                                unknown_reason=("TaskAnalyzerPhysicalEvidenceError"),
                             )
                             raise TaskAnalyzerPhysicalEvidenceError(
-                                "task analyzer DoneEvent physical-request "
-                                "identity is contradictory"
+                                "task analyzer DoneEvent physical-request identity is contradictory"
                             )
                         if done_unique_ids:
                             physical_attempt_id = done_unique_ids[0]
@@ -5831,9 +5694,7 @@ async def analyze_task_with_provider(
                             1 if event.request_started is True else 0,
                             1 if reported_physical_attempt_ids else 0,
                         )
-                        explicit_zero = bool(
-                            event.request_started is False or explicit_count == 0
-                        )
+                        explicit_zero = bool(event.request_started is False or explicit_count == 0)
                         evidence_conflict = bool(
                             (explicit_zero and physical_count > 0)
                             or physical_count > 1
@@ -5855,9 +5716,7 @@ async def analyze_task_with_provider(
                                     physical_count,
                                     len(receipt_rows),
                                 ),
-                                reported_physical_attempt_ids=(
-                                    reported_physical_attempt_ids
-                                ),
+                                reported_physical_attempt_ids=(reported_physical_attempt_ids),
                                 decision_id=decision_id,
                                 request_context=request_context,
                                 message=message,
@@ -5904,9 +5763,7 @@ async def analyze_task_with_provider(
                     timeout_seconds=close_timeout,
                     require_aclose=not (terminal_observed or stream_exhausted),
                     pending_cleanup_tracker=(
-                        admission_guard.track_cleanup
-                        if admission_guard is not None
-                        else None
+                        admission_guard.track_cleanup if admission_guard is not None else None
                     ),
                 )
             finally:
@@ -5976,10 +5833,7 @@ async def analyze_task_with_provider(
         if admission_lease is not None:
             admission_lease = None
         absolute_deadline_exhausted = bool(
-            (
-                admission_deadline is not None
-                and time.monotonic() >= admission_deadline
-            )
+            (admission_deadline is not None and time.monotonic() >= admission_deadline)
             or (
                 _absolute_deadline is not None
                 and asyncio.get_running_loop().time() >= _absolute_deadline
@@ -5988,10 +5842,8 @@ async def analyze_task_with_provider(
         schema_error = isinstance(exc, TaskAnalyzerSchemaError)
         reason = (
             _TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON
-            if absolute_deadline_exhausted
-            and not isinstance(exc, ProviderAdmissionError)
-            else
-            exc.code
+            if absolute_deadline_exhausted and not isinstance(exc, ProviderAdmissionError)
+            else exc.code
             if schema_error and _schema_repair_only
             else exc.public_reason
             if isinstance(exc, TaskAnalyzerProviderError) and _schema_repair_only
@@ -6053,9 +5905,7 @@ async def analyze_task_with_provider(
                 admission_before_release=admission_before_release,
                 cache_continuity_available=cache_continuity_available,
                 _attempt=_attempt + 1,
-                _retry_feedback=(
-                    exc.feedback if schema_error and _schema_repair_only else reason
-                ),
+                _retry_feedback=(exc.feedback if schema_error and _schema_repair_only else reason),
                 _accumulated_usage=accumulated_usage,
                 _allow_provider_stream_fallback=(_allow_provider_stream_fallback),
                 _absolute_deadline=_absolute_deadline,
@@ -6233,9 +6083,7 @@ def _public_task_analyzer_chain_failure_reason(value: Any) -> str:
     return "analyzer_failed"
 
 
-def _task_analyzer_provider_failure_reason(
-    *, provider_id: str, event: ErrorEvent
-) -> str:
+def _task_analyzer_provider_failure_reason(*, provider_id: str, event: ErrorEvent) -> str:
     raw_code = str(event.code or "")
     kind = classify_provider_error(
         provider_id,
@@ -6289,9 +6137,7 @@ async def analyze_task_with_fallback_chain(
     """
 
     if not isinstance(cache_continuity_available, bool):
-        raise DynamicRankingError(
-            "router_dynamic cache_continuity_available must be a boolean"
-        )
+        raise DynamicRankingError("router_dynamic cache_continuity_available must be a boolean")
     normalized_candidates = _normalize_task_analyzer_chain_candidates(candidates)
     effective_config = _resolve_ranking_config(ranking_config)
     chain_policy = task_analyzer_chain_policy(effective_config)
@@ -6301,8 +6147,7 @@ async def analyze_task_with_fallback_chain(
         else (
             float(chain_policy["total_timeout_seconds"])
             if chain_policy["configured"]
-            else float(chain_policy["total_timeout_seconds"])
-            * len(normalized_candidates)
+            else float(chain_policy["total_timeout_seconds"]) * len(normalized_candidates)
         )
     )
     if not math.isfinite(total_timeout) or total_timeout <= 0.0:
@@ -6317,9 +6162,7 @@ async def analyze_task_with_fallback_chain(
         or not isinstance(configured_schema_repairs, int)
         or not 0 <= configured_schema_repairs <= 1
     ):
-        raise ValueError(
-            "task analyzer fallback chain schema repair retries must be 0 or 1"
-        )
+        raise ValueError("task analyzer fallback chain schema repair retries must be 0 or 1")
     loop = asyncio.get_running_loop()
     started_at = loop.time()
     chain_absolute_deadline = started_at + total_timeout
@@ -6421,9 +6264,7 @@ async def analyze_task_with_fallback_chain(
             "reason": (
                 ""
                 if result.schema_valid
-                else _public_task_analyzer_chain_failure_reason(
-                    result.fallback_reason
-                )
+                else _public_task_analyzer_chain_failure_reason(result.fallback_reason)
             ),
             "physical_request_count": max(
                 0,
@@ -6442,21 +6283,14 @@ async def analyze_task_with_fallback_chain(
                 ),
             )
         deadline_remaining = chain_absolute_deadline - loop.time()
-        if (
-            admission_deadline is not None
-            and 0.0 < deadline_remaining <= chain_cleanup_reserve
-        ):
+        if admission_deadline is not None and 0.0 < deadline_remaining <= chain_cleanup_reserve:
             # The remaining slice is reserved for proving the just-finished
             # stream closed.  Do not spend it on a replacement physical
             # request; wait out the authenticated Analyzer deadline instead
             # of claiming an early prefix exhaustion.
             await asyncio.sleep(deadline_remaining)
-        if (
-            loop.time() >= chain_absolute_deadline
-            or (
-                admission_deadline is not None
-                and time.monotonic() >= admission_deadline
-            )
+        if loop.time() >= chain_absolute_deadline or (
+            admission_deadline is not None and time.monotonic() >= admission_deadline
         ):
             break
 
@@ -6599,9 +6433,7 @@ def _validate_packaged_role_reliability_provenance(
             continue
         online_profile = row.get("online_profile")
         reliability = (
-            online_profile.get("role_reliability")
-            if isinstance(online_profile, Mapping)
-            else None
+            online_profile.get("role_reliability") if isinstance(online_profile, Mapping) else None
         )
         if not isinstance(reliability, Mapping):
             raise DynamicRankingError(
@@ -6654,9 +6486,29 @@ def _validate_role_reliability_snapshot_content_hash(
     if not isinstance(models, list) or (
         _role_reliability_snapshot_content_sha256(models, provenance) != recorded
     ):
-        raise DynamicRankingError(
-            "router_dynamic reliability provenance content_sha256 differs"
+        raise DynamicRankingError("router_dynamic reliability provenance content_sha256 differs")
+
+
+def _archived_pre_status_disable_registry_snapshot() -> dict[str, Any]:
+    try:
+        path = resources.files("opensquilla.provider").joinpath(
+            _PRE_STATUS_DISABLE_REGISTRY_RESOURCE
         )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - surfaced as a precise startup/build error
+        raise DynamicRankingError(
+            "router_dynamic archived model registry snapshot unavailable"
+        ) from exc
+    validated = _validate_registry_snapshot(payload)
+    _validate_packaged_role_reliability_provenance(validated)
+    if (
+        str(validated.get("snapshot_version") or "").strip()
+        != _PRE_STATUS_DISABLE_REGISTRY_SNAPSHOT_VERSION
+    ):
+        raise DynamicRankingError(
+            "router_dynamic archived model registry has an unexpected version"
+        )
+    return validated
 
 
 def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, Any]:
@@ -6673,6 +6525,8 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
     packaged_version = str(packaged.get("snapshot_version") or "").strip()
     if requested == packaged_version:
         return packaged
+    if requested == _PRE_STATUS_DISABLE_REGISTRY_SNAPSHOT_VERSION:
+        return _archived_pre_status_disable_registry_snapshot()
     if requested not in _HISTORICAL_REGISTRY_BASE_VERSIONS:
         raise DynamicRankingError(
             f"router_dynamic model registry base_version {requested!r} is not available"
@@ -6698,6 +6552,7 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         )
     if requested not in {
         recorded_base,
+        _PRE_STATUS_DISABLE_REGISTRY_BASE_VERSION,
         _PREVIOUS_REGISTRY_BASE_VERSION,
         _LEGACY_REGISTRY_BASE_VERSION,
     }:
@@ -6720,6 +6575,11 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         if not isinstance(facts, dict):
             continue
         model_id = str(facts.get("model_id") or "").strip()
+        if (
+            requested != _CURRENT_REGISTRY_BASE_VERSION
+            and model_id in _POST_CURRENT_BASE_DISABLED_MODEL_IDS
+        ):
+            facts["status"] = "enabled"
         if requested == _LEGACY_REGISTRY_BASE_VERSION:
             if model_id in _POST_BASE_DISABLED_MODEL_IDS:
                 facts["status"] = "enabled"
@@ -6886,9 +6746,7 @@ def _reset_packaged_registry_template_index_lock_after_fork() -> None:
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(
-        after_in_child=_reset_packaged_registry_template_index_lock_after_fork
-    )
+    os.register_at_fork(after_in_child=_reset_packaged_registry_template_index_lock_after_fork)
 
 
 def _compile_packaged_registry_template_index(
@@ -6927,8 +6785,7 @@ def _compile_packaged_registry_template_index(
     )
 
 
-def _packaged_registry_template_index_lookup(
-) -> tuple[_PackagedRegistryTemplateIndex, bool]:
+def _packaged_registry_template_index_lookup() -> tuple[_PackagedRegistryTemplateIndex, bool]:
     """Atomically return the packaged index and this lookup's hit status."""
 
     global _PACKAGED_REGISTRY_TEMPLATE_INDEX
@@ -6940,9 +6797,7 @@ def _packaged_registry_template_index_lookup(
         cached = _PACKAGED_REGISTRY_TEMPLATE_INDEX
         if cached is not None:
             return cached, True
-        compiled = _compile_packaged_registry_template_index(
-            _packaged_registry_snapshot()
-        )
+        compiled = _compile_packaged_registry_template_index(_packaged_registry_snapshot())
         _PACKAGED_REGISTRY_TEMPLATE_INDEX = compiled
         return compiled, False
 
@@ -7340,8 +7195,7 @@ def _validate_role_reliability(
         counts = raw.get(role)
         if not isinstance(counts, Mapping) or set(counts) != {"success", "failure"}:
             raise DynamicRankingError(
-                "router_dynamic model registry "
-                f"{identity} has invalid role_reliability.{role}"
+                f"router_dynamic model registry {identity} has invalid role_reliability.{role}"
             )
         success = _registry_nonnegative_int(
             counts.get("success"),
@@ -7670,15 +7524,8 @@ def _availability_reasons(
             role_reasons,
             (str, bytes),
         ):
-            reasons.extend(
-                str(reason).strip()
-                for reason in role_reasons
-                if str(reason).strip()
-            )
-    if (
-        role.strip().lower() == "proposer"
-        and facts.get("retry_excluded_proposer") is True
-    ):
+            reasons.extend(str(reason).strip() for reason in role_reasons if str(reason).strip())
+    if role.strip().lower() == "proposer" and facts.get("retry_excluded_proposer") is True:
         reasons.append("prior_attempt_reasoning_only_length")
     return reasons
 
@@ -7751,28 +7598,17 @@ def _hard_filter_reasons(
     if not required_modalities.issubset(supported_modalities):
         reasons.append("modality_mismatch")
     raw_required_by_role = (
-        request_context.get("required_parameters_by_role")
-        if thinking_policy is not None
-        else None
+        request_context.get("required_parameters_by_role") if thinking_policy is not None else None
     )
     required_by_role = (
-        raw_required_by_role.get(role)
-        if isinstance(raw_required_by_role, Mapping)
-        else None
+        raw_required_by_role.get(role) if isinstance(raw_required_by_role, Mapping) else None
     )
     required_parameters = (
-        {
-            str(value).strip().lower()
-            for value in required_by_role
-            if str(value).strip()
-        }
-        if isinstance(required_by_role, Sequence)
-        and not isinstance(required_by_role, (str, bytes))
+        {str(value).strip().lower() for value in required_by_role if str(value).strip()}
+        if isinstance(required_by_role, Sequence) and not isinstance(required_by_role, (str, bytes))
         else set()
     )
-    if "tools" in required_parameters and not bool(
-        model.registry_facts.get("supports_tools")
-    ):
+    if "tools" in required_parameters and not bool(model.registry_facts.get("supports_tools")):
         reasons.append("required_parameter_tools_unsupported")
 
     context_need = _context_need(
@@ -7844,9 +7680,7 @@ def _role_reliability_score(
     observed = success + failure
     prior_success = _ranking_int(ranking_config, "role_reliability", "prior_success")
     prior_failure = _ranking_int(ranking_config, "role_reliability", "prior_failure")
-    failure_rate = (failure + prior_failure) / (
-        observed + prior_success + prior_failure
-    )
+    failure_rate = (failure + prior_failure) / (observed + prior_success + prior_failure)
     penalty_weight = _ranking_number(
         ranking_config,
         "role_reliability",
@@ -8088,8 +7922,7 @@ def _cache_affinity_policy_for_topology(
         (str, bytes, bytearray),
     ):
         raise DynamicRankingError(
-            "router_dynamic ranking config session.kv_cache_affinity.topologies "
-            "must be a list"
+            "router_dynamic ranking config session.kv_cache_affinity.topologies must be a list"
         )
     return raw_policy if topology in topologies else None
 
@@ -8105,10 +7938,7 @@ def _cache_affinity_unavailable_reason_trace(
 
     if raw_reasons is None:
         return []
-    if (
-        policy is None
-        or str(policy.get("strategy") or "") != "expected_cost"
-    ):
+    if policy is None or str(policy.get("strategy") or "") != "expected_cost":
         raise DynamicRankingError(
             "router_dynamic cache affinity unavailable reasons require an "
             "active expected_cost policy"
@@ -8120,15 +7950,9 @@ def _cache_affinity_unavailable_reason_trace(
         raise DynamicRankingError(
             "router_dynamic cache affinity unavailable reasons must be a list"
         )
-    allowed_roles = (
-        {"single"}
-        if topology == "single"
-        else {"proposer", "aggregator"}
-    )
+    allowed_roles = {"single"} if topology == "single" else {"proposer", "aggregator"}
     allowed_identities = set(candidate_identities)
-    allowed_reason = (
-        CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
-    )
+    allowed_reason = CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
     normalized: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
     for raw in raw_reasons:
@@ -8150,16 +7974,10 @@ def _cache_affinity_unavailable_reason_trace(
             or reason != allowed_reason
             or key in seen
         ):
-            raise DynamicRankingError(
-                "router_dynamic cache affinity unavailable reason is invalid"
-            )
+            raise DynamicRankingError("router_dynamic cache affinity unavailable reason is invalid")
         seen.add(key)
-        normalized.append(
-            {"role": role, "identity": identity, "reason": reason}
-        )
-    normalized.sort(
-        key=lambda row: (row["role"], row["identity"], row["reason"])
-    )
+        normalized.append({"role": role, "identity": identity, "reason": reason})
+    normalized.sort(key=lambda row: (row["role"], row["identity"], row["reason"]))
     return normalized
 
 
@@ -8176,9 +7994,7 @@ def _cache_affinity_evidence(
     if cache_affinity_inputs is None:
         return None
     if not isinstance(cache_affinity_inputs, Mapping):
-        raise DynamicRankingError(
-            "router_dynamic cache_affinity_inputs must be a role mapping"
-        )
+        raise DynamicRankingError("router_dynamic cache_affinity_inputs must be a role mapping")
     role_inputs = cache_affinity_inputs.get(role)
     if role_inputs is None:
         return None
@@ -8228,16 +8044,12 @@ def _cache_affinity_adjustment_for_model(
     intent_map = intent if isinstance(intent, Mapping) else {}
     if frozen_adjustments is not None:
         role_adjustments = frozen_adjustments.get(role)
-        if role_adjustments is not None and not isinstance(
-            role_adjustments, Mapping
-        ):
+        if role_adjustments is not None and not isinstance(role_adjustments, Mapping):
             raise DynamicRankingError(
                 "router_dynamic frozen cache adjustments must be role mappings"
             )
         frozen = (
-            role_adjustments.get(model.identity)
-            if isinstance(role_adjustments, Mapping)
-            else None
+            role_adjustments.get(model.identity) if isinstance(role_adjustments, Mapping) else None
         )
         if frozen is not None:
             _validate_frozen_cache_adjustment_for_model(
@@ -8274,13 +8086,10 @@ def _cache_affinity_adjustment_for_model(
         return None
     budget = _routing_budget(request_context, ranking_config)
     price_components = _model_price_components(model)
-    input_price, output_price = (
-        price_components if price_components is not None else (None, None)
-    )
+    input_price, output_price = price_components if price_components is not None else (None, None)
     ranking_price_source = _model_price_source(model)
     if str(policy.get("strategy") or "") == "expected_cost" and (
-        ranking_price_source is None
-        or evidence.ranking_price_source != ranking_price_source
+        ranking_price_source is None or evidence.ranking_price_source != ranking_price_source
     ):
         return None
     adjustment = cache_affinity_score_adjustment(
@@ -8333,23 +8142,15 @@ def _cache_affinity_trace_number(
 ) -> float:
     value = raw.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise DynamicRankingError(
-            f"router_dynamic frozen cache adjustment {key} must be numeric"
-        )
+        raise DynamicRankingError(f"router_dynamic frozen cache adjustment {key} must be numeric")
     try:
         number = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
         raise DynamicRankingError(
             f"router_dynamic frozen cache adjustment {key} must be finite"
         ) from exc
-    if (
-        not math.isfinite(number)
-        or number < minimum
-        or (maximum is not None and number > maximum)
-    ):
-        raise DynamicRankingError(
-            f"router_dynamic frozen cache adjustment {key} is out of range"
-        )
+    if not math.isfinite(number) or number < minimum or (maximum is not None and number > maximum):
+        raise DynamicRankingError(f"router_dynamic frozen cache adjustment {key} is out of range")
     return number
 
 
@@ -8394,9 +8195,7 @@ def _cache_affinity_adjustment_from_trace(
         "cost_normalized_before",
         "cost_normalized_after",
     }
-    expected_keys = common_keys | (
-        expected_cost_keys if strategy == "expected_cost" else set()
-    )
+    expected_keys = common_keys | (expected_cost_keys if strategy == "expected_cost" else set())
     if set(raw) != expected_keys:
         raise DynamicRankingError(
             "router_dynamic frozen cache adjustment has unknown or missing keys"
@@ -8426,14 +8225,10 @@ def _cache_affinity_adjustment_from_trace(
     if strategy == "bonus":
         configured = policy.get("bonus_by_evidence")
         if not isinstance(configured, Mapping):
-            raise DynamicRankingError(
-                "router_dynamic frozen cache bonus policy is invalid"
-            )
+            raise DynamicRankingError("router_dynamic frozen cache bonus policy is invalid")
         expected_score = float(configured[evidence_kind]) * decay_factor
         if score_adjustment != expected_score or not math.isfinite(expected_score):
-            raise DynamicRankingError(
-                "router_dynamic frozen cache bonus does not match the policy"
-            )
+            raise DynamicRankingError("router_dynamic frozen cache bonus does not match the policy")
         return CacheAffinityScoreAdjustment(
             identity=identity,
             role=role,  # type: ignore[arg-type]
@@ -8443,9 +8238,7 @@ def _cache_affinity_adjustment_from_trace(
             score_adjustment=score_adjustment,
         )
     if strategy != "expected_cost":
-        raise DynamicRankingError(
-            "router_dynamic frozen cache strategy is invalid"
-        )
+        raise DynamicRankingError("router_dynamic frozen cache strategy is invalid")
     input_tokens = _cache_affinity_trace_int(raw, "N")
     cache_tokens = _cache_affinity_trace_int(raw, "K")
     observed_cache_tokens = _cache_affinity_trace_int(
@@ -8459,14 +8252,10 @@ def _cache_affinity_adjustment_from_trace(
         or cache_tokens > input_tokens
         or cache_tokens != min(input_tokens, observed_cache_tokens)
     ):
-        raise DynamicRankingError(
-            "router_dynamic frozen cache token projection is invalid"
-        )
+        raise DynamicRankingError("router_dynamic frozen cache token projection is invalid")
     price_source = str(raw.get("price_source") or "").strip()
     if not price_source:
-        raise DynamicRankingError(
-            "router_dynamic frozen cache price source is missing"
-        )
+        raise DynamicRankingError("router_dynamic frozen cache price source is missing")
     return CacheAffinityScoreAdjustment(
         identity=identity,
         role=role,  # type: ignore[arg-type]
@@ -8530,9 +8319,7 @@ def _validate_frozen_cache_adjustment_for_model(
         or adjustment.role != role
         or adjustment.strategy != str(policy.get("strategy") or "")
     ):
-        raise DynamicRankingError(
-            "router_dynamic frozen cache adjustment model binding is invalid"
-        )
+        raise DynamicRankingError("router_dynamic frozen cache adjustment model binding is invalid")
     intent = task_profile.get("session_intent")
     intent_map = intent if isinstance(intent, Mapping) else {}
     if (
@@ -8546,21 +8333,16 @@ def _validate_frozen_cache_adjustment_for_model(
         )
         or adjustment.decay_factor <= 0.0
     ):
-        raise DynamicRankingError(
-            "router_dynamic frozen cache adjustment violates the intent gate"
-        )
+        raise DynamicRankingError("router_dynamic frozen cache adjustment violates the intent gate")
     if adjustment.strategy == "bonus":
         configured = policy.get("bonus_by_evidence")
         expected = (
-            float(configured[adjustment.evidence_kind])
-            * adjustment.decay_factor
+            float(configured[adjustment.evidence_kind]) * adjustment.decay_factor
             if isinstance(configured, Mapping)
             else math.nan
         )
         if adjustment.score_adjustment != expected:
-            raise DynamicRankingError(
-                "router_dynamic frozen cache bonus does not match the model"
-            )
+            raise DynamicRankingError("router_dynamic frozen cache bonus does not match the model")
         return
     budget = _routing_budget(request_context, ranking_config)
     expected_input_tokens = budget["input"] + budget["tools"]
@@ -8568,14 +8350,12 @@ def _validate_frozen_cache_adjustment_for_model(
         expected_input_tokens += proposer_count * budget["candidate"]
     probabilities = policy.get("hit_probability_by_evidence")
     expected_probability = (
-        float(probabilities[adjustment.evidence_kind])
-        * adjustment.decay_factor
+        float(probabilities[adjustment.evidence_kind]) * adjustment.decay_factor
         if isinstance(probabilities, Mapping)
         else math.nan
     )
     expected_score = cost_weight * (
-        adjustment.cost_normalized_before
-        - adjustment.cost_normalized_after
+        adjustment.cost_normalized_before - adjustment.cost_normalized_after
     )
     price_components = _model_price_components(model)
     if price_components is None:
@@ -8583,10 +8363,7 @@ def _validate_frozen_cache_adjustment_for_model(
             "router_dynamic frozen expected-cost adjustment lacks decomposable pricing"
         )
     ranking_price_source = _model_price_source(model)
-    if (
-        ranking_price_source is None
-        or adjustment.price_source != ranking_price_source
-    ):
+    if ranking_price_source is None or adjustment.price_source != ranking_price_source:
         raise DynamicRankingError(
             "router_dynamic frozen expected-cost adjustment price source does not match the model"
         )
@@ -8622,16 +8399,11 @@ def _validate_frozen_cache_adjustment_for_model(
     ) / 1_000_000
     expected_input_cost = (
         adjustment.hit_probability * expected_hit
-        + (1.0 - adjustment.hit_probability)
-        * expected_miss
+        + (1.0 - adjustment.hit_probability) * expected_miss
     )
-    expected_effective_rate = (
-        expected_input_cost / expected_input_tokens * 1_000_000
-    )
+    expected_effective_rate = expected_input_cost / expected_input_tokens * 1_000_000
     old_rate = input_weight * input_price + output_weight * output_price
-    new_rate = old_rate + input_weight * (
-        expected_effective_rate - input_price
-    )
+    new_rate = old_rate + input_weight * (expected_effective_rate - input_price)
     expected_normalized_before = _clamp(old_rate / price_reference)
     expected_normalized_after = _clamp(new_rate / price_reference)
     if (
@@ -8641,12 +8413,9 @@ def _validate_frozen_cache_adjustment_for_model(
         or adjustment.baseline_input_cost_usd != expected_baseline
         or adjustment.cache_hit_input_cost_usd != expected_hit
         or adjustment.cache_miss_input_cost_usd != expected_miss
-        or adjustment.effective_input_per_million
-        != expected_effective_rate
-        or adjustment.cost_normalized_before
-        != expected_normalized_before
-        or adjustment.cost_normalized_after
-        != expected_normalized_after
+        or adjustment.effective_input_per_million != expected_effective_rate
+        or adjustment.cost_normalized_before != expected_normalized_before
+        or adjustment.cost_normalized_after != expected_normalized_after
         or adjustment.score_adjustment != expected_score
     ):
         raise DynamicRankingError(
@@ -8673,9 +8442,7 @@ def _cache_affinity_adjustments_from_trace(
         adjustment = _cache_affinity_adjustment_from_trace(raw, policy=policy)
         role_rows = result.setdefault(adjustment.role, {})
         if adjustment.identity in role_rows:
-            raise DynamicRankingError(
-                "router_dynamic frozen cache adjustment table has duplicates"
-            )
+            raise DynamicRankingError("router_dynamic frozen cache adjustment table has duplicates")
         role_rows[adjustment.identity] = adjustment
     return result
 
@@ -8865,9 +8632,7 @@ def _apply_session_adjustment(
     cache_continuity_available: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(cache_continuity_available, bool):
-        raise DynamicRankingError(
-            "router_dynamic cache_continuity_available must be a boolean"
-        )
+        raise DynamicRankingError("router_dynamic cache_continuity_available must be a boolean")
     before = copy.deepcopy(dict(task_profile))
     adjusted = copy.deepcopy(dict(task_profile))
     intent = adjusted.get("session_intent")
@@ -9234,10 +8999,7 @@ def _proposer_global_ceiling(
     """Largest proposer set allowed by any configured routing envelope."""
 
     return max(
-        *(
-            _ranking_int(ranking_config, "proposer_count", "by_tier", tier, "max")
-            for tier in TIERS
-        ),
+        *(_ranking_int(ranking_config, "proposer_count", "by_tier", tier, "max") for tier in TIERS),
         _ranking_int(ranking_config, "proposer_count", "high_risk", "max"),
     )
 
@@ -9609,9 +9371,7 @@ def _single_model_context_need(
         max(0, _as_int(budget.get("estimated_input_tokens"), 0)),
         bucket_min_tokens.get(bucket, bucket_min_tokens[default_bucket]),
     )
-    minimum_tokens = _ranking_int(
-        ranking_config, "context", "output_budget", "minimum_tokens"
-    )
+    minimum_tokens = _ranking_int(ranking_config, "context", "output_budget", "minimum_tokens")
     return (
         input_tokens
         + max(0, _as_int(budget.get("tool_log_tokens"), 0))
@@ -9637,9 +9397,7 @@ def _single_model_direct_output_tokens(
             "direct_output_tokens budget"
         )
 
-    runtime_output_tokens = model.registry_facts.get(
-        "runtime_direct_output_tokens"
-    )
+    runtime_output_tokens = model.registry_facts.get("runtime_direct_output_tokens")
     if runtime_output_tokens is None:
         # Compatibility for archived/external snapshots that predate runtime
         # deployment enrichment. The request scalar is the audited safe upper
@@ -9691,11 +9449,9 @@ def _single_model_filter_reasons(
         reasons.append("status_not_enabled")
     if requires_tools and model.registry_facts.get("supports_tools") is not True:
         reasons.append("required_parameter_tools_unsupported")
-    direct_output_tokens, direct_output_tokens_source = (
-        _single_model_direct_output_tokens(
-            model,
-            request_context=request_context,
-        )
+    direct_output_tokens, direct_output_tokens_source = _single_model_direct_output_tokens(
+        model,
+        request_context=request_context,
     )
     context_need = _single_model_context_need(
         task_profile=task_profile,
@@ -9731,10 +9487,7 @@ def rank_single_model(
         Mapping[str, CacheAffinityEvidenceInput],
     ]
     | None = None,
-    _cache_affinity_unavailable_reasons: Sequence[
-        Mapping[str, Any]
-    ]
-    | None = None,
+    _cache_affinity_unavailable_reasons: Sequence[Mapping[str, Any]] | None = None,
     _cache_affinity_replay_adjustments: Mapping[
         str,
         Mapping[str, CacheAffinityScoreAdjustment],
@@ -9744,17 +9497,13 @@ def rank_single_model(
     """Select one enabled direct-call model by proposer base score."""
 
     if not isinstance(requires_tools, bool):
-        raise DynamicRankingError(
-            "router_dynamic single-model requires_tools must be a boolean"
-        )
+        raise DynamicRankingError("router_dynamic single-model requires_tools must be a boolean")
     if not isinstance(ranking_thinking_assignment_enabled, bool):
         raise DynamicRankingError(
             "router_dynamic ranking_thinking_assignment_enabled must be a boolean"
         )
     if not isinstance(registry_snapshot, Mapping):
-        raise DynamicRankingError(
-            "router_dynamic single-model registry snapshot must be an object"
-        )
+        raise DynamicRankingError("router_dynamic single-model registry snapshot must be an object")
 
     effective_ranking_config = _prepare_effective_ranking_config(
         ranking_config,
@@ -9764,10 +9513,7 @@ def rank_single_model(
         effective_ranking_config,
         "single",
     )
-    if (
-        _cache_affinity_replay_adjustments is not None
-        and cache_affinity_policy is None
-    ):
+    if _cache_affinity_replay_adjustments is not None and cache_affinity_policy is None:
         raise DynamicRankingError(
             "router_dynamic frozen cache adjustments require an enabled single policy"
         )
@@ -9777,13 +9523,10 @@ def rank_single_model(
         "models": copy.deepcopy(registry_snapshot.get("models")),
     }
     if not ranking_thinking_assignment_enabled:
-        model_registry_snapshot = _legacy_registry_snapshot_projection(
-            model_registry_snapshot
-        )
+        model_registry_snapshot = _legacy_registry_snapshot_projection(model_registry_snapshot)
     if (
         ranking_thinking_assignment_enabled
-        and effective_ranking_config.get("schema_version")
-        != RANKING_CONFIG_SCHEMA_VERSION
+        and effective_ranking_config.get("schema_version") != RANKING_CONFIG_SCHEMA_VERSION
     ):
         raise DynamicRankingError(
             f"router_dynamic thinking_assignment requires {RANKING_CONFIG_SCHEMA_VERSION}"
@@ -9834,16 +9577,13 @@ def rank_single_model(
     model_identities = [model.identity.casefold() for model in models]
     if len(set(model_identities)) != len(model_identities):
         raise DynamicRankingError(
-            "router_dynamic single-model registry snapshot contains duplicate "
-            "model identities"
+            "router_dynamic single-model registry snapshot contains duplicate model identities"
         )
-    cache_affinity_unavailable_reasons = (
-        _cache_affinity_unavailable_reason_trace(
-            _cache_affinity_unavailable_reasons,
-            policy=cache_affinity_policy,
-            topology="single",
-            candidate_identities=[model.identity for model in models],
-        )
+    cache_affinity_unavailable_reasons = _cache_affinity_unavailable_reason_trace(
+        _cache_affinity_unavailable_reasons,
+        policy=cache_affinity_policy,
+        topology="single",
+        candidate_identities=[model.identity for model in models],
     )
 
     user_profile_enabled = user_profile is not None
@@ -9897,9 +9637,7 @@ def rank_single_model(
         log.warning(
             "llm_ensemble.router_dynamic.no_eligible_single_model",
             decision_id=decision_id,
-            registry_snapshot_version=model_registry_snapshot.get(
-                "snapshot_version"
-            ),
+            registry_snapshot_version=model_registry_snapshot.get("snapshot_version"),
             filter_reason_counts=reason_counts,
         )
         raise DynamicRankingError(
@@ -9936,9 +9674,7 @@ def rank_single_model(
             )
             if adjustment is not None:
                 row["cache_affinity_adjustment"] = adjustment
-                row["final_score"] = (
-                    _as_float(row["base"]) + adjustment.score_adjustment
-                )
+                row["final_score"] = _as_float(row["base"]) + adjustment.score_adjustment
     score_rows.sort(
         key=lambda row: (
             -_as_float(row.get("final_score"), row["base"]),
@@ -9955,8 +9691,8 @@ def rank_single_model(
         for row in score_rows
         if abs(_as_float(row.get("session_score"))) > session_nonzero_epsilon
     )
-    session_trace["sticky_applied"] = (
-        session_trace["intent"] == "continue" and bool(session_adjusted_ids)
+    session_trace["sticky_applied"] = session_trace["intent"] == "continue" and bool(
+        session_adjusted_ids
     )
     session_trace["adjusted_model_ids"] = session_adjusted_ids
 
@@ -9982,18 +9718,14 @@ def rank_single_model(
             policy=thinking_policy,
         )
         thinking_assignment = {
-            "proposers": {
-                assigned_model.identity: assigned_model.effective_thinking_level
-            },
+            "proposers": {assigned_model.identity: assigned_model.effective_thinking_level},
             "thinking_policy_version": str(thinking_policy["policy_version"]),
         }
         thinking_assignment_details = {
             "effective_tier": effective_tier,
             "proposers": [detail],
         }
-        thinking_assignment_reasons = {
-            "proposers": {detail["identity"]: list(detail["reasons"])}
-        }
+        thinking_assignment_reasons = {"proposers": {detail["identity"]: list(detail["reasons"])}}
         if unsupported is not None:
             thinking_unsupported_fallbacks.append(unsupported)
 
@@ -10012,9 +9744,7 @@ def rank_single_model(
     }
     trace_registry_snapshot = copy.deepcopy(model_registry_snapshot)
     trace_request_context = copy.deepcopy(dict(request_context))
-    trace_request_context["snapshot_hash"] = _request_context_hash(
-        trace_request_context
-    )
+    trace_request_context["snapshot_hash"] = _request_context_hash(trace_request_context)
     _assert_public_ranking_trace_payload(
         trace_registry_snapshot,
         label="registry_snapshot",
@@ -10024,9 +9754,7 @@ def rank_single_model(
         label="request_context",
     )
     base_ranking_version = (
-        RANKING_VERSION
-        if ranking_thinking_assignment_enabled
-        else LEGACY_RANKING_VERSION
+        RANKING_VERSION if ranking_thinking_assignment_enabled else LEGACY_RANKING_VERSION
     )
     trace = {
         "strategy": "router_dynamic",
@@ -10034,47 +9762,31 @@ def rank_single_model(
         "decision_id": decision_id,
         "ranking_version": SINGLE_MODEL_RANKING_VERSION,
         "base_ranking_version": base_ranking_version,
-        "ranking_config_schema_version": str(
-            effective_ranking_config["schema_version"]
-        ),
+        "ranking_config_schema_version": str(effective_ranking_config["schema_version"]),
         "ranking_config_version": str(effective_ranking_config["config_version"]),
         "ranking_config_hash": ranking_config_hash,
         "task_profile_schema_version": TASK_PROFILE_SCHEMA_VERSION,
-        "registry_snapshot_version": str(
-            model_registry_snapshot.get("snapshot_version") or ""
-        ),
+        "registry_snapshot_version": str(model_registry_snapshot.get("snapshot_version") or ""),
         "registry_snapshot_hash": registry_snapshot_hash,
         "registry_snapshot": trace_registry_snapshot,
         "routed_tier": _router_tier(routed_tier, effective_ranking_config),
-        "routing_confidence": round(
-            _clamp(routing_confidence), profile_decimal_places
-        ),
+        "routing_confidence": round(_clamp(routing_confidence), profile_decimal_places),
         "effective_tier": effective_tier,
         "effective_router_tier": router_tier_by_effective_tier[effective_tier],
         "task_analyzer": task_analysis.trace(effective_ranking_config),
         "task_profile": copy.deepcopy(task_profile),
         "task_profile_hash": _canonical_hash(task_profile),
-        "task_profile_pre_escalation": session_trace.pop(
-            "task_profile_pre_escalation"
-        ),
-        "task_profile_post_escalation": session_trace.pop(
-            "task_profile_post_escalation"
-        ),
+        "task_profile_pre_escalation": session_trace.pop("task_profile_pre_escalation"),
+        "task_profile_post_escalation": session_trace.pop("task_profile_post_escalation"),
         "session": session_trace,
         "user_profile_enabled": user_profile_enabled,
-        "user_profile_version": str(
-            effective_user_profile.get("profile_version") or ""
-        ),
-        "user_profile_source": str(
-            effective_user_profile.get("profile_source") or ""
-        ),
+        "user_profile_version": str(effective_user_profile.get("profile_version") or ""),
+        "user_profile_source": str(effective_user_profile.get("profile_source") or ""),
         "request_context_hash": trace_request_context["snapshot_hash"],
         "request_context": trace_request_context,
         "candidate_pool_size": len(models),
         "candidate_pool": [
-            model.trace(
-                include_thinking_contract=ranking_thinking_assignment_enabled
-            )
+            model.trace(include_thinking_contract=ranking_thinking_assignment_enabled)
             for model in models
         ],
         "hard_filter": {
@@ -10082,9 +9794,7 @@ def rank_single_model(
             "eligible_proposer_ids": [model.identity for model in eligible],
             "filter_reason_counts": reason_counts,
         },
-        "model_scores": [
-            _score_trace(row, effective_ranking_config) for row in score_rows
-        ],
+        "model_scores": [_score_trace(row, effective_ranking_config) for row in score_rows],
         "selection_policy": "base_score_top1",
         "selection_tie_breakers": [
             "S_base_desc",
@@ -10097,16 +9807,10 @@ def rank_single_model(
         "stop_reason": "single_model_top1_selected",
     }
     if cache_affinity_policy is not None:
-        trace["ranking_parameters"] = _detached_ranking_config(
-            effective_ranking_config
-        )
+        trace["ranking_parameters"] = _detached_ranking_config(effective_ranking_config)
         trace["requires_tools"] = requires_tools
-        trace["ranking_thinking_assignment_enabled"] = (
-            ranking_thinking_assignment_enabled
-        )
-        trace["cache_continuity_available"] = bool(
-            cache_continuity_available
-        )
+        trace["ranking_thinking_assignment_enabled"] = ranking_thinking_assignment_enabled
+        trace["cache_continuity_available"] = bool(cache_continuity_available)
         trace["cache_affinity_inputs"] = [
             adjustment.trace()
             for row in score_rows
@@ -10118,27 +9822,17 @@ def rank_single_model(
         trace["selection_policy"] = "cache_adjusted_base_score_top1"
         trace["selection_tie_breakers"][0] = "S_final_desc"
         if cache_affinity_unavailable_reasons:
-            trace["cache_affinity_unavailable_reasons"] = (
-                cache_affinity_unavailable_reasons
-            )
+            trace["cache_affinity_unavailable_reasons"] = cache_affinity_unavailable_reasons
     if thinking_policy is not None:
         trace.update(
             {
                 "ranking_thinking_assignment_enabled": True,
-                "thinking_physical_evidence_schema": (
-                    THINKING_PHYSICAL_EVIDENCE_SCHEMA
-                ),
+                "thinking_physical_evidence_schema": (THINKING_PHYSICAL_EVIDENCE_SCHEMA),
                 "thinking_policy_version": str(thinking_policy["policy_version"]),
                 "thinking_assignment": copy.deepcopy(thinking_assignment),
-                "thinking_assignment_details": copy.deepcopy(
-                    thinking_assignment_details
-                ),
-                "assignment_reasons": copy.deepcopy(
-                    thinking_assignment_reasons
-                ),
-                "unsupported_level_fallbacks": copy.deepcopy(
-                    thinking_unsupported_fallbacks
-                ),
+                "thinking_assignment_details": copy.deepcopy(thinking_assignment_details),
+                "assignment_reasons": copy.deepcopy(thinking_assignment_reasons),
+                "unsupported_level_fallbacks": copy.deepcopy(thinking_unsupported_fallbacks),
                 "policy_versions": {
                     "ranking": base_ranking_version,
                     "thinking": str(thinking_policy["policy_version"]),
@@ -10159,9 +9853,7 @@ def rank_single_model(
         effective_tier=effective_tier,
         trace=trace,
         thinking_assignment=copy.deepcopy(thinking_assignment),
-        thinking_assignment_details=copy.deepcopy(
-            thinking_assignment_details
-        ),
+        thinking_assignment_details=copy.deepcopy(thinking_assignment_details),
     )
 
 
@@ -10179,9 +9871,7 @@ def _selection_roster_counts(
 
     proposer_count = _ranking_mapping(ranking_config, "proposer_count")
     aggregator = _ranking_mapping(ranking_config, "aggregator")
-    has_roster_policy = (
-        "backup_count" in proposer_count and "candidate_count" in aggregator
-    )
+    has_roster_policy = "backup_count" in proposer_count and "candidate_count" in aggregator
     if has_roster_policy:
         if legacy_proposer_backup_count is not None:
             raise DynamicRankingError(
@@ -10192,12 +9882,8 @@ def _selection_roster_counts(
             _ranking_int(ranking_config, "aggregator", "candidate_count"),
             _ranking_int(ranking_config, "proposer_count", "backup_count"),
         )
-    if not _is_pre_roster_ranking_config_version(
-        ranking_config.get("config_version")
-    ):
-        raise DynamicRankingError(
-            "router_dynamic ranking config lacks the selection roster policy"
-        )
+    if not _is_pre_roster_ranking_config_version(ranking_config.get("config_version")):
+        raise DynamicRankingError("router_dynamic ranking config lacks the selection roster policy")
     if (
         legacy_proposer_backup_count is None
         or isinstance(legacy_proposer_backup_count, bool)
@@ -10205,8 +9891,7 @@ def _selection_roster_counts(
         or legacy_proposer_backup_count < 0
     ):
         raise DynamicRankingError(
-            "router_dynamic pre-roster replay requires a non-negative legacy "
-            "proposer backup count"
+            "router_dynamic pre-roster replay requires a non-negative legacy proposer backup count"
         )
     return 3, legacy_proposer_backup_count
 
@@ -10233,10 +9918,7 @@ def rank_models(
         Mapping[str, CacheAffinityEvidenceInput],
     ]
     | None = None,
-    _cache_affinity_unavailable_reasons: Sequence[
-        Mapping[str, Any]
-    ]
-    | None = None,
+    _cache_affinity_unavailable_reasons: Sequence[Mapping[str, Any]] | None = None,
     _cache_affinity_replay_adjustments: Mapping[
         str,
         Mapping[str, CacheAffinityScoreAdjustment],
@@ -10249,13 +9931,8 @@ def rank_models(
 
     if not isinstance(_emit_logs, bool):
         raise DynamicRankingError("router_dynamic _emit_logs must be a boolean")
-    if (
-        _stage_observability_out is not None
-        and type(_stage_observability_out) is not dict
-    ):
-        raise DynamicRankingError(
-            "router_dynamic stage observability output must be a dict"
-        )
+    if _stage_observability_out is not None and type(_stage_observability_out) is not dict:
+        raise DynamicRankingError("router_dynamic stage observability output must be a dict")
     if _stage_observability_out is not None:
         _stage_observability_out.pop("hard_filter_ms", None)
         _stage_observability_out.pop("score_ms", None)
@@ -10283,21 +9960,16 @@ def rank_models(
         or proposer_max_tokens_cap < 2
         or isinstance(proposer_visible_answer_reserve_tokens, bool)
         or not isinstance(proposer_visible_answer_reserve_tokens, int)
-        or not 1
-        <= proposer_visible_answer_reserve_tokens
-        < proposer_max_tokens_cap
+        or not 1 <= proposer_visible_answer_reserve_tokens < proposer_max_tokens_cap
     ):
         raise DynamicRankingError(
             "router_dynamic proposer visible reserve must be positive and "
             "smaller than proposer max tokens cap"
         )
-    if (
-        proposer_recovery_quorum is not None
-        and (
-            isinstance(proposer_recovery_quorum, bool)
-            or not isinstance(proposer_recovery_quorum, int)
-            or proposer_recovery_quorum <= 0
-        )
+    if proposer_recovery_quorum is not None and (
+        isinstance(proposer_recovery_quorum, bool)
+        or not isinstance(proposer_recovery_quorum, int)
+        or proposer_recovery_quorum <= 0
     ):
         raise DynamicRankingError(
             "router_dynamic proposer recovery quorum must be a positive integer"
@@ -10310,10 +9982,7 @@ def rank_models(
         effective_ranking_config,
         "multiple",
     )
-    if (
-        _cache_affinity_replay_adjustments is not None
-        and cache_affinity_policy is None
-    ):
+    if _cache_affinity_replay_adjustments is not None and cache_affinity_policy is None:
         raise DynamicRankingError(
             "router_dynamic frozen cache adjustments require an enabled multiple policy"
         )
@@ -10344,10 +10013,7 @@ def rank_models(
         legacy_proposer_backup_count=legacy_proposer_backup_count,
     )
     proposer_global_ceiling = _proposer_global_ceiling(effective_ranking_config)
-    if (
-        proposer_recovery_quorum is not None
-        and proposer_recovery_quorum > proposer_global_ceiling
-    ):
+    if proposer_recovery_quorum is not None and proposer_recovery_quorum > proposer_global_ceiling:
         raise DynamicRankingError(
             "router_dynamic configured proposer recovery quorum "
             f"{proposer_recovery_quorum} exceeds the global proposer ceiling "
@@ -10391,13 +10057,11 @@ def rank_models(
         raise DynamicRankingError(
             "router_dynamic registry snapshot contains duplicate model identities"
         )
-    cache_affinity_unavailable_reasons = (
-        _cache_affinity_unavailable_reason_trace(
-            _cache_affinity_unavailable_reasons,
-            policy=cache_affinity_policy,
-            topology="multiple",
-            candidate_identities=[model.identity for model in models],
-        )
+    cache_affinity_unavailable_reasons = _cache_affinity_unavailable_reason_trace(
+        _cache_affinity_unavailable_reasons,
+        policy=cache_affinity_policy,
+        topology="multiple",
+        candidate_identities=[model.identity for model in models],
     )
     registry_snapshot_hash = _canonical_hash(registry_snapshot)
     user_profile_enabled = user_profile is not None
@@ -10423,9 +10087,7 @@ def rank_models(
         bound_reasons.append("proposer_recovery_quorum")
 
     proposer_filter_started_ns = (
-        time.monotonic_ns()
-        if _stage_observability_out is not None
-        else None
+        time.monotonic_ns() if _stage_observability_out is not None else None
     )
     proposer_filters: list[dict[str, Any]] = []
     eligible: list[RankedModel] = []
@@ -10517,11 +10179,7 @@ def rank_models(
             ),
         )
 
-    score_started_ns = (
-        time.monotonic_ns()
-        if _stage_observability_out is not None
-        else None
-    )
+    score_started_ns = time.monotonic_ns() if _stage_observability_out is not None else None
     score_rows = [
         _base_score_row(
             model,
@@ -10692,12 +10350,8 @@ def rank_models(
                 - rerank_similarity_penalty * similarity
             )
             if _resource_aware_proposer_rerank_enabled(effective_ranking_config):
-                marginal -= _as_float(row["cost_weight"]) * _as_float(
-                    row["cost_normalized"]
-                )
-                marginal -= _as_float(row["latency_weight"]) * _as_float(
-                    row["latency_normalized"]
-                )
+                marginal -= _as_float(row["cost_weight"]) * _as_float(row["cost_normalized"])
+                marginal -= _as_float(row["latency_weight"]) * _as_float(row["latency_normalized"])
             cache_adjustment = row.get("cache_affinity_adjustment")
             if isinstance(cache_adjustment, CacheAffinityScoreAdjustment):
                 marginal += cache_adjustment.score_adjustment
@@ -10799,11 +10453,7 @@ def rank_models(
                             score_decimal_places,
                         ),
                         **(
-                            {
-                                "cache_affinity": candidate[
-                                    "cache_affinity_adjustment"
-                                ].trace()
-                            }
+                            {"cache_affinity": candidate["cache_affinity_adjustment"].trace()}
                             if isinstance(
                                 candidate.get("cache_affinity_adjustment"),
                                 CacheAffinityScoreAdjustment,
@@ -10860,15 +10510,9 @@ def rank_models(
             f"a feasible aggregator (stop_reason={stop_reason})",
             reason="proposer_recovery_quorum_unreachable",
         )
-    score_ms = (
-        _ranking_stage_elapsed_ms(score_started_ns)
-        if score_started_ns is not None
-        else 0
-    )
+    score_ms = _ranking_stage_elapsed_ms(score_started_ns) if score_started_ns is not None else 0
     aggregator_filter_started_ns = (
-        time.monotonic_ns()
-        if _stage_observability_out is not None
-        else None
+        time.monotonic_ns() if _stage_observability_out is not None else None
     )
     aggregator_rows, aggregator_filters = _aggregator_rows(
         models,
@@ -10923,9 +10567,7 @@ def rank_models(
     aggregator_row = aggregator_candidate_rows[0]
     aggregator = aggregator_row["model"]
     aggregator_candidates = tuple(row["model"] for row in aggregator_candidate_rows)
-    aggregator_candidate_identities = {
-        model.identity for model in aggregator_candidates
-    }
+    aggregator_candidate_identities = {model.identity for model in aggregator_candidates}
     backup_rows = [
         row
         for row in quality_candidate_rows
@@ -10989,9 +10631,7 @@ def rank_models(
             policy=thinking_policy,
         )
         assigned_fallbacks: list[RankedModel] = []
-        aggregator_candidate_details = [
-            copy.deepcopy(thinking_assignment_details["aggregator"])
-        ]
+        aggregator_candidate_details = [copy.deepcopy(thinking_assignment_details["aggregator"])]
         for fallback in aggregator_candidates[1:]:
             assigned_fallback, fallback_detail, unsupported = _resolve_model_thinking_level(
                 fallback,
@@ -11013,9 +10653,7 @@ def rank_models(
         # Recovery candidates need their own replay-bound initial/native
         # levels and ordered provider-rejection chain so an execution receipt
         # for a secondary aggregator cannot masquerade as a primary mutation.
-        thinking_assignment_details["aggregator_candidates"] = (
-            aggregator_candidate_details
-        )
+        thinking_assignment_details["aggregator_candidates"] = aggregator_candidate_details
         (
             proposer_target,
             proposer_reasons,
@@ -11030,15 +10668,13 @@ def rank_models(
         assigned_backups: list[RankedModel] = []
         backup_details: list[dict[str, Any]] = []
         for backup in backup_proposers:
-            assigned_backup, backup_detail, unsupported = (
-                _resolve_model_thinking_level(
-                    backup,
-                    role="proposer_backup",
-                    requested_level=proposer_target,
-                    reasons=proposer_reasons,
-                    risk_floor=proposer_risk_floor,
-                    policy=thinking_policy,
-                )
+            assigned_backup, backup_detail, unsupported = _resolve_model_thinking_level(
+                backup,
+                role="proposer_backup",
+                requested_level=proposer_target,
+                reasons=proposer_reasons,
+                risk_floor=proposer_risk_floor,
+                policy=thinking_policy,
             )
             assigned_backups.append(assigned_backup)
             backup_details.append(backup_detail)
@@ -11141,23 +10777,17 @@ def rank_models(
             "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
             "configured_backup_count": proposer_backup_count,
             "effective_backup_count": len(assigned_backup_proposers),
-            "max_additional_physical_requests": (
-                proposer_recovery_max_additional_calls
-            ),
+            "max_additional_physical_requests": (proposer_recovery_max_additional_calls),
             "quorum_required": recovery_quorum,
             "max_tokens_cap": proposer_max_tokens_cap,
-            "visible_answer_reserve_tokens": (
-                proposer_visible_answer_reserve_tokens
-            ),
+            "visible_answer_reserve_tokens": (proposer_visible_answer_reserve_tokens),
             "thinking_downgrade_order": ["one_strictly_lower"],
             "transient_same_model_retries": 1,
             "backup_reasoning_downgrades": 1,
         },
         "selected_A": aggregator.identity,
         "configured_aggregator_candidate_count": aggregator_candidate_count,
-        "effective_aggregator_candidate_count": len(
-            assigned_aggregator_candidates
-        ),
+        "effective_aggregator_candidate_count": len(assigned_aggregator_candidates),
         "aggregator_candidates": [model.identity for model in assigned_aggregator_candidates],
         "exploration": copy.deepcopy(
             dict(_ranking_mapping(effective_ranking_config, "exploration"))
@@ -11177,9 +10807,7 @@ def rank_models(
         },
     }
     if cache_affinity_policy is not None:
-        trace["cache_continuity_available"] = bool(
-            cache_continuity_available
-        )
+        trace["cache_continuity_available"] = bool(cache_continuity_available)
         trace["cache_affinity_inputs"] = [
             adjustment.trace()
             for row in [*quality_candidate_rows, *aggregator_rows]
@@ -11189,16 +10817,12 @@ def rank_models(
             )
         ]
         if cache_affinity_unavailable_reasons:
-            trace["cache_affinity_unavailable_reasons"] = (
-                cache_affinity_unavailable_reasons
-            )
+            trace["cache_affinity_unavailable_reasons"] = cache_affinity_unavailable_reasons
     if thinking_policy is not None:
         trace.update(
             {
                 "ranking_thinking_assignment_enabled": True,
-                "thinking_physical_evidence_schema": (
-                    THINKING_PHYSICAL_EVIDENCE_SCHEMA
-                ),
+                "thinking_physical_evidence_schema": (THINKING_PHYSICAL_EVIDENCE_SCHEMA),
                 "thinking_policy_version": str(thinking_policy["policy_version"]),
                 "thinking_assignment": copy.deepcopy(thinking_assignment),
                 "thinking_assignment_details": copy.deepcopy(thinking_assignment_details),
@@ -11333,10 +10957,7 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
         )
     except DynamicRankingError:
         return ["single_ranking_replay_secret_evidence"]
-    if (
-        _canonical_hash(registry_snapshot)
-        != str(trace.get("registry_snapshot_hash") or "")
-    ):
+    if _canonical_hash(registry_snapshot) != str(trace.get("registry_snapshot_hash") or ""):
         return ["single_replay_registry_snapshot_hash_mismatch"]
     context_hash = _request_context_hash(request_context)
     if (
@@ -11344,10 +10965,7 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
         or str(trace.get("request_context_hash") or "") != context_hash
     ):
         return ["single_replay_request_context_hash_mismatch"]
-    if (
-        _canonical_hash(ranking_parameters)
-        != str(trace.get("ranking_config_hash") or "")
-    ):
+    if _canonical_hash(ranking_parameters) != str(trace.get("ranking_config_hash") or ""):
         return ["single_replay_ranking_config_hash_mismatch"]
     cache_policy = _cache_affinity_policy_for_topology(
         ranking_parameters,
@@ -11374,9 +10992,7 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
             source=str(analyzer.get("source") or "replay"),
             schema_valid=analyzer.get("schema_valid") is True,
             confidence=_clamp(_as_float(analyzer.get("confidence"), 0.0)),
-            analyzer_version=str(
-                analyzer.get("analyzer_version") or TASK_ANALYZER_VERSION
-            ),
+            analyzer_version=str(analyzer.get("analyzer_version") or TASK_ANALYZER_VERSION),
             fallback_reason=str(analyzer.get("fallback_reason") or ""),
             usage=(
                 copy.deepcopy(dict(analyzer["usage"]))
@@ -11386,8 +11002,7 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
             provider_id=str(analyzer.get("provider") or ""),
             model_id=str(analyzer.get("model") or ""),
             normalization_warnings=tuple(
-                str(value)
-                for value in analyzer.get("normalization_warnings") or []
+                str(value) for value in analyzer.get("normalization_warnings") or []
             ),
             replay=(
                 copy.deepcopy(dict(analyzer["replay"]))
@@ -11412,9 +11027,7 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
             decision_id=str(trace.get("decision_id") or ""),
             ranking_thinking_assignment_enabled=thinking_enabled,
             cache_continuity_available=raw_continuity,
-            _cache_affinity_unavailable_reasons=trace.get(
-                "cache_affinity_unavailable_reasons"
-            ),
+            _cache_affinity_unavailable_reasons=trace.get("cache_affinity_unavailable_reasons"),
             _cache_affinity_replay_adjustments=frozen_adjustments,
         ).trace
     except (
@@ -11529,9 +11142,7 @@ def ranking_trace_replay_reasons(
         "proposer_recovery_policy",
     }
     present_proposer_recovery_fields = {
-        field_name
-        for field_name in proposer_recovery_fields
-        if field_name in trace
+        field_name for field_name in proposer_recovery_fields if field_name in trace
     }
     if present_proposer_recovery_fields and (
         present_proposer_recovery_fields != proposer_recovery_fields
@@ -11542,9 +11153,7 @@ def ranking_trace_replay_reasons(
         "effective_aggregator_candidate_count",
     }
     present_aggregator_roster_fields = {
-        field_name
-        for field_name in aggregator_roster_fields
-        if field_name in trace
+        field_name for field_name in aggregator_roster_fields if field_name in trace
     }
     if present_aggregator_roster_fields and (
         present_aggregator_roster_fields != aggregator_roster_fields
@@ -11594,10 +11203,13 @@ def ranking_trace_replay_reasons(
     if reasons:
         return list(dict.fromkeys(reasons))
 
-    frozen_cache_adjustments: dict[
-        str,
-        dict[str, CacheAffinityScoreAdjustment],
-    ] | None = None
+    frozen_cache_adjustments: (
+        dict[
+            str,
+            dict[str, CacheAffinityScoreAdjustment],
+        ]
+        | None
+    ) = None
     frozen_cache_continuity = False
     replay_cache_policy = _cache_affinity_policy_for_topology(
         ranking_parameters,
@@ -11631,9 +11243,7 @@ def ranking_trace_replay_reasons(
 
     ranking_proposer_policy = ranking_parameters.get("proposer_count")
     ranking_proposer_policy = (
-        ranking_proposer_policy
-        if isinstance(ranking_proposer_policy, Mapping)
-        else {}
+        ranking_proposer_policy if isinstance(ranking_proposer_policy, Mapping) else {}
     )
     legacy_replay_backup_count: int | None = None
     if "backup_count" not in ranking_proposer_policy:
@@ -11690,9 +11300,7 @@ def ranking_trace_replay_reasons(
             decision_id=str(trace.get("decision_id") or ""),
             ranking_thinking_assignment_enabled=thinking_assignment_enabled,
             cache_continuity_available=frozen_cache_continuity,
-            _cache_affinity_unavailable_reasons=trace.get(
-                "cache_affinity_unavailable_reasons"
-            ),
+            _cache_affinity_unavailable_reasons=trace.get("cache_affinity_unavailable_reasons"),
             _cache_affinity_replay_adjustments=frozen_cache_adjustments,
             legacy_proposer_backup_count=legacy_replay_backup_count,
             proposer_recovery_max_additional_calls=(
@@ -11711,16 +11319,10 @@ def ranking_trace_replay_reasons(
                 else 0
             ),
             proposer_max_tokens_cap=(
-                int(
-                    (trace.get("proposer_recovery_policy") or {}).get(
-                        "max_tokens_cap"
-                    )
-                )
+                int((trace.get("proposer_recovery_policy") or {}).get("max_tokens_cap"))
                 if isinstance(trace.get("proposer_recovery_policy"), Mapping)
                 and isinstance(
-                    (trace.get("proposer_recovery_policy") or {}).get(
-                        "max_tokens_cap"
-                    ),
+                    (trace.get("proposer_recovery_policy") or {}).get("max_tokens_cap"),
                     int,
                 )
                 else 65_536
@@ -11741,16 +11343,10 @@ def ranking_trace_replay_reasons(
                 else 4_096
             ),
             proposer_recovery_quorum=(
-                int(
-                    (trace.get("proposer_recovery_policy") or {}).get(
-                        "quorum_required"
-                    )
-                )
+                int((trace.get("proposer_recovery_policy") or {}).get("quorum_required"))
                 if isinstance(trace.get("proposer_recovery_policy"), Mapping)
                 and isinstance(
-                    (trace.get("proposer_recovery_policy") or {}).get(
-                        "quorum_required"
-                    ),
+                    (trace.get("proposer_recovery_policy") or {}).get("quorum_required"),
                     int,
                 )
                 else None
@@ -11771,32 +11367,20 @@ def ranking_trace_replay_reasons(
     }
     legacy_disabled_replay = not thinking_assignment_enabled and legacy_trace
     for field_name in _RANKING_REPLAY_FIELDS:
-        if (
-            field_name in proposer_recovery_fields
-            and not present_proposer_recovery_fields
-        ):
+        if field_name in proposer_recovery_fields and not present_proposer_recovery_fields:
             # Pre-recovery frozen traces remain replayable as legacy evidence,
             # but cannot acquire a partial/new policy projection.
             continue
-        if (
-            field_name in aggregator_roster_fields
-            and not present_aggregator_roster_fields
-        ):
+        if field_name in aggregator_roster_fields and not present_aggregator_roster_fields:
             # Pre-roster frozen traces bind the historical hard-coded
             # three-candidate aggregator chain, but do not acquire the new
             # explicit configured/effective count fields during replay.
             continue
-        if field_name == "ranking_version" and (
-            legacy_disabled_replay or legacy_thinking_trace
-        ):
+        if field_name == "ranking_version" and (legacy_disabled_replay or legacy_thinking_trace):
             continue
         # Managed v3 already bound the top-level aggregator recovery chain.
         # Only unmanaged v2 predates that field.
-        if (
-            field_name == "aggregator_candidates"
-            and field_name not in trace
-            and legacy_trace
-        ):
+        if field_name == "aggregator_candidates" and field_name not in trace and legacy_trace:
             continue
         if (
             field_name == "thinking_assignment_details"
@@ -11804,19 +11388,12 @@ def ranking_trace_replay_reasons(
             and isinstance(trace.get(field_name), Mapping)
             and isinstance(replayed.get(field_name), Mapping)
         ):
-            observed_details = copy.deepcopy(
-                dict(trace[field_name])
-            )
-            replayed_details = copy.deepcopy(
-                dict(replayed[field_name])
-            )
+            observed_details = copy.deepcopy(dict(trace[field_name]))
+            replayed_details = copy.deepcopy(dict(replayed[field_name]))
             if "aggregator_candidates" not in observed_details:
                 replayed_details.pop("aggregator_candidates", None)
             if observed_details != replayed_details:
-                reasons.append(
-                    "g1_frozen_ranker_replay_mismatch_"
-                    "thinking_assignment_details"
-                )
+                reasons.append("g1_frozen_ranker_replay_mismatch_thinking_assignment_details")
             continue
         if (
             field_name == "policy_versions"
@@ -11826,21 +11403,12 @@ def ranking_trace_replay_reasons(
         ):
             observed_versions = dict(trace[field_name])
             replayed_versions = dict(replayed[field_name])
-            if (
-                observed_versions.get("ranking")
-                != LEGACY_THINKING_RANKING_VERSION
-            ):
-                reasons.append(
-                    "g1_frozen_ranker_replay_mismatch_policy_versions"
-                )
+            if observed_versions.get("ranking") != LEGACY_THINKING_RANKING_VERSION:
+                reasons.append("g1_frozen_ranker_replay_mismatch_policy_versions")
                 continue
-            observed_versions["ranking"] = replayed_versions.get(
-                "ranking"
-            )
+            observed_versions["ranking"] = replayed_versions.get("ranking")
             if observed_versions != replayed_versions:
-                reasons.append(
-                    "g1_frozen_ranker_replay_mismatch_policy_versions"
-                )
+                reasons.append("g1_frozen_ranker_replay_mismatch_policy_versions")
             continue
         if (
             field_name in additive_thinking_fields

@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-08-19.1-reliability-20260818T121632Z-01580c6982b4",
+  "snapshot_version": "curated-openrouter-step2-2026-08-18.2-reliability-20260818T121632Z-a04f8e2167bf",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -1850,7 +1850,7 @@
         "provider": "openrouter",
         "vendor": "mistralai",
         "family": "mistral-medium",
-        "status": "disabled",
+        "status": "enabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -5501,7 +5501,7 @@
         "provider": "openrouter",
         "vendor": "mistralai",
         "family": "mistral-small",
-        "status": "disabled",
+        "status": "enabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -5623,7 +5623,7 @@
         "provider": "openrouter",
         "vendor": "mistralai",
         "family": "mistral-large",
-        "status": "disabled",
+        "status": "enabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -8901,7 +8901,7 @@
         "provider": "openrouter",
         "vendor": "mistralai",
         "family": "ministral",
-        "status": "disabled",
+        "status": "enabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -9504,7 +9504,7 @@
         "provider": "openrouter",
         "vendor": "mistralai",
         "family": "voxtral",
-        "status": "disabled",
+        "status": "enabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -9732,10 +9732,10 @@
   "role_reliability_snapshot": {
     "schema_version": "role-reliability-snapshot-v2",
     "generated_at": "2026-08-18T12:16:32+00:00",
-    "base_snapshot_version": "curated-openrouter-step2-2026-08-19.1",
+    "base_snapshot_version": "curated-openrouter-step2-2026-08-18.2",
     "window_size": 50,
     "observation_policy": "aef-physical-model-calls-v5",
     "completion_gate": "manual_thresholded_draco_audit",
-    "content_sha256": "01580c6982b49de8d13fc65c6f323f8b1754a0083ea19b6a10a0fbfd5581c2fc"
+    "content_sha256": "a04f8e2167bf496d989b8d600a5e8f027ef3ea4533bcd02956f50f63b2e022f7"
   }
 }

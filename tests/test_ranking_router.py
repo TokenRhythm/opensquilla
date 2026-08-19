@@ -73,6 +73,16 @@ from opensquilla.provider.types import (
     TextDeltaEvent,
 )
 
+_MISTRAL_MODEL_IDS = frozenset(
+    {
+        "mistralai/mistral-large-2512",
+        "mistralai/mistral-medium-3-5",
+        "mistralai/mistral-small-2603",
+        "mistralai/ministral-14b-2512",
+        "mistralai/voxtral-small-24b-2507",
+    }
+)
+
 
 def _task_profile(
     *,
@@ -170,11 +180,7 @@ def _model(
             "price": {
                 "input_per_million": price,
                 "output_per_million": price,
-                **(
-                    {"price_source": price_source}
-                    if price_source is not None
-                    else {}
-                ),
+                **({"price_source": price_source} if price_source is not None else {}),
             },
             "latency_p50_ms": latency_ms // 2,
             "latency_p95_ms": latency_ms,
@@ -289,9 +295,7 @@ def _cache_ranking_config(
             "read_hit": 0.8,
             "write_only": 0.5,
         }
-    return ranking_config_snapshot(
-        override={"session": {"kv_cache_affinity": policy}}
-    )
+    return ranking_config_snapshot(override={"session": {"kv_cache_affinity": policy}})
 
 
 def _cache_evidence(
@@ -331,11 +335,7 @@ def _decision(
 ):
     return rank_models(
         task_analysis=analysis or _analysis(),
-        user_profile=(
-            user_profile or mock_user_profile()
-            if user_profile_enabled
-            else None
-        ),
+        user_profile=(user_profile or mock_user_profile() if user_profile_enabled else None),
         request_context=context or _context(),
         registry_snapshot=_snapshot(*models),
         routed_tier="c2",
@@ -345,9 +345,7 @@ def _decision(
         proposer_recovery_quorum=proposer_recovery_quorum,
         cache_continuity_available=cache_continuity_available,
         cache_affinity_inputs=cache_affinity_inputs,
-        _cache_affinity_unavailable_reasons=(
-            cache_affinity_unavailable_reasons
-        ),
+        _cache_affinity_unavailable_reasons=(cache_affinity_unavailable_reasons),
         _stage_observability_out=stage_observability_out,
     )
 
@@ -413,14 +411,10 @@ def test_ranking_trace_replay_preserves_task_analyzer_chain(
             "candidate_index": index,
             **route,
             "outcome": (
-                "success"
-                if selected_index is not None and index == selected_index
-                else "failed"
+                "success" if selected_index is not None and index == selected_index else "failed"
             ),
             "reason": (
-                ""
-                if selected_index is not None and index == selected_index
-                else "provider_error"
+                "" if selected_index is not None and index == selected_index else "provider_error"
             ),
             "physical_request_count": 1,
         }
@@ -508,9 +502,7 @@ def test_legacy_v4_trace_without_embedded_enabled_switch_remains_replayable() ->
     ).trace
     legacy = deepcopy(trace)
     legacy["ranking_parameters"]["thinking_assignment"].pop("enabled")
-    legacy["ranking_config_hash"] = canonical_json_sha256(
-        legacy["ranking_parameters"]
-    )
+    legacy["ranking_config_hash"] = canonical_json_sha256(legacy["ranking_parameters"])
 
     assert ranking_trace_replay_reasons(legacy) == []
 
@@ -543,43 +535,34 @@ def test_v3_managed_thinking_trace_requires_explicit_compatibility() -> None:
         ranking_thinking_assignment_enabled=True,
     ).trace
     legacy = deepcopy(trace)
-    legacy["ranking_version"] = (
-        ranking_router.LEGACY_THINKING_RANKING_VERSION
-    )
+    legacy["ranking_version"] = ranking_router.LEGACY_THINKING_RANKING_VERSION
     legacy.pop("thinking_physical_evidence_schema")
-    legacy["thinking_assignment_details"].pop(
-        "aggregator_candidates"
-    )
-    legacy["policy_versions"]["ranking"] = (
-        ranking_router.LEGACY_THINKING_RANKING_VERSION
-    )
+    legacy["thinking_assignment_details"].pop("aggregator_candidates")
+    legacy["policy_versions"]["ranking"] = ranking_router.LEGACY_THINKING_RANKING_VERSION
 
     assert "g1_frozen_ranker_replay_mismatch_ranking_version" in (
         ranking_trace_replay_reasons(legacy)
     )
-    assert ranking_trace_replay_reasons(
-        legacy,
-        allow_legacy_managed_v3=True,
-    ) == []
+    assert (
+        ranking_trace_replay_reasons(
+            legacy,
+            allow_legacy_managed_v3=True,
+        )
+        == []
+    )
 
     tampered = deepcopy(legacy)
     tampered["policy_versions"]["thinking"] = "tampered"
-    assert (
-        "g1_frozen_ranker_replay_mismatch_policy_versions"
-        in ranking_trace_replay_reasons(
-            tampered,
-            allow_legacy_managed_v3=True,
-        )
+    assert "g1_frozen_ranker_replay_mismatch_policy_versions" in ranking_trace_replay_reasons(
+        tampered,
+        allow_legacy_managed_v3=True,
     )
 
     missing_recovery_chain = deepcopy(legacy)
     missing_recovery_chain.pop("aggregator_candidates")
-    assert (
-        "g1_frozen_ranker_replay_mismatch_aggregator_candidates"
-        in ranking_trace_replay_reasons(
-            missing_recovery_chain,
-            allow_legacy_managed_v3=True,
-        )
+    assert "g1_frozen_ranker_replay_mismatch_aggregator_candidates" in ranking_trace_replay_reasons(
+        missing_recovery_chain,
+        allow_legacy_managed_v3=True,
     )
 
 
@@ -679,14 +662,15 @@ def test_prepared_ranking_config_is_recursive_immutable_json_and_identity_copy()
     assert ranking_router._is_validated_ranking_config(prepared) is True
     assert prepared == source
     assert prepared["task_analyzer"] == source["task_analyzer"]
-    assert prepared["task_analyzer"]["fallback_chain"] == (
-        source["task_analyzer"]["fallback_chain"]
+    assert (
+        prepared["task_analyzer"]["fallback_chain"] == (source["task_analyzer"]["fallback_chain"])
     )
     assert copy(prepared) is prepared
     assert deepcopy(prepared) is prepared
     assert deepcopy(prepared["task_analyzer"]) is prepared["task_analyzer"]
-    assert deepcopy(prepared["task_analyzer"]["fallback_chain"]) is (
-        prepared["task_analyzer"]["fallback_chain"]
+    assert (
+        deepcopy(prepared["task_analyzer"]["fallback_chain"])
+        is (prepared["task_analyzer"]["fallback_chain"])
     )
     assert json.loads(ranking_router.canonical_json_bytes(prepared)) == source
     assert canonical_json_sha256(prepared) == canonical_json_sha256(source)
@@ -746,9 +730,7 @@ def test_canonical_json_only_thaws_registered_immutable_containers() -> None:
     ordinary = {"tuple": (1, 2), "list": [3, 4]}
 
     assert json.loads(ranking_router.canonical_json_bytes(prepared)) == source
-    assert ranking_router.canonical_json_bytes(ordinary) == (
-        b'{"list":[3,4],"tuple":[1,2]}'
-    )
+    assert ranking_router.canonical_json_bytes(ordinary) == (b'{"list":[3,4],"tuple":[1,2]}')
     with pytest.raises(TypeError, match="not JSON serializable"):
         ranking_router.canonical_json_bytes(range(3))
     with pytest.raises(TypeError, match="not JSON serializable"):
@@ -762,9 +744,7 @@ def test_canonical_json_only_thaws_registered_immutable_containers() -> None:
 
 def test_external_ranking_config_does_not_coerce_tuple_for_json_array_field() -> None:
     external = load_ranking_config()
-    external["task_analyzer"]["fallback_chain"] = tuple(
-        external["task_analyzer"]["fallback_chain"]
-    )
+    external["task_analyzer"]["fallback_chain"] = tuple(external["task_analyzer"]["fallback_chain"])
 
     with pytest.raises(DynamicRankingError):
         ranking_router._prepare_ranking_config(external)
@@ -860,10 +840,13 @@ def test_prepared_ranking_config_skips_revalidation_across_hot_path_helpers(
         thinking_assignment_enabled=True,
     )
     for _ in range(100):
-        assert ranking_router._prepare_effective_ranking_config(
-            prepared,
-            thinking_assignment_enabled=True,
-        ) is prepared
+        assert (
+            ranking_router._prepare_effective_ranking_config(
+                prepared,
+                thinking_assignment_enabled=True,
+            )
+            is prepared
+        )
         task_analyzer_policy(prepared)
         task_analyzer_chain_policy(prepared)
         dynamic_output_token_budgets(
@@ -1013,12 +996,8 @@ def test_ranking_config_resolution_without_override_preserves_packaged_identity(
     config_version: str,
     sha256: str,
 ) -> None:
-    snapshot = ranking_config_snapshot(
-        thinking_assignment_enabled=thinking_assignment_enabled
-    )
-    resolution = ranking_config_resolution(
-        thinking_assignment_enabled=thinking_assignment_enabled
-    )
+    snapshot = ranking_config_snapshot(thinking_assignment_enabled=thinking_assignment_enabled)
+    resolution = ranking_config_resolution(thinking_assignment_enabled=thinking_assignment_enabled)
     empty_resolution = ranking_config_resolution(
         thinking_assignment_enabled=thinking_assignment_enabled,
         override={},
@@ -1034,17 +1013,18 @@ def test_ranking_config_resolution_without_override_preserves_packaged_identity(
     assert resolution["effective_config"]["config_version"] == config_version
     assert resolution["effective_config"]["task_analyzer"]["max_retries"] == 1
     assert empty_resolution == resolution
-    assert ranking_config_snapshot(
-        thinking_assignment_enabled=thinking_assignment_enabled,
-        override={},
-    ) == snapshot
+    assert (
+        ranking_config_snapshot(
+            thinking_assignment_enabled=thinking_assignment_enabled,
+            override={},
+        )
+        == snapshot
+    )
 
 
 def test_task_analyzer_chain_policy_preserves_historical_single_route() -> None:
     current = task_analyzer_chain_policy()
-    historical_config = ranking_config_snapshot(
-        base_version="step2-ranking-2026-08-10.1"
-    )
+    historical_config = ranking_config_snapshot(base_version="step2-ranking-2026-08-10.1")
     historical = task_analyzer_chain_policy(historical_config)
     sparse_primary_override = task_analyzer_chain_policy(
         ranking_config_snapshot(
@@ -1089,9 +1069,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     default = ranking_config_resolution(thinking_assignment_enabled=False)
 
     assert historical["base_config"]["schema_version"] == "step2-ranking-config-v3"
-    assert historical["base_config"]["config_version"] == (
-        "step2-ranking-2026-08-02.2"
-    )
+    assert historical["base_config"]["config_version"] == ("step2-ranking-2026-08-02.2")
     assert "thinking_assignment" not in historical["base_config"]
     assert "role_reliability" not in historical["base_config"]
     assert historical["base_sha256"] == (
@@ -1122,16 +1100,16 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
         base_version="step2-ranking-2026-08-18.3",
     )
     assert (
-        previous_schema_repair_policy["base_config"]["task_analyzer"][
-            "schema_repair_max_retries"
-        ]
+        previous_schema_repair_policy["base_config"]["task_analyzer"]["schema_repair_max_retries"]
         == 1
     )
-    assert previous_schema_repair_policy["base_config"]["normalization"] == (
-        default["base_config"]["normalization"]
+    assert (
+        previous_schema_repair_policy["base_config"]["normalization"]
+        == (default["base_config"]["normalization"])
     )
-    assert previous_schema_repair_policy["base_config"]["penalties"] == (
-        default["base_config"]["penalties"]
+    assert (
+        previous_schema_repair_policy["base_config"]["penalties"]
+        == (default["base_config"]["penalties"])
     )
     assert previous_schema_repair_policy["base_sha256"] == (
         "667eb6057b2d261a2cb6a82b1073c87896e5b3f7b25124f18ade488900792e16"
@@ -1151,13 +1129,11 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert previous_resource_policy["base_config"]["normalization"][
         "price_reference_usd_per_million"
     ] == pytest.approx(40.0)
+    assert "latency_penalty_enabled" not in previous_resource_policy["base_config"]["penalties"]
     assert (
-        "latency_penalty_enabled"
-        not in previous_resource_policy["base_config"]["penalties"]
+        previous_resource_policy["base_config"]["penalties"]["task_cost_weights"]
+        == default["base_config"]["penalties"]["task_cost_weights"]
     )
-    assert previous_resource_policy["base_config"]["penalties"][
-        "task_cost_weights"
-    ] == default["base_config"]["penalties"]["task_cost_weights"]
     assert previous_resource_policy["base_config"]["rerank"]["top_l_min"] == 8
     assert previous_resource_policy["base_config"]["task_analyzer"]["max_retries"] == 1
     assert previous_resource_policy["base_sha256"] == (
@@ -1235,9 +1211,7 @@ def test_previous_zero_failure_prior_base_reconstructs_frozen_identity(
     )
 
     assert resolution["base_config"]["schema_version"] == schema_version
-    assert resolution["base_config"]["config_version"] == (
-        "step2-ranking-2026-08-11.1"
-    )
+    assert resolution["base_config"]["config_version"] == ("step2-ranking-2026-08-11.1")
     assert resolution["base_config"]["role_reliability"] == {
         "penalty_weight": pytest.approx(0.40),
         "prior_success": 10,
@@ -1299,8 +1273,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        "step2-ranking-2026-08-18.4+override."
-        f"{resolution['override_sha256'][:12]}"
+        f"step2-ranking-2026-08-18.4+override.{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
     override["penalties"]["task_cost_weights"]["medium"] = 99
@@ -1531,9 +1504,7 @@ def test_ranking_config_rejects_ambiguous_or_inactive_settings() -> None:
     missing_latency_policy = load_ranking_config()
     missing_latency_policy["penalties"].pop("latency_penalty_enabled")
 
-    historical_latency_policy = load_ranking_config(
-        base_version="step2-ranking-2026-08-18.2"
-    )
+    historical_latency_policy = load_ranking_config(base_version="step2-ranking-2026-08-18.2")
     historical_latency_policy["penalties"]["latency_penalty_enabled"] = False
 
     inactive_exploration = load_ranking_config()
@@ -1671,10 +1642,16 @@ def test_role_reliability_config_is_strictly_validated() -> None:
 def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     snapshot = load_model_registry_snapshot()
     model_ids = [model["registry_facts"]["model_id"] for model in snapshot["models"]]
+    mistral_statuses = {
+        model["registry_facts"]["model_id"]: model["registry_facts"]["status"]
+        for model in snapshot["models"]
+        if model["registry_facts"]["vendor"] == "mistralai"
+    }
 
     assert snapshot["snapshot_version"].startswith("curated-openrouter-step2-")
     assert len(snapshot["models"]) == 79
     assert len(set(model_ids)) == len(model_ids)
+    assert mistral_statuses == {model_id: "disabled" for model_id in _MISTRAL_MODEL_IDS}
     assert {
         "poolside/laguna-xs-2.1",
         "tencent/hy3",
@@ -1737,9 +1714,7 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         "input_per_million": 0.95,
         "output_per_million": 4.0,
     }
-    assert by_model_id["nvidia/nemotron-3-ultra-550b-a55b"]["registry_facts"][
-        "price"
-    ] == {
+    assert by_model_id["nvidia/nemotron-3-ultra-550b-a55b"]["registry_facts"]["price"] == {
         "input_per_million": 0.6,
         "output_per_million": 3.6,
     }
@@ -1800,6 +1775,11 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         "kwaipilot/kat-coder-pro-v2.5",
         "meituan/longcat-2.0",
         "meta-llama/llama-3.3-70b-instruct",
+        "mistralai/mistral-large-2512",
+        "mistralai/mistral-medium-3-5",
+        "mistralai/mistral-small-2603",
+        "mistralai/ministral-14b-2512",
+        "mistralai/voxtral-small-24b-2507",
         "moonshotai/kimi-k3",
         "nex-agi/nex-n2-pro",
         "poolside/laguna-s-2.1",
@@ -1828,20 +1808,16 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
 
 def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     current = load_model_registry_snapshot()
-    historical = load_model_registry_snapshot(
-        base_version="curated-openrouter-step2-2026-07-31.1"
-    )
+    historical = load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
     frozen = ranking_router._legacy_registry_snapshot_projection(historical)
 
     assert current["snapshot_version"].startswith(
-        "curated-openrouter-step2-2026-08-18.2-reliability-"
+        "curated-openrouter-step2-2026-08-19.1-reliability-"
     )
     assert "role_reliability_snapshot" in current
     provenance = current["role_reliability_snapshot"]
     assert provenance["schema_version"] == "role-reliability-snapshot-v2"
-    assert provenance["base_snapshot_version"] == (
-        "curated-openrouter-step2-2026-08-18.2"
-    )
+    assert provenance["base_snapshot_version"] == ("curated-openrouter-step2-2026-08-19.1")
     assert provenance["observation_policy"] == "aef-physical-model-calls-v5"
     assert provenance["completion_gate"] == "manual_thresholded_draco_audit"
     assert set(provenance) == {
@@ -1854,16 +1830,10 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         "content_sha256",
     }
     assert provenance["content_sha256"] == (
-        ranking_router._role_reliability_snapshot_content_sha256(
-            current["models"], provenance
-        )
+        ranking_router._role_reliability_snapshot_content_sha256(current["models"], provenance)
     )
-    assert current["snapshot_version"].endswith(
-        f"-{provenance['content_sha256'][:12]}"
-    )
-    assert all(
-        "role_reliability" in row["online_profile"] for row in current["models"]
-    )
+    assert current["snapshot_version"].endswith(f"-{provenance['content_sha256'][:12]}")
+    assert all("role_reliability" in row["online_profile"] for row in current["models"])
     selected_rows = {
         row["registry_facts"]["model_id"]: row["online_profile"]["role_reliability"]
         for row in current["models"]
@@ -1930,20 +1900,13 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     assert current_reliability["penalty"] == pytest.approx(0.40 / 11)
     assert historical["snapshot_version"] == "curated-openrouter-step2-2026-07-31.1"
     assert "role_reliability_snapshot" not in historical
-    assert all(
-        "role_reliability" not in row["online_profile"]
-        for row in historical["models"]
-    )
-    historical_by_model = {
-        row["registry_facts"]["model_id"]: row for row in historical["models"]
-    }
+    assert all("role_reliability" not in row["online_profile"] for row in historical["models"])
+    historical_by_model = {row["registry_facts"]["model_id"]: row for row in historical["models"]}
     assert historical_by_model["z-ai/glm-5.2"]["registry_facts"]["price"] == {
         "input_per_million": 0.8246,
         "output_per_million": 2.5916,
     }
-    assert historical_by_model["deepseek/deepseek-v4-pro"]["registry_facts"][
-        "price"
-    ] == {
+    assert historical_by_model["deepseek/deepseek-v4-pro"]["registry_facts"]["price"] == {
         "input_per_million": 0.435,
         "output_per_million": 0.87,
     }
@@ -1951,21 +1914,18 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         "input_per_million": 0.684,
         "output_per_million": 3.42,
     }
-    assert historical_by_model["nvidia/nemotron-3-ultra-550b-a55b"]["registry_facts"][
-        "price"
-    ] == {
+    assert historical_by_model["nvidia/nemotron-3-ultra-550b-a55b"]["registry_facts"]["price"] == {
         "input_per_million": 0.5,
         "output_per_million": 2.2,
     }
-    assert historical_by_model["moonshotai/kimi-k3"]["registry_facts"][
-        "modalities"
-    ] == ["text", "image"]
-    assert historical_by_model["moonshotai/kimi-k3"]["static_profile"][
-        "tier_dist_prior"
-    ]["4"] == pytest.approx(0.79)
-    historical_codex_profile = historical_by_model["openai/gpt-5.3-codex"][
-        "static_profile"
+    assert historical_by_model["moonshotai/kimi-k3"]["registry_facts"]["modalities"] == [
+        "text",
+        "image",
     ]
+    assert historical_by_model["moonshotai/kimi-k3"]["static_profile"]["tier_dist_prior"][
+        "4"
+    ] == pytest.approx(0.79)
+    historical_codex_profile = historical_by_model["openai/gpt-5.3-codex"]["static_profile"]
     assert {
         key: historical_codex_profile["capability_dist_prior"][key]
         for key in ("summarization", "writing")
@@ -1991,9 +1951,7 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     }
     assert historical_codex_profile["tier_dist_prior"]["4"] == pytest.approx(0.94)
     assert historical_codex_profile["role_fit_prior"]["proposer"] == pytest.approx(0.99)
-    assert historical_by_model["anthropic/claude-sonnet-5"]["static_profile"][
-        "role_fit_prior"
-    ] == {
+    assert historical_by_model["anthropic/claude-sonnet-5"]["static_profile"]["role_fit_prior"] == {
         "proposer": pytest.approx(0.96),
         "aggregator": pytest.approx(0.95),
     }
@@ -2030,9 +1988,9 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
     )
     current_base = load_model_registry_snapshot(
-        base_version="curated-openrouter-step2-2026-08-18.2"
+        base_version="curated-openrouter-step2-2026-08-19.1"
     )
-    assert current_base["snapshot_version"] == "curated-openrouter-step2-2026-08-18.2"
+    assert current_base["snapshot_version"] == "curated-openrouter-step2-2026-08-19.1"
     assert current_base["models"] == [
         {
             **row,
@@ -2044,45 +2002,83 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         }
         for row in current["models"]
     ]
+    pre_status_base = load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-08-18.2"
+    )
+    assert pre_status_base["snapshot_version"] == "curated-openrouter-step2-2026-08-18.2"
+    assert canonical_json_sha256(pre_status_base) == (
+        "1eb4ebbf3cfb5903b99f104a05b52f3037b772a03de9493072ddad67d1ce970e"
+    )
     previous_base = load_model_registry_snapshot(
         base_version="curated-openrouter-step2-2026-08-18.1"
     )
-    assert previous_base["snapshot_version"] == (
-        "curated-openrouter-step2-2026-08-18.1"
-    )
+    assert previous_base["snapshot_version"] == ("curated-openrouter-step2-2026-08-18.1")
     assert canonical_json_sha256(previous_base) == (
         "f23130040c4ccbe5e2e3bff74edd16a03cc928e1a957a055fec23f02f8f1b62b"
     )
     current_base_by_model = {
         row["registry_facts"]["model_id"]: row for row in current_base["models"]
     }
-    previous_by_model = {
-        row["registry_facts"]["model_id"]: row for row in previous_base["models"]
+    pre_status_base_by_model = {
+        row["registry_facts"]["model_id"]: row for row in pre_status_base["models"]
     }
-    assert previous_by_model["openai/gpt-5.3-codex"]["static_profile"] == (
-        historical_by_model["openai/gpt-5.3-codex"]["static_profile"]
+    previous_by_model = {row["registry_facts"]["model_id"]: row for row in previous_base["models"]}
+    assert all(
+        current_base_by_model[model_id]["registry_facts"]["status"] == "disabled"
+        for model_id in _MISTRAL_MODEL_IDS
     )
-    assert previous_by_model["anthropic/claude-sonnet-5"]["static_profile"] == (
-        historical_by_model["anthropic/claude-sonnet-5"]["static_profile"]
+    for registry_by_model in (
+        historical_by_model,
+        pre_status_base_by_model,
+        previous_by_model,
+    ):
+        assert all(
+            registry_by_model[model_id]["registry_facts"]["status"] == "enabled"
+            for model_id in _MISTRAL_MODEL_IDS
+        )
+    assert (
+        previous_by_model["openai/gpt-5.3-codex"]["static_profile"]
+        == (historical_by_model["openai/gpt-5.3-codex"]["static_profile"])
+    )
+    assert (
+        previous_by_model["anthropic/claude-sonnet-5"]["static_profile"]
+        == (historical_by_model["anthropic/claude-sonnet-5"]["static_profile"])
     )
     for model_id in set(previous_by_model) - {
         "openai/gpt-5.3-codex",
         "anthropic/claude-sonnet-5",
     }:
-        assert previous_by_model[model_id] == current_base_by_model[model_id]
+        assert previous_by_model[model_id] == pre_status_base_by_model[model_id]
+
+
+def test_pre_status_disable_full_registry_snapshot_remains_replayable() -> None:
+    archived = load_model_registry_snapshot(
+        base_version=(
+            "curated-openrouter-step2-2026-08-18.2-reliability-20260818T121632Z-a04f8e2167bf"
+        )
+    )
+    assert archived["snapshot_version"] == (
+        "curated-openrouter-step2-2026-08-18.2-reliability-20260818T121632Z-a04f8e2167bf"
+    )
+    assert canonical_json_sha256(archived) == (
+        "b656ee2f7cdbcefa73c6263f9cf34c25d655bba10d32229058fc6e0373d84611"
+    )
+    by_model_id = {row["registry_facts"]["model_id"]: row for row in archived["models"]}
+    assert all(
+        by_model_id[model_id]["registry_facts"]["status"] == "enabled"
+        for model_id in _MISTRAL_MODEL_IDS
+    )
+    projected = ranking_router._legacy_registry_snapshot_projection(archived)
+    assert canonical_json_sha256(projected) == (
+        "686144c33d57bf57ec9b1785f604d10c061928eaf993e09bf6beae54ab985cd3"
+    )
 
 
 def test_static_profile_calibration_preserves_code_and_cn_controls() -> None:
     current = load_model_registry_snapshot()
-    historical = load_model_registry_snapshot(
-        base_version="curated-openrouter-step2-2026-07-31.1"
-    )
-    current_by_model = {
-        row["registry_facts"]["model_id"]: row for row in current["models"]
-    }
-    historical_by_model = {
-        row["registry_facts"]["model_id"]: row for row in historical["models"]
-    }
+    historical = load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
+    current_by_model = {row["registry_facts"]["model_id"]: row for row in current["models"]}
+    historical_by_model = {row["registry_facts"]["model_id"]: row for row in historical["models"]}
     config = load_ranking_config()
     current_codex = ranking_router._normalize_model(
         current_by_model["openai/gpt-5.3-codex"], config
@@ -2095,18 +2091,14 @@ def test_static_profile_calibration_preserves_code_and_cn_controls() -> None:
     general_writing_profile["capability_dist"] = {"writing": 1.0}
     general_writing_profile["domain_dist"] = {"general": 1.0}
 
-    assert ranking_router._task_match(
-        current_codex, code_profile, config, role="proposer"
-    ) > 0.95
+    assert ranking_router._task_match(current_codex, code_profile, config, role="proposer") > 0.95
     assert ranking_router._task_match(
         current_codex, general_writing_profile, config, role="proposer"
     ) < ranking_router._task_match(
         historical_codex, general_writing_profile, config, role="proposer"
     )
     assert ranking_router._task_match(
-        ranking_router._normalize_model(
-            current_by_model["anthropic/claude-sonnet-5"], config
-        ),
+        ranking_router._normalize_model(current_by_model["anthropic/claude-sonnet-5"], config),
         code_profile,
         config,
         role="aggregator",
@@ -2121,24 +2113,21 @@ def test_static_profile_calibration_preserves_code_and_cn_controls() -> None:
         )
     )
     for model_id in ("qwen/qwen3.7-max", "z-ai/glm-5.2"):
-        assert current_by_model[model_id]["static_profile"] == (
-            historical_by_model[model_id]["static_profile"]
+        assert (
+            current_by_model[model_id]["static_profile"]
+            == (historical_by_model[model_id]["static_profile"])
         )
 
 
 def test_packaged_registry_rejects_obsolete_or_tampered_statistics() -> None:
     current = load_model_registry_snapshot()
     obsolete = deepcopy(current)
-    obsolete["role_reliability_snapshot"]["observation_policy"] = (
-        "aef-physical-model-calls-v3"
-    )
+    obsolete["role_reliability_snapshot"]["observation_policy"] = "aef-physical-model-calls-v3"
     with pytest.raises(DynamicRankingError, match="observation policy is obsolete"):
         ranking_router._validate_packaged_role_reliability_provenance(obsolete)
 
     nonzero = deepcopy(current)
-    nonzero["models"][0]["online_profile"]["role_reliability"]["proposer"][
-        "success"
-    ] = 1
+    nonzero["models"][0]["online_profile"]["role_reliability"]["proposer"]["success"] = 1
     with pytest.raises(DynamicRankingError, match="content_sha256 differs"):
         ranking_router._validate_packaged_role_reliability_provenance(nonzero)
 
@@ -2161,16 +2150,12 @@ def test_packaged_registry_rejects_nonzero_invalidated_statistics() -> None:
             "completion_gate": "legacy_statistics_invalidated",
         }
     )
-    provenance["content_sha256"] = (
-        ranking_router._role_reliability_snapshot_content_sha256(
-            invalidated["models"], provenance
-        )
+    provenance["content_sha256"] = ranking_router._role_reliability_snapshot_content_sha256(
+        invalidated["models"], provenance
     )
     ranking_router._validate_packaged_role_reliability_provenance(invalidated)
 
-    invalidated["models"][0]["online_profile"]["role_reliability"]["proposer"][
-        "success"
-    ] = 1
+    invalidated["models"][0]["online_profile"]["role_reliability"]["proposer"]["success"] = 1
     with pytest.raises(DynamicRankingError, match="nonzero counts"):
         ranking_router._validate_packaged_role_reliability_provenance(invalidated)
 
@@ -2184,17 +2169,13 @@ def test_packaged_v5_reliability_statistics_are_content_bound() -> None:
     provenance.pop("invalidated_observation_policy", None)
     provenance.pop("invalidated_snapshot_version", None)
     provenance.pop("invalidation_reason", None)
-    provenance["content_sha256"] = (
-        ranking_router._role_reliability_snapshot_content_sha256(
-            trusted["models"], provenance
-        )
+    provenance["content_sha256"] = ranking_router._role_reliability_snapshot_content_sha256(
+        trusted["models"], provenance
     )
     ranking_router._validate_packaged_role_reliability_provenance(trusted)
 
     tampered = deepcopy(trusted)
-    tampered["models"][0]["online_profile"]["role_reliability"]["proposer"][
-        "success"
-    ] = 1
+    tampered["models"][0]["online_profile"]["role_reliability"]["proposer"]["success"] = 1
     with pytest.raises(DynamicRankingError, match="content_sha256 differs"):
         ranking_router._validate_packaged_role_reliability_provenance(tampered)
 
@@ -2204,9 +2185,7 @@ def test_packaged_v5_reliability_statistics_are_content_bound() -> None:
         ranking_router._validate_packaged_role_reliability_provenance(missing_hash)
 
     unbound_v1 = deepcopy(trusted)
-    unbound_v1["role_reliability_snapshot"]["schema_version"] = (
-        "role-reliability-snapshot-v1"
-    )
+    unbound_v1["role_reliability_snapshot"]["schema_version"] = "role-reliability-snapshot-v1"
     with pytest.raises(DynamicRankingError, match="content-bound provenance"):
         ranking_router._validate_packaged_role_reliability_provenance(unbound_v1)
 
@@ -2223,9 +2202,7 @@ def test_historical_registry_base_accepts_versioned_reliability_provenance(
     current["role_reliability_snapshot"]["schema_version"] = schema_version
     monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: current)
 
-    historical = load_model_registry_snapshot(
-        base_version="curated-openrouter-step2-2026-07-31.1"
-    )
+    historical = load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
     assert historical["snapshot_version"] == "curated-openrouter-step2-2026-07-31.1"
 
 
@@ -2252,9 +2229,7 @@ def test_historical_registry_base_rejects_unauthenticated_provenance(
     monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: current)
 
     with pytest.raises(DynamicRankingError, match=message):
-        load_model_registry_snapshot(
-            base_version="curated-openrouter-step2-2026-07-31.1"
-        )
+        load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
 
 
 def test_registry_base_selector_rejects_unallowlisted_version() -> None:
@@ -2781,8 +2756,7 @@ def test_ambiguous_bare_model_name_uses_synthesized_profile() -> None:
     assert anchor["static_profile"]["capability_dist_prior"]["reasoning"] == 0.74
 
 
-def test_packaged_registry_template_index_preserves_exact_and_basename_semantics(
-) -> None:
+def test_packaged_registry_template_index_preserves_exact_and_basename_semantics() -> None:
     first_exact = _model("vendor/shared", provider="provider-a", capability=0.91)
     second_exact = _model("vendor/shared", provider="provider-b", capability=0.11)
     first_basename = _model("other/duplicate", provider="provider-c")
@@ -2860,9 +2834,7 @@ def test_packaged_registry_template_cache_reports_one_atomic_miss(
     try:
         ranking_router._PACKAGED_REGISTRY_TEMPLATE_INDEX = None
         ranking_router._reset_packaged_registry_template_index_lock_after_fork()
-        reset_index, reset_hit = (
-            ranking_router._packaged_registry_template_index_lookup()
-        )
+        reset_index, reset_hit = ranking_router._packaged_registry_template_index_lookup()
     finally:
         inherited_lock.release()
     assert reset_hit is False
@@ -2947,9 +2919,7 @@ def test_default_packaged_template_index_matches_linear_snapshot_build() -> None
 def test_explicit_legacy_registry_snapshot_skips_packaged_template_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    historical = load_model_registry_snapshot(
-        base_version="curated-openrouter-step2-2026-07-31.1"
-    )
+    historical = load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
     legacy = ranking_router._legacy_registry_snapshot_projection(historical)
     monkeypatch.setattr(
         ranking_router,
@@ -3028,9 +2998,7 @@ def test_ranker_records_monotonic_stage_timings_outside_decision_trace(
     monkeypatch.setattr(
         ranking_router.time,
         "monotonic_ns",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("unrequested ranking timing")
-        ),
+        lambda: (_ for _ in ()).throw(AssertionError("unrequested ranking timing")),
     )
     assert _decision(*models) == expected
 
@@ -3301,9 +3269,7 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
 ) -> None:
     providers = [
         _AnalyzerProvider(
-            json.dumps(_task_profile(tier=2))
-            if index == success_index
-            else "not-json"
+            json.dumps(_task_profile(tier=2)) if index == success_index else "not-json"
         )
         for index in range(3)
     ]
@@ -3329,9 +3295,7 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
         for provider in providers
         for _, config in provider.calls
     )
-    expected_models = [
-        route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]
-    ]
+    expected_models = [route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]]
     assert result.usage["attempt_count"] == len(expected_models)
     attempts = result.usage["physical_attempts"]
     assert [attempt["attempt"] for attempt in attempts] == list(range(1, len(attempts) + 1))
@@ -3388,9 +3352,7 @@ async def test_task_analyzer_fallback_chain_can_disable_schema_repair() -> None:
 @pytest.mark.asyncio
 async def test_historical_explicit_analyzer_chain_keeps_per_route_total_budget() -> None:
     providers = [_AnalyzerProvider(json.dumps(_task_profile(tier=2))) for _ in range(3)]
-    historical_config = ranking_config_snapshot(
-        base_version="step2-ranking-2026-08-10.1"
-    )
+    historical_config = ranking_config_snapshot(base_version="step2-ranking-2026-08-10.1")
 
     result = await analyze_task_with_fallback_chain(
         candidates=_task_analyzer_chain_candidates(providers),
@@ -3557,8 +3519,7 @@ async def test_task_analyzer_fallback_chain_classifies_provider_errors(
     assert result.usage["attempt_count"] == 2
     assert result.trace()["chain"]["attempt_outcomes"][0]["reason"] == public_reason
     assert [
-        outcome["physical_request_count"]
-        for outcome in result.trace()["chain"]["attempt_outcomes"]
+        outcome["physical_request_count"] for outcome in result.trace()["chain"]["attempt_outcomes"]
     ] == [1, 1]
 
 
@@ -3728,10 +3689,7 @@ async def test_task_analyzer_fallback_chain_returns_fallback_after_exhaustion() 
     assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[-1][1]
     assert [len(provider.calls) for provider in providers] == [1, 1, 1]
     assert result.usage["attempt_count"] == 3
-    assert [
-        attempt["requested_model"]
-        for attempt in result.usage["physical_attempts"]
-    ] == [
+    assert [attempt["requested_model"] for attempt in result.usage["physical_attempts"]] == [
         route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES
     ]
     chain = result.trace()["chain"]
@@ -3857,8 +3815,7 @@ async def test_task_analyzer_fallback_chain_physical_evidence_failure_does_not_a
 
 
 @pytest.mark.asyncio
-async def test_task_analyzer_hanging_stream_close_is_bounded(
-) -> None:
+async def test_task_analyzer_hanging_stream_close_is_bounded() -> None:
     class _HangingStream:
         def __init__(self) -> None:
             self.close_started = False
@@ -4235,8 +4192,9 @@ async def test_task_analyzer_payload_keeps_unicode_without_ascii_expansion() -> 
     assert "\\u4e2d" not in payload
     assert len(payload) <= config["task_analyzer"]["payload_max_chars"]
     assert len(payload.encode("utf-8")) <= config["task_analyzer"]["payload_max_bytes"]
-    assert ranking_router._estimated_tokens_from_text(payload, config) <= (
-        config["task_analyzer"]["payload_max_estimated_tokens"]
+    assert (
+        ranking_router._estimated_tokens_from_text(payload, config)
+        <= (config["task_analyzer"]["payload_max_estimated_tokens"])
     )
 
 
@@ -4321,9 +4279,7 @@ async def test_task_analyzer_impossible_payload_budget_starts_no_request() -> No
 async def test_historical_task_analyzer_keeps_single_route_serialization() -> None:
     provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
     invalid_provider = _AnalyzerProvider("not-json")
-    historical_config = ranking_config_snapshot(
-        base_version="step2-ranking-2026-08-10.1"
-    )
+    historical_config = ranking_config_snapshot(base_version="step2-ranking-2026-08-10.1")
 
     result = await analyze_task_with_provider(
         provider=provider,
@@ -4718,13 +4674,9 @@ async def test_task_analyzer_explicit_no_request_retry_has_no_physical_gap() -> 
     assert len(provider.calls) == 2
     assert result.usage["attempt_count"] == 1
     assert [row["attempt"] for row in result.usage["physical_attempts"]] == [1]
-    assert result.usage["physical_attempts"][0]["provider_usage"]["response_ids"] == [
-        "analyzer-2"
-    ]
+    assert result.usage["physical_attempts"][0]["provider_usage"]["response_ids"] == ["analyzer-2"]
     assert (
-        result.usage["physical_attempts"][0]["provider_usage"][
-            "physical_attempt_id"
-        ]
+        result.usage["physical_attempts"][0]["provider_usage"]["physical_attempt_id"]
         == result.usage["physical_attempts"][0]["physical_attempt_id"]
     )
     assert result.usage["physical_attempts"][0]["physical_attempt_id"] == "e" * 32
@@ -4899,13 +4851,11 @@ async def test_task_analyzer_contradictory_receipt_fails_closed_with_usage() -> 
 
     assert len(provider.calls) == 1
     assert caught.value.usage["attempt_count"] == 1
-    assert caught.value.usage["physical_attempts"][0]["provider_usage"][
-        "response_ids"
-    ] == ["paid-response"]
+    assert caught.value.usage["physical_attempts"][0]["provider_usage"]["response_ids"] == [
+        "paid-response"
+    ]
     assert (
-        caught.value.usage["physical_attempts"][0]["provider_usage"][
-            "physical_attempt_id"
-        ]
+        caught.value.usage["physical_attempts"][0]["provider_usage"]["physical_attempt_id"]
         == caught.value.usage["physical_attempts"][0]["physical_attempt_id"]
     )
 
@@ -4941,10 +4891,7 @@ async def test_task_analyzer_multiple_physical_requests_fail_closed() -> None:
         1,
         2,
     ]
-    assert all(
-        row["usage_unknown"] is True
-        for row in caught.value.usage["physical_attempts"]
-    )
+    assert all(row["usage_unknown"] is True for row in caught.value.usage["physical_attempts"])
 
 
 @pytest.mark.asyncio
@@ -5562,12 +5509,10 @@ def test_latency_penalty_switch_defaults_off_and_controls_all_score_paths() -> N
     assert default_single.model.model_id == "a-slow"
     assert enabled_single.model.model_id == "z-fast"
     assert all(
-        row["latency_weight"] == pytest.approx(0.0)
-        for row in default_single.trace["model_scores"]
+        row["latency_weight"] == pytest.approx(0.0) for row in default_single.trace["model_scores"]
     )
     assert all(
-        row["latency_weight"] == pytest.approx(0.22)
-        for row in enabled_single.trace["model_scores"]
+        row["latency_weight"] == pytest.approx(0.22) for row in enabled_single.trace["model_scores"]
     )
 
     common = {"provider": "openrouter", "vendor": "shared", "family": "shared"}
@@ -5670,12 +5615,8 @@ def test_latency_penalty_switch_defaults_off_and_controls_all_score_paths() -> N
 
     assert default_multi.aggregator.model_id == "a-slow-aggregator"
     assert enabled_multi.aggregator.model_id == "z-fast-aggregator"
-    assert default_multi.trace["aggregator"]["selected"]["latency_weight"] == pytest.approx(
-        0.0
-    )
-    assert enabled_multi.trace["aggregator"]["selected"]["latency_weight"] == pytest.approx(
-        0.22
-    )
+    assert default_multi.trace["aggregator"]["selected"]["latency_weight"] == pytest.approx(0.0)
+    assert enabled_multi.trace["aggregator"]["selected"]["latency_weight"] == pytest.approx(0.22)
 
 
 def test_resource_aware_proposer_rerank_retains_cost_penalty_inside_top_l() -> None:
@@ -5725,20 +5666,23 @@ def test_resource_aware_proposer_rerank_retains_cost_penalty_inside_top_l() -> N
         efficient,
         aggregator,
         analysis=analysis,
-        ranking_config=load_ranking_config(
-            base_version="step2-ranking-2026-08-18.2"
-        ),
+        ranking_config=load_ranking_config(base_version="step2-ranking-2026-08-18.2"),
         user_profile_enabled=False,
     )
 
     assert [model.model_id for model in current.proposers] == ["primary", "efficient"]
     assert [model.model_id for model in historical.proposers] == ["primary", "expensive"]
-    assert ranking_router._resource_aware_proposer_rerank_enabled(
-        current.trace["ranking_parameters"]
-    ) is True
-    assert ranking_router._resource_aware_proposer_rerank_enabled(
-        historical.trace["ranking_parameters"]
-    ) is False
+    assert (
+        ranking_router._resource_aware_proposer_rerank_enabled(current.trace["ranking_parameters"])
+        is True
+    )
+    assert (
+        ranking_router._resource_aware_proposer_rerank_enabled(
+            historical.trace["ranking_parameters"]
+        )
+        is False
+    )
+
 
 def test_zero_role_reliability_observations_use_cold_start_prior() -> None:
     model = _with_role_reliability(_model("zero-observations"))
@@ -5784,9 +5728,7 @@ def test_reliability_cold_start_penalty_is_monotonic() -> None:
             analysis=_analysis(tier=1),
             user_profile_enabled=False,
         )
-        return decision.trace["model_scores"][0]["role_reliability"][
-            "failure_rate"
-        ]
+        return decision.trace["model_scores"][0]["role_reliability"]["failure_rate"]
 
     cold_start = failure_rate(success=0, failure=0)
     after_success = failure_rate(success=1, failure=0)
@@ -5851,9 +5793,7 @@ def test_archived_config_without_reliability_policy_keeps_legacy_trace_shape() -
         proposer=(0, 50),
         aggregator=(0, 50),
     )
-    reliable = _with_role_reliability(
-        _model("reliable", provider="provider-b", capability=0.80)
-    )
+    reliable = _with_role_reliability(_model("reliable", provider="provider-b", capability=0.80))
 
     decision = _decision(
         unreliable,
@@ -5892,9 +5832,7 @@ def test_role_reliability_is_isolated_between_proposer_and_aggregator() -> None:
     assert decision.proposers[0].model_id == "proposer-reliable"
     assert decision.aggregator.model_id == "aggregator-reliable"
     proposer_trace = next(
-        row
-        for row in decision.trace["model_scores"]
-        if row["model"] == "proposer-reliable"
+        row for row in decision.trace["model_scores"] if row["model"] == "proposer-reliable"
     )
     aggregator_trace = next(
         row
@@ -5952,12 +5890,8 @@ def test_reliability_penalty_changes_initial_order_and_quality_floor() -> None:
     unreliable_trace = next(
         row for row in penalized.trace["model_scores"] if row["model"] == "unreliable"
     )
-    assert unreliable_trace["role_reliability"]["failure_rate"] == pytest.approx(
-        51 / 61
-    )
-    assert unreliable_trace["role_reliability"]["penalty"] == pytest.approx(
-        0.40 * 51 / 61
-    )
+    assert unreliable_trace["role_reliability"]["failure_rate"] == pytest.approx(51 / 61)
+    assert unreliable_trace["role_reliability"]["penalty"] == pytest.approx(0.40 * 51 / 61)
 
 
 def test_reliability_penalty_changes_greedy_marginal_selection() -> None:
@@ -6003,9 +5937,7 @@ def test_reliability_penalty_changes_greedy_marginal_selection() -> None:
         for row in penalized.trace["selection_steps"][1]["top_candidates"]
         if row["identity"] == "provider-b:unreliable"
     )
-    assert unstable_candidate["reliability_penalty"] == pytest.approx(
-        0.40 * 51 / 61
-    )
+    assert unstable_candidate["reliability_penalty"] == pytest.approx(0.40 * 51 / 61)
 
 
 def test_reliability_penalty_orders_proposer_and_aggregator_fallbacks() -> None:
@@ -6065,11 +5997,9 @@ def test_reliability_penalty_orders_proposer_and_aggregator_fallbacks() -> None:
         "unreliable-a",
     ]
     assert [
-        row["role_reliability"]["failure_rate"]
-        for row in decision.trace["aggregator"]["scores"]
+        row["role_reliability"]["failure_rate"] for row in decision.trace["aggregator"]["scores"]
     ] == sorted(
-        row["role_reliability"]["failure_rate"]
-        for row in decision.trace["aggregator"]["scores"]
+        row["role_reliability"]["failure_rate"] for row in decision.trace["aggregator"]["scores"]
     )
 
 
@@ -6724,8 +6654,7 @@ def test_default_off_keeps_request_filters_off_but_honors_retry_exclusions() -> 
     ]
 
     assert all(
-        "required_parameter_tools_unsupported" not in row["reasons"]
-        for row in disabled_alpha
+        "required_parameter_tools_unsupported" not in row["reasons"] for row in disabled_alpha
     )
     assert any(
         "prior_attempt_reasoning_only_length" in row["reasons"]
@@ -6737,10 +6666,7 @@ def test_default_off_keeps_request_filters_off_but_honors_retry_exclusions() -> 
         for row in disabled_alpha
         if row["role"] == "aggregator"
     )
-    assert any(
-        "required_parameter_tools_unsupported" in row["reasons"]
-        for row in enabled_alpha
-    )
+    assert any("required_parameter_tools_unsupported" in row["reasons"] for row in enabled_alpha)
     assert any(
         "prior_attempt_reasoning_only_length" in row["reasons"]
         for row in enabled_alpha
@@ -7127,9 +7053,7 @@ def test_ranker_freezes_ordered_disjoint_proposer_backups_and_replays_exactly() 
     )
 
     selected = {model.identity for model in decision.proposers}
-    aggregators = {
-        model.identity for model in decision.aggregator_candidates
-    }
+    aggregators = {model.identity for model in decision.aggregator_candidates}
     backups = [model.identity for model in decision.backup_proposers]
     assert len(backups) == 2
     assert len(set(backups)) == 2
@@ -7451,9 +7375,7 @@ _SINGLE_CONTEXT_FUSION_FIELDS = {
 
 def _nested_mapping_keys(value: Any) -> set[str]:
     if isinstance(value, dict):
-        return set(value).union(
-            *(_nested_mapping_keys(child) for child in value.values())
-        )
+        return set(value).union(*(_nested_mapping_keys(child) for child in value.values()))
     if isinstance(value, (list, tuple)):
         return set().union(*(_nested_mapping_keys(child) for child in value))
     return set()
@@ -7483,9 +7405,7 @@ def _single_decision(
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
         cache_continuity_available=cache_continuity_available,
         cache_affinity_inputs=cache_affinity_inputs,
-        _cache_affinity_unavailable_reasons=(
-            cache_affinity_unavailable_reasons
-        ),
+        _cache_affinity_unavailable_reasons=(cache_affinity_unavailable_reasons),
     )
 
 
@@ -7515,9 +7435,7 @@ def test_build_single_model_request_context_has_only_direct_output_budget(
         "direct_output_tokens": 2_048,
     }
     assert context["last_route"] == {}
-    assert _nested_mapping_keys(context).isdisjoint(
-        _SINGLE_CONTEXT_FUSION_FIELDS
-    )
+    assert _nested_mapping_keys(context).isdisjoint(_SINGLE_CONTEXT_FUSION_FIELDS)
     assert context["snapshot_hash"] == ranking_router._request_context_hash(context)
 
 
@@ -7540,9 +7458,7 @@ def test_single_context_ignores_stale_fusion_route_in_hash_and_score() -> None:
                     "quality_feedback": 1.0,
                     "escalation_level": 3,
                 },
-                "intermediate_outputs": {
-                    "previous_candidates": ["stale candidate answer"]
-                },
+                "intermediate_outputs": {"previous_candidates": ["stale candidate answer"]},
             },
             "router_dynamic_last_route": {
                 "selected_P": ["provider:other-stale-proposer"],
@@ -7559,9 +7475,7 @@ def test_single_context_ignores_stale_fusion_route_in_hash_and_score() -> None:
 
     assert stale == clean
     assert stale["last_route"] == {}
-    assert _nested_mapping_keys(stale).isdisjoint(
-        _SINGLE_CONTEXT_FUSION_FIELDS
-    )
+    assert _nested_mapping_keys(stale).isdisjoint(_SINGLE_CONTEXT_FUSION_FIELDS)
     assert "stale" not in ranking_router.canonical_json_bytes(stale).decode()
 
     models = (
@@ -7738,9 +7652,7 @@ def test_cache_affinity_config_is_strict_and_discriminated(
     policy: dict[str, Any],
 ) -> None:
     with pytest.raises(DynamicRankingError):
-        ranking_config_snapshot(
-            override={"session": {"kv_cache_affinity": policy}}
-        )
+        ranking_config_snapshot(override={"session": {"kv_cache_affinity": policy}})
 
 
 def test_single_cache_continuity_only_preserves_analyzer_continue() -> None:
@@ -7786,9 +7698,7 @@ async def test_cache_continuity_flag_reaches_every_live_analyzer_path(
         strategy="bonus",
         topologies=["single"],
     )
-    response = json.dumps(
-        _task_profile(intent="continue", intent_confidence=1.0)
-    )
+    response = json.dumps(_task_profile(intent="continue", intent_confidence=1.0))
     if analyzer_path == "retry":
         ranking_config["task_analyzer"]["max_retries"] = 1
         provider = _AnalyzerProvider(["not-json", response])
@@ -7859,11 +7769,7 @@ def test_schema_invalid_high_confidence_continue_cannot_apply_cache_live_or_repl
             strategy="bonus",
             topologies=["single"],
         )
-        affinity_inputs = {
-            "single": {
-                beta_identity: _cache_evidence(beta_identity, role="single")
-            }
-        }
+        affinity_inputs = {"single": {beta_identity: _cache_evidence(beta_identity, role="single")}}
         valid = _single_decision(
             alpha,
             beta,
@@ -7888,9 +7794,7 @@ def test_schema_invalid_high_confidence_continue_cannot_apply_cache_live_or_repl
         assert valid.model.identity == beta_identity
         assert invalid.model.identity == "test-provider:alpha"
         replay_reasons = single_ranking_trace_replay_reasons
-        expected_tamper_reasons = [
-            "invalid_single_ranking_replay_cache_affinity_inputs"
-        ]
+        expected_tamper_reasons = ["invalid_single_ranking_replay_cache_affinity_inputs"]
         score_rows = invalid.trace["model_scores"]
     else:
         proposer_alpha = _model(
@@ -7973,9 +7877,7 @@ def test_schema_invalid_high_confidence_continue_cannot_apply_cache_live_or_repl
         assert invalid.proposers[0].identity == "test-provider:p-alpha"
         assert invalid.aggregator.identity == "test-provider:a-alpha"
         replay_reasons = ranking_trace_replay_reasons
-        expected_tamper_reasons = [
-            "g1_frozen_ranker_replay_failed"
-        ]
+        expected_tamper_reasons = ["g1_frozen_ranker_replay_failed"]
         score_rows = [
             *invalid.trace["model_scores"],
             *invalid.trace["aggregator"]["scores"],
@@ -8029,11 +7931,7 @@ async def test_configured_continue_fallback_never_applies_cache_after_analyzer_f
 
             return stream()
 
-    provider = (
-        None
-        if failure_mode == "provider_unavailable"
-        else TimeoutAnalyzerProvider()
-    )
+    provider = None if failure_mode == "provider_unavailable" else TimeoutAnalyzerProvider()
     analysis = await analyze_task_with_provider(
         provider=provider,
         message="continue the previous task",
@@ -8053,9 +7951,7 @@ async def test_configured_continue_fallback_never_applies_cache_after_analyzer_f
         ranking_config=config,
         cache_continuity_available=True,
         cache_affinity_inputs={
-            "single": {
-                beta_identity: _cache_evidence(beta_identity, role="single")
-            }
+            "single": {beta_identity: _cache_evidence(beta_identity, role="single")}
         },
     )
 
@@ -8068,10 +7964,7 @@ async def test_configured_continue_fallback_never_applies_cache_after_analyzer_f
     }
     assert decision.model.identity == "test-provider:alpha"
     assert decision.trace["cache_affinity_inputs"] == []
-    assert all(
-        "cache_affinity" not in row
-        for row in decision.trace["model_scores"]
-    )
+    assert all("cache_affinity" not in row for row in decision.trace["model_scores"])
     assert single_ranking_trace_replay_reasons(decision.trace) == []
 
 
@@ -8087,9 +7980,7 @@ def test_single_bonus_applies_after_hard_filter_before_top1() -> None:
         ranking_config=config,
         cache_continuity_available=True,
         cache_affinity_inputs={
-            "single": {
-                beta_identity: _cache_evidence(beta_identity, role="single")
-            }
+            "single": {beta_identity: _cache_evidence(beta_identity, role="single")}
         },
     )
 
@@ -8116,9 +8007,7 @@ def test_single_cache_bonus_is_soft_and_cannot_overcome_a_larger_score_gap() -> 
         ),
         cache_continuity_available=True,
         cache_affinity_inputs={
-            "single": {
-                beta_identity: _cache_evidence(beta_identity, role="single")
-            }
+            "single": {beta_identity: _cache_evidence(beta_identity, role="single")}
         },
     )
 
@@ -8131,11 +8020,7 @@ def test_cache_intent_gate_includes_threshold_and_rejects_other_intents() -> Non
     beta_identity = "test-provider:beta"
     config = _cache_ranking_config(strategy="bonus", topologies=["single"])
     threshold = config["session"]["intent_confidence_threshold"]
-    evidence = {
-        "single": {
-            beta_identity: _cache_evidence(beta_identity, role="single")
-        }
-    }
+    evidence = {"single": {beta_identity: _cache_evidence(beta_identity, role="single")}}
 
     at_threshold = _single_decision(
         alpha,
@@ -8213,9 +8098,7 @@ def test_single_expected_cost_replaces_only_input_cost_component() -> None:
 
     assert decision.model.identity == beta_identity
     beta_score = next(
-        row
-        for row in decision.trace["model_scores"]
-        if row["identity"] == beta_identity
+        row for row in decision.trace["model_scores"] if row["identity"] == beta_identity
     )
     assert beta_score["S_base"] == beta_score["S_base_clean"]
     assert beta_score["cache_affinity"]["N"] == 1_000
@@ -8225,12 +8108,8 @@ def test_single_expected_cost_replaces_only_input_cost_component() -> None:
 
 def test_expected_cost_unavailable_reason_is_safe_replayable_and_tamper_bound() -> None:
     identity = "test-provider:beta"
-    reason = (
-        ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
-    )
-    reasons = [
-        {"role": "single", "identity": identity, "reason": reason}
-    ]
+    reason = ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+    reasons = [{"role": "single", "identity": identity, "reason": reason}]
     decision = _single_decision(
         _model("alpha", capability=0.9, price=2.0),
         _model("beta", capability=0.9, price=2.0),
@@ -8246,9 +8125,7 @@ def test_expected_cost_unavailable_reason_is_safe_replayable_and_tamper_bound() 
     assert decision.trace["cache_affinity_unavailable_reasons"] == reasons
     assert single_ranking_trace_replay_reasons(decision.trace) == []
     tampered = deepcopy(decision.trace)
-    tampered["cache_affinity_unavailable_reasons"][0]["reason"] = (
-        "untrusted_reason"
-    )
+    tampered["cache_affinity_unavailable_reasons"][0]["reason"] = "untrusted_reason"
     assert single_ranking_trace_replay_reasons(tampered) == [
         "invalid_single_ranking_replay_cache_affinity_inputs"
     ]
@@ -8256,12 +8133,8 @@ def test_expected_cost_unavailable_reason_is_safe_replayable_and_tamper_bound() 
 
 def test_multiple_expected_cost_unavailable_reason_is_replayable() -> None:
     identity = "test-provider:p-beta"
-    reason = (
-        ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
-    )
-    reasons = [
-        {"role": "proposer", "identity": identity, "reason": reason}
-    ]
+    reason = ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+    reasons = [{"role": "proposer", "identity": identity, "reason": reason}]
     decision = _decision(
         _model("p-alpha", roles=["proposer"], capability=0.9, price=2.0),
         _model("p-beta", roles=["proposer"], capability=0.9, price=2.0),
@@ -8285,12 +8158,8 @@ def test_multiple_expected_cost_unavailable_reason_is_replayable() -> None:
     assert decision.trace["cache_affinity_unavailable_reasons"] == reasons
     assert ranking_trace_replay_reasons(decision.trace) == []
     tampered = deepcopy(decision.trace)
-    tampered["cache_affinity_unavailable_reasons"][0]["identity"] = (
-        "test-provider:unknown"
-    )
-    assert ranking_trace_replay_reasons(tampered) == [
-        "g1_frozen_ranker_replay_failed"
-    ]
+    tampered["cache_affinity_unavailable_reasons"][0]["identity"] = "test-provider:unknown"
+    assert ranking_trace_replay_reasons(tampered) == ["g1_frozen_ranker_replay_failed"]
 
 
 def test_cache_unavailable_reason_is_absent_for_bonus_and_disabled_policy() -> None:
@@ -8475,9 +8344,7 @@ def test_multiple_bonus_applies_only_at_proposer_marginal_and_aggregator_score()
 
     assert decision.proposers[0].identity == proposer_identity
     assert decision.aggregator.identity == aggregator_identity
-    proposer_scores = {
-        row["identity"]: row for row in decision.trace["model_scores"]
-    }
+    proposer_scores = {row["identity"]: row for row in decision.trace["model_scores"]}
     assert (
         proposer_scores["test-provider:p-alpha"]["S_base_clean"]
         == proposer_scores[proposer_identity]["S_base_clean"]
@@ -8609,9 +8476,7 @@ def test_cache_aware_trace_replay_consumes_only_frozen_adjustments() -> None:
     assert ranking_trace_replay_reasons(decision.trace) == []
     tampered = deepcopy(decision.trace)
     tampered["cache_affinity_inputs"][0]["score_adjustment"] += 0.001
-    assert ranking_trace_replay_reasons(tampered) == [
-        "invalid_g1_replay_cache_affinity_inputs"
-    ]
+    assert ranking_trace_replay_reasons(tampered) == ["invalid_g1_replay_cache_affinity_inputs"]
 
 
 def test_expected_cost_trace_replay_uses_frozen_safe_table() -> None:
@@ -8695,9 +8560,7 @@ def test_expected_cost_trace_replay_uses_frozen_safe_table() -> None:
     assert ranking_trace_replay_reasons(decision.trace) == []
     tampered = deepcopy(decision.trace)
     tampered["cache_affinity_inputs"][0]["p"] = float("nan")
-    assert ranking_trace_replay_reasons(tampered) == [
-        "invalid_g1_replay_cache_affinity_inputs"
-    ]
+    assert ranking_trace_replay_reasons(tampered) == ["invalid_g1_replay_cache_affinity_inputs"]
 
     coordinated = deepcopy(decision.trace)
     target_identity = coordinated["cache_affinity_inputs"][0]["identity"]
@@ -8706,10 +8569,7 @@ def test_expected_cost_trace_replay_uses_frozen_safe_table() -> None:
     def tamper_price_source(value: object) -> None:
         nonlocal changed
         if isinstance(value, dict):
-            if (
-                value.get("identity") == target_identity
-                and "price_source" in value
-            ):
+            if value.get("identity") == target_identity and "price_source" in value:
                 value["price_source"] = "forged_price_source"
                 changed += 1
             for child in value.values():
@@ -8722,9 +8582,7 @@ def test_expected_cost_trace_replay_uses_frozen_safe_table() -> None:
         if field_name != "registry_snapshot":
             tamper_price_source(field_value)
     assert changed >= 2  # frozen input plus its nested score/selection projection
-    assert ranking_trace_replay_reasons(coordinated) == [
-        "g1_frozen_ranker_replay_failed"
-    ]
+    assert ranking_trace_replay_reasons(coordinated) == ["g1_frozen_ranker_replay_failed"]
 
     coordinated_k = deepcopy(decision.trace)
     changed_k = 0
@@ -8768,9 +8626,7 @@ async def test_single_context_compaction_preserves_only_direct_budget(
         turn_metadata={
             "router_dynamic_request_context": {
                 "conversation": {"summary": "large context " * 1_000},
-                "intermediate_outputs": {
-                    "previous_candidates": ["stale candidate answer"]
-                },
+                "intermediate_outputs": {"previous_candidates": ["stale candidate answer"]},
                 "last_route": {
                     "selected_P": ["provider:stale-proposer"],
                     "selected_A": "provider:stale-aggregator",
@@ -8801,17 +8657,13 @@ async def test_single_context_compaction_preserves_only_direct_budget(
     compact_context = payload["request_context"]
     assert compact_context["payload_context_truncated"] is True
     assert compact_context["routing_budget"] == {
-        "estimated_input_tokens": request_context["routing_budget"][
-            "estimated_input_tokens"
-        ],
+        "estimated_input_tokens": request_context["routing_budget"]["estimated_input_tokens"],
         "tool_log_tokens": request_context["routing_budget"]["tool_log_tokens"],
         "direct_output_tokens": 2_048,
     }
     assert compact_context["last_route"] == {}
     assert compact_context["snapshot_hash"] == request_context["snapshot_hash"]
-    assert _nested_mapping_keys(compact_context).isdisjoint(
-        _SINGLE_CONTEXT_FUSION_FIELDS
-    )
+    assert _nested_mapping_keys(compact_context).isdisjoint(_SINGLE_CONTEXT_FUSION_FIELDS)
 
 
 def test_rank_single_model_has_no_fusion_or_roster_dependencies(
@@ -8883,10 +8735,7 @@ def test_rank_single_model_enforces_direct_execution_hard_filters() -> None:
         analysis=_analysis(modalities=["text", "image"]),
         ranking_config=config,
     )
-    filter_rows = {
-        row["model"]: row
-        for row in decision.trace["hard_filter"]["proposer_results"]
-    }
+    filter_rows = {row["model"]: row for row in decision.trace["hard_filter"]["proposer_results"]}
 
     assert decision.model.model_id == "eligible"
     assert "status_not_enabled" in filter_rows["wrong-status"]["reasons"]
@@ -8920,10 +8769,7 @@ def test_rank_single_model_uses_candidate_specific_direct_output_budget() -> Non
         fallback,
         context=_single_context(input_tokens=1_000, output_tokens=1_000),
     )
-    filter_rows = {
-        row["model"]: row
-        for row in decision.trace["hard_filter"]["proposer_results"]
-    }
+    filter_rows = {row["model"]: row for row in decision.trace["hard_filter"]["proposer_results"]}
 
     assert decision.model.model_id == "candidate-exact-fit"
     assert filter_rows["candidate-exact-fit"]["context_need_tokens"] == 6_000
@@ -8948,9 +8794,7 @@ def test_rank_single_model_rejects_invalid_runtime_direct_output_tokens(
     runtime_direct_output_tokens: object,
 ) -> None:
     model = _model("invalid-runtime-output")
-    model["registry_facts"][
-        "runtime_direct_output_tokens"
-    ] = runtime_direct_output_tokens
+    model["registry_facts"]["runtime_direct_output_tokens"] = runtime_direct_output_tokens
 
     with pytest.raises(
         DynamicRankingError,
@@ -8991,9 +8835,7 @@ def test_rank_single_model_tools_filter_is_independent_of_thinking_switch(
         for row in with_tools.trace["hard_filter"]["proposer_results"]
         if row["model"] == "unsupported-tools"
     )
-    assert unsupported_filter["reasons"] == [
-        "required_parameter_tools_unsupported"
-    ]
+    assert unsupported_filter["reasons"] == ["required_parameter_tools_unsupported"]
 
 
 @pytest.mark.parametrize("surface", ["registry_snapshot", "request_context"])
