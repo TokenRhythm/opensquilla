@@ -164,6 +164,24 @@ def _requested_initial_collaboration_mode(params: dict[str, Any]) -> str | None:
     return mode
 
 
+def _requested_initial_routing_mode(params: dict[str, Any]) -> str | None:
+    """Read the first-turn-only durable model-routing selection."""
+
+    mode = params.get("initialRoutingMode")
+    snake_mode = params.get("initial_routing_mode")
+    if mode is not None and snake_mode is not None and mode != snake_mode:
+        raise ValueError("initialRoutingMode and initial_routing_mode must match")
+    if mode is None:
+        mode = snake_mode
+    if mode is None:
+        return None
+    if not isinstance(mode, str) or mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("initialRoutingMode must be direct, router, or ensemble")
+    if params.get("intent") != "new_chat":
+        raise ValueError("initialRoutingMode requires explicit new_chat intent")
+    return mode
+
+
 def _require_chat_session_manager(ctx: RpcContext):
     if ctx.session_manager is None:
         raise RpcUnavailableError("Chat session manager not available")
@@ -949,15 +967,16 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
     initial_collaboration_mode = _requested_initial_collaboration_mode(params)
+    initial_routing_mode = _requested_initial_routing_mode(params)
 
     # Fresh-WebUI / smoke path: when no session manager is wired (webui
     # simulator, dispatcher-only boot), instant-accept without kicking off a
     # turn. This matches the roundtrip the WebUI observes on first paint
     # before the sessions engine is attached.
     if ctx.session_manager is None:
-        if initial_collaboration_mode is not None:
+        if initial_collaboration_mode is not None or initial_routing_mode is not None:
             raise RpcUnavailableError(
-                "Initial collaboration mode requires atomic turn acceptance"
+                "Initial session controls require atomic turn acceptance"
             )
         return {"ok": True, "sessionKey": session_key, "instant_accept": True}
 
@@ -1039,6 +1058,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("surface_id", "surface_id"),
             ("workspaceId", "workspaceId"),
             ("workspace_id", "workspace_id"),
+            ("initialRoutingMode", "initialRoutingMode"),
+            ("initial_routing_mode", "initial_routing_mode"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]
@@ -1077,11 +1098,14 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             fingerprint_params["initialCollaborationMode"] = (
                 initial_collaboration_mode
             )
+        if initial_routing_mode is not None:
+            fingerprint_params["initialRoutingMode"] = initial_routing_mode
         result = await _handle_sessions_send(
             send_params,
             ctx,
             fingerprint_params=fingerprint_params,
             initial_collaboration_mode=initial_collaboration_mode,
+            initial_routing_mode=initial_routing_mode,
         )
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}

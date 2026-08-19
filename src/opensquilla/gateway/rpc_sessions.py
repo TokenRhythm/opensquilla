@@ -171,6 +171,7 @@ from opensquilla.session.storage import (
     PendingChatInputNotFoundError,
     PlanImplementationSessionBusyError,
     SessionListCursor,
+    SessionRoutingConflictError,
     SessionStorage,
     StaleEpochError,
     StorageBusyError,
@@ -188,6 +189,8 @@ from opensquilla.session.terminal_reply import (
 )
 
 _d = get_dispatcher()
+
+_SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 _PENDING_INPUT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
@@ -1512,8 +1515,12 @@ def _first_dict_value(*values: Any) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_memory_capture_controls(params: dict[str, Any]) -> dict[str, Any]:
-    """Normalize RPC/chat memory-capture controls onto snake_case fields."""
+def _normalize_memory_capture_controls(
+    params: dict[str, Any],
+    *,
+    trusted_run_kind: str | None = None,
+) -> dict[str, Any]:
+    """Normalize user capture controls without trusting a public run-kind label."""
 
     source_hint = params.get("_source")
     if not isinstance(source_hint, dict):
@@ -1546,14 +1553,16 @@ def _normalize_memory_capture_controls(params: dict[str, Any]) -> dict[str, Any]
     elif input_provenance is not None and "kind" not in input_provenance and provenance_kind:
         input_provenance["kind"] = str(provenance_kind)
 
-    run_kind = params.get("run_kind", params.get("runKind"))
-    if run_kind is None:
-        run_kind = source_hint.get("run_kind", source_hint.get("runKind"))
-
     return {
         "no_memory_capture": bool(no_memory_capture),
         "input_provenance": input_provenance,
-        "run_kind": str(run_kind) if run_kind is not None and str(run_kind) else None,
+        # Public WebSocket params, including `_source`, are caller-controlled.
+        # Only an in-process caller can supply this keyword-only override.
+        "run_kind": (
+            str(trusted_run_kind)
+            if trusted_run_kind is not None and str(trusted_run_kind)
+            else None
+        ),
     }
 
 
@@ -3333,6 +3342,7 @@ async def _handle_sessions_send_impl(
     required_collaboration_mode: str | None = None,
     required_collaboration_revision: int | None = None,
     initial_collaboration_mode: str | None = None,
+    initial_routing_mode: str | None = None,
     expected_collaboration_revision: int | None = None,
     expected_active_plan_revision_id: str | None = None,
     require_idle_for_current_plan_implementation: bool = False,
@@ -3340,6 +3350,7 @@ async def _handle_sessions_send_impl(
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
+    trusted_run_kind: str | None = None,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
@@ -3381,6 +3392,19 @@ async def _handle_sessions_send_impl(
     )
     if fork_before_message_id is not None and session_intent is not SessionIntent.CONTINUE:
         raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
+    param_initial_routing_mode = _optional_string_param(
+        params,
+        "initialRoutingMode",
+        "initial_routing_mode",
+    )
+    if (
+        initial_routing_mode is not None
+        and param_initial_routing_mode is not None
+        and initial_routing_mode != param_initial_routing_mode
+    ):
+        raise ValueError("initialRoutingMode does not match initial_routing_mode")
+    if initial_routing_mode is None:
+        initial_routing_mode = param_initial_routing_mode
     raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
     workspace_id: str | None = None
     if raw_workspace_id is not None:
@@ -3462,6 +3486,18 @@ async def _handle_sessions_send_impl(
         required_collaboration_revision = (
             1 if initial_collaboration_mode == "plan" else 0
         )
+    if initial_routing_mode is not None:
+        if initial_routing_mode not in _SESSION_ROUTING_MODES:
+            raise ValueError("initialRoutingMode must be direct, router, or ensemble")
+        if session_intent is not SessionIntent.NEW_CHAT:
+            raise ValueError("initialRoutingMode requires new_chat intent")
+        if fork_before_message_id is not None:
+            raise ValueError("initialRoutingMode cannot be combined with a transcript fork")
+        # Validate the activation plan before accepting a first message. This
+        # is read-only and rejects an Ensemble that cannot be built today.
+        from opensquilla.gateway.model_routing import model_routing_patches
+
+        model_routing_patches(ctx.config, initial_routing_mode)
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -3534,6 +3570,14 @@ async def _handle_sessions_send_impl(
                     replay_response["collaboration"] = (
                         _plan_collaboration_snapshot(current_session)
                     )
+            if initial_routing_mode is not None:
+                replay_response["acceptedRouting"] = {
+                    "mode": initial_routing_mode,
+                }
+                replay_response["routing"] = await _resolve_session_routing_snapshot(
+                    ctx,
+                    previous_acceptance.receipt.accepted_session_key,
+                )
             return replay_response
 
     if require_idle_for_current_plan_implementation:
@@ -3573,6 +3617,19 @@ async def _handle_sessions_send_impl(
             owner=ctx.principal.is_owner,
         )
 
+    def _preaccept_storage_busy_error(exc: StorageBusyError) -> RpcHandlerError:
+        return RpcHandlerError(
+            "STORAGE_BUSY",
+            "Session storage is temporarily busy. Retry this send.",
+            details={
+                "operation": exc.operation,
+                "waited_ms": exc.waited_ms,
+            },
+            retryable=True,
+            retry_after_ms=exc.retry_after_ms,
+            accepted=False,
+        )
+
     selected_workspace = None
     workspace_guard = None
     if workspace_id is not None:
@@ -3608,6 +3665,8 @@ async def _handle_sessions_send_impl(
                 source="project_workspace",
             ).to_origin_payload()
         }
+    if initial_routing_mode is not None:
+        create_kwargs["model_routing_mode"] = initial_routing_mode
     supports_prepared_acceptance = all(
         callable(value)
         for value in (
@@ -3623,9 +3682,11 @@ async def _handle_sessions_send_impl(
         and callable(getattr(task_runtime_candidate, "activate", None))
         and callable(getattr(task_runtime_candidate, "abort_reservation", None))
     )
-    if initial_collaboration_mode is not None and not supports_task_runtime_activation:
+    if (
+        initial_collaboration_mode is not None or initial_routing_mode is not None
+    ) and not supports_task_runtime_activation:
         raise RpcUnavailableError(
-            "Initial collaboration mode requires atomic turn acceptance"
+            "Initial session controls require atomic turn acceptance"
         )
 
     async def _prepare_or_apply_intent() -> tuple[Any, Any | None]:
@@ -3654,18 +3715,21 @@ async def _handle_sessions_send_impl(
         return existing_session, None
 
     intent_lock = get_session_lock(ctx.turn_runner, key)
-    if intent_lock is None:
-        session, atomic_intent_plan = await _prepare_or_apply_intent()
-    else:
-        async with intent_lock:
+    try:
+        if intent_lock is None:
             session, atomic_intent_plan = await _prepare_or_apply_intent()
+        else:
+            async with intent_lock:
+                session, atomic_intent_plan = await _prepare_or_apply_intent()
+    except StorageBusyError as exc:
+        raise _preaccept_storage_busy_error(exc) from exc
 
-    if initial_collaboration_mode is not None and (
+    if (initial_collaboration_mode is not None or initial_routing_mode is not None) and (
         atomic_intent_plan is None
         or getattr(atomic_intent_plan, "action", None) != "create"
     ):
         raise ValueError(
-            "Initial collaboration mode requires atomic session creation"
+            "Initial session controls require atomic session creation"
         )
 
     if fork_before_message_id is not None:
@@ -3688,11 +3752,14 @@ async def _handle_sessions_send_impl(
                 )
 
             parent_lock = get_session_lock(ctx.turn_runner, parent_key)
-            if parent_lock is None:
-                atomic_intent_plan = await _prepare_prefix_intent()
-            else:
-                async with parent_lock:
+            try:
+                if parent_lock is None:
                     atomic_intent_plan = await _prepare_prefix_intent()
+                else:
+                    async with parent_lock:
+                        atomic_intent_plan = await _prepare_prefix_intent()
+            except StorageBusyError as exc:
+                raise _preaccept_storage_busy_error(exc) from exc
             session = atomic_intent_plan.node
             key = child_key
         else:
@@ -4193,7 +4260,10 @@ async def _handle_sessions_send_impl(
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
 
-    capture_controls = _normalize_memory_capture_controls(params)
+    capture_controls = _normalize_memory_capture_controls(
+        params,
+        trusted_run_kind=trusted_run_kind,
+    )
     input_provenance = capture_controls["input_provenance"]
     if input_provenance is not None:
         input_provenance = dict(input_provenance)
@@ -4606,9 +4676,11 @@ async def _handle_sessions_send_impl(
         raise RpcUnavailableError(
             "Plan implementation requires atomic TaskRuntime acceptance"
         )
-    if initial_collaboration_mode is not None and not atomic_runtime_acceptance:
+    if (
+        initial_collaboration_mode is not None or initial_routing_mode is not None
+    ) and not atomic_runtime_acceptance:
         raise RpcUnavailableError(
-            "Initial collaboration mode requires atomic TaskRuntime acceptance"
+            "Initial session controls require atomic TaskRuntime acceptance"
         )
 
     if durable_meta_control is not None and not atomic_runtime_acceptance:
@@ -4863,6 +4935,20 @@ async def _handle_sessions_send_impl(
                 accepted_run_mode_override=accepted_run_mode_override,
             )
             try:
+                if atomic_intent_plan.action in {"create", "fork"}:
+                    from opensquilla.gateway.session_model_routing import (
+                        capture_prepared_session_model_routing_config,
+                    )
+
+                    await atomic_task_runtime.freeze_acceptance(
+                        reservation,
+                        accepted_config=capture_prepared_session_model_routing_config(
+                            ctx.config,
+                            atomic_intent_plan.node,
+                        ),
+                    )
+                else:
+                    await atomic_task_runtime.freeze_acceptance(reservation)
                 acceptance = await _accept_task_record(reservation.task_record)
             except BaseException:
                 await atomic_task_runtime.abort_reservation(reservation)
@@ -5286,6 +5372,9 @@ async def _handle_sessions_send_impl(
                         "sessions.send.initial_collaboration_emit_failed",
                         session_key=key,
                     )
+        if initial_routing_mode is not None:
+            response["acceptedRouting"] = {"mode": initial_routing_mode}
+            response["routing"] = await _resolve_session_routing_snapshot(ctx, key)
         return response
 
     if prepared_acceptance:
@@ -5865,6 +5954,7 @@ async def _handle_sessions_send(
     required_collaboration_mode: str | None = None,
     required_collaboration_revision: int | None = None,
     initial_collaboration_mode: str | None = None,
+    initial_routing_mode: str | None = None,
     expected_collaboration_revision: int | None = None,
     expected_active_plan_revision_id: str | None = None,
     require_idle_for_current_plan_implementation: bool = False,
@@ -5872,6 +5962,7 @@ async def _handle_sessions_send(
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
+    trusted_run_kind: str | None = None,
     _explicit_ingress_intent_registered: bool = False,
 ) -> dict:
     """Register explicit intent before any asynchronous send preparation.
@@ -5899,6 +5990,7 @@ async def _handle_sessions_send(
                 required_collaboration_mode=required_collaboration_mode,
                 required_collaboration_revision=required_collaboration_revision,
                 initial_collaboration_mode=initial_collaboration_mode,
+                initial_routing_mode=initial_routing_mode,
                 expected_collaboration_revision=expected_collaboration_revision,
                 expected_active_plan_revision_id=expected_active_plan_revision_id,
                 require_idle_for_current_plan_implementation=(
@@ -5908,6 +6000,7 @@ async def _handle_sessions_send(
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
                 pending_input_revision=pending_input_revision,
+                trusted_run_kind=trusted_run_kind,
             ),
         )
 
@@ -5978,6 +6071,9 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
         result["displayText"] = display_text
     if payload.get("confirmedPlainText") is True:
         result["confirmedPlainText"] = True
+    initial_routing_mode = payload.get("initialRoutingMode")
+    if isinstance(initial_routing_mode, str):
+        result["initialRoutingMode"] = initial_routing_mode
     return result
 
 
@@ -6062,6 +6158,7 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         (("intent",), "intent"),
         (("workspaceId", "workspace_id"), "workspaceId"),
         (("collaborationMode", "collaboration_mode"), "collaborationMode"),
+        (("initialRoutingMode", "initial_routing_mode"), "initialRoutingMode"),
     ):
         value = _optional_string_param(params, *source_names)
         if value is not None:
@@ -6238,6 +6335,17 @@ async def _handle_pending_inputs_enqueue(
         "pending_input_id",
     )
     raw_payload = _pending_input_send_payload(params, key=key)
+    if raw_payload.get("initialRoutingMode") is not None:
+        # A staged input is owned by an already-durable session, while an
+        # initial routing mode is valid only in the transaction that creates a
+        # new session.  Reject this impossible combination before writing a
+        # queue row that could never be dispatched successfully.
+        raise RpcHandlerError(
+            "PENDING_INITIAL_ROUTING_UNSUPPORTED",
+            "Send a new chat's initialRoutingMode with its first chat.send request.",
+            retryable=False,
+            accepted=False,
+        )
     source_scope = _turn_source_scope(
         cast(dict[str, Any], raw_payload["_source"]),
         ctx,
@@ -10012,6 +10120,7 @@ def _deferred_sessions_messages_metadata() -> dict[str, Any]:
         "run_mode_lock",
         "pendingUserInputs",
         "collaboration",
+        "routing",
         "currentPlan",
         "activePlanRun",
         "goal",
@@ -10026,6 +10135,7 @@ def _deferred_sessions_messages_metadata() -> dict[str, Any]:
         "run_mode_lock": {"locked": True, "source": "deferred"},
         "pendingUserInputs": [],
         "collaboration": None,
+        "routing": None,
         "currentPlan": None,
         "activePlanRun": None,
         "goal": None,
@@ -10089,6 +10199,7 @@ async def _hydrate_sessions_messages_metadata(
             await candidate if inspect.isawaitable(candidate) else candidate
         )
     collaboration: dict[str, Any] | None = None
+    routing = await _resolve_session_routing_snapshot(ctx, key)
     current_plan_payload: dict[str, Any] | None = None
     active_plan_run_payload: dict[str, Any] | None = None
     goal_payload: dict[str, Any] | None = None
@@ -10156,6 +10267,7 @@ async def _hydrate_sessions_messages_metadata(
         ),
         "pendingUserInputs": pending_user_inputs,
         "collaboration": collaboration,
+        "routing": routing,
         "currentPlan": current_plan_payload,
         "activePlanRun": active_plan_run_payload,
         "goal": goal_payload,
@@ -10378,6 +10490,80 @@ def _plan_collaboration_snapshot(
     }
 
 
+def _session_routing_snapshot(
+    value: Any,
+    *,
+    applies_to: str = "next_accepted_turn",
+) -> dict[str, Any]:
+    """Normalize the storage/manager routing result for public RPCs."""
+
+    if isinstance(value, dict):
+        raw_mode = value.get("mode")
+        revision = value.get("revision", 0)
+        source = value.get("source", "session")
+        initialized = value.get("initialized", False)
+    else:
+        raw_mode = getattr(value, "mode", None)
+        revision = getattr(value, "revision", 0)
+        source = getattr(value, "source", "session")
+        initialized = getattr(value, "initialized", False)
+    mode = str(raw_mode or "direct").strip().lower()
+    if mode not in _SESSION_ROUTING_MODES:
+        mode = "direct"
+    return {
+        "mode": mode,
+        "revision": max(0, int(revision or 0)),
+        "source": str(source or "session"),
+        "initialized": bool(initialized),
+        "appliesTo": applies_to,
+    }
+
+
+def _global_session_routing_snapshot(ctx: RpcContext) -> dict[str, Any]:
+    """Return the current global default for a not-yet-created session."""
+
+    from opensquilla.gateway.model_routing import model_routing_snapshot
+
+    mode = str(model_routing_snapshot(ctx.config).get("mode") or "direct")
+    return _session_routing_snapshot(
+        {
+            "mode": mode,
+            "revision": 0,
+            "source": "global",
+            "initialized": False,
+        }
+    )
+
+
+async def _resolve_session_routing_snapshot(
+    ctx: RpcContext,
+    key: str,
+) -> dict[str, Any]:
+    """Resolve one durable row; draft keys expose their global creation default."""
+
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    fallback = _global_session_routing_snapshot(ctx)["mode"]
+    getter = getattr(manager, "get_session_routing", None)
+    try:
+        if callable(getter):
+            return _session_routing_snapshot(
+                await getter(key, fallback_mode=fallback)
+            )
+        storage = get_session_storage(manager)
+        resolver = getattr(storage, "resolve_model_routing_mode", None)
+        if callable(resolver):
+            return _session_routing_snapshot(await resolver(key, fallback))
+    except KeyError:
+        # This is a new-chat draft, not a durable inherited value. The first
+        # accepted turn writes its `initialRoutingMode` or this global value.
+        return _global_session_routing_snapshot(ctx)
+    # Mixed-version/in-memory session services can still provide the global
+    # default until their durable resolver is available.
+    return _global_session_routing_snapshot(ctx)
+
+
 async def _goal_owned_plan_run_for_revision(
     storage: Any,
     revision_id: str,
@@ -10407,6 +10593,118 @@ async def _handle_plans_capabilities(
         "initialModeOnSend": True,
         "atomicInitialMode": True,
     }
+
+
+@_d.method("sessions.routing.get", scope="operator.read")
+async def _handle_sessions_routing_get(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Return a session's effective routing strategy and CAS generation."""
+
+    key = _require_plan_session_key(params)
+    snapshot = await _resolve_session_routing_snapshot(ctx, key)
+    return {
+        "key": key,
+        "sessionKey": key,
+        **snapshot,
+        "routing": snapshot,
+    }
+
+
+@_d.method("sessions.routing.set", scope="operator.write")
+async def _handle_sessions_routing_set(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _explicit_ingress_intent_registered: bool = False,
+) -> dict[str, Any]:
+    """CAS-update a durable session mode before the next admitted turn."""
+
+    key = _require_plan_session_key(params)
+    runtime = getattr(ctx, "task_runtime", None)
+    register = getattr(runtime, "explicit_ingress_intent", None)
+    if not _explicit_ingress_intent_registered and callable(register):
+        async with register(key):
+            return cast(
+                dict[str, Any],
+                await _handle_sessions_routing_set(
+                    params,
+                    ctx,
+                    _explicit_ingress_intent_registered=True,
+                ),
+            )
+    mode = _optional_string_param(params, "mode")
+    if mode not in _SESSION_ROUTING_MODES:
+        raise ValueError("params.mode must be direct, router, or ensemble")
+    expected_revision = (params or {}).get(
+        "expectedRevision",
+        (params or {}).get("expected_revision"),
+    )
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 0
+    ):
+        raise ValueError("params.expectedRevision must be a non-negative integer")
+    # Reuse the global control's activation planner as validation only. It
+    # catches an unbuildable Ensemble lineup without changing shared config.
+    from opensquilla.gateway.model_routing import model_routing_patches
+
+    model_routing_patches(ctx.config, mode)
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    setter = getattr(manager, "set_session_routing", None)
+    storage = get_session_storage(manager)
+    if not callable(setter):
+        setter = getattr(storage, "set_model_routing_mode", None)
+    if not callable(setter):
+        raise RpcUnavailableError("Session routing storage is not configured")
+
+    async def _commit() -> dict[str, Any]:
+        try:
+            return _session_routing_snapshot(
+                await setter(key, mode, expected_revision=expected_revision)
+            )
+        except KeyError as exc:
+            raise RpcHandlerError(
+                "SESSION_NOT_FOUND",
+                "Set a new chat's initialRoutingMode with its first message instead.",
+                retryable=False,
+                accepted=False,
+            ) from exc
+
+    try:
+        collector = getattr(runtime, "collect_admission", None)
+        if callable(collector):
+            async with collector(key):
+                snapshot = await _commit()
+        else:
+            lock = get_session_lock(ctx.turn_runner, key)
+            if lock is None:
+                snapshot = await _commit()
+            else:
+                async with lock:
+                    snapshot = await _commit()
+    except SessionRoutingConflictError as exc:
+        latest = await _resolve_session_routing_snapshot(ctx, key)
+        raise RpcHandlerError(
+            "SESSION_ROUTING_CHANGED",
+            str(exc),
+            details={"routing": latest},
+            retryable=True,
+            accepted=False,
+        ) from exc
+
+    event = {
+        "key": key,
+        "sessionKey": key,
+        "routing": snapshot,
+        **snapshot,
+    }
+    await _emit_to_subscribers(ctx, key, "sessions.routing.changed", event)
+    return event
 
 
 @_d.method("plans.setMode", scope="operator.write")
@@ -11103,7 +11401,18 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             workspace = (
                 str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
             )
-    from opensquilla.gateway.model_routing import model_routing_snapshot
+    from opensquilla.gateway.model_routing import (
+        capture_model_routing_config,
+        model_routing_snapshot,
+    )
+
+    routing = await _resolve_session_routing_snapshot(ctx, session_key)
+    effective_routing_config = capture_model_routing_config(
+        ctx.config,
+        session_mode=routing["mode"],
+        session_routing_revision=routing["revision"],
+        session_routing_source=routing["source"],
+    )
 
     metadata: dict[str, Any] = {
         "session_key": session_key,
@@ -11148,8 +11457,9 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "running_count": running_count,
         },
         "runtime": {
-            "model_routing": model_routing_snapshot(ctx.config),
+            "model_routing": model_routing_snapshot(effective_routing_config),
         },
+        "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),
         "currentPlan": (
             plan_revision_snapshot(current_plan, current=True)

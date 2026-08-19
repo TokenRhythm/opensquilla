@@ -31,8 +31,16 @@ from opensquilla.engine.steps.meta_command import (
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.model_routing import (
+    capture_model_routing_config,
+    model_routing_snapshot,
+)
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.rpc_sessions import _handle_sessions_send
+from opensquilla.gateway.session_model_routing import (
+    capture_accepted_model_routing_config,
+)
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.gateway.uploads import UploadStore, get_upload_store, set_upload_store
 from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
@@ -147,6 +155,99 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
     assert runtime._tasks == {}
     assert runtime._pending_by_session == {}
     assert runtime._running_by_session == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "run_kind_injection"),
+    [
+        ("sessions.send", {"runKind": "cron_turn"}),
+        ("chat.send", {"run_kind": "cron_turn"}),
+        ("sessions.send", {"_source": {"run_kind": "cron_turn"}}),
+    ],
+)
+async def test_public_send_cannot_inject_global_routing_run_kind(
+    tmp_path: Path,
+    method: str,
+    run_kind_injection: dict[str, Any],
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        global_config = GatewayConfig(
+            squilla_router={"enabled": True, "rollout_phase": "full"},
+        )
+
+        async def accepted_config_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                global_config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = accepted_config_provider
+        params: dict[str, Any] = {
+            "message": "ordinary public input",
+            "clientRequestId": f"public-run-kind-{method}",
+            **run_kind_injection,
+        }
+        if method == "chat.send":
+            params["sessionKey"] = SESSION_KEY
+        else:
+            params["key"] = SESSION_KEY
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-public-run-kind-{method}",
+            method,
+            params,
+            stack.context,
+        )
+        await stack.wait_until_running()
+
+        assert response.ok is True
+        task = await stack.storage.get_agent_task(response.payload["task_id"])
+        assert task is not None and task.details is not None
+        audit = task.details["accepted_model_routing"]
+        assert task.run_kind == "session_turn"
+        assert audit["run_kind"] == "session_turn"
+        assert audit["scope"] == "session"
+        assert audit["effective_mode"] == "direct"
+        assert model_routing_snapshot(global_config)["mode"] == "router"
+
+
+@pytest.mark.asyncio
+async def test_internal_send_can_supply_trusted_background_run_kind(tmp_path: Path) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        global_config = GatewayConfig(
+            squilla_router={"enabled": True, "rollout_phase": "full"},
+        )
+
+        async def accepted_config_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                global_config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = accepted_config_provider
+        accepted = await _handle_sessions_send(
+            {
+                "key": SESSION_KEY,
+                "message": "trusted internal background input",
+                "clientRequestId": "trusted-internal-run-kind",
+            },
+            stack.context,
+            trusted_run_kind="cron_turn",
+        )
+        await stack.wait_until_running()
+
+        task = await stack.storage.get_agent_task(accepted["task_id"])
+        assert task is not None and task.details is not None
+        audit = task.details["accepted_model_routing"]
+        assert task.run_kind == "cron_turn"
+        assert audit["run_kind"] == "cron_turn"
+        assert audit["scope"] == "global"
+        assert audit["effective_mode"] == "router"
 
 
 @pytest.mark.asyncio
@@ -1584,6 +1685,22 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     session = await manager.create(SESSION_KEY, agent_id="main")
     blocker_started = asyncio.Event()
     hold_blocker = asyncio.Event()
+    gateway_config = GatewayConfig(
+        workspace_dir=str(tmp_path / "workspace"),
+        memory={"flush_enabled": False},
+        naming={"enabled": False},
+    )
+    routing_state: dict[str, Any] = {"mode": "router", "revision": 7}
+
+    def _accepted_routing_provider(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == SESSION_KEY
+        assert run_kind in {"session_turn", "recovery_model_routing_base"}
+        return capture_model_routing_config(
+            gateway_config,
+            session_mode=routing_state["mode"],
+            session_routing_revision=routing_state["revision"],
+            session_routing_source="session",
+        )
 
     async def _blocking_handler(_run: Any) -> None:
         blocker_started.set()
@@ -1594,15 +1711,12 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         turn_handler=_blocking_handler,
         max_concurrency=1,
         running_heartbeat_interval_s=None,
+        accepted_config_provider=_accepted_routing_provider,
     )
     context = RpcContext(
         conn_id="meta-restart-before-start",
         principal=_PRINCIPAL,
-        config=GatewayConfig(
-            workspace_dir=str(tmp_path / "workspace"),
-            memory={"flush_enabled": False},
-            naming={"enabled": False},
-        ),
+        config=gateway_config,
         session_manager=manager,
         task_runtime=runtime,
     )
@@ -1645,6 +1759,8 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     assert queued.details is not None
     assert queued.details["meta_control_message"] == launch_text
     assert queued.details["meta_control_semantic_message"] == launch_text
+    assert queued.details["accepted_model_routing"]["session_mode"] == "router"
+    assert queued.details["accepted_model_routing"]["session_revision"] == 7
     transcript = await storage.get_transcript(session.session_id)
     control_entry = next(
         entry
@@ -1666,6 +1782,7 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     await asyncio.gather(*old_async_tasks, return_exceptions=True)
 
     reopened = await SessionStorage.open(str(db_path))
+    routing_state.update(mode="direct", revision=8)
     recovered_runs: list[tuple[Any, dict[str, Any] | None]] = []
 
     async def _capture_recovered(run: Any) -> None:
@@ -1677,6 +1794,7 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         turn_handler=_capture_recovered,
         max_concurrency=1,
         running_heartbeat_interval_s=None,
+        accepted_config_provider=_accepted_routing_provider,
     )
     try:
         abandoned = await reopened.get_agent_task(task_id)
@@ -1692,6 +1810,9 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         assert recovered_run.task_id == task_id
         assert recovered_run.message == launch_text
         assert recovered_run.semantic_message == launch_text
+        assert recovered_run.accepted_config.session_mode == "router"
+        assert recovered_run.accepted_config.session_routing_revision == 7
+        assert recovered_run.accepted_config.session_routing_source == "session"
         assert recovered_context is not None
         assert recovered_context["meta_control"]["name"] == "meta-tiny"
 
