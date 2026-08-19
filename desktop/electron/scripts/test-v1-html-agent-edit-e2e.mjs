@@ -683,6 +683,21 @@ async function waitForSettledTurn(page) {
   )
 }
 
+async function submitChatComposer(page) {
+  const button = page.locator('.chat-send-btn.btn--primary')
+  await waitFor(
+    async () => {
+      if (await button.count() !== 1 || !await button.isVisible() || await button.isDisabled()) {
+        return false
+      }
+      return (await button.getAttribute('class'))?.includes('is-ready') === true
+    },
+    'ready chat send action',
+    TIMEOUT_MS,
+  )
+  await button.evaluate(element => element.click())
+}
+
 function generatedArtifactCard(page) {
   return page.locator('.msg-artifact-chip').filter({ hasText: GENERATED_FILENAME })
 }
@@ -1163,7 +1178,7 @@ try {
   }
 
   await page.locator('.chat-textarea').fill(GENERATE_MESSAGE)
-  await page.locator('.chat-send-btn.btn--primary').click()
+  await submitChatComposer(page)
   await waitFor(() => /\/control\/chat\?session=/.test(page.url()), 'materialized V1 session', TIMEOUT_MS)
   evidence.sessionUrl = page.url()
   await waitForSettledTurn(page)
@@ -1328,7 +1343,7 @@ try {
   const annotationRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
   await dropNextChatSend(page)
-  await page.locator('.chat-send-btn.btn--primary').click()
+  await submitChatComposer(page)
   await page.waitForFunction(
     () => window.__opensquillaV1DroppedChatSend === true,
     undefined,
@@ -1363,7 +1378,7 @@ try {
   )
   evidence.annotationSendFailureRetained = true
 
-  await page.locator('.chat-send-btn.btn--primary').click()
+  await submitChatComposer(page)
   await waitFor(
     () => provider.requests.slice(annotationRequestStart)
       .some(payload => annotationToolNames(payload).length > 0),
@@ -1453,7 +1468,7 @@ try {
 
   const ambiguousRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(AMBIGUOUS_MESSAGE)
-  await page.locator('.chat-send-btn.btn--primary').click()
+  await submitChatComposer(page)
   await waitFor(
     () => provider.contextualCandidateErrors() === 2,
     'two rejected contextual candidates',
@@ -1485,7 +1500,7 @@ try {
 
   const patchRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(PATCH_MESSAGE)
-  await page.locator('.chat-send-btn.btn--primary').click()
+  await submitChatComposer(page)
   await waitFor(() => provider.documentPatchCalls() === 1, 'document_patch proposal', TIMEOUT_MS)
   await waitForSettledTurn(page)
   const mutationTurnText = await page.locator('.msg-ai').last().innerText()
