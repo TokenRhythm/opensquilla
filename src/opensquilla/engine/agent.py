@@ -202,10 +202,14 @@ from opensquilla.provider.correlation_context import bind_provider_request_corre
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
+    IMAGE_INPUT_UNSUPPORTED_CODE,
+    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+    count_provider_image_blocks,
+    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
-    validate_provider_chat_request,
+    validate_provider_chat_admission,
 )
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
@@ -372,20 +376,6 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
-UNSUPPORTED_IMAGE_INPUT_REPLY = (
-    "当前选择的模型暂不支持查看图片，因此无法分析你上传的图片。"
-    "请切换到支持图片的模型，或将图片中的文字和关键信息粘贴到消息中后重试。"
-)
-
-
-def model_explicitly_lacks_vision(capabilities: Any) -> bool:
-    """Return true only when capability data explicitly denies vision."""
-
-    return capabilities is not None and not bool(
-        getattr(capabilities, "supports_vision", False)
-    )
-
-
 _TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
 _TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
     "[Runtime recovery]\n"
@@ -2658,6 +2648,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         output_json_schema=chat_cfg.output_json_schema,
         output_json_schema_strict=chat_cfg.output_json_schema_strict,
         model_capabilities=chat_cfg.model_capabilities,
+        model_vision_support=chat_cfg.model_vision_support,
         thinking_level=ThinkingLevel.OFF,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
         context_window_tokens_global_override=(
@@ -3366,6 +3357,7 @@ class Agent:
             model_capabilities=(
                 resolved_capabilities
             ),
+            model_vision_support=self.config.model_vision_support,
             thinking_level=(
                 self.config.thinking
                 if isinstance(self.config.thinking, ThinkingLevel)
@@ -4137,25 +4129,6 @@ class Agent:
                 error=str(exc),
             )
             return False
-
-    def _provider_local_terminal_reply(
-        self,
-        messages: list[Message],
-        config: ChatConfig,
-    ) -> str | None:
-        local_reply = getattr(self.provider, "local_terminal_reply", None)
-        if not callable(local_reply):
-            return None
-        try:
-            reply = local_reply(messages, config)
-        except Exception as exc:  # noqa: BLE001 - optional preflight must be isolated
-            logger.warning(
-                "provider.local_terminal_reply_failed",
-                session_key=self._session_key,
-                error=str(exc),
-            )
-            return None
-        return reply if isinstance(reply, str) and reply else None
 
     @staticmethod
     def _tool_call_string_arg(
@@ -6642,25 +6615,36 @@ class Agent:
             _ = terminates  # always terminates today; reserved for future
             return
 
-        current_turn_image_count = self._count_image_blocks(extra_messages or [])
-        if current_turn_image_count > 0 and model_explicitly_lacks_vision(
-            self.config.model_capabilities
-        ):
+        current_turn_image_count = count_provider_image_blocks(extra_messages or [])
+        forced_image_rejection = str(
+            self.config.metadata.get("image_input_forced_rejection_reason") or ""
+        ).strip()
+        image_admission_error = image_input_admission_error(
+            extra_messages or [],
+            vision_support=(
+                "unsupported"
+                if forced_image_rejection
+                else self.config.model_vision_support
+            ),
+        )
+        if forced_image_rejection or image_admission_error is not None:
+            image_input_reason = forced_image_rejection or "model_vision_unsupported"
             self.config.metadata["image_input_mode"] = "rejected"
-            self.config.metadata["image_input_reason"] = "vision_unsupported"
+            self.config.metadata["image_input_reason"] = image_input_reason
             self.config.metadata["image_input_count"] = current_turn_image_count
+            self.config.metadata["image_input_stage"] = "primary"
             self._write_turn_call_log(
                 "image_input_preflight",
-                action="terminal_reply",
-                reason="vision_unsupported",
+                action="reject",
+                reason=image_input_reason,
                 model=self.config.model_id or "",
                 image_count=current_turn_image_count,
             )
-            async for ev in self._emit_terminal_text(
-                UNSUPPORTED_IMAGE_INPUT_REPLY,
-                iterations=0,
-            ):
-                yield ev
+            yield self._transition(AgentState.ERROR)
+            yield ErrorEvent(
+                message=IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+                code=IMAGE_INPUT_UNSUPPORTED_CODE,
+            )
             return
 
         # Use the system prompt from config (wired by gateway via identity.prompt)
@@ -8121,31 +8105,10 @@ class Agent:
                         self._provider_call_tool_result_retrieval_available = (
                             previous_call_retrieval
                         )
-                    local_terminal_reply = self._provider_local_terminal_reply(
-                        request_messages,
-                        chat_cfg,
-                    )
-                    if local_terminal_reply is not None:
-                        assistant_text_parts = [local_terminal_reply]
-                        attempt_user_visible_emitted = True
-                        _got_done_event = True
-                        provider_done_for_log = ProviderDoneEvent(
-                            stop_reason="end_turn",
-                            input_tokens=0,
-                            output_tokens=0,
-                            model=self.config.model_id or "",
-                        )
-                        self._write_turn_call_log(
-                            "provider_local_terminal_reply",
-                            reason=self.config.metadata.get("image_input_reason", ""),
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield TextDeltaEvent(text=local_terminal_reply)
-                        break
-                    validation_error = validate_provider_chat_request(
+                    validation_error = validate_provider_chat_admission(
                         self.provider,
                         request_messages,
+                        chat_cfg,
                     )
                     if validation_error is not None:
                         terminal_error = ErrorEvent(
@@ -8164,6 +8127,39 @@ class Agent:
                             terminal_error = None
                             yield TextDeltaEvent(text=response_text)
                         else:
+                            if terminal_error.code == IMAGE_INPUT_UNSUPPORTED_CODE:
+                                exact_image_count = count_provider_image_blocks(
+                                    request_messages
+                                )
+                                self.config.metadata["image_input_mode"] = "rejected"
+                                self.config.metadata.setdefault(
+                                    "image_input_reason",
+                                    "model_vision_unsupported",
+                                )
+                                self.config.metadata["image_input_count"] = (
+                                    exact_image_count
+                                )
+                                self.config.metadata.setdefault(
+                                    "image_input_stage",
+                                    "primary",
+                                )
+                                self._write_turn_call_log(
+                                    "image_input_preflight",
+                                    action="reject",
+                                    reason=str(
+                                        self.config.metadata.get("image_input_reason")
+                                        or "model_vision_unsupported"
+                                    ),
+                                    stage=str(
+                                        self.config.metadata.get("image_input_stage")
+                                        or "primary"
+                                    ),
+                                    image_count=int(
+                                        self.config.metadata.get("image_input_count") or 0
+                                    ),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
                             self._write_turn_call_log(
                                 "turn_policy_decision",
                                 action="stop",

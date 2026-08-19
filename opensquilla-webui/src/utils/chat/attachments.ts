@@ -123,6 +123,10 @@ export function hasSendableModelInputImageAttachment(attachments: readonly Attac
   return attachments.some(isSendableModelInputImageAttachment)
 }
 
+export function hasModelInputImageAttachment(attachments: readonly Attachment[]): boolean {
+  return attachments.some(attachment => isModelInputImageMime(attachment.mime))
+}
+
 export function serializeSendableAttachment(attachment: SendableAttachment): ChatSendAttachmentPayload {
   if (attachment.kind === 'staged') {
     return {

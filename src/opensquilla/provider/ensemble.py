@@ -62,13 +62,13 @@ from .model_catalog import resolve_effective_context_window, shared_catalog
 from .protocol import (
     LLMProvider,
     ProviderMetadata,
+    count_provider_image_blocks,
     project_provider_final_request,
     project_provider_message_count,
 )
 from .selector import ModelSelector, ProviderConfig, SelectorConfig
 from .types import (
     ChatConfig,
-    ContentBlockImage,
     ContentBlockToolResult,
     DoneEvent,
     EnsembleProgressEvent,
@@ -2114,25 +2114,12 @@ class EnsembleProvider:
     def validate_chat_request(self, messages: list[Message]) -> ErrorEvent | None:
         """Reject typed image input before any ensemble leg can start."""
 
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            for block in message.content:
-                if isinstance(block, ContentBlockImage):
-                    return ErrorEvent(
-                        message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-                        code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-                    )
-                if not isinstance(block, ContentBlockToolResult):
-                    continue
-                if isinstance(block.content, list) and any(
-                    isinstance(item, ContentBlockImage) for item in block.content
-                ):
-                    return ErrorEvent(
-                        message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-                        code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-                    )
-        return None
+        if count_provider_image_blocks(messages) <= 0:
+            return None
+        return ErrorEvent(
+            message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
+            code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         models: list[ModelInfo] = []

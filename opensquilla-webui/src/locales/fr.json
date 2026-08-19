@@ -3806,6 +3806,7 @@
       "routerAnimationOff": "Animation du routeur désactivée",
       "modelRouting": "Routage des modèles",
       "ensembleImageUnsupported": "Ensemble ne prend pas encore en charge les images en entrée. Dans « Routage des modèles », utilisez « Routeur mono-modèle avec IA » configuré pour les images ou « Désactivé » avec un modèle compatible avec les images en entrée.",
+      "imageInputUnsupported": "Le modèle sélectionné ne peut pas traiter les images. Choisissez un modèle compatible ou retirez l’image.",
       "routingUpdateImageBlocked": "Le routage des modèles est en cours de mise à jour. Attendez avant d’envoyer des images.",
       "modelRoutingOff": "Désactivé",
       "modelRoutingOffDesc": "Envoie chaque tour au modèle sélectionné.",

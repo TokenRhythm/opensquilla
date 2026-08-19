@@ -100,12 +100,7 @@ from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import (
-    UNSUPPORTED_IMAGE_INPUT_REPLY,
-    Agent,
-    ToolHandler,
-    model_explicitly_lacks_vision,
-)
+from opensquilla.engine.agent import Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.hooks import (
@@ -228,9 +223,6 @@ from opensquilla.observability.turn_call_log import TurnCallLogger, is_turn_call
 from opensquilla.paths import media_root_from_config
 from opensquilla.process_tree import task_process_scope
 from opensquilla.provider import (
-    DoneEvent as ProviderDoneEvent,
-)
-from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider import (
@@ -246,9 +238,6 @@ from opensquilla.provider import (
     ReasoningDeltaEvent as ProviderReasoningDeltaEvent,
 )
 from opensquilla.provider import (
-    TextDeltaEvent as ProviderTextDeltaEvent,
-)
-from opensquilla.provider import (
     ToolUseDeltaEvent as ProviderToolUseDeltaEvent,
 )
 from opensquilla.provider import (
@@ -262,19 +251,21 @@ from opensquilla.provider.model_catalog import (
     shared_catalog,
 )
 from opensquilla.provider.protocol import (
+    count_provider_image_blocks,
+    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
-    validate_provider_chat_request,
-)
-from opensquilla.provider.types import (
-    ContentBlockImage,
-    ProviderGenerationResetEvent,
-    ProviderRequestCorrelation,
-    derive_provider_request_correlation,
+    validate_provider_chat_admission,
 )
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
+)
+from opensquilla.provider.types import (
+    ProviderGenerationResetEvent,
+    ProviderRequestCorrelation,
+    VisionSupport,
+    derive_provider_request_correlation,
 )
 from opensquilla.router_control import (
     RouterControlHoldStore,
@@ -1671,13 +1662,7 @@ def _fallback_deployment_identity(config: Any) -> _FallbackDeploymentIdentity:
 
 
 def _count_image_blocks(messages: Sequence[Any]) -> int:
-    count = 0
-    for message in messages:
-        content = getattr(message, "content", None)
-        if not isinstance(content, list):
-            continue
-        count += sum(1 for block in content if isinstance(block, ContentBlockImage))
-    return count
+    return count_provider_image_blocks(list(messages))
 
 
 _SELECTOR_PRE_TEXT_REASONING_LIMIT_BYTES: Final[int] = 2 * 1024 * 1024
@@ -2200,6 +2185,9 @@ class _SelectorFallbackProvider:
         self._fallback_deployment_capabilities: dict[
             _FallbackDeploymentIdentity, ModelCapabilities
         ] = {}
+        self._fallback_deployment_vision_support: dict[
+            _FallbackDeploymentIdentity, VisionSupport
+        ] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -2412,6 +2400,20 @@ class _SelectorFallbackProvider:
         self._fallback_deployment_limits = normalized
         self._fallback_deployment_capabilities = normalized_capabilities
 
+    def configure_fallback_deployment_vision_support(
+        self,
+        entries: Sequence[tuple[Any, Any]],
+    ) -> None:
+        """Install exact deployment-scoped tri-state vision evidence."""
+
+        normalized: dict[_FallbackDeploymentIdentity, VisionSupport] = {}
+        for deployment, value in entries:
+            identity = _fallback_deployment_identity(deployment)
+            if identity is None or value not in {"supported", "unsupported", "unknown"}:
+                continue
+            normalized[identity] = value
+        self._fallback_deployment_vision_support = normalized
+
     def configure_fallback_limits(
         self,
         limits: Mapping[tuple[str, str], tuple[int, int]],
@@ -2536,9 +2538,10 @@ class _SelectorFallbackProvider:
         ).strip()
         model = str(getattr(current_config, "model", "") or "").strip()
         if model:
+            deployment_identity = _fallback_deployment_identity(current_config)
             deployment_capabilities = (
                 self._fallback_deployment_capabilities.get(
-                    _fallback_deployment_identity(current_config)
+                    deployment_identity
                 )
                 if current_config is not None
                 else None
@@ -2583,6 +2586,40 @@ class _SelectorFallbackProvider:
                     error=type(exc).__name__,
                 )
                 updates["model_capabilities"] = ModelCapabilities()
+
+            vision_support = self._fallback_deployment_vision_support.get(
+                deployment_identity,
+                "unknown",
+            )
+            if vision_support == "unknown":
+                try:
+                    vision_resolver = getattr(
+                        shared_catalog(),
+                        "resolve_deployment_vision_support",
+                        None,
+                    )
+                    if callable(vision_resolver):
+                        resolved_vision_support = vision_resolver(
+                            model,
+                            provider=provider_id,
+                            api_key=str(getattr(current_config, "api_key", "") or ""),
+                            base_url=str(getattr(current_config, "base_url", "") or ""),
+                            proxy=str(getattr(current_config, "proxy", "") or ""),
+                        )
+                        if resolved_vision_support in {
+                            "supported",
+                            "unsupported",
+                            "unknown",
+                        }:
+                            vision_support = resolved_vision_support
+                except Exception as exc:  # noqa: BLE001 - optional capability refinement
+                    log.warning(
+                        "selector_fallback_vision_support_rebind_failed",
+                        provider=provider_id,
+                        model=model,
+                        error=type(exc).__name__,
+                    )
+            updates["model_vision_support"] = vision_support
 
         try:
             inherited_proof_cap = max(
@@ -2757,46 +2794,57 @@ class _SelectorFallbackProvider:
         messages: list[Any],
         config: Any,
         *,
-        reason: str,
         reject_unknown_capability: bool,
-    ) -> int:
-        """Record a local image rejection for the active physical leg."""
+    ) -> ProviderErrorEvent | None:
+        """Return and record an image admission error for the active physical leg."""
 
+        raw_vision_support = getattr(config, "model_vision_support", "unknown")
+        vision_support: VisionSupport = (
+            cast(VisionSupport, raw_vision_support)
+            if raw_vision_support in {"supported", "unsupported", "unknown"}
+            else "unknown"
+        )
+        error = image_input_admission_error(
+            messages,
+            vision_support=vision_support,
+            reject_unknown=reject_unknown_capability,
+        )
+        if error is None:
+            return None
         image_count = _count_image_blocks(messages)
-        capabilities = getattr(config, "model_capabilities", None)
-        if image_count <= 0:
-            return 0
-        if capabilities is None and not reject_unknown_capability:
-            return 0
-        if capabilities is not None and bool(
-            getattr(capabilities, "supports_vision", False)
-        ):
-            return 0
         if self._turn_metadata is not None:
             self._turn_metadata["image_input_mode"] = "rejected"
-            self._turn_metadata["image_input_reason"] = reason
+            self._turn_metadata["image_input_reason"] = (
+                "capability_unknown"
+                if vision_support == "unknown"
+                else "model_vision_unsupported"
+            )
             self._turn_metadata["image_input_count"] = image_count
-        return image_count
+            self._turn_metadata["image_input_stage"] = (
+                "fallback" if self._used_fallback else "primary"
+            )
+        return error
 
-    def local_terminal_reply(
+    def validate_chat_admission(
         self,
         messages: list[Any],
         config: Any,
-    ) -> str | None:
-        """Return a capability rejection before Agent reserves another call."""
+    ) -> ProviderErrorEvent | None:
+        """Validate the exact request against the active physical deployment."""
 
         active_config = self._config_for_active_leg(config)
-        reason = (
-            "fallback_vision_unsupported" if self._used_fallback else "vision_unsupported"
-        )
-        if self._reject_unsupported_image_input(
+        capability_error = self._reject_unsupported_image_input(
             messages,
             active_config,
-            reason=reason,
             reject_unknown_capability=self._used_fallback,
-        ):
-            return UNSUPPORTED_IMAGE_INPUT_REPLY
-        return None
+        )
+        if capability_error is not None:
+            return capability_error
+        return validate_provider_chat_admission(
+            self._provider,
+            messages,
+            active_config,
+        )
 
     def project_final_request(
         self,
@@ -2864,18 +2912,7 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
-        local_terminal_reply = self.local_terminal_reply(messages, config)
-        if local_terminal_reply is not None:
-            yield ProviderTextDeltaEvent(text=UNSUPPORTED_IMAGE_INPUT_REPLY)
-            yield ProviderDoneEvent(
-                stop_reason="end_turn",
-                input_tokens=0,
-                output_tokens=0,
-                model=self._last_executed_model or active_model,
-            )
-            return
-
-        validation_error = validate_provider_chat_request(active_provider, messages)
+        validation_error = self.validate_chat_admission(messages, config)
         if validation_error is not None:
             yield validation_error
             return
@@ -3068,19 +3105,21 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
-                    if self._reject_unsupported_image_input(
+                    fallback_admission_error = self._reject_unsupported_image_input(
                         messages,
                         fallback_config,
-                        reason="fallback_vision_unsupported",
                         reject_unknown_capability=True,
-                    ):
-                        yield ProviderTextDeltaEvent(text=UNSUPPORTED_IMAGE_INPUT_REPLY)
-                        yield ProviderDoneEvent(
-                            stop_reason="end_turn",
-                            input_tokens=0,
-                            output_tokens=0,
-                            model=self._last_executed_model or active_model,
-                        )
+                    )
+                    if fallback_admission_error is not None:
+                        yield fallback_admission_error
+                        return
+                    fallback_validation_error = validate_provider_chat_admission(
+                        fallback_provider,
+                        messages,
+                        fallback_config,
+                    )
+                    if fallback_validation_error is not None:
+                        yield fallback_validation_error
                         return
                     fallback_authority_config = getattr(
                         self._selector,
@@ -5378,14 +5417,23 @@ class TurnRunner:
                 )
 
             current_turn_image_count = _count_image_blocks(extra_msgs or [])
+            forced_image_rejection_reason = str(
+                turn.metadata.get("image_input_forced_rejection_reason", "") or ""
+            ).strip()
             image_input_preflight_blocked = bool(
-                current_turn_image_count > 0
-                and model_explicitly_lacks_vision(model_caps)
+                forced_image_rejection_reason
+                or (
+                    current_turn_image_count > 0
+                    and agent_config.model_vision_support == "unsupported"
+                )
             )
             if image_input_preflight_blocked:
                 turn.metadata["image_input_mode"] = "rejected"
-                turn.metadata["image_input_reason"] = "vision_unsupported"
+                turn.metadata["image_input_reason"] = (
+                    forced_image_rejection_reason or "model_vision_unsupported"
+                )
                 turn.metadata["image_input_count"] = current_turn_image_count
+                turn.metadata["image_input_stage"] = "primary"
             # 6. Compaction (t3 + preflight) + history load + request-context
             # prepend. CompactionAndHistoryStage owns the four-call sequence
             # (t3_upgrade → preflight → load_history → prepend_request_context_prompt).

@@ -1747,18 +1747,12 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 c3_fusion_active=c3_fusion_active,
                 empty_model_tiers=sorted(image_capable_tiers),
             )
-            if c3_fusion_active:
-                raise RuntimeError(
-                    "No image-capable SquillaRouter tier is available for this image "
-                    "request while C3 multi-model fusion is selected. Configure "
-                    "squilla_router.tiers.image_model with supports_image=true and a "
-                    "non-empty model, or enable image support on another non-C3 tier."
-                )
-            raise RuntimeError(
-                "No image-capable SquillaRouter tier is configured with a non-empty model "
-                "for this image request. Configure squilla_router.tiers.image_model with "
-                "supports_image=true and a model."
+            ctx.metadata["image_input_forced_rejection_reason"] = (
+                "router_image_route_unavailable"
             )
+            ctx.metadata["image_input_mode"] = "rejected"
+            ctx.metadata["image_input_reason"] = "router_image_route_unavailable"
+            return ctx
         ordered_image_tiers = sorted(
             image_tiers,
             key=lambda name: (

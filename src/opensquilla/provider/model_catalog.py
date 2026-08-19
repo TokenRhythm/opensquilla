@@ -32,7 +32,7 @@ from .tokenrhythm_catalog import (
     is_official_tokenrhythm_endpoint,
     tokenrhythm_authority_identity,
 )
-from .types import ModelCapabilities, ModelInfo
+from .types import ModelCapabilities, ModelInfo, VisionSupport
 
 log = structlog.get_logger(__name__)
 
@@ -991,6 +991,97 @@ class ModelCatalog:
             max_output_tokens=effective_max,
             max_output_tokens_known=max_known,
         )
+
+    def resolve_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider_name: str = "",
+        base_url: str = "",
+    ) -> VisionSupport:
+        """Resolve per-field vision evidence without treating defaults as facts."""
+
+        provider_id = str(provider_name or "").strip().lower()
+        model_id = str(model_id or "").strip()
+        openrouter_live_fields = (
+            _live_layer_fields(self._models.get(model_id))
+            if provider_id in {"", "openrouter"}
+            else {}
+        )
+        layers = (
+            self._user_override_fields(model_id, provider_id),
+            self._live_provider_fields(model_id, provider_id),
+            openrouter_live_fields,
+            _corrections_layer_fields(provider_id, model_id),
+            _snapshot_layer_fields(provider_id, model_id),
+        )
+        for fields in layers:
+            value = fields.get("supports_vision")
+            if isinstance(value, bool):
+                return "supported" if value else "unsupported"
+        return "unknown"
+
+    def resolve_deployment_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider: str,
+        api_key: str = "",
+        base_url: str = "",
+        proxy: str = "",
+    ) -> VisionSupport:
+        """Resolve exact deployment vision evidence for selector legs."""
+
+        del proxy  # Identity is represented by the provider's catalog authority.
+        provider_id = str(provider or "").strip().lower()
+        if provider_id != "tokenrhythm":
+            return self.resolve_vision_support(
+                model_id,
+                provider_name=provider_id,
+                base_url=base_url,
+            )
+
+        effective_base = str(base_url or "").strip() or TOKENRHYTHM_API_BASE_URL
+        canonical_base = canonical_tokenrhythm_base_url(effective_base)
+        official_endpoint = bool(
+            canonical_base and is_official_tokenrhythm_endpoint(canonical_base)
+        )
+        authority = tokenrhythm_authority_identity(
+            provider=provider_id,
+            base_url=canonical_base,
+            api_key=api_key,
+        )
+        model_l = str(model_id or "").strip().lower()
+        snapshot = self._tokenrhythm_snapshot_sidecars
+        declared = (
+            snapshot.declared_by_authority.get(authority, {}).get(model_l)
+            if authority is not None
+            else None
+        )
+        published = snapshot.published.get(model_l) if official_endpoint else None
+        deployment_value = None
+        if declared is not None:
+            deployment_value = declared.capabilities.vision
+        if deployment_value is None and published is not None:
+            deployment_value = published.capabilities.vision
+
+        layers = (
+            self._user_override_fields(str(model_id or "").strip(), provider_id),
+            {"supports_vision": deployment_value}
+            if isinstance(deployment_value, bool)
+            else {},
+            _corrections_layer_fields(provider_id, model_id)
+            if official_endpoint
+            else {},
+            _snapshot_layer_fields(provider_id, model_id)
+            if official_endpoint
+            else {},
+        )
+        for fields in layers:
+            value = fields.get("supports_vision")
+            if isinstance(value, bool):
+                return "supported" if value else "unsupported"
+        return "unknown"
 
     def resolve_deployment_capabilities(
         self,

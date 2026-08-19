@@ -2157,6 +2157,61 @@ describe('useChatHistory optimistic local rows', () => {
     })
   })
 
+  it.each([
+    [
+      'image_input_unsupported',
+      'The selected model cannot process image input. Choose an image-capable model or remove the image.',
+    ],
+    [
+      'ensemble_multimodal_unsupported',
+      "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+    ],
+  ])('restores %s as a localized error card', async (errorClass, expectedText) => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [
+          {
+            id: 'user-image',
+            message_id: 'user-image',
+            role: 'user',
+            text: 'inspect this image',
+            timestamp: '2026-07-07T10:00:00Z',
+            turn_context: { turn_id: 'turn-image' },
+          },
+          {
+            id: 'system-image',
+            message_id: 'system-image',
+            role: 'system',
+            text: 'Error: server fallback [synthetic ref]',
+            timestamp: '2026-07-07T10:00:01Z',
+            turn_context: { turn_id: 'turn-image' },
+          },
+        ],
+        turn_outcomes: [{
+          turn_id: 'turn-image',
+          task_id: 'turn-image',
+          status: 'failed',
+          error_class: errorClass,
+          retryable: false,
+          terminal_message: 'server fallback',
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      errorCode: errorClass,
+      terminalNotice: true,
+      text: expectedText,
+    })
+  })
+
   it('restores a usage barrier retry card when the transcript error row is absent', async () => {
     const { api, messages } = makeHistory(true, {
       response: {

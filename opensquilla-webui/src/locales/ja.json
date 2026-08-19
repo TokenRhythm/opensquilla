@@ -3806,6 +3806,7 @@
       "routerAnimationOff": "ルーターアニメーション オフ",
       "modelRouting": "モデルルーティング",
       "ensembleImageUnsupported": "Ensemble はまだ画像入力に対応していません。「モデルルーティング」で、画像モデルを設定した「AI搭載シングルモデルルーター」、または「オフ」と画像対応モデルを選択してください。",
+      "imageInputUnsupported": "選択したモデルは画像を処理できません。画像対応モデルを選択するか、画像を削除してください。",
       "routingUpdateImageBlocked": "モデルルーティングを更新しています。画像を送信する前にお待ちください。",
       "modelRoutingOff": "オフ",
       "modelRoutingOffDesc": "各ターンを選択中のモデルへ送信します。",

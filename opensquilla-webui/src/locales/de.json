@@ -3806,6 +3806,7 @@
       "routerAnimationOff": "Router-Animation aus",
       "modelRouting": "Modell-Routing",
       "ensembleImageUnsupported": "Ensemble unterstützt derzeit keine Bildeingaben. Wählen Sie unter „Modell-Routing“ „AI-gestützter Einzelmodell-Router“ mit konfiguriertem Bildmodell oder „Aus“ mit einem bildfähigen Modell.",
+      "imageInputUnsupported": "Das ausgewählte Modell kann keine Bilder verarbeiten. Wählen Sie ein bildfähiges Modell oder entfernen Sie das Bild.",
       "routingUpdateImageBlocked": "Das Modell-Routing wird aktualisiert. Warten Sie, bevor Sie Bilder senden.",
       "modelRoutingOff": "Aus",
       "modelRoutingOffDesc": "Jeden Durchlauf an das ausgewählte Modell senden.",

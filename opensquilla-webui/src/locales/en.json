@@ -3888,6 +3888,7 @@
       "routerAnimationOff": "Router animation off",
       "modelRouting": "Model routing",
       "ensembleImageUnsupported": "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+      "imageInputUnsupported": "The selected model cannot process image input. Choose an image-capable model or remove the image.",
       "routingUpdateImageBlocked": "Model routing is being updated. Wait before sending images.",
       "modelRoutingOff": "Off",
       "modelRoutingOffDesc": "Send every turn to the selected model.",

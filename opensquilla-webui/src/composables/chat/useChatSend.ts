@@ -9,7 +9,7 @@ import type {
   ChatPendingItem,
   ChatSteerCapability,
 } from '@/types/chat'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import type { ImageInputAdmission, ModelRoutingMode } from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
@@ -33,6 +33,7 @@ import type { SlashCommandClassification } from '@/composables/chat/useChatSlash
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 import {
+  hasModelInputImageAttachment,
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
   serializeDisplayAttachment,
@@ -354,6 +355,7 @@ export interface UseChatSendOptions {
   busySendMode: Ref<BusySendMode>
   modelRoutingMode: Readonly<Ref<ModelRoutingMode>>
   modelRoutingSettingsBusy: Readonly<Ref<boolean>>
+  imageInputAdmission?: Readonly<Ref<ImageInputAdmission>>
   elevatedMode: Ref<string>
   runMode: Ref<SandboxRunMode>
   pendingAttachments: Ref<Attachment[]>
@@ -567,9 +569,13 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function modelImageSendBlocked(attachments: readonly Attachment[]): boolean {
-    if (!hasSendableModelInputImageAttachment(attachments)) return false
+    if (!hasModelInputImageAttachment(attachments)) return false
     return options.modelRoutingSettingsBusy.value
-      || options.modelRoutingMode.value === 'llm_ensemble'
+      || options.imageInputAdmission?.value === 'blocked'
+      || (
+        options.imageInputAdmission === undefined
+        && options.modelRoutingMode.value === 'llm_ensemble'
+      )
   }
 
   function activeSteerCapability(): ChatSteerCapability | null {
@@ -2291,7 +2297,13 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.modelRoutingSettingsBusy.value) {
         return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
       }
-      if (options.modelRoutingMode.value === 'llm_ensemble') {
+      if (
+        options.imageInputAdmission?.value === 'blocked'
+        || (
+          options.imageInputAdmission === undefined
+          && options.modelRoutingMode.value === 'llm_ensemble'
+        )
+      ) {
         return preserveRetryState('not_sent')
       }
     }
@@ -2384,7 +2396,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
-    if (modelImageSendBlocked(initialSendableAttachments)) return 'not_sent'
+    if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
     const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
     const requiresRecoveryReplay = Boolean(
       retryCandidate?.requiresIdempotentReplay

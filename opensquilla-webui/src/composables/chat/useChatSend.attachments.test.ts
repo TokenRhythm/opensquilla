@@ -6723,6 +6723,42 @@ describe('useChatSend Ensemble image guard', () => {
     },
   )
 
+  it('blocks explicitly unsupported image input before upload or draft mutation', async () => {
+    const image = readyAttachment('image/png', { file_uuid: '' })
+    const pendingAttachments = ref<Attachment[]>([image])
+    const prepareAttachmentsForSend = vi.fn(async () => true)
+    const { api, options, rpc } = makeOptions({
+      pendingAttachments,
+      modelRoutingMode: ref<'off'>('off'),
+      imageInputAdmission: ref<'blocked'>('blocked'),
+      prepareAttachmentsForSend,
+    })
+
+    await api.onSend()
+
+    expect(prepareAttachmentsForSend).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+    expect(options.inputText.value).toBe('hello')
+    expect(pendingAttachments.value).toEqual([image])
+  })
+
+  it('allows unknown image admission so the backend remains authoritative', async () => {
+    const image = readyAttachment('image/png')
+    const pendingAttachments = ref<Attachment[]>([image])
+    const { api, rpc } = makeOptions({
+      pendingAttachments,
+      modelRoutingMode: ref<'off'>('off'),
+      imageInputAdmission: ref<'unknown'>('unknown'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      attachments: [expect.objectContaining({ mime: 'image/png' })],
+    }))
+  })
+
   it('rechecks routing after attachment preparation without consuming the draft', async () => {
     const image = readyAttachment('image/gif')
     const pendingAttachments = ref<Attachment[]>([image])
@@ -6889,6 +6925,24 @@ describe('useChatSend Ensemble image guard', () => {
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
       text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+    })
+  })
+
+  it('localizes a model image admission rejection while preserving its error code', async () => {
+    const rpc = {
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('server fallback text'), {
+        code: 'image_input_unsupported',
+        retryable: false,
+      })),
+    }
+    const { api, options } = makeOptions({ rpc })
+
+    await api.onSend()
+
+    expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'image_input_unsupported',
+      text: 'The selected model cannot process image input. Choose an image-capable model or remove the image.',
     })
   })
 

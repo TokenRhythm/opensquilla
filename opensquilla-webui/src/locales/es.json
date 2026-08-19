@@ -3806,6 +3806,7 @@
       "routerAnimationOff": "Animación del enrutador desactivada",
       "modelRouting": "Enrutamiento de modelos",
       "ensembleImageUnsupported": "Ensemble aún no admite entradas de imagen. En «Enrutamiento de modelos», usa «Enrutador monomodelo con IA» configurado para imágenes o «Desactivado» con un modelo compatible con imágenes.",
+      "imageInputUnsupported": "El modelo seleccionado no puede procesar imágenes. Elige un modelo compatible o elimina la imagen.",
       "routingUpdateImageBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar imágenes.",
       "modelRoutingOff": "Desactivado",
       "modelRoutingOffDesc": "Envía cada turno al modelo seleccionado.",

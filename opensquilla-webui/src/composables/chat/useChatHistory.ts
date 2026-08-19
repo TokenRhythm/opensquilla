@@ -36,7 +36,7 @@ import {
 } from '@/composables/chat/sessionBootstrapContract'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
-import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 
@@ -371,12 +371,12 @@ function attachHistoryTurnOutcomes(
     const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
     if (!outcome) return message
     const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
-    const durableUsageError = usageBarrier
+    const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass))
       && message.role === 'system'
       && message.text.trimStart().startsWith('Error:')
     return {
       ...message,
-      ...(durableUsageError
+      ...(durableLocalizedError
         ? {
             role: 'error',
             text: localizedChatErrorMessage(
@@ -433,7 +433,10 @@ function attachHistoryTurnOutcomes(
   // compacted or paginated window, so materialize the retry card whenever the
   // outcome has no matching terminal row in this page.
   for (const outcome of outcomes) {
-    if (!isUsageAccountingBarrier(outcome.errorClass)) continue
+    if (
+      !isUsageAccountingBarrier(outcome.errorClass)
+      && !isImageInputUnsupported(outcome.errorClass)
+    ) continue
     if (enriched.some(message =>
       message.turnId === outcome.turnId && message.role === 'error',
     )) continue
@@ -466,7 +469,10 @@ function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage
       .filter(message =>
         message.role === 'error'
         && Boolean(message.turnId)
-        && isUsageAccountingBarrier(message.errorCode)
+        && (
+          isUsageAccountingBarrier(message.errorCode)
+          || isImageInputUnsupported(message.errorCode)
+        )
         && !message.messageId?.startsWith('terminal-error:'),
       )
       .map(message => message.turnId!),
@@ -476,7 +482,10 @@ function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage
     if (
       message.role !== 'error'
       || !message.turnId
-      || !isUsageAccountingBarrier(message.errorCode)
+      || !(
+        isUsageAccountingBarrier(message.errorCode)
+        || isImageInputUnsupported(message.errorCode)
+      )
       || !message.messageId?.startsWith('terminal-error:')
     ) return true
     if (durableErrorTurns.has(message.turnId)) return false

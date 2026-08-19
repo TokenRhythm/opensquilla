@@ -13,14 +13,149 @@ from typing import Any, Literal
 
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
+    HIGHEST_TEXT_TIER,
+    IMAGE_TIER,
     INDEPENDENT_ENSEMBLE_SELECTION_MODES,
     STATIC_B5_PROFILES,
     effective_ensemble_selection_mode,
     ensemble_selection_configured,
+    normalize_tier_mapping,
     static_b5_profile,
+    tier_ensemble_active,
+    tier_index,
 )
 
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
+
+
+def _router_image_route(config: Any) -> tuple[str, dict[str, Any]] | None:
+    router = getattr(config, "squilla_router", None)
+    tiers = normalize_tier_mapping(getattr(router, "tiers", {}) or {})
+    c3_fusion_active = bool(
+        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+    ) or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
+    image_tiers = {
+        name: tier
+        for name, tier in tiers.items()
+        if isinstance(tier, dict)
+        and bool(tier.get("supports_image", False))
+        and bool(str(tier.get("model") or "").strip())
+        and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
+    }
+    if not image_tiers:
+        return None
+    ordered = sorted(
+        image_tiers,
+        key=lambda name: (tier_index(name) < 0, tier_index(name)),
+    )
+    if IMAGE_TIER in image_tiers:
+        ordered = [IMAGE_TIER, *(name for name in ordered if name != IMAGE_TIER)]
+    selected = ordered[0]
+    return selected, image_tiers[selected]
+
+
+def _deployment_vision_support(
+    *,
+    model: str,
+    provider: str,
+    api_key: str = "",
+    base_url: str = "",
+    proxy: str = "",
+) -> str:
+    if not model:
+        return "unknown"
+    try:
+        from opensquilla.provider.model_catalog import shared_catalog
+
+        resolver = getattr(shared_catalog(), "resolve_deployment_vision_support", None)
+        if callable(resolver):
+            resolved = resolver(
+                model,
+                provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+                proxy=proxy,
+            )
+            if isinstance(resolved, str) and resolved in {
+                "supported",
+                "unsupported",
+                "unknown",
+            }:
+                return resolved
+    except Exception:  # noqa: BLE001 - public snapshot must remain available
+        pass
+    return "unknown"
+
+
+def _image_input_routing_snapshot(
+    config: Any,
+    *,
+    router_enabled: bool,
+    ensemble_enabled: bool,
+    selection_mode: str,
+) -> dict[str, str]:
+    independent_ensemble = bool(
+        ensemble_enabled and selection_mode in INDEPENDENT_ENSEMBLE_SELECTION_MODES
+    )
+    if independent_ensemble or (ensemble_enabled and not router_enabled):
+        return {
+            "admission": "blocked",
+            "reason": "ensemble_mode_unsupported",
+        }
+    if router_enabled:
+        image_route = _router_image_route(config)
+        if image_route is None:
+            return {
+                "admission": "blocked",
+                "reason": "router_image_route_unavailable",
+            }
+        _, image_tier = image_route
+        llm = getattr(config, "llm", None)
+        active_provider = _clean(getattr(llm, "provider", ""))
+        tier_provider = _clean(image_tier.get("provider"))
+        cross_provider = bool(
+            getattr(getattr(config, "squilla_router", None), "cross_provider_tiers", False)
+        )
+        provider = tier_provider if cross_provider and tier_provider else active_provider
+        provider = provider or tier_provider
+        use_active_authority = not provider or provider == active_provider
+        vision_support = _deployment_vision_support(
+            model=_clean(image_tier.get("model")),
+            provider=provider,
+            api_key=str(getattr(llm, "api_key", "") or "") if use_active_authority else "",
+            base_url=str(getattr(llm, "base_url", "") or "") if use_active_authority else "",
+            proxy=str(getattr(llm, "proxy", "") or "") if use_active_authority else "",
+        )
+        if vision_support == "supported":
+            return {
+                "admission": "allowed",
+                "reason": "router_image_route_available",
+            }
+        if vision_support == "unsupported":
+            return {
+                "admission": "blocked",
+                "reason": "model_vision_unsupported",
+            }
+        return {"admission": "unknown", "reason": "capability_unknown"}
+
+    llm = getattr(config, "llm", None)
+    model = _clean(getattr(llm, "model", ""))
+    provider = _clean(getattr(llm, "provider", ""))
+    vision_support = _deployment_vision_support(
+        model=model,
+        provider=provider,
+        api_key=str(getattr(llm, "api_key", "") or ""),
+        base_url=str(getattr(llm, "base_url", "") or ""),
+        proxy=str(getattr(llm, "proxy", "") or ""),
+    )
+    if vision_support == "supported":
+        return {"admission": "allowed", "reason": "model_vision_supported"}
+    if vision_support == "unsupported":
+        return {
+            "admission": "blocked",
+            "reason": "model_vision_unsupported",
+        }
+    return {"admission": "unknown", "reason": "capability_unknown"}
 
 @dataclass(frozen=True, slots=True)
 class _ModelRoutingConfigSnapshot:
@@ -266,6 +401,12 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
         "selection_configured": ensemble_selection_configured(config),
         "activation_preview": ensemble_activation_preview(config),
         "router_required_by_ensemble": router_required,
+        "image_input": _image_input_routing_snapshot(
+            config,
+            router_enabled=router_enabled,
+            ensemble_enabled=ensemble_enabled,
+            selection_mode=selection_mode,
+        ),
         "applies_to": "next_accepted_turn",
     }
 

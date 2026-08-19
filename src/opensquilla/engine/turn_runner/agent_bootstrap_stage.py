@@ -396,6 +396,7 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
+    vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Raw positive global ``llm.context_window_tokens`` value, or zero when
     # unset. This is deliberately distinct from ``context_window`` because a
     # per-model override may win for the current deployment while the global
@@ -840,6 +841,9 @@ class AgentBootstrapStage:
         private_fallback_limits: list[
             tuple[Any, int, int, ModelCapabilities | None]
         ] = []
+        private_fallback_vision_support: list[
+            tuple[Any, Literal["supported", "unsupported", "unknown"]]
+        ] = []
         fallback_deployment_configs = getattr(
             inp.provider,
             "fallback_deployment_configs",
@@ -878,6 +882,9 @@ class AgentBootstrapStage:
                         effective_max_tokens,
                         fallback_catalog.capabilities,
                     )
+                )
+                private_fallback_vision_support.append(
+                    (deployment, fallback_catalog.vision_support)
                 )
                 fallback_capabilities.setdefault(
                     (fallback_provider, fallback_model),
@@ -930,6 +937,15 @@ class AgentBootstrapStage:
         )
         if callable(configure_private_fallback_limits):
             configure_private_fallback_limits(private_fallback_limits)
+        configure_private_fallback_vision_support = getattr(
+            inp.provider,
+            "configure_fallback_deployment_vision_support",
+            None,
+        )
+        if callable(configure_private_fallback_vision_support):
+            configure_private_fallback_vision_support(
+                private_fallback_vision_support
+            )
         configure_fallback_limits = getattr(
             inp.provider,
             "configure_fallback_limits",
@@ -1028,6 +1044,7 @@ class AgentBootstrapStage:
             compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
+            model_vision_support=catalog.vision_support,
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(aux.tool_result_projection_max_inline_chars),
             tool_result_fresh_diagnostic_policy_enabled=(

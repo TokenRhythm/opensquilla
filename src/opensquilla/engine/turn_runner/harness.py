@@ -582,16 +582,48 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             capabilities = runner._model_catalog.get_capabilities(
                 model_id, provider_name=provider_name, base_url=base_url
             )
+            deployment_vision_resolver = getattr(
+                runner._model_catalog,
+                "resolve_deployment_vision_support",
+                None,
+            )
+            if callable(deployment_vision_resolver):
+                vision_support = deployment_vision_resolver(
+                    model_id,
+                    provider=provider_name,
+                    api_key=str(getattr(llm_cfg, "api_key", "") or ""),
+                    base_url=base_url,
+                    proxy=str(getattr(llm_cfg, "proxy", "") or ""),
+                )
+            else:
+                vision_resolver = getattr(
+                    runner._model_catalog,
+                    "resolve_vision_support",
+                    None,
+                )
+                vision_support = (
+                    vision_resolver(
+                        model_id,
+                        provider_name=provider_name,
+                        base_url=base_url,
+                    )
+                    if callable(vision_resolver)
+                    else "unknown"
+                )
         else:
             max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
             auto_max_tokens = 0
             auto_max_tokens_source = "default"
             context_window = user_context_window if user_context_window > 0 else 200_000
             capabilities = None
+            vision_support = "unknown"
+        if vision_support not in {"supported", "unsupported", "unknown"}:
+            vision_support = "unknown"
         return _ResolvedCatalog(
             max_tokens=max_tokens,
             context_window=context_window,
             capabilities=capabilities,
+            vision_support=cast(Any, vision_support),
             context_window_tokens_global_override=user_context_window,
             auto_max_tokens=auto_max_tokens,
             auto_max_tokens_known=auto_max_tokens_source in {"catalog", "override"},
@@ -658,6 +690,24 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
                 base_url=base_url,
             )
         )
+        deployment_vision_resolver = getattr(
+            catalog,
+            "resolve_deployment_vision_support",
+            None,
+        )
+        vision_support = (
+            deployment_vision_resolver(
+                model_id,
+                provider=provider_name,
+                api_key=str(getattr(deployment, "api_key", "") or ""),
+                base_url=base_url,
+                proxy=str(getattr(deployment, "proxy", "") or ""),
+            )
+            if callable(deployment_vision_resolver)
+            else "unknown"
+        )
+        if vision_support not in {"supported", "unsupported", "unknown"}:
+            vision_support = "unknown"
         context_window = limits.context_window
         if include_global_overrides:
             per_model_context = catalog.user_context_window_override(
@@ -676,6 +726,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             max_tokens=max_tokens,
             context_window=context_window,
             capabilities=capabilities,
+            vision_support=cast(Any, vision_support),
             auto_max_tokens=limits.max_output_tokens,
             auto_max_tokens_known=limits.max_output_tokens_known,
             temperature=getattr(llm_cfg, "temperature", None),

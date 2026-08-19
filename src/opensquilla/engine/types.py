@@ -749,6 +749,9 @@ class AgentConfig:
     repair_max_items_per_tick: int = 5
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
+    # Runtime-only tri-state evidence; synthesized capability defaults remain
+    # ``unknown`` instead of becoming an authoritative vision denial.
+    model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
     # Legacy compression knobs remain as compatibility shims for meta_invoke
