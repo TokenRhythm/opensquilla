@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
@@ -170,6 +170,17 @@ class _ModelRoutingConfigSnapshot:
 
     squilla_router: Any
     llm_ensemble: Any
+    # ``None`` means the snapshot came from the global policy.  Interactive
+    # session snapshots carry the persisted, explicit mode that was resolved
+    # at acceptance.  This remains diagnostic metadata only: TurnRunner uses
+    # the two routing subtrees above and never consults this field to mutate
+    # live configuration.
+    session_mode: ModelRoutingMode | None = None
+    # Resolution metadata is frozen with the effective mode so task audit can
+    # explain whether a turn used a persisted session choice or the global
+    # policy.  It is never used by the execution overlay itself.
+    session_routing_revision: int | None = None
+    session_routing_source: str = "global_policy"
 
     def overlay_live_config(self, live_config: Any) -> Any:
         """Overlay only routing fields onto the latest live Gateway config."""
@@ -634,7 +645,13 @@ def reconcile_model_routing_write(
     return {"squilla_router.enabled": required}
 
 
-def capture_model_routing_config(config: Any) -> Any:
+def capture_model_routing_config(
+    config: Any,
+    *,
+    session_mode: ModelRoutingMode | str | None = None,
+    session_routing_revision: int | None = None,
+    session_routing_source: str | None = None,
+) -> Any:
     """Freeze model-routing inputs at the turn acceptance boundary.
 
     Gateway config writes update the long-lived config object in place.  A
@@ -647,9 +664,49 @@ def capture_model_routing_config(config: Any) -> Any:
 
     if config is None:
         return None
+    normalized_mode = _clean(session_mode)
+    if not normalized_mode:
+        return _ModelRoutingConfigSnapshot(
+            squilla_router=copy.deepcopy(getattr(config, "squilla_router", None)),
+            llm_ensemble=copy.deepcopy(getattr(config, "llm_ensemble", None)),
+            session_routing_revision=session_routing_revision,
+            session_routing_source=(
+                session_routing_source or "global_policy"
+            ),
+        )
+    if normalized_mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("session_mode must be direct, router, ensemble, or None")
+
+    # Do not apply the per-session control to the shared GatewayConfig.  A
+    # small config-like copy is sufficient because ``apply_model_routing_mode``
+    # only owns these two subtrees; it also retains the normal Ensemble
+    # activation planner through ``activation_config``.
+    class _RoutingOverlay:
+        squilla_router: Any
+        llm_ensemble: Any
+
+        def __init__(self) -> None:
+            self.squilla_router = copy.deepcopy(
+                getattr(config, "squilla_router", None)
+            )
+            self.llm_ensemble = copy.deepcopy(
+                getattr(config, "llm_ensemble", None)
+            )
+
+    overlay = _RoutingOverlay()
+    apply_model_routing_mode(
+        overlay,
+        normalized_mode,
+        activation_config=config,
+    )
     return _ModelRoutingConfigSnapshot(
-        squilla_router=copy.deepcopy(getattr(config, "squilla_router", None)),
-        llm_ensemble=copy.deepcopy(getattr(config, "llm_ensemble", None)),
+        squilla_router=overlay.squilla_router,
+        llm_ensemble=overlay.llm_ensemble,
+        session_mode=cast(ModelRoutingMode, normalized_mode),
+        session_routing_revision=session_routing_revision,
+        session_routing_source=(
+            session_routing_source or "session_persisted"
+        ),
     )
 
 
