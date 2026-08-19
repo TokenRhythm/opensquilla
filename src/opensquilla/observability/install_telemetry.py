@@ -52,12 +52,17 @@ _MAC_HEX_RE = re.compile(r"^[0-9a-f]{12}$")
 _COLLECT_LOCK = threading.Lock()
 _STATE_LOCK = threading.RLock()
 _STATE_TRANSACTION_TIMEOUT_SECONDS = 1.0
+_RESULT_STATE_TRANSACTION_TIMEOUT_SECONDS = 5.0
 _WINDOWS_STATE_REPLACE_RETRY_DELAYS_SECONDS = (0.02, 0.05, 0.1, 0.2)
 _WINDOWS_TRANSIENT_STATE_REPLACE_ERRORS = frozenset({5, 32, 33})
 
 
 @contextmanager
-def _state_transaction(path: Path) -> Iterator[None]:
+def _state_transaction(
+    path: Path,
+    *,
+    timeout: float = _STATE_TRANSACTION_TIMEOUT_SECONDS,
+) -> Iterator[None]:
     """Serialize one short telemetry-state transaction across threads/processes."""
     # Import lazily so merely importing telemetry during boot does not load the
     # platform-specific lock implementation. The exact JSON path is the key, so
@@ -65,7 +70,7 @@ def _state_transaction(path: Path) -> Iterator[None]:
     from opensquilla.profile_operation_lock import ProfileOperationLock
 
     with _STATE_LOCK:
-        with ProfileOperationLock(path, timeout=_STATE_TRANSACTION_TIMEOUT_SECONDS):
+        with ProfileOperationLock(path, timeout=timeout):
             yield
 
 
@@ -168,7 +173,10 @@ def collect_install_telemetry(
                 payload,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
             )
-            with _state_transaction(path):
+            with _state_transaction(
+                path,
+                timeout=_RESULT_STATE_TRANSACTION_TIMEOUT_SECONDS,
+            ):
                 # Merge the result into the latest state rather than overwriting
                 # another telemetry writer's atomic update.
                 state = _load_or_create_state(path)

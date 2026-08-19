@@ -342,6 +342,37 @@ def test_upload_failure_does_not_mark_install_uploaded(tmp_path, monkeypatch):
     assert state["last_error"] == "network_down"
 
 
+def test_successful_upload_uses_longer_timeout_for_result_merge(tmp_path, monkeypatch):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, TEST_ENDPOINT)
+    _set_stable_sources(monkeypatch, macs=["02:00:00:00:00:06"])
+    state_path = tmp_path / "install_telemetry.json"
+    lock_timeouts: list[float] = []
+
+    from opensquilla import profile_operation_lock
+
+    class RecordingLock:
+        def __init__(self, _path, *, timeout):
+            lock_timeouts.append(timeout)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    monkeypatch.setattr(profile_operation_lock, "ProfileOperationLock", RecordingLock)
+    monkeypatch.setattr(telemetry, "_post_payload", lambda *_args, **_kwargs: (True, None))
+
+    result = telemetry.collect_install_telemetry(state_path=state_path, version="1.0.0")
+
+    assert result.uploaded is True
+    assert lock_timeouts == [
+        telemetry._STATE_TRANSACTION_TIMEOUT_SECONDS,
+        telemetry._RESULT_STATE_TRANSACTION_TIMEOUT_SECONDS,
+    ]
+
+
 @pytest.mark.parametrize("winerror", [5, 32, 33])
 def test_state_replace_retries_transient_windows_errors(
     tmp_path,
