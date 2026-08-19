@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -51,6 +52,8 @@ _MAC_HEX_RE = re.compile(r"^[0-9a-f]{12}$")
 _COLLECT_LOCK = threading.Lock()
 _STATE_LOCK = threading.RLock()
 _STATE_TRANSACTION_TIMEOUT_SECONDS = 1.0
+_WINDOWS_STATE_REPLACE_RETRY_DELAYS_SECONDS = (0.02, 0.05, 0.1, 0.2)
+_WINDOWS_TRANSIENT_STATE_REPLACE_ERRORS = frozenset({5, 32, 33})
 
 
 @contextmanager
@@ -493,7 +496,7 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
             json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
             fh.write("\n")
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, path)
+        _replace_state_file(tmp_name, path)
         os.chmod(path, 0o600)
     except Exception:
         try:
@@ -501,6 +504,23 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _replace_state_file(source: str | Path, destination: Path) -> None:
+    """Publish telemetry state after transient Windows readers release it."""
+    for delay in (*_WINDOWS_STATE_REPLACE_RETRY_DELAYS_SECONDS, None):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None)
+                not in _WINDOWS_TRANSIENT_STATE_REPLACE_ERRORS
+                or delay is None
+            ):
+                raise
+            time.sleep(delay)
 
 
 def _next_event(state: dict[str, Any], current_version: str) -> str | None:

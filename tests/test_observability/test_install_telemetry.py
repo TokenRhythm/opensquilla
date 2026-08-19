@@ -10,6 +10,8 @@ from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from opensquilla.observability import install_telemetry as telemetry
 from opensquilla.observability import network_policy
 
@@ -340,6 +342,120 @@ def test_upload_failure_does_not_mark_install_uploaded(tmp_path, monkeypatch):
     assert state["last_error"] == "network_down"
 
 
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_state_replace_retries_transient_windows_errors(
+    tmp_path,
+    monkeypatch,
+    winerror,
+):
+    source = tmp_path / "state.tmp"
+    destination = tmp_path / "state.json"
+    source.write_text("next", encoding="utf-8")
+    destination.write_text("current", encoding="utf-8")
+    real_replace = os.replace
+    attempts = 0
+    delays: list[float] = []
+
+    def flaky_replace(source_path, destination_path):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = PermissionError("synthetic transient Windows state reader")
+            error.winerror = winerror
+            raise error
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(telemetry.os, "name", "nt")
+    monkeypatch.setattr(telemetry.os, "replace", flaky_replace)
+    monkeypatch.setattr(telemetry.time, "sleep", delays.append)
+
+    telemetry._replace_state_file(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.02, 0.05]
+    assert not source.exists()
+    assert destination.read_text(encoding="utf-8") == "next"
+
+
+def test_state_replace_does_not_retry_permanent_windows_error(tmp_path, monkeypatch):
+    source = tmp_path / "state.tmp"
+    destination = tmp_path / "state.json"
+    source.write_text("next", encoding="utf-8")
+    destination.write_text("current", encoding="utf-8")
+    attempts = 0
+
+    def denied_replace(_source_path, _destination_path):
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError("synthetic permanent Windows denial")
+        error.winerror = 50
+        raise error
+
+    monkeypatch.setattr(telemetry.os, "name", "nt")
+    monkeypatch.setattr(telemetry.os, "replace", denied_replace)
+
+    with pytest.raises(PermissionError, match="permanent Windows denial"):
+        telemetry._replace_state_file(source, destination)
+
+    assert attempts == 1
+    assert source.read_text(encoding="utf-8") == "next"
+    assert destination.read_text(encoding="utf-8") == "current"
+
+
+def test_state_replace_does_not_retry_transient_code_off_windows(tmp_path, monkeypatch):
+    source = tmp_path / "state.tmp"
+    destination = tmp_path / "state.json"
+    source.write_text("next", encoding="utf-8")
+    destination.write_text("current", encoding="utf-8")
+    attempts = 0
+
+    def denied_replace(_source_path, _destination_path):
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError("synthetic non-Windows denial")
+        error.winerror = 32
+        raise error
+
+    monkeypatch.setattr(telemetry.os, "name", "posix")
+    monkeypatch.setattr(telemetry.os, "replace", denied_replace)
+
+    with pytest.raises(PermissionError, match="non-Windows denial"):
+        telemetry._replace_state_file(source, destination)
+
+    assert attempts == 1
+    assert source.read_text(encoding="utf-8") == "next"
+    assert destination.read_text(encoding="utf-8") == "current"
+
+
+def test_write_state_cleans_temp_after_transient_windows_retries_exhausted(
+    tmp_path,
+    monkeypatch,
+):
+    destination = tmp_path / "state.json"
+    destination.write_text('{"value":"current"}\n', encoding="utf-8")
+    attempts = 0
+    delays: list[float] = []
+
+    def blocked_replace(_source_path, _destination_path):
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError("synthetic persistent Windows sharing violation")
+        error.winerror = 32
+        raise error
+
+    monkeypatch.setattr(telemetry.os, "name", "nt")
+    monkeypatch.setattr(telemetry.os, "replace", blocked_replace)
+    monkeypatch.setattr(telemetry.time, "sleep", delays.append)
+
+    with pytest.raises(PermissionError, match="sharing violation"):
+        telemetry._write_state(destination, {"value": "next"})
+
+    assert attempts == 5
+    assert delays == [0.02, 0.05, 0.1, 0.2]
+    assert destination.read_text(encoding="utf-8") == '{"value":"current"}\n'
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
 def test_desktop_env_sets_install_method(monkeypatch):
     _enable_telemetry_for_test(monkeypatch)
     monkeypatch.delenv(telemetry.TELEMETRY_INSTALL_METHOD_ENV, raising=False)
@@ -591,7 +707,12 @@ result = telemetry.collect_install_telemetry(
     state_path=state_path,
     version=version,
 )
-print(json.dumps({"uploaded": result.uploaded, "error": result.error}))
+print(json.dumps({
+    "sent": result.sent,
+    "uploaded": result.uploaded,
+    "skipped_reason": result.skipped_reason,
+    "error": result.error,
+}))
 """
     env = os.environ.copy()
     env[telemetry.TELEMETRY_ENDPOINT_ENV] = TEST_ENDPOINT
@@ -644,7 +765,13 @@ print(json.dumps({"uploaded": result.uploaded, "error": result.error}))
 
     for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
         assert worker.returncode == 0, stderr
-        assert json.loads(stdout)["uploaded"] is True
+        result = json.loads(stdout)
+        assert result["sent"] is True, (
+            f"telemetry worker result={result!r}, stderr={stderr!r}"
+        )
+        assert result["uploaded"] is True, (
+            f"telemetry worker result={result!r}, stderr={stderr!r}"
+        )
     state = _load(state_path)
     assert set(state["uploaded_versions"]) == {"0.9.0", "1.0.0", "2.0.0"}
     assert state["future_field"] == {"preserve": True}
