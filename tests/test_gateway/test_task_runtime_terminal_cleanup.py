@@ -2033,6 +2033,101 @@ async def test_undrained_late_steer_is_promoted_to_followup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_late_steer_commit_precedes_session_routing_set() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    followup_seen = asyncio.Event()
+    promotion_committed = asyncio.Event()
+    release_promotion_commit = asyncio.Event()
+    setting_entered = asyncio.Event()
+    current_mode = "direct"
+    seen: list[tuple[str, str | None]] = []
+    committed_audits: list[dict[str, Any]] = []
+    promoted_task_ids: list[str] = []
+
+    def accepted_config(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == "agent-1::steer-routing-linearization"
+        assert run_kind == "session_turn"
+        return SimpleNamespace(
+            squilla_router=SimpleNamespace(
+                enabled=current_mode == "router",
+                rollout_phase="enforce" if current_mode == "router" else "observe",
+            ),
+            llm_ensemble=SimpleNamespace(enabled=False, selection_mode=""),
+            session_mode=current_mode,
+            session_routing_revision=1 if current_mode == "direct" else 2,
+            session_routing_source="session_override",
+        )
+
+    async def handler(run: Any) -> None:
+        seen.append((run.message, getattr(run.accepted_config, "session_mode", None)))
+        if run.message == "first":
+            first_started.set()
+            await release_first.wait()
+            return
+        followup_seen.set()
+
+    storage = _make_storage()
+    create_agent_task = storage.create_agent_task
+
+    async def create_with_blocked_promotion_return(record: AgentTaskRecord) -> None:
+        details = record.details if isinstance(record.details, dict) else {}
+        metadata = details.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("steer_restart_recovery") is True:
+            # The durable boundary has crossed, but the runtime has not yet
+            # activated the promoted task or returned its admission gate.
+            await create_agent_task(record)
+            committed_audits.append(dict(details["accepted_model_routing"]))
+            promoted_task_ids.append(record.task_id)
+            promotion_committed.set()
+            await release_promotion_commit.wait()
+            return
+        await create_agent_task(record)
+
+    storage.create_agent_task = create_with_blocked_promotion_return
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        accepted_config_provider=accepted_config,
+    )
+    envelope = _make_envelope("agent-1::steer-routing-linearization")
+    first = await runtime.enqueue(
+        envelope,
+        "first",
+        run_kind="session_turn",
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    assert await runtime.steer(
+        envelope.session_key,
+        "late correction",
+        persisted_user_message_id="message-routing-linearization",
+    ) == first.task_id
+
+    release_first.set()
+    await asyncio.wait_for(promotion_committed.wait(), timeout=2.0)
+
+    async def set_session_mode() -> None:
+        nonlocal current_mode
+        async with runtime.collect_admission(envelope.session_key):
+            setting_entered.set()
+            current_mode = "router"
+
+    setting = asyncio.create_task(set_session_mode())
+    await asyncio.sleep(0)
+    assert setting_entered.is_set() is False
+    assert committed_audits[0]["effective_mode"] == "direct"
+    assert committed_audits[0]["session_revision"] == 1
+
+    release_promotion_commit.set()
+    await asyncio.wait_for(setting, timeout=2.0)
+    await runtime.wait(first.task_id, timeout=2.0)
+    await asyncio.wait_for(followup_seen.wait(), timeout=2.0)
+    await runtime.wait(promoted_task_ids[0], timeout=2.0)
+
+    assert seen == [("first", "direct"), ("late correction", "direct")]
+
+
+@pytest.mark.asyncio
 async def test_terminal_waits_for_late_steer_handoff_and_publishes_in_order() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()

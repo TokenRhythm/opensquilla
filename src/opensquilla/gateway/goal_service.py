@@ -744,6 +744,11 @@ class GoalService:
                     turn_id=task_id,
                     accepted_run_mode_override=accepted_run_mode_override,
                 )
+                try:
+                    await self._task_runtime.freeze_acceptance(reservation)
+                except BaseException:
+                    await self._task_runtime.abort_reservation(reservation)
+                    raise
                 async with self._lock(key):
                     previous_lease = self._leases.get(key)
                     previous_grant = self._continuity_grants.get(key)
@@ -1950,6 +1955,11 @@ class GoalService:
                 accepted_run_mode_override=accepted_run_mode_override,
                 update_envelope_cache=False,
             )
+            try:
+                await self._task_runtime.freeze_acceptance(reservation)
+            except BaseException:
+                await self._task_runtime.abort_reservation(reservation)
+                raise
 
             async def _commit_and_activate() -> None:
                 async with self._task_runtime.automatic_ingress_fence(

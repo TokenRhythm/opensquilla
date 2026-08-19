@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -231,6 +232,139 @@ async def test_activate_captures_accepted_config_once() -> None:
     assert (await runtime.wait(first.task_id, timeout=1.0)).status == (
         AgentTaskStatus.SUCCEEDED
     )
+
+
+@pytest.mark.asyncio
+async def test_activate_passes_session_and_run_kind_to_contextual_config_provider() -> None:
+    storage = _TrackingStorage()
+    calls: list[tuple[str, str]] = []
+    captured = SimpleNamespace(
+        squilla_router=SimpleNamespace(enabled=False, rollout_phase="observe"),
+        llm_ensemble=SimpleNamespace(enabled=False, selection_mode=""),
+        session_mode="direct",
+        session_routing_revision=11,
+        session_routing_source="session_override",
+    )
+
+    async def provider(*, session_key: str, run_kind: str) -> Any:
+        calls.append((session_key, run_kind))
+        return captured
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_noop_turn_handler,
+        accepted_config_provider=provider,
+    )
+    reservation = await runtime.reserve(
+        _envelope("agent-1::accepted-routing"),
+        "accepted",
+        run_kind="channel_turn",
+    )
+    storage.accept(reservation.task_record)
+
+    handle = await runtime.activate(reservation)
+    await runtime.wait(handle.task_id, timeout=1.0)
+
+    assert calls == [("agent-1::accepted-routing", "channel_turn")]
+    assert reservation.runtime_task.accepted_config is captured
+    details = storage.records[handle.task_id].details
+    assert details is not None
+    assert details["accepted_model_routing"] == {
+        "scope": "session",
+        "session_mode": "direct",
+        "session_revision": 11,
+        "source": "session_override",
+        "effective_mode": "direct",
+        "router_enabled": False,
+        "ensemble_enabled": False,
+        "rollout_phase": "observe",
+        "selection_mode": "",
+        "run_kind": "channel_turn",
+    }
+
+
+@pytest.mark.asyncio
+async def test_freeze_acceptance_attaches_audit_before_commit_without_storage_update() -> None:
+    storage = _TrackingStorage()
+    captured = SimpleNamespace(
+        squilla_router=SimpleNamespace(enabled=False, rollout_phase="observe"),
+        llm_ensemble=SimpleNamespace(enabled=False, selection_mode=""),
+        session_mode="direct",
+        session_routing_revision=17,
+        session_routing_source="session_override",
+    )
+
+    async def provider(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == "agent-1::precommit-routing-audit"
+        assert run_kind == "session_turn"
+        return captured
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_noop_turn_handler,
+        accepted_config_provider=provider,
+    )
+    reservation = await runtime.reserve(
+        _envelope("agent-1::precommit-routing-audit"),
+        "accepted",
+        run_kind="session_turn",
+    )
+
+    await runtime.freeze_acceptance(reservation)
+
+    assert storage.records == {}
+    assert storage.update_calls == []
+    assert reservation.task_record.details is not None
+    audit = reservation.task_record.details["accepted_model_routing"]
+    assert audit["effective_mode"] == "direct"
+    assert audit["session_revision"] == 17
+
+    # Simulate the process dying immediately after durable acceptance: the
+    # record itself already carries recovery authority, before activation or
+    # any best-effort update can run.
+    await storage.create_agent_task(reservation.task_record)
+    committed = storage.records[reservation.task_id]
+    assert committed.details is not None
+    assert committed.details["accepted_model_routing"] == audit
+    assert storage.update_calls == []
+
+    await runtime.abort_reservation(reservation)
+
+
+@pytest.mark.asyncio
+async def test_accepted_config_resolution_does_not_hold_runtime_state_lock() -> None:
+    storage = _TrackingStorage()
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def provider(*, session_key: str, run_kind: str) -> dict[str, str]:
+        del session_key, run_kind
+        provider_started.set()
+        await release_provider.wait()
+        return {"strategy": "direct"}
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_noop_turn_handler,
+        accepted_config_provider=provider,
+    )
+    accepted = await runtime.reserve(_envelope("agent-1::lock-free"), "accepted")
+    storage.accept(accepted.task_record)
+
+    activating = asyncio.create_task(runtime.activate(accepted))
+    await asyncio.wait_for(provider_started.wait(), timeout=1.0)
+
+    # A second reservation touches the same runtime state lock.  It must not
+    # wait for the session/storage resolver used by the first accepted task.
+    second = await asyncio.wait_for(
+        runtime.reserve(_envelope("agent-1::other-session"), "next"),
+        timeout=1.0,
+    )
+    await runtime.abort_reservation(second)
+
+    release_provider.set()
+    handle = await asyncio.wait_for(activating, timeout=1.0)
+    await runtime.wait(handle.task_id, timeout=1.0)
 
 
 @pytest.mark.asyncio

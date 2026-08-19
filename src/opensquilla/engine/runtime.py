@@ -681,8 +681,8 @@ _SESSION_LOCK_BYPASS_ONLY: contextvars.ContextVar[set[int] | None] = contextvars
 )
 # Gateway TaskRuntime installs the routing config captured when a turn is
 # accepted.  ContextVar keeps concurrent sessions isolated without mutating the
-# shared TurnRunner or GatewayConfig instances. Standalone/direct callers never
-# set it and continue to read the runner's live config exactly as before.
+# shared TurnRunner or GatewayConfig instances. Standalone and direct-channel
+# callers install the same snapshot while iterating their turn stream.
 _ACCEPTED_TURN_CONFIG: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "_accepted_turn_config",
     default=None,

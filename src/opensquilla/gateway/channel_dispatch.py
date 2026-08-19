@@ -2074,6 +2074,7 @@ async def _run_turn_with_streaming(
     )
     principal_is_owner = _stamp_channel_admin_principal(config, envelope, msg)
     storage = get_session_storage(session_manager)
+    session = None
     if storage is not None:
         session = await storage.get_session(session_key)
         if session is None:
@@ -2111,6 +2112,16 @@ async def _run_turn_with_streaming(
     from opensquilla.sandbox.policy_store import pin_sandbox_policy
 
     pin_sandbox_policy(tool_ctx, config)
+    from opensquilla.gateway.session_model_routing import (
+        capture_accepted_model_routing_config,
+    )
+
+    accepted_config = await capture_accepted_model_routing_config(
+        config,
+        session_manager,
+        session_key=session_key,
+        run_kind="channel_turn",
+    )
     use_streaming = resolve_channel_stream_policy(channel).relay_stream
 
     if use_streaming:
@@ -2124,6 +2135,7 @@ async def _run_turn_with_streaming(
             semantic_message,
             config,
             attachments,
+            accepted_config=accepted_config,
         )
     else:
         await _run_turn_batch_path(
@@ -2136,6 +2148,7 @@ async def _run_turn_with_streaming(
             semantic_message,
             config,
             attachments,
+            accepted_config=accepted_config,
         )
 
 
@@ -3369,6 +3382,20 @@ async def _accept_channel_runtime_turn_impl(
             ),
         )
         try:
+            if intent_plan.action == "create":
+                from opensquilla.gateway.session_model_routing import (
+                    capture_prepared_session_model_routing_config,
+                )
+
+                await task_runtime.freeze_acceptance(
+                    reservation,
+                    accepted_config=capture_prepared_session_model_routing_config(
+                        config,
+                        intent_plan.node,
+                    ),
+                )
+            else:
+                await task_runtime.freeze_acceptance(reservation)
             acceptance = await storage.accept_turn(
                 entry,
                 expected_epoch=expected_epoch,
@@ -4088,6 +4115,8 @@ async def _run_turn_batch_path(
     semantic_message: str | None,
     config: Any,
     attachments: list[dict[str, Any]] | None = None,
+    *,
+    accepted_config: Any = None,
 ) -> None:
     """Batch mode: accumulate all text, send once at the end."""
     text_parts: list[str] = []
@@ -4110,10 +4139,17 @@ async def _run_turn_batch_path(
     if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
         run_kwargs["attachments"] = attachments
     try:
-        stream = turn_runner.run(
-            msg.content,
-            session_key,
-            **run_kwargs,
+        from opensquilla.gateway.session_model_routing import (
+            accepted_model_routing_stream,
+        )
+
+        stream = accepted_model_routing_stream(
+            turn_runner.run(
+                msg.content,
+                session_key,
+                **run_kwargs,
+            ),
+            accepted_config,
         )
         from opensquilla.engine.stream_wrappers import is_context_bound_owner
 
@@ -4278,6 +4314,8 @@ async def _run_turn_streaming_path(
     semantic_message: str | None,
     config: Any,
     attachments: list[dict[str, Any]] | None = None,
+    *,
+    accepted_config: Any = None,
 ) -> None:
     """Streaming mode: feed text deltas through an async queue to send_streaming.
 
@@ -4340,10 +4378,17 @@ async def _run_turn_streaming_path(
             run_kwargs["semantic_message"] = semantic_message
         if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
             run_kwargs["attachments"] = attachments
-        stream = turn_runner.run(
-            msg.content,
-            session_key,
-            **run_kwargs,
+        from opensquilla.gateway.session_model_routing import (
+            accepted_model_routing_stream,
+        )
+
+        stream = accepted_model_routing_stream(
+            turn_runner.run(
+                msg.content,
+                session_key,
+                **run_kwargs,
+            ),
+            accepted_config,
         )
         from opensquilla.engine.stream_wrappers import is_context_bound_owner
 
