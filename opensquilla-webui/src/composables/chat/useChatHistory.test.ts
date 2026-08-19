@@ -5,6 +5,7 @@ import { nextTick, ref, type Ref } from 'vue'
 import { useChatHistory } from './useChatHistory'
 import type { ChatMessage } from '@/types/chat'
 import type { ChatHistoryResponse } from '@/types/rpc'
+import { RpcTimeoutError } from '@/lib/rpc'
 
 function makeHistory(autoScroll = true, overrides: {
   response?: ChatHistoryResponse
@@ -2812,5 +2813,216 @@ describe('useChatHistory accepted ensemble reconciliation', () => {
     expect(messages.value.some(message => ['ensemble', 'llm_ensemble'].includes(
       String(message.routerDecision?.accepted_routing_mode || '').toLowerCase(),
     ))).toBe(false)
+  })
+})
+
+describe('useChatHistory safe local-tail synchronization', () => {
+  it('protects a successor from an older response until a post-generation load succeeds', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveOld!: (value: ChatHistoryResponse) => void
+      let resolveSafe!: (value: ChatHistoryResponse) => void
+      const oldResponse = new Promise<ChatHistoryResponse>(resolve => { resolveOld = resolve })
+      const safeResponse = new Promise<ChatHistoryResponse>(resolve => { resolveSafe = resolve })
+      const durableA: NonNullable<ChatHistoryResponse['messages']> = [
+        {
+          id: 'user-a',
+          message_id: 'user-a',
+          role: 'user',
+          text: 'prompt A',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: { turn_id: 'turn-a' },
+        },
+        {
+          id: 'assistant-a',
+          message_id: 'assistant-a',
+          role: 'assistant',
+          text: 'answer A',
+          timestamp: '2026-07-06T00:00:01Z',
+          turn_context: { turn_id: 'turn-a' },
+        },
+      ]
+      const durableAB: NonNullable<ChatHistoryResponse['messages']> = [
+        ...durableA,
+        {
+          id: 'user-b',
+          message_id: 'user-b',
+          role: 'user',
+          text: 'prompt B',
+          timestamp: '2026-07-06T00:00:02Z',
+          turn_context: { turn_id: 'turn-b' },
+        },
+        {
+          id: 'assistant-b',
+          message_id: 'assistant-b',
+          role: 'assistant',
+          text: 'answer B',
+          timestamp: '2026-07-06T00:00:03Z',
+          turn_context: { turn_id: 'turn-b' },
+        },
+      ]
+      const { api, rpc, messages } = makeHistory(false, {
+        concurrentHistoryReads: false,
+        messages: [
+          {
+            role: 'user',
+            text: 'prompt A',
+            ts: '2026-07-06T00:00:00Z',
+            messageId: 'user-a',
+            turnId: 'turn-a',
+            restoredFromHistory: true,
+          },
+          {
+            role: 'assistant',
+            text: 'answer A',
+            ts: '2026-07-06T00:00:01Z',
+            messageId: 'assistant-a',
+            turnId: 'turn-a',
+            restoredFromHistory: true,
+          },
+          {
+            role: 'user',
+            text: 'prompt B',
+            ts: 'local-b',
+            messageId: 'user-b',
+            turnId: 'turn-b',
+          },
+          {
+            role: 'assistant',
+            text: 'answer B in progress',
+            ts: 'local-b-answer',
+            turnId: 'turn-b',
+          },
+        ],
+      })
+      rpc.call
+        .mockImplementationOnce(() => oldResponse)
+        .mockImplementationOnce(() => safeResponse)
+        .mockResolvedValueOnce({ messages: durableA, has_more: false })
+
+      const oldLoad = api.loadHistory()
+      await Promise.resolve()
+      expect(rpc.call).toHaveBeenCalledTimes(1)
+
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(50)
+      expect(rpc.call).toHaveBeenCalledTimes(1)
+
+      resolveOld({ messages: durableA, has_more: false })
+      await oldLoad
+      expect(messages.value.map(message => message.text)).toEqual([
+        'prompt A',
+        'answer A',
+        'prompt B',
+        'answer B in progress',
+      ])
+
+      await vi.advanceTimersByTimeAsync(50)
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(rpc.call.mock.calls[1]?.[2]).toMatchObject({
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      })
+      resolveSafe({ messages: durableAB, has_more: false })
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(api.historyState.value.loading).toBe(false)
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'user-a',
+        'assistant-a',
+        'user-b',
+        'assistant-b',
+      ])
+
+      await api.loadHistory()
+      expect(rpc.call).toHaveBeenCalledTimes(3)
+      expect(rpc.call.mock.calls[2]?.[2]).toMatchObject({
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      })
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'user-a',
+        'assistant-a',
+      ])
+      api.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a ready session unchanged when a safe background sync times out', async () => {
+    vi.useFakeTimers()
+    try {
+      const { api, rpc, messages } = makeHistory(false, {
+        concurrentHistoryReads: false,
+      })
+      await api.loadHistory()
+      const readyMessages = messages.value
+      expect(api.historyState.value).toMatchObject({
+        initialLoadStatus: 'ready',
+        loading: false,
+        retrying: false,
+        recoveryError: false,
+      })
+
+      rpc.call.mockRejectedValueOnce(new RpcTimeoutError('chat.history', 1_000))
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(50)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(rpc.call.mock.calls[1]?.[2]).toMatchObject({
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      })
+      expect(messages.value).toBe(readyMessages)
+      expect(api.historyState.value).toMatchObject({
+        initialLoadStatus: 'ready',
+        loading: false,
+        loadingEarlier: false,
+        retrying: false,
+        loadEarlierError: false,
+        recoveryError: false,
+      })
+      expect(api.retryHistory()).toBeUndefined()
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+
+      messages.value.push(
+        {
+          role: 'user',
+          text: 'successor prompt',
+          ts: 'local-successor',
+          messageId: 'successor-user',
+          turnId: 'successor-turn',
+        },
+        {
+          role: 'assistant',
+          text: 'successor answer',
+          ts: 'local-successor-answer',
+          turnId: 'successor-turn',
+        },
+      )
+      rpc.call.mockResolvedValueOnce({
+        messages: [historyMessage('m1')],
+        has_more: false,
+      })
+
+      await api.loadHistory()
+
+      expect(rpc.call.mock.calls[2]?.[2]).toMatchObject({
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      })
+      expect(messages.value.map(message => message.text)).toEqual([
+        'm1',
+        'successor prompt',
+        'successor answer',
+      ])
+      api.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -334,11 +334,14 @@ class WsConnection:
     ) -> None:
         if self._closing:
             return
-        event, payload = project_session_event_for_client(
+        projected = project_session_event_for_client(
             event,
             payload,
             client_caps=self.client_caps,
         )
+        if projected is None:
+            return
+        event, payload = projected
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -1450,6 +1453,7 @@ async def _dispatch_and_send(
 
 
 def _build_features(dispatcher: RpcDispatcher) -> Any:
+    from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
 
     methods = dispatcher.list_methods()
@@ -1464,5 +1468,6 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "health",
         "heartbeat",
         "cron",
+        TURN_COMMITTED_EVENT,
     ]
     return FeaturesInfo(methods=methods, events=events)

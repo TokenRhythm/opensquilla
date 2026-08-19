@@ -64,7 +64,7 @@ function projectedRunState(
   }
 }
 
-function makeHarness() {
+function makeHarness({ supportsTurnCommitted = false } = {}) {
   const stream = makeStream()
   const messages: Ref<ChatMessage[]> = ref([])
   const activeStreamTaskId = ref('task-A')
@@ -122,6 +122,7 @@ function makeHarness() {
     handleRouterControlReplay: vi.fn(),
     showCompactionToast: vi.fn(),
     showWarningToast: vi.fn(),
+    supportsTurnCommitted: () => supportsTurnCommitted,
     scheduleHistorySync: vi.fn(),
     schedulePendingDrainAfterTerminal: vi.fn(),
     popAllPendingIntoComposer: vi.fn(() => false),
@@ -613,6 +614,58 @@ describe('task ownership event races', () => {
     expect(activeStreamTaskId.value).toBe('task-A')
     expect(stream.endStreaming).not.toHaveBeenCalled()
     expect(options.applySessionRunState).not.toHaveBeenCalled()
+    scope.stop()
+  })
+
+  it('settles a late A commit without ending or idling running B', () => {
+    const {
+      api,
+      options,
+      stream,
+      activeStreamTaskId,
+      taskOwnership,
+      scope,
+    } = makeHarness({ supportsTurnCommitted: true })
+
+    api.handlers.onAny('session.event.done', {
+      task_id: 'task-A',
+      turn_id: 'turn-A',
+      session_key: SESSION,
+      stream_seq: 1,
+      reason: 'completed',
+      text: 'answer A',
+    })
+    api.handlers.onTaskRunning({
+      task_id: 'task-B',
+      session_key: SESSION,
+    })
+
+    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(taskOwnership.runningTaskId.value).toBe('task-B')
+    vi.mocked(stream.endStreaming).mockClear()
+    vi.mocked(options.applySessionRunState).mockClear()
+    vi.mocked(options.scheduleHistorySync).mockClear()
+    const noteTerminal = vi.spyOn(taskOwnership, 'noteTerminal')
+
+    api.handlers.onAny('session.event.turn_committed', {
+      schema_version: 1,
+      task_id: 'task-A',
+      turn_id: 'turn-A',
+      session_key: SESSION,
+      stream_seq: 2,
+      status: 'succeeded',
+      terminal_reason: 'completed',
+      finished_at: 123,
+    })
+
+    expect(api.awaitingCommitTaskIds.value).toEqual(new Set())
+    expect(noteTerminal).toHaveBeenCalledWith('task-A', false)
+    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(taskOwnership.runningTaskId.value).toBe('task-B')
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(options.applySessionRunState).not.toHaveBeenCalled()
+    expect(options.scheduleHistorySync).toHaveBeenCalledOnce()
+    expect(options.scheduleHistorySync).toHaveBeenCalledWith(true)
     scope.stop()
   })
 })

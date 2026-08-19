@@ -3176,6 +3176,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
+  supportsTurnCommitted: () => rpc.supportsEvent('session.event.turn_committed'),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,

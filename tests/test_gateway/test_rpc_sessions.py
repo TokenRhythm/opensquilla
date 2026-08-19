@@ -20,7 +20,11 @@ from starlette.websockets import WebSocketState
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
-from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
 from opensquilla.engine.types import AnswerGenerationResetEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
@@ -37,7 +41,12 @@ from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_lifecycle import SessionTaskSnapshot
-from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
+from opensquilla.gateway.session_streams import (
+    BufferedSessionEvent,
+    LiveTurnSnapshot,
+    SessionStreamRegistry,
+    get_session_streams,
+)
 from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
@@ -620,8 +629,14 @@ class _LegacyCompactManager:
 
 
 class _ReplayConn:
-    def __init__(self, conn_id: str) -> None:
+    def __init__(
+        self,
+        conn_id: str,
+        *,
+        client_caps: frozenset[str] = frozenset(),
+    ) -> None:
         self.conn_id = conn_id
+        self.client_caps = client_caps
         self.events: list[tuple[str, dict, dict | None]] = []
 
     async def send_event(
@@ -631,6 +646,21 @@ class _ReplayConn:
         meta: dict | None = None,
     ) -> None:
         self.events.append((event, payload or {}, meta))
+
+
+def _turn_committed_payload(session_key: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "session_key": session_key,
+        "task_id": "task-committed",
+        "turn_id": "turn-committed",
+        "status": "succeeded",
+        "terminal_reason": "completed",
+        "finished_at": 1_234,
+        "text": "must not cross the public boundary",
+    }
+    payload.update(overrides)
+    return payload
 
 
 class _CaptureSocket:
@@ -8756,6 +8786,64 @@ class TestSessionsMessagesSubscribe:
         assert buffered.payload["terminal_error_message"] == "INTERNAL_MESSAGE"
 
     @pytest.mark.asyncio
+    async def test_messages_snapshot_capability_gates_injected_turn_committed(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:turn-committed-snapshot"
+        payload = _turn_committed_payload(
+            key,
+            stream_generation="snapshot-generation",
+            stream_seq=7,
+            emitted_at=1_235,
+        )
+        snapshot = LiveTurnSnapshot(
+            stream_generation="snapshot-generation",
+            current_stream_seq=7,
+            task_id=None,
+            events=[BufferedSessionEvent(TURN_COMMITTED_EVENT, payload, 7)],
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "get_session_streams",
+            lambda: SimpleNamespace(live_snapshot=lambda _key: snapshot),
+        )
+        registry = get_registry()
+
+        async def _snapshot_for(conn: _ReplayConn) -> dict[str, Any]:
+            registry.register(conn)  # type: ignore[arg-type]
+            try:
+                response = await dispatcher.dispatch(
+                    f"snapshot-{conn.conn_id}",
+                    "sessions.messages.snapshot",
+                    {"key": key},
+                    make_ctx(conn_id=conn.conn_id),
+                )
+            finally:
+                registry.unregister(conn.conn_id)
+            assert response.ok is True
+            return response.payload
+
+        legacy = await _snapshot_for(_ReplayConn("turn-committed-snapshot-legacy"))
+        capable = await _snapshot_for(
+            _ReplayConn(
+                "turn-committed-snapshot-capable",
+                client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+            )
+        )
+
+        assert legacy["events"] == []
+        assert capable["events"] == [
+            {
+                "event": TURN_COMMITTED_EVENT,
+                "payload": {
+                    field: value for field, value in payload.items() if field != "text"
+                },
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe(self, dispatcher, ctx_with_sessions, session):
         session.epoch = 4
         res = await dispatcher.dispatch(
@@ -9541,6 +9629,94 @@ class TestSessionsMessagesSubscribe:
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 1
         assert conn.events == [("session.event.done", second, {"replayed": True})]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_replays_turn_committed_only_to_capable_clients(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:turn-committed-replay"
+        streams = get_session_streams()
+        done = streams.record(
+            key,
+            "session.event.done",
+            {"task_id": "task-committed", "turn_id": "turn-committed"},
+        )
+        committed = streams.record(key, TURN_COMMITTED_EVENT, _turn_committed_payload(key))
+        legacy = _ReplayConn("turn-committed-replay-legacy")
+        capable = _ReplayConn(
+            "turn-committed-replay-capable",
+            client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+        )
+        registry = get_registry()
+        subscriptions = SubscriptionManager()
+        registry.register(legacy)  # type: ignore[arg-type]
+        registry.register(capable)  # type: ignore[arg-type]
+        responses = []
+        try:
+            for conn in (legacy, capable):
+                response = await dispatcher.dispatch(
+                    f"subscribe-{conn.conn_id}",
+                    "sessions.messages.subscribe",
+                    {
+                        "key": key,
+                        "since_stream_seq": done["stream_seq"],
+                        "fast_ack": True,
+                    },
+                    make_ctx(
+                        session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+                        conn_id=conn.conn_id,
+                        subscription_manager=subscriptions,
+                    ),
+                )
+                assert response.ok is True
+                responses.append(response.payload)
+        finally:
+            registry.unregister(legacy.conn_id)
+            registry.unregister(capable.conn_id)
+
+        assert responses[0]["current_stream_seq"] == committed["stream_seq"]
+        assert [response["replayed_count"] for response in responses] == [0, 1]
+        assert legacy.events == []
+        event_name, payload, meta = capable.events[0]
+        assert event_name == TURN_COMMITTED_EVENT
+        assert meta == {"replayed": True}
+        assert payload["stream_seq"] == committed["stream_seq"]
+        assert "text" not in payload
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_drops_bad_committed_without_aborting_replay(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:turn-committed-bad-replay"
+        streams = get_session_streams()
+        streams.record(key, TURN_COMMITTED_EVENT, {"finished_at": True})
+        done = streams.record(key, "session.event.done", {"task_id": "task-following"})
+        conn = _ReplayConn(
+            "turn-committed-bad-replay",
+            client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+        )
+        registry = get_registry()
+        registry.register(conn)  # type: ignore[arg-type]
+        try:
+            response = await dispatcher.dispatch(
+                "subscribe-turn-committed-bad-replay",
+                "sessions.messages.subscribe",
+                {"key": key, "since_stream_seq": 0, "fast_ack": True},
+                make_ctx(
+                    session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+                    conn_id=conn.conn_id,
+                    subscription_manager=SubscriptionManager(),
+                ),
+            )
+        finally:
+            registry.unregister(conn.conn_id)
+
+        assert response.ok is True
+        assert response.payload["current_stream_seq"] == done["stream_seq"]
+        assert response.payload["replayed_count"] == 1
+        assert [event for event, _payload, _meta in conn.events] == ["session.event.done"]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_replay_projects_terminal_reset_per_connection(

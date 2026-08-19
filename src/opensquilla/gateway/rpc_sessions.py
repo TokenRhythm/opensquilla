@@ -10062,22 +10062,32 @@ async def _build_sessions_messages_subscription_payload(
         )
     replayed_count = 0
     if subscribed and replay.events:
+        from opensquilla.gateway.protocol import project_session_event_for_client
         from opensquilla.gateway.websocket import get_registry
 
         conn = get_registry().get(ctx.conn_id)
         if conn is not None:
+            client_caps: frozenset[str] = getattr(conn, "client_caps", frozenset())
             replay_deadline = (
                 asyncio.get_running_loop().time()
                 + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
             )
             for event in replay.events:
+                projected = project_session_event_for_client(
+                    event.event_name,
+                    event.payload,
+                    client_caps=client_caps,
+                )
+                if projected is None:
+                    continue
+                event_name, event_payload = projected
                 remaining = replay_deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise TimeoutError("Session replay send budget exhausted")
                 async with asyncio.timeout(remaining):
                     await conn.send_event(
-                        event.event_name,
-                        event.payload,
+                        event_name,
+                        event_payload,
                         meta={"replayed": True},
                     )
                 replayed_count += 1
@@ -10329,14 +10339,15 @@ async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContex
     snapshot = get_session_streams().live_snapshot(key)
     connection = get_registry().get(ctx.conn_id)
     client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
-    projected_events = [
-        project_session_event_for_client(
+    projected_events = []
+    for event in snapshot.events:
+        projected = project_session_event_for_client(
             event.event_name,
             event.payload,
             client_caps=client_caps,
         )
-        for event in snapshot.events
-    ]
+        if projected is not None:
+            projected_events.append(projected)
     projected_terminal = any(
         event_payload.get("terminal") is True
         for _event_name, event_payload in projected_events

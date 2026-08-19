@@ -404,6 +404,21 @@ export interface SessionDonePayload extends SessionEventPayload {
   runKind?: string
 }
 
+/** Durable-success receipt emitted only after transcript and task commits. */
+export interface TurnCommittedPayload extends SessionEventPayload {
+  schema_version: 1
+  session_key: string
+  session_id?: string
+  task_id: string
+  turn_id: string
+  status: 'succeeded'
+  terminal_reason: 'completed'
+  finished_at: number
+  client_message_id?: string
+  user_message_id?: string
+  surface_id?: string
+}
+
 export interface ToolUsePayload extends SessionEventPayload {
   id?: string
   toolId?: string
@@ -926,4 +941,5 @@ export interface RpcEventMap {
   'session.event.meta_step_state': MetaStepStatePayload
   'session.event.meta_run_completed': MetaRunCompletedPayload
   'session.event.done': SessionDonePayload
+  'session.event.turn_committed': TurnCommittedPayload
 }
