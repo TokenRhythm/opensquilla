@@ -18,6 +18,7 @@ dependencies = [
     "starlette>=0.40",
     "python-multipart>=0.0.20",
     "uvicorn[standard]>=0.30",
+    "watchfiles>=1.1.1",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "sqlmodel>=0.0.20",

@@ -1807,6 +1807,7 @@ dependencies = [
     { name = "tomli-w" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
     { name = "websockets" },
     { name = "yoyo-migrations" },
 ]
@@ -1917,6 +1918,7 @@ requires-dist = [
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "watchfiles", specifier = ">=1.1.1" },
     { name = "weasyprint", marker = "extra == 'document-extras'", specifier = ">=60.0" },
     { name = "websockets", specifier = ">=13.0" },
     { name = "yoyo-migrations", specifier = ">=8.2,<10" },

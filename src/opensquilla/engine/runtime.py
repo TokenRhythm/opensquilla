@@ -7411,6 +7411,20 @@ class TurnRunner:
         loader = self._skill_loader
         if loader is None:
             return None
+        snapshot_for_turn = getattr(loader, "snapshot_for_turn", None)
+        if callable(snapshot_for_turn):
+            try:
+                return snapshot_for_turn(reason="turn")
+            except Exception as exc:  # noqa: BLE001 - preserve last-known-good catalog
+                log.warning("skills.catalog.turn_snapshot_failed", error=str(exc))
+                try:
+                    return loader.snapshot()
+                except Exception as snapshot_exc:  # noqa: BLE001 - legacy fail-open behavior
+                    log.warning(
+                        "skills.catalog.turn_snapshot_failed",
+                        error=str(snapshot_exc),
+                    )
+                    return None
         refresh = getattr(loader, "refresh_if_changed", None)
         snapshot = getattr(loader, "snapshot", None)
         if not callable(refresh) or not callable(snapshot):
