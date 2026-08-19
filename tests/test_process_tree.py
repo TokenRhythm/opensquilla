@@ -1764,6 +1764,7 @@ def test_pid_identity_mismatch_reclaims_stale_row_without_signalling(
     assert deleted == [reference.record.owner_id]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="AF_UNIX control endpoint is POSIX-specific")
 def test_live_posix_owner_with_unavailable_control_endpoint_retains_row(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
