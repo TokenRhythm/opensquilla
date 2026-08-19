@@ -3583,10 +3583,13 @@
   "model": "dummy-vision-1"
  },
  "image_without_image_tier_errors": {
-  "error": "RuntimeError: No image-capable SquillaRouter tier is configured with a non-empty model for this image request. Configure squilla_router.tiers.image_model with supports_image=true and a model.",
+  "error": null,
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
+   "image_input_forced_rejection_reason": "router_image_route_unavailable",
+   "image_input_mode": "rejected",
+   "image_input_reason": "router_image_route_unavailable",
    "large_context_capacity_required": true,
    "large_context_material_tokens": 8
   },
