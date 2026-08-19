@@ -1259,7 +1259,7 @@ describe('useSetupCatalog model strategy IA', () => {
     await vi.waitFor(() => {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
     })
-    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'critic')
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
     resolveRouting({
       mode: 'ensemble',
       selection_mode: 'custom_b5',
@@ -1273,7 +1273,7 @@ describe('useSetupCatalog model strategy IA', () => {
 
     expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
     expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
-      expect.objectContaining({ model: 'user/pending-model', role: 'critic' }),
+      expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
     ]))
     expect(api.modelStrategyPanel.value.ensemble.candidates).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ model: 'server/preview' }),
@@ -1307,13 +1307,13 @@ describe('useSetupCatalog model strategy IA', () => {
     await vi.waitFor(() => {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
     })
-    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'critic')
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
     rejectRouting(new Error('routing write failed'))
     await mutation
 
     expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
     expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
-      expect.objectContaining({ model: 'user/pending-model', role: 'critic' }),
+      expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
     ]))
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     expect(pushToast).toHaveBeenCalledWith(

@@ -100,7 +100,7 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     const state = f.captureRoutingModeState()
 
     f.setEnabled(true)
-    f.addCandidate('openrouter', 'openai/gpt-5.5', 'critic')
+    f.addCandidate('openrouter', 'openai/gpt-5.5', 'proposer')
     f.acceptRoutingModeChange(state, {
       mode: 'ensemble',
       selection_mode: CUSTOM_B5_SELECTION_MODE,
@@ -122,7 +122,7 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     const state = f.captureRoutingModeState()
 
     f.setEnabled(true)
-    f.addCandidate('openrouter', 'openai/gpt-5.5', 'critic')
+    f.addCandidate('openrouter', 'openai/gpt-5.5', 'proposer')
     f.restoreRoutingModeState(state)
 
     expect(f.enabled.value).toBe(false)

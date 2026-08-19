@@ -1005,7 +1005,7 @@ describe('useChatRenderedMessages router visual mode', () => {
 
     const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
     expect(strip?.routerPanel).toBe('llm-ensemble')
-    expect(strip?.routerTurnKey).toBe('router-turn:turn-cold')
+    expect(strip?.routerTurnKey).toBe('router-event:turn-cold:1-ensemble-router')
   })
 
   it('does not reclassify a live router turn from the next-turn session mode', () => {
