@@ -1491,6 +1491,16 @@ def test_task_analyzer_usage_wrapper_preserves_runner_local_callbacks(
 def test_group_specs_publish_canonical_config_without_renaming_arm_kind(module) -> None:
     assert module.GROUP_SPECS["B1"]["kind"] == "router_single"
     assert module.GROUP_SPECS["B2"]["selection_mode"] == "static_openrouter"
+    assert module.GROUP_SPECS["S4"] == {
+        "kind": "router_single",
+        "label": "single_model_routing_restricted_4",
+        "tier_models": {
+            "c0": "qwen/qwen3-8b",
+            "c1": "deepseek/deepseek-v4-flash",
+            "c2": "qwen/qwen3.7-plus",
+            "c3": "deepseek/deepseek-v4-pro",
+        },
+    }
 
 
 def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
@@ -1516,6 +1526,50 @@ def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
         },
     )
     return config, inherited
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_restricted_single_group_changes_only_copied_text_tier_models(module) -> None:
+    source = GatewayConfig(
+        llm={"provider": "openrouter", "model": "fallback", "api_key": "fake"},
+        squilla_router={
+            "enabled": True,
+            "default_tier": "c1",
+            "tiers": {
+                tier: {
+                    "provider": "openrouter",
+                    "model": f"baseline/{tier}",
+                    "description": f"tier {tier}",
+                    "supports_image": False,
+                    "thinking_level": "high",
+                }
+                for tier in ("c0", "c1", "c2", "c3")
+            }
+            | {
+                "image_model": {
+                    "provider": "openrouter",
+                    "model": "baseline/image",
+                    "supports_image": True,
+                    "image_only": True,
+                }
+            },
+        },
+    )
+    copied = source.model_copy(deep=True)
+
+    module.apply_group_router_tier_models(copied, module.GROUP_SPECS["S4"])
+
+    assert {
+        tier: row["model"]
+        for tier, row in copied.squilla_router.tiers.items()
+        if tier != "image_model"
+    } == module.GROUP_SPECS["S4"]["tier_models"]
+    assert copied.squilla_router.tiers["image_model"] == source.squilla_router.tiers["image_model"]
+    assert {
+        tier: row["model"]
+        for tier, row in source.squilla_router.tiers.items()
+        if tier != "image_model"
+    } == {tier: f"baseline/{tier}" for tier in ("c0", "c1", "c2", "c3")}
 
 
 def test_b2_argument_alignment_applies_g12_derived_quality_first_envelope() -> None:

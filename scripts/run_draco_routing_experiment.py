@@ -344,6 +344,16 @@ GROUP_SPECS: dict[str, dict[str, Any]] = {
         "label": "fixed_claude_fable5",
     },
     "B1": {"kind": "router_single", "label": "single_model_routing"},
+    "S4": {
+        "kind": "router_single",
+        "label": "single_model_routing_restricted_4",
+        "tier_models": {
+            "c0": "qwen/qwen3-8b",
+            "c1": "deepseek/deepseek-v4-flash",
+            "c2": "qwen/qwen3.7-plus",
+            "c3": "deepseek/deepseek-v4-pro",
+        },
+    },
     "B2": {
         "kind": "selection_mode",
         "selection_mode": "static_openrouter",
@@ -366,6 +376,37 @@ GROUP_SPECS: dict[str, dict[str, Any]] = {
         "label": "ranking_router_dynamic",
     },
 }
+
+def apply_group_router_tier_models(
+    config: GatewayConfig,
+    spec: Mapping[str, Any],
+) -> None:
+    """Apply an experiment-only four-tier model map to a copied config."""
+
+    raw_tier_models = spec.get("tier_models")
+    if raw_tier_models is None:
+        return
+    expected_tiers = {"c0", "c1", "c2", "c3"}
+    if not isinstance(raw_tier_models, Mapping) or set(raw_tier_models) != expected_tiers:
+        raise ValueError("restricted single-model group requires exact c0-c3 tier models")
+    router = getattr(config, "squilla_router", None)
+    tiers = getattr(router, "tiers", None)
+    if not isinstance(tiers, dict):
+        raise ValueError("restricted single-model group requires router tiers")
+    for tier in sorted(expected_tiers):
+        current = tiers.get(tier)
+        model = raw_tier_models[tier]
+        if (
+            not isinstance(current, dict)
+            or not isinstance(model, str)
+            or not model.strip()
+            or model != model.strip()
+        ):
+            raise ValueError("restricted single-model tier mapping is malformed")
+        updated = dict(current)
+        updated.update({"provider": "openrouter", "model": model})
+        tiers[tier] = updated
+
 
 TOOL_MODE_PROVIDER_ONLY = "provider_only"
 TOOL_MODE_OPENROUTER_SERVER_TOOLS = "openrouter_server_tools"
@@ -4448,6 +4489,7 @@ async def build_experiment_provider(
         return result
 
     group_config = config.model_copy(deep=True)
+    apply_group_router_tier_models(group_config, spec)
     selector = ModelSelector(SelectorConfig(primary=inherited))
     fallback_provider = selector.resolve()
     session_key = f"draco:{group}:{hashlib.sha256(prompt.encode()).hexdigest()[:16]}"
@@ -4495,6 +4537,9 @@ async def build_experiment_provider(
             "routing_applied": turn.metadata.get("routing_applied"),
             "rollout_phase": turn.metadata.get("rollout_phase"),
         }
+    tier_models = spec.get("tier_models")
+    if isinstance(tier_models, Mapping):
+        routing_trace["experimental_tier_models"] = dict(tier_models)
     routing_trace["fallback_model"] = routed_config.model
     if kind == "router_single":
         result = ProviderBuildResult(
@@ -11468,6 +11513,7 @@ async def _amain_with_run_lock(
         )
         from opensquilla.eval.draco_task_analyzer_execution import (
             task_analyzer_execution_contract_from_g1_registry,
+            task_analyzer_execution_contract_from_ranking_config,
             validated_task_analyzer_execution_contract,
         )
 
@@ -11481,11 +11527,18 @@ async def _amain_with_run_lock(
             execution_contract = validated_task_analyzer_execution_contract(
                 replay_execution_contract
             )
-        else:
+        elif args._g1_registry_contract.get("live_task_analyzer_chain"):
             execution_contract = validated_task_analyzer_execution_contract(
                 task_analyzer_execution_contract_from_g1_registry(
                     args._g1_registry_contract
                 )
+            )
+        else:
+            ranking_config = config.llm_ensemble.ranking_config_resolution_snapshot()[
+                "effective_config"
+            ]
+            execution_contract = validated_task_analyzer_execution_contract(
+                task_analyzer_execution_contract_from_ranking_config(ranking_config)
             )
         if execution_contract is None:
             raise ValueError("G1 task Analyzer execution contract is invalid")
