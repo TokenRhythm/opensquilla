@@ -59,18 +59,42 @@ Attempt terminal errors：
 
 三项失败的全部 generation attempts 均计入 Actual；Selected 只含成功选中的 generation/Judge，失败 cell 的 selected requests/cost 为 0。Primary 未使用 fresh replacement。
 
+## Post-hoc fresh-budget reruns（不属于 primary）
+
+观察到三项 primary failure 后，分别以相同 frozen contract、无 resume history、fresh `3` 次上限串行重跑。原失败行和原成本均保留；这些结果不改写上面的 57/60 primary。
+
+| Arm / task | Outcome | Fresh attempts | AvgQ | AvgPass | Actual Gen$ | Judge$ | Actual LLM$ | Req X/E/M/U | Result SHA-256 | Manifest SHA-256 |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|---|
+| `B2/f004b46b-c0e7-4e86-a072-c7491328d538` | EXEC_FAIL | 3/3 | — | — | 0.472376287 | 0.000000000 | 0.472376287 | 12/0/0/0 | `9b2bb7731091781ead930b1b534432f3d8002814693ab0eda8bdaf0542414b5d` | `9791081d16f8ee0a260da8359ab59b6ac172855ee41b160b25f9038b19c6919a` |
+| `B4/f004b46b-c0e7-4e86-a072-c7491328d538` | EXEC_FAIL | 3/3 | — | — | 4.689597750 | 0.000000000 | 4.689597750 | 28/0/0/0 | `376373062d17d73c0921ea2ab203ded47a97d771de6980dc3b42e607b7616679` | `9b43691bf539197fb2cfe49afe1bd6e6406363c010afa5dcc7b23dd9b4f36b1d` |
+| `S4/f004b46b-c0e7-4e86-a072-c7491328d538` | SCORED | 1/3 | 63.5927 | 64.17% | 0.073797152 | 2.079012000 | 2.152809152 | 123/0/0/0 | `bea4496f10d45f0107b323dacb7f5921311912ec44128eb3430d6b4f072c54e7` | `c80cfb78eff0d2ee95f98bf3e23249651380a6ac384fd27e8e3b37838b5f179f` |
+- `B2/f004b46b-c0e7-4e86-a072-c7491328d538` 再次失败：`tool-enabled aggregation requires 3 fully completed proposer draft(s), but only 2 completed; aggregation was not started`。
+- `B4/f004b46b-c0e7-4e86-a072-c7491328d538` 再次失败：`Provider returned no visible response for a large input. Send the material as an attachment, summarize or shorten the prompt, or use a stronger model.`。
+- Fresh reruns 新增 exact LLM spend `$7.314783189`；它与 primary Actual 分账，不计入 primary 成本表。
+- 恢复 `1/3`：`S4/f004b46b-c0e7-4e86-a072-c7491328d538`。该成功是 outcome-conditioned post-hoc 观测，只进入下方 sensitivity。
+
 ## 分组指标
 
-| Arm | Observed | Scored | Completion | AvgQ scored-only | AvgQ failure-adjusted | AvgPass scored-only | JudgeErr | Avg Tokens | Avg Tools | Avg LLMReq | p50 ms | p95 ms | Note |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| B0 | 10 | 10 | 100.0% | 69.7675 | 69.7675 | 70.87 | 0 | 383556.3 | 15.60 | 7.70 | 230888 | 1077135 | all 10 scored |
-| B1 | 10 | 10 | 100.0% | 57.3393 | 57.3393 | 60.04 | 0 | 283696.6 | 13.10 | 6.90 | 159304 | 409545 | all 10 scored |
-| B2 | 10 | 9 | 90.0% | 66.9465 | 60.2519 | 68.68 | 0 | 541126.2 | 8.40 | 17.50 | 396224 | 2477728 | native EXEC_FAIL on f004b46b-c0e |
-| B4 | 10 | 9 | 90.0% | 62.2350 | 56.0115 | 63.20 | 0 | 708067.8 | 69.00 | 16.90 | 442957 | 1632599 | native EXEC_FAIL on f004b46b-c0e |
-| G1 | 10 | 10 | 100.0% | 64.6580 | 64.6580 | 65.74 | 0 | 702081.7 | 10.80 | 25.30 | 904581 | 2496493 | all 10 scored |
-| S4 | 10 | 9 | 90.0% | 63.8941 | 57.5047 | 65.18 | 0 | 245547.0 | 14.40 | 7.60 | 128009 | 529491 | native EXEC_FAIL on f004b46b-c0e |
+| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| B0 | 10 | 10 | 69.7675 | 70.87% | 0 | 4.745483 | 47.454830 | 10/10 | 360808.3 | 22748.0 | 17208.5 | 0.0 | 5539.5 | 383556.3 | 15.60 | 100.00% | 23.30 | 7.70 | 233584 | 896788 |
+| B1 | 10 | 10 | 57.3393 | 60.04% | 0 | 1.506192 | 15.061918 | 10/10 | 274391.4 | 9305.2 | 4035.9 | 12697.6 | 5269.3 | 283696.6 | 13.10 | 90.00% | 20.00 | 6.90 | 159534 | 299821 |
+| B2 | 10 | 9 | 66.9465 | 68.68% | 0 | 0.567998 | 5.679984 | 10/10 | 470931.4 | 70194.8 | 25336.3 | 276218.6 | 44858.5 | 541126.2 | 8.40 | 80.00% | 25.90 | 17.50 | 501703 | 1924432 |
+| B4 | 10 | 9 | 62.2350 | 63.20% | 0 | 1.831516 | 18.315158 | 10/10 | 688876.7 | 19191.1 | 14412.7 | 530304.9 | 4778.4 | 708067.8 | 69.00 | 80.00% | 85.90 | 16.90 | 454439 | 1232513 |
+| G1 | 10 | 10 | 64.6580 | 65.74% | 0 | ≥2.166452 | ≥21.664519 | 6/10 | 567263.3 | 134818.4 | 89587.3 | 157838.8 | 45231.1 | 702081.7 | 10.80 | 100.00% | 36.10 | 25.30 | 979582 | 2396512 |
+| S4 | 10 | 9 | 63.8941 | 65.18% | 0 | 0.045282 | 0.452817 | 10/10 | 238680.9 | 6866.1 | 3844.5 | 192102.4 | 3021.6 | 245547.0 | 14.40 | 90.00% | 22.00 | 7.60 | 152976 | 437940 |
 
-`AvgQ scored-only` 只平均有完整 Judge 的行；`AvgQ failure-adjusted` 将 protocol failure 的 operational utility 计 0、固定分母 10。这不是为失败行生成 Judge 分数。
+`AvgQ`/`AvgPass` 只平均 `Done` 行；B2/B4/S4 的 EXEC_FAIL 未伪造 Judge 分数。Input/Output/Reason/Cache/Visible/Tokens、Tools、Steps、LLMReq 和 Gen$ 均为 selected-generation scope；失败行因没有 selected attempt 在这些列贡献 0，但其 terminal-attempt latency 仍进入 p50/p95。
+逐行 `Visible = max(Output - Reason, 0)` 后再取均值；Cache 是 Input 的子集，不重复加入 Avg Tokens。`≥` 表示 generation 成本存在未知请求、只能作为下界；`Gen exact` 是 selected generation 成本精确的任务数。p50/p95 使用线性插值。所有失败 physical attempts 的真实用量和成本仍完整保留在下方 Actual ledger；failure-adjusted U 分析也保持固定分母 10。
+
+### Post-hoc successful-rerun sensitivity（同格式）
+
+下表只把成功的 fresh rerun 投影到对应失败 cell；本次仅 S4/f004 恢复。它不替代上表 primary。
+
+| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| S4 + fresh f004 | 10 | 10 | 63.8640 | 65.08% | 0 | 0.052661 | 0.526614 | 10/10 | 242342.5 | 8398.7 | 4896.9 | 192153.6 | 3501.8 | 250741.2 | 14.90 | 100.00% | 22.80 | 7.90 | 152976 | 318000 |
+
 
 ## 成本与 coverage
 
@@ -106,6 +130,21 @@ Attempt terminal errors：
 
 所有六臂统一剔除 f004；该表是共同 complete-case 诊断，不是 primary。
 
+### 共同 9 题完整指标（同格式）
+
+| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| B0 | 9 | 9 | 70.9446 | 71.99% | 0 | 5.112116 | 46.009040 | 9/9 | 396884.9 | 22865.3 | 17138.4 | 0.0 | 5726.9 | 419750.2 | 16.78 | 100.00% | 25.00 | 8.22 | 230888 | 916826 |
+| B1 | 9 | 9 | 58.1388 | 60.88% | 0 | 1.619798 | 14.578183 | 9/9 | 300168.0 | 9131.4 | 3813.4 | 14108.4 | 5318.0 | 309299.4 | 13.89 | 88.89% | 21.22 | 7.33 | 159304 | 312013 |
+| B2 | 9 | 9 | 66.9465 | 68.68% | 0 | 0.631109 | 5.679984 | 9/9 | 523257.1 | 77994.2 | 28151.4 | 306909.6 | 49842.8 | 601251.3 | 9.33 | 88.89% | 28.78 | 19.44 | 607182 | 1985910 |
+| B4 | 9 | 9 | 62.2350 | 63.20% | 0 | 2.035018 | 18.315158 | 9/9 | 765418.6 | 21323.4 | 16014.1 | 589227.7 | 5309.3 | 786742.0 | 76.67 | 88.89% | 95.44 | 18.78 | 442957 | 738217 |
+| G1 | 9 | 9 | 65.3741 | 66.38% | 0 | ≥1.996321 | ≥17.966888 | 5/9 | 581024.9 | 119393.4 | 74107.4 | 167696.4 | 45286.0 | 700418.3 | 10.67 | 100.00% | 36.00 | 25.33 | 904581 | 1970819 |
+| S4 | 9 | 9 | 63.8941 | 65.18% | 0 | 0.050313 | 0.452817 | 9/9 | 265201.0 | 7629.0 | 4271.7 | 213447.1 | 3357.3 | 272830.0 | 16.00 | 100.00% | 24.44 | 8.44 | 128009 | 318894 |
+
+该表从每个臂同时删除同一个 f004 cell 后重新计算；Rows/Done 均为 9，成本、token、工具、步骤、请求与延迟也全部只使用这 9 题，而不是沿用主表的 10 题分母。`≥` 与 `Gen exact` 的定义同主表。
+
+### 共同 9 题同题配对比较
+
 | Arm - baseline | Pairs | Mean ΔQ | 95% CI | W/T/L | Seed |
 |---|---:|---:|---|---|---|
 | B1 - B0 | 9 | -12.8058 | [-20.5286, -6.3425] | 1/0/8 | `draco:complete-case-common-9-task:B1:B0` |
@@ -128,6 +167,15 @@ Attempt terminal errors：
 | 4 | S4 | 9 | 63.8941 |
 | 5 | B4 | 9 | 62.2350 |
 | 6 | B1 | 9 | 58.1388 |
+
+## Post-hoc sensitivity（含 successful rerun）
+
+| Arm - baseline | Pairs | Mean ΔU | 95% CI | W/T/L | Seed |
+|---|---:|---:|---|---|---|
+| S4 - B0 | 10 | -5.9036 | [-11.7559, -0.3566] | 2/0/8 | `draco:post-hoc-replacement:S4:B0` |
+| S4 - B1 | 10 | 6.5246 | [1.9619, 11.8324] | 8/0/2 | `draco:post-hoc-replacement:S4:B1` |
+
+该表在观察到 primary failure 后才纳入成功的 targeted fresh rerun；仅用于 sensitivity，不得替代 57/60 primary、failure-aware n=10 或共同 9 题诊断。未恢复的原生失败仍按 U=0。
 
 ## 同题质量矩阵
 
@@ -152,11 +200,19 @@ Attempt terminal errors：
 |---:|---|---|---:|---|---|---|
 | 1 | `20260819-005239` | `result_incomplete` | 60 | B0,B1,B2,B4,G1,S4 | `2c8cff41396b0cccae10a71381b26e1765d46699a41e57fc32a43964e5c86823` | `638e418faf87e5721afe7b5cc288660742608a6d9519b290427dab02e01ddad8` |
 
+No-history post-hoc fresh-budget reruns（不属于 causal resume wave）：
+
+| Arm | Stamp | Status | Rows | Groups | Result SHA-256 | Manifest SHA-256 |
+|---|---|---|---:|---|---|---|
+| B2 | `20260819-144706` | `resume_repair_incomplete` | 1 | B2,G1 | `9b2bb7731091781ead930b1b534432f3d8002814693ab0eda8bdaf0542414b5d` | `9791081d16f8ee0a260da8359ab59b6ac172855ee41b160b25f9038b19c6919a` |
+| B4 | `20260819-151905` | `resume_repair_incomplete` | 1 | B4,G1 | `376373062d17d73c0921ea2ab203ded47a97d771de6980dc3b42e607b7616679` | `9b43691bf539197fb2cfe49afe1bd6e6406363c010afa5dcc7b23dd9b4f36b1d` |
+| S4 | `20260819-161404` | `complete` | 1 | S4,G1 | `bea4496f10d45f0107b323dacb7f5921311912ec44128eb3430d6b4f072c54e7` | `c80cfb78eff0d2ee95f98bf3e23249651380a6ac384fd27e8e3b37838b5f179f` |
+
 ## 来源与限制
 
 - Git HEAD：`797987b705d8e484e9c7975f56964631fd8752b4`；source tree SHA-256：`ea9f83938a07bc573c287f3ab409d2f6956aeb3d101016d2964363153283990f`；manifest dirty：`True`。
 - Primary 多 wave 选择使用 runner resume classifier；没有拼接 JSONL、累加 wave summary 或 simple last-row-wins。Relaxed gate 仅限上文逐项披露的 closed cost-only `metadata_only`；三项失败使用独立 exact allowlist gate。
-- Primary 是 60 observed / 57 scored；失败成本保留、Judge 缺失不被改写。可选 fresh B2 replacement 若出现，只在单独 sensitivity 与 receipt 证据中披露。
+- Primary 是 60 observed / 57 scored；失败成本保留、Judge 缺失不被改写。Fresh reruns 是 outcome-conditioned post-hoc 证据，只在独立成本与 sensitivity 章节披露，不回填 primary。
 - 若各臂未逐题交错执行，paired ΔQ 仍可能混入 provider/time drift；DRACO Mini 仅用于 10 题诊断。
 
-生成时间：`2026-08-18T23:27:45.719962+00:00`。
+生成时间：`2026-08-19T08:52:57.894584+00:00`。

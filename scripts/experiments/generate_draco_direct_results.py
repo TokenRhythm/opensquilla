@@ -30,7 +30,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -263,6 +263,28 @@ class NativeFailureEvidence:
     actual_llm_account: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class PosthocRerunEvidence:
+    policy_name: str
+    failure_kind: str
+    group: str
+    task_id: str
+    wave: WaveEvidence
+    row_sha256: str
+    run_compatibility_fingerprint: str
+    succeeded: bool
+    generation_attempt_budget_used: int
+    generation_attempt_budget_limit: int
+    attempt_ids: tuple[str, ...]
+    physical_attempt_ids: tuple[str, ...]
+    error: str | None
+    quality_total: float | None
+    pass_rate: float | None
+    actual_generation_account: Mapping[str, Any]
+    judge_account: Mapping[str, Any]
+    actual_llm_account: Mapping[str, Any]
+
+
 def load_repo_helpers(repo_root: Path) -> RepoHelpers:
     repo_root = repo_root.resolve()
     src = repo_root / "src"
@@ -471,6 +493,9 @@ def expected_incident_resume_selection(
     policy: IncidentPolicy = B2_INCIDENT_POLICY,
 ) -> dict[str, Any]:
     return {
+        "resume_source_count": 0,
+        "matching_attempt_count": 0,
+        "best_pair_count": 0,
         "selected_pair_count": 1,
         "scheduled_pair_count": 1,
         "regenerate_pair_count": 1,
@@ -481,6 +506,18 @@ def expected_incident_resume_selection(
         "metadata_only_pair_count": 0,
         "audit_only_pair_count": 0,
         "policy_violation_pair_count": 0,
+        "strict_valid_pair_count": 0,
+        "strict_invalid_attempt_count": 0,
+        "strict_invalid_reason_counts": {},
+        "resume_action_counts": {
+            "complete": 0,
+            "metadata_only": 0,
+            "regenerate": 0,
+            "judge_only": 0,
+            "audit_only": 0,
+            "policy_violation": 0,
+        },
+        "audit_reason_counts": {},
         "scheduled_pairs": [
             {"group": policy.group, "task_id": policy.task_id, "action": "regenerate"}
         ],
@@ -1938,6 +1975,228 @@ def build_native_failure_evidence(
     return result
 
 
+def validate_posthoc_reruns(
+    result_paths: Sequence[Path],
+    *,
+    helpers: RepoHelpers,
+    expected_manifest_path: Path,
+    expected_manifest: Mapping[str, Any],
+    task_ids: Sequence[str],
+    prompt_hashes: Mapping[str, str],
+    task_input_hashes: Mapping[str, str],
+    fingerprints: Mapping[str, str],
+    primary_rows: Sequence[Mapping[str, Any]],
+    policies: Sequence[IncidentPolicy],
+) -> tuple[list[PosthocRerunEvidence], dict[tuple[str, str], dict[str, Any]]]:
+    """Validate the three no-history fresh-budget reruns without changing primary rows."""
+
+    policies_by_key = {policy.key: policy for policy in policies}
+    if len(result_paths) != len(policies_by_key):
+        raise ReportError(
+            f"post-hoc rerun evidence must contain exactly {len(policies_by_key)} waves"
+        )
+    primary_by_key = {
+        (str(row.get("group") or ""), str(row.get("task_id") or "")): row for row in primary_rows
+    }
+    primary_attempt_ids: set[str] = set()
+    primary_physical_ids: set[str] = set()
+    for policy in policies:
+        primary = primary_by_key.get(policy.key)
+        if not isinstance(primary, Mapping):
+            raise ReportError(f"post-hoc rerun lacks primary evidence for {policy.key}")
+        primary_attempt_ids.update(
+            _attempt_ids(primary, label=f"post-hoc primary {policy.group}/{policy.task_id}")
+        )
+        primary_physical_ids.update(
+            _optional_physical_attempt_ids(
+                primary, label=f"post-hoc primary {policy.group}/{policy.task_id}"
+            )
+        )
+
+    expected_manifest_sha256 = file_sha256(expected_manifest_path)
+    seen_attempt_ids: set[str] = set()
+    seen_physical_ids: set[str] = set()
+    evidence: list[PosthocRerunEvidence] = []
+    rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for result_path in result_paths:
+        wave = validate_wave(
+            result_path.resolve(),
+            helpers=helpers,
+            expected_fingerprints=fingerprints,
+        )
+        rows = read_jsonl_objects(wave.results_path, label="post-hoc rerun result")
+        if len(rows) != 1:
+            raise ReportError("each post-hoc rerun wave must contain exactly one row")
+        row = rows[0]
+        key = (str(row.get("group") or ""), str(row.get("task_id") or ""))
+        policy = policies_by_key.get(key)
+        if policy is None or key in rows_by_key:
+            raise ReportError(f"unexpected or duplicate post-hoc rerun key: {key}")
+        if wave.groups != policy.replacement_groups or wave.rows_written != 1:
+            raise ReportError(
+                f"post-hoc {policy.group} wave must declare groups "
+                f"{list(policy.replacement_groups)!r} and one row"
+            )
+        manifest = read_json_object(wave.manifest_path, label="post-hoc rerun manifest")
+        if manifest.get("task_count") != EXPECTED_TASKS or manifest.get("task_ids") != list(
+            task_ids
+        ):
+            raise ReportError("post-hoc rerun manifest changed the frozen 10-task universe")
+        if manifest.get("resume_selection") != expected_incident_resume_selection(policy):
+            raise ReportError("post-hoc rerun selection is not exact 1/1 no-history regenerate")
+        manifest_args = manifest.get("args")
+        if not isinstance(manifest_args, Mapping):
+            raise ReportError("post-hoc rerun manifest lacks args evidence")
+        if manifest_args.get("resume_from_jsonl") not in ([], None):
+            raise ReportError("post-hoc rerun unexpectedly consumes resume history")
+        recorded_expected = Path(
+            str(manifest_args.get("expected_compatibility_manifest") or "")
+        ).resolve()
+        if (
+            recorded_expected != expected_manifest_path.resolve()
+            or not recorded_expected.is_file()
+            or file_sha256(recorded_expected) != expected_manifest_sha256
+        ):
+            raise ReportError("post-hoc rerun expected-manifest binding differs from wave-1")
+        only_keys = Path(str(manifest_args.get("only_group_task_keys") or "")).resolve()
+        validate_only_group_task_keys(only_keys, policy=policy)
+        if str(manifest_args.get("groups") or "") != ",".join(policy.replacement_groups):
+            raise ReportError("post-hoc rerun argv group order differs from the frozen protocol")
+        if row.get("run_compatibility_fingerprint") != fingerprints[policy.group]:
+            raise ReportError("post-hoc rerun fingerprint differs from the primary arm")
+        if row.get("prompt_sha256") != prompt_hashes[policy.task_id]:
+            raise ReportError("post-hoc rerun prompt hash differs from the frozen task")
+        if row.get("task_input_sha256") != task_input_hashes[policy.task_id]:
+            raise ReportError("post-hoc rerun task-input hash differs from the frozen task")
+
+        used = row.get("generation_attempt_budget_used")
+        limit = row.get("generation_attempt_budget_limit")
+        execution = row.get("execution")
+        if (
+            not isinstance(used, int)
+            or isinstance(used, bool)
+            or not 1 <= used <= INCIDENT_PRIMARY_BUDGET
+            or limit != INCIDENT_PRIMARY_BUDGET
+            or row.get("generation_attempt_count") != used
+            or not isinstance(execution, Mapping)
+            or execution.get("prior_generation_attempts_used") != 0
+            or execution.get("generation_attempt_count") != used
+            or execution.get("generation_attempt_budget_remaining") != limit - used
+        ):
+            raise ReportError("post-hoc rerun attempt budget/evidence is inconsistent")
+        attempts = _attempts(row, label=f"post-hoc rerun {policy.group}")
+        attempt_ids = _attempt_ids(row, label=f"post-hoc rerun {policy.group}")
+        if len(attempts) != used or tuple(int(item.get("attempt") or 0) for item in attempts) != (
+            tuple(range(1, used + 1))
+        ):
+            raise ReportError("post-hoc rerun attempt ordinals are not fresh and contiguous")
+        physical_ids = _optional_physical_attempt_ids(row, label=f"post-hoc rerun {policy.group}")
+        if primary_attempt_ids.intersection(attempt_ids) or seen_attempt_ids.intersection(
+            attempt_ids
+        ):
+            raise ReportError("post-hoc rerun reuses a logical generation attempt id")
+        if primary_physical_ids.intersection(physical_ids) or seen_physical_ids.intersection(
+            physical_ids
+        ):
+            raise ReportError("post-hoc rerun reuses a physical request id")
+        seen_attempt_ids.update(attempt_ids)
+        seen_physical_ids.update(physical_ids)
+
+        succeeded = row.get("selected_generation_succeeded") is True
+        judge = row.get("judge")
+        completion = row.get("completion_status")
+        if succeeded:
+            if (
+                wave.status != "complete"
+                or row.get("error") is not None
+                or not str(row.get("final_text") or "").strip()
+                or not finite_number(row.get("quality_total"))
+                or not isinstance(judge, Mapping)
+                or judge.get("score_status") != "complete"
+                or int(judge.get("judge_error_count") or 0) != 0
+                or not finite_number(judge.get("pass_rate"))
+                or not isinstance(completion, Mapping)
+                or completion.get("status") != "complete"
+                or completion.get("generation_accepted") is not True
+                or completion.get("judge_complete") is not True
+            ):
+                raise ReportError(
+                    "successful post-hoc rerun lacks complete generation/Judge evidence"
+                )
+            if any(
+                str((attempt.get("run") or {}).get("error") or "").strip() for attempt in attempts
+            ):
+                raise ReportError("successful post-hoc rerun contains a failed generation attempt")
+        else:
+            observed_errors = _generation_attempt_errors(row)
+            expected_errors = policy.expected_attempt_errors
+            if policy.failure_kind == "strict_quorum":
+                expected_errors = (INCIDENT_ATTEMPT_ERRORS[-1],) * INCIDENT_PRIMARY_BUDGET
+                if _strict_quorum_completed_counts(row) != (2, 2, 2):
+                    raise ReportError("B2 post-hoc rerun does not reproduce 2/3 quorum exhaustion")
+            if (
+                wave.status != "resume_repair_incomplete"
+                or used != INCIDENT_PRIMARY_BUDGET
+                or row.get("selected_generation_succeeded") is not False
+                or str(row.get("final_text") or "")
+                or row.get("quality_total") is not None
+                or judge not in (None, {})
+                or observed_errors != expected_errors
+                or str(row.get("error") or "") != expected_errors[-1]
+            ):
+                raise ReportError("failed post-hoc rerun differs from its sealed failure contract")
+
+        accounting = helpers.runner.row_cost_accounting(row)
+        selected = accounting["llm_total"]
+        actual_generation = accounting["actual_generation_spend"]
+        judge_account = helpers.runner.merge_cost_accounting(
+            f"posthoc_{policy.group}_judge",
+            [accounting["judge"], accounting["candidate_judge"]],
+        )
+        actual = accounting["actual_llm_total"]
+        if (
+            int(actual.get("request_count") or 0) <= 0
+            or int(actual.get("unknown_request_count") or 0) != 0
+            or actual.get("cost_complete") is not True
+            or actual.get("cost_exact") is not True
+            or Decimal(str(actual.get("recorded_cost_usd"))) <= 0
+        ):
+            raise ReportError("post-hoc rerun actual LLM accounting is not complete and exact")
+        if not succeeded and (
+            int(selected.get("request_count") or 0) != 0
+            or Decimal(str(selected.get("recorded_cost_usd"))) != 0
+        ):
+            raise ReportError("failed post-hoc rerun has nonzero selected LLM accounting")
+
+        evidence.append(
+            PosthocRerunEvidence(
+                policy_name=policy.name,
+                failure_kind=policy.failure_kind,
+                group=policy.group,
+                task_id=policy.task_id,
+                wave=wave,
+                row_sha256=canonical_object_sha256(row),
+                run_compatibility_fingerprint=str(row["run_compatibility_fingerprint"]),
+                succeeded=succeeded,
+                generation_attempt_budget_used=used,
+                generation_attempt_budget_limit=limit,
+                attempt_ids=attempt_ids,
+                physical_attempt_ids=physical_ids,
+                error=None if succeeded else str(row.get("error") or ""),
+                quality_total=float(row["quality_total"]) if succeeded else None,
+                pass_rate=float(judge["pass_rate"]) if succeeded else None,
+                actual_generation_account=actual_generation,
+                judge_account=judge_account,
+                actual_llm_account=actual,
+            )
+        )
+        rows_by_key[key] = row
+    if set(rows_by_key) != set(policies_by_key):
+        raise ReportError("post-hoc rerun evidence does not cover B2/B4/S4 exactly once")
+    evidence.sort(key=lambda item: ARMS.index(item.group))
+    return evidence, rows_by_key
+
+
 def finite_number(value: Any) -> bool:
     return (
         isinstance(value, (int, float))
@@ -2045,6 +2304,17 @@ def _physical_attempt_ids(row: Mapping[str, Any], *, label: str) -> tuple[str, .
     if not values:
         raise ReportError(f"{label} contains no physical request identities")
     return tuple(sorted(values))
+
+
+def _optional_physical_attempt_ids(row: Mapping[str, Any], *, label: str) -> tuple[str, ...]:
+    """Return physical IDs when the row schema projects them; absence is explicit, not invented."""
+
+    try:
+        return _physical_attempt_ids(row, label=label)
+    except ReportError as exc:
+        if "contains no physical request identities" not in str(exc):
+            raise
+        return ()
 
 
 def _strict_quorum_completed_counts(row: Mapping[str, Any]) -> tuple[int, ...]:
@@ -2464,6 +2734,171 @@ def failure_aware_group_metrics(
     return result
 
 
+def _nonnegative_metric_number(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ReportError(f"{label} is not numeric")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ReportError(f"{label} is not a finite non-negative number")
+    return number
+
+
+def _linear_percentile(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        raise ReportError("cannot compute a percentile without values")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def build_consolidated_group_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_rows: int = EXPECTED_TASKS,
+) -> dict[str, dict[str, Any]]:
+    """Build the compact P0/P0.5-style metric table from selected scope.
+
+    A native execution failure has no selected generation attempt. Its selected
+    cost, token, tool, step, and request contribution is therefore zero, while
+    its terminal-attempt latency remains observable. The separate Actual cost
+    ledger continues to retain every failed physical attempt.
+    """
+
+    if expected_rows <= 0:
+        raise ReportError("metric table expected_rows must be positive")
+    grouped: dict[str, list[Mapping[str, Any]]] = {group: [] for group in ARMS}
+    for row in rows:
+        group = str(row.get("group") or "")
+        if group not in ARM_SET:
+            raise ReportError(f"metric table encountered an unexpected arm: {group!r}")
+        grouped[group].append(row)
+
+    result: dict[str, dict[str, Any]] = {}
+    for group in ARMS:
+        group_rows = grouped[group]
+        if len(group_rows) != expected_rows:
+            raise ReportError(f"metric table does not contain {expected_rows} rows for {group}")
+        inputs: list[float] = []
+        outputs: list[float] = []
+        reasoning: list[float] = []
+        cached: list[float] = []
+        visible: list[float] = []
+        total_tokens: list[float] = []
+        tool_calls: list[float] = []
+        trajectory_steps: list[float] = []
+        llm_requests: list[float] = []
+        latencies: list[float] = []
+        generation_cost = Decimal("0")
+        generation_cost_complete = True
+        generation_cost_exact_rows = 0
+
+        for row in group_rows:
+            selected = row.get("selected_generation_succeeded") is True
+            usage = row.get("usage")
+            selected_metrics = row.get("selected_attempt_metrics")
+            if not isinstance(usage, Mapping):
+                raise ReportError(f"metric table row {group} has no usage object")
+            if not isinstance(selected_metrics, Mapping):
+                raise ReportError(f"metric table row {group} has no selected-attempt metrics")
+            if selected:
+                input_tokens = _nonnegative_metric_number(
+                    usage.get("input_tokens"), label=f"{group} input_tokens"
+                )
+                output_tokens = _nonnegative_metric_number(
+                    usage.get("output_tokens"), label=f"{group} output_tokens"
+                )
+                reasoning_tokens = _nonnegative_metric_number(
+                    usage.get("reasoning_tokens"), label=f"{group} reasoning_tokens"
+                )
+                cached_tokens = _nonnegative_metric_number(
+                    usage.get("cached_tokens"), label=f"{group} cached_tokens"
+                )
+                row_tool_calls = _nonnegative_metric_number(
+                    selected_metrics.get("total_tool_call_count"),
+                    label=f"{group} total_tool_call_count",
+                )
+                row_steps = _nonnegative_metric_number(
+                    selected_metrics.get("trajectory_steps"),
+                    label=f"{group} trajectory_steps",
+                )
+                row_requests = _nonnegative_metric_number(
+                    selected_metrics.get("llm_request_count"),
+                    label=f"{group} llm_request_count",
+                )
+            else:
+                input_tokens = 0.0
+                output_tokens = 0.0
+                reasoning_tokens = 0.0
+                cached_tokens = 0.0
+                row_tool_calls = 0.0
+                row_steps = 0.0
+                row_requests = 0.0
+            inputs.append(input_tokens)
+            outputs.append(output_tokens)
+            reasoning.append(reasoning_tokens)
+            cached.append(cached_tokens)
+            visible.append(max(0.0, output_tokens - reasoning_tokens))
+            total_tokens.append(input_tokens + output_tokens)
+            tool_calls.append(row_tool_calls)
+            trajectory_steps.append(row_steps)
+            llm_requests.append(row_requests)
+
+            selected_latency = (
+                _nonnegative_metric_number(
+                    selected_metrics.get("latency_ms"),
+                    label=f"{group} selected latency_ms",
+                )
+                if selected
+                else 0.0
+            )
+            if selected_latency == 0:
+                selected_latency = _nonnegative_metric_number(
+                    row.get("latency_ms"), label=f"{group} terminal latency_ms"
+                )
+            latencies.append(selected_latency)
+
+            cost_accounting = row.get("cost_accounting")
+            if not isinstance(cost_accounting, Mapping):
+                raise ReportError(f"metric table row {group} has no cost accounting")
+            generation = cost_accounting.get("generation")
+            if not isinstance(generation, Mapping):
+                raise ReportError(f"metric table row {group} has no generation account")
+            row_cost = _nonnegative_metric_number(
+                generation.get("recorded_cost_usd"),
+                label=f"{group} selected generation cost",
+            )
+            generation_cost += Decimal(str(row_cost))
+            if generation.get("cost_complete") is not True:
+                generation_cost_complete = False
+            if generation.get("cost_exact") is True:
+                generation_cost_exact_rows += 1
+
+        row_count = len(group_rows)
+        result[group] = {
+            "avg_generation_cost_usd": generation_cost / Decimal(row_count),
+            "total_generation_cost_usd": generation_cost,
+            "generation_cost_is_lower_bound": not generation_cost_complete,
+            "generation_cost_exact_rows": generation_cost_exact_rows,
+            "avg_input_tokens": sum(inputs) / row_count,
+            "avg_output_tokens": sum(outputs) / row_count,
+            "avg_reasoning_tokens": sum(reasoning) / row_count,
+            "avg_cached_tokens": sum(cached) / row_count,
+            "avg_visible_tokens": sum(visible) / row_count,
+            "avg_total_tokens": sum(total_tokens) / row_count,
+            "avg_tool_calls": sum(tool_calls) / row_count,
+            "tool_task_rate_pct": (sum(1 for count in tool_calls if count > 0) / row_count * 100),
+            "avg_trajectory_steps": sum(trajectory_steps) / row_count,
+            "avg_llm_requests": sum(llm_requests) / row_count,
+            "latency_p50_ms": _linear_percentile(latencies, 0.50),
+            "latency_p95_ms": _linear_percentile(latencies, 0.95),
+        }
+    return result
+
+
 def common_task_ranking(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2641,6 +3076,7 @@ def fmt(value: Any, digits: int = 2) -> str:
 
 def render_markdown(report: Mapping[str, Any]) -> str:
     summaries = report["summary"]["groups"]
+    consolidated = report["consolidated_metrics"]
     failure_metrics = report["failure_metrics"]
     native_failures = list(report["native_failures"])
     native_failure_keys = {(failure.group, failure.task_id) for failure in native_failures}
@@ -2650,6 +3086,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     arm_definitions = list(report["arm_definitions"])
     waves = report["waves"]
     incident = report.get("incident")
+    posthoc_reruns = list(report.get("posthoc_reruns") or [])
+    posthoc_sensitivity = report.get("posthoc_sensitivity")
     selection = report.get("selection") or {}
     correction = selection.get("validator_domain_correction") or {}
     action_counts = selection.get("action_counts") or {}
@@ -2882,6 +3320,73 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
         ]
     )
+    if posthoc_reruns:
+        total_posthoc_llm = sum(
+            (Decimal(str(item.actual_llm_account["recorded_cost_usd"])) for item in posthoc_reruns),
+            Decimal(0),
+        )
+        lines.extend(
+            [
+                "## Post-hoc fresh-budget reruns（不属于 primary）",
+                "",
+                (
+                    "观察到三项 primary failure 后，分别以相同 frozen contract、"
+                    "无 resume history、fresh `3` 次上限串行重跑。原失败行和原成本均保留；"
+                    "这些结果不改写上面的 57/60 primary。"
+                ),
+                "",
+                (
+                    "| Arm / task | Outcome | Fresh attempts | AvgQ | AvgPass | Actual Gen$ | "
+                    "Judge$ | Actual LLM$ | Req X/E/M/U | Result SHA-256 | Manifest SHA-256 |"
+                ),
+                "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|",
+            ]
+        )
+        for item in posthoc_reruns:
+            actual = item.actual_llm_account
+            generation = item.actual_generation_account
+            judge_account = item.judge_account
+            counts = "/".join(
+                str(int(actual[key]))
+                for key in (
+                    "exact_request_count",
+                    "estimated_request_count",
+                    "mixed_request_count",
+                    "unknown_request_count",
+                )
+            )
+            lines.append(
+                f"| `{item.group}/{item.task_id}` | "
+                f"{'SCORED' if item.succeeded else 'EXEC_FAIL'} | "
+                f"{item.generation_attempt_budget_used}/{item.generation_attempt_budget_limit} | "
+                f"{fmt(item.quality_total, 4) if item.succeeded else '—'} | "
+                f"{fmt(item.pass_rate, 2) + '%' if item.succeeded else '—'} | "
+                f"{fmt(generation['recorded_cost_usd'], 9)} | "
+                f"{fmt(judge_account['recorded_cost_usd'], 9)} | "
+                f"{fmt(actual['recorded_cost_usd'], 9)} | {counts} | "
+                f"`{item.wave.results_sha256}` | `{item.wave.manifest_sha256}` |"
+            )
+        for item in posthoc_reruns:
+            if not item.succeeded:
+                lines.append(
+                    f"- `{item.group}/{item.task_id}` 再次失败："
+                    f"`{md_escape(item.error or 'unknown')}`。"
+                )
+        recovered = [item for item in posthoc_reruns if item.succeeded]
+        lines.extend(
+            [
+                (
+                    f"- Fresh reruns 新增 exact LLM spend `${fmt(total_posthoc_llm, 9)}`；"
+                    "它与 primary Actual 分账，不计入 primary 成本表。"
+                ),
+                (
+                    f"- 恢复 `{len(recovered)}/{len(posthoc_reruns)}`："
+                    + ", ".join(f"`{item.group}/{item.task_id}`" for item in recovered)
+                    + "。该成功是 outcome-conditioned post-hoc 观测，只进入下方 sensitivity。"
+                ),
+                "",
+            ]
+        )
     if isinstance(incident, IncidentEvidence):
         parent = incident.primary_actual_account
         repair = incident.replacement_actual_account
@@ -2947,41 +3452,114 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "## 分组指标",
             "",
             (
-                "| Arm | Observed | Scored | Completion | AvgQ scored-only | "
-                "AvgQ failure-adjusted | AvgPass scored-only | JudgeErr | Avg Tokens | "
-                "Avg Tools | Avg LLMReq | p50 ms | p95 ms | Note |"
+                "| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | "
+                "Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | "
+                "Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |"
             ),
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            (
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+                "---:|---:|---:|---:|---:|---:|---:|---:|"
+            ),
         ]
     )
     for group in ARMS:
         item = summaries[group]
         metrics = failure_metrics[group]
-        note = (
-            f"native EXEC_FAIL on {INCIDENT_TASK_ID[:12]}"
-            if metrics["protocol_failure_rows"]
-            else "all 10 scored"
-        )
+        detail = consolidated[group]
+        cost_marker = "≥" if detail["generation_cost_is_lower_bound"] else ""
         lines.append(
             f"| {group} | {metrics['observed_rows']} | {metrics['scored_rows']} | "
-            f"{fmt(metrics['completion_rate_pct'], 1)}% | "
             f"{fmt(metrics['scored_only_avg_quality'], 4)} | "
-            f"{fmt(metrics['failure_adjusted_avg_quality'], 4)} | "
-            f"{fmt(item['avg_pass_rate'], 2)} | {item['judge_errors']} | "
-            f"{fmt(item['avg_total_tokens'], 1)} | {fmt(item['avg_tool_calls'], 2)} | "
-            f"{fmt(item['avg_llm_requests'], 2)} | "
-            f"{fmt(item['latency_p50_ms'], 0)} | {fmt(item['latency_p95_ms'], 0)} | {note} |"
+            f"{fmt(item['avg_pass_rate'], 2)}% | {item['judge_errors']} | "
+            f"{cost_marker}{fmt(detail['avg_generation_cost_usd'], 6)} | "
+            f"{cost_marker}{fmt(detail['total_generation_cost_usd'], 6)} | "
+            f"{detail['generation_cost_exact_rows']}/{metrics['observed_rows']} | "
+            f"{fmt(detail['avg_input_tokens'], 1)} | "
+            f"{fmt(detail['avg_output_tokens'], 1)} | "
+            f"{fmt(detail['avg_reasoning_tokens'], 1)} | "
+            f"{fmt(detail['avg_cached_tokens'], 1)} | "
+            f"{fmt(detail['avg_visible_tokens'], 1)} | "
+            f"{fmt(detail['avg_total_tokens'], 1)} | "
+            f"{fmt(detail['avg_tool_calls'], 2)} | "
+            f"{fmt(detail['tool_task_rate_pct'], 2)}% | "
+            f"{fmt(detail['avg_trajectory_steps'], 2)} | "
+            f"{fmt(detail['avg_llm_requests'], 2)} | "
+            f"{fmt(detail['latency_p50_ms'], 0)} | "
+            f"{fmt(detail['latency_p95_ms'], 0)} |"
         )
     lines.extend(
         [
             "",
             (
-                "`AvgQ scored-only` 只平均有完整 Judge 的行；`AvgQ failure-adjusted` "
-                "将 protocol failure 的 operational utility 计 0、固定分母 10。"
-                "这不是为失败行生成 Judge 分数。"
+                "`AvgQ`/`AvgPass` 只平均 `Done` 行；B2/B4/S4 的 EXEC_FAIL 未伪造 "
+                "Judge 分数。Input/Output/Reason/Cache/Visible/Tokens、Tools、Steps、LLMReq "
+                "和 Gen$ 均为 selected-generation scope；失败行因没有 selected attempt "
+                "在这些列贡献 0，但其 terminal-attempt latency 仍进入 p50/p95。"
+            ),
+            (
+                "逐行 `Visible = max(Output - Reason, 0)` 后再取均值；Cache 是 Input 的子集，"
+                "不重复加入 Avg Tokens。`≥` 表示 generation 成本存在未知请求、只能作为"
+                "下界；`Gen exact` 是 selected generation 成本精确的任务数。p50/p95 使用"
+                "线性插值。所有失败 physical attempts 的真实用量和成本仍完整保留在下方 "
+                "Actual ledger；failure-adjusted U 分析也保持固定分母 10。"
             ),
         ]
     )
+    if isinstance(posthoc_sensitivity, Mapping):
+        sensitivity_groups = sorted(
+            {str(key[0]) for key in posthoc_sensitivity.get("successful_keys", [])},
+            key=ARMS.index,
+        )
+        sensitivity_summaries = posthoc_sensitivity["summary"]["groups"]
+        sensitivity_metrics = posthoc_sensitivity["failure_metrics"]
+        sensitivity_consolidated = posthoc_sensitivity["consolidated_metrics"]
+        lines.extend(
+            [
+                "",
+                "### Post-hoc successful-rerun sensitivity（同格式）",
+                "",
+                (
+                    "下表只把成功的 fresh rerun 投影到对应失败 cell；本次仅 S4/f004 恢复。"
+                    "它不替代上表 primary。"
+                ),
+                "",
+                (
+                    "| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | "
+                    "Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | "
+                    "Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |"
+                ),
+                (
+                    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+                    "---:|---:|---:|---:|---:|---:|---:|---:|"
+                ),
+            ]
+        )
+        for group in sensitivity_groups:
+            item = sensitivity_summaries[group]
+            metrics = sensitivity_metrics[group]
+            detail = sensitivity_consolidated[group]
+            marker = "≥" if detail["generation_cost_is_lower_bound"] else ""
+            lines.append(
+                f"| {group} + fresh f004 | {metrics['observed_rows']} | "
+                f"{metrics['scored_rows']} | {fmt(metrics['scored_only_avg_quality'], 4)} | "
+                f"{fmt(item['avg_pass_rate'], 2)}% | {item['judge_errors']} | "
+                f"{marker}{fmt(detail['avg_generation_cost_usd'], 6)} | "
+                f"{marker}{fmt(detail['total_generation_cost_usd'], 6)} | "
+                f"{detail['generation_cost_exact_rows']}/{metrics['observed_rows']} | "
+                f"{fmt(detail['avg_input_tokens'], 1)} | "
+                f"{fmt(detail['avg_output_tokens'], 1)} | "
+                f"{fmt(detail['avg_reasoning_tokens'], 1)} | "
+                f"{fmt(detail['avg_cached_tokens'], 1)} | "
+                f"{fmt(detail['avg_visible_tokens'], 1)} | "
+                f"{fmt(detail['avg_total_tokens'], 1)} | "
+                f"{fmt(detail['avg_tool_calls'], 2)} | "
+                f"{fmt(detail['tool_task_rate_pct'], 2)}% | "
+                f"{fmt(detail['avg_trajectory_steps'], 2)} | "
+                f"{fmt(detail['avg_llm_requests'], 2)} | "
+                f"{fmt(detail['latency_p50_ms'], 0)} | "
+                f"{fmt(detail['latency_p95_ms'], 0)} |"
+            )
+        lines.append("")
     lines.extend(
         [
             "",
@@ -3078,6 +3656,56 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
             "所有六臂统一剔除 f004；该表是共同 complete-case 诊断，不是 primary。",
             "",
+            "### 共同 9 题完整指标（同格式）",
+            "",
+            (
+                "| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | "
+                "Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | "
+                "Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |"
+            ),
+            (
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+                "---:|---:|---:|---:|---:|---:|---:|---:|"
+            ),
+        ]
+    )
+    common_summaries = report["common_task_summary"]["groups"]
+    common_details = report["common_task_consolidated_metrics"]
+    for group in ARMS:
+        item = common_summaries[group]
+        detail = common_details[group]
+        marker = "≥" if detail["generation_cost_is_lower_bound"] else ""
+        lines.append(
+            f"| {group} | {item['rows']} | {item['completed']} | "
+            f"{fmt(item['avg_quality'], 4)} | {fmt(item['avg_pass_rate'], 2)}% | "
+            f"{item['judge_errors']} | "
+            f"{marker}{fmt(detail['avg_generation_cost_usd'], 6)} | "
+            f"{marker}{fmt(detail['total_generation_cost_usd'], 6)} | "
+            f"{detail['generation_cost_exact_rows']}/{item['rows']} | "
+            f"{fmt(detail['avg_input_tokens'], 1)} | "
+            f"{fmt(detail['avg_output_tokens'], 1)} | "
+            f"{fmt(detail['avg_reasoning_tokens'], 1)} | "
+            f"{fmt(detail['avg_cached_tokens'], 1)} | "
+            f"{fmt(detail['avg_visible_tokens'], 1)} | "
+            f"{fmt(detail['avg_total_tokens'], 1)} | "
+            f"{fmt(detail['avg_tool_calls'], 2)} | "
+            f"{fmt(detail['tool_task_rate_pct'], 2)}% | "
+            f"{fmt(detail['avg_trajectory_steps'], 2)} | "
+            f"{fmt(detail['avg_llm_requests'], 2)} | "
+            f"{fmt(detail['latency_p50_ms'], 0)} | "
+            f"{fmt(detail['latency_p95_ms'], 0)} |"
+        )
+    lines.extend(
+        [
+            "",
+            (
+                "该表从每个臂同时删除同一个 f004 cell 后重新计算；Rows/Done 均为 9，"
+                "成本、token、工具、步骤、请求与延迟也全部只使用这 9 题，而不是沿用"
+                "主表的 10 题分母。`≥` 与 `Gen exact` 的定义同主表。"
+            ),
+            "",
+            "### 共同 9 题同题配对比较",
+            "",
             "| Arm - baseline | Pairs | Mean ΔQ | 95% CI | W/T/L | Seed |",
             "|---|---:|---:|---|---|---|",
         ]
@@ -3106,17 +3734,22 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{fmt(item['avg_quality'], 4)} |"
         )
     lines.append("")
-    if isinstance(incident, IncidentEvidence):
+    sensitivity_groups = (
+        {str(key[0]) for key in posthoc_sensitivity.get("successful_keys", [])}
+        if isinstance(posthoc_sensitivity, Mapping)
+        else ({INCIDENT_GROUP} if isinstance(incident, IncidentEvidence) else set())
+    )
+    if sensitivity_groups:
         lines.extend(
             [
-                "## Post-hoc sensitivity（含 replacement）",
+                "## Post-hoc sensitivity（含 successful rerun）",
                 "",
                 "| Arm - baseline | Pairs | Mean ΔU | 95% CI | W/T/L | Seed |",
                 "|---|---:|---:|---|---|---|",
             ]
         )
         for comparison in report["paired_sensitivity"]:
-            if INCIDENT_GROUP not in {comparison["group"], comparison["baseline"]}:
+            if not sensitivity_groups.intersection({comparison["group"], comparison["baseline"]}):
                 continue
             lines.append(
                 f"| {comparison['group']} - {comparison['baseline']} | "
@@ -3129,9 +3762,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             [
                 "",
                 (
-                    "该表在观察到 primary failure 后才纳入 B2 targeted replacement；"
+                    "该表在观察到 primary failure 后才纳入成功的 targeted fresh rerun；"
                     "仅用于 sensitivity，不得替代 57/60 primary、failure-aware n=10 或共同 "
-                    "9 题诊断。B4/S4 原生失败仍按 U=0。"
+                    "9 题诊断。未恢复的原生失败仍按 U=0。"
                 ),
                 "",
             ]
@@ -3200,6 +3833,23 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 ),
             ]
         )
+    if posthoc_reruns:
+        lines.extend(
+            [
+                "",
+                "No-history post-hoc fresh-budget reruns（不属于 causal resume wave）：",
+                "",
+                "| Arm | Stamp | Status | Rows | Groups | Result SHA-256 | Manifest SHA-256 |",
+                "|---|---|---|---:|---|---|---|",
+            ]
+        )
+        for item in posthoc_reruns:
+            wave = item.wave
+            lines.append(
+                f"| {item.group} | `{wave.stamp}` | `{wave.status}` | {wave.rows_written} | "
+                f"{','.join(wave.groups)} | `{wave.results_sha256}` | "
+                f"`{wave.manifest_sha256}` |"
+            )
     source = report["source_provenance"]
     lines.extend(
         [
@@ -3218,7 +3868,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             ),
             (
                 "- Primary 是 60 observed / 57 scored；失败成本保留、Judge 缺失不被改写。"
-                "可选 fresh B2 replacement 若出现，只在单独 sensitivity 与 receipt 证据中披露。"
+                "Fresh reruns 是 outcome-conditioned post-hoc 证据，只在独立成本与 sensitivity "
+                "章节披露，不回填 primary。"
             ),
             (
                 "- 若各臂未逐题交错执行，paired ΔQ 仍可能混入 provider/time drift；"
@@ -3445,6 +4096,26 @@ def self_test() -> None:
                         "status": "complete",
                         "generation_accepted": True,
                         "judge_complete": True,
+                    },
+                    "usage": {
+                        "input_tokens": 100 + task_index,
+                        "output_tokens": 50 + group_index,
+                        "reasoning_tokens": 20,
+                        "cached_tokens": 10,
+                    },
+                    "selected_attempt_metrics": {
+                        "latency_ms": 1000 + task_index * 100 + group_index,
+                        "total_tool_call_count": 1 if task_index % 2 == 0 else 0,
+                        "trajectory_steps": 3,
+                        "llm_request_count": 2,
+                    },
+                    "latency_ms": 1000 + task_index * 100 + group_index,
+                    "cost_accounting": {
+                        "generation": {
+                            "recorded_cost_usd": 0.1,
+                            "cost_complete": True,
+                            "cost_exact": True,
+                        }
                     },
                     "quality_total": float(50 + task_index + group_index),
                     "judge": {"score_status": "complete", "judge_error_count": 0},
@@ -3731,6 +4402,13 @@ def self_test() -> None:
                     "status": "incomplete",
                     "generation_accepted": False,
                     "judge_complete": False,
+                },
+                "cost_accounting": {
+                    "generation": {
+                        "recorded_cost_usd": 0.0,
+                        "cost_complete": True,
+                        "cost_exact": True,
+                    }
                 },
             }
         )
@@ -4137,6 +4815,37 @@ def self_test() -> None:
         summary_groups[group]["avg_quality"] = float(
             failure_metrics[group]["scored_only_avg_quality"]
         )
+    metric_lower_bound_row = next(
+        row for row in primary_rows if (row["group"], row["task_id"]) == ("G1", task_ids[0])
+    )
+    metric_lower_bound_row["cost_accounting"]["generation"].update(
+        {"cost_complete": False, "cost_exact": False}
+    )
+    consolidated_metrics = build_consolidated_group_metrics(primary_rows)
+    assert consolidated_metrics["B0"]["generation_cost_exact_rows"] == 10
+    assert consolidated_metrics["B2"]["total_generation_cost_usd"] == Decimal("0.9")
+    assert consolidated_metrics["G1"]["generation_cost_is_lower_bound"] is True
+    assert consolidated_metrics["G1"]["generation_cost_exact_rows"] == 9
+    common_rows = [row for row in primary_rows if str(row.get("task_id") or "") != INCIDENT_TASK_ID]
+    common_consolidated_metrics = build_consolidated_group_metrics(
+        common_rows,
+        expected_rows=EXPECTED_TASKS - 1,
+    )
+    common_quality_by_group = {
+        str(item["group"]): float(item["avg_quality"]) for item in common_ranking
+    }
+    common_summary_groups = {
+        group: {
+            **summary_groups[group],
+            "rows": EXPECTED_TASKS - 1,
+            "completed": EXPECTED_TASKS - 1,
+            "scored_rows": EXPECTED_TASKS - 1,
+            "avg_quality": common_quality_by_group[group],
+        }
+        for group in ARMS
+    }
+    assert common_consolidated_metrics["B0"]["generation_cost_exact_rows"] == 9
+    assert common_consolidated_metrics["B2"]["total_generation_cost_usd"] == Decimal("0.9")
     arm_contracts = {
         group: {"group_spec": deepcopy(synthetic_group_specs[group])} for group in ARMS
     }
@@ -4200,6 +4909,7 @@ def self_test() -> None:
     document = render_markdown(
         {
             "summary": {"groups": summary_groups},
+            "consolidated_metrics": consolidated_metrics,
             "failure_metrics": failure_metrics,
             "native_failures": native_failures,
             "cost_coverage": cost_coverage,
@@ -4209,6 +4919,8 @@ def self_test() -> None:
             "waves": [wave],
             "paired": failure_aware,
             "paired_complete_case": complete_case,
+            "common_task_summary": {"groups": common_summary_groups},
+            "common_task_consolidated_metrics": common_consolidated_metrics,
             "common_task_ranking": common_ranking,
             "paired_sensitivity": [],
             "bootstrap_samples": 200,
@@ -4248,6 +4960,14 @@ def self_test() -> None:
     )
     assert document.startswith("# DRACO Mini")
     assert "可评分 `57/60`" in document
+    assert "| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ |" in document
+    assert "| B2 | 10 | 9 |" in document
+    expected_g1_metric_prefix = (
+        "| G1 | 10 | 10 | 58.5000 | 75.00% | 0 | ≥0.100000 | ≥1.000000 | 9/10 |"
+    )
+    assert expected_g1_metric_prefix in document, next(
+        line for line in document.splitlines() if line.startswith("| G1 | 10 | 10 |")
+    )
     assert "60/60 scored" not in document
     assert "## 成本与 coverage" in document
     assert "## 实验臂定义" in document
@@ -4256,8 +4976,10 @@ def self_test() -> None:
     assert "## Relaxed cost-metadata audit" in document
     assert "## Primary failure-aware 同题配对比较（U，n=10）" in document
     assert "## Complete-case 共同 9 题诊断" in document
+    assert "### 共同 9 题完整指标（同格式）" in document
+    assert "| B2 | 9 | 9 |" in document
     assert document.count("EXEC_FAIL‡") == 3
-    assert "AvgQ failure-adjusted" in document
+    assert "failure-adjusted U" in document
     assert "Primary 未使用 fresh replacement" in document
     assert "missing_expected_b2_ensemble_contract" in document
     assert B2_INCIDENT_CONTRACT_REASON in document
@@ -4328,6 +5050,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-manifest", type=Path)
     parser.add_argument("--results-jsonl", type=Path, action="append", default=[])
     parser.add_argument(
+        "--posthoc-rerun-results-jsonl",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "one-row no-history fresh-budget rerun evidence; when supplied, B2/B4/S4 "
+            "must each appear exactly once and remain outside causal primary selection"
+        ),
+    )
+    parser.add_argument(
         "--incident-replacement-spec",
         type=Path,
         help="hashed authorization receipt for the one supported post-hoc replacement",
@@ -4397,6 +5129,13 @@ def run(args: argparse.Namespace) -> int:
     result_paths = [path.resolve() for path in args.results_jsonl]
     if len(result_paths) != len(set(result_paths)):
         raise ReportError("duplicate --results-jsonl paths")
+    posthoc_result_paths = [path.resolve() for path in args.posthoc_rerun_results_jsonl]
+    if len(posthoc_result_paths) != len(set(posthoc_result_paths)):
+        raise ReportError("duplicate --posthoc-rerun-results-jsonl paths")
+    if incident_enabled and posthoc_result_paths:
+        raise ReportError("legacy incident replacement and three-arm post-hoc reruns are exclusive")
+    if set(result_paths).intersection(posthoc_result_paths):
+        raise ReportError("post-hoc reruns must not enter causal --results-jsonl selection")
     replacement_path = (
         args.incident_replacement_results_jsonl.resolve() if incident_enabled else None
     )
@@ -4463,6 +5202,21 @@ def run(args: argparse.Namespace) -> int:
         policies=INCIDENT_POLICIES,
         runner=helpers.runner,
     )
+    posthoc_reruns: list[PosthocRerunEvidence] = []
+    posthoc_rerun_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    if posthoc_result_paths:
+        posthoc_reruns, posthoc_rerun_rows = validate_posthoc_reruns(
+            posthoc_result_paths,
+            helpers=helpers,
+            expected_manifest_path=args.expected_manifest.resolve(),
+            expected_manifest=expected_manifest,
+            task_ids=task_ids,
+            prompt_hashes=prompt_hashes,
+            task_input_hashes=task_input_hashes,
+            fingerprints=fingerprints,
+            primary_rows=primary_rows,
+            policies=INCIDENT_POLICIES,
+        )
     incident: IncidentEvidence | None = None
     paired_sensitivity: list[dict[str, Any]] = []
     posthoc_rows: list[dict[str, Any]] | None = None
@@ -4554,6 +5308,16 @@ def run(args: argparse.Namespace) -> int:
             for row in primary_rows
         ]
         selection["incident_replacement"] = replacement_selection
+    if posthoc_reruns:
+        successful_keys = frozenset(
+            (item.group, item.task_id) for item in posthoc_reruns if item.succeeded
+        )
+        posthoc_rows = [
+            posthoc_rerun_rows.get((str(row["group"]), str(row["task_id"])), row)
+            if (str(row["group"]), str(row["task_id"])) in successful_keys
+            else row
+            for row in primary_rows
+        ]
     rows = primary_rows
     actual_ledger_rows = primary_rows
     arm_definitions = build_arm_definitions(
@@ -4563,6 +5327,7 @@ def run(args: argparse.Namespace) -> int:
         rows=rows,
     )
     summary = helpers.runner.summarize(rows)
+    consolidated_metrics = build_consolidated_group_metrics(rows)
     failure_count_by_group = Counter(policy.group for policy in INCIDENT_POLICIES)
     for group in ARMS:
         item = summary.get("groups", {}).get(group)
@@ -4602,31 +5367,79 @@ def run(args: argparse.Namespace) -> int:
         rows,
         excluded_task_ids=frozenset({INCIDENT_TASK_ID}),
     )
-    if incident and posthoc_rows is not None:
-        posthoc_failure_keys = native_failure_keys - {INCIDENT_KEY}
+    common_rows = [row for row in rows if str(row.get("task_id") or "") != INCIDENT_TASK_ID]
+    common_summary = helpers.runner.summarize(common_rows)
+    common_consolidated_metrics = build_consolidated_group_metrics(
+        common_rows,
+        expected_rows=EXPECTED_TASKS - 1,
+    )
+    for group in ARMS:
+        item = common_summary.get("groups", {}).get(group)
+        if (
+            not isinstance(item, Mapping)
+            or item.get("rows") != EXPECTED_TASKS - 1
+            or item.get("completed") != EXPECTED_TASKS - 1
+            or item.get("scored_rows") != EXPECTED_TASKS - 1
+        ):
+            raise ReportError(f"common 9-task completion gate failed for {group}")
+    posthoc_sensitivity: dict[str, Any] | None = None
+    if posthoc_rows is not None:
+        posthoc_success_keys = (
+            frozenset((item.group, item.task_id) for item in posthoc_reruns if item.succeeded)
+            if posthoc_reruns
+            else frozenset({INCIDENT_KEY})
+        )
+        posthoc_failure_keys = native_failure_keys - posthoc_success_keys
         paired_sensitivity = paired_quality_comparisons(
             posthoc_rows,
             bootstrap_samples=args.bootstrap_samples,
             failure_keys=posthoc_failure_keys,
             analysis_label="post-hoc-replacement",
         )
+        posthoc_summary = helpers.runner.summarize(posthoc_rows)
+        posthoc_consolidated = build_consolidated_group_metrics(posthoc_rows)
+        posthoc_failure_metrics = failure_aware_group_metrics(
+            posthoc_rows,
+            failure_keys=posthoc_failure_keys,
+        )
+        for group in ARMS:
+            item = posthoc_summary.get("groups", {}).get(group)
+            expected_scored = EXPECTED_TASKS - sum(key[0] == group for key in posthoc_failure_keys)
+            if (
+                not isinstance(item, Mapping)
+                or item.get("rows") != EXPECTED_TASKS
+                or item.get("completed") != expected_scored
+                or item.get("scored_rows") != expected_scored
+            ):
+                raise ReportError(f"post-hoc sensitivity completion gate failed for {group}")
+        posthoc_sensitivity = {
+            "summary": posthoc_summary,
+            "consolidated_metrics": posthoc_consolidated,
+            "failure_metrics": posthoc_failure_metrics,
+            "successful_keys": sorted(posthoc_success_keys),
+        }
     report = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "input_sha256": file_sha256(args.input.resolve()),
         "task_ids": task_ids,
         "rows": rows,
         "arm_definitions": arm_definitions,
         "waves": waves,
         "summary": summary,
+        "consolidated_metrics": consolidated_metrics,
         "failure_metrics": failure_metrics,
         "native_failures": native_failures,
         "cost_coverage": costs,
         "paired": paired,
         "paired_complete_case": paired_complete_case,
+        "common_task_summary": common_summary,
+        "common_task_consolidated_metrics": common_consolidated_metrics,
         "common_task_ranking": common_ranking,
         "bootstrap_samples": args.bootstrap_samples,
         "selection": selection,
         "incident": incident,
+        "posthoc_reruns": posthoc_reruns,
+        "posthoc_sensitivity": posthoc_sensitivity,
         "paired_sensitivity": paired_sensitivity,
         "source_provenance": expected_manifest.get("source_provenance") or {},
     }
@@ -4638,7 +5451,8 @@ def run(args: argparse.Namespace) -> int:
             f"{primary_scoring_complete}/{EXPECTED_PAIRS}; "
             f"observed={len(rows)}/{EXPECTED_PAIRS}; primary_waves={len(waves)}; "
             f"metadata_only={len(metadata_only_pairs)}; "
-            f"incident_replacement={bool(incident)}; comparisons={len(paired)}"
+            f"incident_replacement={bool(incident)}; posthoc_reruns={len(posthoc_reruns)}; "
+            f"comparisons={len(paired)}"
         )
         return 0
     atomic_write(args.output, document)
