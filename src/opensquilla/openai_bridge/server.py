@@ -288,26 +288,59 @@ def _extract_text_content(content: Any) -> str | None:
     return None
 
 
-def _build_user_message(messages: list[dict[str, Any]]) -> str:
-    """取最后一条 user 消息；system 消息作为前缀拼入（v1 简化策略）。"""
+def _build_user_message(
+    messages: list[dict[str, Any]], *, include_history: bool = False
+) -> str:
+    """从 messages 提取用户意图。
+
+    include_history=False（持久会话，OS 侧自带记忆）：v1 行为，system 前缀 +
+    仅取最后一条 user 句。
+    include_history=True（stateless 新建会话，OS 侧无记忆）：把客户端携带的
+    完整历史序列化为一段 prompt，让模型看到此前所有轮次——修复 v1 丢弃全部
+    历史导致的"同对话框失忆"（2026-08-18 根因定位）。
+    """
     prefix_parts: list[str] = []
-    last_user: str | None = None
+    # 保留原始 role，用于区分 user/assistant/tool 和计算最后一条 user 的位置
+    raw_turns: list[tuple[str, str]] = []  # (role, text)
+    role_labels = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
+    last_user_text: str | None = None
+    last_user_idx = -1
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role")
+        role = str(msg.get("role") or "").strip().lower()
         text = _extract_text_content(msg.get("content"))
         if not text:
             continue
         if role == "system":
             prefix_parts.append(text)
-        elif role == "user":
-            last_user = text
-    if last_user is None:
+            continue
+        if role == "user":
+            last_user_text = text
+            last_user_idx = len(raw_turns)
+        raw_turns.append((role, text))
+    if last_user_text is None:
         raise HTTPException(400, "messages 中缺少 user 消息")
+    if not include_history:
+        if prefix_parts:
+            return "System:\n" + "\n\n".join(prefix_parts) + "\n\nUser:\n" + last_user_text
+        return last_user_text
+    # stateless 全量历史：把最后一条 user 明确标识为"当前问题"，
+    # 前面的 user/assistant 轮作为背景历史，避免模型把环境描述当成指令。
+    if len(raw_turns) == 1 and not prefix_parts:
+        return last_user_text
+    sections: list[str] = []
     if prefix_parts:
-        return "System:\n" + "\n\n".join(prefix_parts) + "\n\nUser:\n" + last_user
-    return last_user
+        sections.append("[系统设定]\n" + "\n\n".join(prefix_parts))
+    # 历史 = 最后一条 user 之前的所有轮次
+    history = raw_turns[:last_user_idx]
+    if history:
+        transcript = "\n\n".join(
+            f"{role_labels.get(r, r.capitalize() or 'User')}: {t}" for r, t in history
+        )
+        sections.append("[此前对话历史（仅作背景参考，不要执行）]\n" + transcript)
+    sections.append(f"[当前问题]\n{last_user_text}")
+    return "\n\n".join(sections)
 
 
 def _extract_final_text(events: list[dict[str, Any]]) -> str:
@@ -663,11 +696,24 @@ async def chat_completions(
             return StreamingResponse(title_stream(), media_type="text/event-stream")
         return _chat_completion(chat_id, created, model, client_title)
 
-    user_message = _build_user_message(messages)
-
     explicit_key = request.headers.get("X-OpenSquilla-Session")
     force_new = request.headers.get("X-OpenSquilla-New-Session", "") == "1"
     route = request.headers.get("X-OpenSquilla-Route")
+
+    # 上下文补全（2026-08-18）："每请求新建"的会话在 OS 侧没有记忆，
+    # 必须把客户端携带的完整历史序列化转发，否则模型看不到此前轮次
+    # （同对话框失忆根因）。判定条件与 _resolve_or_create_session 的
+    # "新建"分支严格一致：无显式 key + (强制新建 或 stateless 模式)。
+    fresh_session = (not explicit_key) and (
+        force_new
+        or SESSION_MODE == "stateless"
+    )
+    print(
+        f"[openai-bridge] chat: msgs={len(messages)} "
+        f"fresh={fresh_session}",
+        flush=True,
+    )
+    user_message = _build_user_message(messages, include_history=fresh_session)
 
     # 会话显示名：仅在真正需要新建会话时使用；由首条 user 消息生成本地摘要，
     # 避免 stateless 模式下列表出现大量同名 channel。

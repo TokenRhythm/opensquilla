@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from opensquilla.openai_bridge import server as bridge_server
 from opensquilla.openai_bridge.server import (
     _build_display_name,
+    _build_user_message,
     _collect_terminal_error,
     _detect_client_title_request,
     _event_error_message,
@@ -375,3 +378,100 @@ def test_build_display_name_collapses_whitespace_and_control_chars() -> None:
     assert "\t" not in name
     assert "\x00" not in name
     assert "第一行 第二行 第三行" in name
+
+
+# --------------------------------------------------------------------
+# _build_user_message — include_history (失忆修复回归测试)
+# --------------------------------------------------------------------
+
+def test_build_user_message_v1_last_user_only() -> None:
+    """include_history=False（默认）：v1 行为，只取最后一条 user。"""
+    result = _build_user_message([
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "回答1"},
+        {"role": "user", "content": "第二问"},
+    ])
+    # 不应包含第一问（历史），只包含第二问（当前）
+    assert "第一问" not in result
+    assert "第二问" in result
+    # system 前缀以 v1 格式拼入
+    assert "你是助手" in result
+
+
+def test_build_user_message_include_history_preserves_full_history() -> None:
+    """include_history=True：全量历史序列化，包含第一问。"""
+    result = _build_user_message([
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "回答1"},
+        {"role": "user", "content": "第二问"},
+    ], include_history=True)
+    assert "第一问" in result
+    assert "第二问" in result
+    assert "回答1" in result
+    # 结构标记
+    assert "[此前对话历史" in result
+    assert "[当前问题]" in result
+
+
+def test_build_user_message_include_history_single_turn_no_system() -> None:
+    """include_history=True 但只有一轮对话：不输出历史标记。"""
+    result = _build_user_message([
+        {"role": "user", "content": "你好"},
+    ], include_history=True)
+    assert "你好" in result
+    assert "此前对话历史" not in result
+    assert "当前问题" not in result
+
+
+def test_build_user_message_include_history_with_system() -> None:
+    """include_history=True + system 前缀 → [系统设定] 标记。"""
+    result = _build_user_message([
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "回答1"},
+        {"role": "user", "content": "当前问"},
+    ], include_history=True)
+    assert "[系统设定]" in result
+    assert "你是助手" in result
+    assert "第一问" in result
+    assert "当前问" in result
+
+
+def test_build_user_message_missing_user_raises() -> None:
+    """无 user 消息抛 HTTP 400。"""
+    with pytest.raises(HTTPException, match="缺少 user"):
+        _build_user_message([{"role": "system", "content": "你是助手"}])
+
+
+def test_build_user_message_empty_messages_raises() -> None:
+    """空 messages 抛 HTTP 400。"""
+    with pytest.raises(HTTPException, match="缺少 user"):
+        _build_user_message([])
+
+
+def test_build_user_message_include_history_last_user_is_current() -> None:
+    """include_history=True 时，最后一条 user 是当前问题，不在历史中。"""
+    result = _build_user_message([
+        {"role": "user", "content": "历史问题"},
+        {"role": "assistant", "content": "历史回答"},
+        {"role": "user", "content": "当前问题"},
+    ], include_history=True)
+    # 历史段不应包含"当前问题"
+    history_start = result.find("[此前对话历史")
+    history_end = result.find("[当前问题]")
+    if history_start >= 0 and history_end >= 0:
+        history_section = result[history_start:history_end]
+        assert "当前问题" not in history_section
+
+
+def test_build_user_message_include_history_tool_role() -> None:
+    """include_history=True 时 tool role 被正确标注。"""
+    result = _build_user_message([
+        {"role": "user", "content": "查天气"},
+        {"role": "assistant", "content": "调用工具"},
+        {"role": "tool", "content": "晴天 25°C"},
+        {"role": "user", "content": "谢谢"},
+    ], include_history=True)
+    assert "Tool:" in result
+    assert "晴天 25°C" in result
