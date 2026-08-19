@@ -1559,7 +1559,10 @@ try {
       return false
     }
   })
-  await generatedArtifactCard(page).locator('.msg-artifact-download').click()
+  const originalDownloadButton = generatedArtifactCard(page).locator('.msg-artifact-download')
+  await originalDownloadButton.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  assert.equal(await originalDownloadButton.isDisabled(), false)
+  await originalDownloadButton.evaluate(element => element.click())
   const originalDownload = await originalDownloadPromise
   assert.equal(originalDownload.status(), 200)
   const originalDownloadPath = new URL(originalDownload.url()).pathname
