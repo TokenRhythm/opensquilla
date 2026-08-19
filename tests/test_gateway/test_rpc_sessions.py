@@ -4664,6 +4664,26 @@ class TestSessionsSteer:
             assert replay.payload["user_message_id"] == accepted.payload["user_message_id"]
             assert await store.list_pending_chat_inputs(key) == []
 
+            # A stale client may still try to drain the identity it hydrated
+            # before steer acceptance. The receipt is a completion tombstone:
+            # replay it instead of admitting a second session turn.
+            stale_dispatch = await dispatcher.dispatch(
+                "r-pending-steer-stale-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": key,
+                    "pendingInputId": row.pending_input_id,
+                    "clientRequestId": row.client_request_id,
+                    "requestFingerprint": row.request_fingerprint,
+                    "_source": {"caller_kind": "web", "channel_kind": "web"},
+                },
+                ctx,
+            )
+            assert stale_dispatch.ok is True
+            assert stale_dispatch.payload["accepted"] is True
+            assert stale_dispatch.payload["replayed"] is True
+            assert stale_dispatch.payload["task_id"] == handle.task_id
+
             receipt = await store.get_pending_chat_input_dispatch_receipt(
                 row.pending_input_id
             )
