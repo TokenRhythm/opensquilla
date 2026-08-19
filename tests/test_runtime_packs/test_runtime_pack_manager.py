@@ -60,6 +60,68 @@ def _isolate_synthetic_archive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime_pack_manager, "_run_probe", probe)
 
 
+def test_atomic_state_replace_retries_transient_windows_reader_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "operation.tmp"
+    destination = tmp_path / "operation.json"
+    source.write_text("next", encoding="utf-8")
+    destination.write_text("current", encoding="utf-8")
+    real_replace = os.replace
+    attempts = 0
+    delays: list[float] = []
+
+    class TransientWindowsReplaceError(PermissionError):
+        winerror = 5
+
+    def flaky_replace(source_path: Path, destination_path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise TransientWindowsReplaceError("reader still has the state file open")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(runtime_pack_manager.os, "name", "nt")
+    monkeypatch.setattr(runtime_pack_manager.os, "replace", flaky_replace)
+    monkeypatch.setattr(runtime_pack_manager.time, "sleep", delays.append)
+
+    runtime_pack_manager._replace_atomic_state(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.02, 0.05]
+    assert not source.exists()
+    assert destination.read_text(encoding="utf-8") == "next"
+
+
+def test_atomic_state_replace_does_not_retry_permanent_windows_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "operation.tmp"
+    destination = tmp_path / "operation.json"
+    source.write_text("next", encoding="utf-8")
+    attempts = 0
+
+    class PermanentWindowsReplaceError(PermissionError):
+        winerror = 50
+
+    def denied_replace(_source: Path, _destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermanentWindowsReplaceError("policy denied the replacement")
+
+    monkeypatch.setattr(runtime_pack_manager.os, "name", "nt")
+    monkeypatch.setattr(runtime_pack_manager.os, "replace", denied_replace)
+
+    with pytest.raises(PermanentWindowsReplaceError, match="policy denied"):
+        runtime_pack_manager._replace_atomic_state(source, destination)
+
+    assert attempts == 1
+    assert source.read_text(encoding="utf-8") == "next"
+    assert not destination.exists()
+
+
 class _Response:
     def __init__(self, body: bytes, *, status: int, start: int, total: int) -> None:
         self._body = io.BytesIO(body)

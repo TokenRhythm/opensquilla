@@ -89,6 +89,8 @@ _INTEGRITY_CACHE_TTL_SECONDS = 30.0
 _SAFE_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_STATE_JSON_BYTES = 64 * 1024**2
+_WINDOWS_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS = (0.02, 0.05, 0.1, 0.2)
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
 _configured_state_dir: ContextVar[Path | None] = ContextVar(
     "opensquilla_runtime_pack_state_dir",
     default=None,
@@ -214,9 +216,26 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             temp_path.chmod(0o600)
         except OSError:
             pass
-        os.replace(temp_path, path)
+        _replace_atomic_state(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _replace_atomic_state(source: Path, destination: Path) -> None:
+    """Publish state after transient Windows readers release the destination."""
+
+    for delay in (*_WINDOWS_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS, None):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as error:
+            if (
+                os.name != "nt"
+                or getattr(error, "winerror", None) not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+                or delay is None
+            ):
+                raise
+            time.sleep(delay)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
