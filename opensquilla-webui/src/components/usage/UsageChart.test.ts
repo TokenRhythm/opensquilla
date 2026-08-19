@@ -31,8 +31,8 @@ function rowByLabel(root: HTMLElement, label: string): HTMLElement {
   return row
 }
 
-describe('UsageChart endpoint cap', () => {
-  it('omits the cap for an exact zero while retaining non-zero endpoints', async () => {
+describe('UsageChart endpoint rendering', () => {
+  it('omits endpoint caps while preserving row values and widths', async () => {
     i18n.global.locale.value = 'en'
     const root = document.createElement('div')
     document.body.appendChild(root)
@@ -56,15 +56,20 @@ describe('UsageChart endpoint cap', () => {
     expect(parseFloat(
       zero.querySelector<HTMLElement>('.usage-bar-row__fill--input')?.style.width || '',
     )).toBe(0)
+    expect(zero.querySelector('.usage-bar-row__value')?.textContent).toBe('0')
 
-    const halfCap = rowByLabel(root, 'half')
-      .querySelector<HTMLElement>('.usage-bar-row__cap')
-    expect(halfCap).not.toBeNull()
-    expect(parseFloat(halfCap?.style.left || '')).toBe(50)
+    const half = rowByLabel(root, 'half')
+    expect(half.querySelector('.usage-bar-row__cap')).toBeNull()
+    expect(parseFloat(
+      half.querySelector<HTMLElement>('.usage-bar-row__fill--input')?.style.width || '',
+    )).toBe(50)
+    expect(half.querySelector('.usage-bar-row__value')?.textContent).toBe('1')
 
-    const tinyCap = rowByLabel(root, 'tiny-positive')
-      .querySelector<HTMLElement>('.usage-bar-row__cap')
-    expect(tinyCap).not.toBeNull()
-    expect(parseFloat(tinyCap?.style.left || '')).toBe(0)
+    const tinyPositive = rowByLabel(root, 'tiny-positive')
+    expect(tinyPositive.querySelector('.usage-bar-row__cap')).toBeNull()
+    expect(parseFloat(
+      tinyPositive.querySelector<HTMLElement>('.usage-bar-row__fill--input')?.style.width || '',
+    )).toBe(0)
+    expect(tinyPositive.querySelector('.usage-bar-row__value')?.textContent).toBe('1')
   })
 })
