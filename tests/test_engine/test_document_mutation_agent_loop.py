@@ -1125,9 +1125,6 @@ async def test_post_tool_iteration_timeout_still_runs_outcome_finalization() -> 
     controller = _MutationController()
 
     async def handler(call: Any) -> ToolResult:
-        # Block just past the tiny synthetic iteration deadline so the tool
-        # returns an authoritative receipt before the post-tool deadline check.
-        time.sleep(0.03)
         controller.committed_ids.add(call.tool_use_id)
         return _effect_result(
             call.tool_use_id,
@@ -1139,15 +1136,19 @@ async def test_post_tool_iteration_timeout_still_runs_outcome_finalization() -> 
             is_error=False,
         )
 
-    events = [
-        event
-        async for event in _agent(
-            provider,
-            controller,
-            handler,
-            iteration_timeout=0.01,
-        ).run_turn("edit")
-    ]
+    events = []
+    async for event in _agent(
+        provider,
+        controller,
+        handler,
+        iteration_timeout=1.0,
+    ).run_turn("edit"):
+        events.append(event)
+        if event.kind == "tool_result":
+            # Cross the iteration deadline only after the authoritative tool
+            # result has been emitted. Sleeping inside the handler races the
+            # tool timeout itself and makes the test scheduler-dependent.
+            time.sleep(1.1)
     done = next(event for event in events if event.kind == "done")
 
     assert len(provider.calls) == 2
