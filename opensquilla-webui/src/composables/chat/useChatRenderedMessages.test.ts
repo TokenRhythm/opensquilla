@@ -958,6 +958,56 @@ describe('useChatRenderedMessages router visual mode', () => {
     expect(after?.routerTurnKey).toBe(before?.routerTurnKey)
   })
 
+  it('restores an accepted ensemble panel from durable cold-history outcome metadata', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0, turnId: 'turn-cold' },
+        {
+          role: 'assistant',
+          text: 'answer',
+          ts: 1,
+          turnId: 'turn-cold',
+          restoredFromHistory: true,
+          turnOutcome: {
+            turnId: 'turn-cold',
+            status: 'succeeded',
+            acceptedRoutingMode: 'ensemble',
+          },
+          usage: {
+            routing_source: 'squilla_router',
+            routed_tier: 'balanced',
+            routed_model: 'anthropic/claude-sonnet-4.6',
+            model_usage_breakdown: [
+              { role: 'primary', provider: 'openrouter', model: 'openai/gpt-5.5' },
+              { role: 'critic', provider: 'openrouter', model: 'z-ai/glm-5.2' },
+            ],
+            ensemble_trace: {
+              profile: 'default',
+              mode: 'custom_b5',
+              llm_request_count: 2,
+              total_candidates: 2,
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('router-ensemble-cold-history-test'),
+      routerSlots: ref(['fast', 'balanced', 'strong']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('off'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerPanel).toBe('llm-ensemble')
+    expect(strip?.routerTurnKey).toBe('router-turn:turn-cold')
+  })
+
   it('does not reclassify a live router turn from the next-turn session mode', () => {
     const nextTurnMode = ref<ModelRoutingMode>('squilla_router')
     const withMessages = useChatRenderedMessages({

@@ -294,21 +294,17 @@ async def _chat_history_turn_outcomes(
         )
         return outcomes
 
-    missing_turn_ids = turn_ids - outcomes_by_turn.keys()
-    if not missing_turn_ids:
-        return _sorted_outcomes()
-
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
     get_task = getattr(storage, "get_agent_task", None)
     list_tasks = getattr(storage, "list_agent_tasks", None)
     try:
         if callable(exact_tasks):
-            rows = await exact_tasks(sorted(missing_turn_ids))
+            rows = await exact_tasks(sorted(turn_ids))
         elif callable(get_task):
             rows = [
                 row
-                for turn_id in sorted(missing_turn_ids)
+                for turn_id in sorted(turn_ids)
                 if (row := await get_task(turn_id)) is not None
             ]
         elif callable(list_tasks):
@@ -330,25 +326,36 @@ async def _chat_history_turn_outcomes(
         turn_id = details.get("turn_id") or task_id
         status = getattr(row, "status", None)
         status = str(getattr(status, "value", status) or "")
-        outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
-        if outcome is None:
-            continue
         if (
             not isinstance(turn_id, str)
-            or turn_id not in missing_turn_ids
+            or turn_id not in turn_ids
         ):
             continue
-        outcomes_by_turn[turn_id] = {
-            "turn_id": turn_id,
-            "task_id": task_id,
-            "status": status,
-            "started_at": getattr(row, "started_at", None),
-            "finished_at": getattr(row, "finished_at", None),
-            "outcome": outcome,
-        }
+        projected = outcomes_by_turn.get(turn_id)
+        outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
+        if projected is None:
+            if outcome is None:
+                continue
+            projected = {
+                "turn_id": turn_id,
+                "task_id": task_id,
+                "status": status,
+                "started_at": getattr(row, "started_at", None),
+                "finished_at": getattr(row, "finished_at", None),
+                "outcome": outcome,
+            }
+            outcomes_by_turn[turn_id] = projected
+        accepted_routing = details.get("accepted_model_routing")
+        if isinstance(accepted_routing, dict):
+            accepted_mode = str(accepted_routing.get("effective_mode") or "").strip().lower()
+            if accepted_mode in {"direct", "router", "ensemble"}:
+                projected["accepted_routing_mode"] = accepted_mode
         error_class = getattr(row, "error_class", None)
         if is_usage_accounting_barrier(error_class):
-            projected = outcomes_by_turn[turn_id]
+            if outcome is None:
+                outcome = terminal_turn_outcome(status, projected.get("outcome"))
+            if outcome is None:
+                continue
             replay_proof = usage_barrier_replay_proof(
                 usage_call_index=details.get("usage_call_index"),
                 no_prior_provider_dispatch=details.get(

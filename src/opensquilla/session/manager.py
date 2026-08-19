@@ -497,6 +497,19 @@ def _entry_turn_id(entry: TranscriptEntry) -> str | None:
     return turn_id_from_context(entry.turn_context)
 
 
+def _accepted_routing_mode_from_task_details(details: object) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    accepted_routing = details.get("accepted_model_routing")
+    if not isinstance(accepted_routing, dict):
+        return None
+    mode = accepted_routing.get("effective_mode")
+    if not isinstance(mode, str):
+        return None
+    normalized = mode.strip().lower()
+    return normalized if normalized in _MODEL_ROUTING_MODES else None
+
+
 def _is_promoted_turn_entry(entry: TranscriptEntry) -> bool:
     return isinstance(entry.turn_context, dict) and (
         entry.turn_context.get("disposition") == "promoted"
@@ -1414,6 +1427,7 @@ class SessionManager:
                         started_at=snapshot.get("started_at"),
                         finished_at=snapshot.get("finished_at"),
                         outcome=snapshot["outcome"],
+                        accepted_routing_mode=snapshot.get("accepted_routing_mode"),
                     )
                     continue
 
@@ -1441,6 +1455,9 @@ class SessionManager:
                     "finished_at": getattr(row, "finished_at", None),
                     "outcome": outcome,
                 }
+                accepted_routing_mode = _accepted_routing_mode_from_task_details(details)
+                if accepted_routing_mode is not None:
+                    snapshot["accepted_routing_mode"] = accepted_routing_mode
             elif turn_id not in invalid_turn_ids:
                 snapshot = source_projections.get(turn_id)
 
@@ -1455,6 +1472,7 @@ class SessionManager:
                 started_at=snapshot.get("started_at"),
                 finished_at=snapshot.get("finished_at"),
                 outcome=snapshot["outcome"],
+                accepted_routing_mode=snapshot.get("accepted_routing_mode"),
             )
 
         return _ForkTerminalOutcomeResolution(

@@ -1123,6 +1123,9 @@ async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
                 finished_at=120,
                 details={
                     "turn_id": "turn-stopped",
+                    "accepted_model_routing": {
+                        "effective_mode": "ensemble",
+                    },
                     "turn_outcome": {
                         "kind": "interrupted",
                         "reason": "cancelled",
@@ -1155,6 +1158,7 @@ async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
                     "cancellation_source": "webui_stop",
                     "retryable": True,
                 },
+                "accepted_routing_mode": "ensemble",
             }
         ]
         assert result["messages"][0]["turn_context"]["turn_id"] == "turn-stopped"

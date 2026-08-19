@@ -739,6 +739,7 @@ export interface ChatHistoryTurnOutcome {
   no_prior_provider_dispatch?: boolean
   replay_safe?: boolean
   user_message_id?: string
+  accepted_routing_mode?: 'direct' | 'router' | 'ensemble'
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {

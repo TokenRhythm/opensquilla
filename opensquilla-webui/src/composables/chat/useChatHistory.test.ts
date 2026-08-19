@@ -2054,6 +2054,7 @@ describe('useChatHistory optimistic local rows', () => {
           status: 'cancelled',
           started_at: 1_000,
           finished_at: 2_000,
+          accepted_routing_mode: 'ensemble',
           outcome: {
             kind: 'cancelled',
             cancellation_source: 'webui_stop',
@@ -2075,6 +2076,7 @@ describe('useChatHistory optimistic local rows', () => {
       turnId: 'turn-1',
       status: 'cancelled',
       cancellationSource: 'webui_stop',
+      acceptedRoutingMode: 'ensemble',
     })
   })
 

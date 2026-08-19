@@ -1633,6 +1633,7 @@ function routerDecisionFromUsage(
       ? immutablePlan.routing_applied
       : usage.routing_applied !== false,
     rollout_phase: usage.rollout_phase || 'full',
+    accepted_routing_mode: msg.turnOutcome?.acceptedRoutingMode,
   })
 }
 

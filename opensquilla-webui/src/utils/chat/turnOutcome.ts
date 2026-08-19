@@ -228,6 +228,19 @@ export function normalizeTurnOutcome(
       ?? nested.activity_snapshot ?? nested.activitySnapshot,
     turnId,
   )
+  const acceptedRoutingModeRaw = text(
+    record.accepted_routing_mode
+    ?? record.acceptedRoutingMode
+    ?? nested.accepted_routing_mode
+    ?? nested.acceptedRoutingMode,
+  ).toLowerCase()
+  const acceptedRoutingMode = (
+    acceptedRoutingModeRaw === 'direct'
+    || acceptedRoutingModeRaw === 'router'
+    || acceptedRoutingModeRaw === 'ensemble'
+  )
+    ? acceptedRoutingModeRaw
+    : undefined
   return {
     turnId,
     ...(taskId ? { taskId } : {}),
@@ -250,6 +263,7 @@ export function normalizeTurnOutcome(
     ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterMs: retryAfter } : {}),
     ...(usageCallIndex !== undefined ? { usageCallIndex } : {}),
     ...(statusHistory.length ? { statusHistory } : {}),
+    ...(acceptedRoutingMode ? { acceptedRoutingMode } : {}),
   }
 }
 
