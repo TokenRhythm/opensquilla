@@ -132,19 +132,16 @@ Source: `_build_custom_b5_members`, `_custom_b5_candidates`
 `llm_ensemble.candidates`. Each candidate row carries:
 
 - **`provider`** / **`model`** — required, non-empty; provider is lower-cased.
-- **`role`** — `aggregator` is the only structural value; an empty or omitted
-  role means proposer. The Web UI therefore presents only **Proposer** and
-  **Aggregator**. Released values `primary`, `contrast`, `fast_check`, and
-  `critic` remain accepted and preserved as advisory decision-trace labels,
-  but all execute and appear in settings as proposers. Unknown values coerce
-  to `""` instead of failing, so a hand-edited config never blocks boot.
+- **`role`** — exactly `proposer` or `aggregator`. Older advisory proposer
+  aliases and unknown non-aggregator values normalize to `proposer`, so an old
+  or hand-edited config never blocks boot or leaks internal labels into traces.
 - **`enabled`** — disabled rows are kept for read compatibility but never
   counted or run.
 
 Lineup assembly (`_build_custom_b5_members`):
 
-1. Every enabled row whose role is **not** `aggregator` runs as a proposer,
-   labeled by its role (or `proposer_N` when unassigned).
+1. Every enabled row whose role is `proposer` runs as a proposer. Internal
+   request identity uses `proposer_N`; public traces display only `Proposer`.
 2. The single row with role `aggregator` fuses the drafts. Proposer rows dedupe
    on `(provider, model)`; the aggregator row may legitimately reuse a
    proposer's model (a model both drafts and fuses).

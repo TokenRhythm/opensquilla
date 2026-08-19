@@ -422,6 +422,10 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   position: relative;
 }
 
+.sidebar-history-row .sidebar-history-item {
+  margin-right: calc(-1 * var(--sp-1));
+}
+
 .sidebar-history-item.is-current {
   background:
     linear-gradient(

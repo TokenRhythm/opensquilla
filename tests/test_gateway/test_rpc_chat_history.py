@@ -79,6 +79,48 @@ def _entry(idx: int, role: str = "user") -> TranscriptEntry:
     )
 
 
+async def _record_finalized_usage(
+    storage: SessionStorage,
+    *,
+    session_id: str,
+    session_epoch: int = 0,
+    turn_id: str,
+    event_id: str,
+    call_index: int = 0,
+    input_tokens: int = 7,
+    output_tokens: int = 3,
+    cost_nanos: int = 30_000_000,
+) -> None:
+    await storage.start_usage_event(
+        UsageEventStart(
+            event_id=event_id,
+            execution_id=turn_id,
+            call_index=call_index,
+            session_id=session_id,
+            session_epoch=session_epoch,
+            started_at_ms=10 + call_index,
+            turn_id=turn_id,
+            provider="ledger-provider",
+            model="ledger-model",
+        )
+    )
+    await storage.finalize_usage_event(
+        event_id,
+        UsageEventCompletion(
+            completed_at_ms=20 + call_index,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            cost_nanos=cost_nanos,
+            billed_cost_nanos=cost_nanos,
+            cost_source="provider_billed",
+            provider="ledger-provider",
+            model="ledger-model",
+            coverage_status="complete",
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -> None:
     entries = [_entry(idx) for idx in range(1, 4)]
@@ -523,6 +565,488 @@ async def test_chat_history_batch_projects_missing_turn_usage_from_ledger(tmp_pa
         assert message["usage"]["coverage_status"] == "complete"
         durable = await manager.get_transcript(session_key)
         assert durable[0].turn_usage is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_projects_ledger_totals_over_partial_duplicate_usage(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-partial.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-partial"
+    session = await manager.create(session_key)
+    turn_id = "partial-duplicate-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "partial answer",
+                turn_usage={
+                    "provider": "routed-provider",
+                    "model": "routed-model",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cost_usd": 0.001,
+                    "ensemble_trace": {"final_request_role": "aggregator"},
+                    "model_usage_breakdown": [{"role": "proposer"}],
+                    "routing_source": "squilla_router",
+                },
+            )
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "final answer",
+            )
+
+        for event_id, call_index, input_tokens, output_tokens, cost_nanos in (
+            ("usage-partial-1", 0, 7, 3, 10_000_000),
+            ("usage-partial-2", 1, 5, 2, 20_000_000),
+        ):
+            await storage.start_usage_event(
+                UsageEventStart(
+                    event_id=event_id,
+                    execution_id=turn_id,
+                    call_index=call_index,
+                    session_id=session.session_id,
+                    session_epoch=session.epoch,
+                    started_at_ms=10 + call_index,
+                    turn_id=turn_id,
+                    provider="test-provider",
+                    model="test-model",
+                )
+            )
+            await storage.finalize_usage_event(
+                event_id,
+                UsageEventCompletion(
+                    completed_at_ms=20 + call_index,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    cost_nanos=cost_nanos,
+                    billed_cost_nanos=cost_nanos,
+                    cost_source="provider_billed",
+                    provider="test-provider",
+                    model="test-model",
+                    coverage_status="complete",
+                ),
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert len(result["messages"]) == 2
+        assert "usage" not in result["messages"][0]
+        usage = result["messages"][1]["usage"]
+        assert usage["input_tokens"] == 12
+        assert usage["output_tokens"] == 5
+        assert usage["total_tokens"] == 17
+        assert usage["cost_usd"] == pytest.approx(0.03)
+        assert usage["billed_cost"] == pytest.approx(0.03)
+        assert usage["coverage_status"] == "complete"
+        assert usage["missing_cost_entries"] == 0
+        assert usage["provider"] == "routed-provider"
+        assert usage["model"] == "routed-model"
+        assert usage["ensemble_trace"] == {"final_request_role": "aggregator"}
+        assert usage["model_usage_breakdown"] == [{"role": "proposer"}]
+        assert usage["routing_source"] == "squilla_router"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_keeps_richer_ensemble_receipt_on_terminal_duplicate(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-richer-receipt.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-richer-receipt"
+    session = await manager.create(session_key)
+    turn_id = "richer-receipt-turn"
+    richer_breakdown = [
+        {
+            "role": "proposer",
+            "provider": "proposal-provider",
+            "model": "proposal-model",
+            "input_tokens": 4,
+            "output_tokens": 2,
+        },
+        {
+            "role": "aggregator",
+            "provider": "aggregator-provider",
+            "model": "aggregator-model",
+            "input_tokens": 6,
+            "output_tokens": 3,
+        },
+    ]
+    richer_trace = {
+        "profile": "custom_b5",
+        "physical_request_count": 2,
+        "final_request_role": "aggregator",
+        "proposer_roles": ["proposer"],
+    }
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "initial ensemble answer",
+                turn_usage={
+                    "provider": "aggregator-provider",
+                    "model": "aggregator-model",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cost_usd": 0.001,
+                    "model_usage_breakdown": richer_breakdown,
+                    "ensemble_trace": richer_trace,
+                    "routing_source": "squilla_router",
+                },
+            )
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "continued ensemble answer",
+                turn_usage={
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "cost_usd": 0.002,
+                    "model_usage_breakdown": [
+                        {
+                            "role": "aggregator",
+                            "provider": "aggregator-provider",
+                            "model": "aggregator-model",
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                        }
+                    ],
+                    "ensemble_trace": {
+                        "final_request_role": "aggregator",
+                        "physical_request_count": 1,
+                    },
+                },
+            )
+
+        for event_id, call_index, input_tokens, output_tokens, cost_nanos in (
+            ("usage-richer-1", 0, 7, 3, 10_000_000),
+            ("usage-richer-2", 1, 5, 2, 20_000_000),
+            ("usage-richer-3", 2, 4, 1, 30_000_000),
+        ):
+            await storage.start_usage_event(
+                UsageEventStart(
+                    event_id=event_id,
+                    execution_id=turn_id,
+                    call_index=call_index,
+                    session_id=session.session_id,
+                    session_epoch=session.epoch,
+                    started_at_ms=10 + call_index,
+                    turn_id=turn_id,
+                    provider="ledger-provider",
+                    model="ledger-model",
+                )
+            )
+            await storage.finalize_usage_event(
+                event_id,
+                UsageEventCompletion(
+                    completed_at_ms=20 + call_index,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    cost_nanos=cost_nanos,
+                    billed_cost_nanos=cost_nanos,
+                    cost_source="provider_billed",
+                    provider="ledger-provider",
+                    model="ledger-model",
+                    coverage_status="complete",
+                ),
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert len(result["messages"]) == 2
+        assert sum("usage" in message for message in result["messages"]) == 1
+        assert "usage" not in result["messages"][0]
+        usage = result["messages"][1]["usage"]
+        assert usage["input_tokens"] == 16
+        assert usage["output_tokens"] == 6
+        assert usage["total_tokens"] == 22
+        assert usage["cost_usd"] == pytest.approx(0.06)
+        assert usage["billed_cost"] == pytest.approx(0.06)
+        assert usage["coverage_status"] == "complete"
+        assert usage["missing_cost_entries"] == 0
+        assert usage["model_usage_breakdown"] == richer_breakdown
+        assert usage["ensemble_trace"] == richer_trace
+        assert usage["routing_source"] == "squilla_router"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_usage_projection_is_terminal_across_limit_one_pages(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-terminal-page.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-terminal-page"
+    session = await manager.create(session_key)
+    turn_id = "terminal-page-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "tool call carrier",
+                turn_usage={
+                    "cost_usd": 0.001,
+                    "model_usage_breakdown": [{"role": "proposer"}],
+                },
+            )
+            await manager.append_message(session_key, "assistant", "final answer")
+        transcript = await manager.get_transcript(session_key)
+        terminal_cursor = f"{transcript[-1].created_at}|{transcript[-1].id}"
+        await _record_finalized_usage(
+            storage,
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            turn_id=turn_id,
+            event_id="usage-terminal-page",
+        )
+
+        latest = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        older = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1, "before": terminal_cursor},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert [message["text"] for message in latest["messages"]] == ["final answer"]
+        assert latest["messages"][0]["usage"]["cost_usd"] == pytest.approx(0.03)
+        assert [message["text"] for message in older["messages"]] == ["tool call carrier"]
+        assert "usage" not in older["messages"][0]
+        combined = [*older["messages"], *latest["messages"]]
+        assert sum("usage" in message for message in combined) == 1
+        assert sum(
+            message.get("usage", {}).get("cost_usd", 0) for message in combined
+        ) == pytest.approx(0.03)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_usage_projection_is_independent_of_page_load_order(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-load-order.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-load-order"
+    session = await manager.create(session_key)
+    turn_id = "load-order-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "first assistant",
+                turn_usage={"cost_usd": 0.001},
+            )
+            await manager.append_message(session_key, "assistant", "second assistant")
+        transcript = await manager.get_transcript(session_key)
+        terminal_cursor = f"{transcript[-1].created_at}|{transcript[-1].id}"
+        await _record_finalized_usage(
+            storage,
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            turn_id=turn_id,
+            event_id="usage-load-order",
+        )
+
+        older_first = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1, "before": terminal_cursor},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        latest_second = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        latest_first = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        older_second = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1, "before": terminal_cursor},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert "usage" not in older_first["messages"][0]
+        assert "usage" not in older_second["messages"][0]
+        assert latest_first["messages"][0]["usage"]["cost_usd"] == pytest.approx(0.03)
+        assert latest_second["messages"][0]["usage"]["cost_usd"] == pytest.approx(0.03)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_usage_projection_terminal_crosses_compacted_boundary(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-compacted-page.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-compacted-page"
+    session = await manager.create(session_key)
+    turn_id = "compacted-page-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "archived carrier",
+                turn_usage={
+                    "cost_usd": 0.001,
+                    "model_usage_breakdown": [{"role": "proposer"}],
+                },
+            )
+            await manager.append_message(session_key, "assistant", "active terminal")
+        transcript = await manager.get_transcript(session_key)
+        await storage.rewrite_compacted_session(
+            node=session,
+            summary=None,
+            archived_entries=[transcript[0]],
+            entries=[transcript[1]],
+        )
+        active = await manager.get_transcript(session_key)
+        terminal_cursor = f"{active[-1].created_at}|{active[-1].id}"
+        await _record_finalized_usage(
+            storage,
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            turn_id=turn_id,
+            event_id="usage-compacted-page",
+        )
+
+        archived_page = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1, "before": terminal_cursor},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        active_page = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert [message["text"] for message in archived_page["messages"]] == ["archived carrier"]
+        assert "usage" not in archived_page["messages"][0]
+        assert [message["text"] for message in active_page["messages"]] == ["active terminal"]
+        assert active_page["messages"][0]["usage"]["cost_usd"] == pytest.approx(0.03)
+        # Structural detail stranded on an earlier page stays there. Placement
+        # only guarantees the total is billed once; migrating a richer receipt
+        # across pages would cost a full-history scan on every read.
+        assert "model_usage_breakdown" not in active_page["messages"][0]["usage"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_continuation_probe_only_reports_rows_after_the_cursor(
+    tmp_path,
+) -> None:
+    """The probe answers 'does this turn continue past the page?' and no more.
+
+    Placement depends on the answer being false for the newest page, which is
+    what keeps that read from touching transcript rows at all.
+    """
+    storage = SessionStorage(str(tmp_path / "history-continuation-probe.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:continuation-probe"
+    session = await manager.create(session_key)
+    turn_id = "probe-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(session_key, "assistant", "carrier")
+            await manager.append_message(session_key, "assistant", "terminal")
+        transcript = await manager.get_transcript(session_key)
+        carrier, terminal = transcript[0], transcript[1]
+
+        # Cursor at the carrier: the terminal row still lies ahead.
+        assert await storage.get_turn_ids_continuing_after_cursor(
+            session_id=session.session_id,
+            created_at=carrier.created_at,
+            entry_id=carrier.id,
+            turn_ids=[turn_id],
+        ) == {turn_id}
+
+        # Cursor at the terminal row: nothing follows, so the page owns it.
+        assert await storage.get_turn_ids_continuing_after_cursor(
+            session_id=session.session_id,
+            created_at=terminal.created_at,
+            entry_id=terminal.id,
+            turn_ids=[turn_id],
+        ) == set()
+
+        # Turns that were never asked about are never reported.
+        assert await storage.get_turn_ids_continuing_after_cursor(
+            session_id=session.session_id,
+            created_at=carrier.created_at,
+            entry_id=carrier.id,
+            turn_ids=["unrelated-turn"],
+        ) == set()
     finally:
         await storage.close()
 

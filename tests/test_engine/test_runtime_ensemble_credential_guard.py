@@ -2048,7 +2048,7 @@ async def test_custom_b5_wraps_when_every_member_resolves_a_key(
 
     assert isinstance(provider, EnsembleProvider)
     assert provider.profile_name == "custom_b5"
-    assert [member.label for member in provider.proposers] == ["primary", "contrast"]
+    assert [member.label for member in provider.proposers] == ["proposer_1", "proposer_2"]
     assert provider.aggregator.provider_config.model == "fuser"
     assert turn.metadata["ensemble_enabled"] is True
     assert "ensemble_wrap_skipped_reason" not in turn.metadata

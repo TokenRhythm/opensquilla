@@ -578,6 +578,47 @@ def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None
     assert "document.body.classList.add('recovering', 'errored')" in render_recovery
 
 
+def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    apply_status = _section(
+        boot_html,
+        "function applyStatus(payload)",
+        "function applyError(payload)",
+    )
+    timer = _section(
+        boot_html,
+        "function updateTimer()",
+        "const api = window.opensquillaDesktop",
+    )
+
+    # The phase is announced once, while the visual 100 ms timer stays out of
+    # the live region so assistive technology is not flooded with elapsed time.
+    assert '<section class="status">' in boot_html
+    assert (
+        'id="phase" data-i18n="phaseDefault" role="status" '
+        'aria-live="polite" aria-atomic="true"'
+        in boot_html
+    )
+    assert 'id="timer" aria-hidden="true"' in boot_html
+
+    # Main-process BootStatus.at is the phase anchor. Replaying the same
+    # (phaseId, at) snapshot must not reset it, while a new status identity does.
+    assert "let phaseStartedAt = performance.now()" in boot_html
+    assert "let phaseStatusIdentity = ''" in boot_html
+    assert "const statusAt = payload && payload.at ? String(payload.at) : ''" in apply_status
+    assert "const statusIdentity = phaseId + '\\u0000' + statusAt" in apply_status
+    assert "if (statusIdentity !== phaseStatusIdentity)" in apply_status
+    assert "phaseStatusIdentity = statusIdentity" in apply_status
+    assert "const statusAtMs = Date.parse(statusAt)" in apply_status
+    assert (
+        "const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0"
+        in apply_status
+    )
+    assert "phaseStartedAt = performance.now() - Math.max(0, wallAgeMs)" in apply_status
+    assert "updateTimer()" in apply_status
+    assert "performance.now() - phaseStartedAt" in timer
+
+
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     main_ts = _read("desktop/electron/src/main.ts")
@@ -1240,7 +1281,7 @@ def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     assert "const parentWindow = currentMainWindow()" in onboarding
     assert "parent: parentWindow ?? undefined" in onboarding
     assert "modal: Boolean(parentWindow)" in onboarding
-    assert "onboardingWindow?.focus()" in onboarding
+    assert "focusOnboardingWindow()" in onboarding
 
 
 def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_cta() -> None:
@@ -1278,6 +1319,46 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
         assert visible_cta in accessible_label
 
 
+def test_desktop_onboarding_exposes_immediate_and_slow_submit_feedback() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
+    clear_slow_timer = _section(
+        html,
+        "function clearSubmitSlowTimer()",
+        "function setSubmitting(next)",
+    )
+    submitting = _section(
+        html,
+        "function setSubmitting(next)",
+        "onboardingLocale.addEventListener('change'",
+    )
+    submit = _section(
+        html,
+        "let succeeded = false",
+        "function applyMigrationPrefill",
+    )
+
+    assert (
+        '<span class="submit-status" id="submitStatus" role="status" '
+        'aria-live="polite" aria-atomic="true"></span>'
+        in html
+    )
+    assert "const SUBMIT_SLOW_FEEDBACK_MS = 8_000" in html
+    assert main_ts.count("savingSetup:") == 6
+    assert main_ts.count("setupTakingLonger:") == 6
+    assert "t.savingSetup" in submitting
+    assert "desktopMessage(activeLocale, 'boot.profile')" in submitting
+    assert "t.setupTakingLonger" in submitting
+    assert "setTimeout" in submitting
+    assert "clearTimeout" in clear_slow_timer
+    assert "clearSubmitSlowTimer()" in submitting
+    assert "SUBMIT_SLOW_FEEDBACK_MS" in submitting
+    assert "pagehide" in html
+    assert submit.index("succeeded = true") < submit.index("clearSubmitSlowTimer()")
+    assert "if (!succeeded)" in submit
+    assert "setSubmitting(false)" in submit
+
+
 def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
@@ -1296,7 +1377,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "routerTiers = clone(routerProfiles[profileKeyForMode()]);" in onboarding_html
     assert "return provider.value;" in onboarding_html
     assert "routerDefaultTier: 'c1'," in onboarding_html
-    assert "routerTiers," in onboarding_html
+    assert "routerTiers: clone(routerTiers)," in onboarding_html
     assert "[data-model-routing-mode]" not in onboarding_html
     assert "'selection_mode = \"custom_b5\"'" in main_ts
     assert "'[[llm_ensemble.candidates]]'" in main_ts
@@ -1323,7 +1404,7 @@ def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer
     )
     window_open = _section(
         onboarding,
-        "onboardingWindow.webContents.setWindowOpenHandler",
+        "window.webContents.setWindowOpenHandler",
         "const guardOnboardingNavigation",
     )
 
@@ -3186,11 +3267,17 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
         "ipcMain.handle('desktop:onboarding:save'",
         "ipcMain.handle('desktop:onboarding:cancel'",
     )
+    perform_save = _section(
+        main_ts,
+        "async function performOnboardingSave",
+        "async function withRecoveryOperation",
+    )
 
     assert "reconcileImportedDesktopCredential" in run
     assert "loadPendingMigrationProviderSetup" in onboarding
     assert "pendingProviderSetup" in onboarding
-    assert "clearPendingMigrationProviderSetup" in save
+    assert "onboardingFlows.requestSave" in save
+    assert "clearPendingMigrationProviderSetup" in perform_save
     assert "scrubImportedProviderEnvEntry" not in main_ts
     assert "readImportedProviderKey" not in main_ts
     assert "apiKey: ''" in main_ts

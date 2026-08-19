@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
@@ -60,6 +61,81 @@ _CHAT_HISTORY_DEFAULT_LIMIT = 50
 _CHAT_HISTORY_MAX_LIMIT = 200
 _CHAT_HISTORY_LOCK_BUDGET_SECONDS = 2.0
 _CHAT_HISTORY_RETRY_AFTER_MS = 100
+_TURN_USAGE_PROJECTION_FIELDS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+        "cost_usd",
+        "billed_cost",
+        "estimated_cost_component_usd",
+        "cost_source",
+        "missing_cost_entries",
+        "coverage_status",
+        "usage_unknown",
+        "unknown_usage_events",
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedTokens",
+        "cacheWriteTokens",
+        "totalTokens",
+        "costUsd",
+        "billedCost",
+        "estimatedCostComponentUsd",
+        "costSource",
+        "missingCostEntries",
+        "coverageStatus",
+        "usageUnknown",
+        "unknownUsageEvents",
+    }
+)
+_TURN_USAGE_PROJECTION_ALIASES = {
+    "input_tokens": "inputTokens",
+    "output_tokens": "outputTokens",
+    "reasoning_tokens": "reasoningTokens",
+    "cached_tokens": "cachedTokens",
+    "cache_write_tokens": "cacheWriteTokens",
+    "total_tokens": "totalTokens",
+    "cost_usd": "costUsd",
+    "billed_cost": "billedCost",
+    "estimated_cost_component_usd": "estimatedCostComponentUsd",
+    "cost_source": "costSource",
+    "missing_cost_entries": "missingCostEntries",
+    "coverage_status": "coverageStatus",
+    "usage_unknown": "usageUnknown",
+    "unknown_usage_events": "unknownUsageEvents",
+}
+_HISTORY_STRUCTURAL_RECEIPT_FIELDS = (
+    ("model_usage_breakdown", "modelUsageBreakdown"),
+    ("ensemble_trace", "ensembleTrace"),
+)
+
+
+def _history_structural_richness(value: object) -> tuple[int, int]:
+    """Rank JSON-like structural receipts without interpreting their schema."""
+    if isinstance(value, Mapping):
+        nested = sum(_history_structural_richness(item)[0] for item in value.values())
+        return nested + len(value), len(value)
+    if isinstance(value, (list, tuple)):
+        nested = sum(_history_structural_richness(item)[0] for item in value)
+        return nested + len(value), len(value)
+    if isinstance(value, str):
+        return (1, len(value)) if value.strip() else (0, 0)
+    return (1, 0) if value is not None else (0, 0)
+
+
+def _clear_history_usage_for_indexes(
+    projected: list[object],
+    indexes: list[int],
+) -> None:
+    for index in indexes:
+        entry = copy.copy(projected[index])
+        setattr(entry, "turn_usage", None)
+        projected[index] = entry
 
 
 def _canonical_webchat_session_key(value: object = None) -> str:
@@ -563,39 +639,58 @@ async def _project_missing_history_usage(
     session_key: str,
     entries: list[object],
 ) -> list[object]:
-    """Read-time repair for pre-fix assistant rows missing turn usage."""
+    """Project ledger totals onto every historical assistant turn.
 
-    missing_by_turn: dict[str, list[int]] = {}
-    turns_with_usage: set[str] = set()
+    Existing ``turn_usage`` is often only a partial receipt from the old
+    publication path. Ledger totals are authoritative for numeric usage and
+    coverage, while structural trace/breakdown/routing metadata stays intact.
+    """
+
+    indexes_by_turn: dict[str, list[int]] = {}
     for index, entry in enumerate(entries):
         if getattr(entry, "role", None) != "assistant":
             continue
         turn_id = turn_id_from_context(getattr(entry, "turn_context", None))
         if not turn_id:
             continue
-        if isinstance(getattr(entry, "turn_usage", None), dict):
-            turns_with_usage.add(turn_id)
-        else:
-            missing_by_turn.setdefault(turn_id, []).append(index)
-    for turn_id in turns_with_usage:
-        missing_by_turn.pop(turn_id, None)
-    if not missing_by_turn:
+        indexes_by_turn.setdefault(turn_id, []).append(index)
+    if not indexes_by_turn:
         return entries
 
     storage = getattr(mgr, "storage", None)
     batch_project = getattr(storage, "get_turn_usage_projections", None)
+    probe_continuation = getattr(storage, "get_turn_ids_continuing_after_cursor", None)
     get_session = getattr(mgr, "get_session", None)
     if not callable(batch_project) or not callable(get_session):
         return entries
+
+    # A page is a contiguous keyset slice, so only rows after its last cursor
+    # can hold a turn's terminal assistant row. Probing that suffix keeps the
+    # newest page — the common read — from touching transcript rows at all.
+    page_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[-1]))
+
+    continuing: set[str] = set()
     try:
         session = await get_session(session_key)
         if session is None:
             return entries
+        session_id = str(getattr(session, "session_id", "") or "")
+        session_epoch = max(0, int(getattr(session, "epoch", 0) or 0))
         projections = await batch_project(
-            session_id=str(getattr(session, "session_id", "") or ""),
-            session_epoch=max(0, int(getattr(session, "epoch", 0) or 0)),
-            turn_ids=list(missing_by_turn),
+            session_id=session_id,
+            session_epoch=session_epoch,
+            turn_ids=list(indexes_by_turn),
         )
+        if page_cursor is not None and callable(probe_continuation):
+            created_at, entry_id = page_cursor
+            continuing = set(
+                await probe_continuation(
+                    session_id=session_id,
+                    created_at=created_at,
+                    entry_id=entry_id,
+                    turn_ids=list(indexes_by_turn),
+                )
+            )
     except Exception:  # noqa: BLE001 - usage fallback must not hide transcript history
         log.warning(
             "chat.history.usage_projection_failed",
@@ -608,16 +703,90 @@ async def _project_missing_history_usage(
         return entries
 
     projected = list(entries)
-    for turn_id, indexes in missing_by_turn.items():
+    for turn_id, indexes in indexes_by_turn.items():
         usage = projections.get(turn_id)
         if usage is None:
             continue
-        # A well-formed turn has one assistant row. If damaged legacy history
-        # contains duplicates, attach usage only to its terminal row so the UI
-        # cannot present the same provider spend more than once.
+        if turn_id in continuing:
+            # The terminal row sits on a later page, which will carry the whole
+            # ledger total. Publishing it here too would bill the turn twice
+            # once a client merges the pages.
+            _clear_history_usage_for_indexes(projected, indexes)
+            continue
+
+        # Every row of this turn is inside the page, so its last row is the
+        # terminal one. Damaged legacy history may still hold duplicates.
         index = indexes[-1]
         entry = copy.copy(projected[index])
-        setattr(entry, "turn_usage", usage)
+        existing = getattr(entry, "turn_usage", None)
+        existing_keys = set(existing) if isinstance(existing, dict) else set()
+        if isinstance(existing, dict):
+            merged_usage = dict(existing)
+            for key in _TURN_USAGE_PROJECTION_FIELDS:
+                if key in usage:
+                    merged_usage[key] = usage[key]
+                    alias = _TURN_USAGE_PROJECTION_ALIASES.get(key)
+                    if alias is not None and alias in merged_usage:
+                        merged_usage[alias] = usage[key]
+        else:
+            merged_usage = dict(usage)
+
+        # Earlier duplicate assistant rows may carry only structural details
+        # or a stale partial receipt. Move those non-accounting fields forward
+        # and clear the old receipt, so one turn can never render two spends.
+        structural_sources: list[dict[str, Any]] = []
+        if isinstance(existing, dict):
+            structural_sources.append(existing)
+        duplicate_structural: dict[str, Any] = {}
+        for duplicate_index in indexes[:-1]:
+            duplicate = getattr(projected[duplicate_index], "turn_usage", None)
+            if not isinstance(duplicate, dict):
+                continue
+            structural_sources.append(duplicate)
+            for key, value in duplicate.items():
+                if key in {"provider", "model"} and key not in duplicate_structural:
+                    duplicate_structural[key] = copy.deepcopy(value)
+                if key not in _TURN_USAGE_PROJECTION_FIELDS and key not in merged_usage:
+                    merged_usage[key] = copy.deepcopy(value)
+            duplicate_entry = copy.copy(projected[duplicate_index])
+            setattr(duplicate_entry, "turn_usage", None)
+            projected[duplicate_index] = duplicate_entry
+
+        # A rebuilt continuation can publish a small terminal receipt after an
+        # earlier row already persisted the complete ensemble structure. Keep
+        # the richer structural receipt, while the numeric fields above remain
+        # authoritative ledger projections. Write both aliases when history
+        # contains both spellings so the chosen receipt is not split in two.
+        for snake_key, camel_key in _HISTORY_STRUCTURAL_RECEIPT_FIELDS:
+            candidates: list[object] = []
+            present_keys: set[str] = set()
+            for source in structural_sources:
+                for key in (snake_key, camel_key):
+                    if key in source:
+                        candidates.append(source[key])
+                        present_keys.add(key)
+            if not candidates:
+                continue
+            richest = candidates[0]
+            richest_score = _history_structural_richness(richest)
+            for candidate in candidates[1:]:
+                candidate_score = _history_structural_richness(candidate)
+                if candidate_score > richest_score:
+                    richest = candidate
+                    richest_score = candidate_score
+            for key in present_keys:
+                merged_usage[key] = copy.deepcopy(richest)
+
+        # Provider/model are useful when no historical row had them, but an
+        # existing routed identity is structural metadata and must not be
+        # replaced by the latest physical ledger leg.
+        for key in ("provider", "model"):
+            if key not in existing_keys and key in duplicate_structural:
+                merged_usage[key] = duplicate_structural[key]
+            if key not in merged_usage and key in usage:
+                merged_usage[key] = usage[key]
+
+        setattr(entry, "turn_usage", merged_usage)
         projected[index] = entry
     return projected
 

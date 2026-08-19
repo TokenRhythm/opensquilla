@@ -1122,6 +1122,7 @@
       "tests/test_desktop/test_electron_dependency_security.py",
       "tests/test_desktop/test_electron_startup_contract.py",
       "tests/test_desktop/test_gateway_tls_runtime.py",
+      "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
       "tests/test_dist/test_workspace_state.py",
       "tests/test_engine/test_agent_finalize_evidence_gate.py",
       "tests/test_engine/test_agent_invalid_provider_response.py",

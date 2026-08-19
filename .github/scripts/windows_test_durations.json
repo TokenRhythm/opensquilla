@@ -192,6 +192,7 @@
     "tests/test_desktop/test_electron_dependency_security.py": 0.01,
     "tests/test_desktop/test_electron_startup_contract.py": 0.147,
     "tests/test_desktop/test_gateway_tls_runtime.py": 0.01,
+    "tests/test_desktop/test_onboarding_main_process_flow_contract.py": 0.01,
     "tests/test_dist/test_workspace_state.py": 0.01,
     "tests/test_engine/test_agent_canonical_text_contract.py": 0.01,
     "tests/test_engine/test_agent_deepseek_dsml_dispatch.py": 0.01,

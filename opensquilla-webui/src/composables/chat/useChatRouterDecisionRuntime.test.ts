@@ -30,6 +30,28 @@ function makeRuntime(
 }
 
 describe('appendEnsembleProgress', () => {
+  it('normalizes every internal candidate label to the public Proposer role', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
+
+    for (const [index, label] of ['primary', 'contrast', 'fast_check', 'critic'].entries()) {
+      runtime.appendEnsembleProgress({
+        event_type: 'proposer_start',
+        proposer_index: index,
+        proposer_label: label,
+        proposer_provider: 'tokenrhythm',
+        proposer_model: `model-${index + 1}`,
+      })
+    }
+
+    const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
+    expect(models?.map(model => ({ role: model.role, label: model.label }))).toEqual([
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+    ])
+  })
+
   it('synthesizes a router message and reveals members with running → done status', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 
@@ -105,8 +127,8 @@ describe('appendEnsembleProgress', () => {
     const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
     expect(models).toHaveLength(2)
     expect(models?.[0]).toMatchObject({
-      role: 'critic',
-      label: 'critic',
+      role: 'proposer',
+      label: 'proposer',
       status: 'failed',
       elapsedMs: 118_000,
       error: 'provider timed out',
@@ -148,7 +170,7 @@ describe('appendEnsembleProgress', () => {
 
     const model = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models[0]
     expect(model).toMatchObject({
-      role: 'critic',
+      role: 'proposer',
       status: 'skipped',
       elapsedMs: 21_000,
       errorCode: 'quorum_cancelled',

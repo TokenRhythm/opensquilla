@@ -358,11 +358,11 @@ test.describe('Settings modal', () => {
     await expect(dirtybar).toBeVisible()
     await expect(dirtybar).toContainText('Unsaved changes in Capabilities')
 
-    // Closing with unsaved edits raises the themed confirm; declining keeps the modal.
+    // Closing with unsaved edits offers save or discard; Escape keeps the modal open.
     await page.keyboard.press('Escape')
-    const confirm = page.getByRole('dialog', { name: 'Discard unsaved changes?' })
+    const confirm = page.getByRole('dialog', { name: 'Unsaved changes' })
     await expect(confirm).toBeVisible()
-    await confirm.getByRole('button', { name: 'Cancel' }).click()
+    await page.keyboard.press('Escape')
     await expect(confirm).toBeHidden()
     await expect(dialog(page)).toBeVisible()
 
@@ -387,9 +387,9 @@ test.describe('Settings modal', () => {
     // router-level guard must raise the same confirm. Declining cancels the
     // navigation and restores the /settings URL.
     await page.goBack()
-    const confirm = page.getByRole('dialog', { name: 'Discard unsaved changes?' })
+    const confirm = page.getByRole('dialog', { name: 'Unsaved changes' })
     await expect(confirm).toBeVisible()
-    await confirm.getByRole('button', { name: 'Cancel' }).click()
+    await page.keyboard.press('Escape')
     await expect(confirm).toBeHidden()
     await expect(dialog(page)).toBeVisible()
     await expect(page).toHaveURL(/\/settings\/capabilities$/)
@@ -398,7 +398,7 @@ test.describe('Settings modal', () => {
     // Accepting the discard lets the same Back proceed and close the overlay.
     await page.goBack()
     await expect(confirm).toBeVisible()
-    await confirm.getByRole('button', { name: 'Confirm' }).click()
+    await confirm.getByRole('button', { name: 'Discard changes' }).click()
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
     await expect(settingsRow(page)).toBeFocused()

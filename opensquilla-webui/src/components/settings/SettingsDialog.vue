@@ -12,8 +12,8 @@
       >
       <div
         class="settings-body"
-        :inert="saveAllPending ? true : undefined"
-        :aria-busy="saveAllPending ? 'true' : undefined"
+        :inert="settingsInteractionLocked ? true : undefined"
+        :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <nav ref="railRef" class="settings-rail" role="tablist" :aria-label="t('settings.dialog.sections')" :aria-orientation="railOrientation">
           <template v-for="(s, i) in visibleSections" :key="s.id">
@@ -71,8 +71,8 @@
         >
           <fieldset
             class="settings-panel__interactions"
-            :disabled="saveAllPending"
-            :aria-busy="saveAllPending ? 'true' : undefined"
+            :disabled="settingsInteractionLocked"
+            :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           >
           <!-- Gateway remains available even when config readiness cannot load,
                because this is where users recover the connection/runtime. -->
@@ -192,23 +192,23 @@
       <div
         v-if="loaded && hasUnsavedChanges"
         class="settings-dirtybar"
-        :aria-busy="saveAllPending ? 'true' : undefined"
+        :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <span class="settings-dirtybar__pulse" aria-hidden="true"></span>
         <span class="settings-dirtybar__text" role="status" aria-live="polite" aria-atomic="true">
-          {{ saveAllPending ? t('settings.dialog.savingChanges') : dirtyBarText }}
+          {{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtyBarText }}
         </span>
         <span class="settings-dirtybar__spacer"></span>
-        <button type="button" class="btn" :disabled="saveAllPending" @click="discardChanges">
+        <button type="button" class="btn" :disabled="settingsInteractionLocked" @click="discardChanges">
           {{ dirtyDiscardLabel }}
         </button>
         <button
           type="button"
           class="btn btn--primary"
-          :disabled="saveAllPending"
-          :aria-busy="saveAllPending ? 'true' : undefined"
+          :disabled="settingsInteractionLocked"
+          :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           @click="saveDirtySections"
-        >{{ saveAllPending ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
+        >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
       </div>
 
       <footer class="settings-foot">
@@ -263,7 +263,7 @@ import '@/styles/settings-forms.css'
 const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
-const { confirm, confirmState } = useConfirm()
+const { confirmChoice, confirmState } = useConfirm()
 
 // The catalog retains the desktopOnly capability for future destinations. The
 // consolidated rail currently shares all ten destinations across surfaces.
@@ -350,6 +350,7 @@ const modalRef = ref<HTMLElement | null>(null)
 const railRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
+const closeSavePending = ref(false)
 
 // Keep the active section's rail tab in view — on mobile the rail scrolls
 // horizontally, so a deep-linked or later section would otherwise sit off-screen.
@@ -426,7 +427,10 @@ const hasSettingsExitDraft = computed(() => (
   hasUnsavedChanges.value || providerDraftDirty.value
 ))
 const hasPendingSettingsWrite = computed(() => (
-  saveAllPending.value || providerSavePending.value
+  saveAllPending.value || providerSavePending.value || closeSavePending.value
+))
+const settingsInteractionLocked = computed(() => (
+  saveAllPending.value || closeSavePending.value
 ))
 const shouldGuardBrowserUnload = computed(() => (
   hasSettingsExitDraft.value || hasPendingSettingsWrite.value
@@ -652,21 +656,47 @@ async function openProfileImport() {
   panelRef.value?.querySelector<HTMLElement>('[data-testid="memory-import-heading"]')?.focus()
 }
 
-// One discard prompt shared by every exit path: requestClose (Escape, the
-// close button, backdrop click) and the history-back leave guard below.
-function confirmDiscard(): Promise<boolean> {
-  return confirm({
+// One exit prompt shared by every exit path: requestClose (Escape, the close
+// button, backdrop click) and the history-back leave guard below. Saving is
+// the primary action; discarding remains explicit and destructive.
+function confirmExitChanges() {
+  return confirmChoice({
     title: t('settings.dialog.discardTitle'),
     body: t('settings.dialog.discardBody'),
-    primaryLabel: t('settings.dialog.discardConfirmPrimary'),
-    primaryClass: 'btn--danger',
+    primaryLabel: t('settings.dialog.saveAndClose'),
+    primaryClass: 'btn--primary',
+    secondaryLabel: t('settings.dialog.discardConfirmPrimary'),
+    secondaryClass: 'btn--danger',
+    showCancel: false,
   })
 }
 
-// Closes unless a section carries unsaved edits and the user keeps them.
+// Save every kind of Settings draft before allowing an exit. Provider drafts
+// have their own save path, while the remaining sections share the dirty bar.
+// If validation or a request fails, their dirty state remains and the dialog
+// stays open for correction.
+async function saveExitChanges(): Promise<boolean> {
+  if (closeSavePending.value || hasPendingSettingsWrite.value) return false
+  closeSavePending.value = true
+  try {
+    if (providerDraftDirty.value && !(await saveProvider())) return false
+    if (hasUnsavedChanges.value) await saveDirtySections()
+    await nextTick()
+    return !hasSettingsExitDraft.value
+  } finally {
+    closeSavePending.value = false
+  }
+}
+
+// Closes unless a section carries unsaved edits and the user chooses to keep
+// them, save them, or discard them.
 async function requestClose(event?: MouseEvent): Promise<boolean> {
   if (hasPendingSettingsWrite.value) return false
-  if (hasSettingsExitDraft.value && !(await confirmDiscard())) return false
+  if (hasSettingsExitDraft.value) {
+    const choice = await confirmExitChanges()
+    if (choice === 'cancel') return false
+    if (choice === 'primary' && !(await saveExitChanges())) return false
+  }
   // Keyboard-generated click events have detail 0; real pointer clicks have a
   // positive click count. Preserve focus restoration for keyboard activation.
   closeOverlay(!event || event.detail === 0)
@@ -676,8 +706,8 @@ async function requestClose(event?: MouseEvent): Promise<boolean> {
 // History traversal (browser Back, a trackpad back-swipe) pops the /settings
 // route and unmounts the overlay without passing through requestClose, which
 // would silently drop unsaved edits. This router-level guard runs the same
-// discard prompt for any navigation that leaves /settings while the dialog is
-// mounted; cancelling restores the URL. Registered on the router rather than
+// save/discard prompt for any navigation that leaves /settings while the dialog
+// is mounted; cancelling restores the URL. Registered on the router rather than
 // via onBeforeRouteLeave because selectSection's replace swaps the matched
 // record between `settings` and `settings-section` while the viewKey-keyed
 // component instance survives — a component guard would stay bound to the
@@ -690,7 +720,10 @@ const removeLeaveGuard = router.beforeEach(async (to) => {
   // requestClose already has the prompt up — hold this navigation instead of
   // stacking a second prompt (useConfirm cancels a pending request).
   if (confirmState.value) return false
-  return confirmDiscard()
+  const choice = await confirmExitChanges()
+  if (choice === 'cancel') return false
+  if (choice === 'primary') return saveExitChanges()
+  return true
 })
 
 function onDocumentKeydown(event: KeyboardEvent) {

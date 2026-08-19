@@ -205,12 +205,9 @@ enabled = false
 # "static_openrouter_b5": fixed five-member OpenRouter proposer set (default).
 # "static_tokenrhythm_b5": the same lineup served through TokenRhythm.
 # "custom_b5": an explicit user-authored lineup from [[llm_ensemble.candidates]]
-#   — 2-6 enabled proposer rows plus at most one role = "aggregator" row (the
+#   — 2-6 enabled role = "proposer" rows plus at most one role = "aggregator" row (the
 #   member that fuses drafts into the final answer; omitted = the current chat
-#   model fuses). The Web UI presents only Proposer and Aggregator. Released
-#   proposer role values ("primary", "contrast", "fast_check", "critic")
-#   remain accepted and preserved as advisory decision-trace labels; they all
-#   run and appear in the settings panel as Proposer.
+#   model fuses). Older advisory role values are migrated to "proposer".
 # "router_dynamic": legacy automatic selection; kept readable for existing
 #   configs but no longer offered in the Web UI.
 selection_mode = "static_tokenrhythm_b5"
@@ -218,7 +215,7 @@ selection_mode = "static_tokenrhythm_b5"
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "doubao-2.0-pro"
-# No role is needed for a proposer.
+# role = "proposer"
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "deepseek-v4-pro"

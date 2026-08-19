@@ -284,10 +284,7 @@
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.ensemble') }}</span>
                   <span class="msg-meta-popover__value">{{ ensembleSummary }}</span>
                 </div>
-                <div
-                  v-if="message.meta.ensemble.costUsd || message.meta.costUsd || !usageIncomplete"
-                  class="msg-meta-popover__row"
-                >
+                <div class="msg-meta-popover__row">
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
                   <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.ensemble.costUsd || message.meta.costUsd) }}</span>
                 </div>
@@ -298,13 +295,15 @@
                 <div class="msg-meta-popover__models" :aria-label="t('chat.msgMeta.ensembleModelsAria')">
                   <div
                     v-for="member in message.meta.ensemble.models"
-                    :key="`${member.role}:${member.provider}:${member.model}`"
+                    :key="`${member.role}:${member.provider}:${member.model}:${member.sampleIndex || 0}`"
                     class="msg-meta-popover__model"
                   >
-                    <span class="msg-meta-popover__model-role">{{ ensembleRole(member.role, member.label) }}</span>
+                    <span class="msg-meta-popover__model-role">
+                      {{ ensembleMemberRoleLabel(member.role) }} <span aria-hidden="true">·</span>
+                    </span>
                     <span class="msg-meta-popover__model-name" :title="member.model">{{ member.modelShort }}</span>
                     <span class="msg-meta-popover__model-cost">
-                      {{ member.costUsd || !usageIncomplete ? fmtUsd(member.costUsd) : '—' }}
+                      {{ fmtUsd(member.costUsd) }}
                     </span>
                   </div>
                 </div>
@@ -449,6 +448,7 @@ import {
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 import {
   isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
@@ -697,11 +697,8 @@ const hasMetaDetails = computed(() => {
   )
 })
 
-const usageIncomplete = computed(() => (
-  props.message.meta ? hasIncompleteUsageCoverage(props.message.meta) : false
-))
 const usageCoverageDetail = computed(() => (
-  props.message.meta
+  props.message.meta && !props.message.meta.ensemble
     ? usageCoverageText(
         props.message.meta,
         (key, named) => String(named ? t(key, named) : t(key)),
@@ -1100,13 +1097,6 @@ function fmtUsd(value: number): string {
   return `$${n.toFixed(6).replace(/\.?0+$/, '')}`
 }
 
-function ensembleRole(role: string, label: string): string {
-  const normalized = String(role || '').replace(/_/g, ' ')
-  if (normalized === 'proposer') return 'proposer'
-  if (normalized === 'aggregator') return 'aggregator'
-  if (normalized === 'fallback single') return 'fallback'
-  return label || normalized || 'member'
-}
 </script>
 
 <style scoped>
