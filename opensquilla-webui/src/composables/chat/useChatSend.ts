@@ -3431,7 +3431,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
       ? options.pendingSessionIntent.value
       : null
+    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
+    if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
     if (displayText && displayText !== providerText) params.displayText = displayText
     params._source = chatSourceMetadata(options)
 
@@ -3448,7 +3450,7 @@ export function useChatSend(options: UseChatSendOptions) {
       attachments: [],
       intent: hiddenSessionIntent,
       initialCollaborationMode: null,
-      initialRoutingMode: null,
+      initialRoutingMode: hiddenInitialRoutingMode,
       forkBeforeMessageId: null,
       workspaceId: null,
       params,

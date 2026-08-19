@@ -1396,7 +1396,10 @@ describe('useChatSend attachment payloads', () => {
 
   it('materializes a provisional draft when its recovered hidden turn is accepted', async () => {
     const pendingSessionIntent = ref<string | null>('new_chat')
-    const { api, rpc } = makeOptions({ pendingSessionIntent })
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent,
+      initialRoutingMode: ref<'ensemble'>('ensemble'),
+    })
 
     await api.dispatchHiddenSend(
       '/meta meta-paper-write -- recovered after reopen',
@@ -1407,6 +1410,7 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       clientRequestId: 'recovered-provisional-request',
       intent: 'new_chat',
+      initialRoutingMode: 'ensemble',
     }))
     expect(pendingSessionIntent.value).toBeNull()
   })

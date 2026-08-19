@@ -97,17 +97,22 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   const hasAuthoritativeSnapshot = ref(false)
   let generation = 0
   let mutationOwner: symbol | null = null
-  let draftModeSelected = false
+  const draftModeSelected = ref(false)
 
   const isAvailable = () => options.available?.value ?? true
+  const controlBusy = computed(() => (
+    busy.value || (options.isDraft() && options.isStreaming.value)
+  ))
   const initialRoutingMode = computed<GatewayModelRoutingMode | null>(() => (
-    isAvailable() ? modelRoutingModeToGateway(mode.value) : null
+    isAvailable() && options.isDraft() && draftModeSelected.value
+      ? modelRoutingModeToGateway(mode.value)
+      : null
   ))
 
   function reset() {
     generation += 1
     mutationOwner = null
-    draftModeSelected = false
+    draftModeSelected.value = false
     mode.value = options.globalMode.value
     revision.value = 0
     busy.value = false
@@ -159,10 +164,10 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   async function setMode(nextMode: ModelRoutingMode): Promise<boolean> {
     if (!isAvailable() || busy.value) return false
     if (options.isDraft()) {
-      if (nextMode === mode.value) return true
+      if (options.isStreaming.value) return false
       mode.value = nextMode
       revision.value = 0
-      draftModeSelected = true
+      draftModeSelected.value = true
       modeAppliesNextTurn.value = false
       return true
     }
@@ -230,12 +235,11 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     // A draft selection is the value that will be atomically persisted with
     // its first turn. A late global/default bootstrap is not authoritative for
     // that user choice.
-    if (!isAvailable() || (options.isDraft() && draftModeSelected)) return false
+    if (options.isDraft() && draftModeSelected.value) return false
     return applySnapshot(snapshot)
   }
 
   function applyChangedEvent(payload: unknown) {
-    if (!isAvailable()) return
     const key = sessionKeyFrom(payload)
     if (key && key !== options.sessionKey.value) return
     applySnapshot(payload)
@@ -252,11 +256,18 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   watch(options.globalMode, nextMode => {
     // Drafts have no durable session setting yet. Their first send captures
     // the current global default unless the user chose one of the three modes.
-    if (options.isDraft() && !busy.value && !draftModeSelected) mode.value = nextMode
+    if (options.isDraft() && !busy.value && !draftModeSelected.value) mode.value = nextMode
   })
   if (options.available) {
     watch(options.available, available => {
-      reset()
+      // Capability/connection loss must cancel an in-flight mutation without
+      // erasing an explicit new-chat choice or a read-only bootstrap snapshot.
+      // `available` gates active get/set calls, not snapshots already delivered
+      // through the authorized session subscription.
+      generation += 1
+      mutationOwner = null
+      busy.value = false
+      modeAppliesNextTurn.value = false
       if (available) void load()
     }, { flush: 'sync' })
   }
@@ -270,7 +281,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   return {
     mode,
     revision,
-    busy,
+    busy: controlBusy,
     modeAppliesNextTurn,
     hasAuthoritativeSnapshot,
     initialRoutingMode,

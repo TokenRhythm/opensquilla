@@ -599,6 +599,7 @@
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :session-routing-mode="modelRoutingMode"
       :session-routing-busy="modelRoutingSettingsBusy"
+      :session-routing-control-blocked="goalBusy"
       :session-routing-available="sessionRoutingAvailable"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
@@ -2498,6 +2499,7 @@ const chatGoals = useChatGoals({
     const sourceKey = sessionKey.value
     const sourceIntent = pendingSessionIntent.value
     const workspaceId = pendingWorkspaceId.value
+    const draftInitialRoutingMode = initialRoutingMode.value
     const created = await rpc.call<{ key?: string }>('sessions.create', {
       agentId: agentIdFromSessionKey(sourceKey),
       kind: 'webchat',
@@ -2512,6 +2514,18 @@ const chatGoals = useChatGoals({
       || pendingSessionIntent.value !== sourceIntent
       || pendingWorkspaceId.value !== workspaceId
     ) return ''
+    if (draftInitialRoutingMode) {
+      await rpc.call('sessions.routing.set', {
+        sessionKey: key,
+        mode: draftInitialRoutingMode,
+        expectedRevision: 0,
+      })
+      if (
+        sessionKey.value !== sourceKey
+        || pendingSessionIntent.value !== sourceIntent
+        || pendingWorkspaceId.value !== workspaceId
+      ) return ''
+    }
     if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
     await switchToSession(key)
     return key
@@ -3888,6 +3902,7 @@ function runComposerSandboxSetupInBackground(): void {
 }
 
 async function setComposerSessionRoutingMode(mode: ModelRoutingMode) {
+  if (goalBusy.value) return
   await chatSessionRouting.setMode(mode)
 }
 

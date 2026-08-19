@@ -258,6 +258,23 @@ describe('ChatComposer popovers', () => {
     app.unmount()
   })
 
+  it('keeps routing choices read-only while a Goal is materializing', async () => {
+    const setMode = vi.fn()
+    const { app, el } = await mountComposer({
+      sessionRoutingControlBlocked: true,
+      onSetSessionRoutingMode: setMode,
+    })
+
+    await clickButton(el, "This chat's model routing")
+    const option = el.querySelector<HTMLButtonElement>('[role="radio"]')
+    expect(option?.getAttribute('aria-disabled')).toBe('true')
+    option?.click()
+    await nextTick()
+
+    expect(setMode).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it('closes every open popover when the composer collapses', async () => {
     const props = reactive({
       modelValue: '',

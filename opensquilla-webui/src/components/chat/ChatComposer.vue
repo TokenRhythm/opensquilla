@@ -175,6 +175,7 @@
                 :title="t('chat.composer.sessionModelRouting')"
                 :aria-label="t('chat.composer.sessionModelRouting')"
                 :aria-expanded="modelRoutingOpen ? 'true' : 'false'"
+                :aria-disabled="sessionRoutingControlBlocked ? 'true' : 'false'"
                 @click="toggleModelRouting"
               >
                 <Icon name="router" :size="17" />
@@ -187,7 +188,7 @@
               <ChatComposerModelRouting
                 v-if="modelRoutingOpen"
                 :model-routing-mode="sessionRoutingMode"
-                :busy="sessionRoutingBusy"
+                :busy="sessionRoutingBusy || sessionRoutingControlBlocked"
                 @close="modelRoutingOpen = false"
                 @set-session-routing-mode="emit('setSessionRoutingMode', $event)"
               />
@@ -409,6 +410,7 @@ const props = withDefaults(defineProps<{
   runModeLockMessage: string
   sessionRoutingMode: ModelRoutingMode
   sessionRoutingBusy: boolean
+  sessionRoutingControlBlocked?: boolean
   sessionRoutingAvailable?: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
@@ -444,6 +446,7 @@ const props = withDefaults(defineProps<{
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
   sessionRoutingAvailable: true,
+  sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
   inputDisabled: false,
   safeSetupAvailable: false,

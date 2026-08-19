@@ -40,6 +40,18 @@ function harness(options: {
 }
 
 describe('useChatSessionRouting', () => {
+  it('does not send the global placeholder as an explicit draft override', async () => {
+    const { api, rpc } = harness({ draft: true, globalMode: 'llm_ensemble' })
+
+    expect(api.mode.value).toBe('llm_ensemble')
+    expect(api.initialRoutingMode.value).toBeNull()
+
+    await expect(api.setMode('llm_ensemble')).resolves.toBe(true)
+
+    expect(api.initialRoutingMode.value).toBe('ensemble')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
   it('accepts an existing revision-zero session mode over its global placeholder', async () => {
     const { api, rpc } = harness({
       globalMode: 'off',
@@ -85,6 +97,61 @@ describe('useChatSessionRouting', () => {
 
     expect(api.initialRoutingMode.value).toBeNull()
     expect(api.mode.value).toBe('squilla_router')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('preserves an explicit draft selection across a disconnect', async () => {
+    const { api, available, rpc } = harness({ draft: true, globalMode: 'off' })
+
+    await expect(api.setMode('llm_ensemble')).resolves.toBe(true)
+    available.value = false
+
+    expect(api.mode.value).toBe('llm_ensemble')
+    expect(api.initialRoutingMode.value).toBeNull()
+
+    available.value = true
+
+    expect(api.mode.value).toBe('llm_ensemble')
+    expect(api.initialRoutingMode.value).toBe('ensemble')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('freezes a draft selection while its first turn is being accepted', async () => {
+    const { api, isStreaming, rpc } = harness({ draft: true, globalMode: 'off' })
+
+    await expect(api.setMode('squilla_router')).resolves.toBe(true)
+    isStreaming.value = true
+
+    expect(api.busy.value).toBe(true)
+    await expect(api.setMode('llm_ensemble')).resolves.toBe(false)
+    expect(api.mode.value).toBe('squilla_router')
+    expect(api.initialRoutingMode.value).toBe('router')
+    expect(rpc.call).not.toHaveBeenCalled()
+
+    isStreaming.value = false
+
+    expect(api.busy.value).toBe(false)
+    await expect(api.setMode('llm_ensemble')).resolves.toBe(true)
+    expect(api.initialRoutingMode.value).toBe('ensemble')
+  })
+
+  it('accepts authorized bootstrap and routing events for a read-only session', () => {
+    const { api, handlers, rpc } = harness({ available: false, globalMode: 'off' })
+
+    expect(api.applyBootstrap({ key: SESSION_ONE, mode: 'router', revision: 2 })).toBe(true)
+    expect(api.mode.value).toBe('squilla_router')
+    expect(api.revision.value).toBe(2)
+    expect(api.hasAuthoritativeSnapshot.value).toBe(true)
+
+    api.subscribe()
+    handlers.get('sessions.routing.changed')?.({
+      key: SESSION_ONE,
+      mode: 'ensemble',
+      revision: 3,
+    })
+
+    expect(api.mode.value).toBe('llm_ensemble')
+    expect(api.revision.value).toBe(3)
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
