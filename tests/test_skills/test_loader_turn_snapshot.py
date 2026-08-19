@@ -9,9 +9,8 @@ from unittest.mock import Mock
 import pytest
 
 import opensquilla.skills.loader as loader_module
+import opensquilla.skills.watcher as watcher_module
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.skills.loader import SkillLoader
-from opensquilla.skills.watcher import SkillCatalogWatcher
 
 
 def _write_skill(root: Path, name: str = "demo", body: str = "body") -> Path:
@@ -24,10 +23,10 @@ def _write_skill(root: Path, name: str = "demo", body: str = "body") -> Path:
     return skill_dir
 
 
-def _loader(tmp_path: Path) -> tuple[SkillLoader, Path]:
+def _loader(tmp_path: Path) -> tuple[loader_module.SkillLoader, Path]:
     root = tmp_path / "skills"
     root.mkdir()
-    loader = SkillLoader(
+    loader = loader_module.SkillLoader(
         bundled_dir=root,
         snapshot_path=tmp_path / "snapshot.json",
         lockfile_path=tmp_path / "skills-lock.json",
@@ -158,8 +157,6 @@ async def test_polling_fallback_invalidates_nested_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import opensquilla.skills.watcher as watcher_module
-
     monkeypatch.setattr(watcher_module, "_awatch", None)
     loader, root = _loader(tmp_path)
     skill_dir = _write_skill(root)
@@ -171,7 +168,7 @@ async def test_polling_fallback_invalidates_nested_changes(
         "mark_dirty",
         lambda reason="mutation": (changes.append(reason), original_mark_dirty(reason))[1],
     )
-    watcher = SkillCatalogWatcher(loader, poll_interval=0.01)
+    watcher = watcher_module.SkillCatalogWatcher(loader, poll_interval=0.01)
     await watcher.start()
     await asyncio.sleep(0.03)
     (skill_dir / "nested").mkdir()
@@ -191,8 +188,6 @@ async def test_native_watcher_debounces_to_one_invalidation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import opensquilla.skills.watcher as watcher_module
-
     loader, root = _loader(tmp_path)
     _write_skill(root)
     invalidations: list[str] = []
@@ -203,7 +198,7 @@ async def test_native_watcher_debounces_to_one_invalidation(
         await asyncio.sleep(3600)
 
     monkeypatch.setattr(watcher_module, "_awatch", fake_awatch)
-    watcher = SkillCatalogWatcher(loader, debounce_ms=1)
+    watcher = watcher_module.SkillCatalogWatcher(loader, debounce_ms=1)
     await watcher.start()
     for _ in range(20):
         if invalidations:
@@ -218,7 +213,7 @@ async def test_native_watcher_debounces_to_one_invalidation(
 async def test_watcher_shutdown_is_idempotent(tmp_path: Path) -> None:
     loader, root = _loader(tmp_path)
     _write_skill(root)
-    watcher = SkillCatalogWatcher(loader, poll_interval=0.01)
+    watcher = watcher_module.SkillCatalogWatcher(loader, poll_interval=0.01)
     await watcher.start()
     await watcher.stop()
     await watcher.stop()

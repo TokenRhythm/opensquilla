@@ -73,6 +73,7 @@ class SkillCatalogWatcher:
         try:
             await task
         except asyncio.CancelledError:
+            # Cancellation is expected after task.cancel() during normal shutdown.
             pass
         except Exception:
             log.debug("skills.catalog_watcher_stop_failed", exc_info=True)
@@ -106,6 +107,7 @@ class SkillCatalogWatcher:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=self._poll_interval)
                 except TimeoutError:
+                    # The timeout lets polling re-check roots while waiting to stop.
                     pass
                 continue
             try:
