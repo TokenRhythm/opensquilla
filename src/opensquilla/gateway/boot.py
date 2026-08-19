@@ -46,6 +46,7 @@ from opensquilla.gateway.config import (
     is_public_bind,
 )
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
@@ -2975,6 +2976,7 @@ async def build_services(
             agent_registry=agent_registry,
             checkpoint_workspace_dir=config.workspace_dir,
             media_root=media_root_from_config(config),
+            model_routing_mode_provider=lambda: model_routing_snapshot(config)["mode"],
         )
 
     # Wire session manager into tool layer (like set_scheduler, set_gateway_config)

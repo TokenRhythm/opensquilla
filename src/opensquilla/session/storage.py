@@ -163,6 +163,10 @@ class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
 
 
+class SessionRoutingConflictError(ValueError):
+    """Raised when a session routing compare-and-set fence is stale."""
+
+
 class PendingChatInputConflictError(ValueError):
     """Raised when a staged-input identity or compare-and-set fence conflicts."""
 
@@ -506,9 +510,17 @@ def _serialized_read[**P, R](
 # and discard tombstones. Version 19 added the generation-fenced current Goal
 # and Goal command idempotency ledger. Version 20 added the durable Goal origin
 # message anchor used by reconnect-safe transcript presentation. Version 21
-# added the bounded durable pending-chat-input outbox.
-SCHEMA_VERSION = 21
+# added the bounded durable pending-chat-input outbox. Version 22 added the
+# persistent per-session model-routing mode and its compare-and-set revision.
+SCHEMA_VERSION = 22
 MAX_PENDING_CHAT_INPUTS = 5
+
+# These fields have their own atomic resolver/CAS API.  Whole-session writes
+# may seed them when inserting a new row, but must never replace the value of
+# an existing row from a stale ``SessionNode`` snapshot.
+_SESSION_DEDICATED_WRITER_COLUMNS = frozenset(
+    {"model_routing_mode", "model_routing_revision"}
+)
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -538,6 +550,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     auth_profile_override TEXT,
     auth_profile_override_source TEXT,
     context_tokens INTEGER,
+    model_routing_mode TEXT,
+    model_routing_revision INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -2098,6 +2112,7 @@ class SessionStorage:
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
         await self._migrate_collaboration_columns()
+        await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
@@ -2328,6 +2343,27 @@ class SessionStorage:
             """
         )
         await self._conn.commit()
+
+    async def _migrate_model_routing_columns(self) -> None:
+        """Idempotently add durable per-session model-routing state."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        additions = {
+            "model_routing_mode": "ALTER TABLE sessions ADD COLUMN model_routing_mode TEXT",
+            "model_routing_revision": (
+                "ALTER TABLE sessions ADD COLUMN "
+                "model_routing_revision INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        changed = False
+        for column, sql in additions.items():
+            if column not in columns:
+                await self._conn.execute(sql)
+                changed = True
+        if changed:
+            await self._conn.commit()
 
     async def _migrate_derived_title_column(self) -> None:
         """Idempotently add the derived_title column to an existing sessions table.
@@ -4863,7 +4899,7 @@ class SessionStorage:
         placeholders = ", ".join("?" for _ in cols)
         update_columns = []
         for c in cols:
-            if c == "session_key":
+            if c == "session_key" or c in _SESSION_DEDICATED_WRITER_COLUMNS:
                 continue
             if c == "epoch":
                 # Hard guarantee: epoch can only increase, never roll back.
@@ -4878,10 +4914,21 @@ class SessionStorage:
         )
         async with self._write_transaction("upsert_session") as conn:
             async with conn.execute(
-                "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                """
+                SELECT session_id, epoch, model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
                 (node.session_key,),
             ) as cursor:
                 previous_identity = await cursor.fetchone()
+            if previous_identity is not None:
+                # Keep the caller-visible node coherent with the dedicated
+                # writer fields that this general-purpose UPSERT preserves.
+                node.model_routing_mode = previous_identity["model_routing_mode"]
+                node.model_routing_revision = max(
+                    0,
+                    int(previous_identity["model_routing_revision"] or 0),
+                )
             if expected_session_id is not None:
                 if node.session_id != expected_session_id:
                     raise KeyError(
@@ -5443,6 +5490,155 @@ class SessionStorage:
                 (normalized_key, normalized_value, _now_ms()),
             )
         return normalized_value
+
+    # ── Per-session model routing ──────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_model_routing_mode(value: str) -> str:
+        mode = value.strip().lower() if isinstance(value, str) else ""
+        if mode not in {"direct", "router", "ensemble"}:
+            raise ValueError("model routing mode must be direct, router, or ensemble")
+        return mode
+
+    async def resolve_model_routing_mode(
+        self,
+        session_key: str,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Read one session's mode, atomically materializing legacy NULL rows.
+
+        A NULL only represents a pre-feature (or not-yet-materialized) row.  It
+        is never returned to an execution caller: the fallback is persisted
+        under the write transaction so subsequent global changes cannot alter
+        the session's routing policy.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        fallback = self._normalize_model_routing_mode(fallback_mode)
+        async with self._write_transaction("resolve_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            raw_mode = row["model_routing_mode"]
+            revision = max(0, int(row["model_routing_revision"] or 0))
+            if raw_mode is not None:
+                return {
+                    "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                    "revision": revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1,
+                    updated_at = ?
+                WHERE session_key = ? AND model_routing_mode IS NULL
+                """,
+                (fallback, _now_ms(), session_key),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                # Another writer materialized the row after our read.  Read
+                # its authoritative choice rather than overwriting it.
+                async with conn.execute(
+                    """
+                    SELECT model_routing_mode, model_routing_revision
+                    FROM sessions WHERE session_key = ?
+                    """,
+                    (session_key,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"Session not found: {session_key}")
+                return {
+                    "mode": self._normalize_model_routing_mode(
+                        str(row["model_routing_mode"])
+                    ),
+                    "revision": max(0, int(row["model_routing_revision"] or 0)),
+                    "source": "session",
+                    "initialized": False,
+                }
+            return {
+                "mode": fallback,
+                "revision": revision + 1,
+                "source": "legacy_initialized",
+                "initialized": True,
+            }
+
+    async def set_model_routing_mode(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set one persisted session routing mode."""
+
+        session_key = canonicalize_session_key(session_key)
+        normalized_mode = self._normalize_model_routing_mode(mode)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        async with self._write_transaction("set_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            current_mode = row["model_routing_mode"]
+            current_revision = max(0, int(row["model_routing_revision"] or 0))
+            if current_mode == normalized_mode:
+                # A lost acknowledgement may retry the same durable choice
+                # with the caller's older generation. Treat that as idempotent
+                # rather than forcing a needless UI reload.
+                return {
+                    "mode": normalized_mode,
+                    "revision": current_revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            if expected_revision is not None and current_revision != expected_revision:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1,
+                    updated_at = ?
+                WHERE session_key = ? AND model_routing_revision = ?
+                """,
+                (normalized_mode, _now_ms(), session_key, current_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            return {
+                "mode": normalized_mode,
+                "revision": current_revision + 1,
+                "source": "session",
+                "initialized": current_mode is None,
+            }
 
     # ── Collaboration plans ────────────────────────────────────────────────
 
@@ -11593,7 +11789,6 @@ class SessionStorage:
         if int(node.epoch or 0) != expected_epoch + 1:
             raise ValueError("reset epoch must advance exactly once")
 
-        session_data = node.model_dump()
         async with self._write_transaction("reset_session") as conn:
             async with conn.execute(
                 """
@@ -11612,6 +11807,9 @@ class SessionStorage:
                 )
             assert previous_row is not None
             previous_node = SessionNode(**_deserialize_row(dict(previous_row)))
+            node.model_routing_mode = previous_node.model_routing_mode
+            node.model_routing_revision = previous_node.model_routing_revision
+            session_data = node.model_dump()
             snapshot = ResetArchiveSnapshot(
                 node=previous_node,
                 entries=tuple(
@@ -11629,11 +11827,17 @@ class SessionStorage:
             )
             await archive_writer(snapshot)
 
-            assignments = [f"{column} = ?" for column in session_data if column != "session_key"]
+            assignments = [
+                f"{column} = ?"
+                for column in session_data
+                if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
+            ]
             values = [
                 _serialize(value)
                 for column, value in session_data.items()
                 if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
             ]
             async with conn.execute(
                 f"UPDATE sessions SET {', '.join(assignments)} "
@@ -12270,6 +12474,10 @@ class SessionStorage:
                     previous_node = SessionNode(
                         **_deserialize_row(dict(previous_row))
                     )
+                    session_node.model_routing_mode = previous_node.model_routing_mode
+                    session_node.model_routing_revision = (
+                        previous_node.model_routing_revision
+                    )
                     reset_archive_snapshot = ResetArchiveSnapshot(
                         node=previous_node,
                         entries=tuple(
@@ -12292,11 +12500,13 @@ class SessionStorage:
                         f"{column} = ?"
                         for column in session_data
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     values = [
                         _serialize(value)
                         for column, value in session_data.items()
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     async with conn.execute(
                         f"UPDATE sessions SET {', '.join(assignments)} "
@@ -14294,7 +14504,7 @@ class SessionStorage:
                 node_placeholders = ", ".join("?" for _ in node_cols)
                 node_updates: list[str] = []
                 for col in node_cols:
-                    if col == "session_key":
+                    if col == "session_key" or col in _SESSION_DEDICATED_WRITER_COLUMNS:
                         continue
                     if col == "epoch":
                         node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")
