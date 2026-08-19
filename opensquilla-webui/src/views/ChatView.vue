@@ -103,13 +103,14 @@
         <div
           ref="threadRef"
           class="chat-thread"
+          :class="{ 'chat-thread--reading-history': !autoScroll }"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
           :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
           @wheel.passive="onThreadWheel"
-          @touchmove.passive="markThreadScrollIntent('either')"
+          @touchmove.passive="onThreadTouchMove"
           @pointerdown="markThreadScrollIntent('either')"
           @pointermove="onThreadPointerMove"
           @keydown="onThreadScrollKeydown"
@@ -440,6 +441,7 @@
         </div>
         <ConversationMinimap
           v-if="!isNewChatLanding && !shareMode && !forkTransition"
+          ref="conversationMinimapRef"
           :messages="renderedMessages"
           :scroll-container="threadRef"
           :ensure-message-visible="messageListRef?.ensureMessageVisible"
@@ -506,6 +508,7 @@
     <Transition name="jump-latest">
       <button
         v-if="showJumpToLatest"
+        ref="jumpToLatestButtonRef"
         type="button"
         class="chat-jump-latest"
         :aria-label="t('chat.jumpToLatest')"
@@ -924,6 +927,10 @@ import {
 import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
+  applyProgrammaticScroll,
+  consumeProgrammaticScroll,
+} from '@/utils/chat/scrollMutation'
+import {
   captureElementScrollAnchor,
   captureVisibleTextScrollAnchor,
   createScrollHandoffGuard,
@@ -1068,7 +1075,9 @@ const chatRootRef = ref<HTMLElement | null>(null)
 const threadRef = ref<HTMLElement | null>(null)
 const goalRunDockRef = ref<HTMLElement | null>(null)
 const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
+const conversationMinimapRef = ref<{ cancelNavigation: () => void } | null>(null)
 const bottomSentinelRef = ref<HTMLElement | null>(null)
+const jumpToLatestButtonRef = ref<HTMLButtonElement | null>(null)
 let bottomIntersectionObserver: IntersectionObserver | null = null
 const composerRef = ref<ChatComposerHandle | null>(null)
 /* Floating-composer retract: a pure controller accumulates slow user travel
@@ -1134,6 +1143,20 @@ const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
+const LIVE_EDGE_EPSILON_PX = 2
+const SCROLL_DIRECTION_EPSILON_PX = 0.5
+let lastObservedThreadScrollTop: number | null = null
+let readerMovingAway = false
+
+function resetReaderScrollTracking() {
+  lastObservedThreadScrollTop = null
+  readerMovingAway = false
+}
+
+watch(sessionKey, resetReaderScrollTracking, { flush: 'sync' })
+watch(autoScroll, following => {
+  if (following) readerMovingAway = false
+}, { flush: 'sync' })
 const composing = ref(false)
 const messages = ref<Message[]>([])
 
@@ -4457,7 +4480,9 @@ function scrollToBottom() {
       // below the viewport, so the live answer remains hidden under the dock
       // and the geometric bottom gap equals the composer height. Scroll the
       // container itself to its true maximum instead.
-      threadRef.value.scrollTop = threadRef.value.scrollHeight
+      applyProgrammaticScroll(threadRef.value, () => {
+        threadRef.value!.scrollTop = threadRef.value!.scrollHeight
+      })
     }
   })
 }
@@ -4465,13 +4490,50 @@ function scrollToBottom() {
 function onThreadScroll() {
   const el = threadRef.value
   if (!el) return
+  const previousScrollTop = lastObservedThreadScrollTop
+  const currentScrollTop = el.scrollTop
+  lastObservedThreadScrollTop = currentScrollTop
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  // Virtualized row measurement and other layout corrections can move the
-  // bottom sentinel without any reader gesture. Only release live-edge follow
-  // when the reader expressed scroll intent; arriving back at the bottom may
-  // always re-enable it.
-  const intent = currentThreadScrollIntent()
-  if (gap < 60 || intent !== null) historyNavigationScrollLock.updateFromScroll(gap)
+  // Native scrollbar drags and middle-button auto-scroll can produce only a
+  // scroll event. Application-owned anchor corrections are marked at their
+  // write sites, so every other position change belongs to the reader.
+  const programmatic = consumeProgrammaticScroll(el)
+  const intent = programmatic ? null : currentThreadScrollIntent()
+  if (!programmatic && historyNavigationScrollLock.locked && intent !== null) {
+    interruptHistoryNavigationForReader()
+  } else if (!programmatic && !historyNavigationScrollLock.locked) {
+    const movedUp = previousScrollTop !== null
+      && currentScrollTop < previousScrollTop - SCROLL_DIRECTION_EPSILON_PX
+    const movedDown = previousScrollTop !== null
+      && currentScrollTop > previousScrollTop + SCROLL_DIRECTION_EPSILON_PX
+    const leavingLiveEdge = intent === 'up'
+      || (gap > LIVE_EDGE_EPSILON_PX && movedUp)
+      || (
+        previousScrollTop === null
+        && autoScroll.value
+        && gap > LIVE_EDGE_EPSILON_PX
+      )
+
+    if (leavingLiveEdge) {
+      readerMovingAway = true
+      autoScroll.value = false
+    } else if (gap <= LIVE_EDGE_EPSILON_PX) {
+      readerMovingAway = false
+      historyNavigationScrollLock.updateFromScroll(gap)
+    } else if (readerMovingAway) {
+      // Browser scroll anchoring can adjust scrollTop without an input event.
+      // While the reader is paused, only a definite downward gesture may use
+      // the forgiving 60px return threshold; source-less movement must reach
+      // the real live edge before following resumes.
+      if (intent === 'down' && movedDown) {
+        historyNavigationScrollLock.updateFromScroll(gap)
+      }
+    } else if (movedDown) {
+      historyNavigationScrollLock.updateFromScroll(gap)
+    } else if (!readerMovingAway) {
+      historyNavigationScrollLock.updateFromScroll(gap)
+    }
+  }
   if (isNewChatLanding.value || !composerFxEnabled.value) {
     resetComposerRetraction()
     return
@@ -4480,7 +4542,7 @@ function onThreadScroll() {
   composerCollapsed.value = composerRetraction.observe({
     scrollTop: el.scrollTop,
     bottomGap: gap,
-    intent: currentThreadScrollIntent(),
+    intent,
     canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
     navigationLocked: historyNavigationScrollLock.locked,
   })
@@ -4488,13 +4550,54 @@ function onThreadScroll() {
 }
 
 function onThreadWheel(event: WheelEvent) {
-  if (event.deltaY === 0) return
+  // Browser zoom gestures surface as ctrl+wheel (including trackpad pinch in
+  // Chromium) but do not represent reader movement inside the transcript.
+  if (event.deltaY === 0 || event.ctrlKey) return
+  const el = threadRef.value
+  if (!el) return
+  // Any wheel gesture inside the transcript takes ownership away from an
+  // in-flight minimap animation, including gestures consumed by a nested
+  // reasoning/tool scroller. Outside navigation, only a wheel that reaches the
+  // thread itself may pause live-edge following.
+  if (historyNavigationScrollLock.locked && !event.defaultPrevented) {
+    interruptHistoryNavigationForReader()
+  }
+  if (!threadConsumesWheel(event, el)) return
   markThreadScrollIntent(event.deltaY < 0 ? 'up' : 'down')
+  if (event.deltaY < 0) pauseFollowingForUpwardIntent()
+}
+
+function threadConsumesWheel(event: WheelEvent, thread: HTMLElement): boolean {
+  if (event.defaultPrevented) return false
+  const canScroll = (element: HTMLElement) => event.deltaY < 0
+    ? element.scrollTop > SCROLL_DIRECTION_EPSILON_PX
+    : element.scrollTop + element.clientHeight
+      < element.scrollHeight - SCROLL_DIRECTION_EPSILON_PX
+
+  for (const target of event.composedPath()) {
+    if (target === thread) return canScroll(thread)
+    if (!(target instanceof HTMLElement)) continue
+    const style = getComputedStyle(target)
+    const scrollable = ['auto', 'scroll', 'overlay'].includes(style.overflowY)
+      && target.scrollHeight > target.clientHeight + SCROLL_DIRECTION_EPSILON_PX
+    if (!scrollable) continue
+    if (canScroll(target)) return false
+    if (style.overscrollBehaviorY === 'contain' || style.overscrollBehaviorY === 'none') {
+      return false
+    }
+  }
+  return false
+}
+
+function onThreadTouchMove() {
+  markThreadScrollIntent('either')
+  interruptHistoryNavigationForReader()
 }
 
 function onThreadPointerMove(event: PointerEvent) {
   if (event.buttons !== 0 || event.pointerType === 'touch') {
     markThreadScrollIntent('either')
+    interruptHistoryNavigationForReader()
   }
 }
 
@@ -4509,14 +4612,31 @@ function onThreadScrollKeydown(event: KeyboardEvent) {
     || event.key === 'End'
     || (event.key === ' ' && !event.shiftKey)
   if (up || down) markThreadScrollIntent(up ? 'up' : 'down')
+  if (up) pauseFollowingForUpwardIntent()
 }
 
-function syncComposerRetractionFromThread() {
+function pauseFollowingForUpwardIntent() {
+  const el = threadRef.value
+  if (!el || el.scrollTop <= SCROLL_DIRECTION_EPSILON_PX) return
+  lastObservedThreadScrollTop = el.scrollTop
+  readerMovingAway = true
+  autoScroll.value = false
+}
+
+function interruptHistoryNavigationForReader() {
+  if (!historyNavigationScrollLock.locked) return
+  const firstInterruption = historyNavigationScrollLock.interrupt()
+  readerMovingAway = true
+  autoScroll.value = false
+  if (firstInterruption) conversationMinimapRef.value?.cancelNavigation()
+}
+
+function syncComposerRetractionFromThread(updateFollow = true) {
   const el = threadRef.value
   if (!el) return
   clearPendingComposerScrollIntent()
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  historyNavigationScrollLock.updateFromScroll(gap)
+  if (updateFollow) historyNavigationScrollLock.updateFromScroll(gap)
   composerCollapsed.value = composerRetraction.observe({
     scrollTop: el.scrollTop,
     bottomGap: gap,
@@ -4533,17 +4653,31 @@ function onHistoryNavigate() {
 }
 
 function onHistoryNavigateEnd() {
-  historyNavigationScrollLock.finish()
+  const navigationInterrupted = historyNavigationScrollLock.finish()
   // Smooth-scroll frames and the final arrival are navigation, not transcript
-  // browsing gestures. Establish a baseline without toggling the composer.
-  syncComposerRetractionFromThread()
+  // browsing gestures. If the reader interrupted the motion, establish only a
+  // composer baseline and preserve their pause unless they reached true bottom.
+  syncComposerRetractionFromThread(!navigationInterrupted)
+  if (navigationInterrupted) {
+    const el = threadRef.value
+    const gap = el ? el.scrollHeight - el.scrollTop - el.clientHeight : Infinity
+    if (gap <= LIVE_EDGE_EPSILON_PX) {
+      readerMovingAway = false
+      historyNavigationScrollLock.updateFromScroll(gap)
+    }
+  }
   if (autoScroll.value) expandComposer()
 }
 
 // Show the jump-to-latest affordance whenever the reader has scrolled up off the
-// live edge (autoScroll releases at gap >= 60) and there is content to return to.
-// Re-pinning autoScroll lets the stream resume following the bottom.
+// live edge. Upward reader movement releases the follow immediately; scrolling
+// back within 60px of the bottom resumes it.
 const showJumpToLatest = computed(() => !autoScroll.value && messages.value.length > 0)
+watch(showJumpToLatest, showing => {
+  if (showing || document.activeElement !== jumpToLatestButtonRef.value) return
+  threadRef.value?.focus({ preventScroll: true })
+}, { flush: 'sync' })
+
 function jumpToLatest() {
   cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
@@ -4888,7 +5022,16 @@ onMounted(async () => {
     && bottomSentinelRef.value
   ) {
     bottomIntersectionObserver = new IntersectionObserver((entries) => {
-      if (entries.some(entry => entry.isIntersecting) && !historyNavigationScrollLock.locked) {
+      const thread = threadRef.value
+      const bottomGap = thread
+        ? thread.scrollHeight - thread.scrollTop - thread.clientHeight
+        : Number.POSITIVE_INFINITY
+      if (
+        entries.some(entry => entry.isIntersecting)
+        && bottomGap <= LIVE_EDGE_EPSILON_PX
+        && !readerMovingAway
+        && !historyNavigationScrollLock.locked
+      ) {
         autoScroll.value = true
       }
     }, {
@@ -4995,7 +5138,9 @@ onMounted(async () => {
           composerDockPinFrame = null
           const thread = threadRef.value
           if (thread && autoScroll.value) {
-            thread.scrollTop = thread.scrollHeight
+            applyProgrammaticScroll(thread, () => {
+              thread.scrollTop = thread.scrollHeight
+            })
           }
         })
       }

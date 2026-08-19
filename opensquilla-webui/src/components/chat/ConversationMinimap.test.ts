@@ -162,11 +162,11 @@ async function mountMinimap(
     messageOffset: options.messageOffset,
   })
   app.use(i18n)
-  app.mount(host)
+  const instance = app.mount(host) as unknown as { cancelNavigation: () => void }
   mountedApps.push(app)
   await nextTick()
   await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeTruthy())
-  return { host, thread }
+  return { host, instance, thread }
 }
 
 function markers(host: HTMLElement): HTMLButtonElement[] {
@@ -346,6 +346,38 @@ describe('ConversationMinimap', () => {
     expect(mounted.thread.scrollTo).toHaveBeenLastCalledWith({ top: 1_184, behavior: 'smooth' })
     mounted.thread.container.dispatchEvent(new Event('scrollend'))
     expect(releaseEnsuredMessage).toHaveBeenCalledWith(6)
+  })
+
+  it('pairs navigation lifecycle when deferred materialization is cancelled', async () => {
+    const deferred: { resolve?: (element: HTMLElement | null) => void } = {}
+    const ensureMessageVisible = vi.fn(() => new Promise<HTMLElement | null>(resolve => {
+      deferred.resolve = resolve
+    }))
+    const releaseEnsuredMessage = vi.fn()
+    const onNavigate = vi.fn()
+    const onNavigateEnd = vi.fn()
+    const mounted = await mountMinimap(8, {
+      ensureMessageVisible,
+      onNavigate,
+      onNavigateEnd,
+      releaseEnsuredMessage,
+    })
+    mounted.thread.container.querySelector('[data-chat-turn-key="user-3"]')?.remove()
+
+    markers(mounted.host)[3].click()
+    await vi.waitFor(() => expect(ensureMessageVisible).toHaveBeenCalledWith(6))
+    expect(onNavigate).toHaveBeenCalledOnce()
+    expect(onNavigateEnd).not.toHaveBeenCalled()
+
+    mounted.instance.cancelNavigation()
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+
+    const lateAnchor = document.createElement('div')
+    deferred.resolve!(lateAnchor)
+    await nextTick()
+    await vi.waitFor(() => expect(releaseEnsuredMessage).toHaveBeenCalledWith(6))
+    expect(mounted.thread.scrollTo).not.toHaveBeenCalled()
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
   })
 
   it('completes immediately when the selected prompt is already in place', async () => {

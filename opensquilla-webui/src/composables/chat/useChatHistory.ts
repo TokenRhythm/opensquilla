@@ -24,6 +24,7 @@ import {
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
@@ -1056,10 +1057,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               && historyRequestSeq === requestSeq,
           })
         } else if (prependContainer) {
-          prependContainer.scrollTop += Math.max(
-            0,
-            prependContainer.scrollHeight - prependFallbackHeight,
-          )
+          applyProgrammaticScroll(prependContainer, () => {
+            prependContainer.scrollTop += Math.max(
+              0,
+              prependContainer.scrollHeight - prependFallbackHeight,
+            )
+          })
         }
       } else if (options.autoScroll?.value ?? true) {
         await nextTick()

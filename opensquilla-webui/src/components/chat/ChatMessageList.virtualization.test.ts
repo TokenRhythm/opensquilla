@@ -155,6 +155,32 @@ describe('ChatMessageList long-history virtualization', () => {
     expect(container.scrollTop).toBe(12_000)
   })
 
+  it('keeps the live edge pinned when the chat viewport changes size', async () => {
+    const { container } = await mountList({ followLiveEdge: true })
+    Object.defineProperty(container, 'scrollHeight', { configurable: true, value: 12_000 })
+    container.scrollTop = 8_400
+
+    const entry = { target: container } as unknown as ResizeObserverEntry
+    for (const callback of resizeObserverCallbacks) callback([entry], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+
+    expect(container.scrollTop).toBe(12_000)
+  })
+
+  it('leaves a historical reader in place when the chat viewport changes size', async () => {
+    const { container } = await mountList({ followLiveEdge: false })
+    Object.defineProperty(container, 'scrollHeight', { configurable: true, value: 12_000 })
+    container.scrollTop = 8_400
+
+    const entry = { target: container } as unknown as ResizeObserverEntry
+    for (const callback of resizeObserverCallbacks) callback([entry], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+
+    expect(container.scrollTop).toBe(8_400)
+  })
+
   it('compensates an above-viewport resize from physical geometry once', async () => {
     const { container, host } = await mountList()
     const row = host.querySelector<HTMLElement>('[data-testid="chat-message-row"]')
