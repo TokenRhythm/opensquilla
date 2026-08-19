@@ -4490,14 +4490,16 @@ function scrollToBottom() {
 function onThreadScroll() {
   const el = threadRef.value
   if (!el) return
-  const previousScrollTop = lastObservedThreadScrollTop
   const currentScrollTop = el.scrollTop
+  const scrollMutation = consumeProgrammaticScroll(el)
+  const previousScrollTop = scrollMutation?.expectedScrollTop
+    ?? lastObservedThreadScrollTop
   lastObservedThreadScrollTop = currentScrollTop
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   // Native scrollbar drags and middle-button auto-scroll can produce only a
   // scroll event. Application-owned anchor corrections are marked at their
   // write sites, so every other position change belongs to the reader.
-  const programmatic = consumeProgrammaticScroll(el)
+  const programmatic = scrollMutation?.matched ?? false
   const intent = programmatic ? null : currentThreadScrollIntent()
   if (!programmatic && historyNavigationScrollLock.locked && intent !== null) {
     interruptHistoryNavigationForReader()

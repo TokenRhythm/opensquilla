@@ -22,8 +22,11 @@ describe('chat scroll mutation ownership', () => {
       thread.scrollTop = 180
     })
 
-    expect(consumeProgrammaticScroll(thread)).toBe(true)
-    expect(consumeProgrammaticScroll(thread)).toBe(false)
+    expect(consumeProgrammaticScroll(thread)).toEqual({
+      expectedScrollTop: 180,
+      matched: true,
+    })
+    expect(consumeProgrammaticScroll(thread)).toBeNull()
   })
 
   it('does not swallow a reader move after an application write had no event', () => {
@@ -37,8 +40,11 @@ describe('chat scroll mutation ownership', () => {
     // disable live following rather than consume the stale marker.
     thread.scrollTop = 96
 
-    expect(consumeProgrammaticScroll(thread)).toBe(false)
-    expect(consumeProgrammaticScroll(thread)).toBe(false)
+    expect(consumeProgrammaticScroll(thread)).toEqual({
+      expectedScrollTop: 180,
+      matched: false,
+    })
+    expect(consumeProgrammaticScroll(thread)).toBeNull()
   })
 
   it('keeps only the latest application correction while scroll events coalesce', () => {
@@ -51,6 +57,24 @@ describe('chat scroll mutation ownership', () => {
       thread.scrollTop = 240
     })
 
-    expect(consumeProgrammaticScroll(thread)).toBe(true)
+    expect(consumeProgrammaticScroll(thread)).toEqual({
+      expectedScrollTop: 240,
+      matched: true,
+    })
+  })
+
+  it('retains the pending target when reader movement coalesces with the correction', () => {
+    const thread = container(1_000)
+
+    applyProgrammaticScroll(thread, () => {
+      thread.scrollTop = 1_100
+    })
+    thread.scrollTop = 1_092
+
+    expect(consumeProgrammaticScroll(thread)).toEqual({
+      expectedScrollTop: 1_100,
+      matched: false,
+    })
+    expect(consumeProgrammaticScroll(thread)).toBeNull()
   })
 })

@@ -1,5 +1,10 @@
 const expectedProgrammaticScrollTop = new WeakMap<HTMLElement, number>()
 
+export interface ProgrammaticScrollConsumption {
+  expectedScrollTop: number
+  matched: boolean
+}
+
 /**
  * Records a chat-thread scroll position that was produced by the application
  * itself. Browser scroll events carry no reliable source information: native
@@ -18,16 +23,19 @@ export function applyProgrammaticScroll(
 }
 
 /**
- * Returns whether this scroll event belongs to the most recent application
- * correction. A mismatch immediately releases the marker so a real reader
- * gesture is never swallowed by a stale correction.
+ * Returns the consumed application target and whether this event reached it.
+ * A mismatch immediately releases the marker so a real reader gesture is never
+ * swallowed by a stale correction.
  */
 export function consumeProgrammaticScroll(
   container: HTMLElement,
   tolerancePx = 1,
-): boolean {
+): ProgrammaticScrollConsumption | null {
   const expected = expectedProgrammaticScrollTop.get(container)
-  if (expected === undefined) return false
+  if (expected === undefined) return null
   expectedProgrammaticScrollTop.delete(container)
-  return Math.abs(container.scrollTop - expected) <= tolerancePx
+  return {
+    expectedScrollTop: expected,
+    matched: Math.abs(container.scrollTop - expected) <= tolerancePx,
+  }
 }

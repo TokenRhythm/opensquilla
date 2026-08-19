@@ -371,15 +371,20 @@ test('treats a native-scrollbar-only event as reader navigation and resumes on f
   await expect.poll(() => scrollGap(page)).toBeGreaterThan(2)
   expect(await scrollGap(page)).toBeLessThan(60)
   await expect(page.locator('.chat-jump-latest')).toBeVisible()
-  await page.locator('.chat-jump-latest').click()
-  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
-  await thread.evaluate(() => new Promise<void>(resolve => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-  }))
-
-  const bareScrollGap = await thread.evaluate(el => {
+  const bareScrollGap = await thread.evaluate(async el => {
     const thread = el as HTMLElement
-    thread.scrollTop = Math.max(0, thread.scrollTop - 5)
+    const latest = document.querySelector<HTMLButtonElement>('.chat-jump-latest')
+    if (!latest) throw new Error('Jump to latest is unavailable')
+    latest.click()
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await Promise.resolve()
+      const gap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+      if (gap <= 1) break
+    }
+    const pinnedTop = thread.scrollTop
+    const pinnedGap = thread.scrollHeight - pinnedTop - thread.clientHeight
+    if (pinnedGap > 1) throw new Error('Programmatic live-edge pin did not run')
+    thread.scrollTop = Math.max(0, pinnedTop - 5)
     thread.dispatchEvent(new Event('scroll'))
     return thread.scrollHeight - thread.scrollTop - thread.clientHeight
   })
