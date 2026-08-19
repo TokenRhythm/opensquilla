@@ -563,6 +563,14 @@ async def test_chat_send_binds_current_document_head_as_additive_runtime_context
         assert bound.tool_names == DOCUMENT_CONTEXT_TOOL_NAMES
         assert "document_read" in bound.request_context_prompt
         assert "document_patch" in bound.request_context_prompt
+        assert "first source read MUST be document_read" in bound.request_context_prompt
+        assert 'cursor=""' in bound.request_context_prompt
+        assert "provider adapter requires that field" in bound.request_context_prompt
+        assert "Never invent a non-empty cursor" in bound.request_context_prompt
+        assert "sha256 returned by document_read" in bound.request_context_prompt
+        assert "write_file, edit_file, and apply_patch" in bound.request_context_prompt
+        assert "MUST NOT substitute for document_patch" in bound.request_context_prompt
+        assert "workspace mutators are unavailable" in bound.request_context_prompt
 
         from opensquilla.gateway.routing import tool_context_from_envelope
 

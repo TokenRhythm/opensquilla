@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from opensquilla.artifact_session import (
     ArtifactMutationAttemptController,
     ArtifactSessionService,
 )
 from opensquilla.gateway.artifact_contexts import (
     DOCUMENT_CONTEXT_TOOL_NAMES,
+    DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY,
     PROMPT_ANNOTATION_TOOL_NAMES,
     BoundDocumentContext,
     BoundPromptAnnotationContext,
@@ -18,7 +21,10 @@ from opensquilla.gateway.routing import (
     build_web_route_envelope,
     tool_context_from_envelope,
 )
+from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.builtin.artifact_range_grants import registry_for_context
+from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.registry import get_default_registry
 
 
 def _prompt_annotation_context() -> BoundPromptAnnotationContext:
@@ -96,7 +102,7 @@ def test_accepted_prompt_annotation_turn_gets_single_writer_controller() -> None
     assert getattr(result, "_artifact_range_grant_registry", None) is None
 
 
-def test_bound_document_context_adds_tools_without_restricting_ordinary_tools() -> None:
+def test_bound_document_context_adds_tools_and_denies_workspace_mutator_substitutes() -> None:
     envelope = build_web_route_envelope(session_key="agent:main:web")
     context = _document_context()
     service = ArtifactSessionService(repository=object())  # type: ignore[arg-type]
@@ -114,10 +120,53 @@ def test_bound_document_context_adds_tools_without_restricting_ordinary_tools() 
     assert result.surfaced_tools == set(DOCUMENT_CONTEXT_TOOL_NAMES)
     assert result.exclusive_tools is None
     assert result.allowed_tools is None
+    assert result.denied_tools == set(DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY)
+    assert "read_file" not in result.denied_tools
+    visible_names = {
+        definition.name for definition in get_default_registry().to_tool_definitions(result)
+    }
+    assert DOCUMENT_CONTEXT_TOOL_NAMES <= visible_names
+    assert not (DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY & visible_names)
     assert isinstance(
         result.artifact_mutation_attempt_controller,
         ArtifactMutationAttemptController,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}),
+        ("edit_file", {"path": "current.html", "old_text": "old", "new_text": "new"}),
+        ("write_file", {"path": "current.html", "content": "replacement"}),
+    ],
+)
+async def test_bound_document_context_dispatch_rejects_workspace_mutators(
+    tool_name: str,
+    arguments: dict[str, str],
+) -> None:
+    envelope = build_web_route_envelope(session_key="agent:main:web")
+    envelope.metadata["task_id"] = "turn-document-denied-writer"
+    envelope.runtime_services.update(
+        {
+            "artifact_context": _document_context(),
+            "artifact_session": ArtifactSessionService(repository=object()),  # type: ignore[arg-type]
+        }
+    )
+    context = tool_context_from_envelope(envelope, is_owner=True)
+    handler = build_tool_handler(get_default_registry(), context)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id=f"denied-{tool_name}",
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+    )
+
+    assert result.is_error is True
+    assert f"Tool '{tool_name}' not available in this context." in result.content
 
 
 def test_non_owner_cannot_surface_prompt_annotation_tools() -> None:

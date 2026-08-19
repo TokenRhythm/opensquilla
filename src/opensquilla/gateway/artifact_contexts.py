@@ -9,6 +9,9 @@ PROMPT_ANNOTATION_TOOL_NAMES = frozenset(
     {"document_apply", "document_inspect", "document_locate", "document_read"}
 )
 DOCUMENT_CONTEXT_TOOL_NAMES = frozenset({"document_patch", "document_read"})
+DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY = frozenset(
+    {"apply_patch", "edit_file", "write_file"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,5 +132,6 @@ __all__ = [
     "BoundPromptAnnotationContext",
     "BoundPromptAnnotationTarget",
     "DOCUMENT_CONTEXT_TOOL_NAMES",
+    "DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY",
     "PROMPT_ANNOTATION_TOOL_NAMES",
 ]

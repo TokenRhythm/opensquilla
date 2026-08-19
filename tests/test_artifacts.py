@@ -30,7 +30,7 @@ from opensquilla.engine.types import ToolCall
 from opensquilla.session.plans import PlanRunConflictError
 from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.dispatch import build_tool_handler
-from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.registry import ToolRegistry, get_default_registry
 from opensquilla.tools.types import (
     CallerKind,
     RetryableToolInputError,
@@ -41,6 +41,30 @@ from opensquilla.tools.types import (
 )
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def test_publish_artifact_schema_distinguishes_single_file_and_directory_modes() -> None:
+    definition = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions(
+            ToolContext(
+                is_owner=True,
+                caller_kind=CallerKind.AGENT,
+                allowed_tools={"publish_artifact"},
+            )
+        )
+        if tool.name == "publish_artifact"
+    )
+
+    assert "set bundle='none' and omit bundle_root" in definition.description
+    assert "bundle_root is valid only with bundle='directory'" in definition.description
+    bundle_schema = definition.input_schema.properties["bundle"]
+    assert bundle_schema["enum"] == ["auto", "directory", "none"]
+    assert "Use none for exactly one file" in bundle_schema["description"]
+    assert "directory requires bundle_root" in bundle_schema["description"]
+    bundle_root_description = definition.input_schema.properties["bundle_root"]["description"]
+    assert "Required only when bundle=directory" in bundle_root_description
+    assert "Invalid when bundle is auto or none" in bundle_root_description
 
 
 def _valid_pptx_bytes(title: str = "Validated deliverable") -> bytes:

@@ -4238,10 +4238,18 @@ async def _handle_sessions_send_impl(
                 operation_class="document_edit",
                 request_context_prompt=(
                     "<active_document_context>\n"
-                    "The currently opened HTML document is bound to this turn. "
-                    "When the request concerns it, call document_read before document_patch. "
-                    "Patch only against the returned sha256 and exact source text; ordinary "
-                    "tools remain available for the rest of the request.\n"
+                    "The currently opened HTML document is bound to this turn. If the user asks "
+                    "to inspect or modify the open page, use the bound document tools, not "
+                    "workspace file tools. The first source read MUST be document_read with "
+                    "view=source and no cursor, or cursor=\"\" only when the provider adapter "
+                    "requires that field. Never invent a non-empty cursor: only pass the exact "
+                    "nextCursor returned by the preceding document_read response when hasMore "
+                    "is true. To modify the open page, call document_patch with the sha256 "
+                    "returned by document_read and exact, unique expectedText from the returned "
+                    "source. write_file, edit_file, and apply_patch operate on workspace files; "
+                    "they do not update this Document and MUST NOT substitute for document_patch. "
+                    "Those workspace mutators are unavailable while this Document is bound; do "
+                    "not attempt to call them.\n"
                     "</active_document_context>"
                 ),
             )

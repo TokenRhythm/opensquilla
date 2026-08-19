@@ -601,6 +601,7 @@ def tool_context_from_envelope(
     exclusive_tools: frozenset[str] | None = None
     artifact_mutation_attempt_controller: Any | None = None
     from opensquilla.gateway.artifact_contexts import (
+        DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY,
         BoundDocumentContext,
         BoundPromptAnnotationContext,
     )
@@ -622,6 +623,11 @@ def tool_context_from_envelope(
                 if allowed_tools is None
                 else set(allowed_tools) & exclusive_tools
             )
+        elif isinstance(artifact_context, BoundDocumentContext):
+            # A workspace file is not the bound Document. Keep ordinary read/search and
+            # authoring capabilities additive, but fail closed on the three direct source
+            # mutators that models commonly mistake for a Document update.
+            denied_tools.update(DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY)
         if _ARTIFACT_MUTATION_WRITER_NAMES & artifact_tool_names:
             task_id = str(envelope.metadata.get("task_id") or "").strip()
             document_id = str(getattr(artifact_context, "document_id", "") or "").strip()

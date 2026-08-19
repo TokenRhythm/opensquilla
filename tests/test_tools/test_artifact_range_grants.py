@@ -389,6 +389,19 @@ def test_registry_reuses_budget_for_an_identical_query_without_broadening_author
         registry.consume_query_budget(query_key="annotation-3:remove_node")
 
 
+def test_document_registry_allows_one_identical_tool_replay_then_stops() -> None:
+    registry = DocumentMutationGrantRegistry()
+
+    assert registry.reserve_tool_attempt(attempt_key="document_inspect") == 1
+    assert registry.reserve_tool_attempt(attempt_key="document_inspect") == 0
+    with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_QUERY_LIMIT") as exc_info:
+        registry.reserve_tool_attempt(attempt_key="document_inspect")
+    assert "Reuse the earlier result" in exc_info.value.user_message
+
+    registry.clear()
+    assert registry.reserve_tool_attempt(attempt_key="document_inspect") == 1
+
+
 @pytest.mark.asyncio
 async def test_agent_turn_finally_clears_range_registry_after_success() -> None:
     ctx = ToolContext(is_owner=True, session_key="agent:main:webchat:range-cleanup")

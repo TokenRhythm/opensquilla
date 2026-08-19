@@ -27,6 +27,7 @@ _DOCUMENT_REGISTRY_ATTRIBUTE = "_document_mutation_grant_registry"
 MAX_RANGE_GRANTS_PER_TURN = 64
 MAX_RANGE_GRANT_TTL_SECONDS = 15 * 60
 MAX_RANGE_QUERIES_PER_TURN = 4
+MAX_IDENTICAL_DOCUMENT_TOOL_CALLS_PER_TURN = 2
 MAX_RECORDED_SOURCE_FRAGMENT_BYTES = 16 * 1024
 MAX_RECORDED_SOURCE_BYTES_PER_TURN = 128 * 1024
 
@@ -499,6 +500,7 @@ class DocumentMutationGrantRegistry:
         self._entries: dict[str, _DocumentGrantEntry] = {}
         self._query_count = 0
         self._query_keys: set[str] = set()
+        self._tool_attempts: dict[str, int] = {}
         self._contextual_candidates: dict[int, str] = {}
         self._source_reads: dict[tuple[object, ...], list[_SourceReadSpan]] = {}
         self._lock = threading.Lock()
@@ -508,8 +510,36 @@ class DocumentMutationGrantRegistry:
             self._entries.clear()
             self._query_count = 0
             self._query_keys.clear()
+            self._tool_attempts.clear()
             self._contextual_candidates.clear()
             self._source_reads.clear()
+
+    def reserve_tool_attempt(self, *, attempt_key: str) -> int:
+        """Bound identical inspection or locate calls while allowing one safe replay.
+
+        A second identical call covers a provider retry or a lost result without
+        broadening authority. Further calls cannot reveal anything new within the
+        immutable turn binding, so rejecting them prevents an Agent from looping on
+        a deterministic outcome.
+        """
+
+        if not isinstance(attempt_key, str) or not attempt_key:
+            raise ArtifactRangeGrantError(
+                "ARTIFACT_RANGE_BINDING_INVALID",
+                "The document tool attempt is invalid.",
+            )
+        with self._lock:
+            attempts = self._tool_attempts.get(attempt_key, 0)
+            if attempts >= MAX_IDENTICAL_DOCUMENT_TOOL_CALLS_PER_TURN:
+                raise ArtifactRangeGrantError(
+                    "ARTIFACT_RANGE_QUERY_LIMIT",
+                    "This document inspection or target query was already repeated. "
+                    "Reuse the earlier result, leave an unsupported item unchanged, "
+                    "and finish without calling it again.",
+                )
+            attempts += 1
+            self._tool_attempts[attempt_key] = attempts
+            return MAX_IDENTICAL_DOCUMENT_TOOL_CALLS_PER_TURN - attempts
 
     def record_source_read(
         self,

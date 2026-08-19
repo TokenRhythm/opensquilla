@@ -61,11 +61,19 @@ def test_prompt_annotation_context_escapes_instruction_and_wraps_source_quote() 
         "document_apply",
     ):
         assert tool_name in rendered
+    assert "summarize only the visible result" in rendered
+    assert "Do not mention tool names" in rendered
+    assert "tool receipt" not in rendered
     assert "answer the user directly" in rendered
     assert "answering does not require a document tool call" in rendered
     assert "An instruction may be answered without being included" in rendered
     assert "Cover every ordered annotation" not in rendered
-    assert "Locate each annotation-operation pair at most once" in rendered
+    assert "call document_inspect once" in rendered
+    assert "initialLocations already contains every prelocated opaque grant" in rendered
+    assert "never pass candidateSource" in rendered
+    assert "document_locate only for an attribute-specific operation" in rendered
+    assert "leave that item unchanged and do not retry or guess" in rendered
+    assert "re-inspecting" in rendered
     assert "CSS declaration list" in rendered
     assert "must not contain selectors" in rendered
     assert "html_edit_source" not in rendered

@@ -192,9 +192,10 @@ def _locations_for_operation(
 @tool(
     name="document_inspect",
     description=(
-        "Inspect the annotated document, ordered user instructions, adapter capabilities, "
-        "and initial semantic mutation grants. No path, source offset, or internal identifier "
-        "is returned."
+        "Inspect the annotated document once. Ready selections return reusable initialLocations "
+        "grants; do not locate those operations again and never pass candidateSource for a ready "
+        "selection. Contextual selections require document_read and one document_locate call. "
+        "No path, source offset, or internal identifier is returned."
     ),
     params=_NO_ARGUMENTS_SCHEMA,
     owner_only=True,
@@ -213,6 +214,12 @@ async def document_inspect() -> str:
 
     if not isinstance(scope.context, BoundPromptAnnotationContext):
         raise SafeToolError("No prompt annotations are bound to this document turn.")
+    try:
+        document_grant_registry_for_context(scope.ctx).reserve_tool_attempt(
+            attempt_key="document_inspect"
+        )
+    except ArtifactRangeGrantError as exc:
+        raise _range_error(exc) from None
     snapshots = normalize_prompt_annotation_snapshots(scope.context.snapshots)
     if len(snapshots) != len(scope.anchors):
         raise SafeToolError("The annotated document context is stale.")
@@ -232,6 +239,18 @@ async def document_inspect() -> str:
                         operation=operation,
                     )
                 )
+        available_initial_operations = sorted(
+            {
+                str(location["operation"])
+                for location in locations
+                if isinstance(location.get("operation"), str)
+            }
+        )
+        unavailable_initial_operations = (
+            sorted(set(_INITIAL_OPERATIONS) - set(available_initial_operations))
+            if target.status == "ready"
+            else []
+        )
         annotations.append(
             {
                 "order": snapshot["order"],
@@ -244,6 +263,15 @@ async def document_inspect() -> str:
                     "quote": _bounded_anchor_text(anchor.quote, "quote"),
                 },
                 "initialLocations": locations,
+                "grantPolicy": {
+                    "reuseInitialLocations": target.status == "ready",
+                    "candidateSource": (
+                        "forbidden" if target.status == "ready" else "required_after_read"
+                    ),
+                    "availableInitialOperations": available_initial_operations,
+                    "unavailableInitialOperations": unavailable_initial_operations,
+                    "unsupportedOperationAction": "leave_unchanged_and_explain",
+                },
             }
         )
     try:
@@ -261,6 +289,12 @@ async def document_inspect() -> str:
             "revision": {"sha256": ref.sha256, "bytes": ref.size},
             "adapter": adapter.capabilities(),
             "structure": structure,
+            "protocol": {
+                "inspectAgain": False,
+                "readyTargets": "reuse_matching_initialLocations",
+                "contextualTargets": "document_read_then_document_locate_once",
+                "unsupportedOperations": "leave_unchanged_and_explain",
+            },
             "annotations": annotations,
         }
     )
@@ -269,12 +303,30 @@ async def document_inspect() -> str:
 _DOCUMENT_READ_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "view": {"type": "string", "enum": ["source", "structure"]},
-        "cursor": {"type": "string", "pattern": "^hcur_[A-Za-z0-9_-]{43}$"},
+        "view": {
+            "type": "string",
+            "enum": ["source", "structure"],
+            "description": (
+                "Use source before editing. Structure returns an outline and never accepts "
+                "a cursor."
+            ),
+        },
+        "cursor": {
+            "type": "string",
+            "pattern": "^(?:[\\t\\n\\r ]*|hcur_[A-Za-z0-9_-]{43})$",
+            "description": (
+                "Opaque continuation token. Omit this property entirely on the first source "
+                "read; if the provider adapter requires every schema field, pass an empty "
+                "string instead. Empty or whitespace-only values mean no cursor. On a later "
+                "read, copy only the exact nextCursor from the immediately preceding "
+                "document_read response; never invent or transform a non-empty cursor."
+            ),
+        },
         "max_chars": {
             "type": "integer",
             "minimum": 256,
             "maximum": _MAX_HTML_READ_CHUNK_CHARS,
+            "description": "Optional bounded source chunk size; omit to use the safe default.",
         },
     },
     "required": ["view"],
@@ -285,9 +337,11 @@ _DOCUMENT_READ_SCHEMA: dict[str, Any] = {
 @tool(
     name="document_read",
     description=(
-        "Read a bounded canonical document view. Use view=structure for the semantic outline "
-        "or view=source for a UTF-8 page. Source pages are read-only and contain no edit "
-        "authority or offsets."
+        "Read the current bound Document, never a workspace copy. For the first source read, "
+        "call with view=source and omit cursor, or use cursor=\"\" only when the provider adapter "
+        "requires the field. Continue only with the exact nextCursor returned when hasMore is "
+        "true; never invent a non-empty cursor. Use view=structure for a semantic outline. "
+        "Source pages are read-only and contain no edit authority or offsets."
     ),
     params=_DOCUMENT_READ_SCHEMA,
     owner_only=True,
@@ -303,8 +357,11 @@ async def document_read(
 ) -> str:
     scope, ref, payload, adapter = await _html_adapter_scope("document_read")
     source = _decode_html(payload)
+    normalized_cursor = (
+        None if isinstance(cursor, str) and not cursor.strip() else cursor
+    )
     if view == "structure":
-        if cursor is not None:
+        if normalized_cursor is not None:
             raise SafeToolError("DOCUMENT_CURSOR_UNEXPECTED: Structure view has no cursor.")
         try:
             structure = adapter.read(source, view="structure")
@@ -335,10 +392,17 @@ async def document_read(
         adapter_version=adapter.adapter_version,
     )
     start = 0
-    if cursor is not None:
+    if normalized_cursor is not None:
         try:
-            start = registry.consume_cursor(binding=binding, token=cursor)
+            start = registry.consume_cursor(binding=binding, token=normalized_cursor)
         except ArtifactRangeGrantError as exc:
+            if exc.code == "ARTIFACT_CURSOR_INVALID":
+                try:
+                    document_grant_registry_for_context(scope.ctx).reserve_tool_attempt(
+                        attempt_key="document_read:invalid_cursor"
+                    )
+                except ArtifactRangeGrantError as guard_exc:
+                    raise _range_error(guard_exc) from None
             raise _range_error(exc) from None
     if start >= len(source):
         raise SafeToolError("DOCUMENT_CURSOR_INVALID: The cursor is past the document.")
@@ -383,16 +447,33 @@ async def document_read(
 _DOCUMENT_LOCATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "annotation_order": {"type": "integer", "minimum": 0},
+        "annotation_order": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The zero-based annotation order returned by document_inspect.",
+        },
         "operation": {
             "type": "string",
             "enum": sorted(DOCUMENT_SEMANTIC_OPERATIONS),
+            "description": (
+                "The one semantic operation to locate. Reuse a matching ready-target "
+                "initialLocations grant instead of calling document_locate."
+            ),
         },
-        "attribute_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "attribute_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Required only for set_attribute or remove_attribute.",
+        },
         "candidateSource": {
             "type": "string",
             "minLength": 1,
             "maxLength": 16384,
+            "description": (
+                "Only for a contextual selection after document_read. Provide one complete, "
+                "unique, source-backed opening tag. Omit for every ready selection."
+            ),
         },
     },
     "required": ["annotation_order", "operation"],
@@ -403,11 +484,13 @@ _DOCUMENT_LOCATE_SCHEMA: dict[str, Any] = {
 @tool(
     name="document_locate",
     description=(
-        "Locate one exact selected-document target for replace_text, set_attribute, "
-        "remove_attribute, set_style, or remove_node. Returns an opaque, turn-scoped grant; "
-        "never returns source offsets. Reuse an existing grant instead of locating the same "
-        "annotation and operation again. For set_style, apply only a CSS declaration list "
-        "such as 'color: #222; background-color: #fff;' without selectors, braces, or a "
+        "Locate one semantic mutation grant at most once. For a ready selection, first reuse a "
+        "matching document_inspect initialLocations grant; call this tool only for an "
+        "attribute-specific operation not prelocated there, and omit candidateSource. For a "
+        "contextual selection, first use document_read and then provide exactly one complete "
+        "opening tag as candidateSource. A not_found result is final for that selection and "
+        "operation: leave it unchanged and do not retry. Never submit source offsets. For "
+        "set_style, input is only a CSS declaration list without selectors, braces, or a "
         "style= wrapper."
     ),
     params=_DOCUMENT_LOCATE_SCHEMA,
@@ -446,14 +529,32 @@ async def document_locate(
     if not isinstance(scope.context, BoundPromptAnnotationContext):
         raise SafeToolError("No prompt annotations are bound to this document turn.")
     target = scope.context.targets[order]
+    document_registry = document_grant_registry_for_context(scope.ctx)
+    attempt_key = json.dumps(
+        [
+            "document_locate",
+            scope.document.document_id,
+            scope.revision.revision_id,
+            order,
+            operation,
+            attribute_name,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    try:
+        document_registry.reserve_tool_attempt(attempt_key=attempt_key)
+    except ArtifactRangeGrantError as exc:
+        raise _range_error(exc) from None
     source = _decode_html(payload)
     contextual_locator: object | None = None
     contextual_fingerprint: str | None = None
-    document_registry = document_grant_registry_for_context(scope.ctx)
     if target.status == "ready":
         if candidateSource is not None:
             raise SafeToolError(
-                "DOCUMENT_CANDIDATE_UNEXPECTED: This target is already located."
+                "DOCUMENT_CANDIDATE_UNEXPECTED: Omit candidateSource for a ready target. "
+                "Reuse a matching document_inspect initialLocations grant; if the operation "
+                "is listed as unavailable, leave the item unchanged and do not retry."
             )
     else:
         if not isinstance(candidateSource, str):
@@ -531,10 +632,17 @@ async def document_locate(
         {
             "status": "ok" if locations else "not_found",
             "annotationOrder": order,
+            "selectionStatus": target.status,
             "operation": operation,
             "attributeName": attribute_name,
             "locations": locations,
-            "retryAllowed": not locations,
+            "reasonCode": None if locations else "DOCUMENT_OPERATION_UNAVAILABLE",
+            "retryAllowed": False,
+            "nextAction": (
+                "apply_returned_grant"
+                if locations
+                else "leave_unchanged_and_explain_without_retry"
+            ),
             "remainingUniqueLocateQueries": remaining_queries,
         }
     )
@@ -570,8 +678,8 @@ _DOCUMENT_APPLY_SCHEMA: dict[str, Any] = {
     name="document_apply",
     description=(
         "Apply one atomic set of semantic mutations using opaque grants. "
-        "Each used grant must remain bound to a current selection. Validation, candidate "
-        "creation, CAS, revision, change set, and receipt are completed server-side."
+        "Each used grant must remain bound to a current selection. Validation and the atomic "
+        "document update are completed server-side."
     ),
     params=_DOCUMENT_APPLY_SCHEMA,
     owner_only=True,
@@ -674,16 +782,33 @@ _DOCUMENT_PATCH_SCHEMA: dict[str, Any] = {
         "expectedSha256": {
             "type": "string",
             "pattern": "^[0-9a-fA-F]{64}$",
+            "description": (
+                "Copy the exact sha256 returned by document_read for this bound Document. "
+                "Never invent it or use a workspace file hash."
+            ),
         },
         "edits": {
             "type": "array",
             "minItems": 1,
             "maxItems": _MAX_DOCUMENT_MUTATIONS,
+            "description": (
+                "Exact replacements in the current Document source returned by document_read."
+            ),
             "items": {
                 "type": "object",
                 "properties": {
-                    "expectedText": {"type": "string", "minLength": 1},
-                    "replacement": {"type": "string"},
+                    "expectedText": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "A non-empty exact source fragment read from this Document that "
+                            "occurs exactly once."
+                        ),
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "description": "The complete replacement for expectedText.",
+                    },
                 },
                 "required": ["expectedText", "replacement"],
                 "additionalProperties": False,
@@ -698,9 +823,11 @@ _DOCUMENT_PATCH_SCHEMA: dict[str, Any] = {
 @tool(
     name="document_patch",
     description=(
-        "Atomically patch the current bound HTML document. First call document_read with "
-        "view=source, then pass its sha256 and exact non-empty source fragments. Every "
-        "expectedText must occur exactly once; all edits apply together or none do."
+        "The only tool that updates the current bound HTML Document. First call document_read "
+        "with view=source and no cursor, then pass its returned sha256 and exact non-empty source "
+        "fragments. Every expectedText must occur exactly once; all edits apply together or none "
+        "do. write_file, edit_file, and apply_patch change workspace files and cannot replace "
+        "this operation."
     ),
     params=_DOCUMENT_PATCH_SCHEMA,
     owner_only=True,

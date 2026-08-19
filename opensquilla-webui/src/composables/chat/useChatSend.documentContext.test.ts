@@ -76,6 +76,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
       acknowledgeAcceptedOffscreen: vi.fn(),
       markStopRequested: vi.fn(),
       reconcileDurableMessages: vi.fn(),
+      resetTransientBoundaries: vi.fn(),
     } as UseChatSendOptions['steerDelivery'],
     popAllPendingIntoComposer: vi.fn(() => false),
     classifySlashCommand: vi.fn(async () => 'unknown' as const),

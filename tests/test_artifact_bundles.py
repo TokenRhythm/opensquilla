@@ -840,6 +840,75 @@ async def test_publish_artifact_defaults_to_auto_bundle_and_reports_partial(
     assert {item.path for item in manifest.files} == {"app.js", "index.html"}
 
 
+@pytest.mark.parametrize(
+    ("bundle", "bundle_root"),
+    [
+        ("none", ""),
+        ("none", " \t\r\n"),
+        ("auto", ""),
+        ("auto", " \t\r\n"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_artifact_treats_blank_optional_bundle_root_as_omitted(
+    tmp_path: Path,
+    bundle: str,
+    bundle_root: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "index.html").write_text("<p>entry</p>", encoding="utf-8")
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        result = json.loads(
+            await publish_artifact(
+                path="index.html",
+                bundle=bundle,
+                bundle_root=bundle_root,
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result["status"] == "published"
+    assert ("bundle" in result) is (bundle == "auto")
+
+
+@pytest.mark.parametrize("bundle", ["none", "auto"])
+@pytest.mark.asyncio
+async def test_publish_artifact_rejects_nonempty_bundle_root_outside_directory_mode(
+    tmp_path: Path,
+    bundle: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "index.html").write_text("<p>entry</p>", encoding="utf-8")
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="only valid with directory mode"):
+            await publish_artifact(
+                path="index.html",
+                bundle=bundle,
+                bundle_root=".",
+            )
+    finally:
+        current_tool_context.reset(token)
+
+
 @pytest.mark.asyncio
 async def test_publish_artifact_bundle_dedupe_includes_dependency_digest(
     tmp_path: Path,

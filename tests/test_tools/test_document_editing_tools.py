@@ -617,6 +617,17 @@ def test_restricted_document_toolset_is_exactly_four_tools() -> None:
     mutation_schema = writer.spec.parameters["properties"]["mutations"]["items"]
     assert set(mutation_schema["properties"]) == {"grant_token", "input"}
 
+    locator = registry.get("document_locate")
+    assert locator is not None
+    locator_properties = locator.spec.parameters["properties"]
+    assert "Reuse a matching ready-target" in locator_properties["operation"]["description"]
+    assert "Only for a contextual selection" in locator_properties["candidateSource"][
+        "description"
+    ]
+    assert "Omit for every ready selection" in locator_properties["candidateSource"][
+        "description"
+    ]
+
     patch_writer = registry.get("document_patch")
     assert patch_writer is not None
     assert patch_writer.spec.owner_only is True
@@ -725,6 +736,76 @@ async def test_bound_document_read_uses_call_time_head_after_context_binding(
         payload = json.loads(read.content)
         assert payload["sha256"] == committed.revision.artifact_sha256
         assert payload["chunk"]["text"] == updated_source.decode("utf-8")
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cursor", ["", " \t\r\n"])
+async def test_bound_document_first_read_accepts_provider_required_empty_cursor(
+    tmp_path: Path,
+    cursor: str,
+) -> None:
+    service, _store, source, ref, _created, ctx = await _bound_document_context(tmp_path)
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        read = await _call(
+            handler,
+            "document_read",
+            {"view": "source", "cursor": cursor},
+        )
+
+        assert read.is_error is False, read.content
+        payload = json.loads(read.content)
+        assert payload["sha256"] == ref.sha256
+        assert payload["chunk"]["text"] == source.decode("utf-8")
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_document_read_bounds_unissued_cursor_retries_without_blocking_valid_cursor(
+    tmp_path: Path,
+) -> None:
+    source = b"<main>" + (b"x" * 700) + b"</main>"
+    service, _store, _source, _ref, _created, ctx = await _bound_document_context(
+        tmp_path,
+        source=source,
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        first = await _call(
+            handler,
+            "document_read",
+            {"view": "source", "cursor": "", "max_chars": 256},
+        )
+        assert first.is_error is False, first.content
+        next_cursor = json.loads(first.content)["nextCursor"]
+        assert isinstance(next_cursor, str)
+
+        for suffix in ("a", "b"):
+            invalid = await _call(
+                handler,
+                "document_read",
+                {"view": "source", "cursor": "hcur_" + (suffix * 43)},
+            )
+            assert invalid.is_error is True
+            assert "ARTIFACT_CURSOR_INVALID" in invalid.content
+
+        continued = await _call(
+            handler,
+            "document_read",
+            {"view": "source", "cursor": next_cursor, "max_chars": 256},
+        )
+        assert continued.is_error is False, continued.content
+
+        stopped = await _call(
+            handler,
+            "document_read",
+            {"view": "source", "cursor": "hcur_" + ("c" * 43)},
+        )
+        assert stopped.is_error is True
+        assert "ARTIFACT_RANGE_QUERY_LIMIT" in stopped.content
     finally:
         await service.close()
 
@@ -844,8 +925,12 @@ async def test_contextual_locate_requires_read_and_allows_only_one_candidate(
             },
         )
         assert located.is_error is False, located.content
-        locations = json.loads(located.content)["locations"]
+        located_payload = json.loads(located.content)
+        locations = located_payload["locations"]
         assert len(locations) == 1
+        assert located_payload["selectionStatus"] == "contextual"
+        assert located_payload["retryAllowed"] is False
+        assert located_payload["nextAction"] == "apply_returned_grant"
 
         changed_candidate = await _call(
             handler,
@@ -876,6 +961,96 @@ async def test_contextual_locate_requires_read_and_allows_only_one_candidate(
             session_id=SESSION_ID,
         )
         assert path.read_bytes() == b'<main><button id="one">One</button></main>'
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_inspection_explains_grant_reuse_and_unavailable_operations(
+    tmp_path: Path,
+) -> None:
+    service, _store, _source, _ref, _created, _anchor, ctx = await _sent_img_context(
+        tmp_path
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        inspected = await _call(handler, "document_inspect", {})
+        assert inspected.is_error is False, inspected.content
+        payload = json.loads(inspected.content)
+        assert payload["protocol"] == {
+            "inspectAgain": False,
+            "readyTargets": "reuse_matching_initialLocations",
+            "contextualTargets": "document_read_then_document_locate_once",
+            "unsupportedOperations": "leave_unchanged_and_explain",
+        }
+        annotation = payload["annotations"][0]
+        assert annotation["selection"]["status"] == "ready"
+        assert annotation["grantPolicy"] == {
+            "reuseInitialLocations": True,
+            "candidateSource": "forbidden",
+            "availableInitialOperations": ["remove_node", "set_style"],
+            "unavailableInitialOperations": ["replace_text"],
+            "unsupportedOperationAction": "leave_unchanged_and_explain",
+        }
+
+        replay = await _call(handler, "document_inspect", {})
+        assert replay.is_error is False, replay.content
+        repeated = await _call(handler, "document_inspect", {})
+        assert repeated.is_error is True
+        assert "ARTIFACT_RANGE_QUERY_LIMIT" in repeated.content
+        assert "Reuse the earlier result" in repeated.content
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_locate_rejects_candidate_and_stops_deterministic_retries(
+    tmp_path: Path,
+) -> None:
+    service, _store, _source, _ref, _created, _anchor, ctx = await _sent_img_context(
+        tmp_path
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        candidate = '<img id="hero" src="photo.png">'
+        unexpected = await _call(
+            handler,
+            "document_locate",
+            {
+                "annotation_order": 0,
+                "operation": "replace_text",
+                "candidateSource": candidate,
+            },
+        )
+        assert unexpected.is_error is True
+        assert "DOCUMENT_CANDIDATE_UNEXPECTED" in unexpected.content
+        assert "Omit candidateSource for a ready target" in unexpected.content
+        assert "initialLocations" in unexpected.content
+
+        unsupported = await _call(
+            handler,
+            "document_locate",
+            {"annotation_order": 0, "operation": "replace_text"},
+        )
+        assert unsupported.is_error is False, unsupported.content
+        unsupported_payload = json.loads(unsupported.content)
+        assert unsupported_payload["status"] == "not_found"
+        assert unsupported_payload["selectionStatus"] == "ready"
+        assert unsupported_payload["reasonCode"] == "DOCUMENT_OPERATION_UNAVAILABLE"
+        assert unsupported_payload["retryAllowed"] is False
+        assert (
+            unsupported_payload["nextAction"]
+            == "leave_unchanged_and_explain_without_retry"
+        )
+
+        repeated = await _call(
+            handler,
+            "document_locate",
+            {"annotation_order": 0, "operation": "replace_text"},
+        )
+        assert repeated.is_error is True
+        assert "ARTIFACT_RANGE_QUERY_LIMIT" in repeated.content
+        assert "finish without calling it again" in repeated.content
     finally:
         await service.close()
 
