@@ -134,6 +134,7 @@ import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useConfirm } from '@/composables/useConfirm'
+import { useFilteredSessionPaging } from '@/composables/useFilteredSessionPaging'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
 import SessionsTaskInput from '@/components/sessions/SessionsTaskInput.vue'
@@ -201,6 +202,7 @@ const {
 
 const filter = ref<FilterId>('all')
 const search = ref('')
+const filteredPagingActive = ref(false)
 const agentNames = ref<Map<string, string>>(new Map())
 const agentsLoaded = ref(false)
 let agentsRequestGeneration = 0
@@ -240,6 +242,17 @@ const ledgerEntries = computed(() => {
   const visible = allSessions.value.filter(item =>
     matchesFilter(item, byKey) && (!query || sessionMatches(item, query)))
   return arrangeSessionLedger(visible)
+})
+
+useFilteredSessionPaging({
+  active: () => filteredPagingActive.value
+    && (filter.value !== 'all' || search.value.trim().length > 0),
+  visibleCount: () => ledgerEntries.value.length,
+  hasMore: () => hasMore.value,
+  isLoading: () => isLoading.value,
+  isLoadingMore: () => isLoadingMore.value,
+  hasError: () => loadMoreError.value,
+  loadMore: loadMoreSessions,
 })
 
 // The inspected row tracks the live session list by key so status flips keep
@@ -480,6 +493,7 @@ function teardownLive() {
 }
 
 onActivated(() => {
+  filteredPagingActive.value = true
   loadAll()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
@@ -494,8 +508,13 @@ onActivated(() => {
   pollTimer = setInterval(loadAll, FALLBACK_POLL_MS)
 })
 
-onDeactivated(teardownLive)
-onUnmounted(teardownLive)
+function deactivateView() {
+  filteredPagingActive.value = false
+  teardownLive()
+}
+
+onDeactivated(deactivateView)
+onUnmounted(deactivateView)
 </script>
 
 <style scoped>
