@@ -5500,6 +5500,17 @@ class SessionStorage:
             raise ValueError("model routing mode must be direct, router, or ensemble")
         return mode
 
+    @_serialized_read
+    async def _read_model_routing_state(self, session_key: str) -> Any:
+        async with self.conn.execute(
+            """
+            SELECT model_routing_mode, model_routing_revision
+            FROM sessions WHERE session_key = ?
+            """,
+            (session_key,),
+        ) as cur:
+            return await cur.fetchone()
+
     async def resolve_model_routing_mode(
         self,
         session_key: str,
@@ -5515,6 +5526,22 @@ class SessionStorage:
 
         session_key = canonicalize_session_key(session_key)
         fallback = self._normalize_model_routing_mode(fallback_mode)
+        row = await self._read_model_routing_state(session_key)
+        if row is None:
+            raise KeyError(f"Session not found: {session_key}")
+        raw_mode = row["model_routing_mode"]
+        revision = max(0, int(row["model_routing_revision"] or 0))
+        if raw_mode is not None:
+            return {
+                "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                "revision": revision,
+                "source": "session",
+                "initialized": False,
+            }
+
+        # Only legacy NULL rows require writer ownership. Re-read after taking
+        # that ownership because another process may have materialized the row
+        # between the read-only fast path and BEGIN IMMEDIATE.
         async with self._write_transaction("resolve_model_routing_mode") as conn:
             async with conn.execute(
                 """
@@ -5539,11 +5566,10 @@ class SessionStorage:
                 """
                 UPDATE sessions
                 SET model_routing_mode = ?,
-                    model_routing_revision = model_routing_revision + 1,
-                    updated_at = ?
+                    model_routing_revision = model_routing_revision + 1
                 WHERE session_key = ? AND model_routing_mode IS NULL
                 """,
-                (fallback, _now_ms(), session_key),
+                (fallback, session_key),
             ) as cur:
                 changed = cur.rowcount or 0
             if changed != 1:

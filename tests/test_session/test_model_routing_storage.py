@@ -21,7 +21,12 @@ async def test_legacy_mode_materializes_once_and_same_mode_retry_is_idempotent()
     try:
         key = "agent:main:webchat:routing-legacy"
         await storage.upsert_session(
-            SessionNode(session_key=key, session_id="routing-legacy", agent_id="main")
+            SessionNode(
+                session_key=key,
+                session_id="routing-legacy",
+                agent_id="main",
+                updated_at=100,
+            )
         )
 
         resolved = await storage.resolve_model_routing_mode(key, "router")
@@ -31,6 +36,9 @@ async def test_legacy_mode_materializes_once_and_same_mode_retry_is_idempotent()
             "source": "legacy_initialized",
             "initialized": True,
         }
+        initialized = await storage.get_session(key)
+        assert initialized is not None
+        assert initialized.updated_at == 100
         changed = await storage.set_model_routing_mode(
             key,
             "ensemble",
@@ -48,6 +56,65 @@ async def test_legacy_mode_materializes_once_and_same_mode_retry_is_idempotent()
         assert replay["revision"] == 2
         with pytest.raises(SessionRoutingConflictError):
             await storage.set_model_routing_mode(key, "direct", expected_revision=1)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_concrete_mode_resolution_never_opens_a_write_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    try:
+        manager = SessionManager(storage, model_routing_mode_provider=lambda: "router")
+        key = "agent:main:webchat:routing-read-only"
+        await manager.create(key)
+
+        async def fail_begin(*_args, **_kwargs) -> None:
+            raise AssertionError("a concrete routing mode must use the read-only path")
+
+        monkeypatch.setattr(storage, "_begin_immediate", fail_begin)
+        assert await storage.resolve_model_routing_mode(key, "direct") == {
+            "mode": "router",
+            "revision": 0,
+            "source": "session",
+            "initialized": False,
+        }
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_materialization_does_not_reorder_session_list() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    try:
+        legacy_key = "agent:main:webchat:routing-legacy-older"
+        recent_key = "agent:main:webchat:routing-recent"
+        await storage.upsert_session(
+            SessionNode(
+                session_key=legacy_key,
+                session_id="routing-legacy-older",
+                agent_id="main",
+                updated_at=100,
+            )
+        )
+        await storage.upsert_session(
+            SessionNode(
+                session_key=recent_key,
+                session_id="routing-recent",
+                agent_id="main",
+                updated_at=200,
+                model_routing_mode="direct",
+            )
+        )
+
+        await storage.resolve_model_routing_mode(legacy_key, "ensemble")
+
+        sessions = await storage.list_sessions()
+        assert [session.session_key for session in sessions] == [recent_key, legacy_key]
+        assert sessions[1].updated_at == 100
     finally:
         await storage.close()
 
