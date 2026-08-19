@@ -164,6 +164,17 @@ def classify_chat_input(
     surface: Surface = Surface.CLI_GATEWAY,
 ) -> TuiInputKind:
     """Classify chat input without leaking slash policy into the runtime."""
+    if (
+        surface is Surface.CLI_STANDALONE
+        and user_input.lstrip().lower().split(maxsplit=1)[0:1] == ["/routing"]
+    ):
+        # Standalone turns are queued in the local TUI before TurnRunner owns
+        # them, so they do not yet carry TaskRuntime's accepted routing
+        # snapshot.  Requiring an idle local queue prevents a later control
+        # write from overtaking an already accepted/queued prompt.  Gateway
+        # mode remains NEXT_TURN because its durable admission captures the
+        # snapshot before returning.
+        return TuiInputKind.COMMAND_REQUIRES_IDLE
     return map_slash_category(classify(user_input, surface=surface))
 
 

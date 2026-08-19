@@ -20,6 +20,17 @@ from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.commands import Surface
 
 
+def test_standalone_routing_waits_for_accepted_local_queue_to_drain() -> None:
+    assert (
+        classify_chat_input("/routing ensemble", surface=Surface.CLI_STANDALONE)
+        is TuiInputKind.COMMAND_REQUIRES_IDLE
+    )
+    assert (
+        classify_chat_input("/routing ensemble", surface=Surface.CLI_GATEWAY)
+        is TuiInputKind.CONTROL
+    )
+
+
 class _FakeSurface:
     def __init__(
         self,
