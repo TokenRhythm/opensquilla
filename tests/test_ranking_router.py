@@ -12,6 +12,7 @@ import weakref
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
+from datetime import date
 from importlib import resources
 from typing import Any
 
@@ -1649,7 +1650,7 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     }
 
     assert snapshot["snapshot_version"].startswith("curated-openrouter-step2-")
-    assert len(snapshot["models"]) == 79
+    assert len(snapshot["models"]) == 80
     assert len(set(model_ids)) == len(model_ids)
     assert mistral_statuses == {model_id: "disabled" for model_id in _MISTRAL_MODEL_IDS}
     assert {
@@ -1672,6 +1673,8 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         "qwen/qwen3.6-27b",
         "inclusionai/ling-2.6-1t",
         "openai/gpt-oss-20b",
+        "qwen/qwen3.5-9b",
+        "qwen/qwen3.5-122b-a10b",
     }.issubset(model_ids)
     for model in snapshot["models"]:
         facts = model["registry_facts"]
@@ -1689,7 +1692,8 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         assert set(thinking_levels) <= set(THINKING_LEVELS)
         assert model["runtime"]["thinking"] == thinking_levels[0]
         assert facts["supports_reasoning"] is any(level != "off" for level in thinking_levels)
-        assert facts["catalog_verified_at"] == "2026-07-24"
+        verified_at = date.fromisoformat(facts["catalog_verified_at"])
+        assert date(2026, 7, 24) <= verified_at <= date(2026, 8, 20)
         assert facts["latency_source"] == "curated_estimate"
         assert set(model["static_profile"]["capability_dist_prior"]) == set(CAPABILITIES)
         assert set(model["static_profile"]["domain_dist_prior"]) == set(DOMAINS)
@@ -1700,8 +1704,49 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     curated_models = [
         model for model in snapshot["models"] if model["source"] == "curated_openrouter_profile"
     ]
-    assert len(curated_models) == 79
+    assert len(curated_models) == 80
     by_model_id = {model["registry_facts"]["model_id"]: model for model in curated_models}
+    qwen_9b = by_model_id["qwen/qwen3.5-9b"]
+    qwen_122b = by_model_id["qwen/qwen3.5-122b-a10b"]
+    expected_qwen_9b_facts = {
+        "version": "qwen/qwen3.5-9b-20260310",
+        "provider": "openrouter",
+        "context_window": 262144,
+        "modalities": ["text", "image", "video"],
+        "price": {"input_per_million": 0.1, "output_per_million": 0.15},
+        "supports_reasoning": True,
+        "supports_tools": True,
+        "supported_thinking_levels": ["high", "off"],
+        "catalog_verified_at": "2026-08-20",
+    }
+    assert {
+        key: qwen_9b["registry_facts"][key] for key in expected_qwen_9b_facts
+    } == expected_qwen_9b_facts
+    expected_qwen_122b_facts = {
+        "version": "qwen/qwen3.5-122b-a10b-20260224",
+        "provider": "openrouter",
+        "context_window": 262144,
+        "price": {"input_per_million": 0.26, "output_per_million": 2.08},
+        "supports_reasoning": True,
+        "supports_tools": True,
+        "supported_thinking_levels": ["high", "off"],
+        "catalog_verified_at": "2026-08-20",
+    }
+    assert {
+        key: qwen_122b["registry_facts"][key] for key in expected_qwen_122b_facts
+    } == expected_qwen_122b_facts
+    assert qwen_9b["runtime"]["thinking"] == qwen_122b["runtime"]["thinking"] == "high"
+    for prior_name in (
+        "capability_dist_prior",
+        "domain_dist_prior",
+        "tier_dist_prior",
+        "role_fit_prior",
+    ):
+        assert all(
+            value <= qwen_122b["static_profile"][prior_name][key]
+            for key, value in qwen_9b["static_profile"][prior_name].items()
+        )
+    assert qwen_9b["registry_facts"]["latency_p95_ms"] > qwen_9b["registry_facts"]["latency_p50_ms"]
     assert by_model_id["z-ai/glm-5.2"]["registry_facts"]["price"] == {
         "input_per_million": 1.4,
         "output_per_million": 4.4,
@@ -1812,12 +1857,12 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     frozen = ranking_router._legacy_registry_snapshot_projection(historical)
 
     assert current["snapshot_version"].startswith(
-        "curated-openrouter-step2-2026-08-19.1-reliability-"
+        "curated-openrouter-step2-2026-08-20.1-reliability-"
     )
     assert "role_reliability_snapshot" in current
     provenance = current["role_reliability_snapshot"]
     assert provenance["schema_version"] == "role-reliability-snapshot-v2"
-    assert provenance["base_snapshot_version"] == ("curated-openrouter-step2-2026-08-19.1")
+    assert provenance["base_snapshot_version"] == ("curated-openrouter-step2-2026-08-20.1")
     assert provenance["observation_policy"] == "aef-physical-model-calls-v5"
     assert provenance["completion_gate"] == "manual_thresholded_draco_audit"
     assert set(provenance) == {
@@ -1988,9 +2033,9 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
     )
     current_base = load_model_registry_snapshot(
-        base_version="curated-openrouter-step2-2026-08-19.1"
+        base_version="curated-openrouter-step2-2026-08-20.1"
     )
-    assert current_base["snapshot_version"] == "curated-openrouter-step2-2026-08-19.1"
+    assert current_base["snapshot_version"] == "curated-openrouter-step2-2026-08-20.1"
     assert current_base["models"] == [
         {
             **row,
@@ -2002,6 +2047,38 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         }
         for row in current["models"]
     ]
+    pre_qwen35_9b_base = load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-08-19.1"
+    )
+    assert pre_qwen35_9b_base["snapshot_version"] == ("curated-openrouter-step2-2026-08-19.1")
+    assert len(pre_qwen35_9b_base["models"]) == 79
+    assert canonical_json_sha256(pre_qwen35_9b_base) == (
+        "3f17f3169034af15829c5162e5590a03316eff821eac9e1dd9d31e745fe84681"
+    )
+    assert "qwen/qwen3.5-9b" not in {
+        row["registry_facts"]["model_id"] for row in pre_qwen35_9b_base["models"]
+    }
+    pre_qwen35_9b_full = load_model_registry_snapshot(
+        base_version=(
+            "curated-openrouter-step2-2026-08-19.1-reliability-20260818T121632Z-01580c6982b4"
+        )
+    )
+    archived_pre_qwen35_9b = json.loads(
+        resources.files("opensquilla.provider")
+        .joinpath("router_dynamic_model_profiles_20260819_01580c6982b4.json")
+        .read_text(encoding="utf-8")
+    )
+    assert pre_qwen35_9b_full == archived_pre_qwen35_9b
+    assert canonical_json_sha256(pre_qwen35_9b_full) == (
+        "2ed00a4d7053ac771e31b4651b55f3a0c2b53e7217fe3c76006e42e5181d9beb"
+    )
+    pre_qwen35_9b_by_model = {
+        row["registry_facts"]["model_id"]: row for row in pre_qwen35_9b_base["models"]
+    }
+    assert (
+        pre_qwen35_9b_by_model["qwen/qwen3.5-122b-a10b"]["registry_facts"]["catalog_verified_at"]
+        == "2026-07-24"
+    )
     pre_status_base = load_model_registry_snapshot(
         base_version="curated-openrouter-step2-2026-08-18.2"
     )
@@ -2202,8 +2279,8 @@ def test_historical_registry_base_accepts_versioned_reliability_provenance(
     current["role_reliability_snapshot"]["schema_version"] = schema_version
     monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: current)
 
-    historical = load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
-    assert historical["snapshot_version"] == "curated-openrouter-step2-2026-07-31.1"
+    historical = load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-08-20.1")
+    assert historical["snapshot_version"] == "curated-openrouter-step2-2026-08-20.1"
 
 
 @pytest.mark.parametrize(
@@ -2229,7 +2306,7 @@ def test_historical_registry_base_rejects_unauthenticated_provenance(
     monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: current)
 
     with pytest.raises(DynamicRankingError, match=message):
-        load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-07-31.1")
+        load_model_registry_snapshot(base_version="curated-openrouter-step2-2026-08-20.1")
 
 
 def test_registry_base_selector_rejects_unallowlisted_version() -> None:

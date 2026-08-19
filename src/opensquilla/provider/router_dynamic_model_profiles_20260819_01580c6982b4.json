@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-08-20.1-reliability-20260818T121632Z-519ac973e9da",
+  "snapshot_version": "curated-openrouter-step2-2026-08-19.1-reliability-20260818T121632Z-01580c6982b4",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -6512,7 +6512,7 @@
         "health": "healthy",
         "is_open_source": true,
         "is_chinese_model": true,
-        "catalog_verified_at": "2026-08-20",
+        "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
         "supports_tools": true,
@@ -6578,129 +6578,6 @@
           "format_error": 0.05,
           "tool_error": 0.07,
           "timeout": 0.04
-        },
-        "source": "curated_estimate",
-        "role_reliability": {
-          "window_size": 50,
-          "proposer": {
-            "success": 0,
-            "failure": 0
-          },
-          "aggregator": {
-            "success": 0,
-            "failure": 0
-          },
-          "source": "legacy_statistics_invalidated"
-        }
-      }
-    },
-    {
-      "source": "curated_openrouter_profile",
-      "runtime": {
-        "thinking": "high"
-      },
-      "registry_facts": {
-        "model_id": "qwen/qwen3.5-9b",
-        "version": "qwen/qwen3.5-9b-20260310",
-        "provider": "openrouter",
-        "vendor": "qwen",
-        "family": "qwen3",
-        "status": "enabled",
-        "roles": [
-          "proposer",
-          "aggregator"
-        ],
-        "context_window": 262144,
-        "effective_context_bucket": "extra_long",
-        "modalities": [
-          "text",
-          "image",
-          "video"
-        ],
-        "tools": [
-          "code_execution",
-          "web_search",
-          "retrieval",
-          "file_system",
-          "api_call"
-        ],
-        "price": {
-          "input_per_million": 0.1,
-          "output_per_million": 0.15
-        },
-        "latency_p50_ms": 1000,
-        "latency_p95_ms": 3000,
-        "quota": "available",
-        "rate_limit": "available",
-        "health": "healthy",
-        "is_open_source": true,
-        "is_chinese_model": true,
-        "catalog_verified_at": "2026-08-20",
-        "latency_source": "curated_estimate",
-        "supports_reasoning": true,
-        "supports_tools": true,
-        "supported_thinking_levels": [
-          "high",
-          "off"
-        ],
-        "thinking_levels": [
-          "high"
-        ],
-        "thinking_level_mapping": {
-          "high": "high"
-        }
-      },
-      "static_profile": {
-        "capability_dist_prior": {
-          "reasoning": 0.68,
-          "code_generation": 0.69,
-          "code_review": 0.64,
-          "tool_use": 0.64,
-          "planning": 0.64,
-          "retrieval": 0.59,
-          "summarization": 0.67,
-          "writing": 0.67,
-          "math": 0.65,
-          "data_analysis": 0.64,
-          "visual_understanding": 0.66,
-          "audio_understanding": 0.05,
-          "long_context": 0.73,
-          "format_following": 0.7,
-          "safety_judgment": 0.58
-        },
-        "domain_dist_prior": {
-          "software_engineering": 0.65,
-          "data_science": 0.65,
-          "document_processing": 0.66,
-          "business_analysis": 0.64,
-          "creative_writing": 0.68,
-          "education": 0.66,
-          "research": 0.63,
-          "customer_support": 0.66,
-          "legal": 0.54,
-          "finance": 0.56,
-          "medical": 0.52,
-          "technical_writing": 0.66,
-          "general": 0.68
-        },
-        "tier_dist_prior": {
-          "1": 0.88,
-          "2": 0.78,
-          "3": 0.64,
-          "4": 0.48
-        },
-        "role_fit_prior": {
-          "proposer": 0.69,
-          "aggregator": 0.62
-        }
-      },
-      "online_profile": {
-        "error_rates": {
-          "hallucination": 0.12,
-          "omission": 0.14,
-          "format_error": 0.07,
-          "tool_error": 0.1,
-          "timeout": 0.05
         },
         "source": "curated_estimate",
         "role_reliability": {
@@ -9855,10 +9732,10 @@
   "role_reliability_snapshot": {
     "schema_version": "role-reliability-snapshot-v2",
     "generated_at": "2026-08-18T12:16:32+00:00",
-    "base_snapshot_version": "curated-openrouter-step2-2026-08-20.1",
+    "base_snapshot_version": "curated-openrouter-step2-2026-08-19.1",
     "window_size": 50,
     "observation_policy": "aef-physical-model-calls-v5",
     "completion_gate": "manual_thresholded_draco_audit",
-    "content_sha256": "519ac973e9da3d36266d293782a90627fbf87a28393f8731ef36dff118e0644a"
+    "content_sha256": "01580c6982b49de8d13fc65c6f323f8b1754a0083ea19b6a10a0fbfd5581c2fc"
   }
 }

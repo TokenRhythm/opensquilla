@@ -41,6 +41,8 @@ OPENROUTER_DEFAULT_PROVIDER_ROUTING = {
     "openai/gpt-5.6-luna": "openai",
     "poolside/laguna-xs-2.1": "poolside",
     "qwen/qwen3-coder-plus": "alibaba",
+    "qwen/qwen3.5-9b": "siliconflow",
+    "qwen/qwen3.5-122b-a10b": "alibaba",
     "qwen/qwen3.7-plus": "alibaba",
     "qwen/qwen3.7-max": "alibaba",
     "qwen/qwen3.8-max": "alibaba",

@@ -299,7 +299,7 @@ def test_formal_routes_are_a_valid_subset_of_router_dynamic_registry() -> None:
     payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     registry_models = {str(row["registry_facts"]["model_id"]) for row in payload["models"]}
 
-    assert len(registry_models) == 79
+    assert len(registry_models) == 80
     assert set(validator.FORMAL_EXPECTED_ROUTES) <= registry_models
     assert set(validator.B2_EXPECTED_ROUTES) <= set(validator.FORMAL_EXPECTED_ROUTES)
     experiment = load_draco_experiment_config(validator.DEFAULT_EXPERIMENT_CONFIG_PATH).config
@@ -345,7 +345,7 @@ def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
             )
         )
     if candidate_scope == "registry_all":
-        payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        payload = validator.formal_registry_snapshot(experiment.g1_routing)
         registry_models = {
             str(row["registry_facts"]["model_id"])
             for row in payload["models"]

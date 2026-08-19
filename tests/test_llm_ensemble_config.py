@@ -1210,7 +1210,7 @@ def test_router_dynamic_uses_structured_candidates_with_source() -> None:
     assert all(candidate["model"] != "disabled/model" for candidate in pool)
 
 
-def test_router_dynamic_registry_all_uses_every_packaged_model_by_default() -> None:
+def test_router_dynamic_registry_all_uses_every_frozen_source_model() -> None:
     experiment = load_draco_experiment_config(
         ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
     ).config
@@ -1243,9 +1243,12 @@ def test_router_dynamic_registry_all_uses_every_packaged_model_by_default() -> N
     plan = provider.selection_plan
     assert provider._provider_health_ledger is None
     assert "runtime_health_filter" not in plan
+    source_registry = load_model_registry_snapshot(
+        base_version=experiment.g1_routing.source_registry_snapshot_version
+    )
     expected = {
         f"openrouter:{row['registry_facts']['model_id']}"
-        for row in load_model_registry_snapshot()["models"]
+        for row in source_registry["models"]
     }
     assert plan["candidate_pool_size"] == len(expected)
     assert {row["identity"] for row in plan["candidate_pool"]} == expected
@@ -1352,8 +1355,11 @@ def test_router_dynamic_explicit_registry_allowlist_still_filters_pool() -> None
     assert plan["candidate_pool_size"] == len(routes)
     assert {row["identity"] for row in plan["candidate_pool"]} == expected
     assert plan["candidate_allowlist"]["policy"] == "exact_openrouter_routes"
+    source_registry = load_model_registry_snapshot(
+        base_version=experiment.g1_routing.source_registry_snapshot_version
+    )
     assert plan["candidate_allowlist"]["excluded_candidate_count"] == (
-        len(load_model_registry_snapshot()["models"]) - len(routes)
+        len(source_registry["models"]) - len(routes)
     )
 
 
