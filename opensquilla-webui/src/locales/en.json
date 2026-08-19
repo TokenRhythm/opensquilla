@@ -253,7 +253,7 @@
       "downloadOnlyDetail": "In-app preview and editing are not available for this file type.",
       "noEditingClaim": "No changes will be presented as applied until a compatible editor is enabled.",
       "noVersions": "No version history is available yet.",
-      "noChanges": "No Agent change sets are available yet.",
+      "noChanges": "No page changes are available yet.",
       "noComments": "No comments are available yet.",
       "commentsUnavailable": "Comments are not enabled for this artifact.",
       "versionNumber": "Version {generation}",

@@ -7026,37 +7026,6 @@ class Agent:
         # on the mutation-only finalizer.
         document_mutation_attempted = False
 
-        def _safe_annotation_instruction(value: object) -> str | None:
-            if not isinstance(value, str):
-                return None
-            text = " ".join(value.split()).strip()
-            if not text:
-                return None
-            text = re.sub(r"\b(?:hrg|dgr)_[A-Za-z0-9_-]+\b", "[reference]", text)
-            text = re.sub(r"<[^>]{1,500}>", "[selected element]", text)
-            text = re.sub(
-                r"(?:[A-Za-z]:\\|/)[^\s]+",
-                "[referenced location]",
-                text,
-            )
-            for forbidden in (
-                "document_apply",
-                "document_patch",
-                "document_inspect",
-                "document_locate",
-                "document_read",
-                "offset",
-                "path",
-                "源码",
-            ):
-                text = re.sub(
-                    re.escape(forbidden),
-                    "[implementation detail]",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-            return text[:1000]
-
         def _document_mutation_response_locale() -> str:
             configured = str(
                 self.config.metadata.get("locale")
@@ -7085,16 +7054,6 @@ class Agent:
             return configured
 
         def _document_mutation_finalization_request() -> list[Message]:
-            instructions: list[str] = []
-            artifact_context = getattr(self._tool_context, "artifact_context", None)
-            snapshots = getattr(artifact_context, "snapshots", ())
-            if isinstance(snapshots, (list, tuple)):
-                for snapshot in snapshots[:16]:
-                    if not isinstance(snapshot, Mapping):
-                        continue
-                    instruction = _safe_annotation_instruction(snapshot.get("body"))
-                    if instruction:
-                        instructions.append(instruction)
             raw_outcome = dict(document_mutation_outcome or {})
             if not raw_outcome:
                 raw_outcome = {
@@ -7104,31 +7063,10 @@ class Agent:
                     "retryPolicy": "new_turn",
                     "code": "document_mutation_not_proposed",
                 }
-            safe_outcome_keys = {
-                "version",
-                "status",
-                "phase",
-                "retryPolicy",
-                "code",
-                "corrected",
-                "proposalAttempts",
-                "refreshRequired",
-            }
-            outcome = {
-                key: value
-                for key, value in raw_outcome.items()
-                if key in safe_outcome_keys
-                and isinstance(value, (str, int, float, bool))
-            }
             requested_locale = _document_mutation_response_locale()
             payload = {
-                "userInstructions": instructions,
-                "documentMutationOutcome": outcome,
-                "responseLocale": requested_locale,
-                "responseInstruction": (
-                    "Give one concise final response in the user's language. "
-                    "Treat the mutation outcome as authoritative."
-                ),
+                "language": requested_locale,
+                "status": str(raw_outcome.get("status") or "not_attempted"),
             }
             return [
                 Message(
@@ -9401,9 +9339,19 @@ class Agent:
                                     if reasoning_end is not None:
                                         yield reasoning_end
                                 assistant_text_parts.append(raw_ev.text)
-                                if raw_ev.text:
+                                buffer_document_finalizer = bool(
+                                    document_mutation_finalization_pending
+                                    and document_mutation_finalization_attempted
+                                )
+                                if raw_ev.text and not buffer_document_finalizer:
                                     attempt_user_visible_emitted = True
                                     attempt_irreversible_output_emitted = True
+                                if buffer_document_finalizer:
+                                    # A mutation finalizer is an untrusted presentation
+                                    # call. Hold its complete response behind the runtime
+                                    # boundary; only the authoritative localized outcome
+                                    # below may reach clients or transcript history.
+                                    continue
                                 if text_presentation_decided:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
@@ -13418,6 +13366,30 @@ class Agent:
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = assembled_text
+                if (
+                    document_mutation_finalization_pending
+                    and document_mutation_finalization_attempted
+                ):
+                    from opensquilla.engine.silent_reply import normalize_silent_reply
+
+                    if normalize_silent_reply(
+                        assembled_text,
+                        run_kind="human",
+                    ).suppressed:
+                        yield WarningEvent(
+                            code="document_mutation_finalization_degraded",
+                            message=(
+                                "The document outcome was preserved, but its generated "
+                                "summary used a deterministic localized fallback."
+                            ),
+                        )
+                    visible_text = _document_mutation_fallback_text()
+                    assistant_text_parts[:] = [visible_text]
+                    yield TextDeltaEvent(
+                        text=visible_text,
+                        presentation="answer",
+                        generation_epoch=generation_epoch,
+                    )
                 if text_only_tool_recovery_pending:
                     text_only_mode = getattr(
                         self.config,

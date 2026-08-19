@@ -103,30 +103,34 @@ def _safe_artifact_dispatch_failure(
         error=str(exc),
         exc_info=exc,
     )
+    # A transport failure after a write handler started is an unknown outcome,
+    # even when the transport itself is currently unavailable.  Preserve the
+    # original request identity so the client can resolve/replay it exactly;
+    # classifying it as a fresh availability failure could duplicate a write.
     code = (
         "INVALID_REQUEST"
         if invalid_request
-        else "DOCUMENT_UNAVAILABLE"
-        if unavailable
         else "MUTATION_OUTCOME_PENDING"
         if may_have_applied
+        else "DOCUMENT_UNAVAILABLE"
+        if unavailable
         else "INTERNAL_ERROR"
     )
     message = (
         _ARTIFACT_INVALID_REQUEST_MESSAGE
         if invalid_request
-        else _ARTIFACT_DOCUMENT_UNAVAILABLE_MESSAGE
-        if unavailable
         else _ARTIFACT_OUTCOME_PENDING_MESSAGE
         if may_have_applied
+        else _ARTIFACT_DOCUMENT_UNAVAILABLE_MESSAGE
+        if unavailable
         else _ARTIFACT_INTERNAL_ERROR_MESSAGE
     )
     return make_error_res(
         req_id,
         code,
         message,
-        retryable=unavailable,
-        accepted=None if may_have_applied and not invalid_request and not unavailable else False,
+        retryable=unavailable and not may_have_applied,
+        accepted=None if may_have_applied and not invalid_request else False,
         details={"correlationId": correlation_id},
     )
 

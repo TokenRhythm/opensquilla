@@ -207,6 +207,19 @@ interface ActivitySemantic {
   footprintKind: 'web' | 'file' | 'command' | 'artifact' | 'memory' | 'tool'
 }
 
+const INTERNAL_MUTATION_PRESENTATION_MARKERS = [
+  'theuserinstructions',
+  'userinstructions',
+  'documentmutationoutcome',
+  'responseinstruction',
+  'responselocale',
+]
+
+function containsInternalMutationPresentation(text: string): boolean {
+  const compact = text.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  return INTERNAL_MUTATION_PRESENTATION_MARKERS.some(marker => compact.includes(marker))
+}
+
 const LIFECYCLE_CODES: Record<AssistantActivityLifecycle, AssistantActivityLifecycleCode> = {
   working: 'chat.activity.lifecycle.working',
   answering: 'chat.activity.lifecycle.answering',
@@ -1125,11 +1138,27 @@ export function projectAssistantActivity(
   fallbackToolItems: ChatStreamTimelineItem[] = [],
   options: ProjectAssistantActivityOptions = {},
 ): AssistantActivityProjection {
-  const timeline = message.timelineItems?.length
+  const sourceTimeline = message.timelineItems?.length
     ? message.timelineItems
     : fallbackToolItems
+  const mutationPresentationText = [
+    String(message.text || ''),
+    ...sourceTimeline.flatMap(item =>
+      item.type === 'text' && typeof item.rawText === 'string' ? [item.rawText] : [],
+    ),
+  ].join('\n')
+  const hideInternalMutationPresentation = Boolean(
+    message.turnOutcome?.documentMutationOutcome
+    && containsInternalMutationPresentation(mutationPresentationText),
+  )
+  const timeline = hideInternalMutationPresentation
+    ? sourceTimeline.filter(item => item.type !== 'text')
+    : sourceTimeline
+  const presentationMessage = hideInternalMutationPresentation
+    ? { ...message, text: '' }
+    : message
   const lifecycle = options.lifecycle ?? 'settled'
-  const answerResolution = resolveAssistantAnswer(message, timeline, lifecycle)
+  const answerResolution = resolveAssistantAnswer(presentationMessage, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
   const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText

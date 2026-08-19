@@ -410,6 +410,50 @@ async def test_committed_mutation_gets_real_outcome_only_tools_disabled_finaliza
 
 
 @pytest.mark.asyncio
+async def test_mutation_finalizer_cannot_stream_internal_protocol_echo() -> None:
+    leaked_prefix = (
+        'TheUserInstructions {"documentMutationOutcome": '
+        '{"status": "applied"}} User(internal control text)'
+    )
+    provider = _ScriptedMutationProvider(
+        [
+            _tool_call_events("apply-contained", {"mutations": []}),
+            [
+                ProviderTextDeltaEvent(text=leaked_prefix),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
+
+    events = [event async for event in _agent(provider, controller, handler).run_turn("edit")]
+    done = next(event for event in events if event.kind == "done")
+    streamed_text = "".join(
+        event.text for event in events if event.kind == "text_delta"
+    )
+    finalization_payload = json.loads(provider.calls[1]["messages"][0].content)
+
+    assert finalization_payload == {"language": "en", "status": "applied"}
+    assert done.text == "The document changes were applied."
+    assert streamed_text == done.text
+    for forbidden in ("TheUserInstructions", "documentMutationOutcome", "internal control"):
+        assert forbidden not in streamed_text
+        assert forbidden not in done.text
+
+
+@pytest.mark.asyncio
 async def test_additive_document_patch_uses_same_guarded_writer_lifecycle() -> None:
     provider = _ScriptedMutationProvider(
         [
@@ -600,7 +644,7 @@ async def test_outcome_only_finalization_includes_bounded_response_locale() -> N
     ]
 
     finalization_payload = json.loads(provider.calls[1]["messages"][0].content)
-    assert finalization_payload["responseLocale"] == "zh-Hans"
+    assert finalization_payload["language"] == "zh-Hans"
 
 
 @pytest.mark.asyncio
@@ -1276,5 +1320,5 @@ async def test_finalization_prefers_the_annotation_turn_language_over_ui_locale(
 
     assert provider.calls[1]["tools"] is None
     finalization_payload = json.loads(provider.calls[1]["messages"][0].content)
-    assert finalization_payload["responseLocale"] == "zh-Hans"
+    assert finalization_payload["language"] == "zh-Hans"
     assert done.text == "文档修改已成功应用。"

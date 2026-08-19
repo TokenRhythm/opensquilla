@@ -8,7 +8,7 @@ import ja from '@/locales/ja.json'
 import zhHans from '@/locales/zh-Hans.json'
 import { promptAnnotationTargetLabel } from './promptAnnotationPresentation'
 
-const FORBIDDEN_PRODUCT_LANGUAGE = /(?:\bstale\b|\breceipt\b|\breconciliation\b|EditSession|sha256|changeSet|actorId|working copy|immutable snapshot|protocol-v3|(?:native|trusted) editor|opaque sandbox|document_apply|<\/?[a-z][^>]*>)/i
+const FORBIDDEN_PRODUCT_LANGUAGE = /(?:\bstale\b|\breceipt\b|\breconciliation\b|EditSession|sha256|change[ -]?sets?|actorId|working copy|immutable snapshot|protocol-v3|(?:native|trusted) editor|opaque sandbox|document_apply|<\/?[a-z][^>]*>)/i
 
 function strings(value: unknown): string[] {
   if (typeof value === 'string') return [value]

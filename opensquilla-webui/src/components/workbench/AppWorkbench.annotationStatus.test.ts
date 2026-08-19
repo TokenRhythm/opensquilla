@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import appWorkbenchSource from './AppWorkbench.vue?raw'
 
 describe('AppWorkbench annotation mode status', () => {
-  it('renders a visible, live status only for the active annotation toolbar action', () => {
+  it('renders live guidance only for the active annotation toolbar action', () => {
     expect(appWorkbenchSource).toContain(
       'v-if="isActiveAnnotationToolbarItem(toolbarItem)"',
     )
@@ -15,10 +15,6 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain(
       "t('workbench.artifactAnnotation.selectElement')",
     )
-    expect(appWorkbenchSource).toContain(
-      "t('workbench.artifactAnnotation.selectElementShort')",
-    )
-
     const predicateStart = appWorkbenchSource.indexOf(
       'function isActiveAnnotationToolbarItem',
     )
@@ -32,6 +28,16 @@ describe('AppWorkbench annotation mode status', () => {
   it('associates the active toggle with the visible guidance', () => {
     expect(appWorkbenchSource).toContain(':aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)')
     expect(appWorkbenchSource).toContain("? 'workbench-annotation-mode-status'")
+  })
+
+  it('uses the workbench container width and preserves fixed-size toolbar actions', () => {
+    expect(appWorkbenchSource).toContain('@container (max-width: 520px)')
+    expect(appWorkbenchSource).toMatch(
+      /@container \(max-width: 520px\)[\s\S]*\.app-workbench__annotation-mode-status\s*\{\s*display: none;/,
+    )
+    expect(appWorkbenchSource).toContain('flex: 0 0 30px')
+    expect(appWorkbenchSource).not.toContain('@media (max-width: 600px)')
+    expect(appWorkbenchSource).not.toContain('app-workbench__annotation-mode-status-short')
   })
 
   it('refreshes mounted document metadata after state events and reconnects', () => {

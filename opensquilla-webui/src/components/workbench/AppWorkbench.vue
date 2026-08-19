@@ -68,9 +68,6 @@
           <span class="app-workbench__annotation-mode-status-full" aria-hidden="true">
             {{ t('workbench.artifactAnnotation.selectElement') }}
           </span>
-          <span class="app-workbench__annotation-mode-status-short" aria-hidden="true">
-            {{ t('workbench.artifactAnnotation.selectElementShort') }}
-          </span>
         </span>
         <span
           v-if="toolbarItem.kind === 'status'"
@@ -1319,6 +1316,7 @@ onBeforeUnmount(() => {
   display: inline-flex;
   width: 30px;
   height: 30px;
+  flex: 0 0 30px;
   align-items: center;
   justify-content: center;
   padding: 0;
@@ -1384,6 +1382,7 @@ onBeforeUnmount(() => {
   min-width: 0;
   max-width: min(220px, 30vw);
   height: 28px;
+  flex: 0 1 220px;
   align-items: center;
   padding: 0 var(--sp-2);
   border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
@@ -1394,15 +1393,10 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
-.app-workbench__annotation-mode-status-full,
-.app-workbench__annotation-mode-status-short {
+.app-workbench__annotation-mode-status-full {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.app-workbench__annotation-mode-status-short {
-  display: none;
 }
 
 .app-workbench__warning {
@@ -1430,9 +1424,9 @@ onBeforeUnmount(() => {
   font-size: var(--fs-sm);
 }
 
-@media (max-width: 600px) {
+@container (max-width: 520px) {
   .app-workbench__switcher {
-    width: min(128px, 35vw);
+    width: min(128px, 35cqw);
   }
 
   .app-workbench__warning span {
@@ -1440,15 +1434,7 @@ onBeforeUnmount(() => {
   }
 
   .app-workbench__annotation-mode-status {
-    max-width: min(96px, 25vw);
-  }
-
-  .app-workbench__annotation-mode-status-full {
     display: none;
-  }
-
-  .app-workbench__annotation-mode-status-short {
-    display: inline;
   }
 }
 </style>

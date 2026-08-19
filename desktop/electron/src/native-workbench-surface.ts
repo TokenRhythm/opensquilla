@@ -538,26 +538,36 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
     }
     footer {
       display: flex;
+      min-width: 0;
       align-items: center;
       justify-content: flex-end;
       gap: 8px;
     }
     .annotation-shortcut-hint {
+      min-width: 0;
+      overflow: hidden;
       margin: 0 auto 0 0;
       color: var(--text-dim);
       font-size: 10px;
       line-height: 1;
+      text-overflow: ellipsis;
       white-space: nowrap;
     }
     button {
+      flex: 0 0 auto;
       min-width: 56px;
+      max-width: 124px;
       height: 32px;
+      overflow: hidden;
       padding: 0 11px;
       border: 1px solid transparent;
       border-radius: 8px;
       outline: none;
       font: inherit;
       font-weight: 600;
+      line-height: 1;
+      text-overflow: ellipsis;
+      white-space: nowrap;
       cursor: pointer;
       transition: background 120ms cubic-bezier(.2, 0, 0, 1),
         border-color 120ms cubic-bezier(.2, 0, 0, 1),
@@ -565,6 +575,7 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
     }
     button:focus-visible { box-shadow: 0 0 0 3px var(--focus-ring); }
     #annotation-cancel {
+      max-width: 88px;
       border-color: var(--border);
       background: transparent;
       color: var(--text-muted);

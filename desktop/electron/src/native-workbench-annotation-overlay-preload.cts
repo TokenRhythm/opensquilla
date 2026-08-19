@@ -83,8 +83,11 @@ function bindUi(initialBody: string, copy: OverlayCopy): void {
   textarea.setAttribute('aria-label', copy.bodyLabel)
   textarea.placeholder = copy.placeholder
   newlineHint.textContent = copy.newlineHint
+  newlineHint.title = copy.newlineHint
   cancel.textContent = copy.cancelLabel
+  cancel.title = copy.cancelLabel
   submitButton.textContent = copy.submitLabel
+  submitButton.title = copy.submitLabel
   const updateSubmitState = () => {
     submitButton.disabled = !textarea.value.trim() || boundedBody(textarea.value) === null
   }

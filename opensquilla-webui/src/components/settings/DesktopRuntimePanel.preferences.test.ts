@@ -282,7 +282,7 @@ describe('DesktopRuntimePanel close behavior preference', () => {
       saveDesktopPreferences: vi.fn(async () => {
         throw new Error(privateDiagnostic)
       }),
-    }))
+    }), 'preview')
     const select = findPreviewModeSelect(el)
 
     select.value = 'full'

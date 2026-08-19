@@ -1284,7 +1284,29 @@ try {
           target: document.getElementById('annotation-target').textContent,
           placeholder: document.getElementById('annotation-body').placeholder,
           newlineHint: document.getElementById('annotation-newline-hint').textContent,
+          newlineHintTitle: document.getElementById('annotation-newline-hint').title,
+          submitTitle: document.getElementById('annotation-submit').title,
         }))()`)
+      const annotationRearmLayout =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const footer = document.querySelector('footer')
+          const hint = document.getElementById('annotation-newline-hint')
+          const submit = document.getElementById('annotation-submit')
+          const submitText = submit.firstChild
+          const range = document.createRange()
+          range.selectNodeContents(submitText)
+          const footerRect = footer.getBoundingClientRect()
+          const submitRect = submit.getBoundingClientRect()
+          return {
+            hintOverflow: getComputedStyle(hint).overflow,
+            hintTextOverflow: getComputedStyle(hint).textOverflow,
+            submitWhiteSpace: getComputedStyle(submit).whiteSpace,
+            submitTextLineCount: range.getClientRects().length,
+            submitContained: submitRect.top >= footerRect.top
+              && submitRect.right <= footerRect.right
+              && submitRect.bottom <= footerRect.bottom,
+          }
+        })()`)
       const annotationRearmEmptyBodyMessage =
         await annotationOverlay.view.webContents.executeJavaScript(`(() => {
           const form = document.getElementById('annotation-form')
@@ -2279,6 +2301,7 @@ try {
         annotationPickerRearm,
         annotationRearmOverlayResult,
         annotationRearmCopy,
+        annotationRearmLayout,
         annotationRearmEmptyBodyMessage,
         annotationRearmTypedValue,
         annotationRearmShiftEnter,
@@ -2656,6 +2679,17 @@ try {
     newlineHint: process.platform === 'darwin'
       ? '⇧ Return for a new line'
       : 'Shift + Enter for a new line',
+    newlineHintTitle: process.platform === 'darwin'
+      ? '⇧ Return for a new line'
+      : 'Shift + Enter for a new line',
+    submitTitle: 'Add annotation',
+  })
+  assert.deepEqual(result.annotationRearmLayout, {
+    hintOverflow: 'hidden',
+    hintTextOverflow: 'ellipsis',
+    submitWhiteSpace: 'nowrap',
+    submitTextLineCount: 1,
+    submitContained: true,
   })
   assert.equal(
     result.annotationRearmEmptyBodyMessage,

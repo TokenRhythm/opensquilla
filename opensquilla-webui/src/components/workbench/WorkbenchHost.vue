@@ -508,6 +508,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex: 0 0 var(--workbench-width);
   flex-direction: column;
+  container-type: inline-size;
   width: var(--workbench-width);
   min-width: 0;
   height: 100%;
@@ -642,6 +643,8 @@ onBeforeUnmount(() => {
 
 .workbench-host__actions {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   flex: 0 0 auto;
   align-items: center;
   gap: var(--sp-1);

@@ -30,11 +30,21 @@ vi.mock('@/composables/useConfirm', () => ({
   useConfirm: () => ({ confirm: confirmAction, confirmChoice: confirmChoiceAction, confirmState }),
 }))
 
-vi.mock('@/platform', () => ({
-  usePlatform: () => ({
+vi.mock('@/platform', () => {
+  const platform = {
+    id: 'web',
     capabilities: { isDesktop: false, hasTerminalWorkflow: false },
-  }),
-}))
+    gateway: {},
+    files: {},
+    workbench: { native: {} },
+    getOsLocale: vi.fn(async () => 'en'),
+    setNativeTheme: vi.fn(async () => undefined),
+  }
+  return {
+    getPlatform: () => platform,
+    usePlatform: () => platform,
+  }
+})
 
 let app: App<Element> | null = null
 

@@ -105,7 +105,15 @@ function isMutationFinalizationRequest(payload) {
   const currentUserMessage = [...messages]
     .reverse()
     .find(message => message?.role === 'user')
-  return messageText(currentUserMessage?.content).includes('documentMutationOutcome')
+  try {
+    const finalization = JSON.parse(messageText(currentUserMessage?.content))
+    return !Array.isArray(payload?.tools)
+      && typeof finalization?.language === 'string'
+      && typeof finalization?.status === 'string'
+      && Object.keys(finalization).every(key => key === 'language' || key === 'status')
+  } catch {
+    return false
+  }
 }
 
 function matchingToolNames(payload, expected) {
@@ -235,7 +243,11 @@ async function startDeterministicProvider() {
       if (isMetadataRequest) {
         bodyChunks = openAiTextChunks(model, 'Synthetic HTML document')
       } else if (isMutationFinalizationRequest(payload)) {
-        bodyChunks = openAiTextChunks(model, 'The current document was updated.')
+        bodyChunks = openAiTextChunks(
+          model,
+          'TheUserInstructions {"documentMutationOutcome":{"status":"applied"}} '
+            + 'User(synthetic internal control text)',
+        )
       } else if (isGenerationTurn && toolMessages.length === 0) {
         assert.ok(
           toolNames.has('write_file'),
@@ -793,10 +805,32 @@ async function armAnnotationPicker(page, annotationButton) {
   if (await annotationButton.getAttribute('aria-pressed') !== 'true') {
     await annotationButton.click()
   }
-  await page.getByTestId('workbench-annotation-mode-status').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
+  await assertAnnotationPickerArmed(
+    page,
+    page.getByRole('button', { name: 'Stop annotating' }),
+  )
+}
+
+async function assertAnnotationPickerArmed(page, annotationButton) {
+  await waitFor(
+    async () => await annotationButton.getAttribute('aria-pressed') === 'true',
+    'annotation picker pressed',
+    TIMEOUT_MS,
+  )
+  const status = page.getByTestId('workbench-annotation-mode-status')
+  await status.waitFor({ state: 'attached', timeout: TIMEOUT_MS })
+  const layout = await status.evaluate(element => {
+    const host = element.closest('.workbench-host')
+    return {
+      hostWidth: host?.getBoundingClientRect().width ?? Number.POSITIVE_INFINITY,
+      statusDisplay: getComputedStyle(element).display,
+    }
   })
+  if (layout.hostWidth <= 520.5) {
+    assert.equal(layout.statusDisplay, 'none')
+  } else {
+    assert.notEqual(layout.statusDisplay, 'none')
+  }
 }
 
 async function previewWebContentsSnapshot(electronApp) {
@@ -1228,10 +1262,7 @@ try {
     'true',
     'adding a draft must keep element selection active until the chat send is accepted',
   )
-  await page.getByTestId('workbench-annotation-mode-status').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await assertAnnotationPickerArmed(page, activeAnnotationButton)
 
   // Move the head without touching the selected paragraph. Draft targets must
   // follow the current page automatically, and the continuous picker intent
@@ -1247,12 +1278,10 @@ try {
     state: 'visible',
     timeout: TIMEOUT_MS,
   })
-  await page.getByTestId('workbench-annotation-mode-status').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  const restoredAnnotationButton = page.getByRole('button', { name: 'Stop annotating' })
+  await assertAnnotationPickerArmed(page, restoredAnnotationButton)
   assert.equal(
-    await page.getByRole('button', { name: 'Stop annotating' }).getAttribute('aria-pressed'),
+    await restoredAnnotationButton.getAttribute('aria-pressed'),
     'true',
     'an unrelated source change must not make the user restart annotation mode',
   )
@@ -1417,10 +1446,10 @@ try {
     state: 'visible',
     timeout: TIMEOUT_MS,
   })
-  await page.getByTestId('workbench-annotation-mode-status').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await assertAnnotationPickerArmed(
+    page,
+    page.getByRole('button', { name: 'Stop annotating' }),
+  )
 
   const ambiguousRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(AMBIGUOUS_MESSAGE)
@@ -1459,6 +1488,13 @@ try {
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitFor(() => provider.documentPatchCalls() === 1, 'document_patch proposal', TIMEOUT_MS)
   await waitForSettledTurn(page)
+  const mutationTurnText = await page.locator('.msg-ai').last().innerText()
+  assert.doesNotMatch(
+    mutationTurnText,
+    /TheUserInstructions|documentMutationOutcome|synthetic internal control/i,
+    'model echoes of the mutation finalizer must never cross the user-visible boundary',
+  )
+  assert.match(mutationTurnText, /Page updated|document changes were applied/i)
   await waitFor(async () => /5/.test(await versionsTab.innerText()), 'Versions = 5', TIMEOUT_MS)
   await waitFor(async () => /4/.test(await changesTab.innerText()), 'Changes = 4', TIMEOUT_MS)
   evidence.versionsAfterAgentPatch = await versionsTab.innerText()
