@@ -1875,9 +1875,14 @@ const {
 planMutationAccepted = () => scheduleHistorySync()
 
 const steerDelivery = useChatSteerDelivery({
+  sessionKey,
+  activeTurnId: activeStreamTaskId,
   messages,
   pendingQueue,
-  checkpointForUserMessage: turnId => chatStream.checkpointForUserMessage?.(turnId),
+  checkpointForUserMessage: (turnId, boundaryKey) =>
+    chatStream.checkpointForUserMessage?.(turnId, boundaryKey),
+  acknowledgeSteerBoundary: (boundaryKey, modelCallId, iteration) =>
+    chatStream.acknowledgeSteerBoundary?.(boundaryKey, modelCallId, iteration),
   scheduleHistorySync,
   removePendingItem: item => settlePendingDelivery(item, 'accepted'),
   restoreSteerIntoComposer: text => appendComposerText(text),

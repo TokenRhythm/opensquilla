@@ -1811,7 +1811,10 @@ describe('useChatSend attachment payloads', () => {
     })
     expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
     expect(rpc.call).not.toHaveBeenCalledWith('chat.abort', expect.anything())
-    expect(stream.checkpointForUserMessage).toHaveBeenCalledWith('turn-current')
+    expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+      'turn-current',
+      expect.any(String),
+    )
     expect(options.messages.value).toContainEqual(expect.objectContaining({
       role: 'user',
       text: 'hello',

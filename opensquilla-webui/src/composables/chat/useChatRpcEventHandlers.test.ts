@@ -45,6 +45,8 @@ function createHarness(options: {
     streamHasVisibleOutput: ref(false),
     startStreaming: vi.fn(),
     endStreaming: vi.fn(() => options.endStreaming?.(messages.value)),
+    checkpointForUserMessage: vi.fn(),
+    acknowledgeSteerBoundary: vi.fn(),
     appendDelta: vi.fn(),
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
@@ -469,6 +471,208 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds an applied steer boundary in snapshot stream order', () => {
+    const { api, stream, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-1',
+        turnId: 'turn-live',
+        inputDisposition: 'steering',
+      }],
+    })
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 12,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Second answer',
+              stream_seq: 12,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'task-live',
+              user_message_id: 'steer-message-1',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 10,
+            },
+          },
+        ],
+      })
+
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'task-live',
+        'steer-message-1',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-1',
+        '',
+        0,
+      )
+      expect(vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder[0])
+        .toBeLessThan(
+          vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder[0]!,
+        )
+      expect(vi.mocked(stream.appendDelta).mock.calls.map(call => call[0])).toEqual([
+        'First answer',
+        'Second answer',
+      ])
+    } finally {
+      stop()
+    }
+  })
+
+  it('checkpoints an applied snapshot boundary before its history row exists', () => {
+    const { api, messages, stream, stop } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 12,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 10,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'task-live',
+              user_message_id: 'steer-message-orphan',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Second answer',
+              stream_seq: 12,
+            },
+          },
+        ],
+      })
+
+      expect(messages.value).toEqual([])
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'task-live',
+        'steer-message-orphan',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-orphan',
+        '',
+        0,
+      )
+      const textOrders = vi.mocked(stream.appendDelta).mock.invocationCallOrder
+      const checkpointOrders = vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder
+      const acknowledgeOrders = vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder
+      expect(textOrders[0]).toBeLessThan(checkpointOrders[0]!)
+      expect(checkpointOrders[0]).toBeLessThan(acknowledgeOrders[0]!)
+      expect(acknowledgeOrders[0]).toBeLessThan(textOrders[1]!)
+
+      messages.value = [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-orphan',
+        turnId: 'task-live',
+        inputDisposition: 'applied',
+      }]
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledTimes(2)
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledTimes(2)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds the boundary when a legacy applied snapshot omits revision and call id', () => {
+    const { api, messages, stream, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-1',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+        inputDispositionRevision: 3,
+      }],
+    })
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'turn-live',
+              user_message_id: 'steer-message-1',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 2,
+            },
+          },
+        ],
+      })
+
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-live',
+        'steer-message-1',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-1',
+        '',
+        0,
+      )
+      expect(messages.value[0]?.inputDispositionRevision).toBe(3)
     } finally {
       stop()
     }
@@ -1472,6 +1676,20 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         usage: { text: '' },
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('outer legacy canonical')
+
+      const segments = [{
+        model_call_id: '2.0',
+        iteration: 2,
+        start_codepoint: 3,
+        end_codepoint: 6,
+      }]
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 7,
+        text_snapshot: '前半段后半段',
+        model_call_segments: segments,
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('前半段后半段', segments)
     } finally {
       stop()
     }

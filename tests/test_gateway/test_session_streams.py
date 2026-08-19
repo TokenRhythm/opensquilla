@@ -239,6 +239,47 @@ def test_live_turn_snapshot_compacts_high_frequency_deltas_without_losing_state(
     assert snapshot.events[5].payload["text"] == "Hello world"
 
 
+def test_live_turn_snapshot_preserves_text_steer_text_boundary_order() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    session_key = "agent:main:steered-turn"
+    task_id = "task-steered"
+
+    first = registry.record(
+        session_key,
+        "session.event.text_delta",
+        {"task_id": task_id, "text": "First answer"},
+    )
+    applied = registry.record(
+        session_key,
+        "session.event.input_disposition",
+        {
+            "task_id": task_id,
+            "turn_id": task_id,
+            "intent": "steer",
+            "disposition": "applied",
+            "user_message_id": "steer-message-1",
+        },
+    )
+    second = registry.record(
+        session_key,
+        "session.event.text_delta",
+        {"task_id": task_id, "text": "Second answer"},
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert [event.event_name for event in snapshot.events] == [
+        "session.event.text_delta",
+        "session.event.input_disposition",
+        "session.event.text_delta",
+    ]
+    assert [event.stream_seq for event in snapshot.events] == [
+        first["stream_seq"],
+        applied["stream_seq"],
+        second["stream_seq"],
+    ]
+
+
 def test_live_turn_snapshot_compacts_thinking_per_block_and_preserves_boundaries() -> None:
     registry = SessionStreamRegistry(max_events_per_session=5)
     session_key = "agent:main:reasoning-blocks"

@@ -16,17 +16,23 @@ const REQUEST: SessionSteerV2Params = {
 }
 
 function createHarness() {
+  const sessionKey = ref('agent:main:webchat:test')
+  const activeTurnId = ref('')
   const messages = ref<ChatMessage[]>([])
   const pendingQueue = ref<ChatPendingItem[]>([])
   const checkpointForUserMessage = vi.fn()
+  const acknowledgeSteerBoundary = vi.fn()
   const scheduleHistorySync = vi.fn()
   const restoreSteerIntoComposer = vi.fn()
   const onProjected = vi.fn()
   const scope = effectScope()
   const api = scope.run(() => useChatSteerDelivery({
+    sessionKey,
+    activeTurnId,
     messages,
     pendingQueue,
     checkpointForUserMessage,
+    acknowledgeSteerBoundary,
     scheduleHistorySync,
     restoreSteerIntoComposer,
     onProjected,
@@ -47,9 +53,12 @@ function createHarness() {
 
   return {
     api,
+    sessionKey,
+    activeTurnId,
     messages,
     pendingQueue,
     checkpointForUserMessage,
+    acknowledgeSteerBoundary,
     scheduleHistorySync,
     restoreSteerIntoComposer,
     onProjected,
@@ -101,7 +110,10 @@ describe('useChatSteerDelivery', () => {
 
       expect(projection.created).toBe(true)
       expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
-      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith('turn-current')
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-current',
+        'client-steer',
+      )
       expect(harness.pendingQueue.value).toEqual([])
       expect(harness.messages.value).toMatchObject([{
         role: 'user',
@@ -189,6 +201,11 @@ describe('useChatSteerDelivery', () => {
         steerAppliedIteration: 1,
       })
       expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'client-steer',
+        '',
+        1,
+      )
     } finally {
       harness.stop()
     }
@@ -224,7 +241,7 @@ describe('useChatSteerDelivery', () => {
     }
   })
 
-  it('reconciles a history-restored durable row and checkpoints the attempt only once', () => {
+  it('reconciles a history-restored durable row and checkpoints the attempt', () => {
     const harness = createHarness()
     try {
       harness.addPending()
@@ -244,7 +261,15 @@ describe('useChatSteerDelivery', () => {
 
       expect(harness.pendingQueue.value).toEqual([])
       expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
-      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith('turn-current')
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-current',
+        'client-steer',
+      )
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'client-steer',
+        '',
+        0,
+      )
     } finally {
       harness.stop()
     }
@@ -269,7 +294,10 @@ describe('useChatSteerDelivery', () => {
       expect(harness.pendingQueue.value).toEqual([])
       expect(harness.messages.value).toHaveLength(1)
       expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
-      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith('turn-current')
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-current',
+        'client-steer',
+      )
     } finally {
       harness.stop()
     }
@@ -288,6 +316,134 @@ describe('useChatSteerDelivery', () => {
 
       expect(harness.messages.value).toEqual([])
       expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('checkpoints an orphan applied boundary before history hydration and repositions it later', () => {
+    const harness = createHarness()
+    try {
+      harness.api.disposition({
+        userMessageId: 'user-orphan',
+        disposition: 'applied',
+        turnId: 'turn-orphan',
+      })
+
+      expect(harness.messages.value).toEqual([])
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-orphan',
+        'user-orphan',
+      )
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'user-orphan',
+        '',
+        0,
+      )
+
+      harness.messages.value = [{
+        role: 'user',
+        text: 'Use English',
+        ts: 'durable',
+        messageId: 'user-orphan',
+        turnId: 'turn-orphan',
+        inputDisposition: 'applied',
+      }]
+
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledTimes(2)
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledTimes(2)
+      expect(harness.messages.value).toHaveLength(1)
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('discards orphan boundary evidence on an authoritative reset', () => {
+    const harness = createHarness()
+    try {
+      harness.api.disposition({
+        userMessageId: 'user-stale-orphan',
+        disposition: 'applied',
+        turnId: 'turn-stale',
+      })
+      harness.api.resetTransientBoundaries()
+      harness.messages.value = [{
+        role: 'user',
+        text: 'stale',
+        ts: 'durable',
+        messageId: 'user-stale-orphan',
+        turnId: 'turn-stale',
+        inputDisposition: 'applied',
+      }]
+
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('does not replay a delayed orphan boundary into a successor turn', () => {
+    const harness = createHarness()
+    try {
+      harness.activeTurnId.value = 'turn-old'
+      harness.api.disposition({
+        userMessageId: 'user-old-orphan',
+        disposition: 'applied',
+        turnId: 'turn-old',
+      })
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
+
+      harness.activeTurnId.value = 'turn-new'
+      harness.messages.value = [{
+        role: 'user',
+        text: 'old steer',
+        ts: 'delayed-history',
+        messageId: 'user-old-orphan',
+        turnId: 'turn-old',
+        inputDisposition: 'applied',
+      }]
+
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledOnce()
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('accepts a legacy applied event without revision and keeps the newer revision', () => {
+    const harness = createHarness()
+    try {
+      harness.messages.value = [{
+        role: 'user',
+        text: REQUEST.message,
+        ts: 'durable',
+        turnId: REQUEST.expected_turn_id,
+        messageId: 'user-steer',
+        inputDisposition: 'applied',
+        inputDispositionRevision: 3,
+        steerClientRequestId: REQUEST.client_request_id,
+        steerClientMessageId: REQUEST.client_message_id,
+      }]
+
+      const projection = harness.api.disposition({
+        clientRequestId: REQUEST.client_request_id,
+        clientMessageId: REQUEST.client_message_id,
+        expectedTurnId: REQUEST.expected_turn_id,
+        disposition: 'applied',
+      })
+
+      expect(projection.stale).toBe(false)
+      expect(harness.messages.value[0]?.inputDispositionRevision).toBe(3)
+      expect(harness.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-current',
+        'client-steer',
+      )
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'client-steer',
+        '',
+        0,
+      )
     } finally {
       harness.stop()
     }

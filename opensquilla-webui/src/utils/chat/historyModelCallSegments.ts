@@ -3,73 +3,14 @@ import type {
   ChatModelCallSegment,
   ChatUsagePayload,
 } from '@/types/chat'
-
-interface NormalizedModelCallSegment {
-  modelCallId: string
-  iteration: number
-  startCodepoint: number
-  endCodepoint: number
-}
-
-function nonNegativeInteger(value: unknown): number | undefined {
-  const number = Number(value)
-  return Number.isInteger(number) && number >= 0 ? number : undefined
-}
-
-function positiveInteger(value: unknown): number | undefined {
-  const number = nonNegativeInteger(value)
-  return number !== undefined && number > 0 ? number : undefined
-}
+import {
+  normalizeModelCallSegments,
+  type NormalizedModelCallSegment,
+} from '@/utils/chat/modelCallSegments'
 
 function usageSegments(usage: ChatUsagePayload | undefined): ChatModelCallSegment[] {
   const value = usage?.model_call_segments ?? usage?.modelCallSegments
   return Array.isArray(value) ? value : []
-}
-
-function normalizedSegments(
-  message: ChatMessage,
-  codepointLength: number,
-): NormalizedModelCallSegment[] {
-  const seenCallIds = new Set<string>()
-  const normalized: NormalizedModelCallSegment[] = []
-  for (const raw of usageSegments(message.usage || message.turn_usage)) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
-    const modelCallId = String(raw.model_call_id || raw.modelCallId || '').trim()
-    const iteration = positiveInteger(raw.iteration)
-    const startCodepoint = nonNegativeInteger(
-      raw.start_codepoint ?? raw.startCodepoint,
-    )
-    const endCodepoint = nonNegativeInteger(raw.end_codepoint ?? raw.endCodepoint)
-    if (
-      !modelCallId
-      || seenCallIds.has(modelCallId)
-      || iteration === undefined
-      || startCodepoint === undefined
-      || endCodepoint === undefined
-      || endCodepoint < startCodepoint
-      || endCodepoint > codepointLength
-      || (
-        normalized.length > 0
-        && startCodepoint !== normalized[normalized.length - 1]!.endCodepoint
-      )
-    ) {
-      return []
-    }
-    seenCallIds.add(modelCallId)
-    normalized.push({
-      modelCallId,
-      iteration,
-      startCodepoint,
-      endCodepoint,
-    })
-  }
-  if (
-    normalized.length === 0
-    || normalized[normalized.length - 1]!.endCodepoint !== codepointLength
-  ) {
-    return []
-  }
-  return normalized
 }
 
 function matchesSegment(message: ChatMessage, segment: NormalizedModelCallSegment): boolean {
@@ -113,7 +54,10 @@ function interleaveAssistantAt(
     return null
   }
   const codepoints = Array.from(assistant.text)
-  const segments = normalizedSegments(assistant, codepoints.length)
+  const segments = normalizeModelCallSegments(
+    usageSegments(assistant.usage || assistant.turn_usage),
+    codepoints.length,
+  )
   if (segments.length === 0) return null
 
   const matchedByCall = new Map<string, Array<{ index: number; message: ChatMessage }>>()

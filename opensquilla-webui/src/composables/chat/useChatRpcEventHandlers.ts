@@ -1,6 +1,7 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
+  ChatModelCallSegment,
   ChatPendingItem,
   ChatRunStatus,
   ChatRunStatusSource,
@@ -78,7 +79,12 @@ export interface ChatRpcStreamApi {
   streamHasVisibleOutput: Ref<boolean>
   startStreaming: () => void
   endStreaming: (opts?: { reason?: string, suppressed?: boolean }) => void
-  checkpointForUserMessage?: (turnId: string) => void
+  checkpointForUserMessage?: (turnId: string, boundaryKey?: string) => void
+  acknowledgeSteerBoundary?: (
+    boundaryKey: string,
+    modelCallId?: string,
+    iteration?: number,
+  ) => void
   appendDelta: (text: string, presentation?: 'intermediate' | 'answer') => void
   scheduleRender: () => void
   appendToolCall: (payload: ToolUsePayload) => void
@@ -86,7 +92,10 @@ export interface ChatRpcStreamApi {
   appendToolEnd?: (payload: ToolEndPayload) => void
   appendToolResult: (payload: ToolResultPayload) => void
   appendArtifact: (payload: ArtifactPayload) => void
-  reconcileFinalText: (finalText: string | null | undefined) => void
+  reconcileFinalText: (
+    finalText: string | null | undefined,
+    modelCallSegments?: ChatModelCallSegment[] | null,
+  ) => void
   resetLiveTurnState?: () => void
   resetAnswerGeneration?: (options?: {
     textSnapshot?: string
@@ -181,6 +190,8 @@ type ChatDoneUsageFields = {
   usageUnknown?: boolean
   unknown_usage_events?: number
   unknownUsageEvents?: number
+  model_call_segments?: ChatModelCallSegment[]
+  modelCallSegments?: ChatModelCallSegment[]
   decision_id?: string
 }
 
@@ -384,9 +395,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream,
   } = options
   const steerDelivery = options.steerDelivery || useChatSteerDelivery({
+    sessionKey,
+    activeTurnId: activeStreamTaskId,
     messages,
     pendingQueue,
     checkpointForUserMessage: stream.checkpointForUserMessage,
+    acknowledgeSteerBoundary: stream.acknowledgeSteerBoundary,
     scheduleHistorySync: options.scheduleHistorySync,
     restoreSteerIntoComposer: options.restoreSteerIntoComposer,
   })
@@ -735,6 +749,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
     } else if (event === 'session.event.router_control_replay') {
       handleRpcRouterControlReplay(payload)
+    } else if (event === 'session.event.input_disposition') {
+      handleRpcInputDisposition(payload as InputDispositionPayload)
     } else if (event === 'session.event.compaction') {
       // A live snapshot is the authoritative base for the active stream, not
       // historical replay. Compaction deliberately ignores replayed
@@ -756,6 +772,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function restoreLiveTurnSnapshot(snapshot: SessionMessagesSnapshotResponse) {
     if (!snapshot || snapshot.key !== sessionKey.value) return
 
+    steerDelivery.resetTransientBoundaries()
     stream.resetLiveTurnState?.()
     clearLiveThinking()
     clearGenerationTracking()
@@ -768,9 +785,20 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       ? snapshot.task_id
       : ''
 
-    for (const entry of snapshot.events || []) {
-      if (!entry || typeof entry.event !== 'string') continue
-      const payload = { ...(entry.payload || {}) }
+    const replayEntries: BufferedPendingReplayEntry[] = (snapshot.events || [])
+      .flatMap((entry, order): BufferedPendingReplayEntry[] => {
+        if (!entry || typeof entry.event !== 'string') return []
+        return [{
+          kind: 'stream',
+          event: entry.event,
+          payload: { ...(entry.payload || {}) },
+          order,
+        }]
+      })
+      .sort(comparePendingReplayEntries)
+    for (const entry of replayEntries) {
+      if (entry.kind !== 'stream') continue
+      const payload = { ...entry.payload }
       // Snapshot events retain their original sequence for diagnostics, but
       // they form an authoritative base rather than fresh deltas. Replaying
       // them through the normal render handlers without the old sequence
@@ -2064,7 +2092,19 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (u.model) usageModel.value = u.model
       options.saveWidgetState()
 
-      stream.reconcileFinalText(doneSuppressed ? '' : doneTextSnapshot(donePayload, u))
+      const rawModelCallSegments = u.model_call_segments
+        ?? u.modelCallSegments
+        ?? donePayload.model_call_segments
+        ?? donePayload.modelCallSegments
+      const terminalText = doneSuppressed ? '' : doneTextSnapshot(donePayload, u)
+      if (Array.isArray(rawModelCallSegments)) {
+        stream.reconcileFinalText(
+          terminalText,
+          rawModelCallSegments as ChatModelCallSegment[],
+        )
+      } else {
+        stream.reconcileFinalText(terminalText)
+      }
 
       if (payload?.reason === 'aborted') {
         options.clearPendingRouterDecision()

@@ -839,14 +839,16 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('before')
-    api.checkpointForUserMessage('turn-steered')
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
     messages.value.push({
       role: 'user',
       text: 'adjust',
       ts: new Date().toISOString(),
+      clientId: 'steer-1',
       turnId: 'turn-steered',
       inputDisposition: 'steering',
     })
+    api.acknowledgeSteerBoundary('steer-1', '', 0)
     api.appendDelta('after')
     api.reconcileFinalText('beforeafter')
     api.endStreaming()
@@ -857,6 +859,130 @@ describe('useChatStream render coalescing', () => {
       ['assistant', 'after'],
     ])
     expect(messages.value.every(message => message.turnId === 'turn-steered')).toBe(true)
+    api.cleanup()
+  })
+
+  it('keeps late old-call tokens above the steer until it is applied', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    messages.value = messages.value.map(message => ({ ...message }))
+
+    api.appendDelta('仍属于第一段')
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段仍属于第一段'],
+      ['user', 'Use English'],
+    ])
+    expect(api.foldedTurn.value.rawText).toBe('')
+
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+    api.appendDelta('Second section.')
+    const prefix = '第一段仍属于第一段'
+    const finalText = `${prefix}Second section.`
+    api.reconcileFinalText(finalText, [{
+      model_call_id: '2.0',
+      iteration: 2,
+      start_codepoint: Array.from(prefix).length,
+      end_codepoint: Array.from(finalText).length,
+    }])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', prefix],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('closes an applied steer boundary when an old gateway omits model-call identity', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-legacy')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-legacy',
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    api.acknowledgeSteerBoundary('steer-legacy')
+    api.appendDelta('Second section.')
+    api.reconcileFinalText('第一段Second section.')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段'],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('rebuilds a checkpoint before an existing steer after live-state reset', () => {
+    const { api, messages } = makeStream()
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      messageId: 'steer-message-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-message-1')
+    api.acknowledgeSteerBoundary('steer-message-1')
+    api.appendDelta('Second section.')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段'],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('reuses an orphan checkpoint when history hydrates the steer row later', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('First answer')
+    api.checkpointForUserMessage('turn-steered', 'steer-orphan')
+    api.acknowledgeSteerBoundary('steer-orphan')
+    api.appendDelta('Second answer')
+
+    // History replacement can arrive after the live snapshot and omit the
+    // optimistic assistant prefix. Replaying the same boundary must restore
+    // that stable row before the now-durable user message.
+    messages.value = [{
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      messageId: 'steer-orphan',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    }]
+    api.checkpointForUserMessage('turn-steered', 'steer-orphan')
+    api.acknowledgeSteerBoundary('steer-orphan')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'First answer'],
+      ['user', 'Use English'],
+      ['assistant', 'Second answer'],
+    ])
     api.cleanup()
   })
 
@@ -871,7 +997,7 @@ describe('useChatStream render coalescing', () => {
     })
     const phaseBeforeSteer = api.streamPhaseLabel.value
 
-    api.checkpointForUserMessage('turn-steered')
+    api.checkpointForUserMessage('turn-steered', 'steer-activity')
 
     expect(messages.value).toHaveLength(1)
     expect(messages.value[0]).toMatchObject({
@@ -902,6 +1028,7 @@ describe('useChatStream render coalescing', () => {
       tool_name: 'web_search',
       result: 'ok',
     })
+    api.acknowledgeSteerBoundary('steer-activity')
     api.appendDelta('after')
     api.reconcileFinalText('beforeafter')
     api.endStreaming()
@@ -1030,10 +1157,11 @@ describe('useChatStream render coalescing', () => {
     api.appendDelta('before')
     expect(api.streamTimelineItems.value).toEqual([])
     expect(api.foldedTurn.value.rawText).toBe('before')
-    api.checkpointForUserMessage('turn-production-steer')
+    api.checkpointForUserMessage('turn-production-steer', 'steer-production')
     expect(messages.value[0]).toMatchObject({ role: 'assistant', text: 'before' })
     expect(api.foldedTurn.value.rawText).toBe('')
 
+    api.acknowledgeSteerBoundary('steer-production')
     api.appendDelta('stale')
     api.reconcileFinalText('canonical')
     expect(api.streamTimelineItems.value).toEqual([])
