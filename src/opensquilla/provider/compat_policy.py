@@ -198,6 +198,11 @@ class OpenAICompatPolicy:
     # fallback is safe only when the tool's wire semantics are textual.
     tool_schema_string_item_fallback_tools: frozenset[str] = frozenset()
 
+    # Exact API root where the string-item projection is required. A tool
+    # allowlist alone is not sufficient evidence for custom endpoints that
+    # happen to use the same provider kind or hostname.
+    tool_schema_string_item_fallback_api_root: str = ""
+
     # Whether the chat-completions endpoint reliably supports native
     # ``response_format.type=json_schema``.  When false, the OpenAI-compatible
     # adapter keeps the same provider/model and places the authoritative
@@ -347,6 +352,21 @@ class OpenAICompatPolicy:
 
         return self.text_tool_profile.enabled
 
+    def allows_string_item_schema_projection(self, tool_name: str, base_url: str) -> bool:
+        """Return whether a trusted tool may use the lossy wire projection."""
+
+        candidate_base_url = str(base_url or "")
+        if not candidate_base_url or candidate_base_url != candidate_base_url.strip():
+            return False
+        return bool(
+            tool_name in self.tool_schema_string_item_fallback_tools
+            and self.tool_schema_string_item_fallback_api_root
+            and base_url_matches_official_api(
+                self.tool_schema_string_item_fallback_api_root,
+                candidate_base_url,
+            )
+        )
+
 
 def effective_reasoning_format(
     policy: OpenAICompatPolicy,
@@ -455,6 +475,9 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         display_name="Gemini",
         official_host="generativelanguage.googleapis.com",
         tool_schema_string_item_fallback_tools=frozenset({"create_csv"}),
+        tool_schema_string_item_fallback_api_root=(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ),
     ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",

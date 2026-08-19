@@ -411,6 +411,7 @@ from pydantic import (  # noqa: E402
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SerializerFunctionWrapHandler,
     model_serializer,
 )
@@ -438,6 +439,10 @@ class ToolInputSchema(BaseModel):
     )
 
 
+class _StringItemSchemaProjectionCapability:
+    """Unserializable identity token for trusted registry construction."""
+
+
 class ToolDefinition(BaseModel):
     """Tool definition passed to the LLM."""
 
@@ -453,6 +458,22 @@ class ToolDefinition(BaseModel):
         default="bounded",
         exclude=True,
     )
+    # Process-local semantic capability. It is deliberately private so an
+    # external ToolDefinition payload cannot opt itself into a lossy provider
+    # projection. Trusted registry construction grants it after validation.
+    _string_item_schema_projection_capability: object | None = PrivateAttr(default=None)
+
+    @property
+    def allow_string_item_schema_projection(self) -> bool:
+        return (
+            self._string_item_schema_projection_capability
+            is _StringItemSchemaProjectionCapability
+        )
+
+    def _enable_string_item_schema_projection(self) -> None:
+        self._string_item_schema_projection_capability = (
+            _StringItemSchemaProjectionCapability
+        )
 
 
 # ---------------------------------------------------------------------------

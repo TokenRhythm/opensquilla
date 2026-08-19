@@ -357,6 +357,9 @@ class ToolSpec:
     # persisted. The dispatcher owns this behavior; handlers must not emulate
     # it with tool-name branches.
     terminates_turn: bool = False
+    # Trusted declaration that itemless arrays have textual wire semantics.
+    # Provider policy still decides whether a request needs the projection.
+    allow_string_item_schema_projection: bool = False
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

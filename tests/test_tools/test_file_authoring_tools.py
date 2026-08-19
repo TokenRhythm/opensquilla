@@ -66,6 +66,8 @@ def test_create_csv_authoritative_schema_keeps_mixed_cell_types() -> None:
 
     rows = definition.input_schema.properties["rows"]
     assert rows["items"] == {"type": "array"}
+    assert definition.allow_string_item_schema_projection is True
+    assert "allow_string_item_schema_projection" not in definition.model_dump()
 
 
 @pytest.mark.asyncio

@@ -387,8 +387,9 @@ class ToolRegistry:
         visible_tools = self._iter_visible_tools(active_ctx, sort=True)
         visible_tool_names = frozenset(rt.spec.name for rt in visible_tools)
         self._record_description_override_event(active_ctx, visible_tools)
-        return [
-            ToolDefinition(
+        definitions: list[ToolDefinition] = []
+        for rt in visible_tools:
+            definition = ToolDefinition(
                 name=rt.spec.name,
                 description=self._description_for(
                     rt,
@@ -412,8 +413,10 @@ class ToolRegistry:
                     )
                 ),
             )
-            for rt in visible_tools
-        ]
+            if rt.spec.allow_string_item_schema_projection:
+                definition._enable_string_item_schema_projection()
+            definitions.append(definition)
+        return definitions
 
     async def list_tools(
         self,
@@ -604,6 +607,7 @@ def tool(
     plan_access: PlanAccess = PlanAccess.DENY,
     terminates_turn: bool = False,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
+    allow_string_item_schema_projection: bool = False,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -630,6 +634,7 @@ def tool(
             sandbox=sandbox or SandboxToolDescriptor.custom(kind=name),
             plan_access=plan_access,
             terminates_turn=terminates_turn,
+            allow_string_item_schema_projection=allow_string_item_schema_projection,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

@@ -3519,19 +3519,16 @@ class OpenAIProvider:
         if cfg.stop_sequences:
             payload["stop"] = cfg.stop_sequences
         if tools:
-            string_item_fallback_tools = (
-                self._compat.tool_schema_string_item_fallback_tools
-                if self._compat.official_host
-                and _base_url_hostname(self._base_url)
-                == self._compat.official_host.lower()
-                else frozenset()
-            )
             payload["tools"] = [
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
                     complete_itemless_arrays_with_string_items=(
-                        tool.name in string_item_fallback_tools
+                        tool.allow_string_item_schema_projection
+                        and self._compat.allows_string_item_schema_projection(
+                            tool.name,
+                            self._base_url,
+                        )
                     ),
                 )
                 for tool in tools
