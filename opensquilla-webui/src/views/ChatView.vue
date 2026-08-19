@@ -4530,7 +4530,7 @@ function onThreadScroll() {
       }
     } else if (movedDown) {
       historyNavigationScrollLock.updateFromScroll(gap)
-    } else if (!readerMovingAway) {
+    } else {
       historyNavigationScrollLock.updateFromScroll(gap)
     }
   }
