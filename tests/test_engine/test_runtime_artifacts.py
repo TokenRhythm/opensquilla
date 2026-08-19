@@ -3242,7 +3242,7 @@ class _GoalArtifactEnsembleProvider(_GoalPostPublishLoopProvider):
                 ]
                 event.ensemble_trace = {
                     "profile": "test",
-                    "llm_request_count": 2,
+                    "llm_request_count": 2 * call_number,
                 }
             yield event
 

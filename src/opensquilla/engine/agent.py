@@ -6901,6 +6901,26 @@ class Agent:
         turn_model_usage_breakdown: list[dict[str, Any]] = []
         last_ensemble_trace: dict[str, Any] | None = None
         turn_ensemble_request_count = 0
+        ensemble_continuation_request_count: int | None = None
+        ensemble_continuation_provider: object | None = None
+
+        def _merge_ensemble_request_count(
+            trace: dict[str, Any],
+            continuation_baseline: int | None,
+        ) -> int:
+            nonlocal last_ensemble_trace, turn_ensemble_request_count
+
+            last_ensemble_trace = dict(trace)
+            reported_count = _usage_int(trace.get("llm_request_count") or 0)
+            if continuation_baseline is None:
+                turn_ensemble_request_count += reported_count
+            else:
+                turn_ensemble_request_count += max(
+                    0,
+                    reported_count - continuation_baseline,
+                )
+            return reported_count
+
         terminal_error: ErrorEvent | None = None
         terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
@@ -8440,6 +8460,30 @@ class Agent:
                         call_id=call_id,
                         tools_supported=tools_supported_for_call,
                     )
+                    ensemble_request_count_baseline: int | None = None
+                    if ensemble_continuation_provider is self.provider:
+                        ensemble_request_count_baseline = (
+                            ensemble_continuation_request_count
+                        )
+                    ensemble_continuation_request_count = None
+                    ensemble_continuation_provider = None
+                    if (
+                        ensemble_request_count_baseline is None
+                        and self._execution_context is not None
+                        and getattr(
+                            self.provider, "execution_context_aware", False
+                        )
+                    ):
+                        continuation_snapshot = (
+                            self._execution_context.ensemble_continuation_snapshot
+                        )
+                        if (
+                            continuation_snapshot is not None
+                            and continuation_snapshot.request_started
+                        ):
+                            ensemble_request_count_baseline = (
+                                continuation_snapshot.physical_request_count
+                            )
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -8722,12 +8766,11 @@ class Agent:
                                         last_actual_provider = last_item.provider
                                         last_actual_model = last_item.model
                                     if isinstance(raw_ev.ensemble_trace, dict):
-                                        last_ensemble_trace = dict(raw_ev.ensemble_trace)
-                                        turn_ensemble_request_count += _usage_int(
-                                            raw_ev.ensemble_trace.get(
-                                                "llm_request_count"
+                                        ensemble_request_count_baseline = (
+                                            _merge_ensemble_request_count(
+                                                raw_ev.ensemble_trace,
+                                                ensemble_request_count_baseline,
                                             )
-                                            or 0
                                         )
                                     provider_error_for_log = ProviderErrorEvent(
                                         message=(
@@ -9626,10 +9669,17 @@ class Agent:
                                         )
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
-                                    last_ensemble_trace = dict(ensemble_trace)
-                                    turn_ensemble_request_count += _usage_int(
-                                        ensemble_trace.get("llm_request_count") or 0
+                                    ensemble_request_count_baseline = (
+                                        _merge_ensemble_request_count(
+                                            ensemble_trace,
+                                            ensemble_request_count_baseline,
+                                        )
                                     )
+                                    if tool_calls:
+                                        ensemble_continuation_request_count = (
+                                            ensemble_request_count_baseline
+                                        )
+                                        ensemble_continuation_provider = self.provider
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
