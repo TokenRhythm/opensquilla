@@ -193,6 +193,10 @@ class ToolContext:
     # and projection code use this bit to avoid replacing raw tool output with
     # a handle that the current model is not authorized to retrieve.
     tool_result_retrieval_available: bool = False
+    # Process-local task ancestry used only to persist exact subprocess
+    # ownership. Raw values are never written to the owner registry.
+    parent_session_key: str | None = field(default=None, repr=False)
+    parent_task_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

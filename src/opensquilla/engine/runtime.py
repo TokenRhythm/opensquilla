@@ -225,6 +225,7 @@ from opensquilla.observability.prompt_report import PromptReport, build_prompt_r
 from opensquilla.observability.trace import TraceContext, TraceEvent, write_trace_event
 from opensquilla.observability.turn_call_log import TurnCallLogger, is_turn_call_log_enabled
 from opensquilla.paths import media_root_from_config
+from opensquilla.process_tree import task_process_scope
 from opensquilla.provider import (
     DoneEvent as ProviderDoneEvent,
 )
@@ -4752,6 +4753,20 @@ class TurnRunner:
             ),
         )
         configured_state_dir = getattr(self._turn_config(), "state_dir", None)
+
+        def process_scope():
+            return task_process_scope(
+                configured_state_dir,
+                session_key=session_key,
+                task_id=getattr(effective_tool_context, "task_id", None),
+                parent_session_key=getattr(
+                    effective_tool_context,
+                    "parent_session_key",
+                    None,
+                ),
+                parent_task_id=getattr(effective_tool_context, "parent_task_id", None),
+            )
+
         logical_turn_id = (
             root_turn_id.strip()
             if isinstance(root_turn_id, str) and root_turn_id.strip()
@@ -4790,6 +4805,7 @@ class TurnRunner:
                 with (
                     managed_toolchain_state_scope(configured_state_dir),
                     runtime_pack_state_scope(configured_state_dir),
+                    process_scope(),
                 ):
                     async for event in self._run_turn(
                         message,
@@ -4842,6 +4858,7 @@ class TurnRunner:
                     with (
                         managed_toolchain_state_scope(configured_state_dir),
                         runtime_pack_state_scope(configured_state_dir),
+                        process_scope(),
                     ):
                         async for event in self._run_turn(
                             message,

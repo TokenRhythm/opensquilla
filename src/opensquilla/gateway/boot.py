@@ -1365,6 +1365,13 @@ async def dispatch_task_runtime_turn(
 
     pin_sandbox_policy(tool_context, config)
     tool_context.task_id = run.task_id
+    run_metadata = getattr(run.envelope, "metadata", {})
+    parent_session_key = run_metadata.get("parent_session_key")
+    parent_task_id = run_metadata.get("parent_task_id")
+    tool_context.parent_session_key = (
+        parent_session_key if isinstance(parent_session_key, str) else None
+    )
+    tool_context.parent_task_id = parent_task_id if isinstance(parent_task_id, str) else None
     if (
         session is None
         and session_manager is not None
@@ -3919,6 +3926,17 @@ async def start_gateway_server(
 
     _pid_lock = GatewayPidLock(_state_path(config, ""))
     _pid_lock.acquire()
+
+    # The profile PID lock proves there is no live Gateway writer for this
+    # runtime state. Reconcile exact persisted owners before any new turn can
+    # launch work; malformed or unsupported rows remain fail-safe and are never
+    # widened into PID/name scans.
+    try:
+        from opensquilla.process_tree import reconcile_persisted_processes
+
+        await reconcile_persisted_processes(getattr(config, "state_dir", None))
+    except Exception:
+        log.warning("gateway.process_owner_reconcile_failed")
 
     # A Desktop child opts into a stronger, nonce-verifiable ownership record.
     # Keep it separate from gateway.pid so legacy CLI/readers retain their

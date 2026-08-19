@@ -37,14 +37,16 @@ import contextlib
 import json
 import logging
 import os
-import signal
 import sys
 import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
@@ -407,24 +409,13 @@ async def _terminate_process_group(
     cancelled, so we signal the group and then gather whatever the transport
     buffered. If SIGTERM doesn't clear the group we escalate to SIGKILL.
     """
-    pid = proc.pid
-    os_mod = cast(Any, os)
-    signal_mod = cast(Any, signal)
-    try:
-        os_mod.killpg(pid, signal_mod.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_S)
-    except TimeoutError:
-        try:
-            os_mod.killpg(pid, signal_mod.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+    owner = capture_process_tree_owner(proc, isolated=True)
+    await owner.terminate(
+        graceful_timeout=_TERMINATE_GRACE_S,
+        kill_timeout=_TERMINATE_GRACE_S,
+    )
+    with contextlib.suppress(ProcessLookupError):
+        await proc.wait()
 
     stdout = b""
     stderr = b""
@@ -445,14 +436,13 @@ async def _run_linux_helper_payload(payload: HelperPayload) -> dict[str, object]
     with tempfile.TemporaryDirectory(prefix="opensquilla-linux-helper-") as temp_dir:
         payload_path = Path(temp_dir) / "payload.json"
         payload_path.write_text(encode_payload(payload), encoding="utf-8")
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_owned_subprocess_exec(
             *internal_child_argv(
                 ChildRole.LINUX_HELPER,
                 args=("--payload", str(payload_path)),
             ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
         try:
             stdout_raw, stderr_raw = await asyncio.wait_for(
@@ -465,6 +455,12 @@ async def _run_linux_helper_payload(payload: HelperPayload) -> dict[str, object]
         except TimeoutError as exc:
             await _terminate_process_group(proc)
             raise SandboxBackendError("linux helper timed out") from exc
+        owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+        if owner is not None:
+            await owner.terminate(
+                graceful_timeout=0.0,
+                kill_timeout=_TERMINATE_GRACE_S,
+            )
     stdout = stdout_raw.decode("utf-8", errors="replace")
     stderr = stderr_raw.decode("utf-8", errors="replace")
     if proc.returncode != 0:

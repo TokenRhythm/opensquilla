@@ -303,12 +303,20 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         events.append("build_services")
         raise RuntimeError("service construction failed")
 
+    async def reconcile(_state_dir: object) -> int:
+        events.append("reconcile_process_owners")
+        return 0
+
     monkeypatch.setattr(
         boot,
         "_start_background_install_telemetry",
         lambda config: events.append("install_telemetry"),
     )
     monkeypatch.setattr(boot, "build_services", fail_build_services)
+    monkeypatch.setattr(
+        "opensquilla.process_tree.reconcile_persisted_processes",
+        reconcile,
+    )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
@@ -330,7 +338,12 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         with pytest.raises(RuntimeError, match="service construction failed"):
             await boot.start_gateway_server(config=config, run=False)
 
-        assert events == ["acquire", "build_services", "release"]
+        assert events == [
+            "acquire",
+            "reconcile_process_owners",
+            "build_services",
+            "release",
+        ]
 
     asyncio.run(run_case())
 
@@ -3087,6 +3100,8 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
         semantic_message=None,
         stream_event_sink=None,
     )
+    run.envelope.metadata["parent_session_key"] = "synthetic-parent-session"
+    run.envelope.metadata["parent_task_id"] = "synthetic-parent-task"
     runner = RecordingTurnRunner()
 
     await dispatch_task_runtime_turn(
@@ -3099,6 +3114,8 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
 
     tool_context = runner.calls[0]["tool_context"]
     assert tool_context.task_id == "task-1"
+    assert tool_context.parent_session_key == "synthetic-parent-session"
+    assert tool_context.parent_task_id == "synthetic-parent-task"
     assert tool_context.is_owner is True
     assert tool_context.run_mode == "full"
     assert tool_context.elevated == "full"

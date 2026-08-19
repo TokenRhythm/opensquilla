@@ -5556,11 +5556,16 @@ class TestSessionsAbort:
                 return SimpleNamespace(task_id=task_id, status="cancelled")
 
         background_cancel_calls: list[str] = []
+        persisted_cancel_calls: list[str] = []
         approval_cancel_calls: list[str] = []
         emitted: list[tuple[str, str, dict[str, Any]]] = []
 
         async def cancel_background(session_key: str) -> int:
             background_cancel_calls.append(session_key)
+            return 1
+
+        async def cancel_persisted(_state_dir: object, session_key: str) -> int:
+            persisted_cancel_calls.append(session_key)
             return 1
 
         class ApprovalQueue:
@@ -5580,6 +5585,10 @@ class TestSessionsAbort:
         monkeypatch.setattr(
             "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
             cancel_background,
+        )
+        monkeypatch.setattr(
+            "opensquilla.process_tree.cancel_persisted_processes_for_session",
+            cancel_persisted,
         )
         monkeypatch.setattr(
             "opensquilla.gateway.approval_queue.get_approval_queue",
@@ -5611,6 +5620,7 @@ class TestSessionsAbort:
         assert runtime.successful_cancel_calls == [session.session_key, grandchild_key, child_key]
         assert runtime.wait_calls == ["task-parent", "task-grandchild", "task-child"]
         assert background_cancel_calls == [session.session_key, child_key, grandchild_key]
+        assert persisted_cancel_calls == [session.session_key, child_key, grandchild_key]
         assert approval_cancel_calls == [
             session.session_key,
             child_key,
