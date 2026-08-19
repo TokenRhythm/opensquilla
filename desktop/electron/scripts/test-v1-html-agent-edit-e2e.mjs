@@ -702,6 +702,34 @@ function generatedArtifactCard(page) {
   return page.locator('.msg-artifact-chip').filter({ hasText: GENERATED_FILENAME })
 }
 
+async function openDeliverablesFromHeader(page) {
+  const wideAction = page.getByTestId('chat-session-action-deliverables')
+  const compactAction = page.locator(
+    '[data-testid="chat-header-primary-action"][data-action="deliverables"]',
+  )
+  const menuTrigger = page.getByTestId('chat-session-actions-trigger')
+
+  await waitFor(
+    async () => await wideAction.isVisible()
+      || await compactAction.isVisible()
+      || await menuTrigger.isVisible(),
+    'responsive deliverables header action',
+    TIMEOUT_MS,
+  )
+  if (await wideAction.isVisible()) {
+    await wideAction.click()
+    return
+  }
+  if (await compactAction.isVisible()) {
+    await compactAction.click()
+    return
+  }
+
+  await menuTrigger.click()
+  await wideAction.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await wideAction.click()
+}
+
 async function openGeneratedArtifact(page) {
   const card = generatedArtifactCard(page)
   await card.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
@@ -877,7 +905,12 @@ async function selectElementInNativePreview(electronApp, selector) {
     const contents = webContents.getAllWebContents().find(candidate => {
       try {
         const url = new URL(candidate.getURL())
-        return url.hostname.endsWith('.localhost')
+        if (!url.hostname.endsWith('.localhost')) return false
+        const owner = candidate.getOwnerBrowserWindow()
+        const view = owner?.contentView.children.find(item => (
+          item.webContents?.id === candidate.id
+        ))
+        return view?.getVisible?.() === true
       } catch {
         return false
       }
@@ -1583,7 +1616,7 @@ try {
     0,
     'one logical generated HTML resource must not create a duplicate switcher entry',
   )
-  await page.getByTestId('chat-session-action-deliverables').click()
+  await openDeliverablesFromHeader(page)
   const logicalResources = page.locator('.resource-collection__item')
   await logicalResources.first().waitFor({ state: 'visible', timeout: TIMEOUT_MS })
   evidence.logicalResourceCount = await logicalResources.count()
