@@ -131,6 +131,7 @@ def _make_input(
     context_window_tokens: int = 200_000,
     restricted_turn: bool = False,
     skip_compaction: bool = False,
+    transcript_snapshot: Any | None = None,
 ) -> CompactionAndHistoryStageInput:
     if agent is None:
         agent = _make_agent_stub(request_context_prompt=request_context_prompt)
@@ -146,6 +147,7 @@ def _make_input(
         bound_user_message_id=bound_user_message_id,
         restricted_turn=restricted_turn,
         skip_compaction=skip_compaction,
+        transcript_snapshot=transcript_snapshot,
     )
 
 
@@ -341,6 +343,20 @@ async def test_active_prompt_binding_is_forwarded_to_both_compaction_ports() -> 
     for call in (t3.calls[0], preflight.calls[0]):
         assert call["history_has_persisted_user"] is True
         assert call["bound_user_message_id"] == "active-user-message"
+
+
+@pytest.mark.asyncio
+async def test_turn_transcript_snapshot_is_shared_across_all_reading_ports() -> None:
+    stage, t3, preflight, history, _ = _make_stage(
+        t3=_RecordingT3(return_value="not_applicable"),
+    )
+    transcript_snapshot = SimpleNamespace()
+
+    await stage.run(_make_input(transcript_snapshot=transcript_snapshot))
+
+    assert t3.calls[0]["transcript_snapshot"] is transcript_snapshot
+    assert preflight.calls[0]["transcript_snapshot"] is transcript_snapshot
+    assert history.calls[0]["transcript_snapshot"] is transcript_snapshot
 
 
 @pytest.mark.asyncio

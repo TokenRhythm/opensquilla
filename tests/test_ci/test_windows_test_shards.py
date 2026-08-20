@@ -63,6 +63,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_artifact_product_errors.py",
     "tests/test_scripts/test_bench_skill_integrity.py",
     "tests/test_skills_hash_consumers.py",
+    "tests/test_skills/test_loader_turn_snapshot.py",
     "tests/test_skills_tree.py",
     "tests/test_recovery/test_config_recovery.py",
     "tests/unit/cli/tui/test_keys_cheatsheet.py",

@@ -675,6 +675,7 @@ class ServiceContainer:
     tool_registry: ToolRegistry | None = None
     session_manager: SessionManager | None = None
     skill_loader: SkillLoader | None = None
+    skill_watcher: Any = None
     skill_management_service: Any = None
     skill_management_state: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker | None = None
@@ -745,6 +746,14 @@ class ServiceContainer:
                 pass
             except Exception:
                 log.debug("gateway.deferred_warmup_close_failed", exc_info=True)
+
+        skill_watcher = self.skill_watcher
+        self.skill_watcher = None
+        if skill_watcher is not None:
+            try:
+                await skill_watcher.stop()
+            except Exception:
+                log.debug("gateway.skill_watcher_close_failed", exc_info=True)
 
         model_catalog_refresh_coordinator = self.model_catalog_refresh_coordinator
         self.model_catalog_refresh_coordinator = None
@@ -3911,6 +3920,15 @@ async def build_services(
         deferred_warmups=deferred_warmups,
         sandbox_setup_task=sandbox_setup_task,
     )
+    if skill_loader is not None:
+        try:
+            from opensquilla.skills.watcher import SkillCatalogWatcher
+
+            skill_watcher = SkillCatalogWatcher(skill_loader)
+            await skill_watcher.start()
+            svc.skill_watcher = skill_watcher
+        except Exception:
+            log.warning("build_services.skill_watcher_failed", exc_info=True)
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
     log.info(

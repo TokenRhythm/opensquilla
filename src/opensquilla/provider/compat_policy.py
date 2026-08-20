@@ -568,6 +568,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "tokenrhythm": OpenAICompatPolicy(
         display_name="TokenRhythm",
         official_host="tokenrhythm.studio",
+        supports_explicit_prompt_cache=True,
         supports_native_json_schema_output=False,
         text_tool_profile=TextToolCompatProfile(
             model_rules=(
