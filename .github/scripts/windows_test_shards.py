@@ -576,11 +576,13 @@ def _merge_junit_reports(destination: Path, reports: tuple[Path, ...]) -> None:
                 try:
                     integer_totals[key] += int(raw)
                 except ValueError:
-                    pass
+                    # Ignore malformed totals so one partial report cannot block merging shards.
+                    continue
             try:
                 elapsed += float(suite.get("time", "0"))
             except ValueError:
-                pass
+                # Ignore malformed durations for the same partial-report tolerance.
+                continue
     if not found:
         raise ValueError("pytest did not produce any readable JUnit suites")
     combined.attrib.update({key: str(value) for key, value in integer_totals.items()})

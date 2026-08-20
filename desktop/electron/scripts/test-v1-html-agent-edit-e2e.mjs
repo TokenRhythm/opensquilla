@@ -993,7 +993,7 @@ async function captureFailureEvidence({
     }
   }
 
-  let renderer = { available: false }
+  let renderer
   let screenshot = null
   if (page && !page.isClosed()) {
     try {
