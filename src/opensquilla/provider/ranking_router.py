@@ -66,8 +66,9 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.4"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.4"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-21.1"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-21.1"
+_PRE_DEEPSEEK_TASK_ANALYZER_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.4"
 _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
 _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
 _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.1"
@@ -87,6 +88,7 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PRE_DEEPSEEK_TASK_ANALYZER_RANKING_CONFIG_VERSION,
         _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION,
         _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION,
         _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
@@ -214,8 +216,8 @@ _TRUSTED_PACKAGED_RELIABILITY_POLICIES = frozenset(
 _PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-27.1"
 _LEGACY_PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-24.3"
 TASK_ANALYZER_PROVIDER_ID = "openrouter"
-TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
-TASK_ANALYZER_UPSTREAM_PROVIDER = "anthropic"
+TASK_ANALYZER_MODEL_ID = "deepseek/deepseek-v4-pro"
+TASK_ANALYZER_UPSTREAM_PROVIDER = "deepseek"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
 TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL = "opensquilla.task-analyzer-fallback-chain/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
@@ -2762,6 +2764,10 @@ def _ranking_config_for_base_version(
         )
     historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
+    historical["task_analyzer"]["model"] = "anthropic/claude-opus-4.8"
+    historical["task_analyzer"]["upstream_provider"] = "anthropic"
+    if requested == _PRE_DEEPSEEK_TASK_ANALYZER_RANKING_CONFIG_VERSION:
+        return _validate_ranking_config(historical)
     historical["task_analyzer"]["schema_repair_max_retries"] = 1
     if requested == _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION:
         return _validate_ranking_config(historical)

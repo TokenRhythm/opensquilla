@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-ranking-config-v4",
-  "config_version": "step2-ranking-2026-08-18.4",
+  "config_version": "step2-ranking-2026-08-21.1",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -89,8 +89,8 @@
   },
   "task_analyzer": {
     "provider": "openrouter",
-    "model": "anthropic/claude-opus-4.8",
-    "upstream_provider": "anthropic",
+    "model": "deepseek/deepseek-v4-pro",
+    "upstream_provider": "deepseek",
     "fallback_chain": [
       {
         "provider": "openrouter",

@@ -315,8 +315,8 @@ def test_v3_replay_authorizes_live_chain_fallback_with_zero_requests(
     routes = [
         {
             "provider": "openrouter",
-            "model": "anthropic/claude-opus-4.8",
-            "upstream_provider": "anthropic",
+            "model": "deepseek/deepseek-v4-pro",
+            "upstream_provider": "deepseek",
             "max_attempts": 1,
         },
         {

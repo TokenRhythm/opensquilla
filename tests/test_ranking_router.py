@@ -633,7 +633,7 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["task_analyzer"]["max_output_tokens"] == 1_200
     assert first["task_analyzer"]["provider"] == "openrouter"
     assert first["task_analyzer"]["model"] == TASK_ANALYZER_MODEL_ID
-    assert first["task_analyzer"]["upstream_provider"] == "anthropic"
+    assert first["task_analyzer"]["upstream_provider"] == "deepseek"
     assert first["task_analyzer"]["stream_close_timeout_seconds"] == 1.0
     assert first["routing_tiers"]["mapping"] == {"c0": 1, "c1": 2, "c2": 3, "c3": 4}
     assert first["context"]["bucket_min_tokens"]["extra_long"] == 128_000
@@ -980,14 +980,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-18.4",
-            "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693",
+            "step2-ranking-2026-08-21.1",
+            "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-18.4",
-            "ca3778b791caaa4719388330cc8c2721ae16b1a1f6ba5d7e4310b929ace93dcf",
+            "step2-ranking-2026-08-21.1",
+            "03fed14a08ad3424c0c77d06f7cbe15e3ac07b95d66992e99a0a10efb8246ca8",
         ),
     ],
 )
@@ -1050,7 +1050,13 @@ def test_task_analyzer_chain_policy_preserves_historical_single_route() -> None:
     assert current["total_timeout_seconds"] == 60.0
     assert current["schema_repair_max_retries"] == 0
     assert historical["configured"] is False
-    assert historical["routes"] == current["routes"][:1]
+    assert historical["routes"] == [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+        }
+    ]
     assert historical["total_timeout_seconds"] == 20.0
     assert historical["schema_repair_max_retries"] == 0
     assert canonical_json_sha256(historical_config) == (
@@ -1076,7 +1082,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-18.4"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-21.1"
     assert "role_reliability" in default["base_config"]
     assert default["base_config"]["normalization"][
         "price_reference_usd_per_million"
@@ -1091,6 +1097,27 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert default["base_config"]["rerank"]["top_l_min"] == 8
     assert default["base_config"]["task_analyzer"]["max_retries"] == 1
     assert default["base_config"]["task_analyzer"]["schema_repair_max_retries"] == 0
+
+    previous_task_analyzer_policy = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-18.4",
+    )
+    previous_task_analyzer_policy_thinking = ranking_config_resolution(
+        thinking_assignment_enabled=True,
+        base_version="step2-ranking-2026-08-18.4",
+    )
+    assert previous_task_analyzer_policy["base_config"]["task_analyzer"]["model"] == (
+        "anthropic/claude-opus-4.8"
+    )
+    assert previous_task_analyzer_policy["base_config"]["task_analyzer"][
+        "upstream_provider"
+    ] == "anthropic"
+    assert previous_task_analyzer_policy["base_sha256"] == (
+        "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693"
+    )
+    assert previous_task_analyzer_policy_thinking["base_sha256"] == (
+        "ca3778b791caaa4719388330cc8c2721ae16b1a1f6ba5d7e4310b929ace93dcf"
+    )
 
     previous_schema_repair_policy = ranking_config_resolution(
         thinking_assignment_enabled=False,
@@ -1274,7 +1301,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-18.4+override.{resolution['override_sha256'][:12]}"
+        f"step2-ranking-2026-08-21.1+override.{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
     override["penalties"]["task_cost_weights"]["medium"] = 99
@@ -1446,10 +1473,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-18.4+override.{suffix}"
+        f"step2-ranking-2026-08-21.1+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-18.4+override.{suffix}"
+        f"step2-ranking-2026-08-21.1+override.{suffix}"
     )
 
 
@@ -3311,7 +3338,7 @@ class _AnalyzerTerminalProvider:
 
 
 _TASK_ANALYZER_CHAIN_ROUTES = (
-    ("openrouter", "anthropic/claude-opus-4.8", "anthropic"),
+    ("openrouter", "deepseek/deepseek-v4-pro", "deepseek"),
     ("openrouter", "openai/gpt-5.6-sol", "azure"),
     (
         "openrouter",
@@ -6665,7 +6692,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693"
+        == "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
@@ -7602,13 +7629,13 @@ def test_packaged_ranking_config_without_affinity_preserves_golden_bytes_and_has
     resolution = ranking_config_resolution()
 
     assert hashlib.sha256(raw_payload).hexdigest() == (
-        "fe0a18a67448a399d245438533beae21caf11a84528c6db9c49a7d9e049f539c"
+        "a0108275a81302de0a4a25588202b3ea823492eb2412dde7f1b56862c42f6625"
     )
     assert canonical_json_sha256(loaded) == (
-        "19ea5d71a4a3f02ec96daebc67efdb0b6935a56e259d60e4af77361269fc16a7"
+        "bcaa30e96be728810adfc6a22d7699b3e78830f3ae849f7cdf3bec8bcd764d99"
     )
     assert resolution["base_sha256"] == (
-        "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693"
+        "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4"
     )
     assert resolution["effective_sha256"] == resolution["base_sha256"]
     assert "kv_cache_affinity" not in loaded["session"]

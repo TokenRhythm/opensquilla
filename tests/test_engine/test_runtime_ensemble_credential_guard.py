@@ -201,7 +201,7 @@ def _successful_chain_analysis(
             "exhausted": False,
             "schema_repair_max_retries": kwargs.get(
                 "schema_repair_max_retries",
-                1,
+                0,
             ),
             "deadline": {
                 "configured_seconds": 1.0,
@@ -765,7 +765,7 @@ async def test_router_dynamic_uses_ordered_task_analyzer_chain(
     config = _static_b5_config(
         **ensemble_overrides,
     )
-    config.llm.provider_routing = {TASK_ANALYZER_MODEL_ID: "anthropic"}
+    config.llm.provider_routing = {TASK_ANALYZER_MODEL_ID: "deepseek"}
     runner = TurnRunner(provider_selector=None, config=config)
     selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
 
@@ -785,7 +785,7 @@ async def test_router_dynamic_uses_ordered_task_analyzer_chain(
         "openai/gpt-5.6-sol",
         "google/gemini-3.1-pro-preview",
     ]
-    expected_upstreams = ["anthropic", "azure", "google-ai-studio"]
+    expected_upstreams = ["deepseek", "azure", "google-ai-studio"]
     if single_route:
         expected_models = expected_models[:1]
         expected_upstreams = expected_upstreams[:1]
@@ -811,7 +811,7 @@ async def test_router_dynamic_uses_ordered_task_analyzer_chain(
     ]
     assert analyzer_calls[0]["user_profile_enabled"] is True
     assert "user_profile" not in analyzer_calls[0]
-    assert turn.metadata["routed_model_before_ensemble"] != TASK_ANALYZER_MODEL_ID
+    assert turn.metadata["routed_model_before_ensemble"] == TASK_ANALYZER_MODEL_ID
     assert turn.metadata["router_dynamic_task_analyzer"]["provider"] == (
         TASK_ANALYZER_PROVIDER_ID
     )

@@ -294,7 +294,7 @@ independent; both receive the outer tool set only when their corresponding switc
    fixed set of proposer roles and independently selects an aggregator from the
    same pool.
 
-The baseline selector does **not** invoke the dedicated Opus task analyzer,
+The baseline selector does **not** invoke the dedicated remote task analyzer,
 build a task profile, apply session intent, or run the current Step2 hard-filter
 and rerank pipeline. It also does not run SquillaRouter a second time: the
 router decision already present on the turn is its input. For a real local-tree
@@ -484,8 +484,9 @@ Before ranking, runtime builds four replaceable inputs:
    bounded before it reaches the analyzer. The trace stores a SHA-256 hash
    rather than raw prompt content.
 2. **Task profile** — a dedicated OpenRouter deployment of
-   `anthropic/claude-opus-4.8` is called once as the JSON classifier. It never
-   reuses the model selected by the single-model route. The result must contain
+   `deepseek/deepseek-v4-pro` is called once as the JSON classifier. It uses a
+   dedicated OpenRouter request even when the single-model route selected the
+   same model ID. The result must contain
    capability, domain, and tier distributions that sum to one within the
    configured tolerance, plus cost, latency, context, modality, risk, and
    session-intent constraints. Required numeric fields accept finite JSON
