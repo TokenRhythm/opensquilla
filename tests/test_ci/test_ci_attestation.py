@@ -683,10 +683,8 @@ def _composition_fixture(
     return repo, attestation, queue_base
 
 
-def test_combined_smoke_trust_root_is_intentionally_narrow() -> None:
-    assert MODULE["COMPOSITION_COMBINED_SMOKE_TRUST_ROOT"] == frozenset(
-        {"python-targeted"}
-    )
+def test_base_advance_composition_has_no_overlap_trust_root() -> None:
+    assert MODULE["COMPOSITION_COMBINED_SMOKE_TRUST_ROOT"] == frozenset()
 
 
 def test_base_advance_composition_accepts_disjoint_risk_domains(tmp_path: Path) -> None:
@@ -721,7 +719,7 @@ def test_base_advance_composition_accepts_disjoint_source_code_domains(
     assert combined_smoke_suites == ()
 
 
-def test_base_advance_composition_allows_trusted_python_targeted_overlap(
+def test_base_advance_composition_rejects_python_targeted_overlap(
     tmp_path: Path,
 ) -> None:
     repo, attestation, queue_base = _composition_fixture(
@@ -732,9 +730,9 @@ def test_base_advance_composition_allows_trusted_python_targeted_overlap(
         repo=repo, attestation=attestation, queue_base_sha=queue_base
     )
 
-    assert safe is True
-    assert "trusted combined-smoke" in reason
-    assert combined_smoke_suites == ("python-targeted",)
+    assert safe is False
+    assert reason == "base delta overlaps unsupported source suites: python-targeted"
+    assert combined_smoke_suites == ()
 
 
 @pytest.mark.parametrize(
@@ -890,7 +888,7 @@ def _verify_composed_fixture(
     return reusable, reason, source_run, details
 
 
-def test_verify_queue_allows_python_targeted_overlap_with_combined_smoke(
+def test_verify_queue_rejects_python_targeted_overlap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -905,11 +903,10 @@ def test_verify_queue_allows_python_targeted_overlap_with_combined_smoke(
         monkeypatch=monkeypatch,
     )
 
-    assert reusable is True
-    assert "composed trusted PR/base evidence" in reason
-    assert source_run == 123
-    assert details["reason_code"] == "reusable_base_advance"
-    assert details["combined_smoke_suites"] == '["python-targeted"]'
+    assert reusable is False
+    assert "unsupported source suites: python-targeted" in reason
+    assert source_run is None
+    assert details["combined_smoke_suites"] == "[]"
 
 
 def test_verify_queue_disjoint_composition_has_no_combined_smoke_suites(

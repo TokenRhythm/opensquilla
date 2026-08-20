@@ -301,14 +301,10 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         "Queue/main installation and offline gateway canary"
     )
     assert "test_gateway_silent_reply_process_e2e.py" in str(jobs["main-canary"])
-    python_combined_smoke = next(
-        step
+    assert all(
+        step.get("name") != "Run overlapping Python domain smoke"
         for step in jobs["main-canary"]["steps"]
-        if step.get("name") == "Run overlapping Python domain smoke"
     )
-    assert "combined_smoke_suites" in python_combined_smoke["if"]
-    assert "python-targeted" in python_combined_smoke["if"]
-    assert "pytest tests/unit" in python_combined_smoke["run"]
     assert jobs["ci-result"]["name"] == "CI result"
     assert "ci-evidence-v2-tree-${{ steps.attestation.outputs.tree_sha }}" in str(
         jobs["ci-result"]

@@ -1580,12 +1580,6 @@ jobs:
           tests/functional/test_gateway_silent_reply_process_e2e.py
           -q --durations=10
 
-      - name: Run overlapping Python domain smoke
-        if: >-
-          ${{ github.event_name == 'merge_group'
-              && contains(fromJSON(needs.queue-attestation.outputs.combined_smoke_suites), 'python-targeted') }}
-        run: uv run pytest tests/unit -q --durations=10
-
   ci-result:
     name: CI result
     needs:

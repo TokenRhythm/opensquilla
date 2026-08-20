@@ -2413,7 +2413,7 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "requires an unlocked foreground GUI session" in native
     assert ci.count(
         "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
-    ) == 2
+    ) == 3
 
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:

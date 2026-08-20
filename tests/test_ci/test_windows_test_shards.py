@@ -324,6 +324,13 @@ def test_known_process_tree_flakes_are_marked_ci_serial() -> None:
     )
 
 
+def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_task_runtime_terminal_cleanup.py"),
+        "test_no_leak_under_load",
+    )
+
+
 @pytest.mark.parametrize(
     "function_name",
     [
@@ -376,6 +383,40 @@ def test_xdist_runtime_roots_are_worker_scoped(
         assert scoped == root / expected_suffix
         assert scoped.is_dir()
     assert os.environ["OPENSQUILLA_PYTEST_XDIST_SCOPE"] == "run_unsafe/gw2"
+
+
+def test_approval_queue_default_path_uses_worker_scoped_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.application import approval_queue as approval_queue_module
+
+    conftest_module = runpy.run_path(
+        Path("tests/conftest.py").as_posix(),
+        run_name="pytest_conftest_approval_queue_contract",
+    )
+    state_root = tmp_path / "state-root"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(state_root))
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.delenv("OPENSQUILLA_PYTEST_XDIST_SCOPE", raising=False)
+    monkeypatch.setattr(approval_queue_module, "_DEFAULT_APPROVAL_QUEUE_PATH", None)
+
+    conftest_module["pytest_configure"](
+        SimpleNamespace(workerinput={"workerid": "gw3", "testrunuid": "queue-run"})
+    )
+    queue = approval_queue_module.ApprovalQueue()
+    try:
+        assert queue._db_path == (
+            state_root
+            / ".pytest-xdist"
+            / "queue-run"
+            / "gw3"
+            / "state"
+            / "approval_queue.sqlite"
+        )
+    finally:
+        queue.close()
 
 
 @pytest.mark.parametrize(

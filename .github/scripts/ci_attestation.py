@@ -38,7 +38,7 @@ SHA_RE: Final = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 PR_QUEUE_REF_RE: Final = re.compile(r"(?:^|/)pr-(?P<number>[1-9][0-9]*)-")
 COMPOSITION_BASELINE_SUITES: Final = frozenset({"readme-locale", "workflow-lint"})
-COMPOSITION_COMBINED_SMOKE_TRUST_ROOT: Final = frozenset({"python-targeted"})
+COMPOSITION_COMBINED_SMOKE_TRUST_ROOT: Final = frozenset()
 TRUST_POLICY_FILES: Final = {
     ".github/CODEOWNERS",
     ".github/ci/suites.v1.json",
