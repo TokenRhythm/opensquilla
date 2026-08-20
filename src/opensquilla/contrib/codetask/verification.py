@@ -44,6 +44,7 @@ from opensquilla.contrib.codetask.types import (
     RegressionResult,
     TaskState,
 )
+from opensquilla.git_runtime import GitRunState, run_git
 
 logger = logging.getLogger(__name__)
 
@@ -791,33 +792,32 @@ class _BaseWorktree:
         import shutil
 
         tmp = Path(tempfile.mkdtemp(prefix="codetask-base-"))
-        try:
-            r = subprocess.run(
-                ["git", "worktree", "add", "--detach", str(tmp), self.base_commit],
-                cwd=str(self.repo),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        result = run_git(
+            ["worktree", "add", "--detach", str(tmp), self.base_commit],
+            cwd=self.repo,
+            timeout=120,
+        )
+        if result.state is GitRunState.UNAVAILABLE:
             shutil.rmtree(tmp, ignore_errors=True)
-            raise _WorktreeError(str(exc)) from exc
-        if r.returncode != 0:
+            reason = result.capability.reason or result.stderr_text.strip()
+            raise _WorktreeError(f"Git is unavailable ({reason or 'git_unavailable'})")
+        if result.state is GitRunState.TIMED_OUT:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise _WorktreeError("git worktree add timed out after 120s")
+        if not result.ok:
             # Do not leak the mkdtemp dir when the worktree was never added
             # (codex review #9).
             shutil.rmtree(tmp, ignore_errors=True)
-            raise _WorktreeError((r.stderr or "").strip()[-200:])
+            detail = result.stderr_text.strip() or result.state.value
+            raise _WorktreeError(detail[-200:])
         self._dir = tmp
         return tmp
 
     def __exit__(self, *exc) -> None:
         if self._dir is not None:
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(self._dir)],
-                cwd=str(self.repo),
-                capture_output=True,
+            run_git(
+                ["worktree", "remove", "--force", str(self._dir)],
+                cwd=self.repo,
                 timeout=60,
             )
 

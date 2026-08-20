@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,6 +80,54 @@ _LIVE_MARKERS = (
     "live_channel",
     "live_search",
 )
+
+
+@pytest.fixture
+def unavailable_git_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Force Git unavailable and fail if a flow still tries to launch it."""
+    from opensquilla import git_runtime
+    from opensquilla.git_runtime import GitCapability, GitCapabilityState
+
+    capability = GitCapability(
+        state=GitCapabilityState.UNAVAILABLE,
+        executable=None,
+        source=None,
+        reason="git_not_found",
+    )
+    resolution_calls: list[dict[str, object]] = []
+
+    def resolve_unavailable(
+        environment=None,
+        run_mode=None,
+        force_refresh: bool = False,
+    ) -> GitCapability:
+        resolution_calls.append(
+            {
+                "environment": environment,
+                "run_mode": run_mode,
+                "force_refresh": force_refresh,
+            }
+        )
+        return capability
+
+    original_run = subprocess.run
+
+    def guarded_run(command, *args, **kwargs):
+        raw_program = command[0] if isinstance(command, (list, tuple)) else command
+        program = os.fsdecode(raw_program).strip().strip("\"'")
+        program = program.replace("\\", "/").rsplit("/", 1)[-1]
+        program = program.split(maxsplit=1)[0].casefold()
+        if program in {"git", "git.exe", "xcode-select", "xcode-select.exe"}:
+            raise AssertionError(f"unexpected Git process launch: {command!r}")
+        return original_run(command, *args, **kwargs)
+
+    git_runtime.clear_git_capability_cache()
+    monkeypatch.setattr(git_runtime, "resolve_git_capability", resolve_unavailable)
+    monkeypatch.setattr(subprocess, "run", guarded_run)
+    return SimpleNamespace(
+        capability=capability,
+        resolution_calls=resolution_calls,
+    )
 
 
 @pytest.fixture(autouse=True)

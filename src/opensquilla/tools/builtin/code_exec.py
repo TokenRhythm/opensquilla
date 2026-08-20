@@ -57,6 +57,7 @@ from opensquilla.tools.write_tracking import (
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
+    workspace_write_deny_effect_preflight,
 )
 
 # Destructive Python patterns that must be surfaced to the unified sandbox gate.
@@ -1068,13 +1069,24 @@ async def execute_code(
         )
     )
     mutation_before = snapshot_current_workspace_mutations()
+    if not full_host:
+        protection_block = workspace_write_deny_effect_preflight(
+            tool_name="execute_code",
+            before=mutation_before,
+        )
+        if protection_block is not None:
+            return protection_block
 
-    def finish(output: str) -> str:
+    def finish(output: str, *, executed: bool = True) -> str:
+        if not executed:
+            return output
         record_observed_workspace_mutations(
             tool_name="execute_code",
             before=mutation_before,
             metadata={"code_hash": mutation_ledger_text_hash(code)},
         )
+        if full_host:
+            return output
         # Effect enforcement runs after the ledger so the raw escape stays
         # honestly recorded before any revert rewrites the workspace.
         return enforce_workspace_write_deny_effects(
@@ -1094,7 +1106,7 @@ async def execute_code(
             hints=hints,
         )
         if isinstance(decision, DenialResult):
-            return finish(json.dumps(decision.to_dict()))
+            return finish(json.dumps(decision.to_dict()), executed=False)
         if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             sandbox_enabled = False
@@ -1108,7 +1120,10 @@ async def execute_code(
             )
             if retry_gate is not None:
                 if not retry_gate.allowed:
-                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                    return finish(
+                        json.dumps(retry_gate.to_envelope(), ensure_ascii=False),
+                        executed=False,
+                    )
                 host_execution = True
                 sandbox_enabled = False
                 elevated_code_execution = True
@@ -1126,9 +1141,9 @@ async def execute_code(
                 if runtime is not None:
                     preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                     if isinstance(preflight, DenialResult):
-                        return finish(json.dumps(preflight.to_dict()))
+                        return finish(json.dumps(preflight.to_dict()), executed=False)
                     if isinstance(preflight, dict):
-                        return finish(json.dumps(preflight))
+                        return finish(json.dumps(preflight), executed=False)
                 try:
                     sandbox_result = await _run_backend_with_managed_network_if_needed(
                         backend_request,
@@ -1153,8 +1168,14 @@ async def execute_code(
                     )
                     if escalation is not None:
                         if isinstance(escalation, DenialResult):
-                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
-                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                            return finish(
+                                json.dumps(escalation.to_dict(), ensure_ascii=False),
+                                executed=False,
+                            )
+                        return finish(
+                            json.dumps(escalation.to_envelope(), ensure_ascii=False),
+                            executed=False,
+                        )
                     return finish(
                         _execution_result_json(
                             returncode=-1,
@@ -1162,7 +1183,8 @@ async def execute_code(
                             stderr=f"Execution error: {exc}",
                             timed_out=False,
                             elapsed_ms=0,
-                        )
+                        ),
+                        executed=False,
                     )
                 except Exception as exc:
                     return finish(
@@ -1172,7 +1194,8 @@ async def execute_code(
                             stderr=f"Execution error: {exc}",
                             timed_out=False,
                             elapsed_ms=0,
-                        )
+                        ),
+                        executed=False,
                     )
                 if is_likely_sandbox_denied(sandbox_result):
                     review_action = _code_elevation_action(
@@ -1206,6 +1229,7 @@ async def execute_code(
                     )
                 )
 
+    process_started = False
     try:
         proc = await create_owned_subprocess_exec(
             python_bin,
@@ -1216,6 +1240,7 @@ async def execute_code(
             cwd=str(workdir_path),
             env=safe_env,
         )
+        process_started = True
         process_tree = capture_process_tree_owner(proc, isolated=True)
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -1263,7 +1288,8 @@ async def execute_code(
                 stderr=f"Execution error: {exc}",
                 timed_out=False,
                 elapsed_ms=0,
-            )
+            ),
+            executed=process_started,
         )
     finally:
         if cleanup_dir:

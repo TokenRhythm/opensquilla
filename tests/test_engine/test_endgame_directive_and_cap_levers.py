@@ -18,6 +18,7 @@ import json
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,6 +28,7 @@ from opensquilla.engine.agent import (
     _ENDGAME_FIX_DIRECTIVE_PREFIX,
     _REASONING_ONLY_ACT_NOW_DIRECTIVE,
 )
+from opensquilla.git_runtime import GitRunState
 from opensquilla.provider import (
     ChatConfig,
     Message,
@@ -626,6 +628,42 @@ async def test_endgame_fix_directive_suppressed_by_substantive_diff(
     events = [event async for event in agent.run_turn("fix the bug")]
 
     assert any(event.kind == "done" for event in events)
+    assert not _fix_directive_texts(provider.calls[1]["messages"])
+    assert _runtime_events(events_path, "endgame_fix_directive") == []
+
+
+@pytest.mark.asyncio
+async def test_endgame_fix_directive_skips_when_git_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _target = _init_repo(tmp_path)
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.run_git",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=False,
+            state=GitRunState.UNAVAILABLE,
+        ),
+    )
+    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
+    agent = _echo_agent(
+        provider,
+        AgentConfig(
+            timeout=30.0,
+            endgame_fix_directive_margin_seconds=60,
+            max_iterations=5,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+            runtime_events_path=str(events_path),
+        ),
+        tool_context=_workspace_ctx(repo),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 2
     assert not _fix_directive_texts(provider.calls[1]["messages"])
     assert _runtime_events(events_path, "endgame_fix_directive") == []
 

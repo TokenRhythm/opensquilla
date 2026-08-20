@@ -20,6 +20,9 @@ _CHANNEL_RUNTIME_TOOL_NAMES: frozenset[str] = frozenset({"message"})
 _ADMIN_RUNTIME_TOOL_NAMES: frozenset[str] = frozenset({"agents_list", "subagents"})
 _GATEWAY_RUNTIME_TOOL_NAMES: frozenset[str] = frozenset({"gateway"})
 _SCHEDULER_RUNTIME_TOOL_NAMES: frozenset[str] = frozenset({"cron"})
+_GIT_RUNTIME_TOOL_NAMES: frozenset[str] = frozenset(
+    {"git_status", "git_diff", "git_log", "git_commit"}
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,9 @@ class ToolSurfaceCapabilities:
     gateway_config: bool = False
     channel_backing: bool = False
     image_generation: bool = True
+    # Default True preserves compatibility for callers that construct a
+    # capability snapshot explicitly rather than using the live detector.
+    git_available: bool = True
 
 
 def private_memory_read_tools_blocked(ctx: ToolContext | None) -> bool:
@@ -71,6 +77,19 @@ def _detect_image_generation_capability() -> bool:
         return False
 
 
+def _detect_git_capability() -> bool:
+    """Return whether background Git can be launched without platform prompts."""
+
+    try:
+        from opensquilla.git_runtime import resolve_git_capability
+
+        return resolve_git_capability().available
+    except Exception:
+        # Git is optional. Capability-resolution failures must fail closed so
+        # the macOS developer-tools shim is never advertised as usable.
+        return False
+
+
 def tool_surface_capabilities_from_runtime(
     *,
     session_manager: object | None = None,
@@ -80,6 +99,7 @@ def tool_surface_capabilities_from_runtime(
     channel_manager: object | None = None,
     originating_envelope: object | None = None,
     image_generation: bool | None = None,
+    git_available: bool | None = None,
 ) -> ToolSurfaceCapabilities:
     """Build tool-surface capabilities from injected runtime dependencies."""
 
@@ -93,6 +113,9 @@ def tool_surface_capabilities_from_runtime(
             _detect_image_generation_capability()
             if image_generation is None
             else image_generation
+        ),
+        git_available=(
+            _detect_git_capability() if git_available is None else git_available
         ),
     )
 
@@ -127,6 +150,8 @@ def resolve_runtime_tool_surface(
         denied_tools |= set(_SCHEDULER_RUNTIME_TOOL_NAMES)
     if not caps.gateway_config:
         denied_tools |= set(_GATEWAY_RUNTIME_TOOL_NAMES)
+    if not caps.git_available:
+        denied_tools |= set(_GIT_RUNTIME_TOOL_NAMES)
 
     if ctx.interaction_mode is InteractionMode.UNATTENDED:
         if not caps.channel_backing:
@@ -179,4 +204,5 @@ def detect_runtime_tool_surface_capabilities(
         gateway_config=gateway_config,
         channel_backing=channel_backing,
         image_generation=_detect_image_generation_capability(),
+        git_available=_detect_git_capability(),
     )

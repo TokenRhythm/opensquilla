@@ -1061,6 +1061,7 @@ async def test_source_patch_rejects_invalid_html_before_durable_mutation(
 @pytest.mark.asyncio
 async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
     artifact_editing_env,
+    unavailable_git_runtime: SimpleNamespace,
 ) -> None:
     env = artifact_editing_env
     ref, document = await _adopt_html(env)
@@ -1265,6 +1266,7 @@ async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
     assert attempt.status is MutationAttemptStatus.APPLIED
     assert attempt.change_set_id == patched.payload["changeSet"]["id"]
     assert attempt.revision_id == patched.payload["revision"]["id"]
+    assert unavailable_git_runtime.resolution_calls == []
 
 
 @pytest.mark.asyncio

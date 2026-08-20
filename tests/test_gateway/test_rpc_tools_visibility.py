@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -211,6 +212,36 @@ async def test_default_tools_rpc_hides_owner_only_tools_from_non_owner(method: s
     assert "spawn_subagent" not in owner_names
     assert "send_message" not in owner_names
     assert "generate_image" not in owner_names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["tools.catalog", "tools.effective"])
+async def test_default_tools_rpc_hides_git_tools_when_runtime_is_unavailable(
+    method: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.resolve_git_capability",
+        lambda: SimpleNamespace(available=False),
+    )
+
+    result = await get_dispatcher().dispatch(
+        "r1",
+        method,
+        {"callerKind": "agent"},
+        _ctx(tool_registry=get_default_registry(), is_owner=True),
+    )
+
+    assert result.error is None, result.error
+    assert {
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_commit",
+    }.isdisjoint(_tool_names(result.payload))
 
 
 @pytest.mark.asyncio

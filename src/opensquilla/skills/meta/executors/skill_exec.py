@@ -28,6 +28,7 @@ from typing import Any
 import jinja2
 import structlog
 
+from opensquilla.git_runtime import resolve_git_capability
 from opensquilla.process_tree import (
     capture_process_tree_owner,
     create_owned_subprocess_exec,
@@ -238,6 +239,31 @@ def _declared_ambient_env_keys(
         *(getattr(requires, "env_any", ()) or ()),
     )
     return frozenset(name for name in declared if isinstance(name, str) and name)
+
+
+def _skill_requires_git(skill_spec: Any) -> bool:
+    metadata = getattr(skill_spec, "metadata", None)
+    requires = getattr(metadata, "requires", None)
+    bins = getattr(requires, "bins", ()) or ()
+    return any(isinstance(name, str) and name.casefold() == "git" for name in bins)
+
+
+def _pin_safe_git_on_path(child_env: dict[str, str]) -> None:
+    """Make a resolved real Git win over the macOS developer-tools shim."""
+
+    capability = resolve_git_capability()
+    if not capability.available or capability.executable is None:
+        reason = capability.reason or "git_unavailable"
+        raise RuntimeError(f"GIT_UNAVAILABLE: Git is unavailable ({reason}).")
+    path_key = next((key for key in child_env if key.casefold() == "path"), "PATH")
+    existing = child_env.get(path_key, "")
+    safe_directory = str(capability.executable.parent)
+    remaining = [
+        value
+        for value in existing.split(os.pathsep)
+        if value and os.path.normcase(value) != os.path.normcase(safe_directory)
+    ]
+    child_env[path_key] = os.pathsep.join((safe_directory, *remaining))
 
 
 def _ambient_value(source: Mapping[str, str], name: str) -> str | None:
@@ -731,6 +757,11 @@ async def run_skill_exec_step(
         if key in allowed_trusted_keys and value:
             child_env[key] = value
             sensitive_values.add(value)
+    if _skill_requires_git(skill_spec):
+        # Eligibility and child execution must agree on the same executable.
+        # In particular, a later Homebrew Git accepted by the resolver must be
+        # placed ahead of an unusable /usr/bin/git shim in the child PATH.
+        _pin_safe_git_on_path(child_env)
     apply_utf8_child_env(child_env)
 
     # Optional stdin: render Jinja template and pipe to the subprocess.

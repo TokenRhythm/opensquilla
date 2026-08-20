@@ -132,6 +132,11 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # The reusable Python Gateway client shares the bounded WebSocket receive
     # contract with the CLI client; contracts remains implementation-free.
     ("gateway_client.py", "contracts"),
+    # The top-level Git resolver consults the optional managed Git Bash
+    # pack and its active runtime policy lazily on Windows; neither dependency
+    # imports the resolver back.
+    ("git_runtime.py", "runtime_packs"),
+    ("git_runtime.py", "sandbox"),
     ("identity", "safety"),
     ("identity", "session"),
     ("mcp", "tools"),

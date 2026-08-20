@@ -454,7 +454,9 @@ async def test_mutation_finalizer_cannot_stream_internal_protocol_echo() -> None
 
 
 @pytest.mark.asyncio
-async def test_additive_document_patch_uses_same_guarded_writer_lifecycle() -> None:
+async def test_additive_document_patch_uses_same_guarded_writer_lifecycle(
+    unavailable_git_runtime: SimpleNamespace,
+) -> None:
     provider = _ScriptedMutationProvider(
         [
             _document_patch_call_events(
@@ -501,6 +503,7 @@ async def test_additive_document_patch_uses_same_guarded_writer_lifecycle() -> N
     assert provider.calls[1]["tools"] is None
     assert done.document_mutation_outcome["status"] == "applied"
     assert done.text.endswith("The document changes were applied.")
+    assert unavailable_git_runtime.resolution_calls == []
 
 
 @pytest.mark.asyncio
