@@ -633,7 +633,7 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["task_analyzer"]["max_output_tokens"] == 1_200
     assert first["task_analyzer"]["provider"] == "openrouter"
     assert first["task_analyzer"]["model"] == TASK_ANALYZER_MODEL_ID
-    assert first["task_analyzer"]["upstream_provider"] == "deepseek"
+    assert first["task_analyzer"]["upstream_provider"] == "together"
     assert first["task_analyzer"]["stream_close_timeout_seconds"] == 1.0
     assert first["routing_tiers"]["mapping"] == {"c0": 1, "c1": 2, "c2": 3, "c3": 4}
     assert first["context"]["bucket_min_tokens"]["extra_long"] == 128_000
@@ -980,14 +980,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-21.1",
-            "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4",
+            "step2-ranking-2026-08-21.2",
+            "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-21.1",
-            "03fed14a08ad3424c0c77d06f7cbe15e3ac07b95d66992e99a0a10efb8246ca8",
+            "step2-ranking-2026-08-21.2",
+            "d0d8b213346a40951985ff750ab69c4c22ad931acaa8f23b64f1a0e084bdfc05",
         ),
     ],
 )
@@ -1082,7 +1082,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-21.1"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-21.2"
     assert "role_reliability" in default["base_config"]
     assert default["base_config"]["normalization"][
         "price_reference_usd_per_million"
@@ -1097,6 +1097,27 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert default["base_config"]["rerank"]["top_l_min"] == 8
     assert default["base_config"]["task_analyzer"]["max_retries"] == 1
     assert default["base_config"]["task_analyzer"]["schema_repair_max_retries"] == 0
+
+    previous_upstream_policy = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-21.1",
+    )
+    previous_upstream_policy_thinking = ranking_config_resolution(
+        thinking_assignment_enabled=True,
+        base_version="step2-ranking-2026-08-21.1",
+    )
+    assert previous_upstream_policy["base_config"]["task_analyzer"]["model"] == (
+        "deepseek/deepseek-v4-pro"
+    )
+    assert previous_upstream_policy["base_config"]["task_analyzer"][
+        "upstream_provider"
+    ] == "deepseek"
+    assert previous_upstream_policy["base_sha256"] == (
+        "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4"
+    )
+    assert previous_upstream_policy_thinking["base_sha256"] == (
+        "03fed14a08ad3424c0c77d06f7cbe15e3ac07b95d66992e99a0a10efb8246ca8"
+    )
 
     previous_task_analyzer_policy = ranking_config_resolution(
         thinking_assignment_enabled=False,
@@ -1301,7 +1322,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-21.1+override.{resolution['override_sha256'][:12]}"
+        f"step2-ranking-2026-08-21.2+override.{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
     override["penalties"]["task_cost_weights"]["medium"] = 99
@@ -1473,10 +1494,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-21.1+override.{suffix}"
+        f"step2-ranking-2026-08-21.2+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-21.1+override.{suffix}"
+        f"step2-ranking-2026-08-21.2+override.{suffix}"
     )
 
 
@@ -3338,7 +3359,7 @@ class _AnalyzerTerminalProvider:
 
 
 _TASK_ANALYZER_CHAIN_ROUTES = (
-    ("openrouter", "deepseek/deepseek-v4-pro", "deepseek"),
+    ("openrouter", "deepseek/deepseek-v4-pro", "together"),
     ("openrouter", "openai/gpt-5.6-sol", "azure"),
     (
         "openrouter",
@@ -3398,6 +3419,21 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
         config is not None and config.allow_provider_stream_fallback is False
         for provider in providers
         for _, config in provider.calls
+    )
+    attempted_configs = [
+        config
+        for provider in providers[: success_index + 1]
+        for _, config in provider.calls
+    ]
+    assert attempted_configs[0] is not None
+    assert attempted_configs[0].model_capabilities is not None
+    assert (
+        attempted_configs[0].model_capabilities.reasoning_format
+        == "openrouter_explicit_off"
+    )
+    assert all(
+        config is not None and config.model_capabilities is None
+        for config in attempted_configs[1:]
     )
     expected_models = [route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]]
     assert result.usage["attempt_count"] == len(expected_models)
@@ -4028,6 +4064,12 @@ async def test_task_analyzer_uses_provider_interface_and_validates_json() -> Non
     assert len(provider.calls) == 1
     assert provider.calls[0][1] is not None
     assert provider.calls[0][1].temperature == 0.0
+    assert provider.calls[0][1].thinking is False
+    assert provider.calls[0][1].model_capabilities is not None
+    assert (
+        provider.calls[0][1].model_capabilities.reasoning_format
+        == "openrouter_explicit_off"
+    )
     assert provider.calls[0][1].allow_provider_stream_fallback is True
     assert '"modality":["<allowed modality>"]' in provider.calls[0][1].system
     assert '"session_intent":{"type":"<allowed intent>"' in provider.calls[0][1].system
@@ -6692,7 +6734,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4"
+        == "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
@@ -7629,13 +7671,13 @@ def test_packaged_ranking_config_without_affinity_preserves_golden_bytes_and_has
     resolution = ranking_config_resolution()
 
     assert hashlib.sha256(raw_payload).hexdigest() == (
-        "a0108275a81302de0a4a25588202b3ea823492eb2412dde7f1b56862c42f6625"
+        "0cd9c3ac18c5a6185f102a4cb5ed8d67aa0937aab0d27a7f4c63293536f9963e"
     )
     assert canonical_json_sha256(loaded) == (
-        "bcaa30e96be728810adfc6a22d7699b3e78830f3ae849f7cdf3bec8bcd764d99"
+        "cdf6147bd1819978c9af493a10b4c43d905679c1f6ce1e787cef2dcf5ddca195"
     )
     assert resolution["base_sha256"] == (
-        "a578f9fc4abfaf09cc64254328cf4a74d7cbfd8323e199982088e8cdcf9914c4"
+        "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc"
     )
     assert resolution["effective_sha256"] == resolution["base_sha256"]
     assert "kv_cache_affinity" not in loaded["session"]

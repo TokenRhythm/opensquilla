@@ -289,7 +289,9 @@ class ModelCapabilities:
     supports_streaming: bool = True
     supports_vision: bool = False
     reasoning_format: str = "none"
-    # "none" | "openrouter" | "deepseek" | "think_tags"
+    # "none" | "openrouter" | "openrouter_explicit_off" | "deepseek" |
+    # "gemini" | "zai" | "dashscope" | "moonshot" | "volcengine" |
+    # "tencent_tokenhub" | "think_tags"
 
 
 StreamEvent = (

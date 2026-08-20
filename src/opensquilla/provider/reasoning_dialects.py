@@ -162,6 +162,10 @@ def _disable_openrouter(payload: dict[str, Any], args: ReasoningDisableArgs) -> 
         payload["reasoning"] = {"enabled": False}
 
 
+def _disable_openrouter_explicit(payload: dict[str, Any], _args: ReasoningDisableArgs) -> None:
+    payload["reasoning"] = {"enabled": False}
+
+
 @dataclass(frozen=True)
 class ReasoningDialect:
     """How one ``reasoning_format`` spells its thinking on/off payload."""
@@ -181,6 +185,11 @@ DIALECTS: dict[str, ReasoningDialect] = {
         name="openrouter",
         enable=_enable_openrouter,
         disable=_disable_openrouter,
+    ),
+    "openrouter_explicit_off": ReasoningDialect(
+        name="openrouter_explicit_off",
+        enable=_enable_openrouter,
+        disable=_disable_openrouter_explicit,
     ),
     "openai": ReasoningDialect(
         name="openai",

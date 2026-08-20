@@ -28,6 +28,8 @@ from opensquilla.provider.registry import list_provider_specs
 #   "openrouter" — compat_policy: openrouter policy replay_reasoning_format;
 #       model_catalog.get_capabilities live-catalog branch (an OpenRouter
 #       /models row with reasoning support); provider/ensemble.py members.
+#   "openrouter_explicit_off" — router_dynamic Task Analyzer request profile;
+#       it shares OpenRouter's enable payload and always sends explicit off.
 #   "openai"     — get_capabilities api.openai.com + gpt-5/o1/o3/o4 prefix
 #       branch (model_catalog.py; host trust stays code).
 #   "deepseek"   — compat_policy: deepseek policy default_reasoning_format;
@@ -51,6 +53,7 @@ from opensquilla.provider.registry import list_provider_specs
 REACHABLE_REASONING_FORMATS = frozenset(
     {
         "openrouter",
+        "openrouter_explicit_off",
         "openai",
         "deepseek",
         "gemini",
@@ -153,6 +156,17 @@ def test_openrouter_disable_payload_is_gated_on_policy_model_set() -> None:
         model="minimax/minimax-m2.5", disable_reasoning_by_default_models=disable_set
     )
     assert _disabled("openrouter", unlisted) == {}
+
+
+def test_openrouter_explicit_off_reuses_enable_and_always_disables() -> None:
+    assert DIALECTS["openrouter_explicit_off"].enable is DIALECTS["openrouter"].enable
+    assert _enabled("openrouter_explicit_off", _HIGH_ARGS) == {
+        "reasoning": {"effort": "high"}
+    }
+    assert _disabled(
+        "openrouter_explicit_off",
+        ReasoningDisableArgs(model="deepseek/deepseek-v4-pro"),
+    ) == {"reasoning": {"enabled": False}}
 
 
 def test_openai_enable_payload_and_no_disable_payload() -> None:

@@ -316,7 +316,7 @@ def test_v3_replay_authorizes_live_chain_fallback_with_zero_requests(
         {
             "provider": "openrouter",
             "model": "deepseek/deepseek-v4-pro",
-            "upstream_provider": "deepseek",
+            "upstream_provider": "together",
             "max_attempts": 1,
         },
         {

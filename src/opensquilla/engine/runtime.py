@@ -4602,6 +4602,7 @@ class TurnRunner:
                     model=analyzer_model_id,
                     provider_routing=analyzer_routing,
                     replay_provider_state=False,
+                    _provider_routing_strict_override=True,
                 )
 
             if analyzer_config is None or (

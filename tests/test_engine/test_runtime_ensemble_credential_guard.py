@@ -765,7 +765,7 @@ async def test_router_dynamic_uses_ordered_task_analyzer_chain(
     config = _static_b5_config(
         **ensemble_overrides,
     )
-    config.llm.provider_routing = {TASK_ANALYZER_MODEL_ID: "deepseek"}
+    config.llm.provider_routing = {TASK_ANALYZER_MODEL_ID: "together"}
     runner = TurnRunner(provider_selector=None, config=config)
     selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
 
@@ -785,7 +785,7 @@ async def test_router_dynamic_uses_ordered_task_analyzer_chain(
         "openai/gpt-5.6-sol",
         "google/gemini-3.1-pro-preview",
     ]
-    expected_upstreams = ["deepseek", "azure", "google-ai-studio"]
+    expected_upstreams = ["together", "azure", "google-ai-studio"]
     if single_route:
         expected_models = expected_models[:1]
         expected_upstreams = expected_upstreams[:1]
@@ -799,6 +799,7 @@ async def test_router_dynamic_uses_ordered_task_analyzer_chain(
         and analyzer_config.api_key == "sk-or-synthetic"
         and analyzer_config.base_url == "https://openrouter.ai/api/v1"
         and analyzer_config.replay_provider_state is False
+        and getattr(analyzer_config, "_provider_routing_strict_override", None) is True
         for analyzer_config in provider_builds
     )
     assert len(analyzer_calls) == 1
@@ -1325,6 +1326,7 @@ def test_router_dynamic_task_analyzer_uses_frozen_override_and_upstream_pin(
     assert captured[0].api_key == "openrouter-key"
     assert captured[0].provider_routing["openai/gpt-5.5"] == "openai"
     assert captured[0].replay_provider_state is False
+    assert getattr(captured[0], "_provider_routing_strict_override", None) is True
 
 
 async def test_router_dynamic_carries_the_previous_route_into_the_next_turn(

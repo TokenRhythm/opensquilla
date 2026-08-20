@@ -2356,6 +2356,91 @@ def test_openrouter_sends_configured_json_output_schema(monkeypatch: Any) -> Non
     }
 
 
+def test_openrouter_deepseek_analyzer_disables_reasoning_with_strict_schema(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    model = "deepseek/deepseek-v4-pro"
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+        provider_routing={model: "together"},
+        provider_routing_strict=True,
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"outcome": {"type": "string", "enum": ["allow", "deny"]}},
+        "required": ["outcome"],
+    }
+
+    _collect(
+        provider,
+        ChatConfig(
+            thinking=False,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_format="openrouter_explicit_off",
+            ),
+            output_json_schema=schema,
+            output_json_schema_strict=True,
+        ),
+    )
+
+    payload = captured["payload"]
+    assert payload["provider"] == {
+        "only": ["together"],
+        "allow_fallbacks": False,
+    }
+    assert payload["reasoning"] == {"enabled": False}
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_output",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "model_capabilities",
+    [
+        None,
+        ModelCapabilities(
+            supports_reasoning=True,
+            reasoning_format="openrouter",
+        ),
+    ],
+    ids=["no-capabilities", "catalog-capabilities"],
+)
+def test_regular_openrouter_deepseek_non_thinking_omits_reasoning(
+    monkeypatch: Any,
+    model_capabilities: ModelCapabilities | None,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-pro",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            thinking=False,
+            model_capabilities=model_capabilities,
+        ),
+    )
+
+    assert "reasoning" not in captured["payload"]
+
+
 def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)

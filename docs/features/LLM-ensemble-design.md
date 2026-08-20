@@ -484,11 +484,11 @@ Before ranking, runtime builds four replaceable inputs:
    bounded before it reaches the analyzer. The trace stores a SHA-256 hash
    rather than raw prompt content.
 2. **Task profile** — a dedicated OpenRouter deployment of
-   `deepseek/deepseek-v4-pro` is called once as the JSON classifier. It uses a
-   dedicated OpenRouter request even when the single-model route selected the
-   same model ID. The result must contain
-   capability, domain, and tier distributions that sum to one within the
-   configured tolerance, plus cost, latency, context, modality, risk, and
+   `deepseek/deepseek-v4-pro`, pinned to Together, is called once as the JSON
+   classifier. It uses a dedicated OpenRouter request with reasoning disabled
+   even when the single-model route selected the same model ID. The result must
+   contain capability, domain, and tier distributions that sum to one within
+   the configured tolerance, plus cost, latency, context, modality, risk, and
    session-intent constraints. Required numeric fields accept finite JSON
    numbers only; booleans and numeric strings are rejected. Invalid JSON,
    timeout, provider errors, an omitted real input modality, an invalid schema,
