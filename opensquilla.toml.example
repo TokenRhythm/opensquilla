@@ -159,6 +159,8 @@ base_url = "https://tokenrhythm.studio/v1"
 # # api_key is optional: set env CUSTOM_LLM_API_KEY (or api_key here) only if
 # # your endpoint enforces one. Declare the endpoint's real context window via
 # # [models.custom."qwen3-32b-awq"] — see the per-model overrides section below.
+# # Generic custom endpoints default to a zero token-cost estimate; that does
+# # not mean the server, GPU, or remote gateway has no infrastructure cost.
 #
 # Example custom Anthropic Messages endpoint:
 # provider = "custom_anthropic"
@@ -283,11 +285,16 @@ all_failed_policy = "fallback_single"
 # The generic `custom` and `custom_anthropic` providers use the same override
 # table shape, keyed by the served model id. Unknown custom models retain the
 # conservative 8k fallback for upgrade compatibility; both remote gateways
-# and local servers should declare their actual window:
+# and local servers should declare their actual window. Their token estimate
+# defaults to zero; to estimate a paid endpoint, set BOTH main price fields.
+# Cache-read and cache-write prices are optional and the same rule applies to
+# `custom_anthropic`:
 # [models.custom."qwen3-32b-awq"]
 # context_window = 131072
 # max_output_tokens = 8192
 # supports_tools = true
+# input_cost_per_mtok = 0.5
+# output_cost_per_mtok = 2.0
 #
 # [models.custom_anthropic."vendor-model"]
 # context_window = 131072

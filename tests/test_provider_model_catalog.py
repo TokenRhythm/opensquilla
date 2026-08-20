@@ -7,6 +7,33 @@ import pytest
 from opensquilla.provider.model_catalog import ModelCatalog, _corrections_budget_fallback
 
 
+def test_user_override_price_fields_keep_qualified_precedence_and_bare_fallback() -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "vendor/priced-model": {
+                "input_cost_per_mtok": 1.0,
+                "output_cost_per_mtok": 2.0,
+                "cache_write_cost_per_mtok": 4.0,
+                "context_window": 131_072,
+            },
+            "custom/vendor/priced-model": {
+                "input_cost_per_mtok": 0.0,
+                "cache_read_cost_per_mtok": 0.1,
+            },
+        }
+    )
+
+    assert catalog.user_override_price_fields(
+        "VENDOR/PRICED-MODEL", provider="CUSTOM"
+    ) == {
+        "input_cost_per_mtok": 0.0,
+        "output_cost_per_mtok": 2.0,
+        "cache_read_cost_per_mtok": 0.1,
+        "cache_write_cost_per_mtok": 4.0,
+    }
+
+
 def test_deepseek_v4_direct_models_use_models_dev_limits() -> None:
     # The vendored models.dev snapshot supplies the real per-(provider, model)
     # budgets offline (PR #406 roadmap item 4); the packaged corrections

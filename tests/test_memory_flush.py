@@ -18,6 +18,8 @@ from opensquilla.memory.session_flush import (
     FlushReceipt,
     SessionFlushService,
     _make_flush_read_only_handler,
+    _usage_from_complete_response,
+    _usage_from_event,
 )
 from opensquilla.memory.store import LongTermMemoryStore
 from opensquilla.memory.sync_manager import MemorySyncManager
@@ -30,6 +32,8 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
+from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+from opensquilla.provider.protocol import ProviderMetadata
 from opensquilla.tool_boundary import ToolCall, ToolResult
 
 
@@ -44,6 +48,87 @@ def test_memory_tool_handler_protocol_uses_tool_boundary_types() -> None:
     typed_handler: MemoryToolHandler = handler
 
     assert typed_handler is handler
+
+
+@pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic"])
+def test_session_flush_event_usage_uses_generic_custom_price(
+    monkeypatch: pytest.MonkeyPatch, provider_id: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    usage = _usage_from_event(
+        DoneEvent(
+            input_tokens=100_000,
+            output_tokens=1_000,
+            model="gpt-4.1",
+            provider=provider_id,
+        )
+    )
+
+    assert usage["cost_usd"] == 0.0
+    assert usage["estimated_cost_usd"] == 0.0
+    assert usage["cost_source"] == "unavailable"
+
+
+@pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic"])
+def test_session_flush_complete_response_uses_configured_provider_price(
+    monkeypatch: pytest.MonkeyPatch, provider_id: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    class CustomProvider:
+        def provider_metadata(self) -> ProviderMetadata:
+            return ProviderMetadata(
+                provider_id=provider_id,
+                provider_name="openai",
+                provider_kind="openai_compat",
+                model="gpt-4.1",
+            )
+
+    usage = _usage_from_complete_response(
+        SimpleNamespace(
+            model="gpt-4.1",
+            usage={"prompt_tokens": 100_000, "completion_tokens": 1_000},
+        ),
+        CustomProvider(),
+    )
+
+    assert usage["cost_usd"] == 0.0
+    assert usage["estimated_cost_usd"] == 0.0
+    assert usage["cost_source"] == "unavailable"
+
+
+def test_session_flush_usage_estimate_prices_custom_cache_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "custom/vendor/cached-model": {
+                "input_cost_per_mtok": 10.0,
+                "output_cost_per_mtok": 20.0,
+                "cache_read_cost_per_mtok": 1.0,
+                "cache_write_cost_per_mtok": 4.0,
+            }
+        }
+    )
+    set_shared_catalog(catalog)
+    try:
+        usage = _usage_from_event(
+            DoneEvent(
+                input_tokens=1_000_000,
+                output_tokens=100_000,
+                cached_tokens=200_000,
+                cache_write_tokens=100_000,
+                model="vendor/cached-model",
+                provider="custom",
+            )
+        )
+    finally:
+        set_shared_catalog(None)
+
+    assert usage["estimated_cost_usd"] == pytest.approx(9.6)
+    assert usage["cost_usd"] == pytest.approx(9.6)
 
 
 @pytest.mark.asyncio

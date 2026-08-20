@@ -125,6 +125,13 @@ _SYNTHESIZED_DEFAULTS: dict[str, Any] = {
     "supports_reasoning": False,
 }
 
+_USER_PRICE_FIELDS = (
+    "input_cost_per_mtok",
+    "output_cost_per_mtok",
+    "cache_read_cost_per_mtok",
+    "cache_write_cost_per_mtok",
+)
+
 # Protocol variants that share one service-side model catalog. User and live
 # overrides remain keyed to the exact configured provider; only packaged
 # corrections use this alias.
@@ -620,6 +627,23 @@ class ModelCatalog:
                 for name, value in entry.items():
                     fields.setdefault(name, value)
         return fields
+
+    def user_override_price_fields(self, model: str, *, provider: str = "") -> dict[str, float]:
+        """Return only explicit user price fields for one provider/model pair.
+
+        The provider-qualified override takes precedence over a bare model-id
+        override, matching :meth:`resolve_entry`. Lower catalog layers are
+        deliberately excluded so callers can distinguish operator-authored
+        pricing from a same-named marketplace model.
+        """
+        fields = self._user_override_fields(
+            str(model or ""), (provider or "").strip().lower()
+        )
+        return {
+            name: float(value)
+            for name in _USER_PRICE_FIELDS
+            if (value := fields.get(name)) is not None
+        }
 
     def set_live_provider_entries(
         self, provider_id: str, entries: Mapping[str, Mapping[str, Any]]
