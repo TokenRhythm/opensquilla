@@ -630,6 +630,9 @@
       :prompt-annotations="activePromptAnnotations"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="rpc.canChooseProject"
+      :agent-options="composerAgentOptions"
+      :selected-agent-id="composerSelectedAgentId"
+      @select-agent="onSelectAgent"
       :plan-mode-available="planUiAvailable"
       :collaboration-mode="collaboration.mode"
       :plan-mode-busy="planModeBusy"
@@ -742,6 +745,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
+import { useAgentOptions } from '@/composables/useAgentOptions'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
@@ -1082,6 +1086,28 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+// Shared agents.list state for the composer agent selector (draft route only).
+const { agents: agentOptions, loadAgents } = useAgentOptions()
+const agentSelectBusy = ref(false)
+
+async function onSelectAgent(agentId: string) {
+  if (!isDraftRoute() || agentSelectBusy.value) return
+  const current = draftAgentId()
+  if (!agentId || agentId === current) return
+  agentSelectBusy.value = true
+  try {
+    await loadAgents()
+    freshTaskDraft.requestFreshTask(agentId)
+    goToDraft({ agentId, replace: true })
+  } finally {
+    agentSelectBusy.value = false
+  }
+}
+
+// Agent selector is only meaningful while composing a brand-new draft; an
+// existing conversation's agent is fixed by its session key.
+const composerAgentOptions = computed(() => isDraftRoute() ? agentOptions.value : [])
+const composerSelectedAgentId = computed(() => draftAgentId())
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
