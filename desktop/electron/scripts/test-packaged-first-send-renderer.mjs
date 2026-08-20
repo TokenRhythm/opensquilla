@@ -13,9 +13,12 @@ import {
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
+const HEADER_IDENTITY_ATTRIBUTE = 'data-opensquilla-first-send-identity'
+const HEADER_IDENTITY_SETTLE_MS = 250
 const FORBIDDEN_RENDERER_ERROR = /(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])/i
 const WIDE_VIEWPORT = { width: 1440, height: 900 }
 const TIGHT_VIEWPORT = { width: 900, height: 780 }
+let headerIdentityNonce = 0
 
 function optionalIntegerOption(name, fallback) {
   const index = process.argv.indexOf(name)
@@ -278,6 +281,22 @@ async function assertSettledMessageReceipt(page) {
   await usagePopover.waitFor({ state: 'hidden', timeout: SEND_TIMEOUT_MS })
 }
 
+async function establishStableHeaderIdentity(header, iteration) {
+  let marker = ''
+  await waitFor(async () => {
+    marker = `p15-${iteration}-${++headerIdentityNonce}`
+    await header.evaluate((element, identity) => {
+      element.setAttribute(identity.attribute, identity.marker)
+    }, { attribute: HEADER_IDENTITY_ATTRIBUTE, marker })
+    // A packaged app can finish one last startup navigation after the first
+    // visible frame. Re-establish the baseline on the active document before
+    // using the marker to guard first-send route materialization.
+    await delay(HEADER_IDENTITY_SETTLE_MS)
+    return await header.getAttribute(HEADER_IDENTITY_ATTRIBUTE) === marker
+  }, `stable landing route header ${iteration}`, SEND_TIMEOUT_MS)
+  return marker
+}
+
 try {
   await assertIsolatedUserData(userDataDir)
   provider = await startSyntheticOllama()
@@ -379,14 +398,13 @@ try {
       1,
       'Chat routes must synchronously own one permanent route header',
     )
-    const landingHeaderNode = await header.elementHandle()
-    assert.ok(landingHeaderNode, 'landing route header node must remain mounted')
     assert.equal(await header.isHidden(), true, 'landing route header must be hidden with its node mounted')
 
     const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
     await composer.fill(firstMessage)
     const sendButton = page.locator('.chat-send-btn.btn--primary')
     await waitFor(async () => await sendButton.count() === 1 && !await sendButton.isDisabled(), 'enabled first send')
+    const landingHeaderIdentity = await establishStableHeaderIdentity(header, iteration)
     await sendButton.click()
 
     await waitFor(
@@ -401,11 +419,9 @@ try {
     assert.equal(await page.locator('.error-boundary').count(), 0)
     assert.equal(await header.count(), 1)
     assert.equal(await header.isVisible(), true)
-    const materializedHeaderNode = await header.elementHandle()
-    assert.ok(materializedHeaderNode, 'materialized route header node must exist')
     assert.equal(
-      await landingHeaderNode.evaluate((node, candidate) => node === candidate, materializedHeaderNode),
-      true,
+      await header.getAttribute(HEADER_IDENTITY_ATTRIBUTE),
+      landingHeaderIdentity,
       'route materialization must preserve the header DOM identity',
     )
     await waitFor(

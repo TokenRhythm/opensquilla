@@ -100,6 +100,10 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "const alreadyOnEmptyDraft" in first_send_gate
     assert "if (!alreadyOnEmptyDraft)" in first_send_gate
     assert "await header.waitFor({ state: 'attached'" in first_send_gate
+    assert "establishStableHeaderIdentity(header, iteration)" in first_send_gate
+    assert "HEADER_IDENTITY_SETTLE_MS" in first_send_gate
+    assert "await header.getAttribute(HEADER_IDENTITY_ATTRIBUTE)" in first_send_gate
+    assert "landingHeaderNode.evaluate" not in first_send_gate
     assert "await page.mouse.move(1, 1)" in first_send_gate
     assert "rendererErrors" in first_send_gate
     assert "consoleErrorMessages" in first_send_gate
