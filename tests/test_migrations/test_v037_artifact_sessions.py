@@ -1,4 +1,4 @@
-"""Upgrade and rollback coverage for the V036 ArtifactSession schema."""
+"""Upgrade and rollback coverage for the V037 ArtifactSession schema."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ from opensquilla.artifact_session.schema import SCHEMA_OBJECTS, SCHEMA_STATEMENT
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION_ID = "V036__artifact_sessions"
+MIGRATION_ID = "V037__artifact_sessions"
 ARTIFACT_MIGRATION_IDS = (
     MIGRATION_ID,
-    "V037__artifact_prompt_annotations",
-    "V038__artifact_mutation_attempts",
-    "V039__document_resources",
+    "V038__artifact_prompt_annotations",
+    "V039__artifact_mutation_attempts",
+    "V040__document_resources",
 )
 
 TABLES = {
@@ -56,7 +56,7 @@ def _apply_origin_main_profile(db_path: Path) -> None:
         backend.connection.close()
 
 
-def test_v036_through_v039_upgrade_origin_main_profile(tmp_path: Path) -> None:
+def test_v037_through_v040_upgrade_origin_main_profile(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     _apply_origin_main_profile(db_path)
 
@@ -71,7 +71,7 @@ def test_v036_through_v039_upgrade_origin_main_profile(tmp_path: Path) -> None:
     assert apply_pending(str(db_path), MIGRATIONS_DIR) == list(ARTIFACT_MIGRATION_IDS)
 
 
-def test_v036_creates_complete_artifact_session_schema_and_guards_revisions(
+def test_v037_creates_complete_artifact_session_schema_and_guards_revisions(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "sessions.db"
@@ -144,7 +144,7 @@ def test_v036_creates_complete_artifact_session_schema_and_guards_revisions(
             )
 
 
-def test_v036_and_runtime_initializer_create_the_same_schema(tmp_path: Path) -> None:
+def test_v037_and_runtime_initializer_create_the_same_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
 
@@ -158,7 +158,7 @@ def test_v036_and_runtime_initializer_create_the_same_schema(tmp_path: Path) -> 
     assert migrated_schema == runtime_schema
 
 
-def test_v036_rolls_back_only_artifact_session_objects(tmp_path: Path) -> None:
+def test_v037_rolls_back_only_artifact_session_objects(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
 
@@ -187,6 +187,6 @@ def test_v036_rolls_back_only_artifact_session_objects(tmp_path: Path) -> None:
     assert not TABLES & tables
     assert "V032__meta_launch_discard_tombstones" in applied
     assert MIGRATION_ID not in applied
-    assert "V037__artifact_prompt_annotations" not in applied
-    assert "V038__artifact_mutation_attempts" not in applied
-    assert "V039__document_resources" not in applied
+    assert "V038__artifact_prompt_annotations" not in applied
+    assert "V039__artifact_mutation_attempts" not in applied
+    assert "V040__document_resources" not in applied

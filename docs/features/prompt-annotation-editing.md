@@ -220,21 +220,21 @@ admitted commit may advance the head.
 
 Four additive migrations provide the durable substrate:
 
-- `V036__artifact_sessions` creates documents, immutable revisions, change
+- `V037__artifact_sessions` creates documents, immutable revisions, change
   sets, anchors, writer leases, edit sessions, and audit events. It also adds
   immutability triggers and document/turn indexes.
-- `V037__artifact_prompt_annotations` creates durable annotation drafts with
-  `draft`, `sent`, and `discarded` states. It depends on V036 and enforces body,
+- `V038__artifact_prompt_annotations` creates durable annotation drafts with
+  `draft`, `sent`, and `discarded` states. It depends on V037 and enforces body,
   send-linkage, session, document, and revision indexes.
-- `V038__artifact_mutation_attempts` adds the durable, proposal-bound commit
+- `V039__artifact_mutation_attempts` adds the durable, proposal-bound commit
   receipt used for idempotency and restart reconciliation.
-- `V039__document_resources` adds source bindings plus import and immutable
+- `V040__document_resources` adds source bindings plus import and immutable
   publication journals for Workbench resources.
 
 Before an upgrade, take the normal profile/database backup and verify it is
 readable. Migrations must be exercised from both a fresh database and the
 oldest supported upgrade database. Do not manually delete the tables or run
-down migrations on a profile that may contain artifact history: V036 rollback
+down migrations on a profile that may contain artifact history: V037 rollback
 deletes annotation drafts and V035 rollback deletes artifact revision history.
 
 The operational rollback is to turn the feature gate off while retaining the
@@ -284,10 +284,10 @@ Run all commands from the repository root unless the command changes directory.
 ```sh
 uv run pytest -q \
   tests/test_artifact_session \
-  tests/test_migrations/test_v036_artifact_sessions.py \
-  tests/test_migrations/test_v037_artifact_prompt_annotations.py \
-  tests/test_migrations/test_v038_artifact_mutation_attempts.py \
-  tests/test_migrations/test_v039_document_resources.py \
+  tests/test_migrations/test_v037_artifact_sessions.py \
+  tests/test_migrations/test_v038_artifact_prompt_annotations.py \
+  tests/test_migrations/test_v039_artifact_mutation_attempts.py \
+  tests/test_migrations/test_v040_document_resources.py \
   tests/test_gateway/test_artifact_tool_context.py \
   tests/test_gateway/test_desktop_artifact_bridge.py \
   tests/test_gateway/test_prompt_annotations.py \

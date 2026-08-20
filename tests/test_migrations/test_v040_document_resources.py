@@ -11,10 +11,10 @@ from yoyo import get_backend, read_migrations
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION_ID = "V039__document_resources"
+MIGRATION_ID = "V040__document_resources"
 
 
-def _apply_through_v038(db_path: Path) -> None:
+def _apply_through_v039(db_path: Path) -> None:
     backend = get_backend("sqlite:///" + str(db_path))
     try:
         migrations = read_migrations(str(MIGRATIONS_DIR)).filter(
@@ -49,11 +49,11 @@ def _seed_document(conn: sqlite3.Connection) -> None:
     )
 
 
-def test_v039_upgrades_v038_and_enforces_resource_occurrence_constraints(
+def test_v040_upgrades_v039_and_enforces_resource_occurrence_constraints(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "sessions.db"
-    _apply_through_v038(db_path)
+    _apply_through_v039(db_path)
     with sqlite3.connect(db_path) as conn:
         _seed_document(conn)
         conn.commit()
@@ -114,7 +114,7 @@ def test_v039_upgrades_v038_and_enforces_resource_occurrence_constraints(
             )
 
 
-def test_v039_rolls_back_only_document_resource_objects(tmp_path: Path) -> None:
+def test_v040_rolls_back_only_document_resource_objects(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
     backend = get_backend("sqlite:///" + str(db_path))
