@@ -649,8 +649,8 @@
     "memoryOverview": {
       "title": "Mémoire",
       "desc": "Choisissez ce qu'OpenSquilla mémorise et gérez les fonctions d'apprentissage facultatives.",
-      "autoCaptureLabel": "Capture automatique de la mémoire",
-      "autoCaptureDesc": "Autorise OpenSquilla à enregistrer les informations utiles des conversations dans la mémoire à long terme.",
+      "autoCaptureLabel": "Capture des conversations",
+      "autoCaptureDesc": "Enregistre localement les conversations et échanges bruts à des fins d’audit et de récupération. Ils ne sont ni ajoutés à la mémoire à long terme ni indexés pour la recherche en mémoire.",
       "learningSummary": "Mémoire et auto-apprentissage (avancé)",
       "learningDesc": "Les fonctions d'apprentissage facultatives peuvent utiliser des jetons supplémentaires et nécessiter un redémarrage.",
       "profileImportLabel": "Importation du profil",
@@ -666,7 +666,7 @@
       "interface": "Interface",
       "shortcuts": "Raccourcis",
       "securityPrivacy": "Sécurité et confidentialité",
-      "memory": "Mémoire",
+      "memory": "Mémoire et exportation",
       "advanced": "Avancé",
       "groups": {
         "ai": "Configuration IA",
@@ -1644,7 +1644,7 @@
     },
     "advanced": {
       "title": "Avancé",
-      "desc": "Préférences client expérimentales pour ce navigateur. Elles s'appliquent immédiatement — aucun enregistrement nécessaire. Les éléments marqués",
+      "desc": "Fonctions de mémoire moins courantes, options expérimentales et outils de gestion. Certains réglages sont enregistrés via la passerelle ; les préférences client s’appliquent immédiatement. Les éléments marqués",
       "reload": "recharger",
       "descReloadSuffix": "prennent effet après un rafraîchissement de la page.",
       "experimentsGroup": "Expériences",
@@ -1712,6 +1712,8 @@
       "memorySurface": "Embedding de mémoire",
       "memorySaved": "Mémoire enregistrée.",
       "memorySavedRestart": "Mémoire enregistrée. Redémarrage requis pour les changements d'embedding.",
+      "captureSaved": "Capture des conversations enregistrée.",
+      "captureSavedRestart": "Capture des conversations enregistrée. Redémarrage requis.",
       "imageSaved": "Génération d'images enregistrée.",
       "noAudioChanges": "Aucun changement audio à enregistrer.",
       "audioSaved": "Audio enregistré.",

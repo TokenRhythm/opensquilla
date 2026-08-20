@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
-// Gateway and config-backed pages expose live/save status in their accessible
-// tab names. Interface, Shortcuts, and Advanced are browser-local pages.
+// Pages participating in the shared setup catalog expose live/save status in
+// their accessible tab names. The remaining destinations do not.
 const SECTIONS = [
   'Gateway',
   'Model Service',
@@ -10,9 +10,9 @@ const SECTIONS = [
   'Capabilities',
   'General',
   'Security & Privacy',
-  'Memory',
+  'Advanced',
 ]
-const CLIENT_SECTIONS = ['Interface', 'Shortcuts', 'Advanced']
+const STATUSLESS_SECTIONS = ['Interface', 'Shortcuts', 'Memory & Export']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
   page.locator('.sidebar-foot button')
@@ -21,7 +21,7 @@ const dialog = (page: import('@playwright/test').Page) =>
   page.getByRole('dialog', { name: 'Settings' })
 
 const railTab = (page: import('@playwright/test').Page, name: string) =>
-  dialog(page).getByRole('tab', { name: new RegExp(`^${name}:`) })
+  dialog(page).getByRole('tab', { name: new RegExp(`^${name}(?::|$)`) })
 
 async function openFromSidebar(page: import('@playwright/test').Page) {
   await page.goto(CONTROL_URL)
@@ -41,14 +41,14 @@ test.describe('Settings modal', () => {
     // Dialog a11y: focus moves into the modal on open, before any interaction.
     await expect(page.getByRole('button', { name: 'Close' })).toBeFocused()
 
-    // Rail has the backend-config sections (each with a readiness/status dot)
-    // plus the client-only sections.
+    // Rail has setup-catalog sections with readiness/save status, plus
+    // destinations that intentionally expose no shared catalog status.
     const tabs = dialog(page).getByRole('tab')
-    await expect(tabs).toHaveCount(SECTIONS.length + CLIENT_SECTIONS.length)
+    await expect(tabs).toHaveCount(SECTIONS.length + STATUSLESS_SECTIONS.length)
     for (const name of SECTIONS) {
       await expect(railTab(page, name)).toBeVisible()
     }
-    for (const name of CLIENT_SECTIONS) {
+    for (const name of STATUSLESS_SECTIONS) {
       await expect(dialog(page).getByRole('tab', { name, exact: true })).toBeVisible()
     }
 
@@ -109,24 +109,25 @@ test.describe('Settings modal', () => {
     await expect(page).not.toHaveURL(/\/settings/)
   })
 
-  test('opens Memory as a first-level page and profile import as its nested route', async ({ page }) => {
+  test('opens Memory & Export directly and canonicalizes the old profile-import route', async ({ page }) => {
     await openFromSidebar(page)
 
-    const memoryTab = railTab(page, 'Memory')
+    const memoryTab = railTab(page, 'Memory & Export')
     await memoryTab.click()
 
     await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/\/settings\/memory$/)
-    await expect(dialog(page).getByRole('heading', { name: 'Memory', exact: true })).toBeVisible()
-    const profileRow = dialog(page).locator('.control-row', { hasText: 'Profile import' })
-    await profileRow.getByRole('button', { name: 'Open' }).click()
-    await expect(page).toHaveURL(/\/settings\/profileImport$/)
     await expect(
       dialog(page).getByRole('heading', { name: 'Import memory from another AI' }),
     ).toBeVisible()
     await expect(dialog(page).locator('[data-testid="settings-memory-panel"]')).toBeVisible()
     await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
+
+    await page.goto(CONTROL_URL + 'settings/profileImport')
+    await expect(page).toHaveURL(/\/settings\/memory$/)
+    await expect(dialog(page).locator('[data-testid="settings-memory-panel"]')).toBeVisible()
+    await expect(railTab(page, 'Memory & Export')).toHaveAttribute('aria-selected', 'true')
   })
 
   test('keeps the SettingsDialog mounted when routing from default settings to a section', async ({ page }) => {
@@ -417,39 +418,40 @@ test.describe('Settings modal', () => {
     expect(behaviors).toEqual(['none', 'none'])
   })
 
-  test('live save round-trip persists a harmless Capabilities toggle', async ({ page }) => {
+  test('live save round-trip persists the Advanced conversation-capture toggle', async ({ page }) => {
     test.setTimeout(90000)
     await openFromSidebar(page)
 
     // memory.auto_capture_enabled is hot-applied via the config.patch path.
-    const capture = () => dialog(page).locator('input[name="setup_memory_auto_capture"]')
-    const saveMemory = () => dialog(page).getByRole('button', { name: 'Save memory embedding' })
+    const capture = () => dialog(page).locator('input[name="memory_auto_capture"]')
+    const dirtybar = () => dialog(page).locator('.settings-dirtybar')
 
-    await railTab(page, 'Capabilities').click()
+    await railTab(page, 'Advanced').click()
     await expect(capture()).toBeVisible()
     const initial = await capture().isChecked()
 
     await capture().setChecked(!initial)
-    await saveMemory().click()
-    await expect(page.locator('.toast', { hasText: /Memory/ }).first()).toBeVisible()
-    await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden({ timeout: 10000 })
+    await expect(dirtybar()).toContainText('Unsaved changes in Advanced')
+    await dirtybar().getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.locator('.toast', { hasText: 'Conversation capture saved.' }).first()).toBeVisible()
+    await expect(dirtybar()).toBeHidden({ timeout: 10000 })
 
     // Reload: the persisted value must survive a fresh modal.
     await page.reload()
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
-    await railTab(page, 'Capabilities').click()
+    await railTab(page, 'Advanced').click()
     await expect(capture()).toBeVisible()
     expect(await capture().isChecked()).toBe(!initial)
 
     // Restore the original value.
     await capture().setChecked(initial)
-    await saveMemory().click()
-    await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden({ timeout: 10000 })
+    await dirtybar().getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(dirtybar()).toBeHidden({ timeout: 10000 })
     await page.reload()
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
-    await railTab(page, 'Capabilities').click()
+    await railTab(page, 'Advanced').click()
     await expect(capture()).toBeVisible()
     expect(await capture().isChecked()).toBe(initial)
   })
@@ -475,9 +477,9 @@ test.describe('Settings modal', () => {
 
   test('boolean settings render as the canonical control-switch and keep checkbox semantics', async ({ page }) => {
     await openFromSidebar(page)
-    await railTab(page, 'Capabilities').click()
+    await railTab(page, 'Advanced').click()
 
-    const capture = dialog(page).locator('input[name="setup_memory_auto_capture"]')
+    const capture = dialog(page).locator('input[name="memory_auto_capture"]')
     await expect(capture).toBeVisible()
 
     // It carries the shared switch primitive, not a raw browser checkbox, and
@@ -577,9 +579,9 @@ test.describe('Settings modal', () => {
     await dialog(page).getByRole('radio', { name: 'Auto', exact: true }).click()
   })
 
-  test('Advanced section surfaces homeless flags, applies instantly without a dirty bar', async ({ page }) => {
+  test('Advanced client experiments still apply instantly without a dirty bar', async ({ page }) => {
     await openFromSidebar(page)
-    const advTab = dialog(page).getByRole('tab', { name: 'Advanced' })
+    const advTab = railTab(page, 'Advanced')
     await expect(advTab).toBeVisible()
     await advTab.click()
     await expect(advTab).toHaveAttribute('aria-selected', 'true')
@@ -600,7 +602,8 @@ test.describe('Settings modal', () => {
     await max.blur()
     expect(await page.evaluate(() => localStorage.getItem('opensquilla.chat.answerReveal'))).toBe('1000,3000')
 
-    // Client-only: none of this raises the settings dirty bar.
+    // These client-only experiment edits do not raise the settings dirty bar;
+    // the Gateway-backed conversation-capture row above still does.
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
 
     // Long-lived Agent management is available only from this advanced escape

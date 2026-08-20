@@ -735,8 +735,8 @@
     "memoryOverview": {
       "title": "记忆",
       "desc": "选择 OpenSquilla 记住的内容，并管理可选学习功能。",
-      "autoCaptureLabel": "自动记忆",
-      "autoCaptureDesc": "允许 OpenSquilla 将对话中有用的信息保存到长期记忆。",
+      "autoCaptureLabel": "对话记录捕获",
+      "autoCaptureDesc": "在本机保存原始对话与回合记录，用于审计和恢复；不会写入长期记忆，也不会建立索引用于记忆检索。",
       "learningSummary": "记忆与自学习（高级）",
       "learningDesc": "可选学习功能可能消耗额外模型 Token，并可能需要重启。",
       "profileImportLabel": "画像导入",
@@ -752,7 +752,7 @@
       "interface": "界面",
       "shortcuts": "快捷键",
       "securityPrivacy": "安全与隐私",
-      "memory": "记忆",
+      "memory": "记忆与导出",
       "advanced": "高级",
       "groups": {
         "ai": "AI 配置",
@@ -1730,7 +1730,7 @@
     },
     "advanced": {
       "title": "高级",
-      "desc": "此浏览器的实验性客户端偏好。它们会立即生效——无需保存。标记为",
+      "desc": "这里包含较少使用的记忆功能、实验选项与管理工具。部分设置会通过网关保存；客户端偏好会立即生效。标记为",
       "reload": "重新加载",
       "descReloadSuffix": "的项目会在刷新页面后生效。",
       "experimentsGroup": "实验功能",
@@ -1798,6 +1798,8 @@
       "memorySurface": "记忆嵌入",
       "memorySaved": "记忆已保存。",
       "memorySavedRestart": "记忆已保存。嵌入更改需要重启。",
+      "captureSaved": "对话记录捕获设置已保存。",
+      "captureSavedRestart": "对话记录捕获设置已保存。需要重启。",
       "imageSaved": "图像生成已保存。",
       "noAudioChanges": "没有需要保存的音频更改。",
       "audioSaved": "音频已保存。",

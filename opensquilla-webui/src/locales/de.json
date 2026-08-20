@@ -649,8 +649,8 @@
     "memoryOverview": {
       "title": "Speicher",
       "desc": "Festlegen, was OpenSquilla speichert, und optionale Lernfunktionen verwalten.",
-      "autoCaptureLabel": "Automatisches Speichern",
-      "autoCaptureDesc": "OpenSquilla darf nützliche Gesprächsinhalte im Langzeitspeicher sichern.",
+      "autoCaptureLabel": "Gesprächsaufzeichnung",
+      "autoCaptureDesc": "Speichert Unterhaltungen und Gesprächsrunden im Rohformat lokal für Prüfzwecke und Wiederherstellung. Sie werden weder dem Langzeitspeicher hinzugefügt noch für den Abruf indexiert.",
       "learningSummary": "Speicher und Selbstlernen (erweitert)",
       "learningDesc": "Optionale Lernfunktionen können zusätzliche Modell-Tokens verwenden und einen Neustart erfordern.",
       "profileImportLabel": "Profilimport",
@@ -666,7 +666,7 @@
       "interface": "Oberfläche",
       "shortcuts": "Tastenkürzel",
       "securityPrivacy": "Sicherheit & Datenschutz",
-      "memory": "Speicher",
+      "memory": "Speicher & Export",
       "advanced": "Erweitert",
       "groups": {
         "ai": "AI-Konfiguration",
@@ -1644,7 +1644,7 @@
     },
     "advanced": {
       "title": "Erweitert",
-      "desc": "Experimentelle Client-Einstellungen für diesen Browser. Sie werden sofort übernommen — kein Speichern nötig. Markierte Elemente",
+      "desc": "Weniger häufig benötigte Speicherfunktionen, experimentelle Optionen und Verwaltungswerkzeuge. Einige Einstellungen werden über das Gateway gespeichert; Client-Einstellungen gelten sofort. Elemente mit der Kennzeichnung",
       "reload": "neu laden",
       "descReloadSuffix": "werden nach einer Seitenaktualisierung wirksam.",
       "experimentsGroup": "Experimente",
@@ -1712,6 +1712,8 @@
       "memorySurface": "Speicher-Embedding",
       "memorySaved": "Speicher gespeichert.",
       "memorySavedRestart": "Speicher gespeichert. Neustart für Embedding-Änderungen erforderlich.",
+      "captureSaved": "Gesprächsaufzeichnung gespeichert.",
+      "captureSavedRestart": "Gesprächsaufzeichnung gespeichert. Neustart erforderlich.",
       "imageSaved": "Bildgenerierung gespeichert.",
       "noAudioChanges": "Keine Audioänderungen zum Speichern.",
       "audioSaved": "Audio gespeichert.",

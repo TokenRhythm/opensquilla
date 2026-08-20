@@ -735,8 +735,8 @@
     "memoryOverview": {
       "title": "Memory",
       "desc": "Choose what OpenSquilla remembers and manage optional learning features.",
-      "autoCaptureLabel": "Automatic memory capture",
-      "autoCaptureDesc": "Allow OpenSquilla to save useful conversation highlights into long-term memory.",
+      "autoCaptureLabel": "Conversation capture",
+      "autoCaptureDesc": "Store raw conversations and turn records locally for audit and recovery. They are not added to long-term memory or indexed for recall.",
       "learningSummary": "Memory and self-learning (advanced)",
       "learningDesc": "Optional learning controls can use additional model tokens and may require a restart.",
       "profileImportLabel": "Profile import",
@@ -752,7 +752,7 @@
       "interface": "Interface",
       "shortcuts": "Shortcuts",
       "securityPrivacy": "Security & Privacy",
-      "memory": "Memory",
+      "memory": "Memory & Export",
       "advanced": "Advanced",
       "groups": {
         "ai": "AI configuration",
@@ -1730,7 +1730,7 @@
     },
     "advanced": {
       "title": "Advanced",
-      "desc": "Experimental client preferences for this browser. They apply instantly — no save needed. Items marked",
+      "desc": "Less-common memory features, experimental options, and management tools. Some settings are saved through the Gateway; client preferences apply immediately. Items marked",
       "reload": "reload",
       "descReloadSuffix": "take effect after a page refresh.",
       "experimentsGroup": "Experiments",
@@ -1798,6 +1798,8 @@
       "memorySurface": "Memory embedding",
       "memorySaved": "Memory saved.",
       "memorySavedRestart": "Memory saved. Restart required for embedding changes.",
+      "captureSaved": "Conversation capture saved.",
+      "captureSavedRestart": "Conversation capture saved. Restart required.",
       "imageSaved": "Image generation saved.",
       "noAudioChanges": "No audio changes to save.",
       "audioSaved": "Audio saved.",

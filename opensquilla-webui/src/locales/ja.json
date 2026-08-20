@@ -649,8 +649,8 @@
     "memoryOverview": {
       "title": "メモリ",
       "desc": "OpenSquilla が記憶する内容と任意の学習機能を管理します。",
-      "autoCaptureLabel": "自動メモリ",
-      "autoCaptureDesc": "OpenSquilla が会話の有用な情報を長期メモリに保存することを許可します。",
+      "autoCaptureLabel": "会話記録の保存",
+      "autoCaptureDesc": "監査と復旧のため、会話とターンの生データをローカルに保存します。長期メモリには追加されず、検索用のインデックスも作成されません。",
       "learningSummary": "メモリと自己学習（詳細）",
       "learningDesc": "任意の学習機能は追加のモデルトークンを使い、再起動が必要な場合があります。",
       "profileImportLabel": "プロフィールのインポート",
@@ -666,7 +666,7 @@
       "interface": "インターフェース",
       "shortcuts": "ショートカット",
       "securityPrivacy": "セキュリティとプライバシー",
-      "memory": "メモリ",
+      "memory": "メモリとエクスポート",
       "advanced": "詳細設定",
       "groups": {
         "ai": "AI 設定",
@@ -1644,7 +1644,7 @@
     },
     "advanced": {
       "title": "詳細設定",
-      "desc": "このブラウザー向けの実験的なクライアント設定です。即時に反映されます。次のマークが付いた項目は",
+      "desc": "使用頻度の低いメモリ機能、実験的なオプション、管理ツールです。一部の設定はゲートウェイに保存され、クライアント設定はすぐに反映されます。次のマークが付いた項目は",
       "reload": "再読み込み",
       "descReloadSuffix": "ページ更新後に有効になります。",
       "experimentsGroup": "実験機能",
@@ -1712,6 +1712,8 @@
       "memorySurface": "メモリの埋め込み",
       "memorySaved": "メモリを保存しました。",
       "memorySavedRestart": "メモリを保存しました。埋め込みの変更には再起動が必要です。",
+      "captureSaved": "会話記録の設定を保存しました。",
+      "captureSavedRestart": "会話記録の設定を保存しました。再起動が必要です。",
       "imageSaved": "画像生成を保存しました。",
       "noAudioChanges": "保存するオーディオの変更はありません。",
       "audioSaved": "オーディオを保存しました。",

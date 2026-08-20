@@ -649,8 +649,8 @@
     "memoryOverview": {
       "title": "Memoria",
       "desc": "Elige qué recuerda OpenSquilla y gestiona las funciones opcionales de aprendizaje.",
-      "autoCaptureLabel": "Captura automática de memoria",
-      "autoCaptureDesc": "Permite que OpenSquilla guarde información útil de las conversaciones en la memoria a largo plazo.",
+      "autoCaptureLabel": "Captura de conversaciones",
+      "autoCaptureDesc": "Guarda localmente conversaciones y turnos sin procesar para auditoría y recuperación. No se añaden a la memoria a largo plazo ni se indexan para su consulta.",
       "learningSummary": "Memoria y autoaprendizaje (avanzado)",
       "learningDesc": "Las funciones de aprendizaje opcionales pueden usar tokens adicionales y requerir un reinicio.",
       "profileImportLabel": "Importación del perfil",
@@ -666,7 +666,7 @@
       "interface": "Interfaz",
       "shortcuts": "Atajos",
       "securityPrivacy": "Seguridad y privacidad",
-      "memory": "Memoria",
+      "memory": "Memoria y exportación",
       "advanced": "Avanzado",
       "groups": {
         "ai": "Configuración de IA",
@@ -1644,7 +1644,7 @@
     },
     "advanced": {
       "title": "Avanzado",
-      "desc": "Preferencias experimentales del cliente para este navegador. Se aplican al instante; no es necesario guardar. Los elementos marcados con",
+      "desc": "Funciones de memoria menos habituales, opciones experimentales y herramientas de gestión. Algunos ajustes se guardan mediante la puerta de enlace; las preferencias del cliente se aplican al instante. Los elementos marcados con",
       "reload": "recargar",
       "descReloadSuffix": "surten efecto tras actualizar la página.",
       "experimentsGroup": "Experimentos",
@@ -1712,6 +1712,8 @@
       "memorySurface": "Incrustación de memoria",
       "memorySaved": "Memoria guardada.",
       "memorySavedRestart": "Memoria guardada. Se requiere reiniciar para los cambios de incrustación.",
+      "captureSaved": "Captura de conversaciones guardada.",
+      "captureSavedRestart": "Captura de conversaciones guardada. Se requiere reiniciar.",
       "imageSaved": "Generación de imágenes guardada.",
       "noAudioChanges": "No hay cambios de audio que guardar.",
       "audioSaved": "Audio guardado.",
