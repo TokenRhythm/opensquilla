@@ -1485,6 +1485,7 @@ def test_owner_registry_refuses_preexisting_symlink(
     assert unrelated.read_text(encoding="utf-8") == "unchanged"
 
 
+@pytest.mark.ci_serial
 def test_owner_registry_supports_concurrent_process_writers(tmp_path) -> None:
     state_dir = tmp_path / "synthetic-runtime-state"
     worker = textwrap.dedent(

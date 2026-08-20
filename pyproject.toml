@@ -65,6 +65,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.6",
     "mypy>=1.10",
     "ruff>=0.5",
 ]
@@ -156,6 +157,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 norecursedirs = ["tests/_private", "tests/fixtures", ".omx", ".codex", ".claude"]
 markers = [
+    "ci_serial: tests that must run outside the parallel CI pytest worker pool",
     "llm: marks tests that make real external model/provider API calls (deselect with '-m \"not llm\"')",
     "llm_smoke: low-cost live LLM smoke tests",
     "llm_costly: slower or more expensive live model/provider tests",
