@@ -307,17 +307,38 @@ function verifyMainProcess(source, label) {
   }
 
   const onboardingIndex = source.indexOf('async function runOnboarding')
-  const onboardingWindowIndex = source.indexOf('onboardingWindow = new BrowserWindow', onboardingIndex)
-  const parentIndex = source.indexOf('const parentWindow = currentMainWindow()', onboardingIndex)
-  const parentOptionIndex = source.indexOf('parent: parentWindow ?? undefined', onboardingWindowIndex)
-  const modalOptionIndex = source.indexOf('modal: Boolean(parentWindow)', onboardingWindowIndex)
+  const onboardingEndIndex = source.indexOf('async function pathExists', onboardingIndex)
+  const onboardingSource =
+    onboardingIndex === -1 || onboardingEndIndex === -1
+      ? ''
+      : source.slice(onboardingIndex, onboardingEndIndex)
+  const parentIndex = onboardingSource.search(
+    /const\s+parentWindow\s*=\s*currentMainWindow\(\)/,
+  )
+  const onboardingWindowIndex = onboardingSource.search(
+    /const\s+window\s*=\s*new\s+(?:[A-Za-z_$][\w$]*\.)*BrowserWindow\s*\(\s*\{/,
+  )
+  const parentOptionIndex = onboardingSource.search(
+    /parent\s*:\s*parentWindow\s*\?\?\s*undefined/,
+  )
+  const modalOptionIndex = onboardingSource.search(
+    /modal\s*:\s*Boolean\(parentWindow\)/,
+  )
+  const onboardingWindowAssignmentIndex = onboardingSource.search(
+    /onboardingWindow\s*=\s*window\b/,
+  )
   if (
     onboardingIndex === -1
+    || onboardingEndIndex === -1
     || onboardingWindowIndex === -1
     || parentIndex === -1
     || parentOptionIndex === -1
     || modalOptionIndex === -1
+    || onboardingWindowAssignmentIndex === -1
     || parentIndex > onboardingWindowIndex
+    || parentOptionIndex < onboardingWindowIndex
+    || modalOptionIndex < parentOptionIndex
+    || onboardingWindowAssignmentIndex < modalOptionIndex
   ) {
     fail(`${label} main process does not make first-run onboarding an owned modal child window`)
   }

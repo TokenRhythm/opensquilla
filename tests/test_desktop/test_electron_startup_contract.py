@@ -1298,6 +1298,7 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
+    verifier = _read("desktop/electron/scripts/verify-package.mjs")
     onboarding = _section(
         main_ts,
         "async function runOnboarding",
@@ -1305,9 +1306,14 @@ def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     )
 
     assert "const parentWindow = currentMainWindow()" in onboarding
+    assert "const window = new BrowserWindow" in onboarding
     assert "parent: parentWindow ?? undefined" in onboarding
     assert "modal: Boolean(parentWindow)" in onboarding
+    assert "onboardingWindow = window" in onboarding
     assert "focusOnboardingWindow()" in onboarding
+    assert r"const\s+window\s*=\s*new\s+" in verifier
+    assert r"onboardingWindow\s*=\s*window\b" in verifier
+    assert "onboardingWindowAssignmentIndex < modalOptionIndex" in verifier
 
 
 def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_cta() -> None:
