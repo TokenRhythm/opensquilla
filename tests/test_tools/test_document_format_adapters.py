@@ -137,6 +137,7 @@ def test_adapter_probe_fails_closed_for_unrecognized_binary_material() -> None:
         ("<main>before\x00after</main>", "DOCUMENT_HTML_ENCODING_INVALID"),
         ("x" * (2 * 1024 * 1024 + 1), "DOCUMENT_CANDIDATE_SIZE_INVALID"),
     ],
+    ids=("nul-byte", "oversized"),
 )
 def test_html_adapter_rejects_sources_outside_the_editable_contract(
     source: str,
