@@ -462,7 +462,7 @@ async def test_cancelled_transcript_fetch_settles_before_releasing_connection() 
 
     cursor.release.set()
     with pytest.raises(asyncio.CancelledError):
-        await fetch
+        await asyncio.gather(fetch)
 
 
 @pytest.mark.asyncio
@@ -505,7 +505,7 @@ async def test_cancelled_reader_query_settles_before_lock_release(tmp_path) -> N
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await read
+            await asyncio.gather(read)
         assert storage._transcript_reader_lock.locked() is False
         await set_progress_handler(None, 0)
     finally:
