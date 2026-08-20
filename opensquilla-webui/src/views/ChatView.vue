@@ -531,7 +531,7 @@
       </button>
     </Transition>
     <!-- Slash command menu -->
-    <div v-if="slashOpen" class="chat-slash">
+    <div v-if="slashOpen" ref="slashMenuRef" class="chat-slash">
       <div
         v-for="(cmd, i) in filteredSlashCmds"
         :key="cmd.cmd"
@@ -1095,6 +1095,7 @@ const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
 const conversationMinimapRef = ref<{ cancelNavigation: () => void } | null>(null)
 const bottomSentinelRef = ref<HTMLElement | null>(null)
 const jumpToLatestButtonRef = ref<HTMLButtonElement | null>(null)
+const slashMenuRef = ref<HTMLElement | null>(null)
 let bottomIntersectionObserver: IntersectionObserver | null = null
 const composerRef = ref<ChatComposerHandle | null>(null)
 /* Floating-composer retract: a pure controller accumulates slow user travel
@@ -2700,6 +2701,22 @@ const {
   executeSlashCommand,
   restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
+
+watch([slashIdx, filteredSlashCmds], () => {
+  slashMenuRef.value
+    ?.querySelector<HTMLElement>('.chat-slash-item--active')
+    ?.scrollIntoView?.({ block: 'nearest' })
+}, { flush: 'post' })
+
+useDocumentEvent('pointerdown', event => {
+  if (!slashOpen.value) return
+  const menu = slashMenuRef.value
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+  if (menu && (path.includes(menu) || (event.target instanceof Node && menu.contains(event.target)))) {
+    return
+  }
+  closeSlashMenu()
+}, true)
 
 const chatComposerShortcuts = useChatComposerShortcuts({
   inputText,
