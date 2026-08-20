@@ -77,6 +77,7 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "npx electron-builder --mac --publish never" in workflow
     assert "npx electron-builder --win --publish never" in workflow
     assert "npm run fetch:runtimes" not in workflow
+    assert workflow.count("verify-sandbox-package.mjs --source") == 2
     assert workflow.count("verify-sandbox-package.mjs --release-source") == 2
     assert "verify_desktop_slim_size.py" in workflow
     assert "--platform macos" in workflow
@@ -746,6 +747,22 @@ def test_manual_release_workflow_without_a_tag_only_uploads_aggregate_artifacts(
 
     assert "if" not in aggregate
     assert "github.event.inputs.tag != ''" in github_upload["if"]
+    for job_name in ("build-desktop-macos", "build-desktop-windows"):
+        steps = workflow["jobs"][job_name]["steps"]
+        test_package_catalog = next(
+            step
+            for step in steps
+            if step["name"] == "Verify test-package runtime-pack catalog"
+        )
+        release_catalog = next(
+            step
+            for step in steps
+            if step["name"] == "Verify finalized runtime-pack catalog"
+        )
+        assert test_package_catalog["if"] == "${{ env.RELEASE_TAG == '' }}"
+        assert test_package_catalog["run"].endswith("--source")
+        assert release_catalog["if"] == "${{ env.RELEASE_TAG != '' }}"
+        assert release_catalog["run"].endswith("--release-source")
     for job_name in (
         "prestage-draft-updater-assets",
         "audit-downloaded-macos-release",

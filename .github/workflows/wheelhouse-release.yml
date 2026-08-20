@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Optional existing tag to upload artifacts to
+        description: Existing tag to upload; leave empty for an internal test-package artifact
         required: false
         default: ""
 
@@ -354,7 +354,13 @@ jobs:
         working-directory: desktop/electron
         run: npm ci
 
+      - name: Verify test-package runtime-pack catalog
+        if: ${{ env.RELEASE_TAG == '' }}
+        working-directory: desktop/electron
+        run: node ../../.github/scripts/verify-sandbox-package.mjs --source
+
       - name: Verify finalized runtime-pack catalog
+        if: ${{ env.RELEASE_TAG != '' }}
         working-directory: desktop/electron
         run: node ../../.github/scripts/verify-sandbox-package.mjs --release-source
 
@@ -480,7 +486,13 @@ jobs:
         working-directory: desktop/electron
         run: npm ci
 
+      - name: Verify test-package runtime-pack catalog
+        if: ${{ env.RELEASE_TAG == '' }}
+        working-directory: desktop/electron
+        run: node ../../.github/scripts/verify-sandbox-package.mjs --source
+
       - name: Verify finalized runtime-pack catalog
+        if: ${{ env.RELEASE_TAG != '' }}
         working-directory: desktop/electron
         run: node ../../.github/scripts/verify-sandbox-package.mjs --release-source
 
