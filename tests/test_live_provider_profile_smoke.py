@@ -143,7 +143,7 @@ def test_live_smoke_env_maps_cover_openai_zhipu_kimi_and_minimax() -> None:
     assert smoke._DEFAULT_MODELS["tokenrhythm"] == "deepseek-v4-flash"
     # Reasoning tokens bill against max_tokens: the default 64 budget would
     # return empty content with finish_reason "length".
-    assert smoke._MIN_MAX_TOKENS["tokenrhythm"] == 1024
+    assert smoke._MIN_MAX_TOKENS["tokenrhythm"] == 4096
     assert smoke._MIN_MAX_TOKENS["minimax"] == 64
 
 
@@ -182,6 +182,39 @@ async def test_exact_probe_budget_bypasses_provider_stream_floor(monkeypatch: An
     )
 
     assert observed == [1]
+    assert result.direct_status == "passed"
+
+
+async def test_tokenrhythm_exact_probe_budget_bypasses_live_smoke_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[int] = []
+
+    async def fake_direct(
+        provider: str,
+        model: str,
+        api_key: str,
+        base_url: str,
+        expected: str,
+        max_tokens: int,
+    ) -> tuple[str, str, str, dict[str, int], int]:
+        del api_key, base_url
+        assert provider == "tokenrhythm"
+        observed.append(max_tokens)
+        return "passed", model, expected, {"output_tokens": 1}, 1
+
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-tokenrhythm-key")
+    monkeypatch.setattr(smoke, "_direct_openai", fake_direct)
+
+    result = await smoke.smoke_provider(
+        "tokenrhythm",
+        include_stream=False,
+        model_override="deepseek-v4-flash",
+        max_tokens=1024,
+        apply_token_floor=False,
+    )
+
+    assert observed == [1024]
     assert result.direct_status == "passed"
 
 

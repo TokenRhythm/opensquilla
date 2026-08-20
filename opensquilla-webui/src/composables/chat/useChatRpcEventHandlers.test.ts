@@ -31,6 +31,7 @@ function createHarness(options: {
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
+  supportsTurnCommitted?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -116,6 +117,7 @@ function createHarness(options: {
     showCompactionToast,
     getCompactionPlacement: options.getCompactionPlacement,
     showWarningToast,
+    supportsTurnCommitted: () => options.supportsTurnCommitted === true,
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
@@ -2541,6 +2543,180 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       await Promise.all([live, history])
     } finally {
       harness.stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers durable turn receipts', () => {
+  it('keeps legacy done behavior when the Gateway does not advertise receipts', () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-legacy',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'legacy answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledWith()
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-legacy',
+        turn_id: 'turn-legacy',
+        stream_seq: 2,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('validates a receipt before sequence consumption and handles replay idempotently', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'durable answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set(['task-durable']))
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        stream_seq: 99,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.api.handlers.onAny('task.succeeded', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        stream_seq: 2,
+        status: 'succeeded',
+      })
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 3,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 4,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
+      expect(harness.showWarningToast).not.toHaveBeenCalled()
+      expect(harness.handleSessionConnectionState).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('performs one silent safe sync after five seconds without blocking done', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-delayed',
+        turn_id: 'turn-delayed',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'visible answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(4_999)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(1)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+      vi.advanceTimersByTime(30_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.showWarningToast).not.toHaveBeenCalled()
+      expect(harness.handleSessionConnectionState).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels commit waiting when finalization transitions the task to failed', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-finalizer-failed',
+        turn_id: 'turn-finalizer-failed',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'answer before finalizer failure',
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(
+        new Set(['task-finalizer-failed']),
+      )
+
+      harness.api.handlers.onAny('task.failed', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-finalizer-failed',
+        stream_seq: 2,
+        status: 'failed',
+        terminal_message: 'transcript finalizer failed',
+      })
+
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      const historyCallsAfterFailure = harness.scheduleHistorySync.mock.calls.length
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(historyCallsAfterFailure)
+      expect(harness.scheduleHistorySync.mock.calls).not.toContainEqual([true])
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
     }
   })
 })

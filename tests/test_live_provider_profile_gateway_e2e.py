@@ -137,11 +137,12 @@ def test_tokenrhythm_uses_curated_inline_tiers_and_never_persists_profile(
     )
 
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert data["llm"]["max_tokens"] == 1024
     assert "tier_profile" not in data["squilla_router"]
     assert data["squilla_router"]["tiers"] == tiers
 
 
-def test_tokenrhythm_run_uses_inline_preset_and_1024_output_floor(
+def test_tokenrhythm_run_uses_inline_preset_and_4096_output_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -174,7 +175,7 @@ def test_tokenrhythm_run_uses_inline_preset_and_1024_output_floor(
     result = e2e._run_provider("tokenrhythm", max_tokens=64, timeout_seconds=1.0)
 
     tiers = e2e._profile_tiers("tokenrhythm")
-    assert captured["max_tokens"] == 1024
+    assert captured["max_tokens"] == 4096
     assert captured["tier_overrides"] == tiers
     assert result["tier_profile"] is None
     assert result["tier_mode"] == "inline_preset"

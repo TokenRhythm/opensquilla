@@ -1423,6 +1423,17 @@ async def dispatch_task_runtime_turn(
                 input_mode=getattr(run, "input_mode", "user"),
                 run_kind=getattr(run, "run_kind", None),
             )
+            finalizer_receipt_sink = getattr(run, "finalizer_receipt_sink", None)
+            if finalizer_receipt_sink is not None:
+                try:
+                    finalizer_receipt_sink()
+                except Exception:
+                    log.warning(
+                        "task_runtime.finalizer_receipt_failed",
+                        session_key=run.session_key,
+                        task_id=getattr(run, "task_id", None),
+                        exc_info=True,
+                    )
     except TaskRuntimeStreamError as exc:
         if exc.code in {
             "provider_request_budget_exhausted",

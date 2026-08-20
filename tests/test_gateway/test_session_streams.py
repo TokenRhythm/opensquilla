@@ -1,3 +1,4 @@
+from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
 from opensquilla.gateway import session_streams
 from opensquilla.gateway.session_streams import (
     SessionStreamRegistry,
@@ -409,6 +410,89 @@ def test_live_turn_snapshot_is_replaced_by_the_next_task_and_cleared_on_terminal
     assert terminal_snapshot.task_id is None
     assert terminal_snapshot.events == []
     assert terminal_snapshot.current_stream_seq == registry.current_seq(session_key)
+
+
+def test_turn_committed_replays_without_reopening_or_clearing_successors() -> None:
+    session_key = "agent:main:durable-terminal"
+    registry = SessionStreamRegistry(max_events_per_session=10)
+    done = registry.record(
+        session_key,
+        "session.event.done",
+        {"task_id": "task-a", "turn_id": "task-a", "reason": "completed"},
+    )
+    registry.record(
+        session_key,
+        TURN_COMMITTED_EVENT,
+        {"task_id": "task-a", "turn_id": "task-a"},
+    )
+
+    assert registry.live_snapshot(session_key).events == []
+    assert [
+        event.event_name
+        for event in registry.replay(session_key, done["stream_seq"]).events
+    ] == [TURN_COMMITTED_EVENT]
+
+    for live_payload, expected_task_id in (
+        ({"task_id": "task-b", "turn_id": "task-b", "text": "tagged B"}, "task-b"),
+        ({"text": "anonymous B"}, None),
+    ):
+        successor = SessionStreamRegistry(max_events_per_session=10)
+        successor.record(session_key, "session.event.text_delta", live_payload)
+        successor.record(
+            session_key,
+            TURN_COMMITTED_EVENT,
+            {"task_id": "task-a", "turn_id": "task-a"},
+        )
+        snapshot = successor.live_snapshot(session_key)
+        assert snapshot.task_id == expected_task_id
+        assert [event.payload["text"] for event in snapshot.events] == [live_payload["text"]]
+
+
+def test_turn_committed_survives_successor_generation_reset_in_replay() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=10)
+    session_key = "agent:main:durable-terminal-reset-successor"
+    done = registry.record(
+        session_key,
+        "session.event.done",
+        {"task_id": "task-a", "turn_id": "task-a", "reason": "completed"},
+    )
+    registry.record(
+        session_key,
+        TURN_COMMITTED_EVENT,
+        {"task_id": "task-a", "turn_id": "task-a"},
+    )
+    registry.record(
+        session_key,
+        "session.event.answer_generation_reset",
+        {
+            "task_id": "task-b",
+            "turn_id": "task-b",
+            "old_generation_epoch": 0,
+            "new_generation_epoch": 1,
+            "authoritative_text_snapshot": "new answer",
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {
+            "task_id": "task-b",
+            "turn_id": "task-b",
+            "text": "new answer",
+            "generation_epoch": 1,
+        },
+    )
+
+    replay = registry.replay(session_key, done["stream_seq"])
+    assert [event.event_name for event in replay.events] == [
+        TURN_COMMITTED_EVENT,
+        "session.event.answer_generation_reset",
+        "session.event.text_delta",
+    ]
+    assert [event.payload["task_id"] for event in replay.events[:2]] == ["task-a", "task-b"]
+    snapshot = registry.live_snapshot(session_key)
+    assert snapshot.task_id == "task-b"
+    assert all(event.event_name != TURN_COMMITTED_EVENT for event in snapshot.events)
 
 
 def test_generation_reset_is_a_compression_boundary_and_keeps_completed_outputs() -> None:

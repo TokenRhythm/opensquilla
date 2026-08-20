@@ -95,7 +95,10 @@ def test_reasoning_timer_starts_on_first_nonempty_delta() -> None:
     import asyncio
 
     async def run() -> list[Any]:
-        agent = Agent(provider=_EmptyThenReasoningProvider(), config=AgentConfig(max_iterations=1))
+        agent = Agent(
+            provider=_EmptyThenReasoningProvider(),
+            config=AgentConfig(max_iterations=1, max_provider_retries=0),
+        )
         return [event async for event in agent.run_turn("hi")]
 
     thinking = [

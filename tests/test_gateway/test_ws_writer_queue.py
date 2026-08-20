@@ -20,9 +20,17 @@ import structlog
 from starlette.websockets import WebSocketState
 
 import opensquilla.gateway.websocket as websocket_module
-from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
 from opensquilla.gateway.auth import Principal
-from opensquilla.gateway.protocol import make_event, make_ok_res
+from opensquilla.gateway.protocol import (
+    make_event,
+    make_ok_res,
+    project_session_event_for_client,
+)
 from opensquilla.gateway.websocket import (
     _LOSSY_EVENTS,
     _SENTINEL_STOP,
@@ -75,6 +83,24 @@ async def _flush_writer(conn: WsConnection, *, deadline: float = 1.0) -> None:
             await asyncio.sleep(0)
             return
         await asyncio.sleep(0.01)
+
+
+def _turn_committed_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "session_key": "agent:main:committed",
+        "task_id": "task-committed",
+        "turn_id": "turn-committed",
+        "status": "succeeded",
+        "terminal_reason": "completed",
+        "finished_at": 1_234,
+        "stream_generation": "generation-committed",
+        "stream_seq": 7,
+        "emitted_at": 1_235,
+        "text": "must not cross the public boundary",
+    }
+    payload.update(overrides)
+    return payload
 
 
 @pytest.mark.asyncio
@@ -153,6 +179,68 @@ async def test_terminal_reset_projection_uses_connect_caps_at_send_boundary(
         assert payload == original
     finally:
         await conn._stop_writer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_enabled", [False, True])
+async def test_turn_committed_is_capability_gated_and_allowlisted(
+    writer_enabled: bool,
+) -> None:
+    payload = _turn_committed_payload()
+    legacy_socket = _FakeWebSocket()
+    legacy = WsConnection(conn_id="committed-legacy", ws=legacy_socket)  # type: ignore[arg-type]
+    capable_socket = _FakeWebSocket()
+    capable = WsConnection(
+        conn_id="committed-capable",
+        ws=capable_socket,  # type: ignore[arg-type]
+        client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+    )
+    legacy._start_writer(maxsize=8, enabled=writer_enabled)
+    capable._start_writer(maxsize=8, enabled=writer_enabled)
+    try:
+        await legacy.send_event(TURN_COMMITTED_EVENT, payload)
+        await capable.send_event(TURN_COMMITTED_EVENT, payload)
+        if writer_enabled:
+            await _flush_writer(legacy)
+            await _flush_writer(capable)
+
+        assert legacy_socket.sent == []
+        frame = json.loads(capable_socket.sent[0])
+        assert frame["event"] == TURN_COMMITTED_EVENT
+        assert frame["payload"] == {
+            key: value for key, value in payload.items() if key != "text"
+        }
+    finally:
+        await legacy._stop_writer()
+        await capable._stop_writer()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("schema_version", None),
+        ("schema_version", True),
+        ("schema_version", 2),
+        ("status", "failed"),
+        ("finished_at", "1234"),
+        ("stream_seq", False),
+    ],
+)
+def test_turn_committed_projection_rejects_invalid_contract_fields(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    payload = _turn_committed_payload()
+    if invalid_value is None:
+        payload.pop(field_name)
+    else:
+        payload[field_name] = invalid_value
+
+    assert project_session_event_for_client(
+        TURN_COMMITTED_EVENT,
+        payload,
+        client_caps={TURN_COMMITTED_CAPABILITY},
+    ) is None
 
 
 # ---------------------------------------------------------------------------

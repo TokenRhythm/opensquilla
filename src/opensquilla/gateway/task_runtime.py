@@ -26,13 +26,22 @@ import json
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import structlog
 
+from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
 from opensquilla.engine.agent_injection import PendingInputClaim, PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
 from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
@@ -100,6 +109,7 @@ TERMINAL_STATUSES = frozenset(
 )
 
 TaskStreamEventSink = Callable[[Any], Awaitable[None]]
+TaskFinalizerReceiptSink = Callable[[], None]
 TaskActivationListener = Callable[
     [str, str, str, str, Mapping[str, Any]],
     Awaitable[Mapping[str, Any] | None],
@@ -127,10 +137,15 @@ _DURABLE_ROUTING_AUDIT_FIELDS = frozenset(
 )
 
 
-async def _complete_terminal_settlement[T](awaitable: Awaitable[T]) -> T:
+async def _complete_terminal_settlement[T](awaitable: Coroutine[Any, Any, T]) -> T:
     """Finish accepted-input settlement even if the task is cancelled again."""
 
-    task = asyncio.ensure_future(awaitable)
+    loop = asyncio.get_running_loop()
+    task: asyncio.Task[T]
+    if loop.get_task_factory() is None:
+        task = asyncio.Task(awaitable, loop=loop, eager_start=True)
+    else:
+        task = loop.create_task(awaitable)
     while True:
         try:
             return await asyncio.shield(task)
@@ -520,6 +535,7 @@ class TaskRun:
     # same live text stream that WebUI already receives without changing
     # the public WS event payload.
     stream_event_sink: TaskStreamEventSink | None = None
+    finalizer_receipt_sink: TaskFinalizerReceiptSink | None = None
     pending_input_provider: PendingInputProvider | None = None
     # Immutable-at-acceptance projection used by the Gateway turn handler.
     # This is deliberately off RouteEnvelope.metadata so cached envelopes can
@@ -635,6 +651,7 @@ class _RuntimeTask:
     terminal_assistant_message_content: str | None = None
     document_mutation_outcome: dict[str, Any] | None = None
     stream_event_sink: TaskStreamEventSink | None = None
+    finalizer_completed: bool = False
     accepted_config: Any | None = None
     provider_request_correlation: ProviderRequestCorrelation | None = field(
         default=None,
@@ -701,6 +718,9 @@ class _RuntimeTask:
 
     def capture_document_mutation_outcome(self, outcome: dict[str, Any]) -> None:
         self.document_mutation_outcome = dict(outcome)
+
+    def capture_finalizer_receipt(self) -> None:
+        self.finalizer_completed = True
 
 
 @dataclass
@@ -4171,6 +4191,7 @@ class TaskRuntime:
                         ),
                         fresh_user_session=task.fresh_user_session,
                         stream_event_sink=task.stream_event_sink,
+                        finalizer_receipt_sink=task.capture_finalizer_receipt,
                         pending_input_provider=task.pending_input_provider,
                         accepted_config=task.accepted_config,
                         accepted_run_mode_override=task.accepted_run_mode_override,
@@ -5845,10 +5866,16 @@ class TaskRuntime:
     ) -> None:
         """Finalize one task after collect and same-turn admissions settle."""
 
-        try:
+        owns_settlement = False
+
+        def _capture_settlement_claim() -> None:
+            nonlocal owns_settlement
+            owns_settlement = True
+
+        async def _settle_with_claims() -> tuple[bool, str | None, str | None]:
             async with task.collect_claim:
                 async with task.steer_claim:
-                    await self._mark_terminal_claimed(
+                    return await self._mark_terminal_claimed(
                         task,
                         status,
                         terminal_reason=terminal_reason,
@@ -5862,12 +5889,38 @@ class TaskRuntime:
                         replay_safe=replay_safe,
                         promote_pending_steers=promote_pending_steers,
                         activate_promoted_steers=activate_promoted_steers,
+                        settlement_claim_sink=_capture_settlement_claim,
                     )
+
+        try:
+            claimed, settled_error_class, settled_error_message = (
+                await _complete_terminal_settlement(_settle_with_claims())
+            )
         finally:
+            if owns_settlement and task.terminal_settled and not task.done.is_set():
+                task.done.set()
             # A driver cancelled before its first event-loop step never enters
             # ``_execute`` and therefore has no execution ``finally`` block.
             if not task.execution_started:
                 _cleanup_guest_profile(task)
+        if not claimed:
+            return
+        if task.cancel_requested_at_monotonic is not None:
+            log.info(
+                "task_runtime.cancellation_settled",
+                reason=task.cancel_reason or terminal_reason,
+                duration_ms=int(
+                    (time.monotonic() - task.cancel_requested_at_monotonic) * 1000
+                ),
+                settlement=status.value,
+            )
+        await self._notify_subagent_terminal(
+            task,
+            status,
+            terminal_reason=terminal_reason,
+            error_class=settled_error_class,
+            error_message=settled_error_message,
+        )
 
     async def _mark_terminal_claimed(
         self,
@@ -5885,13 +5938,14 @@ class TaskRuntime:
         replay_safe: bool = False,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
-    ) -> None:
+        settlement_claim_sink: Callable[[], None],
+    ) -> tuple[bool, str | None, str | None]:
         record_primary_terminal_disposition = False
         collected_terminal_inputs: list[_CollectedPrimaryInput] = []
         was_running_owner = False
         async with self._state_lock:
             if task.terminal_closing:
-                return
+                return False, error_class, error_message
             was_running_owner = (
                 self._running_by_session.get(task.envelope.session_key) is task
             )
@@ -5903,6 +5957,7 @@ class TaskRuntime:
                 collected_terminal_inputs = list(task.collected_primary_inputs)
                 task.collected_primary_inputs.clear()
             task.status = status
+            settlement_claim_sink()
         if record_primary_terminal_disposition:
             await self._record_primary_terminal_disposition(
                 task,
@@ -5992,7 +6047,7 @@ class TaskRuntime:
                 session_key=task.envelope.session_key,
                 error=str(exc),
             )
-        terminal_persisted = True
+        terminal_persisted = False
         promotion_result: _SteerPromotionResult | None = None
         try:
             try:
@@ -6000,8 +6055,8 @@ class TaskRuntime:
                     task.task_id,
                     **terminal_update,
                 )
+                terminal_persisted = True
             except Exception as exc:  # noqa: BLE001 - do not strand the UI in running.
-                terminal_persisted = False
                 log.warning(
                     "task_runtime.terminal_persist_failed",
                     task_id=task.task_id,
@@ -6023,13 +6078,11 @@ class TaskRuntime:
                 # cannot start early.
                 pending_steers = task.pending_input_provider.reclaim_pending()
                 if pending_steers:
-                    promotion_result = await _complete_terminal_settlement(
-                        self._promote_undrained_steers(
-                            task,
-                            pending_steers,
-                            activate=activate_promoted_steers,
-                            defer_queued_notification=activate_promoted_steers,
-                        )
+                    promotion_result = await self._promote_undrained_steers(
+                        task,
+                        pending_steers,
+                        activate=activate_promoted_steers,
+                        defer_queued_notification=activate_promoted_steers,
                     )
             payload: dict[str, Any] = {
                 "task_id": task.task_id,
@@ -6088,8 +6141,10 @@ class TaskRuntime:
                 if safe_retry is not None:
                     payload["retry_after_ms"] = safe_retry
             try:
-                await _complete_terminal_settlement(
-                    self._emit(task.envelope.session_key, f"task.{status.value}", payload)
+                await self._emit(
+                    task.envelope.session_key,
+                    f"task.{status.value}",
+                    payload,
                 )
                 async with self._state_lock:
                     task.terminal_emitted = True
@@ -6115,34 +6170,61 @@ class TaskRuntime:
                         no_prior_provider_dispatch=no_prior_provider_dispatch,
                         replay_safe=replay_safe,
                     )
-            await _complete_terminal_settlement(
-                self._notify_task_lifecycle(
-                    TaskLifecycleEvent(
-                        phase="terminal",
-                        session_key=task.envelope.session_key,
-                        task_id=task.task_id,
-                        task_status=status,
-                        run_kind=task.run_kind,
-                        terminal_reason=terminal_reason,
-                        error_class=error_class,
-                        error_message=error_message,
-                        terminal_persisted=terminal_persisted,
-                        continuation_task_id=(
-                            promotion_result.task_id
-                            if promotion_result is not None
-                            else None
-                        ),
+            if (
+                status == AgentTaskStatus.SUCCEEDED
+                and terminal_reason == "completed"
+                and task.finalizer_completed
+                and terminal_persisted
+            ):
+                try:
+                    await self._emit(
+                        task.envelope.session_key,
+                        TURN_COMMITTED_EVENT,
+                        {
+                            "schema_version": 1,
+                            "session_key": task.envelope.session_key,
+                            "task_id": task.task_id,
+                            "status": AgentTaskStatus.SUCCEEDED.value,
+                            "terminal_reason": "completed",
+                            "finished_at": terminal_update["finished_at"],
+                            **_task_identity_payload(
+                                task.envelope,
+                                task.task_id,
+                                user_message_id=task.persisted_user_message_id,
+                            ),
+                        },
                     )
+                except Exception as exc:  # noqa: BLE001 - optional receipt only
+                    log.warning(
+                        "task_runtime.turn_committed_emit_failed",
+                        task_id=task.task_id,
+                        session_key=task.envelope.session_key,
+                        error=str(exc),
+                    )
+            await self._notify_task_lifecycle(
+                TaskLifecycleEvent(
+                    phase="terminal",
+                    session_key=task.envelope.session_key,
+                    task_id=task.task_id,
+                    task_status=status,
+                    run_kind=task.run_kind,
+                    terminal_reason=terminal_reason,
+                    error_class=error_class,
+                    error_message=error_message,
+                    terminal_persisted=terminal_persisted,
+                    continuation_task_id=(
+                        promotion_result.task_id
+                        if promotion_result is not None
+                        else None
+                    ),
                 )
             )
             if (
                 promotion_result is not None
                 and promotion_result.deferred_notification is not None
             ):
-                await _complete_terminal_settlement(
-                    self._publish_deferred_queued_activation(
-                        promotion_result.deferred_notification
-                    )
+                await self._publish_deferred_queued_activation(
+                    promotion_result.deferred_notification
                 )
         finally:
             fairness_changed = False
@@ -6197,26 +6279,7 @@ class TaskRuntime:
             if fairness_changed and self._fair_cond is not None:
                 async with self._fair_cond:
                     self._fair_cond.notify_all()
-            # Wake waiters only after the task and its session lane have both
-            # left the runtime ledger. Otherwise a caller can observe a
-            # terminal record while automatic admission still sees stale work.
-            task.done.set()
-        if task.cancel_requested_at_monotonic is not None:
-            log.info(
-                "task_runtime.cancellation_settled",
-                reason=task.cancel_reason or terminal_reason,
-                duration_ms=int(
-                    (time.monotonic() - task.cancel_requested_at_monotonic) * 1000
-                ),
-                settlement=status.value,
-            )
-        await self._notify_subagent_terminal(
-            task,
-            status,
-            terminal_reason=terminal_reason,
-            error_class=error_class,
-            error_message=error_message,
-        )
+        return True, error_class, error_message
 
     async def _record_primary_terminal_disposition(
         self,

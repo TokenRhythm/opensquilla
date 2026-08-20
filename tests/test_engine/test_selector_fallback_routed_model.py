@@ -491,6 +491,164 @@ def test_each_hop_uses_the_active_physical_models_own_output_limit() -> None:
     assert last.provider_request_max_chars < middle.provider_request_max_chars
 
 
+async def test_capability_constrained_fallback_skips_non_vision_candidates() -> None:
+    primary_config = SimpleNamespace(provider="openrouter", model="vision-primary")
+    text_config = SimpleNamespace(provider="openrouter", model="text-fallback")
+    unknown_config = SimpleNamespace(provider="openrouter", model="unknown-fallback")
+    vision_config = SimpleNamespace(provider="openrouter", model="vision-fallback")
+
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, model: str) -> None:
+            self.model = model
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            yield TextDeltaEvent(text=f"reply from {self.model}")
+            yield DoneEvent(model=self.model)
+
+    providers = {
+        config.model: _Provider(config.model)
+        for config in (
+            primary_config,
+            text_config,
+            unknown_config,
+            vision_config,
+        )
+    }
+
+    class _Selector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self._chain = [
+                primary_config,
+                text_config,
+                unknown_config,
+                vision_config,
+            ]
+            self._index = 0
+
+        @property
+        def current_config(self):
+            return self._chain[self._index]
+
+        def remaining_chain(self):
+            return list(self._chain[self._index :])
+
+        def next_fallback_after_failure_matching(self, _exc, *, predicate):
+            matching = [cfg for cfg in self._chain[self._index + 1 :] if predicate(cfg)]
+            if not matching:
+                raise IndexError("No fallback chain available")
+            provider = providers[matching[0].model]
+            self._chain = [self.current_config, *matching]
+            self._index = 1
+            return provider
+
+    selector = _Selector()
+    wrapper = _SelectorFallbackProvider(providers[primary_config.model], selector)
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (text_config, 0, 0, ModelCapabilities(supports_vision=False)),
+            (unknown_config, 0, 0, ModelCapabilities(supports_vision=False)),
+            (vision_config, 0, 0, ModelCapabilities(supports_vision=True)),
+        ]
+    )
+    wrapper.configure_fallback_deployment_vision_support(
+        [
+            (text_config, "unsupported"),
+            (unknown_config, "unknown"),
+            (vision_config, "supported"),
+        ]
+    )
+
+    selected = wrapper.fallback_after_invalid_response_with_capabilities(
+        "reasoning_only",
+        requires_vision=True,
+    )
+    events = [
+        event
+        async for event in wrapper.chat(
+            [
+                Message(
+                    role="user",
+                    content=[
+                        ContentBlockImage(
+                            media_type="image/png",
+                            data="c3ludGhldGlj",
+                        )
+                    ],
+                )
+            ],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert selected is True
+    assert selector.current_config is vision_config
+    assert providers[primary_config.model].calls == 0
+    assert providers[text_config.model].calls == 0
+    assert providers[unknown_config.model].calls == 0
+    assert providers[vision_config.model].calls == 1
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "reply from vision-fallback"
+    ]
+
+
+def test_capability_constrained_fallback_keeps_primary_without_vision_candidate() -> None:
+    primary_config = SimpleNamespace(provider="openrouter", model="vision-primary")
+    text_config = SimpleNamespace(provider="openrouter", model="text-fallback")
+    unknown_config = SimpleNamespace(provider="openrouter", model="unknown-fallback")
+
+    class _Selector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self._chain = [primary_config, text_config, unknown_config]
+            self._index = 0
+            self.fallback_builds = 0
+
+        @property
+        def current_config(self):
+            return self._chain[self._index]
+
+        def remaining_chain(self):
+            return list(self._chain[self._index :])
+
+        def next_fallback_after_failure_matching(self, _exc, *, predicate):
+            matching = [cfg for cfg in self._chain[self._index + 1 :] if predicate(cfg)]
+            if not matching:
+                raise IndexError("No fallback chain available")
+            self.fallback_builds += 1
+            self._chain = [self.current_config, *matching]
+            self._index = 1
+            return object()
+
+    primary_provider = object()
+    selector = _Selector()
+    wrapper = _SelectorFallbackProvider(primary_provider, selector)
+    wrapper.configure_fallback_deployment_vision_support(
+        [
+            (text_config, "unsupported"),
+            (unknown_config, "unknown"),
+        ]
+    )
+
+    selected = wrapper.fallback_after_invalid_response_with_capabilities(
+        "reasoning_only",
+        requires_vision=True,
+    )
+
+    assert selected is False
+    assert selector.current_config is primary_config
+    assert selector.fallback_builds == 0
+    assert wrapper._provider is primary_provider
+    assert wrapper._used_fallback is False
+
+
 def test_tokenrhythm_same_model_fallback_uses_exact_private_config_identity() -> None:
     primary = SimpleNamespace(
         provider="tokenrhythm",
@@ -1177,7 +1335,7 @@ async def test_image_request_does_not_call_text_only_fallback(
     ]
 
 
-async def test_invalid_response_fallback_rejects_image_before_text_only_call(
+async def test_invalid_response_fallback_preserves_empty_response_without_vision_candidate(
     monkeypatch: Any,
 ) -> None:
     class _Catalog:
@@ -1217,9 +1375,11 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
             self.calls += 1
             if self.empty:
                 yield DoneEvent(
-                    stop_reason="stop",
+                    stop_reason="length",
                     input_tokens=3,
-                    output_tokens=0,
+                    output_tokens=1024,
+                    reasoning_tokens=1023,
+                    reasoning_content="internal reasoning",
                     model="vision-primary",
                 )
                 return
@@ -1230,22 +1390,41 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
         def __init__(self) -> None:
             self.primary = _Provider(empty=True)
             self.fallback = _Provider(empty=False)
-            self.current_config = SimpleNamespace(
+            self.primary_config = SimpleNamespace(
                 provider="openrouter",
                 model="vision-primary",
                 base_url="",
             )
+            self.fallback_config = SimpleNamespace(
+                provider="openrouter",
+                model="text-fallback",
+                base_url="",
+            )
+            self.current_config = self.primary_config
+            self.fallback_builds = 0
 
         @property
         def active_provider_id(self) -> str:
             return "openrouter"
 
+        def remaining_chain(self):
+            return [self.primary_config, self.fallback_config]
+
+        def next_fallback_after_failure_matching(
+            self,
+            _exc: Exception,
+            *,
+            predicate,
+        ) -> _Provider:
+            matching = [cfg for cfg in [self.fallback_config] if predicate(cfg)]
+            if not matching:
+                raise IndexError("No fallback chain available")
+            self.fallback_builds += 1
+            self.current_config = self.fallback_config
+            return self.fallback
+
         def next_fallback_after_failure(self, _exc: Exception) -> _Provider:
-            self.current_config = SimpleNamespace(
-                provider="openrouter",
-                model="text-fallback",
-                base_url="",
-            )
+            self.current_config = self.fallback_config
             return self.fallback
 
     monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
@@ -1260,6 +1439,9 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
         selector.primary,
         selector,
         turn_metadata=metadata,
+    )
+    wrapper.configure_fallback_deployment_vision_support(
+        [(selector.fallback_config, "unsupported")]
     )
     agent = Agent(
         provider=wrapper,
@@ -1286,25 +1468,25 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
 
     assert selector.primary.calls == 1
     assert selector.fallback.calls == 0
+    assert selector.fallback_builds == 0
     assert selector.primary.validation_calls == 2
     assert selector.fallback.validation_calls == 0
-    assert any(
+    error = next(event for event in events if getattr(event, "kind", "") == "error")
+    assert getattr(error, "code", "") == "empty_response"
+    assert "llm.max_tokens" in getattr(error, "message", "")
+    assert not any(
         getattr(event, "kind", "") == "error"
         and getattr(event, "code", "") == IMAGE_INPUT_UNSUPPORTED_CODE
-        for event in events
-    )
-    assert any(
-        getattr(event, "kind", "") == "warning"
-        and getattr(event, "code", "") == "provider_empty_retry"
         for event in events
     )
     done_events = [event for event in events if isinstance(event, EngineDoneEvent)]
     if done_events:
         assert done_events[-1].input_tokens == 3
-        assert done_events[-1].output_tokens == 0
-    assert metadata["image_input_mode"] == "rejected"
-    assert metadata["image_input_reason"] == "model_vision_unsupported"
-    assert metadata["image_input_stage"] == "fallback"
+        assert done_events[-1].output_tokens == 1024
+        assert done_events[-1].reasoning_tokens == 1023
+    assert "image_input_mode" not in metadata
+    assert "image_input_reason" not in metadata
+    assert "image_input_stage" not in metadata
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"
     assert "router_fallback_hops" not in metadata
@@ -1312,6 +1494,131 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
     assert metadata["savings_pct"] == 17.0
     assert [leg["model"] for leg in metadata["execution_legs"]] == [
         "vision-primary"
+    ]
+
+
+async def test_invalid_response_fallback_skips_text_leg_for_vision_fallback() -> None:
+    primary_config = SimpleNamespace(provider="openrouter", model="vision-primary")
+    text_config = SimpleNamespace(provider="openrouter", model="text-fallback")
+    vision_config = SimpleNamespace(provider="openrouter", model="vision-fallback")
+
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, model: str, *, empty: bool = False) -> None:
+            self.model = model
+            self.empty = empty
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            if self.empty:
+                yield DoneEvent(
+                    stop_reason="length",
+                    input_tokens=3,
+                    output_tokens=1024,
+                    reasoning_tokens=1023,
+                    reasoning_content="internal reasoning",
+                    model=self.model,
+                )
+                return
+            yield TextDeltaEvent(text=f"reply from {self.model}")
+            yield DoneEvent(model=self.model)
+
+    providers = {
+        primary_config.model: _Provider(primary_config.model, empty=True),
+        text_config.model: _Provider(text_config.model),
+        vision_config.model: _Provider(vision_config.model),
+    }
+
+    class _Selector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self._chain = [primary_config, text_config, vision_config]
+            self._index = 0
+
+        @property
+        def current_config(self):
+            return self._chain[self._index]
+
+        def remaining_chain(self):
+            return list(self._chain[self._index :])
+
+        def next_fallback_after_failure_matching(self, _exc, *, predicate):
+            matching = [cfg for cfg in self._chain[self._index + 1 :] if predicate(cfg)]
+            if not matching:
+                raise IndexError("No fallback chain available")
+            provider = providers[matching[0].model]
+            self._chain = [self.current_config, *matching]
+            self._index = 1
+            return provider
+
+    selector = _Selector()
+    metadata: dict[str, Any] = {
+        "routed_model": "vision-primary",
+        "executed_provider": "openrouter",
+        "executed_model": "vision-primary",
+    }
+    wrapper = _SelectorFallbackProvider(
+        providers[primary_config.model],
+        selector,
+        turn_metadata=metadata,
+    )
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (text_config, 0, 0, ModelCapabilities(supports_vision=False)),
+            (vision_config, 0, 0, ModelCapabilities(supports_vision=True)),
+        ]
+    )
+    wrapper.configure_fallback_deployment_vision_support(
+        [
+            (text_config, "unsupported"),
+            (vision_config, "supported"),
+        ]
+    )
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_provider_retries=0,
+            max_turn_llm_calls=2,
+            model_id="vision-primary",
+            model_capabilities=ModelCapabilities(supports_vision=True),
+            model_vision_support="supported",
+        ),
+    )
+    image_message = Message(
+        role="user",
+        content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "Describe the image.",
+            extra_messages=[image_message],
+        )
+    ]
+
+    assert providers[primary_config.model].calls == 1
+    assert providers[text_config.model].calls == 0
+    assert providers[vision_config.model].calls == 1
+    assert selector.current_config is vision_config
+    assert any(
+        getattr(event, "kind", "") == "text_delta"
+        and getattr(event, "text", "") == "reply from vision-fallback"
+        for event in events
+    )
+    assert not any(
+        getattr(event, "kind", "") == "error"
+        and getattr(event, "code", "") == IMAGE_INPUT_UNSUPPORTED_CODE
+        for event in events
+    )
+    assert metadata["router_fallback_hops"] == 1
+    assert [leg["model"] for leg in metadata["execution_legs"]] == [
+        "vision-primary",
+        "vision-fallback",
     ]
 
 

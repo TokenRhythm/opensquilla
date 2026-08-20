@@ -8,6 +8,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
+
 _JS_MAX_SAFE_INTEGER = (1 << 53) - 1
 _ANSWER_GENERATION_RESET_EVENT = "session.event.answer_generation_reset"
 _GENERATION_LOSSY_EVENTS = frozenset(
@@ -22,6 +24,7 @@ _COMPLETED_TURN_EVENTS = frozenset(
     {
         "session.event.tool_result",
         "session.event.artifact",
+        TURN_COMMITTED_EVENT,
     }
 )
 
@@ -156,6 +159,14 @@ class SessionStreamRegistry:
             if event_value and reset_value and event_value != reset_value:
                 return False
         return True
+
+    @classmethod
+    def _preserve_completed_before_reset(
+        cls,
+        event: BufferedSessionEvent,
+        reset: BufferedSessionEvent,
+    ) -> bool:
+        return event.event_name == TURN_COMMITTED_EVENT or cls._same_turn_identity(event, reset)
 
     def _clear_live_state(self, session_key: str) -> None:
         self._live_events_by_session.pop(session_key, None)
@@ -339,6 +350,12 @@ class SessionStreamRegistry:
     ) -> None:
         task_id = self._task_id(event.payload)
         current_task_id = self._live_task_by_session.get(session_key)
+
+        if event.event_name == TURN_COMMITTED_EVENT:
+            if task_id is not None and task_id == current_task_id:
+                self._clear_live_state(session_key)
+            return
+
         if task_id and current_task_id and task_id != current_task_id:
             self._clear_live_state(session_key)
         if task_id:
@@ -577,14 +594,14 @@ class SessionStreamRegistry:
                 for event in self._completed_events_by_session.get(session_key, ())
                 if (
                     since_stream_seq < event.stream_seq < first_reset_seq
-                    and self._same_turn_identity(event, first_reset)
+                    and self._preserve_completed_before_reset(event, first_reset)
                 )
             }
             for event in events:
                 if since_stream_seq < event.stream_seq < first_reset_seq:
                     if (
                         self._is_completed_turn_event(event.event_name)
-                        and self._same_turn_identity(event, first_reset)
+                        and self._preserve_completed_before_reset(event, first_reset)
                     ):
                         candidates[event.stream_seq] = event
 

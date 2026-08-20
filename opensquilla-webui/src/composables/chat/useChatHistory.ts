@@ -67,6 +67,13 @@ function historyTerminationActions(rpc: RpcClient) {
   }
 }
 
+function nonReconnectingHistoryActions() {
+  return {
+    timeoutAction: 'reject' as const,
+    abortAction: 'reject' as const,
+  }
+}
+
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
   return Array.isArray(value)
     ? value.filter((item): item is T => !!item && typeof item === 'object' && !Array.isArray(item))
@@ -635,6 +642,7 @@ interface HistoryLoadParams {
   prepend?: boolean
   bridgeRetry?: boolean
   retry?: boolean
+  nonReconnecting?: boolean
 }
 
 type FailedHistoryRequest =
@@ -654,7 +662,11 @@ const MAX_FORWARD_BRIDGE_PAGES = 2
 export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
   let historyRequestSeq = 0
+  let preserveLocalTailGeneration = 0
+  let acknowledgedPreserveLocalTailGeneration = 0
   let historySyncPending = false
+  let historySyncTimerNonReconnecting = false
+  let historySyncPendingNonReconnecting = false
   // Exposed read-only by convention so session hand-offs can distinguish the
   // prior session's terminal `ready` state from the new session's first load.
   const historySessionKey = ref('')
@@ -690,16 +702,25 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     stop()
   }
 
-  function scheduleHistorySync() {
+  function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean) {
+    if (nonReconnecting && advanceGeneration) preserveLocalTailGeneration += 1
+    historySyncTimerNonReconnecting ||= nonReconnecting
     if (historySyncTimer) clearTimeout(historySyncTimer)
     historySyncTimer = setTimeout(() => {
       historySyncTimer = null
+      const timerNonReconnecting = historySyncTimerNonReconnecting
+      historySyncTimerNonReconnecting = false
       if (historyState.value.loading) {
         historySyncPending = true
+        historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
       }
-      void loadHistory()
+      void loadHistory({ nonReconnecting: timerNonReconnecting })
     }, 50)
+  }
+
+  function scheduleHistorySync(preserveLocalTail = false) {
+    armHistorySync(preserveLocalTail, true)
   }
 
   function flushPendingHistorySync() {
@@ -710,8 +731,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       return
     }
     if (!historySyncPending) return
+    const pendingNonReconnecting = historySyncPendingNonReconnecting
     historySyncPending = false
-    scheduleHistorySync()
+    historySyncPendingNonReconnecting = false
+    armHistorySync(pendingNonReconnecting, false)
   }
 
   function mapHistoryMessage(
@@ -827,6 +850,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     if (historySessionKey.value === key) return false
     cancelAnchorStabilization()
     const crossedSession = Boolean(historySessionKey.value)
+    if (crossedSession) {
+      acknowledgedPreserveLocalTailGeneration = preserveLocalTailGeneration
+    }
     historySessionKey.value = key
     hasLoadedEarlier = false
     loadEarlierPending = false
@@ -852,13 +878,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   function callHistory<T>(
     request: Record<string, unknown>,
     bootstrap: SessionBootstrapPhaseContext,
+    nonReconnecting = false,
   ): Promise<T> {
     const callOptions = {
       ...phaseCallOptions(bootstrap, 'chat.history'),
       // History is background content. A slow read may fail independently,
       // without recycling a Gateway that advertises concurrent reads. Legacy
       // serial Gateways still need a fresh connection to escape a stuck read.
-      ...historyTerminationActions(options.rpc),
+      ...(nonReconnecting
+        ? nonReconnectingHistoryActions()
+        : historyTerminationActions(options.rpc)),
       onSent: (socketGeneration: number) => {
         bootstrap.markHistoryRequestSent?.(socketGeneration)
       },
@@ -879,6 +908,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const key = options.sessionKey.value
     const crossedSession = resetForSession(key)
     cancelAnchorStabilization()
+    const historyStateBeforeLoad = historyState.value
+    const failedHistoryRequestBeforeLoad = failedHistoryRequest
+    const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
+    const nonReconnecting = Boolean(params.nonReconnecting)
     const requestSeq = ++historyRequestSeq
     let bridgeAttempted = Boolean(params.bridgeRetry)
     const isInitialLoad = !params.prepend
@@ -886,24 +919,32 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         historyState.value.initialLoadStatus === 'pending'
         || historyState.value.initialLoadStatus === 'error'
       )
-    historyState.value = {
-      ...historyState.value,
-      loading: true,
-      // Only explicit backward pagination owns the sentinel. Forward
-      // catch-up/bridge recovery is a session-recovery concern and must not
-      // impersonate "load earlier" progress or failure.
-      loadingEarlier: Boolean(params.prepend),
-      retrying: Boolean(params.retry && !params.prepend),
-      initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
-      loadEarlierError: false,
-      recoveryError: params.prepend ? historyState.value.recoveryError : false,
+    if (!nonReconnecting) {
+      historyState.value = {
+        ...historyState.value,
+        loading: true,
+        // Only explicit backward pagination owns the sentinel. Forward
+        // catch-up/bridge recovery is a session-recovery concern and must not
+        // impersonate "load earlier" progress or failure.
+        loadingEarlier: Boolean(params.prepend),
+        retrying: Boolean(params.retry && !params.prepend),
+        initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
+        loadEarlierError: false,
+        recoveryError: params.prepend ? historyState.value.recoveryError : false,
+      }
     }
     const isCurrentRequest = () => key === options.sessionKey.value && requestSeq === historyRequestSeq
+    const restoreSilentBackgroundState = () => {
+      failedHistoryRequest = failedHistoryRequestBeforeLoad
+      historyState.value = historyStateBeforeLoad
+    }
     try {
       await options.rpc.waitForConnection(
         phaseTimeoutMs(bootstrap, 'chat.history'),
         bootstrap.signal,
-        historyTerminationActions(options.rpc),
+        nonReconnecting
+          ? nonReconnectingHistoryActions()
+          : historyTerminationActions(options.rpc),
       )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
@@ -926,11 +967,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         includeSummaries: true,
       }
       if (params.before != null) request.before = params.before
-      const data = await callHistory<ChatHistoryResponse>(request, bootstrap)
+      const data = await callHistory<ChatHistoryResponse>(request, bootstrap, nonReconnecting)
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
       const msgs = data.messages || []
       const canonicalAvailable = data.canonical_available ?? data.canonicalAvailable
       if (canonicalAvailable === false) {
+        if (nonReconnecting) {
+          restoreSilentBackgroundState()
+          return { ok: false }
+        }
         failedHistoryRequest = hasLoadedEarlier && !params.prepend
           ? { kind: 'bridge', key }
           : {
@@ -1012,10 +1057,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               includeSummaries: true,
             },
             bootstrap,
+            nonReconnecting,
           )
           if (!isCurrentRequest()) return { ok: false, cancelled: true }
           const bridgeAvailable = bridgeData.canonical_available ?? bridgeData.canonicalAvailable
           if (bridgeAvailable === false) {
+            if (nonReconnecting) {
+              restoreSilentBackgroundState()
+              return { ok: false }
+            }
             historyState.value = {
               ...historyState.value,
               canonicalAvailable: false,
@@ -1105,7 +1155,22 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         hasLoadedEarlier = true
         loadedEarlierCursors.add(String(params.before))
       }
-      const preserveLiveTail = !crossedSession && Boolean(options.preserveLiveTail?.value)
+      const preserveLiveTail = !crossedSession && (
+        Boolean(options.preserveLiveTail?.value)
+        || preserveLocalTailGeneration > acknowledgedPreserveLocalTailGeneration
+      )
+
+      const acknowledgePreservedLocalTail = () => {
+        if (
+          !crossedSession
+          && !params.prepend
+          && canonicalAvailable !== false
+          && requestPreserveLocalTailGeneration > acknowledgedPreserveLocalTailGeneration
+          && requestPreserveLocalTailGeneration === preserveLocalTailGeneration
+        ) {
+          acknowledgedPreserveLocalTailGeneration = requestPreserveLocalTailGeneration
+        }
+      }
 
       if (msgs.length === 0 && !params.prepend) {
         const transcript = preserveLiveTail
@@ -1121,6 +1186,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           options.lastHeaderRole.value = ''
           options.lastHeaderDay.value = ''
         }
+        acknowledgePreservedLocalTail()
         flushPendingHistorySync()
         return { ok: true }
       }
@@ -1197,11 +1263,23 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       // and the existing timer/session cleanup makes the continuation yielding
       // and cancellable rather than one unbounded request or DOM update.
       if (bridgeContinuationNeeded) historySyncPending = true
+      if (bridgeContinuationNeeded) {
+        historySyncPendingNonReconnecting ||= nonReconnecting
+      }
+      if (!bridgeContinuationNeeded) acknowledgePreservedLocalTail()
       flushPendingHistorySync()
       return { ok: true }
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
+        if (nonReconnecting) {
+          restoreSilentBackgroundState()
+          return {
+            ok: false,
+            error,
+            cancelled: bootstrap.signal.aborted || isRpcAbort(error),
+          }
+        }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
         failedHistoryRequest = bridgeAttempted
           ? { kind: 'bridge', key }
@@ -1250,6 +1328,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           if (!historyState.value.loadingEarlier) loadEarlierPending = true
         } else {
           historySyncPending = true
+          historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
         }
         // Never report a deduplicated request as a successful bootstrap.
         // The caller observes the real terminal result of the in-flight read.
@@ -1333,7 +1412,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       clearTimeout(historySyncTimer)
       historySyncTimer = null
     }
+    historySyncTimerNonReconnecting = false
     historySyncPending = false
+    historySyncPendingNonReconnecting = false
     loadEarlierPending = false
     cancelAnchorStabilization()
     historyState.value = {
