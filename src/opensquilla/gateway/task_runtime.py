@@ -5883,9 +5883,6 @@ class TaskRuntime:
                         settlement_claim_sink=_capture_settlement_claim,
                     )
 
-        claimed = False
-        settled_error_class = error_class
-        settled_error_message = error_message
         try:
             claimed, settled_error_class, settled_error_message = (
                 await _complete_terminal_settlement(_settle_with_claims())
