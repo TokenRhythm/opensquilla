@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -427,7 +428,8 @@ def _workspace_write_protection_unavailable_warning(
     ctx.workspace_mutation_records.append(record)
     callback = getattr(ctx, "on_runtime_event", None)
     if callback is not None:
-        try:
+        # Runtime telemetry is best-effort and must not alter the tool result.
+        with contextlib.suppress(Exception):
             callback(
                 {
                     "feature": "workspace_write_deny",
@@ -438,8 +440,6 @@ def _workspace_write_protection_unavailable_warning(
                     "injected_to_model": True,
                 }
             )
-        except Exception:
-            pass
     message = (
         "[workspace write protection unavailable] OpenSquilla could not verify "
         f"write-protected workspace paths after {tool_name} because Git state is "

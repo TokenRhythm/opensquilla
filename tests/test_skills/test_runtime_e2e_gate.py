@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-import opensquilla.git_runtime as git_runtime
 from opensquilla.engine.types import AgentConfig, DoneEvent
 from opensquilla.git_runtime import (
     GitCapability,
@@ -107,8 +106,14 @@ async def test_runtime_e2e_context_returns_meta_error_when_git_unavailable(
     def forbidden_subprocess(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         raise AssertionError("unavailable Git must not launch a subprocess")
 
-    monkeypatch.setattr(git_runtime, "resolve_git_capability", unavailable_capability)
-    monkeypatch.setattr(git_runtime.subprocess, "run", forbidden_subprocess)
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.resolve_git_capability",
+        unavailable_capability,
+    )
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.subprocess.run",
+        forbidden_subprocess,
+    )
     ctx = make_runtime_e2e_context(
         provider=object(),
         base_config=AgentConfig(model_id="frontier/highest"),
