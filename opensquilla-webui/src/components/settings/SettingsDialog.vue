@@ -12,8 +12,8 @@
       >
       <div
         class="settings-body"
-        :inert="saveAllPending ? true : undefined"
-        :aria-busy="saveAllPending ? 'true' : undefined"
+        :inert="settingsInteractionLocked ? true : undefined"
+        :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <nav ref="railRef" class="settings-rail" role="tablist" :aria-label="t('settings.dialog.sections')" :aria-orientation="railOrientation">
           <template v-for="(s, i) in visibleSections" :key="s.id">
@@ -21,7 +21,7 @@
                  tab stop. Rendered when the group changes so each bin is headed
                  once. Hidden on the mobile horizontal strip. -->
             <span
-              v-if="i === 0 || s.group !== visibleSections[i - 1].group"
+              v-if="s.group && (i === 0 || s.group !== visibleSections[i - 1]?.group)"
               class="settings-rail__group"
               role="presentation"
               aria-hidden="true"
@@ -40,7 +40,7 @@
               <Icon :name="s.icon" :size="16" aria-hidden="true" />
               <span class="settings-rail__label">{{ t('settings.rail.' + s.id) }}</span>
               <span v-if="sectionDirty(s.id)" class="settings-rail__dirty" aria-hidden="true"></span>
-              <span v-if="!s.client && s.id === 'connection'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
+              <span v-if="s.id === 'gateway'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
               <span v-else-if="!s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
             </button>
           </template>
@@ -71,32 +71,56 @@
         >
           <fieldset
             class="settings-panel__interactions"
-            :disabled="saveAllPending"
-            :aria-busy="saveAllPending ? 'true' : undefined"
+            :disabled="settingsInteractionLocked"
+            :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           >
-          <!-- Connection renders regardless of load state: it is how you point
-               the UI at a reachable gateway when nothing has loaded yet. -->
-          <SetupConnectionPanel v-if="section === 'connection'" />
+          <!-- Gateway remains available even when config readiness cannot load,
+               because this is where users recover the connection/runtime. -->
+          <SettingsGatewayPanel
+            v-if="section === 'gateway'"
+            :is-desktop="isDesktop"
+          />
 
-          <!-- Runtime (desktop only) also renders regardless of load state: it
-               reports the owned gateway and offers logs/restart precisely for
-               when the gateway is down and config never loaded. -->
-          <DesktopRuntimePanel v-else-if="section === 'runtime' && isDesktop" />
-
-          <!-- Memory import is an action flow with its own RPC capability gate,
-               rather than a config-backed form. It remains usable even when
-               readiness catalog loading is unavailable. -->
-          <SettingsMemoryPanel v-else-if="section === 'memory'" />
-
-          <SandboxSettingsPanel v-else-if="section === 'sandbox'" />
+          <!-- Profile import is nested under Memory and owns its RPC gate. -->
+          <SettingsMemoryPanel v-else-if="section === 'profileImport'" />
 
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
           <DataMigrationPanel v-else-if="section === 'dataMigration'" />
 
-          <!-- Config-backed sections wait for readiness so their baselines are
-               final before any field can be edited. -->
+          <!-- Mixed pages render their local controls immediately and gate only
+               the config-backed rows on catalog readiness. -->
+          <SettingsGeneralPanel
+            v-else-if="section === 'general'"
+            :panel="behaviorPanel"
+            :loaded="loaded"
+            :is-desktop="isDesktop"
+            @update-auto-session-titles="setAutoSessionTitles"
+          />
+          <SettingsSecurityPrivacyPanel
+            v-else-if="section === 'securityPrivacy'"
+            :panel="privacyPanel"
+            :loaded="loaded"
+            :is-desktop="isDesktop"
+            @update-network-reporting-enabled="setNetworkReportingEnabled"
+          />
+          <SettingsMemoryOverviewPanel
+            v-else-if="section === 'memory'"
+            :auto-capture="memoryPanel.autoCapture"
+            :loaded="loaded"
+            @update-auto-capture="setMemoryAutoCapture"
+            @open-profile-import="openProfileImport"
+          />
+          <SettingsAppearancePanel v-else-if="section === 'interface'" />
+          <SettingsKeyboardPanel v-else-if="section === 'shortcuts'" />
+          <SettingsAdvancedPanel
+            v-else-if="section === 'advanced'"
+            @open-agent-configuration="openAgentConfiguration"
+            @open-data-maintenance="openDataMaintenance"
+          />
+
+          <!-- AI configuration pages wait for complete readiness baselines. -->
           <div v-else-if="!loaded" class="settings-loading" role="status">
             <LoadingSpinner />
             <strong>{{ t('settings.rail.' + section) }}</strong>
@@ -128,20 +152,10 @@
               @activate-provider="activateProvider"
               @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
-            <SetupBehaviorPanel
-              v-else-if="section === 'behavior'"
-              :panel="behaviorPanel"
-              @update-auto-session-titles="setAutoSessionTitles"
-            />
-            <SettingsPrivacyPanel
-              v-else-if="section === 'privacy'"
-              :panel="privacyPanel"
-              @update-disable-network-observability="setDisableNetworkObservability"
-              @update-memory-auto-capture="setMemoryAutoCapture"
-            />
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
+              :routing-mode-busy="modelStrategyRoutingBusy"
               @update-strategy="setModelStrategy"
               @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
@@ -170,13 +184,6 @@
               @use-image-recommendation="useImageRecommendation"
               @reset-capability="resetCapability"
             />
-            <SettingsAppearancePanel v-else-if="section === 'appearance'" />
-            <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
-            <SettingsAdvancedPanel
-              v-else-if="section === 'advanced'"
-              @open-agent-configuration="openAgentConfiguration"
-              @open-data-maintenance="openDataMaintenance"
-            />
           </template>
           </fieldset>
         </div>
@@ -186,23 +193,23 @@
       <div
         v-if="loaded && hasUnsavedChanges"
         class="settings-dirtybar"
-        :aria-busy="saveAllPending ? 'true' : undefined"
+        :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <span class="settings-dirtybar__pulse" aria-hidden="true"></span>
         <span class="settings-dirtybar__text" role="status" aria-live="polite" aria-atomic="true">
-          {{ saveAllPending ? t('settings.dialog.savingChanges') : dirtyBarText }}
+          {{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtyBarText }}
         </span>
         <span class="settings-dirtybar__spacer"></span>
-        <button type="button" class="btn" :disabled="saveAllPending" @click="discardChanges">
+        <button type="button" class="btn" :disabled="settingsInteractionLocked" @click="discardChanges">
           {{ dirtyDiscardLabel }}
         </button>
         <button
           type="button"
           class="btn btn--primary"
-          :disabled="saveAllPending"
-          :aria-busy="saveAllPending ? 'true' : undefined"
+          :disabled="settingsInteractionLocked"
+          :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           @click="saveDirtySections"
-        >{{ saveAllPending ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
+        >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
       </div>
 
       <footer class="settings-foot">
@@ -232,21 +239,24 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
-import SetupBehaviorPanel from '@/components/setup/SetupBehaviorPanel.vue'
-import SetupConnectionPanel from '@/components/settings/SetupConnectionPanel.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
-import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
-import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue'
-import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
+import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
+import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
+import SettingsSecurityPrivacyPanel from '@/components/settings/SettingsSecurityPrivacyPanel.vue'
+import SettingsMemoryOverviewPanel from '@/components/settings/SettingsMemoryOverviewPanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
-import { parseProviderHash, sectionFromRouteParam } from '@/composables/setup/useSettingsSection'
+import {
+  parseProviderHash,
+  sectionFromRouteParam,
+  settingsSectionAliasFor,
+} from '@/composables/setup/useSettingsSection'
 import { useConfirm } from '@/composables/useConfirm'
 import { usePlatform } from '@/platform'
 import '@/styles/settings-forms.css'
@@ -254,10 +264,10 @@ import '@/styles/settings-forms.css'
 const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
-const { confirm, confirmState } = useConfirm()
+const { confirmChoice, confirmState } = useConfirm()
 
-// Desktop owns a local gateway, so it exposes a Runtime section the web build
-// hides. `desktopOnly` sections are filtered out everywhere else.
+// The catalog retains the desktopOnly capability for future destinations. The
+// consolidated rail currently shares all ten destinations across surfaces.
 const isDesktop = usePlatform().capabilities.isDesktop
 const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop))
 
@@ -268,6 +278,7 @@ const {
   providerPanel,
   behaviorPanel,
   privacyPanel,
+  memoryPanel,
   modelStrategyPanel,
   presetPanel,
   capabilitiesPanel,
@@ -280,6 +291,7 @@ const {
   hasUnsavedChanges,
   saveAllPending,
   providerSavePending,
+  modelStrategyRoutingBusy,
   saveDirtySections,
   discardChanges,
   selectProvider,
@@ -287,7 +299,7 @@ const {
   requestAddProvider,
   cancelProviderEdit,
   setAutoSessionTitles,
-  setDisableNetworkObservability,
+  setNetworkReportingEnabled,
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,
   setModelStrategy,
@@ -331,13 +343,16 @@ const {
 // the parent selected while its nested route is open so the rail communicates
 // hierarchy without advertising migration during normal Settings use.
 const activeRailSection = computed(() => (
-  section.value === 'dataMigration' ? 'advanced' : section.value
+  section.value === 'dataMigration'
+    ? 'advanced'
+    : section.value === 'profileImport' ? 'memory' : section.value
 ))
 
 const modalRef = ref<HTMLElement | null>(null)
 const railRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
+const closeSavePending = ref(false)
 
 // Keep the active section's rail tab in view — on mobile the rail scrolls
 // horizontally, so a deep-linked or later section would otherwise sit off-screen.
@@ -414,7 +429,13 @@ const hasSettingsExitDraft = computed(() => (
   hasUnsavedChanges.value || providerDraftDirty.value
 ))
 const hasPendingSettingsWrite = computed(() => (
-  saveAllPending.value || providerSavePending.value
+  saveAllPending.value
+  || providerSavePending.value
+  || modelStrategyRoutingBusy.value
+  || closeSavePending.value
+))
+const settingsInteractionLocked = computed(() => (
+  saveAllPending.value || closeSavePending.value
 ))
 const shouldGuardBrowserUnload = computed(() => (
   hasSettingsExitDraft.value || hasPendingSettingsWrite.value
@@ -455,6 +476,13 @@ const routeParam = computed(() => route.params.section)
 // readiness is known; it is a routing sentinel, never a real rail section.
 const wantsAutoSection = computed(() => routeParam.value === 'auto')
 
+const COMPOSITE_HASH_TARGETS: Record<string, string> = {
+  '#connection': 'settings-gateway-connection',
+  '#runtime': 'settings-gateway-runtime',
+  '#privacy': 'settings-security-privacy',
+  '#sandbox': 'settings-security-sandbox',
+}
+
 // Reflect the active section in the URL with replace (not push) so the browser
 // Back button exits Settings in one step rather than walking section history.
 // Only replace when the section actually changes — an unconditional replace on
@@ -468,23 +496,42 @@ function selectSection(id: string) {
   }
 }
 
-// Resolve the section the route is asking for. Connection works before config
-// loads; the auto sentinel waits for readiness; everything else maps the param
-// (or the default) straight through.
+// Resolve aliases and nested destinations. Old URLs are canonicalized with a
+// subsection hash so bookmarks keep landing on their original content.
 function applyRouteSection() {
   if (wantsAutoSection.value) {
     if (loaded.value && !userNavigated) selectInitialSection('auto')
     return
   }
   const resolved = sectionFromRouteParam(routeParam.value)
-  if (resolved === 'dataMigration') {
+  const alias = settingsSectionAliasFor(routeParam.value)
+  if (alias) {
+    void router.replace({
+      path: `/settings/${alias.section}`,
+      hash: route.hash || alias.hash || '',
+    })
+  }
+  if (resolved === 'dataMigration' || resolved === 'profileImport') {
     setSection(resolved)
     return
   }
-  // A desktopOnly section requested where it is unavailable (e.g. a stale
-  // /settings/runtime deep link on web) has no rail entry or panel branch; fall
-  // back to the default so the dialog never renders an empty body.
+  // A future surface-specific destination requested where unavailable has no
+  // rail entry or panel branch; fall back so the dialog never renders empty.
   setSection(visibleSections.value.some(s => s.id === resolved) ? resolved : 'provider')
+}
+
+function focusCompositeHash(): boolean {
+  const targetId = COMPOSITE_HASH_TARGETS[route.hash]
+  if (!targetId) return false
+  const target = document.getElementById(targetId)
+  if (!target) return false
+  target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })
+  target.focus({ preventScroll: true })
+  return true
+}
+
+function applyCompositeHash() {
+  void nextTick(() => { focusCompositeHash() })
 }
 
 // `#provider-<id>` deep links land on the Provider section with that provider
@@ -608,21 +655,53 @@ async function openDataMaintenance() {
   panelRef.value?.querySelector<HTMLElement>('[data-testid="data-migration-heading"]')?.focus()
 }
 
-// One discard prompt shared by every exit path: requestClose (Escape, the
-// close button, backdrop click) and the history-back leave guard below.
-function confirmDiscard(): Promise<boolean> {
-  return confirm({
+async function openProfileImport() {
+  selectSection('profileImport')
+  await nextTick()
+  panelRef.value?.querySelector<HTMLElement>('[data-testid="memory-import-heading"]')?.focus()
+}
+
+// One exit prompt shared by every exit path: requestClose (Escape, the close
+// button, backdrop click) and the history-back leave guard below. Saving is
+// the primary action; discarding remains explicit and destructive.
+function confirmExitChanges() {
+  return confirmChoice({
     title: t('settings.dialog.discardTitle'),
     body: t('settings.dialog.discardBody'),
-    primaryLabel: t('settings.dialog.discardConfirmPrimary'),
-    primaryClass: 'btn--danger',
+    primaryLabel: t('settings.dialog.saveAndClose'),
+    primaryClass: 'btn--primary',
+    secondaryLabel: t('settings.dialog.discardConfirmPrimary'),
+    secondaryClass: 'btn--danger',
+    showCancel: false,
   })
 }
 
-// Closes unless a section carries unsaved edits and the user keeps them.
+// Save every kind of Settings draft before allowing an exit. Provider drafts
+// have their own save path, while the remaining sections share the dirty bar.
+// If validation or a request fails, their dirty state remains and the dialog
+// stays open for correction.
+async function saveExitChanges(): Promise<boolean> {
+  if (closeSavePending.value || hasPendingSettingsWrite.value) return false
+  closeSavePending.value = true
+  try {
+    if (providerDraftDirty.value && !(await saveProvider())) return false
+    if (hasUnsavedChanges.value) await saveDirtySections()
+    await nextTick()
+    return !hasSettingsExitDraft.value
+  } finally {
+    closeSavePending.value = false
+  }
+}
+
+// Closes unless a section carries unsaved edits and the user chooses to keep
+// them, save them, or discard them.
 async function requestClose(event?: MouseEvent): Promise<boolean> {
   if (hasPendingSettingsWrite.value) return false
-  if (hasSettingsExitDraft.value && !(await confirmDiscard())) return false
+  if (hasSettingsExitDraft.value) {
+    const choice = await confirmExitChanges()
+    if (choice === 'cancel') return false
+    if (choice === 'primary' && !(await saveExitChanges())) return false
+  }
   // Keyboard-generated click events have detail 0; real pointer clicks have a
   // positive click count. Preserve focus restoration for keyboard activation.
   closeOverlay(!event || event.detail === 0)
@@ -632,8 +711,8 @@ async function requestClose(event?: MouseEvent): Promise<boolean> {
 // History traversal (browser Back, a trackpad back-swipe) pops the /settings
 // route and unmounts the overlay without passing through requestClose, which
 // would silently drop unsaved edits. This router-level guard runs the same
-// discard prompt for any navigation that leaves /settings while the dialog is
-// mounted; cancelling restores the URL. Registered on the router rather than
+// save/discard prompt for any navigation that leaves /settings while the dialog
+// is mounted; cancelling restores the URL. Registered on the router rather than
 // via onBeforeRouteLeave because selectSection's replace swaps the matched
 // record between `settings` and `settings-section` while the viewKey-keyed
 // component instance survives — a component guard would stay bound to the
@@ -646,7 +725,10 @@ const removeLeaveGuard = router.beforeEach(async (to) => {
   // requestClose already has the prompt up — hold this navigation instead of
   // stacking a second prompt (useConfirm cancels a pending request).
   if (confirmState.value) return false
-  return confirmDiscard()
+  const choice = await confirmExitChanges()
+  if (choice === 'cancel') return false
+  if (choice === 'primary') return saveExitChanges()
+  return true
 })
 
 function onDocumentKeydown(event: KeyboardEvent) {
@@ -690,7 +772,10 @@ watch(routeParam, () => applyRouteSection())
 // A provider deep-link hash can arrive (or change) after mount. (Legacy
 // #channel- hashes never reach this dialog: a router guard rewrites them to
 // the /channels workspace before the settings route resolves.)
-watch(() => route.hash, () => { applyProviderHash() })
+watch(() => route.hash, () => {
+  applyProviderHash()
+  applyCompositeHash()
+})
 
 // Whenever the active section changes (rail click, deep link, Back), bring its
 // tab into view on the horizontally-scrolling mobile rail.
@@ -698,6 +783,7 @@ watch(section, () => {
   scrollActiveTabIntoView()
   resetActivePanelScroll()
   applyProviderHash()
+  applyCompositeHash()
 })
 
 // The auto deep link lands on its readiness-derived section once config is
@@ -705,7 +791,10 @@ watch(section, () => {
 watch(loaded, (isLoaded) => {
   if (isLoaded && wantsAutoSection.value && !userNavigated) selectInitialSection('auto')
   // Catalog data is required to validate a provider hash, so (re)try now.
-  if (isLoaded) { applyProviderHash() }
+  if (isLoaded) {
+    applyProviderHash()
+    applyCompositeHash()
+  }
 })
 
 onMounted(() => {
@@ -721,7 +810,9 @@ onMounted(() => {
   document.addEventListener('keydown', onDocumentKeydown)
   mq = window.matchMedia('(max-width: 768px)')
   mq.addEventListener('change', onViewportChange)
-  nextTick(() => closeBtn.value?.focus())
+  nextTick(() => {
+    if (!focusCompositeHash()) closeBtn.value?.focus()
+  })
 })
 
 onUnmounted(() => {

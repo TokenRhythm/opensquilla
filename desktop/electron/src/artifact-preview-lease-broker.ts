@@ -65,10 +65,12 @@ export interface ArtifactPreviewSurfaceGrant {
 }
 
 interface IssuedArtifactPreview {
+  artifactId: string
   gatewayOrigin: string
   launchUrl: string
   expectedOrigin: string
   scopeId: string
+  authToken?: string
   mode: ArtifactPreviewLeaseMode
   expiresAtMs: number
 }
@@ -343,6 +345,7 @@ export class ArtifactPreviewLeaseBroker {
   private readonly now: () => number
   private readonly timeoutMs: number
   private readonly issued = new Map<string, IssuedArtifactPreview>()
+  private generation = 0
 
   constructor(private readonly options: ArtifactPreviewLeaseBrokerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch
@@ -351,12 +354,41 @@ export class ArtifactPreviewLeaseBroker {
   }
 
   clear(): void {
+    this.generation += 1
     this.issued.clear()
+  }
+
+  /**
+   * Revoke every lease owned by the current renderer generation.
+   *
+   * Local authority is removed synchronously before any network request. The
+   * snapshot also keeps leases created by a replacement renderer out of this
+   * cleanup, even while the old Gateway DELETE requests are still pending.
+   */
+  async revokeAll(): Promise<void> {
+    this.generation += 1
+    const issued = [...this.issued.entries()]
+    this.issued.clear()
+    await Promise.allSettled(issued.map(([leaseId, lease]) => {
+      if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== lease.gatewayOrigin) {
+        return Promise.resolve()
+      }
+      return this.request(
+        new URL(
+          `/api/v1/artifact-preview-leases/${encodeURIComponent(leaseId)}`,
+          lease.gatewayOrigin,
+        ),
+        'DELETE',
+        lease.scopeId,
+        lease.authToken,
+      )
+    }))
   }
 
   async create(
     value: unknown,
   ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
+    const generation = this.generation
     let request: ArtifactPreviewLeaseCreateRequest
     try {
       request = parseArtifactPreviewLeaseCreateRequest(value)
@@ -392,14 +424,37 @@ export class ArtifactPreviewLeaseBroker {
     }
     try {
       const parsed = parseLeasePayload(response.payload, request.mode)
+      if (
+        generation !== this.generation
+        || parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== gatewayOrigin
+      ) {
+        if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) === gatewayOrigin) {
+          await this.request(
+            new URL(
+              `/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`,
+              gatewayOrigin,
+            ),
+            'DELETE',
+            request.scopeId,
+            request.authToken,
+          )
+        }
+        return failure(
+          409,
+          'PREVIEW_LEASE_RETIRED',
+          'The Desktop preview request was retired.',
+        )
+      }
       if (parsed.expiresAtMs <= this.now()) {
         return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an expired preview lease.')
       }
       this.issued.set(parsed.payload.lease_id, {
+        artifactId: request.artifactId,
         gatewayOrigin,
         launchUrl: parsed.payload.launch_url,
         expectedOrigin: parsed.payload.preview_origin,
         scopeId: request.scopeId,
+        authToken: request.authToken,
         mode: parsed.payload.effective_mode,
         expiresAtMs: parsed.expiresAtMs,
       })
@@ -494,8 +549,17 @@ export class ArtifactPreviewLeaseBroker {
   }
 
   authorizesSurface(grant: ArtifactPreviewSurfaceGrant): boolean {
+    return this.resolveSurfaceArtifactId(grant) !== null
+  }
+
+  /**
+   * Resolve the immutable artifact identity attached to an exact lease grant.
+   * The renderer never supplies this value to the surface contract: Desktop
+   * derives it only from the authenticated lease issuance it performed.
+   */
+  resolveSurfaceArtifactId(grant: ArtifactPreviewSurfaceGrant): string | null {
     const gatewayOrigin = parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())
-    if (!gatewayOrigin) return false
+    if (!gatewayOrigin) return null
     for (const [leaseId, issued] of this.issued) {
       if (
         issued.expiresAtMs <= this.now()
@@ -509,9 +573,9 @@ export class ArtifactPreviewLeaseBroker {
         && issued.expectedOrigin === grant.expectedOrigin
         && issued.scopeId === grant.scopeId
         && issued.mode === grant.mode
-      ) return true
+      ) return issued.artifactId
     }
-    return false
+    return null
   }
 
   private currentIssuedLease(

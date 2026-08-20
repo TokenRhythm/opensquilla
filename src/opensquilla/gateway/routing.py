@@ -41,6 +41,7 @@ class SourceKind(StrEnum):
 
 
 PRINCIPAL_HOST_EXECUTE_METADATA_KEY = "principal_host_execute"
+_ARTIFACT_MUTATION_WRITER_NAMES = frozenset({"document_apply", "document_patch"})
 
 
 @dataclass(frozen=True)
@@ -588,6 +589,83 @@ def tool_context_from_envelope(
         sandbox_mounts = _filtered_legacy_sandbox_mounts(
             envelope.metadata.get("sandbox_mounts")
         )
+    artifact_context = envelope.runtime_services.get("artifact_context")
+    artifact_session = envelope.runtime_services.get("artifact_session")
+    desktop_artifact_bridge = envelope.runtime_services.get("desktop_artifact_bridge")
+    artifact_event_emitter = envelope.runtime_services.get("artifact_event_emitter")
+    generated_artifact_adopter = envelope.runtime_services.get(
+        "generated_artifact_adopter"
+    )
+    artifact_tool_names: object = getattr(artifact_context, "tool_names", frozenset())
+    surfaced_tools: set[str] | None = None
+    exclusive_tools: frozenset[str] | None = None
+    artifact_mutation_attempt_controller: Any | None = None
+    from opensquilla.gateway.artifact_contexts import (
+        DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY,
+        BoundDocumentContext,
+        BoundPromptAnnotationContext,
+    )
+
+    if (
+        isinstance(artifact_context, (BoundDocumentContext, BoundPromptAnnotationContext))
+        and artifact_session is not None
+        and caller_kind is CallerKind.WEB
+        and interaction_mode is InteractionMode.INTERACTIVE
+        and is_owner
+        and not guest_safe
+        and isinstance(artifact_tool_names, frozenset)
+    ):
+        surfaced_tools = set(artifact_tool_names)
+        if isinstance(artifact_context, BoundPromptAnnotationContext):
+            exclusive_tools = frozenset(artifact_tool_names)
+            allowed_tools = (
+                set(exclusive_tools)
+                if allowed_tools is None
+                else set(allowed_tools) & exclusive_tools
+            )
+        elif isinstance(artifact_context, BoundDocumentContext):
+            # A workspace file is not the bound Document. Keep ordinary read/search and
+            # authoring capabilities additive, but fail closed on the three direct source
+            # mutators that models commonly mistake for a Document update.
+            denied_tools.update(DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY)
+        if _ARTIFACT_MUTATION_WRITER_NAMES & artifact_tool_names:
+            task_id = str(envelope.metadata.get("task_id") or "").strip()
+            document_id = str(getattr(artifact_context, "document_id", "") or "").strip()
+            revision_id = str(getattr(artifact_context, "revision_id", "") or "").strip()
+            if task_id and document_id and revision_id:
+                from opensquilla.artifact_session import (
+                    ArtifactMutationAttemptController,
+                    ArtifactSessionService,
+                )
+
+                if isinstance(artifact_session, ArtifactSessionService):
+                    artifact_mutation_attempt_controller = ArtifactMutationAttemptController(
+                        artifact_session,
+                        document_id=document_id,
+                        base_revision_id=revision_id,
+                        turn_id=task_id,
+                    )
+    else:
+        artifact_event_emitter = None
+        desktop_artifact_bridge = None
+    if not callable(artifact_event_emitter):
+        artifact_event_emitter = None
+    if not (
+        callable(generated_artifact_adopter)
+        and caller_kind is CallerKind.WEB
+        and envelope.source_kind is SourceKind.WEB
+        and interaction_mode is InteractionMode.INTERACTIVE
+        and is_owner
+        and not guest_safe
+    ):
+        generated_artifact_adopter = None
+    if desktop_artifact_bridge is not None:
+        from opensquilla.gateway.desktop_artifact_bridge import (
+            DesktopArtifactBridgeClient,
+        )
+
+        if not isinstance(desktop_artifact_bridge, DesktopArtifactBridgeClient):
+            desktop_artifact_bridge = None
     ctx = ToolContext(
         is_owner=is_owner,
         channel_admin_verified=channel_admin_verified,
@@ -617,6 +695,7 @@ def tool_context_from_envelope(
         source_name=source_name,
         allowed_tools=allowed_tools,
         denied_tools=denied_tools,
+        surfaced_tools=surfaced_tools,
         elevated=elevated,
         tool_policy=(
             envelope.metadata.get("tool_policy") if cron_trusted else None
@@ -649,6 +728,15 @@ def tool_context_from_envelope(
         plan_run=envelope.runtime_services.get("plan_run"),
         goal_context=envelope.runtime_services.get("goal_context"),
         goal_service=envelope.runtime_services.get("goal_service"),
+        artifact_context=artifact_context,
+        artifact_session=artifact_session,
+        desktop_artifact_bridge=desktop_artifact_bridge,
+        artifact_event_emitter=artifact_event_emitter,
+        generated_artifact_adopter=generated_artifact_adopter,
+        exclusive_tools=exclusive_tools,
+        artifact_mutation_attempt_controller=(
+            artifact_mutation_attempt_controller
+        ),
     )
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,

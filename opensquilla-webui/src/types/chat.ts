@@ -1,5 +1,6 @@
 import type { ArtifactPayload } from './rpc'
 import type { SessionSteerV2Params } from './rpc'
+import type { PromptAnnotationSnapshot } from './promptAnnotations'
 import type { IconName } from '@/utils/icons'
 
 export interface Attachment {
@@ -34,6 +35,8 @@ export interface DisplayAttachment {
   localFile?: File
   download_url?: string
   sha256_ref?: string
+  /** Session-scoped opaque identity for Workbench preview/import actions. */
+  attachmentId?: string
 }
 
 /**
@@ -205,12 +208,14 @@ export interface ChatToolCallGroup {
   status: '' | 'success' | 'error'
 }
 
+export type ChatTextPresentation = 'intermediate' | 'answer'
+
 export interface ChatStreamSegment {
   type: 'text' | 'tool-group' | 'interrupt'
   raw?: string
   html?: string
   dirty?: boolean
-  presentation?: 'intermediate' | 'answer'
+  presentation?: ChatTextPresentation
   groupId?: string
   operationKey?: string
   approvalId?: string
@@ -222,7 +227,7 @@ export type ChatStreamTimelineItem =
       key: string
       html: string
       rawText?: string
-      presentation?: 'intermediate' | 'answer'
+      presentation?: ChatTextPresentation
     }
   | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
   | {
@@ -258,6 +263,39 @@ export interface ChatSteerCapability {
   reason?: string
 }
 
+export type DocumentMutationStatus =
+  | 'not_attempted'
+  | 'applied'
+  | 'not_applied'
+  | 'conflict'
+  | 'ambiguous'
+
+export type DocumentMutationPhase = 'proposal' | 'commit'
+
+export type DocumentMutationRetryPolicy =
+  | 'same_turn'
+  | 'new_turn'
+  | 'refresh'
+  | 'reconcile'
+  | 'never'
+
+/**
+ * Authoritative document-side effect receipt projected onto one completed turn.
+ * Assistant prose and generic task completion never participate in this state.
+ */
+export interface DocumentMutationOutcome {
+  version: number
+  status: DocumentMutationStatus
+  phase?: DocumentMutationPhase
+  code?: string
+  retryPolicy?: DocumentMutationRetryPolicy
+  attemptId?: string
+  changeSetId?: string
+  resultRevisionId?: string
+  proposalAttempts?: number
+  corrected?: boolean
+}
+
 export interface ChatTurnOutcome {
   turnId: string
   taskId?: string
@@ -268,6 +306,7 @@ export interface ChatTurnOutcome {
   startedAt?: number | string
   finishedAt?: number | string
   retryable?: boolean
+  documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
   terminalMessage?: string
   retryAfterMs?: number
@@ -276,10 +315,13 @@ export interface ChatTurnOutcome {
   noPriorProviderDispatch?: boolean
   replaySafe?: boolean
   userMessageId?: string
+  acceptedRoutingMode?: 'direct' | 'router' | 'ensemble'
 }
 
 export interface ChatRunTask {
   status?: string
+  cancel_requested?: boolean
+  cancelRequested?: boolean
   task_id?: string
   taskId?: string
   started_at?: number | string
@@ -296,6 +338,8 @@ export interface ChatRunTask {
   steerCapability?: ChatSteerCapability
   turn_outcome?: Record<string, unknown>
   turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
 }
 
 export interface ChatRunStatus {
@@ -332,12 +376,14 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   execution_status?: { status?: string }
   groupId?: string
   group_id?: string
+  presentation?: ChatTextPresentation
 }
 
 export interface ChatTimelineSegment extends Record<string, unknown> {
   type?: string
   raw?: string
   text?: string
+  presentation?: ChatTextPresentation
   groupId?: string
   group_id?: string
   approvalId?: string
@@ -383,6 +429,11 @@ export interface ChatUsagePayload {
   routePlan?: Record<string, unknown>
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
+  /** Physical provider call whose visible output owns the route card. */
+  router_model_call_id?: string
+  routerModelCallId?: string
+  router_iteration?: number
+  routerIteration?: number
   /** Per-turn ledger coverage. Older gateways omit these additive fields. */
   coverage_status?: string
   coverageStatus?: string
@@ -506,11 +557,16 @@ export interface ChatMessage {
   /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
   reasoningPresentationPending?: boolean
   routerDecision?: import('./rpc').RouterDecisionPayload | null
+  /** Routing-only usage projection for a split historical answer segment. */
+  routerUsage?: ChatUsagePayload
+  routerModelCallId?: string
+  routerIteration?: number
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timeline?: ChatTimelineSegment[]
   attachments?: DisplayAttachment[]
+  promptAnnotations?: PromptAnnotationSnapshot[]
   provenanceKind?: string
   provenanceSourceSessionKey?: string
   provenanceSourceTool?: string
@@ -607,10 +663,10 @@ export interface ChatRenderedMessage {
   isStreaming?: boolean
   messageId?: string
   restoredFromHistory?: boolean
+  /** Durable server turn identity restored from transcript context once assigned. */
+  turnId?: string
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
-  /** Durable server turn identity restored from transcript turn_context. */
-  turnId?: string
   /** Internal-input provenance copied from the source ChatMessage. */
   turnInputMode?: string
   /** Runtime turn kind copied from the source ChatMessage. */
@@ -621,6 +677,7 @@ export interface ChatRenderedMessage {
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
+  promptAnnotations?: PromptAnnotationSnapshot[]
   /** Explicit placement for successful sessions_spawn cards. An empty array
    *  suppresses the source card after it is rehomed below the parent reply. */
   createdSessionLinks?: ChatCreatedSessionLink[]
@@ -643,9 +700,10 @@ export interface ChatRenderedMessage {
   daySeparator?: boolean
   dayLabel?: string
   isRouterStrip?: boolean
-  /** Stable per-turn render identity. Unlike the router event message id, this
-   *  does not change when a live strip is replaced by its settled trace. */
+  /** Stable per-card render identity; preserved during terminal reconciliation. */
   routerTurnKey?: string
+  routerModelCallId?: string
+  routerIteration?: number
   routerState?: string
   routerSource?: string
   routerObserve?: boolean

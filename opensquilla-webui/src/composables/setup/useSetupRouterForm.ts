@@ -133,6 +133,13 @@ interface RouterConfig {
 
 export type RouterBinding = 'follow_primary' | 'custom' | 'legacy'
 
+export interface RouterRoutingModeState {
+  mode: string
+  sharedSelectionMode: string
+  ensembleGloballyEnabled: boolean
+  providerRoleContextDirty: boolean
+}
+
 function normalizeRouterProviderRole(value: unknown): RouterTierProviderRole {
   const raw = String(
     value && typeof value === 'object'
@@ -530,6 +537,40 @@ export function useSetupRouterForm() {
     routerMode.value = value
   }
 
+  function captureRoutingModeState(): RouterRoutingModeState {
+    return {
+      mode: routerMode.value,
+      sharedSelectionMode: sharedSelectionMode.value,
+      ensembleGloballyEnabled: ensembleGloballyEnabled.value,
+      providerRoleContextDirty: providerRoleContextDirty.value,
+    }
+  }
+
+  function restoreRoutingModeState(state: RouterRoutingModeState) {
+    routerMode.value = state.mode
+    sharedSelectionMode.value = state.sharedSelectionMode
+    ensembleGloballyEnabled.value = state.ensembleGloballyEnabled
+    providerRoleContextDirty.value = state.providerRoleContextDirty
+  }
+
+  /**
+   * The global direct/router/ensemble selector is persisted by
+   * `models.routing.set`. Keep that acknowledged mode out of this form's
+   * detailed-routing dirty state while retaining any unsaved tier edits.
+   */
+  function acceptRoutingModeChange() {
+    try {
+      const baseline = JSON.parse(routerBaseline.value) as Record<string, unknown>
+      baseline.m = routerMode.value
+      routerBaseline.value = JSON.stringify(baseline)
+    } catch {
+      // The baseline is internal JSON produced immediately above. This
+      // fallback is defensive for corrupted devtools state and favors a
+      // coherent form over repeatedly submitting an already-accepted mode.
+      routerBaseline.value = routerSerialized.value
+    }
+  }
+
   function enableFromSavedBinding() {
     routerMode.value = savedBinding.value === 'follow_primary' ? 'recommended' : 'custom'
   }
@@ -614,6 +655,9 @@ export function useSetupRouterForm() {
     refreshRuntimeMetadata,
     initFromConfig,
     setRouterMode,
+    captureRoutingModeState,
+    restoreRoutingModeState,
+    acceptRoutingModeChange,
     enableFromSavedBinding,
     setRouterDefaultTier,
     setRouterVisualMode,

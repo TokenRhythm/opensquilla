@@ -2615,6 +2615,91 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     assert [entry.content for entry in transcript] == original_contents[-len(transcript) :]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_protected_recent_messages"),
+    [
+        pytest.param(
+            CompactionConfig(protected_recent_messages=1),
+            2,
+            id="explicit-protection",
+        ),
+        pytest.param(
+            CompactionConfig(compaction_profile="coding"),
+            12,
+            id="profile-protection",
+        ),
+    ],
+)
+async def test_compact_with_result_recomputes_bound_to_tail_protection(
+    manager,
+    monkeypatch,
+    config,
+    expected_protected_recent_messages,
+):
+    node = await manager.create("agent:main:protected-boundary")
+    await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    await manager.append_message(node.session_key, "user", "queued request")
+    observed: dict[str, Any] = {}
+
+    async def compact_context_spy(request):
+        observed["protected_recent_messages"] = request.config.protected_recent_messages
+        return CompactionResult(
+            summary="",
+            kept_entries=request.entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+        )
+
+    monkeypatch.setattr(session_manager_module, "compact_context", compact_context_spy)
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1_000,
+        config=config,
+        protected_boundary_message_id=active_user.message_id,
+    )
+
+    assert result.removed_count == 0
+    assert observed["protected_recent_messages"] == expected_protected_recent_messages
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_missing_protected_boundary_fails_closed(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:missing-protected-boundary")
+    entry = await manager.append_message(node.session_key, "user", "active request")
+
+    async def unexpected_compact_context(request):  # noqa: ARG001
+        raise AssertionError("compaction must not run without the protected boundary")
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "compact_context",
+        unexpected_compact_context,
+    )
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1_000,
+        protected_boundary_message_id="missing-message-id",
+    )
+
+    assert result.summary == ""
+    assert result.removed_count == 0
+    assert result.skip_reason == "protected_boundary_missing"
+    transcript = await manager.get_transcript(node.session_key)
+    assert [candidate.message_id for candidate in transcript] == [entry.message_id]
+    current = await manager.get_session(node.session_key)
+    assert current is not None
+    assert current.compaction_count == 0
+
+
 def test_compaction_singleflight_target_fingerprint_is_credential_aware():
     first = CompactionConfig(provider="provider-a", model="model-a", api_key="secret-a")
     same_deployment_and_credentials = CompactionConfig(
@@ -3577,6 +3662,29 @@ async def test_persist_compaction_result_preserves_structured_tail_metadata(mana
     assert transcript[0].reasoning_content == "signed reasoning"
     assert transcript[1].tool_call_id == "tool-live"
     assert transcript[1].content == "result"
+
+
+@pytest.mark.asyncio
+async def test_capture_compaction_source_uses_supplied_transcript_entries(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:capture-snapshot")
+    await manager.append_message(node.session_key, "user", "old question")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    transcript = await manager.get_transcript(node.session_key)
+    get_transcript = AsyncMock(side_effect=AssertionError("unexpected transcript reread"))
+    monkeypatch.setattr(manager, "get_transcript", get_transcript)
+
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+        transcript_entries=transcript,
+    )
+
+    get_transcript.assert_not_awaited()
+    assert source.entries == tuple(transcript)
+    assert source.boundary_message_id == active_user.message_id
 
 
 @pytest.mark.asyncio

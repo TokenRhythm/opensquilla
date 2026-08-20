@@ -24,11 +24,13 @@ async def _seed(
     updated_at: int = 1000,
 ) -> None:
     for index, key in enumerate(keys):
+        key_parts = key.split(":", 2)
+        agent_id = key_parts[1] if len(key_parts) == 3 and key_parts[0] == "agent" else "main"
         await storage.upsert_session(
             SessionNode(
                 session_key=key,
                 session_id=f"session-{index}-{key[-8:]}",
-                agent_id="main",
+                agent_id=agent_id,
                 status="idle",
                 created_at=updated_at,
                 updated_at=updated_at,
@@ -107,7 +109,11 @@ async def test_keyset_traversal_handles_concurrent_insert_and_delete(
 async def test_keyset_page_preserves_guest_owner_filter(storage: SessionStorage) -> None:
     owner_id = "a" * 64
     other_owner_id = "b" * 64
-    visible = [guest_owned_session_key(owner_id, f"visible-{index}") for index in range(3)]
+    visible = [
+        guest_owned_session_key(owner_id, "visible-main", agent_id="main"),
+        guest_owned_session_key(owner_id, "visible-research", agent_id="research"),
+        guest_owned_session_key(owner_id, "visible-ops", agent_id="ops"),
+    ]
     await _seed(
         storage,
         [

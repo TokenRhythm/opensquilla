@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import zipfile
@@ -24,6 +25,7 @@ from opensquilla.engine.turn_runner.attachment_stage import (
 )
 from opensquilla.gateway.input_normalization import normalize_incoming_text
 from opensquilla.provider.types import ContentBlockText
+from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -159,6 +161,39 @@ async def test_paste_txt_pdf_docx_and_multiple_files_share_capacity_floor() -> N
         assert paste_tokens * 0.9 <= routed_tokens <= paste_tokens * 1.1
 
 
+@pytest.mark.parametrize("attachment_kind", ["txt", "pdf", "docx"])
+@pytest.mark.asyncio
+async def test_stats_measure_exact_provider_visible_text_for_rendered_formats(
+    attachment_kind: str,
+) -> None:
+    material = "synthetic capacity content 0123456789\n" * 80
+    if attachment_kind == "txt":
+        attachment = _inline_attachment(material.encode(), "text/plain", "sample.txt")
+    elif attachment_kind == "pdf":
+        attachment = _inline_attachment(
+            _pdf_bytes(material),
+            "application/pdf",
+            "sample.pdf",
+        )
+    else:
+        attachment = _inline_attachment(
+            _docx_bytes(material),
+            DOCX_MIME,
+            "sample.docx",
+        )
+
+    output, _builder = await _materialize(attachment)
+    content = output.extra_messages[0].content
+    visible_blocks = [block for block in content[1:] if isinstance(block, ContentBlockText)]
+    visible_text = "".join(block.text for block in visible_blocks)
+
+    assert material.splitlines()[0] in visible_text
+    assert output.stats.provider_visible_text_chars == len(visible_text)
+    assert output.stats.estimated_tokens == sum(
+        estimate_attachment_text_tokens(block.text) for block in visible_blocks
+    )
+
+
 @pytest.mark.asyncio
 async def test_capacity_counts_prompt_and_attachment_once_and_rebind_does_not_parse() -> None:
     material = "z" * 120_000
@@ -181,7 +216,11 @@ async def test_capacity_counts_prompt_and_attachment_once_and_rebind_does_not_pa
         normalization_tokens=normalized.material_estimated_tokens,
         generated_normalization_tokens=output.stats.estimated_tokens,
     )
-    assert guarded_tokens < normalized.material_estimated_tokens * 1.1
+    # The provider-visible tokenizer estimate may conservatively exceed the
+    # ingress chars/4 hint (highly repetitive text is one such case). It is
+    # still counted once rather than added to the original paste estimate.
+    assert guarded_tokens >= normalized.material_estimated_tokens
+    assert guarded_tokens < output.stats.estimated_tokens * 1.1
 
     rebound = rebind_attachment_prompt(output.extra_messages, "new routed prompt")
     assert builder.calls == 1
@@ -240,9 +279,98 @@ async def test_generated_normalization_tokens_are_measured_separately() -> None:
 
 
 @pytest.mark.asyncio
+async def test_image_workspace_marker_does_not_shift_following_attachment_accounting(
+    tmp_path: Path,
+) -> None:
+    image = _inline_attachment(b"\x89PNG", "image/png", "pixel.png")
+    generated = _inline_attachment(b"g" * 40_000, "text/plain", "generated.txt")
+    generated["_generated_by"] = "input_normalization"
+    generated["source"] = "input_normalization"
+    generated["_provider_inline_policy"] = "preview_only"
+    builder = _RuntimeAttachmentBuilder()
+
+    output = (
+        await AttachmentStage(builder=builder).run(
+            AttachmentStageInput(
+                effective_runtime_message="preview",
+                attachments=[image, generated],
+                workspace_dir=tmp_path,
+                session_id="synthetic-session",
+                generated_normalization_attachment_count=1,
+            )
+        )
+    ).require_output()
+    text_blocks = [
+        block
+        for block in output.extra_messages[0].content[1:]
+        if isinstance(block, ContentBlockText)
+    ]
+    generated_block = text_blocks[-1]
+
+    assert output.stats.image_count == 1
+    assert output.stats.provider_visible_text_chars == sum(
+        len(block.text) for block in text_blocks
+    )
+    assert output.stats.generated_normalization_estimated_tokens == (
+        estimate_attachment_text_tokens(generated_block.text)
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_do_not_share_attachment_envelopes() -> None:
+    builder = _RuntimeAttachmentBuilder()
+    stage = AttachmentStage(builder=builder)
+    left_material = "left-only-" * 100
+    right_material = "right-only-" * 100
+
+    left, right = await asyncio.gather(
+        stage.run(
+            AttachmentStageInput(
+                effective_runtime_message="left prompt",
+                attachments=[
+                    _inline_attachment(
+                        left_material.encode(),
+                        "text/plain",
+                        "left.txt",
+                    )
+                ],
+                session_id="left-session",
+            )
+        ),
+        stage.run(
+            AttachmentStageInput(
+                effective_runtime_message="right prompt",
+                attachments=[
+                    _inline_attachment(
+                        right_material.encode(),
+                        "text/plain",
+                        "right.txt",
+                    )
+                ],
+                session_id="right-session",
+            )
+        ),
+    )
+    left_output = left.require_output()
+    right_output = right.require_output()
+
+    assert builder.calls == 2
+    assert left_material in str(left_output.extra_messages)
+    assert right_material not in str(left_output.extra_messages)
+    assert right_material in str(right_output.extra_messages)
+    assert left_material not in str(right_output.extra_messages)
+    rebind_attachment_prompt(left_output.extra_messages, "left rebound")
+    rebind_attachment_prompt(right_output.extra_messages, "right rebound")
+    assert builder.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_opaque_image_and_extreme_text_have_bounded_capacity() -> None:
     broken_pdf, _ = await _materialize(
         _inline_attachment(b"%PDF-1.4\nbroken", "application/pdf", "broken.pdf")
+    )
+    broken_docx, _ = await _materialize(
+        _inline_attachment(b"not-a-zip", DOCX_MIME, "broken.docx")
     )
     opaque, _ = await _materialize(
         _inline_attachment(b"\x00\x01" * 50_000, "application/octet-stream", "blob.bin")
@@ -257,6 +385,8 @@ async def test_failed_opaque_image_and_extreme_text_have_bounded_capacity() -> N
     assert broken_pdf.stats.parse_failure_count == 1
     assert broken_pdf.stats.estimated_tokens < 1_000
     assert large_context_min_tier(broken_pdf.stats.estimated_tokens, 200_000) is None
+    assert broken_docx.stats.parse_failure_count == 1
+    assert broken_docx.stats.estimated_tokens < 1_000
     assert opaque.stats.parse_failure_count == 0
     assert opaque.stats.estimated_tokens < 1_000
     assert large_context_min_tier(opaque.stats.estimated_tokens, 200_000) is None

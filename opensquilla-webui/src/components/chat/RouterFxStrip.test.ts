@@ -295,6 +295,55 @@ describe('RouterFxStrip model selection motion', () => {
 })
 
 describe('RouterFxStrip ensemble panel', () => {
+  it('shows every candidate as Proposer and the fuser as Aggregator', async () => {
+    const roles = ['primary', 'contrast', 'fast_check', 'critic', 'aggregator']
+    const { app, el } = await mountStrip(ensembleStrip({
+      routerSettled: true,
+      ensemble: {
+        profile: 'custom_b5',
+        modelCount: 4,
+        totalCandidates: 4,
+        requestCount: 5,
+        fallbackUsed: false,
+        fallbackReason: '',
+        costUsd: 0,
+        savedUsd: 0,
+        savedPct: 0,
+        models: roles.map((role, index) => ({
+          role,
+          label: role,
+          provider: 'tokenrhythm',
+          model: `model-${index + 1}`,
+          modelShort: `model-${index + 1}`,
+          input: 10,
+          output: 2,
+          costUsd: 0,
+          status: 'done' as const,
+        })),
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('[data-testid="router-ensemble-toggle"]')?.click()
+    await nextTick()
+
+    const displayedRoles = Array.from(
+      el.querySelectorAll<HTMLElement>('.router-fx-inspector__role'),
+      node => node.textContent?.trim(),
+    )
+    expect(displayedRoles).toEqual([
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Aggregator ·',
+    ])
+    expect(el.textContent).not.toContain('primary')
+    expect(el.textContent).not.toContain('contrast')
+    expect(el.textContent).not.toContain('fast_check')
+    expect(el.textContent).not.toContain('critic')
+    app.unmount()
+  })
+
   it('keeps an empty pending ensemble panel openable', async () => {
     const { app, el } = await mountStrip(ensembleStrip())
 

@@ -1,4 +1,11 @@
-import type { ChatRunTask, ChatTurnOutcome } from '@/types/chat'
+import type {
+  ChatRunTask,
+  ChatTurnOutcome,
+  DocumentMutationOutcome,
+  DocumentMutationPhase,
+  DocumentMutationRetryPolicy,
+  DocumentMutationStatus,
+} from '@/types/chat'
 import type { ChatHistoryTurnOutcome } from '@/types/rpc'
 import {
   isUsageAccountingBarrier,
@@ -14,6 +21,17 @@ function text(value: unknown): string {
 
 function bool(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined
+}
+
+function finiteInteger(value: unknown): number | undefined {
+  const numeric = Number(value)
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : undefined
+}
+
+function outcomeBody(raw: unknown): RawOutcomeRecord {
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as RawOutcomeRecord
+    : {}
 }
 
 type ConsistentField<T> = {
@@ -108,6 +126,64 @@ function firstTextValue(
   return ''
 }
 
+const DOCUMENT_MUTATION_STATUSES = new Set<DocumentMutationStatus>([
+  'not_attempted',
+  'applied',
+  'not_applied',
+  'conflict',
+  'ambiguous',
+])
+const DOCUMENT_MUTATION_PHASES = new Set<DocumentMutationPhase>(['proposal', 'commit'])
+const DOCUMENT_MUTATION_RETRY_POLICIES = new Set<DocumentMutationRetryPolicy>([
+  'same_turn',
+  'new_turn',
+  'refresh',
+  'reconcile',
+  'never',
+])
+
+function enumValue<T extends string>(value: unknown, accepted: ReadonlySet<T>): T | undefined {
+  const normalized = text(value) as T
+  return accepted.has(normalized) ? normalized : undefined
+}
+
+export function normalizeDocumentMutationOutcome(
+  raw: unknown,
+): DocumentMutationOutcome | undefined {
+  const record = outcomeBody(raw)
+  const status = enumValue(record.status, DOCUMENT_MUTATION_STATUSES)
+  if (!status) return undefined
+  const phase = enumValue(
+    record.phase ?? record.failure_phase ?? record.failurePhase,
+    DOCUMENT_MUTATION_PHASES,
+  )
+  const retryPolicy = enumValue(
+    record.retry_policy ?? record.retryPolicy,
+    DOCUMENT_MUTATION_RETRY_POLICIES,
+  )
+  const version = finiteInteger(record.version ?? record.schema_version ?? record.schemaVersion) ?? 1
+  const code = text(record.code ?? record.failure_code ?? record.failureCode)
+  const attemptId = text(record.attempt_id ?? record.attemptId)
+  const changeSetId = text(record.change_set_id ?? record.changeSetId)
+  const resultRevisionId = text(
+    record.result_revision_id ?? record.resultRevisionId ?? record.revision_id ?? record.revisionId,
+  )
+  const proposalAttempts = finiteInteger(record.proposal_attempts ?? record.proposalAttempts)
+  const corrected = bool(record.corrected)
+  return {
+    version,
+    status,
+    ...(phase ? { phase } : {}),
+    ...(code ? { code } : {}),
+    ...(retryPolicy ? { retryPolicy } : {}),
+    ...(attemptId ? { attemptId } : {}),
+    ...(changeSetId ? { changeSetId } : {}),
+    ...(resultRevisionId ? { resultRevisionId } : {}),
+    ...(proposalAttempts !== undefined ? { proposalAttempts } : {}),
+    ...(corrected !== undefined ? { corrected } : {}),
+  }
+}
+
 function timestampMilliseconds(value: number | string | undefined): number {
   if (value == null) return Number.NaN
   const numeric = typeof value === 'number' ? value : Number(value)
@@ -143,6 +219,16 @@ export function normalizeTurnOutcome(
   const startedAt = record.started_at ?? record.startedAt ?? nested.started_at ?? nested.startedAt
   const finishedAt = record.finished_at ?? record.finishedAt ?? nested.finished_at ?? nested.finishedAt
   const retryable = bool(record.retryable ?? nested.retryable)
+  const documentMutationOutcome = normalizeDocumentMutationOutcome(
+    record.document_mutation_outcome
+    ?? record.documentMutationOutcome
+    ?? record.document_mutation
+    ?? record.documentMutation
+    ?? nested.document_mutation_outcome
+    ?? nested.documentMutationOutcome
+    ?? nested.document_mutation
+    ?? nested.documentMutation,
+  )
   const noPriorState = fieldStateAcross(
     sources,
     ['no_prior_provider_dispatch', 'noPriorProviderDispatch'],
@@ -228,6 +314,19 @@ export function normalizeTurnOutcome(
       ?? nested.activity_snapshot ?? nested.activitySnapshot,
     turnId,
   )
+  const acceptedRoutingModeRaw = text(
+    record.accepted_routing_mode
+    ?? record.acceptedRoutingMode
+    ?? nested.accepted_routing_mode
+    ?? nested.acceptedRoutingMode,
+  ).toLowerCase()
+  const acceptedRoutingMode = (
+    acceptedRoutingModeRaw === 'direct'
+    || acceptedRoutingModeRaw === 'router'
+    || acceptedRoutingModeRaw === 'ensemble'
+  )
+    ? acceptedRoutingModeRaw
+    : undefined
   return {
     turnId,
     ...(taskId ? { taskId } : {}),
@@ -238,6 +337,7 @@ export function normalizeTurnOutcome(
     ...(startedAt != null ? { startedAt: startedAt as string | number } : {}),
     ...(finishedAt != null ? { finishedAt: finishedAt as string | number } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
+    ...(documentMutationOutcome ? { documentMutationOutcome } : {}),
     ...(hasUsageReplayProof
       ? { noPriorProviderDispatch: provedNoPriorProviderDispatch }
       : {}),
@@ -250,6 +350,7 @@ export function normalizeTurnOutcome(
     ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterMs: retryAfter } : {}),
     ...(usageCallIndex !== undefined ? { usageCallIndex } : {}),
     ...(statusHistory.length ? { statusHistory } : {}),
+    ...(acceptedRoutingMode ? { acceptedRoutingMode } : {}),
   }
 }
 

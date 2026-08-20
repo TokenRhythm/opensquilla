@@ -705,13 +705,17 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
     assert res.config.llm_ensemble.selection_mode == "router_dynamic"
     assert res.config.llm_ensemble.model_options == ["legacy/model"]
     assert res.config.llm_ensemble.min_successful_proposers == 2
+    # An omitted role canonicalizes to "proposer": the two-role contract in
+    # router_tiers.ENSEMBLE_CANDIDATE_ROLES has no unassigned member, and the
+    # generated web contract plus normalizeEnsembleMemberRole already coerce
+    # the same way, so the public payload must not leak an empty role.
     assert [candidate.model_dump() for candidate in res.config.llm_ensemble.candidates] == [
         {
             "provider": "openrouter",
             "model": "qwen/qwen3.7-max",
             "source": "custom",
             "enabled": True,
-            "role": "",
+            "role": "proposer",
             "thinking_level": "",
         }
     ]
@@ -721,7 +725,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "model": "qwen/qwen3.7-max",
             "source": "custom",
             "enabled": True,
-            "role": "",
+            "role": "proposer",
             "thinking_level": "",
         }
     ]

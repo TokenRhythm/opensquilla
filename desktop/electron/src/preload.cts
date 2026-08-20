@@ -26,6 +26,39 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),
   getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
+  getArtifactBridgeCapabilities: () => (
+    ipcRenderer.invoke('desktop:workbench:artifact:capabilities')
+  ),
+  getArtifactAnnotationCapabilities: () => (
+    ipcRenderer.invoke('desktop:workbench:annotation:capabilities')
+  ),
+  setArtifactAnnotationMode: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:set-mode', payload)
+  ),
+  showArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:show-overlay', payload)
+  ),
+  closeArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
+  ),
+  captureSelection: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:capture-selection', payload)
+  ),
+  browserInspect: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:browser-inspect', payload)
+  ),
+  browserAct: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:browser-act', payload)
+  ),
+  screenshot: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:screenshot', payload)
+  ),
+  officeFlush: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:office-flush', payload)
+  ),
+  reloadSurface: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:reload-surface', payload)
+  ),
   createArtifactPreviewLease: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
   ),
@@ -58,6 +91,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
+  resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),

@@ -31,6 +31,7 @@ function createHarness(options: {
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
+  supportsTurnCommitted?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -45,6 +46,8 @@ function createHarness(options: {
     streamHasVisibleOutput: ref(false),
     startStreaming: vi.fn(),
     endStreaming: vi.fn(() => options.endStreaming?.(messages.value)),
+    checkpointForUserMessage: vi.fn(),
+    acknowledgeSteerBoundary: vi.fn(),
     appendDelta: vi.fn(),
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
@@ -66,6 +69,7 @@ function createHarness(options: {
     useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
+  const bindRouterDecisionToModelCall = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -104,6 +108,7 @@ function createHarness(options: {
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
     queueRouterDecision: vi.fn(),
+    bindRouterDecisionToModelCall,
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
     flushPendingRouterDecision: vi.fn(),
@@ -112,6 +117,7 @@ function createHarness(options: {
     showCompactionToast,
     getCompactionPlacement: options.getCompactionPlacement,
     showWarningToast,
+    supportsTurnCommitted: () => options.supportsTurnCommitted === true,
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
@@ -135,6 +141,7 @@ function createHarness(options: {
     pendingQueue,
     applySessionRunState,
     markEnsembleHandoff,
+    bindRouterDecisionToModelCall,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showCompactionToast,
@@ -148,6 +155,55 @@ function createHarness(options: {
     stop: () => scope.stop(),
   }
 }
+
+describe('useChatRpcEventHandlers route-card ownership', () => {
+  it('binds text and thinking events to their physical provider calls', () => {
+    const { api, bindRouterDecisionToModelCall, stop } = createHarness()
+    try {
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 1,
+        generation_epoch: 0,
+        text: 'answer',
+        model_call_id: '1.0',
+        iteration: 1,
+      })
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 2,
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+      })
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 3,
+        generation_epoch: 0,
+        text: 'stale answer',
+        model_call_id: 'stale-call',
+        iteration: 99,
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 4,
+        generation_epoch: 1,
+        text: 'reasoning',
+        model_call_id: '2.0',
+        iteration: 2,
+      })
+
+      expect(bindRouterDecisionToModelCall.mock.calls).toEqual([
+        ['1.0', 1, 'turn-1'],
+        ['2.0', 2, 'turn-1'],
+      ])
+    } finally {
+      stop()
+    }
+  })
+})
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
   it('replays a committed tool timeline including its authoritative end', () => {
@@ -469,6 +525,208 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds an applied steer boundary in snapshot stream order', () => {
+    const { api, stream, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-1',
+        turnId: 'turn-live',
+        inputDisposition: 'steering',
+      }],
+    })
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 12,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Second answer',
+              stream_seq: 12,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'task-live',
+              user_message_id: 'steer-message-1',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 10,
+            },
+          },
+        ],
+      })
+
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'task-live',
+        'steer-message-1',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-1',
+        '',
+        0,
+      )
+      expect(vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder[0])
+        .toBeLessThan(
+          vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder[0]!,
+        )
+      expect(vi.mocked(stream.appendDelta).mock.calls.map(call => call[0])).toEqual([
+        'First answer',
+        'Second answer',
+      ])
+    } finally {
+      stop()
+    }
+  })
+
+  it('checkpoints an applied snapshot boundary before its history row exists', () => {
+    const { api, messages, stream, stop } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 12,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 10,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'task-live',
+              user_message_id: 'steer-message-orphan',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Second answer',
+              stream_seq: 12,
+            },
+          },
+        ],
+      })
+
+      expect(messages.value).toEqual([])
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'task-live',
+        'steer-message-orphan',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-orphan',
+        '',
+        0,
+      )
+      const textOrders = vi.mocked(stream.appendDelta).mock.invocationCallOrder
+      const checkpointOrders = vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder
+      const acknowledgeOrders = vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder
+      expect(textOrders[0]).toBeLessThan(checkpointOrders[0]!)
+      expect(checkpointOrders[0]).toBeLessThan(acknowledgeOrders[0]!)
+      expect(acknowledgeOrders[0]).toBeLessThan(textOrders[1]!)
+
+      messages.value = [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-orphan',
+        turnId: 'task-live',
+        inputDisposition: 'applied',
+      }]
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledTimes(2)
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledTimes(2)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds the boundary when a legacy applied snapshot omits revision and call id', () => {
+    const { api, messages, stream, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-1',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+        inputDispositionRevision: 3,
+      }],
+    })
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'turn-live',
+              user_message_id: 'steer-message-1',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 2,
+            },
+          },
+        ],
+      })
+
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-live',
+        'steer-message-1',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-1',
+        '',
+        0,
+      )
+      expect(messages.value[0]?.inputDispositionRevision).toBe(3)
     } finally {
       stop()
     }
@@ -1472,6 +1730,20 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         usage: { text: '' },
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('outer legacy canonical')
+
+      const segments = [{
+        model_call_id: '2.0',
+        iteration: 2,
+        start_codepoint: 3,
+        end_codepoint: 6,
+      }]
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 7,
+        text_snapshot: '前半段后半段',
+        model_call_segments: segments,
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('前半段后半段', segments)
     } finally {
       stop()
     }
@@ -2271,6 +2543,180 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       await Promise.all([live, history])
     } finally {
       harness.stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers durable turn receipts', () => {
+  it('keeps legacy done behavior when the Gateway does not advertise receipts', () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-legacy',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'legacy answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledWith()
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-legacy',
+        turn_id: 'turn-legacy',
+        stream_seq: 2,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('validates a receipt before sequence consumption and handles replay idempotently', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'durable answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set(['task-durable']))
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        stream_seq: 99,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.api.handlers.onAny('task.succeeded', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        stream_seq: 2,
+        status: 'succeeded',
+      })
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 3,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 4,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
+      expect(harness.showWarningToast).not.toHaveBeenCalled()
+      expect(harness.handleSessionConnectionState).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('performs one silent safe sync after five seconds without blocking done', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-delayed',
+        turn_id: 'turn-delayed',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'visible answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(4_999)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(1)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+      vi.advanceTimersByTime(30_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.showWarningToast).not.toHaveBeenCalled()
+      expect(harness.handleSessionConnectionState).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels commit waiting when finalization transitions the task to failed', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-finalizer-failed',
+        turn_id: 'turn-finalizer-failed',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'answer before finalizer failure',
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(
+        new Set(['task-finalizer-failed']),
+      )
+
+      harness.api.handlers.onAny('task.failed', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-finalizer-failed',
+        stream_seq: 2,
+        status: 'failed',
+        terminal_message: 'transcript finalizer failed',
+      })
+
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      const historyCallsAfterFailure = harness.scheduleHistorySync.mock.calls.length
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(historyCallsAfterFailure)
+      expect(harness.scheduleHistorySync.mock.calls).not.toContainEqual([true])
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
     }
   })
 })

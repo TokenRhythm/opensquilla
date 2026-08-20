@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
+import type { Component } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
@@ -27,10 +28,13 @@ async function settlePreview() {
 
 function mountPanel(
   props: Record<string, unknown>,
-): { element: HTMLElement; unmount: () => void } {
+): { element: HTMLElement; unmount: () => void; update: (patch: Record<string, unknown>) => void } {
   const element = document.createElement('div')
   document.body.append(element)
-  const app = createApp(ArtifactPreviewPanel, props)
+  const state = reactive({ ...props })
+  const app = createApp({
+    render: () => h(ArtifactPreviewPanel as Component, state),
+  })
   app.use(createI18n({
     legacy: false,
     locale: 'en',
@@ -43,6 +47,7 @@ function mountPanel(
       app.unmount()
       element.remove()
     },
+    update: patch => Object.assign(state, patch),
   }
 }
 
@@ -72,6 +77,8 @@ describe('ArtifactPreviewPanel', () => {
     expect(frame).not.toBeNull()
     expect(frame?.getAttribute('sandbox')).toBe('allow-scripts')
     expect(frame?.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-forms')
+    expect(frame?.getAttribute('allow')).toBe('')
     expect(frame?.getAttribute('referrerpolicy')).toBe('no-referrer')
     expect(frame?.getAttribute('tabindex')).toBe('0')
     expect(createObjectUrl).toHaveBeenCalledOnce()
@@ -79,6 +86,32 @@ describe('ArtifactPreviewPanel', () => {
 
     mounted.unmount()
     expect(revokeObjectUrl).toHaveBeenCalledWith('about:blank#artifact-preview')
+  })
+
+  it('keeps a prepared opaque preview isolated even when the saved mode is full', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#prepared-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      '<html><body><form><input></form></body></html>',
+      { status: 200, headers: { 'Content-Type': 'text/html' } },
+    )))
+
+    const mounted = mountPanel({
+      artifact: artifact(),
+      previewMode: 'full',
+      previewNetworkAllowed: false,
+      previewSandboxProfile: 'opaque-offline',
+    })
+    await settlePreview()
+
+    const frame = mounted.element.querySelector<HTMLIFrameElement>(
+      '.artifact-preview__frame--html',
+    )
+    expect(frame?.getAttribute('sandbox')).toBe('allow-scripts')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-forms')
+    expect(frame?.getAttribute('allow')).toBe('')
+    mounted.unmount()
   })
 
   it('can omit its header when embedded in the workbench chrome', async () => {
@@ -196,6 +229,53 @@ describe('ArtifactPreviewPanel', () => {
       type: 'native-html-ready',
       payload: expect.any(Object),
     })
+    mounted.unmount()
+  })
+
+  it('reloads changed native HTML instead of resuming stale bytes after Source was active', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => Promise.resolve(new Response(
+      `<h1>${String(url)}</h1>`,
+      { status: 200, headers: { 'Content-Type': 'text/html' } },
+    )))
+    const onNativeHtmlReady = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const mounted = mountPanel({
+      artifact: artifact(),
+      nativeHtml: true,
+      onNativeHtmlReady,
+      suspended: true,
+    })
+    await settlePreview()
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    mounted.update({ suspended: false })
+    await settlePreview()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(onNativeHtmlReady).toHaveBeenCalledTimes(1)
+
+    mounted.update({ suspended: true })
+    await settlePreview()
+    mounted.update({ suspended: false })
+    await settlePreview()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    mounted.update({ suspended: true })
+    await settlePreview()
+    mounted.update({
+      artifact: artifact({
+        id: 'artifact-2',
+        download_url: '/api/v1/artifacts/artifact-2',
+      }),
+    })
+    await settlePreview()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    mounted.update({ suspended: false })
+    await settlePreview()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(onNativeHtmlReady).toHaveBeenCalledTimes(2)
+    expect(onNativeHtmlReady.mock.calls[1]?.[0].artifact.id).toBe('artifact-2')
     mounted.unmount()
   })
 

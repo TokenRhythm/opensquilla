@@ -401,6 +401,38 @@ class RouterDecisionWriter:
         bound = max(1, int(per_session))
         return {key: entries[-bound:] for key, entries in grouped.items()}
 
+    def load_next_turn_indexes(
+        self,
+    ) -> dict[str, int]:
+        """Return ``MAX(turn_index) + 1`` for every retained session.
+
+        This sequence seed deliberately has no sticky-policy time window. It
+        keeps decision identities monotonic when an older retained session is
+        resumed after a process restart, while the much richer policy history
+        remains bounded to recent sessions and five entries each.
+        """
+
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_key, MAX(turn_index) AS max_turn_index
+                    FROM router_decisions
+                    WHERE turn_index IS NOT NULL
+                    GROUP BY session_key
+                    """,
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("router_decision_writer.load_turn_indexes_failed: %s", exc)
+            return {}
+        seeds: dict[str, int] = {}
+        for row in rows:
+            session_key = str(row["session_key"])
+            maximum = _optional_int(row["max_turn_index"])
+            if session_key and maximum is not None and maximum >= 0:
+                seeds[session_key] = maximum + 1
+        return seeds
+
     def list_decisions(
         self,
         *,

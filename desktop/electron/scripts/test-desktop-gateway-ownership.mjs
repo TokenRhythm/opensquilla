@@ -27,6 +27,7 @@ import {
   requestVerifiedDesktopGatewayShutdown,
   sameDesktopGatewayOwnershipInstance,
   verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayLaunchOwnership,
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import {
@@ -100,6 +101,52 @@ assert.equal(
   false,
   'the per-launch nonce remains mandatory',
 )
+
+{
+  const authority = {
+    instanceNonce: nonce,
+    profileFingerprint: record.profile_fingerprint,
+    port: record.port,
+  }
+  let challengeCalls = 0
+  assert.equal(
+    await verifyDesktopGatewayLaunchOwnership('/profile/current', authority, {
+      load: () => ({ status: 'valid', record }),
+      verify: async () => {
+        challengeCalls += 1
+        return true
+      },
+    }),
+    true,
+    'a matching launch record plus identity challenge proves the listener',
+  )
+  assert.equal(challengeCalls, 1)
+
+  assert.equal(
+    await verifyDesktopGatewayLaunchOwnership('/profile/current', authority, {
+      load: () => ({
+        status: 'valid',
+        record: { ...record, instance_nonce: 'x'.repeat(43) },
+      }),
+      verify: async () => {
+        challengeCalls += 1
+        return true
+      },
+    }),
+    false,
+    'a healthy foreign listener cannot inherit authority from a live launcher child',
+  )
+  assert.equal(challengeCalls, 1, 'a foreign record is rejected before any challenge')
+
+  assert.equal(
+    await verifyDesktopGatewayLaunchOwnership('/profile/current', authority, {
+      load: () => ({ status: 'valid', record }),
+      verify: async () => false,
+    }),
+    false,
+    'a matching record without a successful identity challenge fails closed',
+  )
+}
 
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-desktop-gateway-owner-'))
 try {

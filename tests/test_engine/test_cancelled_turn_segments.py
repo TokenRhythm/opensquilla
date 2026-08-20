@@ -26,6 +26,7 @@ from opensquilla.tools.registry import ToolRegistry, ToolSpec
 from opensquilla.tools.types import CallerKind, ToolContext
 
 PARTIAL_ANSWER = "Based on the lookup, the answer is 42 and the reasoning is as follows"
+PARTIAL_ACTIVITY = "I will inspect another source before answering."
 
 
 class _ToolThenHangingTextProvider:
@@ -65,6 +66,21 @@ class _ToolThenCompletedTextProvider(_ToolThenHangingTextProvider):
             return
         yield ProviderText(text=PARTIAL_ANSWER)
         yield ProviderDone(stop_reason="end_turn", input_tokens=1, output_tokens=1)
+
+
+class _HangingIntermediateTextProvider(_ToolThenHangingTextProvider):
+    """Start a tool and then stream work narration before cancellation."""
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        del call_number
+        yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
+        yield ProviderToolUseEnd(
+            tool_use_id="tool-1",
+            tool_name="lookup",
+            arguments={},
+        )
+        yield ProviderText(text=PARTIAL_ACTIVITY)
+        await asyncio.Event().wait()
 
 
 class _HangingReasoningProvider:
@@ -260,6 +276,71 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
         assert session.output_tokens == 1
         assert session.total_tokens == 2
         assert session.missing_cost_entries == 1
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_preserves_intermediate_text_presentation(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-intermediate-text"
+    await manager.create(session_key)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(_HangingIntermediateTextProvider()),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+    partial_seen = asyncio.Event()
+
+    async def _consume() -> None:
+        async for event in runner.run(
+            "inspect it before answering",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        ):
+            if isinstance(event, TextDeltaEvent) and PARTIAL_ACTIVITY in (event.text or ""):
+                assert event.presentation == "intermediate"
+                partial_seen.set()
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(partial_seen.wait(), timeout=5.0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        transcript = await manager.get_transcript(session_key)
+        assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
+        text_segments = [
+            segment
+            for segment in (assistant.tool_calls or [])
+            if isinstance(segment, dict) and segment.get("type") == "text"
+        ]
+        assert text_segments == [
+            {
+                "type": "text",
+                "text": PARTIAL_ACTIVITY,
+                "presentation": "intermediate",
+            }
+        ]
     finally:
         if not task.done():
             task.cancel()

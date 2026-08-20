@@ -10,6 +10,7 @@ from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.policy import ToolSurfaceCapabilities
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext, ToolSpec
+from opensquilla.tools.visibility import apply_exclusive_tool_ceiling
 
 
 async def _handler() -> str:
@@ -67,6 +68,36 @@ def test_allowed_tools_remains_strict_when_tool_is_surfaced() -> None:
     names = {tool.name for tool in registry.to_tool_definitions(ctx)}
 
     assert names == {"visible"}
+
+
+def test_exclusive_tool_ceiling_hides_policy_allowed_and_surfaced_tools() -> None:
+    registry = ToolRegistry()
+    registry.register(_spec("artifact_reader", exposed_by_default=False), _handler)
+    registry.register(_spec("read_file"), _handler)
+    ctx = ToolContext(
+        is_owner=True,
+        allowed_tools={"artifact_reader", "read_file"},
+        surfaced_tools={"artifact_reader", "read_file"},
+        exclusive_tools={"artifact_reader"},
+    )
+
+    names = {tool.name for tool in registry.to_tool_definitions(ctx)}
+
+    assert names == {"artifact_reader"}
+    assert isinstance(ctx.exclusive_tools, frozenset)
+
+
+def test_exclusive_tool_ceiling_is_final_intersection() -> None:
+    ctx = ToolContext(
+        allowed_tools={"artifact_reader", "read_file"},
+        surfaced_tools={"artifact_reader", "read_file"},
+        exclusive_tools={"artifact_reader"},
+    )
+
+    resolved = apply_exclusive_tool_ceiling(ctx)
+
+    assert resolved.allowed_tools == {"artifact_reader"}
+    assert resolved.surfaced_tools == {"artifact_reader"}
 
 
 def test_default_registry_removes_obsolete_wrapper_tools_but_keeps_canonical_tools() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,6 +26,7 @@ from opensquilla.provider.types import (
     TextDeltaEvent,
     ToolDefinition,
 )
+from opensquilla.tools.types import ToolContext
 
 
 class _FailProvider:
@@ -209,6 +211,75 @@ async def test_gate_skips_when_current_turn_has_image() -> None:
 
     assert out.metadata["router_vision_followup_gate_decision"] == "current_image"
     assert out.metadata.get("router_vision_followup_needs_image") is not True
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotation_skips_history_image_gate_and_keeps_artifact_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={
+            "enabled": True,
+            "rollout_phase": "full",
+            "require_router_runtime": False,
+            "auto_thinking": False,
+        },
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    auxiliary_setup_calls = 0
+
+    def forbidden_gate_setup(*_args: object, **_kwargs: object) -> tuple[None, None]:
+        nonlocal auxiliary_setup_calls
+        auxiliary_setup_calls += 1
+        raise AssertionError("PromptAnnotation must not construct a vision gate target")
+
+    monkeypatch.setattr(
+        runner,
+        "_make_vision_followup_gate_chat",
+        forbidden_gate_setup,
+    )
+    primary = _JsonProvider("unused")
+    tool_context = ToolContext(
+        exclusive_tools={"document_inspect", "document_apply"},
+        artifact_context=SimpleNamespace(
+            artifact_format="html",
+            operation_class="selection_edit",
+        ),
+    )
+
+    turn, returned_provider = await runner._run_pipeline(
+        "   ",
+        "agent:main:webchat:prompt-annotation-with-image-history",
+        primary,
+        None,
+        [],
+        "restricted prompt",
+        [],
+        semantic_message="",
+        history_has_recent_image=True,
+        history_image_turn_count=1,
+        turns_since_last_image=1,
+        last_image_turn_text="Describe the previous screenshot",
+        vision_candidate_turns=8,
+        tool_context=tool_context,
+    )
+
+    assert returned_provider is primary
+    assert auxiliary_setup_calls == 0
+    assert primary.calls == []
+    assert turn.metadata["router_vision_followup_gate_decision"] == "not_applicable"
+    assert turn.metadata["router_vision_followup_gate_reason"] == (
+        "prompt_annotation_dom_selection"
+    )
+    assert turn.metadata["router_vision_followup_gate_source"] == "prompt_annotation"
+    assert turn.metadata["router_vision_followup_needs_image"] is False
+    assert turn.metadata["routed_tier"] == "c2"
+    assert turn.metadata["artifact_minimum_tier"] == "c2"
+    assert turn.metadata["artifact_floor_applied"] is True
+    assert "apply_vision_followup_gate" not in {
+        record.step_name for record in turn.metadata["pipeline_steps"]
+    }
 
 
 @pytest.mark.asyncio

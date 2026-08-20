@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,7 +21,11 @@ from starlette.websockets import WebSocketState
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
-from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
 from opensquilla.engine.types import AnswerGenerationResetEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
@@ -37,7 +42,12 @@ from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_lifecycle import SessionTaskSnapshot
-from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
+from opensquilla.gateway.session_streams import (
+    BufferedSessionEvent,
+    LiveTurnSnapshot,
+    SessionStreamRegistry,
+    get_session_streams,
+)
 from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
@@ -620,8 +630,14 @@ class _LegacyCompactManager:
 
 
 class _ReplayConn:
-    def __init__(self, conn_id: str) -> None:
+    def __init__(
+        self,
+        conn_id: str,
+        *,
+        client_caps: frozenset[str] = frozenset(),
+    ) -> None:
         self.conn_id = conn_id
+        self.client_caps = client_caps
         self.events: list[tuple[str, dict, dict | None]] = []
 
     async def send_event(
@@ -631,6 +647,21 @@ class _ReplayConn:
         meta: dict | None = None,
     ) -> None:
         self.events.append((event, payload or {}, meta))
+
+
+def _turn_committed_payload(session_key: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "session_key": session_key,
+        "task_id": "task-committed",
+        "turn_id": "turn-committed",
+        "status": "succeeded",
+        "terminal_reason": "completed",
+        "finished_at": 1_234,
+        "text": "must not cross the public boundary",
+    }
+    payload.update(overrides)
+    return payload
 
 
 class _CaptureSocket:
@@ -1216,13 +1247,13 @@ class TestSessionsList:
         assert res.payload["totalCount"] == 201
 
     @pytest.mark.asyncio
-    async def test_session_list_view_pages_beyond_200_without_gaps(
+    async def test_session_list_view_pages_all_401_rows_without_gaps(
         self, dispatcher, tmp_path
     ):
         storage = SessionStorage(str(tmp_path / "sessions-page.db"))
         await storage.connect()
         try:
-            for index in range(201):
+            for index in range(401):
                 await storage.upsert_session(
                     SessionNode(
                         session_key=f"agent:main:webchat:session-{index:03d}",
@@ -1247,26 +1278,38 @@ class TestSessionsList:
             assert first.payload["hasMore"] is True
             assert first.payload["next_cursor"] == first.payload["nextCursor"]
 
-            second = await dispatcher.dispatch(
-                "page-2",
-                "sessions.list",
-                {
-                    "limit": 200,
-                    "view": "session-list-v1",
-                    "cursor": first.payload["next_cursor"],
-                },
-                ctx,
-            )
+            pages = [first]
+            cursor = first.payload["next_cursor"]
+            for page_number in (2, 3):
+                page = await dispatcher.dispatch(
+                    f"page-{page_number}",
+                    "sessions.list",
+                    {
+                        "limit": 200,
+                        "view": "session-list-v1",
+                        "cursor": cursor,
+                    },
+                    ctx,
+                )
+                assert page.ok is True
+                pages.append(page)
+                cursor = page.payload["next_cursor"]
+
+            second, third = pages[1:]
             assert second.ok is True
-            assert second.payload["count"] == 1
-            assert second.payload["has_more"] is False
-            assert second.payload["next_cursor"] is None
+            assert second.payload["count"] == 200
+            assert second.payload["has_more"] is True
+            assert second.payload["next_cursor"] is not None
+            assert third.payload["count"] == 1
+            assert third.payload["has_more"] is False
+            assert third.payload["next_cursor"] is None
 
             keys = [
                 row["key"]
-                for row in [*first.payload["sessions"], *second.payload["sessions"]]
+                for page in pages
+                for row in page.payload["sessions"]
             ]
-            assert len(keys) == len(set(keys)) == 201
+            assert len(keys) == len(set(keys)) == 401
             assert keys == sorted(keys, reverse=True)
         finally:
             await storage.close()
@@ -4438,6 +4481,8 @@ class TestSessionsSend:
         assert store.evicted == ["u-pdf"]
         persisted = json.loads(manager.created_messages[0][2])
         persisted_att = persisted["attachments"][0]
+        attachment_id = persisted_att.pop("attachment_id")
+        assert re.fullmatch(r"att_[A-Za-z0-9_-]{24}", attachment_id)
         assert persisted_att == {
             "sha256_ref": sha,
             "name": "r.pdf",
@@ -4663,6 +4708,26 @@ class TestSessionsSteer:
             assert replay.payload["replayed"] is True
             assert replay.payload["user_message_id"] == accepted.payload["user_message_id"]
             assert await store.list_pending_chat_inputs(key) == []
+
+            # A stale client may still try to drain the identity it hydrated
+            # before steer acceptance. The receipt is a completion tombstone:
+            # replay it instead of admitting a second session turn.
+            stale_dispatch = await dispatcher.dispatch(
+                "r-pending-steer-stale-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": key,
+                    "pendingInputId": row.pending_input_id,
+                    "clientRequestId": row.client_request_id,
+                    "requestFingerprint": row.request_fingerprint,
+                    "_source": {"caller_kind": "web", "channel_kind": "web"},
+                },
+                ctx,
+            )
+            assert stale_dispatch.ok is True
+            assert stale_dispatch.payload["accepted"] is True
+            assert stale_dispatch.payload["replayed"] is True
+            assert stale_dispatch.payload["task_id"] == handle.task_id
 
             receipt = await store.get_pending_chat_input_dispatch_receipt(
                 row.pending_input_id
@@ -5029,7 +5094,37 @@ class TestSessionsAbort:
         ]
 
     @pytest.mark.asyncio
-    async def test_abort_with_task_id_cancels_only_that_runtime_task(self, dispatcher, session):
+    async def test_abort_with_task_id_returns_without_waiting_for_terminal(
+        self,
+        dispatcher,
+        session,
+        monkeypatch,
+    ):
+        auxiliary_started = asyncio.Event()
+        descendant_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def blocked_auxiliary_cleanup(**_kwargs: Any) -> int:
+            auxiliary_started.set()
+            await release_cleanup.wait()
+            return 0
+
+        async def blocked_descendant_cleanup(*_args: Any, **_kwargs: Any) -> int:
+            descendant_started.set()
+            await release_cleanup.wait()
+            return 0
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_cancel_task_owned_auxiliary_work",
+            blocked_auxiliary_cleanup,
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_cancel_task_owned_descendants",
+            blocked_descendant_cleanup,
+        )
+
         class Runtime:
             def __init__(self) -> None:
                 self.cancel_calls: list[dict[str, Any]] = []
@@ -5061,17 +5156,26 @@ class TestSessionsAbort:
 
             async def wait(self, task_id: str):
                 self.wait_calls.append(task_id)
-                return SimpleNamespace(task_id=task_id, status="cancelled")
+                await asyncio.Event().wait()
 
         runtime = Runtime()
         ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
 
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.abort",
-            {"key": session.session_key, "task_id": "task-old", "source": "webui_stop"},
-            ctx,
+        response_task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.abort",
+                {
+                    "key": session.session_key,
+                    "task_id": "task-old",
+                    "source": "webui_stop",
+                },
+                ctx,
+            )
         )
+        await asyncio.wait_for(auxiliary_started.wait(), timeout=0.2)
+        await asyncio.wait_for(descendant_started.wait(), timeout=0.2)
+        res = await asyncio.wait_for(response_task, timeout=0.2)
 
         assert res.ok is True
         assert runtime.cancel_calls == [
@@ -5082,7 +5186,9 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert runtime.wait_calls == ["task-old"]
+        assert runtime.wait_calls == []
+        release_cleanup.set()
+        await asyncio.sleep(0)
 
     @pytest.mark.asyncio
     async def test_guest_chat_abort_binds_task_id_to_owned_session(self, dispatcher):
@@ -5287,7 +5393,7 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert runtime.wait_calls == ["task-current"]
+        assert runtime.wait_calls == []
 
     @pytest.mark.asyncio
     async def test_cancel_queued_task_preserves_running_task_session_registries(
@@ -5359,7 +5465,7 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert runtime.wait_calls == ["task-queued"]
+        assert runtime.wait_calls == []
         assert task_background_cancel_calls == [(session.session_key, "task-queued")]
         assert approval_cancel_calls == []
 
@@ -5495,11 +5601,16 @@ class TestSessionsAbort:
                 return SimpleNamespace(task_id=task_id, status="cancelled")
 
         background_cancel_calls: list[str] = []
+        persisted_cancel_calls: list[str] = []
         approval_cancel_calls: list[str] = []
         emitted: list[tuple[str, str, dict[str, Any]]] = []
 
         async def cancel_background(session_key: str) -> int:
             background_cancel_calls.append(session_key)
+            return 1
+
+        async def cancel_persisted(_state_dir: object, session_key: str) -> int:
+            persisted_cancel_calls.append(session_key)
             return 1
 
         class ApprovalQueue:
@@ -5519,6 +5630,10 @@ class TestSessionsAbort:
         monkeypatch.setattr(
             "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
             cancel_background,
+        )
+        monkeypatch.setattr(
+            "opensquilla.process_tree.cancel_persisted_processes_for_session",
+            cancel_persisted,
         )
         monkeypatch.setattr(
             "opensquilla.gateway.approval_queue.get_approval_queue",
@@ -5550,6 +5665,7 @@ class TestSessionsAbort:
         assert runtime.successful_cancel_calls == [session.session_key, grandchild_key, child_key]
         assert runtime.wait_calls == ["task-parent", "task-grandchild", "task-child"]
         assert background_cancel_calls == [session.session_key, child_key, grandchild_key]
+        assert persisted_cancel_calls == [session.session_key, child_key, grandchild_key]
         assert approval_cancel_calls == [
             session.session_key,
             child_key,
@@ -5692,6 +5808,7 @@ class TestSessionsAbort:
 
         completion_calls: list[tuple[str, str]] = []
         process_calls: list[tuple[str, str]] = []
+        owned_cleanup_complete = asyncio.Event()
 
         async def cancel_completion(session_key: str, task_id: str) -> int:
             completion_calls.append((session_key, task_id))
@@ -5699,6 +5816,11 @@ class TestSessionsAbort:
 
         async def cancel_processes(session_key: str, task_id: str) -> int:
             process_calls.append((session_key, task_id))
+            if (session_key, task_id) == (
+                finished_child_key,
+                "task-finished-child",
+            ):
+                owned_cleanup_complete.set()
             return 0
 
         monkeypatch.setattr(
@@ -5732,6 +5854,9 @@ class TestSessionsAbort:
 
         assert response.ok is True
         assert response.payload["aborted"] is True
+        # Exact Stop acknowledges once the root cancellation is accepted;
+        # task-owned descendant and process cleanup continues in the background.
+        await asyncio.wait_for(owned_cleanup_complete.wait(), timeout=0.2)
         assert runtime.cancel_calls == [
             (root_key, "task-root"),
             (child_key, "task-child"),
@@ -8664,6 +8789,64 @@ class TestSessionsMessagesSubscribe:
         assert buffered.payload["terminal_error_message"] == "INTERNAL_MESSAGE"
 
     @pytest.mark.asyncio
+    async def test_messages_snapshot_capability_gates_injected_turn_committed(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:turn-committed-snapshot"
+        payload = _turn_committed_payload(
+            key,
+            stream_generation="snapshot-generation",
+            stream_seq=7,
+            emitted_at=1_235,
+        )
+        snapshot = LiveTurnSnapshot(
+            stream_generation="snapshot-generation",
+            current_stream_seq=7,
+            task_id=None,
+            events=[BufferedSessionEvent(TURN_COMMITTED_EVENT, payload, 7)],
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "get_session_streams",
+            lambda: SimpleNamespace(live_snapshot=lambda _key: snapshot),
+        )
+        registry = get_registry()
+
+        async def _snapshot_for(conn: _ReplayConn) -> dict[str, Any]:
+            registry.register(conn)  # type: ignore[arg-type]
+            try:
+                response = await dispatcher.dispatch(
+                    f"snapshot-{conn.conn_id}",
+                    "sessions.messages.snapshot",
+                    {"key": key},
+                    make_ctx(conn_id=conn.conn_id),
+                )
+            finally:
+                registry.unregister(conn.conn_id)
+            assert response.ok is True
+            return response.payload
+
+        legacy = await _snapshot_for(_ReplayConn("turn-committed-snapshot-legacy"))
+        capable = await _snapshot_for(
+            _ReplayConn(
+                "turn-committed-snapshot-capable",
+                client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+            )
+        )
+
+        assert legacy["events"] == []
+        assert capable["events"] == [
+            {
+                "event": TURN_COMMITTED_EVENT,
+                "payload": {
+                    field: value for field, value in payload.items() if field != "text"
+                },
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe(self, dispatcher, ctx_with_sessions, session):
         session.epoch = 4
         res = await dispatcher.dispatch(
@@ -8812,6 +8995,7 @@ class TestSessionsMessagesSubscribe:
 
         manager._storage.get_session = _hanging_metadata
         manager._storage.list_agent_tasks = _hanging_metadata
+        manager.get_session_routing = _hanging_metadata
         monkeypatch.setattr(
             rpc_sessions,
             "project_workspace_snapshot",
@@ -8848,6 +9032,8 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["workspaceId"] is None
         assert response.payload["projectWorkspace"] is None
         assert response.payload["hydration_complete"] is False
+        assert response.payload["routing"] is None
+        assert "routing" in response.payload["deferred_fields"]
         assert snapshot.ok is True
         assert metadata_called is False
 
@@ -9091,7 +9277,12 @@ class TestSessionsMessagesSubscribe:
                 started_at=110,
                 finished_at=None,
                 terminal_reason=None,
-                details={},
+                details={
+                    "cancellation_requested": {
+                        "source": "webui_stop",
+                        "reason": "user_abort",
+                    }
+                },
             )
         ]
         subscriptions = SubscriptionManager()
@@ -9126,11 +9317,13 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["projectWorkspace"] is None
         assert response.payload["projectWorkspaceDeferred"] is True
         assert response.payload["active_task"]["task_id"] == "task-hydrate"
+        assert response.payload["active_task"]["cancel_requested"] is True
         assert (
             response.payload["active_task"]["steer_capability"]
             == steer_capability
         )
         assert response.payload["tasks"][0]["steer_capability"] == steer_capability
+        assert response.payload["tasks"][0]["cancel_requested"] is True
         assert response.payload["run_status"] == "running"
         assert response.payload["pendingUserInputs"] == pending
         assert response.payload["epoch"] == 7
@@ -9439,6 +9632,94 @@ class TestSessionsMessagesSubscribe:
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 1
         assert conn.events == [("session.event.done", second, {"replayed": True})]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_replays_turn_committed_only_to_capable_clients(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:turn-committed-replay"
+        streams = get_session_streams()
+        done = streams.record(
+            key,
+            "session.event.done",
+            {"task_id": "task-committed", "turn_id": "turn-committed"},
+        )
+        committed = streams.record(key, TURN_COMMITTED_EVENT, _turn_committed_payload(key))
+        legacy = _ReplayConn("turn-committed-replay-legacy")
+        capable = _ReplayConn(
+            "turn-committed-replay-capable",
+            client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+        )
+        registry = get_registry()
+        subscriptions = SubscriptionManager()
+        registry.register(legacy)  # type: ignore[arg-type]
+        registry.register(capable)  # type: ignore[arg-type]
+        responses = []
+        try:
+            for conn in (legacy, capable):
+                response = await dispatcher.dispatch(
+                    f"subscribe-{conn.conn_id}",
+                    "sessions.messages.subscribe",
+                    {
+                        "key": key,
+                        "since_stream_seq": done["stream_seq"],
+                        "fast_ack": True,
+                    },
+                    make_ctx(
+                        session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+                        conn_id=conn.conn_id,
+                        subscription_manager=subscriptions,
+                    ),
+                )
+                assert response.ok is True
+                responses.append(response.payload)
+        finally:
+            registry.unregister(legacy.conn_id)
+            registry.unregister(capable.conn_id)
+
+        assert responses[0]["current_stream_seq"] == committed["stream_seq"]
+        assert [response["replayed_count"] for response in responses] == [0, 1]
+        assert legacy.events == []
+        event_name, payload, meta = capable.events[0]
+        assert event_name == TURN_COMMITTED_EVENT
+        assert meta == {"replayed": True}
+        assert payload["stream_seq"] == committed["stream_seq"]
+        assert "text" not in payload
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_drops_bad_committed_without_aborting_replay(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:turn-committed-bad-replay"
+        streams = get_session_streams()
+        streams.record(key, TURN_COMMITTED_EVENT, {"finished_at": True})
+        done = streams.record(key, "session.event.done", {"task_id": "task-following"})
+        conn = _ReplayConn(
+            "turn-committed-bad-replay",
+            client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+        )
+        registry = get_registry()
+        registry.register(conn)  # type: ignore[arg-type]
+        try:
+            response = await dispatcher.dispatch(
+                "subscribe-turn-committed-bad-replay",
+                "sessions.messages.subscribe",
+                {"key": key, "since_stream_seq": 0, "fast_ack": True},
+                make_ctx(
+                    session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+                    conn_id=conn.conn_id,
+                    subscription_manager=SubscriptionManager(),
+                ),
+            )
+        finally:
+            registry.unregister(conn.conn_id)
+
+        assert response.ok is True
+        assert response.payload["current_stream_seq"] == done["stream_seq"]
+        assert response.payload["replayed_count"] == 1
+        assert [event for event, _payload, _meta in conn.events] == ["session.event.done"]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_replay_projects_terminal_reset_per_connection(

@@ -23,6 +23,7 @@ import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import structlog
 
@@ -58,8 +59,80 @@ from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
 
+_ARTIFACT_PRODUCT_METHOD_PREFIXES = (
+    "artifacts.",
+    "documents.",
+    "workbench.previews.",
+    "workbench.resources.",
+)
+_ARTIFACT_INTERNAL_ERROR_MESSAGE = "The operation could not be completed. Try again."
+_ARTIFACT_INVALID_REQUEST_MESSAGE = (
+    "The request could not be completed. Check the input and try again."
+)
+_ARTIFACT_OUTCOME_PENDING_MESSAGE = (
+    "The update result cannot be confirmed yet. Open the page to check before retrying."
+)
+_ARTIFACT_DOCUMENT_UNAVAILABLE_MESSAGE = "This page is temporarily unavailable. Try again."
+_ARTIFACT_WRITE_SCOPES = frozenset({"operator.write", "operator.admin"})
+
 # Handler type: (params, context) -> payload or raises
 RpcHandlerFn = Callable[[Any, "RpcContext"], Coroutine[Any, Any, Any]]
+
+
+def _is_artifact_product_method(method: str) -> bool:
+    return method.startswith(_ARTIFACT_PRODUCT_METHOD_PREFIXES)
+
+
+def _safe_artifact_dispatch_failure(
+    req_id: str,
+    *,
+    method: str,
+    exc: BaseException,
+    may_have_applied: bool,
+    invalid_request: bool = False,
+    unavailable: bool = False,
+) -> ResFrame:
+    """Log private diagnostics while returning one stable product fallback."""
+
+    correlation_id = uuid4().hex
+    log.error(
+        "artifact.rpc_dispatch_failed",
+        correlation_id=correlation_id,
+        method=method,
+        error_type=type(exc).__name__,
+        error=str(exc),
+        exc_info=exc,
+    )
+    # A transport failure after a write handler started is an unknown outcome,
+    # even when the transport itself is currently unavailable.  Preserve the
+    # original request identity so the client can resolve/replay it exactly;
+    # classifying it as a fresh availability failure could duplicate a write.
+    code = (
+        "INVALID_REQUEST"
+        if invalid_request
+        else "MUTATION_OUTCOME_PENDING"
+        if may_have_applied
+        else "DOCUMENT_UNAVAILABLE"
+        if unavailable
+        else "INTERNAL_ERROR"
+    )
+    message = (
+        _ARTIFACT_INVALID_REQUEST_MESSAGE
+        if invalid_request
+        else _ARTIFACT_OUTCOME_PENDING_MESSAGE
+        if may_have_applied
+        else _ARTIFACT_DOCUMENT_UNAVAILABLE_MESSAGE
+        if unavailable
+        else _ARTIFACT_INTERNAL_ERROR_MESSAGE
+    )
+    return make_error_res(
+        req_id,
+        code,
+        message,
+        retryable=unavailable and not may_have_applied,
+        accepted=None if may_have_applied and not invalid_request else False,
+        details={"correlationId": correlation_id},
+    )
 
 
 @dataclass
@@ -285,10 +358,14 @@ class RpcRegistry:
             )
 
         try:
+            from opensquilla.runtime_packs import runtime_pack_state_scope
             from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 
             configured_state_dir = getattr(ctx.config, "state_dir", None)
-            with managed_toolchain_state_scope(configured_state_dir):
+            with (
+                managed_toolchain_state_scope(configured_state_dir),
+                runtime_pack_state_scope(configured_state_dir),
+            ):
                 result = await entry.handler(params, ctx)
             return make_ok_res(req_id, result)
         except RpcHandlerError as exc:
@@ -302,8 +379,25 @@ class RpcRegistry:
                 details=exc.details,
             )
         except RpcUnavailableError as exc:
+            if _is_artifact_product_method(method):
+                return _safe_artifact_dispatch_failure(
+                    req_id,
+                    method=method,
+                    exc=exc,
+                    may_have_applied=entry.required_scope in _ARTIFACT_WRITE_SCOPES,
+                    unavailable=True,
+                )
             return make_error_res(req_id, ERROR_UNAVAILABLE, str(exc), retryable=True)
         except StorageBusyError as exc:
+            if _is_artifact_product_method(method):
+                return make_error_res(
+                    req_id,
+                    "WRITE_BUSY",
+                    "The page is being updated. Wait a moment and try again.",
+                    retryable=True,
+                    retry_after_ms=exc.retry_after_ms,
+                    accepted=False,
+                )
             details: dict[str, Any] = {
                 "operation": exc.operation,
                 "waited_ms": exc.waited_ms,
@@ -321,10 +415,32 @@ class RpcRegistry:
                 details=details,
             )
         except ValueError as exc:
+            if _is_artifact_product_method(method):
+                return _safe_artifact_dispatch_failure(
+                    req_id,
+                    method=method,
+                    exc=exc,
+                    may_have_applied=entry.required_scope in _ARTIFACT_WRITE_SCOPES,
+                    invalid_request=True,
+                )
             return make_error_res(req_id, "INVALID_REQUEST", str(exc))
         except KeyError as exc:
+            if _is_artifact_product_method(method):
+                return _safe_artifact_dispatch_failure(
+                    req_id,
+                    method=method,
+                    exc=exc,
+                    may_have_applied=entry.required_scope in _ARTIFACT_WRITE_SCOPES,
+                )
             return make_error_res(req_id, "NOT_FOUND", str(exc))
         except Exception as exc:
+            if _is_artifact_product_method(method):
+                return _safe_artifact_dispatch_failure(
+                    req_id,
+                    method=method,
+                    exc=exc,
+                    may_have_applied=entry.required_scope in _ARTIFACT_WRITE_SCOPES,
+                )
             log.error(
                 "rpc.dispatch_failed",
                 method=method,

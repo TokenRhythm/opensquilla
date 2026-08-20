@@ -21,6 +21,11 @@ interface ProjectLifecycleState {
   postDeleteWorkspaceLists: number
   postDeleteSessionLists: number
   projectPresent: boolean
+  workspaceName: string
+  workspacePath: string
+  workspaceOpenError: string | null
+  workspaceOpenRequests: RpcParams[]
+  workspaceUpdateRequests: RpcParams[]
   removed: boolean
   sent: boolean
   historyDeleted: boolean
@@ -30,6 +35,7 @@ async function installProjectLifecycleRpc(
   page: Page,
   options: { connectDelayMs?: number; owner?: boolean } = {},
 ): Promise<ProjectLifecycleState> {
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   const state: ProjectLifecycleState = {
     sessionKey: 'agent:main:webchat:project-demo-task',
     requestMethods: [],
@@ -40,14 +46,19 @@ async function installProjectLifecycleRpc(
     postDeleteWorkspaceLists: 0,
     postDeleteSessionLists: 0,
     projectPresent: false,
+    workspaceName: 'demo',
+    workspacePath: '/repos/demo',
+    workspaceOpenError: null,
+    workspaceOpenRequests: [],
+    workspaceUpdateRequests: [],
     removed: false,
     sent: false,
     historyDeleted: false,
   }
   const workspace = () => ({
     id: 'project-demo',
-    name: 'demo',
-    path: '/repos/demo',
+    name: state.workspaceName,
+    path: state.workspacePath,
     taskCount: state.sent ? 1 : 0,
     pinned: false,
     available: true,
@@ -80,6 +91,12 @@ async function installProjectLifecycleRpc(
       ok: true,
       payload,
     }))
+    const reject = (id: unknown, message: string) => ws.send(JSON.stringify({
+      type: 'res',
+      id,
+      ok: false,
+      error: { code: 'WORKSPACE_OPEN_FAILED', message },
+    }))
     ws.onMessage(raw => {
       let frame: {
         type?: string
@@ -90,6 +107,10 @@ async function installProjectLifecycleRpc(
       try {
         frame = JSON.parse(String(raw))
       } catch {
+        return
+      }
+      if (frame.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }))
         return
       }
       if (frame.type !== 'req' || frame.id === undefined) return
@@ -143,8 +164,18 @@ async function installProjectLifecycleRpc(
           return
         case 'workspaces.open':
           expect(params).toMatchObject({ path: '/repos/demo', trusted: true })
+          state.workspaceOpenRequests.push(params)
+          if (state.workspaceOpenError) {
+            reject(frame.id, state.workspaceOpenError)
+            return
+          }
           state.projectPresent = true
           state.removed = false
+          respond(frame.id, { workspace: workspace() })
+          return
+        case 'workspaces.update':
+          state.workspaceUpdateRequests.push(params)
+          state.workspaceName = String(params.name || state.workspaceName)
           respond(frame.id, { workspace: workspace() })
           return
         case 'workspaces.list':
@@ -245,6 +276,31 @@ async function installProjectLifecycleRpc(
   return state
 }
 
+async function submitProjectFromHeader(page: Page, name = 'demo') {
+  let creator = page.getByRole('dialog', { name: 'Create project' })
+  await expect(async () => {
+    if (!await creator.isVisible()) {
+      await page.getByTestId('sidebar-create-project').click()
+    }
+    await page.waitForTimeout(250)
+    await expect(creator).toBeVisible()
+  }).toPass({ timeout: 10_000 })
+  await creator
+    .getByRole('button', { name: 'Add a folder OpenSquilla can read and edit', exact: true })
+    .click()
+
+  const picker = page.getByRole('dialog', { name: 'Choose project' })
+  await picker.getByRole('option', { name: 'demo', exact: true }).click()
+  await picker.getByRole('button', { name: 'Choose selected directory', exact: true }).click()
+
+  creator = page.getByRole('dialog', { name: 'Create project' })
+  const nameInput = creator.getByRole('textbox', { name: 'Project name' })
+  await expect(nameInput).toHaveValue('demo')
+  if (name !== 'demo') await nameInput.fill(name)
+  await creator.getByRole('button', { name: 'Create project', exact: true }).click()
+  await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
+}
+
 test.describe('Project workspaces', () => {
   test('non-owner can continue an existing project task without management RPCs', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page, { owner: false })
@@ -322,29 +378,78 @@ test.describe('Project workspaces', () => {
     const state = await installProjectLifecycleRpc(page)
     await openControl(page)
 
-    await page.getByTestId('sidebar-create-project').click()
-
-    let creator = page.getByRole('dialog', { name: 'Create project' })
-    await expect(creator).toBeVisible()
-    await creator
-      .getByRole('button', { name: 'Add a folder OpenSquilla can read and edit', exact: true })
-      .click()
-
-    const picker = page.getByRole('dialog', { name: 'Choose project' })
-    await expect.poll(() => state.pathListRequests.length).toBe(1)
-    expect(state.requestMethods).not.toContain('sandbox.path.pick')
-    await picker.getByRole('option', { name: 'demo', exact: true }).click()
-    await picker.getByRole('button', { name: 'Choose selected directory', exact: true }).click()
-
-    creator = page.getByRole('dialog', { name: 'Create project' })
-    await expect(creator.getByRole('textbox', { name: 'Project name' })).toHaveValue('demo')
-    await creator.getByRole('button', { name: 'Create project', exact: true }).click()
-    await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
+    await submitProjectFromHeader(page)
 
     await expect.poll(() => state.projectPresent).toBe(true)
+    await expect.poll(() => state.pathListRequests.length).toBe(1)
+    expect(state.requestMethods).not.toContain('sandbox.path.pick')
     await expect(page.locator('.sidebar-history-row--workspace')).toHaveCount(1)
     await expect(page.locator('[data-session-key^="draft:project:"]')).toHaveCount(0)
     await expect(page).not.toHaveURL(/project=project-demo/)
+    const toast = page.getByTestId('toast')
+    await expect(toast).toContainText('Created project “demo”')
+    await expect(toast).toHaveClass(/toast--ok/)
+  })
+
+  test('reports an existing project by returned workspace identity', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page)
+    state.projectPresent = true
+    // The picker submits an alias while the server returns its canonical path.
+    // Duplicate detection must use the stable workspace id rather than either string.
+    state.workspacePath = '/canonical/repos/demo'
+    await openControl(page)
+    await expect(page.locator('.sidebar-history-row--workspace')).toHaveCount(1)
+
+    await submitProjectFromHeader(page)
+
+    await expect(page.getByRole('dialog', { name: 'Create project' })).toHaveCount(0)
+    const toast = page.getByTestId('toast')
+    await expect(toast).toContainText(
+      'Project “demo” already exists; using the existing project',
+    )
+    await expect(toast).toHaveClass(/toast--info/)
+    await expect(page.locator('.sidebar-history-row--workspace')).toHaveCount(1)
+    expect(state.workspaceOpenRequests).toHaveLength(1)
+    expect(state.workspaceUpdateRequests).toEqual([])
+    await expect(page).not.toHaveURL(/project=project-demo/)
+  })
+
+  test('renames an existing project and explains the update', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page)
+    state.projectPresent = true
+    await openControl(page)
+    await expect(page.locator('.sidebar-history-row--workspace')).toHaveCount(1)
+
+    await submitProjectFromHeader(page, 'renamed')
+
+    const toast = page.getByTestId('toast')
+    await expect(toast).toContainText(
+      'The project already existed and was renamed to “renamed”',
+    )
+    await expect(toast).toHaveClass(/toast--info/)
+    expect(state.workspaceOpenRequests).toHaveLength(1)
+    expect(state.workspaceUpdateRequests).toEqual([{
+      workspaceId: 'project-demo',
+      name: 'renamed',
+    }])
+    await expect(page.locator('.sidebar-history-row--workspace')).toContainText('renamed')
+  })
+
+  test('keeps open failures distinct from duplicate feedback', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page)
+    state.projectPresent = true
+    state.workspaceOpenError = 'synthetic open failure'
+    await openControl(page)
+    await expect(page.locator('.sidebar-history-row--workspace')).toHaveCount(1)
+
+    await submitProjectFromHeader(page)
+
+    const toast = page.getByTestId('toast')
+    await expect(toast).toContainText('synthetic open failure')
+    await expect(toast).not.toContainText('already exists')
+    await expect(toast).toHaveClass(/toast--danger/)
+    await expect(page.getByRole('dialog', { name: 'Create project' })).toBeVisible()
+    expect(state.workspaceUpdateRequests).toEqual([])
   })
 
   test('project names only disclose tasks while the plus opens a project draft', async ({ page }) => {
@@ -393,6 +498,9 @@ test.describe('Project workspaces', () => {
     const picker = page.getByRole('dialog', { name: 'Choose project' })
     await picker.getByRole('option', { name: 'demo' }).click()
     await picker.getByRole('button', { name: 'Choose selected directory' }).click()
+    const subscriptionsBeforeProject = state.requestMethods
+      .filter(method => method === 'sessions.messages.subscribe')
+      .length
     await page.getByRole('button', { name: 'Trust and open' }).click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=project-demo$/)
     const projectChip = page.locator('.chat-project-chip')
@@ -401,7 +509,7 @@ test.describe('Project workspaces', () => {
     await expect(projectChip).toHaveAttribute('data-status', 'ready')
     await expect.poll(
       () => state.requestMethods.filter(method => method === 'sessions.messages.subscribe').length,
-    ).toBeGreaterThanOrEqual(3)
+    ).toBeGreaterThan(subscriptionsBeforeProject)
     await expect(projectChip).toHaveAttribute('data-status', 'ready')
 
     await page.getByRole('textbox', { name: 'Message to send' }).fill('pwd')

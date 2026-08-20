@@ -240,6 +240,9 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
     config.squilla_router.default_tier = "c1"
     config.llm.provider = "openrouter"
     config.llm.model = _TEXT_MODEL
+    # Synthetic model ids are absent from the production catalog. Declare the
+    # deployment contract exercised by this end-to-end fixture explicitly.
+    config.llm.context_window_tokens = 128_000
     return config
 
 

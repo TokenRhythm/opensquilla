@@ -72,7 +72,7 @@
         data-testid="chat-header-primary-action"
         @click="invoke(primaryAction)"
       >
-        <Icon :name="primaryAction === 'deliverables' ? 'fileText' : 'share'" :size="16" />
+        <Icon :name="primaryActionIcon" :size="16" />
         <span
           v-if="primaryAction === 'deliverables'"
           class="chat-header__count-badge chat-header__count-badge--corner"
@@ -235,9 +235,14 @@ const primaryAction = computed<Action | null>(() => {
   return null
 })
 
-const primaryActionLabel = computed(() => primaryAction.value === 'deliverables'
-  ? deliverablesLabel.value
-  : shareAriaLabel.value)
+const primaryActionLabel = computed(() => {
+  if (primaryAction.value === 'deliverables') return deliverablesLabel.value
+  return shareAriaLabel.value
+})
+const primaryActionIcon = computed<IconName>(() => {
+  if (primaryAction.value === 'deliverables') return 'fileText'
+  return 'share'
+})
 
 const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []

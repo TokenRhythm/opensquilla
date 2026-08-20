@@ -38,6 +38,14 @@ from opensquilla.engine.cache_break_monitor import (
     notify_compaction,
     record_prompt_state,
 )
+from opensquilla.engine.cancellation import (
+    STOP_CANCEL_GRACE_SECONDS,
+    TIMEOUT_CANCEL_GRACE_SECONDS,
+    CancellationPolicy,
+    cancel_task,
+    cancel_tasks,
+    defer_async_cleanup,
+)
 from opensquilla.engine.elevation_triage import RuleAssessment, local_elevation_assessment
 from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep
 from opensquilla.engine.final_diff_contract import (
@@ -63,6 +71,7 @@ from opensquilla.engine.history import (
     limit_turns,
     reconstruct_messages_from_entry,
     repair_tool_pairing,
+    strip_historical_tool_pairs,
 )
 from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
 from opensquilla.engine.post_write_convergence import (
@@ -194,10 +203,14 @@ from opensquilla.provider.correlation_context import bind_provider_request_corre
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
+    IMAGE_INPUT_UNSUPPORTED_CODE,
+    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+    count_provider_image_blocks,
+    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
-    validate_provider_chat_request,
+    validate_provider_chat_admission,
 )
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
@@ -305,6 +318,7 @@ from .types import (
     ThinkingLevel,
     ThinkingStartEvent,
     ToolCall,
+    ToolEffectOutcome,
     ToolResult,
     ToolResultEvent,
     ToolUseDeltaEvent,
@@ -364,20 +378,6 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
-UNSUPPORTED_IMAGE_INPUT_REPLY = (
-    "当前选择的模型暂不支持查看图片，因此无法分析你上传的图片。"
-    "请切换到支持图片的模型，或将图片中的文字和关键信息粘贴到消息中后重试。"
-)
-
-
-def model_explicitly_lacks_vision(capabilities: Any) -> bool:
-    """Return true only when capability data explicitly denies vision."""
-
-    return capabilities is not None and not bool(
-        getattr(capabilities, "supports_vision", False)
-    )
-
-
 _TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
 _TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
     "[Runtime recovery]\n"
@@ -1222,6 +1222,14 @@ _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
 _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_projection:"
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
+_PROMPT_ANNOTATION_WRITER_TOOLS = frozenset({"document_apply", "document_patch"})
+_DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS = 8_192
+_DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS = 256
+_DOCUMENT_MUTATION_FINALIZATION_SYSTEM = (
+    "You are OpenSquilla. No tools are available for this response. "
+    "State the supplied authoritative document outcome concisely in the requested language. "
+    "Do not mention internal protocols, capabilities, identifiers, source text, or paths."
+)
 _AGGREGATE_TOOL_RESULT_MAX_SHARE = 0.25
 # Below this size a duplicate tool result is not worth eliding: the dedup stub
 # itself costs ~200 chars, so tiny repeated payloads would grow, not shrink.
@@ -2417,6 +2425,10 @@ class _IterationStreamTimeoutError(TimeoutError):
 class _RaisedProviderBoundaryError(RuntimeError):
     """Content-free marker for an exception raised by provider call/iteration."""
 
+    def __init__(self, *, timeout: bool) -> None:
+        super().__init__("provider boundary failed")
+        self.timeout = timeout
+
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
 
@@ -2650,6 +2662,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         output_json_schema=chat_cfg.output_json_schema,
         output_json_schema_strict=chat_cfg.output_json_schema_strict,
         model_capabilities=chat_cfg.model_capabilities,
+        model_vision_support=chat_cfg.model_vision_support,
         thinking_level=ThinkingLevel.OFF,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
         context_window_tokens_global_override=(
@@ -2925,6 +2938,11 @@ class Agent:
             )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
+        # Set only after a restricted PromptAnnotation provider emits the
+        # writer identity. This is an ephemeral proposal observation; durable
+        # state begins only after document_apply validates and reserves commit.
+        self._active_artifact_writer_intent_id: str | None = None
+        self._artifact_writer_rejected_proposal_digests: set[str] = set()
         # Test-only offline failure seam. ``None`` on every production path,
         # so the provider chat call below stays byte-identical to before when
         # it is unset; a test passes an explicit FailureInjector to script the
@@ -3043,6 +3061,15 @@ class Agent:
             return ErrorEvent(
                 message="Context compaction did not reduce the provider request.",
                 code="compaction_not_smaller",
+            )
+        if reason == "restricted_turn_compaction_disabled":
+            return ErrorEvent(
+                message=(
+                    "The restricted artifact request is too large. Durable session "
+                    "history was not changed or sent to an auxiliary model; retry "
+                    "with fewer annotations or a larger-context model."
+                ),
+                code="provider_request_too_large",
             )
         if reason in {
             "provider_native_overflow_after_admission",
@@ -3358,6 +3385,7 @@ class Agent:
             model_capabilities=(
                 resolved_capabilities
             ),
+            model_vision_support=self.config.model_vision_support,
             thinking_level=(
                 self.config.thinking
                 if isinstance(self.config.thinking, ThinkingLevel)
@@ -3517,6 +3545,8 @@ class Agent:
             history,
             preserve_reasoning_content=preserve_reasoning_content,
         )
+        if self._restricted_tool_boundary_active():
+            history, _restricted_projection = strip_historical_tool_pairs(history)
         history = repair_tool_pairing(history)
         history = drop_reasoning(
             history,
@@ -3576,7 +3606,7 @@ class Agent:
 
         summary_context = (
             format_compaction_summary_context([replay_summary])
-            if replay_summary.strip()
+            if replay_summary.strip() and not self._restricted_tool_boundary_active()
             else None
         )
         existing_context: str | None = self.config.request_context_prompt
@@ -4037,6 +4067,18 @@ class Agent:
             timeout = max(timeout, argument_timeout)
         return timeout
 
+    def _tool_cancellation_policy(self, tool_call: ToolCall) -> CancellationPolicy:
+        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
+        policy = getattr(tool_def, "cancellation_policy", "bounded")
+        return "must_settle" if policy == "must_settle" else "bounded"
+
+    def _tool_effect_observation(self) -> tuple[int, int, int]:
+        return (
+            len(self._workspace_mutation_receipts()),
+            len(self._workspace_write_records()),
+            len(self._scratch_write_records()),
+        )
+
     def _tool_activity_heartbeat_interval(self) -> float:
         raw_interval = self.config.metadata.get("tool_activity_heartbeat_interval", 15.0)
         try:
@@ -4103,7 +4145,36 @@ class Agent:
             **payload,
         )
 
-    def _switch_to_invalid_response_fallback(self, reason: str) -> bool:
+    def _switch_to_invalid_response_fallback(
+        self,
+        reason: str,
+        *,
+        requires_vision: bool = False,
+    ) -> bool:
+        if requires_vision:
+            constrained_fallback = getattr(
+                self.provider,
+                "fallback_after_invalid_response_with_capabilities",
+                None,
+            )
+            if not callable(constrained_fallback):
+                return False
+            try:
+                return bool(
+                    constrained_fallback(
+                        reason,
+                        requires_vision=True,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - fallback support is optional
+                logger.warning(
+                    "provider.invalid_response_fallback_failed",
+                    session_key=self._session_key,
+                    reason=reason,
+                    requires_vision=True,
+                    error=str(exc),
+                )
+                return False
         fallback = getattr(self.provider, "fallback_after_invalid_response", None)
         if not callable(fallback):
             return False
@@ -4118,24 +4189,67 @@ class Agent:
             )
             return False
 
-    def _provider_local_terminal_reply(
+    def _new_reasoning_only_act_now_message(
         self,
-        messages: list[Message],
-        config: ChatConfig,
-    ) -> str | None:
-        local_reply = getattr(self.provider, "local_terminal_reply", None)
-        if not callable(local_reply):
-            return None
-        try:
-            reply = local_reply(messages, config)
-        except Exception as exc:  # noqa: BLE001 - optional preflight must be isolated
-            logger.warning(
-                "provider.local_terminal_reply_failed",
-                session_key=self._session_key,
-                error=str(exc),
-            )
-            return None
-        return reply if isinstance(reply, str) and reply else None
+        *,
+        iteration: int,
+        attempt: int,
+        reasoning_content: str | None,
+        provider_default_reasoning: bool,
+    ) -> Message:
+        message = Message(
+            role="user",
+            content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+        )
+        append_runtime_event(
+            self.config.runtime_events_path,
+            {
+                "feature": "reasoning_only_act_now",
+                "name": "reasoning_only_act_now.injected",
+                "action": "retry_with_act_now_directive",
+                "reason": "provider_reasoning_only",
+                "provider_default_reasoning": provider_default_reasoning,
+                "iteration": iteration,
+                "attempt": attempt,
+                "reasoning_chars": len(reasoning_content or ""),
+                "session_key": self._session_key,
+                "agent_id": (
+                    self.config.tool_result_store_agent_id
+                    or self.config.metadata.get("agent_id")
+                ),
+            },
+        )
+        return message
+
+    def _provider_log_identity(self, observed_provider: str = "") -> str:
+        return (
+            str(getattr(self.provider, "active_provider_id", "") or "").strip()
+            or str(observed_provider or "").strip()
+            or str(self.config.provider_id or "").strip()
+            or str(getattr(self.provider, "provider_name", "") or "").strip()
+            or type(self.provider).__name__
+        )
+
+    def _log_reasoning_output_budget_exhausted(
+        self,
+        *,
+        model: str,
+        observed_provider: str,
+        configured_max_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        reasoning_content: str | None,
+    ) -> None:
+        logger.warning(
+            "provider.reasoning_output_budget_exhausted",
+            session_key=self._session_key,
+            model=model,
+            provider=self._provider_log_identity(observed_provider),
+            configured_max_tokens=configured_max_tokens,
+            iter_output_tokens=output_tokens,
+            iter_reasoning_tokens=reasoning_tokens,
+            reasoning_chars=len(reasoning_content or ""),
+        )
 
     @staticmethod
     def _tool_call_string_arg(
@@ -5760,6 +5874,8 @@ class Agent:
             artifacts=list(guarded_result.artifacts),
             execution_status=guarded_result.execution_status,
             terminates_turn=guarded_result.terminates_turn,
+            effect_outcome=guarded_result.effect_outcome,
+            terminal_response_text=guarded_result.terminal_response_text,
         )
 
     async def _project_tool_result_for_llm(
@@ -5832,6 +5948,8 @@ class Agent:
                     else None
                 ),
                 terminates_turn=result.terminates_turn,
+                effect_outcome=result.effect_outcome,
+                terminal_response_text=result.terminal_response_text,
             )
             self.config.metadata["tool_json_guard_applied"] = True
             self.config.metadata["tool_json_guard_calls"] = (
@@ -6169,6 +6287,8 @@ class Agent:
             artifacts=list(result.artifacts),
             execution_status=result.execution_status,
             terminates_turn=result.terminates_turn,
+            effect_outcome=result.effect_outcome,
+            terminal_response_text=result.terminal_response_text,
         )
 
     async def _canonicalize_tool_result(
@@ -6287,6 +6407,8 @@ class Agent:
                     else None
                 ),
                 terminates_turn=result.terminates_turn,
+                effect_outcome=result.effect_outcome,
+                terminal_response_text=result.terminal_response_text,
             )
         mode = self._tool_result_compression_mode()
         if mode == "off" or not self._tool_result_over_budget(result.content):
@@ -6315,6 +6437,8 @@ class Agent:
                 else None
             ),
             terminates_turn=result.terminates_turn,
+            effect_outcome=result.effect_outcome,
+            terminal_response_text=result.terminal_response_text,
         )
 
     # ------------------------------------------------------------------
@@ -6477,8 +6601,9 @@ class Agent:
             clear_sandbox_approval_denials,
             prune_once_mount_grants,
         )
-
         self._prompt_cache_keepalive_candidate = None
+        self._active_artifact_writer_intent_id = None
+        self._artifact_writer_rejected_proposal_digests.clear()
 
         try:
             if self._session_key:
@@ -6508,10 +6633,36 @@ class Agent:
                 ):
                     yield event
         finally:
+            writer_cleanup = asyncio.create_task(
+                self._finalize_unresolved_artifact_writer_intent()
+            )
+            writer_cleanup_cancelled = False
+            while not writer_cleanup.done():
+                try:
+                    await asyncio.shield(writer_cleanup)
+                except asyncio.CancelledError:
+                    writer_cleanup_cancelled = True
+            writer_cleanup.result()
+            self._active_artifact_writer_intent_id = None
             self._terminalize_pending_durable_compaction(
                 status="cancelled",
                 reason="turn_closed_before_compaction_install",
             )
+            # Process-local authorities are cleared only after the turn
+            # generator has persisted/streamed its final tool result, but on
+            # every terminal path (including cancellation and provider abort)
+            # before this ToolContext can be reused or discarded.
+            if self._tool_context is not None:
+                callbacks = tuple(self._tool_context.turn_cleanup_callbacks)
+                self._tool_context.turn_cleanup_callbacks.clear()
+                for callback in callbacks:
+                    try:
+                        callback()
+                    except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
+                        logger.warning(
+                            "agent.turn_authority_cleanup_failed",
+                            exc_info=True,
+                        )
             approval_cleanup = asyncio.create_task(
                 clear_approval_run_context_deltas_for_tool_context(
                     self._tool_context,
@@ -6525,6 +6676,8 @@ class Agent:
                     cleanup_wait_cancelled = True
             approval_cleanup.result()
             if cleanup_wait_cancelled:
+                raise asyncio.CancelledError
+            if writer_cleanup_cancelled:
                 raise asyncio.CancelledError
 
     async def _turn_generator(
@@ -6622,25 +6775,36 @@ class Agent:
             _ = terminates  # always terminates today; reserved for future
             return
 
-        current_turn_image_count = self._count_image_blocks(extra_messages or [])
-        if current_turn_image_count > 0 and model_explicitly_lacks_vision(
-            self.config.model_capabilities
-        ):
+        current_turn_image_count = count_provider_image_blocks(extra_messages or [])
+        forced_image_rejection = str(
+            self.config.metadata.get("image_input_forced_rejection_reason") or ""
+        ).strip()
+        image_admission_error = image_input_admission_error(
+            extra_messages or [],
+            vision_support=(
+                "unsupported"
+                if forced_image_rejection
+                else self.config.model_vision_support
+            ),
+        )
+        if forced_image_rejection or image_admission_error is not None:
+            image_input_reason = forced_image_rejection or "model_vision_unsupported"
             self.config.metadata["image_input_mode"] = "rejected"
-            self.config.metadata["image_input_reason"] = "vision_unsupported"
+            self.config.metadata["image_input_reason"] = image_input_reason
             self.config.metadata["image_input_count"] = current_turn_image_count
+            self.config.metadata["image_input_stage"] = "primary"
             self._write_turn_call_log(
                 "image_input_preflight",
-                action="terminal_reply",
-                reason="vision_unsupported",
+                action="reject",
+                reason=image_input_reason,
                 model=self.config.model_id or "",
                 image_count=current_turn_image_count,
             )
-            async for ev in self._emit_terminal_text(
-                UNSUPPORTED_IMAGE_INPUT_REPLY,
-                iterations=0,
-            ):
-                yield ev
+            yield self._transition(AgentState.ERROR)
+            yield ErrorEvent(
+                message=IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+                code=IMAGE_INPUT_UNSUPPORTED_CODE,
+            )
             return
 
         # Use the system prompt from config (wired by gateway via identity.prompt)
@@ -6688,6 +6852,12 @@ class Agent:
             preserve_reasoning_content=preserve_reasoning_content,
             recoverable_references=recoverable_references,
         )
+        restricted_history_projection = None
+        if self._restricted_tool_boundary_active():
+            (
+                sanitized_history,
+                restricted_history_projection,
+            ) = strip_historical_tool_pairs(sanitized_history)
         sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
             sanitized_history,
@@ -6709,6 +6879,11 @@ class Agent:
             sanitized_history,
             sanitize=sanitize_result,
             historical_projection=historical_projection_result.__dict__,
+            restricted_history_projection=(
+                restricted_history_projection.__dict__
+                if restricted_history_projection is not None
+                else None
+            ),
         )
         history = limit_turns(sanitized_history, self.config.max_history_turns)
         history = repair_tool_pairing(history)
@@ -6897,10 +7072,32 @@ class Agent:
         turn_model_usage_breakdown: list[dict[str, Any]] = []
         last_ensemble_trace: dict[str, Any] | None = None
         turn_ensemble_request_count = 0
+        ensemble_continuation_request_count: int | None = None
+        ensemble_continuation_provider: object | None = None
+
+        def _merge_ensemble_request_count(
+            trace: dict[str, Any],
+            continuation_baseline: int | None,
+        ) -> int:
+            nonlocal last_ensemble_trace, turn_ensemble_request_count
+
+            last_ensemble_trace = dict(trace)
+            reported_count = _usage_int(trace.get("llm_request_count") or 0)
+            if continuation_baseline is None:
+                turn_ensemble_request_count += reported_count
+            else:
+                turn_ensemble_request_count += max(
+                    0,
+                    reported_count - continuation_baseline,
+                )
+            return reported_count
+
         terminal_error: ErrorEvent | None = None
         terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
+        router_model_call_id = ""
+        router_iteration = 0
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -6913,6 +7110,133 @@ class Agent:
         max_iterations_deadline_extension_logged = False
         post_write_convergence_finalization_pending = False
         post_write_convergence_finalization_message: Message | None = None
+        document_mutation_finalization_pending = False
+        document_mutation_finalization_attempted = False
+        document_mutation_finalization_message: Message | None = None
+        document_mutation_outcome: dict[str, Any] | None = None
+        # A prompt annotation is ordinary request context until the provider
+        # actually starts ``document_apply``.  Keeping this separate from the
+        # presence of a writer controller prevents read/answer-only turns from
+        # manufacturing a mutation outcome or spending a second provider call
+        # on the mutation-only finalizer.
+        document_mutation_attempted = False
+
+        def _document_mutation_response_locale() -> str:
+            configured = str(
+                self.config.metadata.get("locale")
+                or self.config.metadata.get("language")
+                or "en"
+            ).strip()
+            if not re.fullmatch(
+                r"[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*",
+                configured,
+            ):
+                configured = "en"
+            language_samples = [str(self._current_turn_message or "")]
+            artifact_context = getattr(self._tool_context, "artifact_context", None)
+            snapshots = getattr(artifact_context, "snapshots", ())
+            if isinstance(snapshots, (list, tuple)):
+                language_samples.extend(
+                    str(snapshot.get("body") or "")
+                    for snapshot in snapshots[:16]
+                    if isinstance(snapshot, Mapping)
+                )
+            combined = "\n".join(language_samples)
+            if re.search(r"[\u3040-\u30ff]", combined):
+                return "ja"
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", combined):
+                return "zh-Hans"
+            return configured
+
+        def _document_mutation_finalization_request() -> list[Message]:
+            raw_outcome = dict(document_mutation_outcome or {})
+            if not raw_outcome:
+                raw_outcome = {
+                    "version": 1,
+                    "status": "not_attempted",
+                    "phase": "proposal",
+                    "retryPolicy": "new_turn",
+                    "code": "document_mutation_not_proposed",
+                }
+            requested_locale = _document_mutation_response_locale()
+            payload = {
+                "language": requested_locale,
+                "status": str(raw_outcome.get("status") or "not_attempted"),
+            }
+            return [
+                Message(
+                    role="user",
+                    content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                )
+            ]
+
+        def _document_mutation_fallback_text() -> str:
+            outcome = document_mutation_outcome or {}
+            status = str(outcome.get("status") or "not_attempted")
+            locale = _document_mutation_response_locale().lower()
+            language = re.split(r"[-_]", locale, maxsplit=1)[0]
+            translations = {
+                "en": {
+                    "applied": "The document changes were applied.",
+                    "conflict": "The document changed; refresh it before trying again.",
+                    "ambiguous": (
+                        "The change result is uncertain; refresh and verify the version."
+                    ),
+                    "not_applied": "The document changes were not applied.",
+                    "not_attempted": "No document change was made.",
+                },
+                "zh": {
+                    "applied": "文档修改已成功应用。",
+                    "conflict": "文档已发生变化，请刷新后重试。",
+                    "ambiguous": "修改结果暂时无法确认，请刷新并核对版本。",
+                    "not_applied": "文档修改未能应用。",
+                    "not_attempted": "本次没有修改文档。",
+                },
+                "de": {
+                    "applied": "Die Dokumentänderungen wurden angewendet.",
+                    "conflict": (
+                        "Das Dokument wurde geändert; aktualisieren Sie es vor einem "
+                        "neuen Versuch."
+                    ),
+                    "ambiguous": (
+                        "Das Änderungsergebnis ist ungewiss; aktualisieren Sie die "
+                        "Ansicht und prüfen Sie die Version."
+                    ),
+                    "not_applied": "Die Dokumentänderungen wurden nicht angewendet.",
+                    "not_attempted": "Das Dokument wurde nicht geändert.",
+                },
+                "es": {
+                    "applied": "Se aplicaron los cambios del documento.",
+                    "conflict": (
+                        "El documento cambió; actualízalo antes de volver a intentarlo."
+                    ),
+                    "ambiguous": (
+                        "El resultado del cambio es incierto; actualiza y verifica la versión."
+                    ),
+                    "not_applied": "No se aplicaron los cambios del documento.",
+                    "not_attempted": "No se modificó el documento.",
+                },
+                "fr": {
+                    "applied": "Les modifications du document ont été appliquées.",
+                    "conflict": (
+                        "Le document a changé ; actualisez-le avant de réessayer."
+                    ),
+                    "ambiguous": (
+                        "Le résultat est incertain ; actualisez et vérifiez la version."
+                    ),
+                    "not_applied": "Les modifications du document n’ont pas été appliquées.",
+                    "not_attempted": "Le document n’a pas été modifié.",
+                },
+                "ja": {
+                    "applied": "文書の変更を適用しました。",
+                    "conflict": "文書が変更されています。更新してから再試行してください。",
+                    "ambiguous": "変更結果を確認できません。更新して版を確認してください。",
+                    "not_applied": "文書の変更は適用されませんでした。",
+                    "not_attempted": "文書は変更されませんでした。",
+                },
+            }
+            messages = translations.get(language, translations["en"])
+            return messages.get(status, messages["not_attempted"])
         placeholder_offense_iterations = 0
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
@@ -7080,6 +7404,16 @@ class Agent:
         # and per-tool execution budget.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
+        document_mutation_summary_deadline: float | None = None
+        document_mutation_summary_deadline_candidate: float | None = None
+        if _total_deadline is not None and self._artifact_writer_controller() is not None:
+            summary_reserve_seconds = min(
+                15.0,
+                max(1.0, float(self.config.timeout) * 0.1),
+            )
+            document_mutation_summary_deadline_candidate = (
+                _total_deadline - summary_reserve_seconds
+            )
 
         # Endgame git freeze: once remaining wall clock drops below the margin,
         # the shell tools block workspace-reverting git commands outright so
@@ -7174,9 +7508,58 @@ class Agent:
                 )
             return True
 
-        tools_supported = True
-        if self.config.model_capabilities is not None:
-            tools_supported = bool(getattr(self.config.model_capabilities, "supports_tools", True))
+        configured_capabilities = self.config.model_capabilities
+        tools_supported = (
+            True
+            if configured_capabilities is None
+            else bool(getattr(configured_capabilities, "supports_tools", True))
+        )
+        artifact_tools_verified = bool(
+            self.config.model_tools_capability_verified
+            and configured_capabilities is not None
+            and getattr(configured_capabilities, "supports_tools", False)
+        )
+        artifact_operation = str(metadata.get("artifact_operation_class") or "").strip()
+        artifact_requires_verified_tools = artifact_operation in {
+            "selection_edit",
+            "structural_edit",
+            "conflict_recovery",
+        }
+        if (
+            artifact_requires_verified_tools
+            and self.tool_definitions
+            and not artifact_tools_verified
+        ):
+            self._write_turn_call_log(
+                "turn_policy_decision",
+                action="answer_without_tools",
+                reason="artifact_model_tools_unsupported",
+                code="artifact_model_tools_unsupported",
+                artifact_operation_class=artifact_operation,
+            )
+            if self._artifact_writer_controller() is not None:
+                # Selection context is still useful to a text-only model. Hide
+                # document tools and let the ordinary answer path complete;
+                # no writer intent exists, so there is no mutation outcome.
+                tools_supported = False
+                yield WarningEvent(
+                    code="artifact_model_tools_unsupported",
+                    message=(
+                        "The selected model is not verified for document tool calling; "
+                        "it can still answer from the selected context."
+                    ),
+                )
+            else:
+                terminal_error = ErrorEvent(
+                    message=(
+                        "The selected model is not verified for tool calling, so the artifact "
+                        "was left unchanged. Choose a tool-capable model and retry."
+                    ),
+                    code="artifact_model_tools_unsupported",
+                )
+                yield self._transition(AgentState.ERROR)
+                yield terminal_error
+                return
         provider_tool_definitions = self.tool_definitions or None
         if not tools_supported:
             provider_tool_definitions = None
@@ -7708,7 +8091,43 @@ class Agent:
                         max_iterations_guidance = (
                             "Set AgentConfig.max_iterations=0 for unlimited tasks."
                         )
-                    if not max_iterations_finalization_attempted:
+                    if (
+                        self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        if not document_mutation_finalization_pending:
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            if not prior_outcome or prior_outcome.get("retryPolicy") == "same_turn":
+                                document_mutation_outcome = {
+                                    "version": 1,
+                                    "status": str(
+                                        prior_outcome.get("status") or "not_attempted"
+                                    ),
+                                    "phase": str(prior_outcome.get("phase") or "proposal"),
+                                    "retryPolicy": "new_turn",
+                                    "code": "document_mutation_iteration_budget_exhausted",
+                                }
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document proposal budget is closed. Do not call "
+                                    "tools. Summarize only the authoritative mutation outcome."
+                                ),
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="document_outcome_finalize",
+                            reason="max_iterations",
+                            code="document_mutation_iteration_budget_exhausted",
+                            iteration=iterations,
+                            max_iterations=self.config.max_iterations,
+                            max_iterations_source=max_iterations_source,
+                        )
+                    elif not max_iterations_finalization_attempted:
                         max_iterations_finalization_attempted = True
                         max_iterations_finalization_pending = True
                         max_iterations_finalization_message = Message(
@@ -7752,6 +8171,32 @@ class Agent:
                 # Check total turn deadline (if configured)
                 if _total_deadline is not None and _loop.time() > _total_deadline:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                if (
+                    document_mutation_summary_deadline is not None
+                    and document_mutation_attempted
+                    and _loop.time() >= document_mutation_summary_deadline
+                    and not document_mutation_finalization_pending
+                    and not document_mutation_finalization_attempted
+                ):
+                    prior_outcome = dict(document_mutation_outcome or {})
+                    if not prior_outcome or prior_outcome.get("retryPolicy") == "same_turn":
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": str(prior_outcome.get("status") or "not_attempted"),
+                            "phase": str(prior_outcome.get("phase") or "proposal"),
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_time_budget_exhausted",
+                        }
+                    document_mutation_finalization_pending = True
+                    document_mutation_finalization_message = Message(
+                        role="user",
+                        content=(
+                            "The document turn time budget is closing. Do not call tools. "
+                            "Summarize only the authoritative mutation outcome."
+                        ),
+                    )
+                    final_text_parts.clear()
+                    applied_model_call_boundaries.clear()
 
                 # Pre-deadline wrap-up: arm once when remaining wall clock drops
                 # below the configured margin. The directive is spliced into
@@ -7871,6 +8316,9 @@ class Agent:
                 iter_reasoning_content: str | None = None
                 iter_thinking_signature: str | None = None
                 provider_error: ProviderErrorEvent | None = None
+                guarded_writer_intent_id: str | None = None
+                guarded_writer_stream_failure: str | None = None
+                guarded_writer_ids: list[str] = []
 
                 _retry_attempt = 0
                 _call_attempt = 0
@@ -7902,6 +8350,9 @@ class Agent:
                     if self._execution_context is not None:
                         self._execution_context.drop_pending_tool_buffers("provider_retry")
                     seen_tool_use_ids: set[str] = set()
+                    guarded_writer_intent_id = None
+                    guarded_writer_stream_failure = None
+                    guarded_writer_ids = []
                     # Plain assistant text streams live as the answer the moment it
                     # arrives. text_presentation_decided flips to True once a tool
                     # appears this call, after which later text is tagged as
@@ -7941,6 +8392,38 @@ class Agent:
                         return event
 
                     call_started_at = time.monotonic()
+                    max_llm_calls = self._positive_int(
+                        getattr(self.config, "max_turn_llm_calls", 0)
+                    )
+                    if (
+                        self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_pending
+                        and not document_mutation_finalization_attempted
+                        and max_llm_calls is not None
+                        and turn_llm_calls + 1 >= max_llm_calls
+                    ):
+                        # Once mutation intent exists, reserve the final
+                        # ordinary provider-call slot for a tool-free summary.
+                        # If intent first appears in that last ordinary call,
+                        # the admission gate below still permits exactly one
+                        # mutation-only finalizer beyond the ordinary cap.
+                        document_mutation_finalization_pending = True
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": "not_attempted",
+                            "phase": "proposal",
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_finalization_budget_reserved",
+                        }
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document mutation tool budget is now closed. "
+                                "Do not call tools. Summarize the observed mutation outcome "
+                                "for the user in their language."
+                            ),
+                        )
                     provider_tools_for_call = (
                         None
                         if (
@@ -7948,6 +8431,7 @@ class Agent:
                             or goal_terminal_final_response_pending
                             or max_iterations_finalization_pending
                             or post_write_convergence_finalization_pending
+                            or document_mutation_finalization_pending
                         )
                         else provider_tool_definitions
                     )
@@ -7971,6 +8455,7 @@ class Agent:
                         and not goal_terminal_final_response_pending
                         and not max_iterations_finalization_pending
                         and not post_write_convergence_finalization_pending
+                        and not document_mutation_finalization_pending
                     )
                     ignored_post_delivery_tool_use = False
                     if message_count_request_view is not None:
@@ -7993,11 +8478,17 @@ class Agent:
                         active_protected_turn_start_index = current_turn_start_index
 
                     request_suffix_messages: list[Message] = []
+                    reasoning_only_act_now_for_call: Message | None = None
                     if goal_terminal_final_response_pending:
                         # The terminal Goal ToolResult is sufficient context for
                         # one ordinary summary. Do not splice work/recovery
                         # directives after the durable terminal decision.
                         request_suffix_messages = []
+                    elif (
+                        document_mutation_finalization_pending
+                        and document_mutation_finalization_message is not None
+                    ):
+                        request_suffix_messages = [document_mutation_finalization_message]
                     elif (
                         post_write_convergence_finalization_pending
                         and post_write_convergence_finalization_message is not None
@@ -8017,6 +8508,7 @@ class Agent:
                         # request. Withheld on an assistant tail for the same
                         # reasoning-prefill reason as below.
                         request_suffix_messages = [reasoning_only_act_now_message]
+                        reasoning_only_act_now_for_call = reasoning_only_act_now_message
                     elif deadline_wrapup_message is not None and (
                         not turn_messages or turn_messages[-1].role != "assistant"
                     ):
@@ -8063,21 +8555,30 @@ class Agent:
                         call_retrieval_available
                     )
                     try:
-                        (
-                            request_messages,
-                            request_sanitize_result,
-                        ) = await self._provider_request_messages_with_sanitize_async(
-                            request_turn_messages,
-                            request_context_message=request_context_message,
-                            request_context_insert_index=(
-                                active_request_context_insert_index
-                            ),
-                            runtime_context_message=runtime_context_message,
-                            runtime_context_insert_index=(
-                                active_runtime_context_insert_index
-                            ),
-                            turn_objective_message=turn_objective_message,
-                        )
+                        if (
+                            document_mutation_finalization_pending
+                            and not goal_terminal_final_response_pending
+                        ):
+                            # Outcome-only request view: never replay this turn's
+                            # source pages, grants, runtime paths, or tool pairs into
+                            # the final response call.
+                            request_messages, request_sanitize_result = (
+                                sanitize_session_messages(
+                                    _document_mutation_finalization_request()
+                                )
+                            )
+                        else:
+                            (
+                                request_messages,
+                                request_sanitize_result,
+                            ) = await self._provider_request_messages_with_sanitize_async(
+                                request_turn_messages,
+                                request_context_message=request_context_message,
+                                request_context_insert_index=active_request_context_insert_index,
+                                runtime_context_message=runtime_context_message,
+                                runtime_context_insert_index=active_runtime_context_insert_index,
+                                turn_objective_message=turn_objective_message,
+                            )
                     except Exception as exc:
                         if not goal_terminal_final_response_pending:
                             raise
@@ -8099,31 +8600,10 @@ class Agent:
                         self._provider_call_tool_result_retrieval_available = (
                             previous_call_retrieval
                         )
-                    local_terminal_reply = self._provider_local_terminal_reply(
-                        request_messages,
-                        chat_cfg,
-                    )
-                    if local_terminal_reply is not None:
-                        assistant_text_parts = [local_terminal_reply]
-                        attempt_user_visible_emitted = True
-                        _got_done_event = True
-                        provider_done_for_log = ProviderDoneEvent(
-                            stop_reason="end_turn",
-                            input_tokens=0,
-                            output_tokens=0,
-                            model=self.config.model_id or "",
-                        )
-                        self._write_turn_call_log(
-                            "provider_local_terminal_reply",
-                            reason=self.config.metadata.get("image_input_reason", ""),
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield TextDeltaEvent(text=local_terminal_reply)
-                        break
-                    validation_error = validate_provider_chat_request(
+                    validation_error = validate_provider_chat_admission(
                         self.provider,
                         request_messages,
+                        chat_cfg,
                     )
                     if validation_error is not None:
                         terminal_error = ErrorEvent(
@@ -8142,6 +8622,39 @@ class Agent:
                             terminal_error = None
                             yield TextDeltaEvent(text=response_text)
                         else:
+                            if terminal_error.code == IMAGE_INPUT_UNSUPPORTED_CODE:
+                                exact_image_count = count_provider_image_blocks(
+                                    request_messages
+                                )
+                                self.config.metadata["image_input_mode"] = "rejected"
+                                self.config.metadata.setdefault(
+                                    "image_input_reason",
+                                    "model_vision_unsupported",
+                                )
+                                self.config.metadata["image_input_count"] = (
+                                    exact_image_count
+                                )
+                                self.config.metadata.setdefault(
+                                    "image_input_stage",
+                                    "primary",
+                                )
+                                self._write_turn_call_log(
+                                    "image_input_preflight",
+                                    action="reject",
+                                    reason=str(
+                                        self.config.metadata.get("image_input_reason")
+                                        or "model_vision_unsupported"
+                                    ),
+                                    stage=str(
+                                        self.config.metadata.get("image_input_stage")
+                                        or "primary"
+                                    ),
+                                    image_count=int(
+                                        self.config.metadata.get("image_input_count") or 0
+                                    ),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
                             self._write_turn_call_log(
                                 "turn_policy_decision",
                                 action="stop",
@@ -8227,7 +8740,33 @@ class Agent:
                         sanitize=request_sanitize_result,
                     )
 
-                    terminal_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    reserved_document_finalizer = bool(
+                        document_mutation_finalization_pending
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    )
+                    # The reserved call is outside the ordinary call budget
+                    # only when document_apply first appeared in its last
+                    # available call. ``document_mutation_finalization_attempted``
+                    # closes this exception before provider I/O, so it cannot
+                    # admit a retry or a second summary.
+                    next_call_budget_error = _turn_llm_call_budget_error(
+                        turn_llm_calls + 1
+                    )
+                    terminal_error = (
+                        None if reserved_document_finalizer else next_call_budget_error
+                    )
+                    if reserved_document_finalizer and next_call_budget_error is not None:
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="document_outcome_finalize",
+                            reason="reserved_finalization_call",
+                            code="document_mutation_finalization_reserved",
+                            sent_llm_calls=turn_llm_calls,
+                            admitted_llm_call=turn_llm_calls + 1,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
                     if terminal_error is not None:
                         self._write_turn_call_log(
                             "turn_policy_decision",
@@ -8277,6 +8816,42 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
+                    if (
+                        self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
+                    ):
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "max_tokens": max(
+                                    1,
+                                    min(
+                                        int(call_chat_cfg.max_tokens),
+                                        _DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS,
+                                    ),
+                                ),
+                            }
+                        )
+                    if document_mutation_finalization_pending:
+                        # The finalizer is an outcome-only presentation call,
+                        # not another planning step. Keep both its prompt and
+                        # output budget independent from the restricted tool
+                        # turn so no capability names or long reasoning stream
+                        # can leak into this one-shot request.
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "max_tokens": max(
+                                    1,
+                                    min(
+                                        int(call_chat_cfg.max_tokens),
+                                        _DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS,
+                                    ),
+                                ),
+                                "system": _DOCUMENT_MUTATION_FINALIZATION_SYSTEM,
+                                "thinking": False,
+                                "thinking_level": None,
+                                "tool_choice": None,
+                            }
+                        )
                     if goal_terminal_final_response_pending:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={"tool_choice": None}
@@ -8422,6 +8997,32 @@ class Agent:
                         call_id=call_id,
                         tools_supported=tools_supported_for_call,
                     )
+                    if document_mutation_finalization_pending:
+                        document_mutation_finalization_attempted = True
+                    ensemble_request_count_baseline: int | None = None
+                    if ensemble_continuation_provider is self.provider:
+                        ensemble_request_count_baseline = (
+                            ensemble_continuation_request_count
+                        )
+                    ensemble_continuation_request_count = None
+                    ensemble_continuation_provider = None
+                    if (
+                        ensemble_request_count_baseline is None
+                        and self._execution_context is not None
+                        and getattr(
+                            self.provider, "execution_context_aware", False
+                        )
+                    ):
+                        continuation_snapshot = (
+                            self._execution_context.ensemble_continuation_snapshot
+                        )
+                        if (
+                            continuation_snapshot is not None
+                            and continuation_snapshot.request_started
+                        ):
+                            ensemble_request_count_baseline = (
+                                continuation_snapshot.physical_request_count
+                            )
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -8518,12 +9119,14 @@ class Agent:
                                 )
                         except (asyncio.CancelledError, UsageAccountingUnavailableError):
                             raise
-                        except Exception:  # noqa: BLE001 - provider boundary
+                        except Exception as exc:  # noqa: BLE001 - provider boundary
                             # Never retain upstream prose on the exception that
                             # crosses into the agent loop.  The original
                             # exception is deliberately not chained because SDK
                             # messages may contain response bodies or secrets.
-                            raise _RaisedProviderBoundaryError from None
+                            raise _RaisedProviderBoundaryError(
+                                timeout=isinstance(exc, TimeoutError)
+                            ) from None
                         raw_stream = guard_provider_text_stream(raw_stream)
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event
@@ -8532,19 +9135,40 @@ class Agent:
                             else None
                         )
 
-                        def _pending_install_stream_deadline() -> float | None:
+                        def _active_stream_deadline() -> float | None:
                             pending_event = self._pending_durable_compaction_event
-                            return (
+                            pending_deadline = (
                                 pending_event.compaction_deadline_at_monotonic
                                 if pending_event is not None
                                 else None
                             )
+                            mutation_deadline = (
+                                document_mutation_summary_deadline
+                                if document_mutation_attempted
+                                and not document_mutation_finalization_pending
+                                and not document_mutation_finalization_attempted
+                                else None
+                            )
+                            deadlines = [
+                                deadline
+                                for deadline in (pending_deadline, mutation_deadline)
+                                if deadline is not None
+                            ]
+                            return min(deadlines) if deadlines else None
 
+                        provider_stream_deadline = _total_deadline
+                        if (
+                            document_mutation_summary_deadline is not None
+                            and document_mutation_attempted
+                            and not document_mutation_finalization_pending
+                            and not document_mutation_finalization_attempted
+                        ):
+                            provider_stream_deadline = document_mutation_summary_deadline
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
-                            total_deadline=_total_deadline,
-                            deadline_provider=_pending_install_stream_deadline,
+                            total_deadline=provider_stream_deadline,
+                            deadline_provider=_active_stream_deadline,
                         ):
                             if isinstance(raw_ev, ProviderGenerationResetEvent):
                                 if (
@@ -8704,12 +9328,11 @@ class Agent:
                                         last_actual_provider = last_item.provider
                                         last_actual_model = last_item.model
                                     if isinstance(raw_ev.ensemble_trace, dict):
-                                        last_ensemble_trace = dict(raw_ev.ensemble_trace)
-                                        turn_ensemble_request_count += _usage_int(
-                                            raw_ev.ensemble_trace.get(
-                                                "llm_request_count"
+                                        ensemble_request_count_baseline = (
+                                            _merge_ensemble_request_count(
+                                                raw_ev.ensemble_trace,
+                                                ensemble_request_count_baseline,
                                             )
-                                            or 0
                                         )
                                     provider_error_for_log = ProviderErrorEvent(
                                         message=(
@@ -8840,14 +9463,27 @@ class Agent:
                                 )
 
                             elif isinstance(raw_ev, ProviderTextDelta):
+                                if raw_ev.text and not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if raw_ev.text:
                                     reasoning_end = _finish_reasoning_block("completed")
                                     if reasoning_end is not None:
                                         yield reasoning_end
                                 assistant_text_parts.append(raw_ev.text)
-                                if raw_ev.text:
+                                buffer_document_finalizer = bool(
+                                    document_mutation_finalization_pending
+                                    and document_mutation_finalization_attempted
+                                )
+                                if raw_ev.text and not buffer_document_finalizer:
                                     attempt_user_visible_emitted = True
                                     attempt_irreversible_output_emitted = True
+                                if buffer_document_finalizer:
+                                    # A mutation finalizer is an untrusted presentation
+                                    # call. Hold its complete response behind the runtime
+                                    # boundary; only the authoritative localized outcome
+                                    # below may reach clients or transcript history.
+                                    continue
                                 if text_presentation_decided:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
@@ -8855,6 +9491,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="intermediate",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
                                 else:
                                     # No tool has appeared yet. Stream the text live,
@@ -8871,6 +9509,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="answer",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
@@ -8880,6 +9520,9 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if not raw_ev.text:
                                     continue
+                                if not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if not reasoning_block_id:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
                                     active_reasoning_block_index = reasoning_block_index
@@ -8927,6 +9570,8 @@ class Agent:
                                     block_id=reasoning_block_id,
                                     block_index=active_reasoning_block_index,
                                     generation_epoch=generation_epoch,
+                                    model_call_id=call_id,
+                                    iteration=iterations,
                                 )
                                 if (
                                     wrapup_margin_seconds > 0
@@ -9137,6 +9782,7 @@ class Agent:
                                         or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
+                                        or document_mutation_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
@@ -9161,6 +9807,32 @@ class Agent:
                                     pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
+                                writer_reservation = (
+                                    await self._reserve_artifact_writer_intent(
+                                        tool_use_id=raw_ev.tool_use_id,
+                                        tool_name=raw_ev.tool_name,
+                                    )
+                                )
+                                if writer_reservation is not None:
+                                    document_mutation_attempted = True
+                                    document_mutation_summary_deadline = (
+                                        document_mutation_summary_deadline_candidate
+                                    )
+                                    if writer_reservation == "rejected":
+                                        if guarded_writer_ids:
+                                            # Keep consuming the response so the
+                                            # complete same-response writer batch
+                                            # can be rejected before dispatch.
+                                            guarded_writer_stream_failure = (
+                                                "parallel_document_writers"
+                                            )
+                                        else:
+                                            guarded_writer_stream_failure = (
+                                                "writer_intent_rejected"
+                                            )
+                                    else:
+                                        guarded_writer_intent_id = raw_ev.tool_use_id
+                                    guarded_writer_ids.append(raw_ev.tool_use_id)
                                 seen_tool_use_ids.add(raw_ev.tool_use_id)
                                 # A tool follows, so any further text this call is
                                 # intermediate narration between tools, not the answer.
@@ -9262,6 +9934,7 @@ class Agent:
                                         or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
+                                        or document_mutation_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
@@ -9596,10 +10269,17 @@ class Agent:
                                         )
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
-                                    last_ensemble_trace = dict(ensemble_trace)
-                                    turn_ensemble_request_count += _usage_int(
-                                        ensemble_trace.get("llm_request_count") or 0
+                                    ensemble_request_count_baseline = (
+                                        _merge_ensemble_request_count(
+                                            ensemble_trace,
+                                            ensemble_request_count_baseline,
+                                        )
                                     )
+                                    if tool_calls:
+                                        ensemble_continuation_request_count = (
+                                            ensemble_request_count_baseline
+                                        )
+                                        ensemble_continuation_provider = self.provider
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
@@ -9786,6 +10466,49 @@ class Agent:
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
+                        if document_mutation_finalization_pending:
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
+                        if (
+                            self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
+                            and not document_mutation_finalization_attempted
+                        ):
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out",
+                            )
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": "not_attempted",
+                                "phase": "proposal",
+                                "retryPolicy": "new_turn",
+                                "code": "document_mutation_iteration_timeout",
+                            }
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document turn timed out before a commit. Do not call "
+                                    "tools. Summarize only the authoritative mutation outcome."
+                                ),
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            break
                         yield self._transition(AgentState.ERROR)
                         terminal_error = ErrorEvent(
                             message=(
@@ -9798,6 +10521,10 @@ class Agent:
                         break
                     except asyncio.CancelledError:
                         usage_unknown_reason = "cancelled"
+                        await self._fail_artifact_writer_intent(
+                            guarded_writer_intent_id,
+                            failure_code="writer_stream_cancelled",
+                        )
                         raise
                     except TimeoutError as exc:
                         reasoning_end = _finish_reasoning_block("error")
@@ -9841,10 +10568,122 @@ class Agent:
                             )
                             yield terminal_error
                             break
+                        mutation_summary_timeout = (
+                            document_mutation_summary_deadline is not None
+                            and document_mutation_attempted
+                            and enforced_stream_deadline
+                            == document_mutation_summary_deadline
+                            and not document_mutation_finalization_pending
+                            and not document_mutation_finalization_attempted
+                        )
+                        if mutation_summary_timeout:
+                            usage_unknown_reason = "document_mutation_summary_reserve"
+                            _notify_call_outcome(
+                                ok=False,
+                                failure_kind="document_mutation_summary_reserve",
+                            )
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out",
+                            )
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": "document_mutation_time_budget_exhausted",
+                            }
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document turn time budget is closing. Do not call "
+                                    "tools. Summarize only the authoritative mutation outcome."
+                                ),
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            break
+                        if (
+                            enforced_stream_deadline is None
+                            and self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
+                        ):
+                            # Provider adapters may surface their own socket/read
+                            # timeout as a bare TimeoutError.  Only timeouts minted
+                            # by _stream_provider_events_with_deadline carry the
+                            # absolute-deadline marker above; an unmarked timeout
+                            # is a provider failure, not proof that the turn's
+                            # global time budget expired.
+                            usage_unknown_reason = "provider_timeout"
+                            _notify_call_outcome(ok=False, failure_kind="provider_timeout")
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out",
+                            )
+                            if document_mutation_finalization_pending:
+                                response_text = _document_mutation_fallback_text()
+                                assistant_text_parts[:] = [response_text]
+                                provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                                _got_done_event = True
+                                _got_error = False
+                                document_mutation_finalization_pending = False
+                                yield TextDeltaEvent(text=response_text)
+                                yield WarningEvent(
+                                    code="document_mutation_finalization_degraded",
+                                    message=(
+                                        "The document outcome was preserved, but its generated "
+                                        "summary used a deterministic localized fallback."
+                                    ),
+                                )
+                                break
+                            if not document_mutation_finalization_attempted:
+                                prior_outcome = dict(document_mutation_outcome or {})
+                                document_mutation_outcome = {
+                                    "version": 1,
+                                    "status": str(
+                                        prior_outcome.get("status") or "not_attempted"
+                                    ),
+                                    "phase": str(
+                                        prior_outcome.get("phase") or "proposal"
+                                    ),
+                                    "retryPolicy": "new_turn",
+                                    "code": "document_mutation_provider_timeout",
+                                }
+                                for detail_key in ("corrected", "proposalAttempts"):
+                                    if detail_key in prior_outcome:
+                                        document_mutation_outcome[detail_key] = prior_outcome[
+                                            detail_key
+                                        ]
+                                document_mutation_finalization_pending = True
+                                document_mutation_finalization_message = Message(
+                                    role="user",
+                                    content=(
+                                        "The document provider timed out. Do not call tools. "
+                                        "Summarize only the authoritative mutation outcome."
+                                    ),
+                                )
+                                final_text_parts.clear()
+                                applied_model_call_boundaries.clear()
+                                yield WarningEvent(
+                                    code="document_mutation_provider_timeout",
+                                    message=(
+                                        "The provider timed out before the document turn "
+                                        "completed; the authoritative outcome was preserved."
+                                    ),
+                                )
+                                break
                         # Total-deadline timeout raised by the stream wrapper:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
                         _notify_call_outcome(ok=False, failure_kind="total_timeout")
+                        await self._fail_artifact_writer_intent(
+                            guarded_writer_intent_id,
+                            failure_code="writer_stream_timed_out",
+                        )
                         if goal_terminal_final_response_pending:
                             response_text = _goal_terminal_final_response_text()
                             assistant_text_parts.append(response_text)
@@ -9901,7 +10740,7 @@ class Agent:
                             )
                         )
                         raise
-                    except _RaisedProviderBoundaryError:
+                    except _RaisedProviderBoundaryError as exc:
                         # Some SDKs raise from call creation or async iteration
                         # instead of yielding a ProviderErrorEvent.  Only those
                         # two provider-boundary operations are wrapped in this
@@ -9930,6 +10769,73 @@ class Agent:
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
+                        if document_mutation_finalization_pending:
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
+                        if (
+                            self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
+                            and not document_mutation_finalization_attempted
+                        ):
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out"
+                                if exc.timeout
+                                else "writer_stream_failed",
+                            )
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            outcome_code = (
+                                "document_mutation_provider_timeout"
+                                if exc.timeout
+                                else "document_mutation_provider_exception"
+                            )
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": outcome_code,
+                            }
+                            for detail_key in ("corrected", "proposalAttempts"):
+                                if detail_key in prior_outcome:
+                                    document_mutation_outcome[detail_key] = prior_outcome[
+                                        detail_key
+                                    ]
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document provider timed out. Do not call tools. "
+                                    if exc.timeout
+                                    else "The document provider stopped unexpectedly. "
+                                )
+                                + "Summarize only the authoritative mutation outcome.",
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            yield WarningEvent(
+                                code=outcome_code,
+                                message=(
+                                    "The provider failed before the document turn completed; "
+                                    "the authoritative outcome was preserved."
+                                ),
+                            )
+                            break
                         provider_error = ProviderErrorEvent(
                             message=(
                                 "The connection to the model provider ended before "
@@ -9954,6 +10860,17 @@ class Agent:
                                 usage_call,
                                 usage_unknown_reason,
                             )
+                        if (
+                            reasoning_only_act_now_for_call is not None
+                            and not bool(
+                                getattr(
+                                    self.config,
+                                    "reasoning_only_act_now",
+                                    False,
+                                )
+                            )
+                        ):
+                            reasoning_only_act_now_message = None
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     _notify_call_outcome(
@@ -10066,6 +10983,40 @@ class Agent:
                         if goal_terminal_final_response_pending
                         else _turn_budget_error()
                     )
+                    if (
+                        terminal_error is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        # The provider has already started document_apply, but
+                        # its complete ToolCall has not crossed dispatch yet.
+                        # Defer token/cost enforcement through that dispatch so
+                        # the authoritative tool outcome can be finalized. The
+                        # post-tool gate below closes the tool loop and admits
+                        # only the reserved tools-disabled summary.
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="defer_budget_to_document_outcome",
+                            reason=terminal_error.message,
+                            code=terminal_error.code,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
+                        terminal_error = None
+                    if (
+                        terminal_error is not None
+                        and document_mutation_finalization_pending
+                        and document_mutation_finalization_attempted
+                    ):
+                        # The final tools-disabled call was admitted from the
+                        # reserved global slot. A token/cost observation made
+                        # after that call cannot discard its authoritative
+                        # summary; report the overage as degraded telemetry.
+                        yield WarningEvent(
+                            code="document_mutation_finalization_budget_exhausted",
+                            message=terminal_error.message,
+                        )
+                        terminal_error = None
                     if terminal_error is not None:
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
@@ -10124,9 +11075,9 @@ class Agent:
                                 and request_turn_messages[-1] is deadline_wrapup_message
                             )
                             or (
-                                reasoning_only_act_now_message is not None
+                                reasoning_only_act_now_for_call is not None
                                 and request_turn_messages[-1]
-                                is reasoning_only_act_now_message
+                                is reasoning_only_act_now_for_call
                             )
                         )
                     ):
@@ -10178,6 +11129,58 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
+                    guarded_writer_completed = bool(
+                        guarded_writer_intent_id
+                        and any(
+                            tool_call.tool_use_id == guarded_writer_intent_id
+                            and tool_call.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
+                            for tool_call in tool_calls
+                        )
+                    )
+                    if (
+                        guarded_writer_stream_failure != "parallel_document_writers"
+                        and guarded_writer_stream_failure is not None
+                    ) or (
+                        guarded_writer_intent_id is not None
+                        and (
+                            _got_error
+                            or not _got_done_event
+                            or not guarded_writer_completed
+                            or attempt_classification.kind is not _ProviderAttemptKind.OK
+                        )
+                    ):
+                        await self._fail_artifact_writer_intent(
+                            guarded_writer_intent_id,
+                            failure_code=(
+                                guarded_writer_stream_failure
+                                or "writer_arguments_incomplete"
+                            ),
+                        )
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": "not_attempted",
+                            "phase": "proposal",
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_proposal_incomplete",
+                        }
+                        document_mutation_finalization_pending = True
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document mutation proposal was incomplete. "
+                                "Do not call tools. Summarize the authoritative outcome."
+                            ),
+                        )
+                        final_text_parts.clear()
+                        applied_model_call_boundaries.clear()
+                        yield WarningEvent(
+                            message=(
+                                "The provider stream ended before a complete document "
+                                "mutation proposal was available."
+                            ),
+                            code="document_mutation_proposal_incomplete",
+                        )
+                        break
                     if (
                         attempt_classification.kind != _ProviderAttemptKind.OK
                         # An engine-chosen preempt truncated the stream; the
@@ -10220,11 +11223,37 @@ class Agent:
                                 code=attempt_classification.kind.value,
                             )
                             break
+                        if (
+                            document_mutation_finalization_pending
+                            and document_mutation_finalization_attempted
+                        ):
+                            # Outcome finalization is deliberately one-shot.  An
+                            # empty, truncated, reasoning-only, or otherwise
+                            # invalid finalizer response must not enter the generic
+                            # provider retry/fallback machinery and create a third
+                            # model call.
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             classification=attempt_classification.kind.value,
                             iteration=iterations,
                             call_attempt=_call_attempt,
@@ -10237,7 +11266,6 @@ class Agent:
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
-
                         large_context_invalid = _is_large_context_invalid_response(
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
@@ -10457,10 +11485,14 @@ class Agent:
                             if (
                                 not _invalid_response_fallback_done
                                 and self._switch_to_invalid_response_fallback(
-                                    attempt_classification.kind.value
+                                    attempt_classification.kind.value,
+                                    requires_vision=(
+                                        self._count_image_blocks(request_messages) > 0
+                                    ),
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                reasoning_only_act_now_message = None
                                 fallback_reason = _provider_activity_reason_for_attempt(
                                     attempt_classification.kind
                                 )
@@ -10485,17 +11517,33 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                                and (
-                                    thinking_enabled
-                                    or (attempt_classification.stop_reason or "").lower()
-                                    == "length"
-                                )
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
+                                if (
+                                    (
+                                        not thinking_enabled
+                                        or bool(
+                                            getattr(
+                                                self.config,
+                                                "reasoning_only_act_now",
+                                                False,
+                                            )
+                                        )
+                                    )
+                                    and reasoning_only_act_now_message is None
+                                ):
+                                    reasoning_only_act_now_message = (
+                                        self._new_reasoning_only_act_now_message(
+                                            iteration=iterations,
+                                            attempt=_call_attempt,
+                                            reasoning_content=iter_reasoning_content,
+                                            provider_default_reasoning=not thinking_enabled,
+                                        )
+                                    )
                                 disable_thinking = (
                                     (attempt_classification.stop_reason or "").lower()
                                     == "length"
@@ -10514,7 +11562,9 @@ class Agent:
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
                                     model=last_actual_model or self.config.model_id or "",
-                                    provider=type(self.provider).__name__,
+                                    provider=self._provider_log_identity(
+                                        last_actual_provider
+                                    ),
                                     classification=attempt_classification.kind.value,
                                     iteration=iterations,
                                     call_attempt=_call_attempt,
@@ -10529,19 +11579,60 @@ class Agent:
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
                                     thinking_disabled=disable_thinking,
-                                )
-                                yield WarningEvent(
-                                    code="provider_large_context_visible_retry",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content for a large input; "
-                                        + (
-                                            "retrying once with thinking disabled."
-                                            if disable_thinking
-                                            else "retrying once to request visible content."
-                                        )
+                                    configured_max_tokens=max(
+                                        0,
+                                        int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
                                     ),
                                 )
+                                reasoning_output_budget_exhausted = (
+                                    attempt_classification.stop_reason or ""
+                                ).lower() == "length"
+                                if reasoning_output_budget_exhausted:
+                                    self._log_reasoning_output_budget_exhausted(
+                                        model=(
+                                            last_actual_model
+                                            or self.config.model_id
+                                            or ""
+                                        ),
+                                        observed_provider=last_actual_provider,
+                                        configured_max_tokens=max(
+                                            0,
+                                            int(
+                                                getattr(
+                                                    call_chat_cfg,
+                                                    "max_tokens",
+                                                    0,
+                                                )
+                                                or 0
+                                            ),
+                                        ),
+                                        output_tokens=iter_output_tokens,
+                                        reasoning_tokens=iter_reasoning_tokens,
+                                        reasoning_content=iter_reasoning_content,
+                                    )
+                                    yield WarningEvent(
+                                        code="provider_reasoning_only_retry",
+                                        message=(
+                                            "The provider used the configured output budget "
+                                            "for reasoning without returning visible content; "
+                                            "retrying once without changing max_tokens."
+                                        ),
+                                    )
+                                else:
+                                    yield WarningEvent(
+                                        code="provider_large_context_visible_retry",
+                                        message=(
+                                            "The provider returned reasoning without visible "
+                                            "content for a large input; "
+                                            + (
+                                                "retrying once with thinking disabled."
+                                                if disable_thinking
+                                                else (
+                                                    "retrying once to request visible content."
+                                                )
+                                            )
+                                        ),
+                                    )
                                 next_provider_activity_reason = "reasoning_only"
                                 yield ProviderActivityEvent(
                                     activity_id=provider_activity_id,
@@ -10559,21 +11650,38 @@ class Agent:
                                 continue
 
                             yield self._transition(AgentState.ERROR)
-                            if self.config.metadata.get("had_attachments"):
+                            if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                                if (attempt_classification.stop_reason or "").lower() == "length":
+                                    large_context_message = (
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning a visible answer. Increase "
+                                        "llm.max_tokens or choose another model or provider."
+                                    )
+                                else:
+                                    large_context_message = (
+                                        "The provider returned reasoning without a visible "
+                                        "answer. Try again or choose another model or provider."
+                                    )
+                            elif self.config.metadata.get("had_attachments"):
                                 recovery_guidance = (
                                     "Split, summarize, or shorten the attached material, "
                                     "or use a stronger model."
+                                )
+                                large_context_message = (
+                                    "Provider returned no visible response for a large input. "
+                                    + recovery_guidance
                                 )
                             else:
                                 recovery_guidance = (
                                     "Send the material as an attachment, summarize or "
                                     "shorten the prompt, or use a stronger model."
                                 )
-                            terminal_error = ErrorEvent(
-                                message=(
+                                large_context_message = (
                                     "Provider returned no visible response for a large input. "
                                     + recovery_guidance
-                                ),
+                                )
+                            terminal_error = ErrorEvent(
+                                message=large_context_message,
                                 code="empty_response",
                             )
                             yield terminal_error
@@ -10581,7 +11689,6 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                            and thinking_enabled
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.REASONING_ONLY,
                                 _attempt_retries_used,
@@ -10589,44 +11696,51 @@ class Agent:
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                             if (
-                                bool(
-                                    getattr(
-                                        self.config, "reasoning_only_act_now", False
+                                (
+                                    not thinking_enabled
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_act_now",
+                                            False,
+                                        )
                                     )
                                 )
                                 and reasoning_only_act_now_message is None
                             ):
-                                # Today's bare retry re-sends the identical
-                                # request; the model that just answered it with
-                                # reasoning only usually does so again. Splice
-                                # in an explicit act-now instruction so the
-                                # retry differs where it matters.
-                                reasoning_only_act_now_message = Message(
-                                    role="user",
-                                    content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+                                reasoning_only_act_now_message = (
+                                    self._new_reasoning_only_act_now_message(
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                        reasoning_content=iter_reasoning_content,
+                                        provider_default_reasoning=not thinking_enabled,
+                                    )
                                 )
-                                append_runtime_event(
-                                    self.config.runtime_events_path,
-                                    {
-                                        "feature": "reasoning_only_act_now",
-                                        "name": "reasoning_only_act_now.injected",
-                                        "action": "retry_with_act_now_directive",
-                                        "reason": "provider_reasoning_only",
-                                        "iteration": iterations,
-                                        "attempt": _call_attempt,
-                                        "reasoning_chars": len(
-                                            iter_reasoning_content or ""
-                                        ),
-                                        "session_key": self._session_key,
-                                        "agent_id": (
-                                            self.config.tool_result_store_agent_id
-                                            or self.config.metadata.get("agent_id")
-                                        ),
-                                    },
+                            disable_thinking = bool(
+                                thinking_enabled
+                                and getattr(
+                                    self.config,
+                                    "reasoning_only_thinking_fallback",
+                                    False,
                                 )
-                            if getattr(
-                                self.config, "reasoning_only_thinking_fallback", False
-                            ):
+                            )
+                            reasoning_output_budget_exhausted = (
+                                attempt_classification.stop_reason or ""
+                            ).lower() == "length"
+                            if reasoning_output_budget_exhausted:
+                                configured_max_tokens = max(
+                                    0,
+                                    int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                                )
+                                self._log_reasoning_output_budget_exhausted(
+                                    model=last_actual_model or self.config.model_id or "",
+                                    observed_provider=last_actual_provider,
+                                    configured_max_tokens=configured_max_tokens,
+                                    output_tokens=iter_output_tokens,
+                                    reasoning_tokens=iter_reasoning_tokens,
+                                    reasoning_content=iter_reasoning_content,
+                                )
+                            if disable_thinking:
                                 _thinking_fallback_done = True
                                 _disable_thinking_for_next_provider_call = True
                                 yield WarningEvent(
@@ -10634,6 +11748,15 @@ class Agent:
                                     message=(
                                         "The provider returned reasoning without visible "
                                         "content; retrying once with thinking disabled."
+                                    ),
+                                )
+                            elif reasoning_output_budget_exhausted:
+                                yield WarningEvent(
+                                    code="provider_reasoning_only_retry",
+                                    message=(
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning visible content; retrying "
+                                        "once without changing max_tokens."
                                     ),
                                 )
                             else:
@@ -10811,10 +11934,14 @@ class Agent:
                             }
                             and not _invalid_response_fallback_done
                             and self._switch_to_invalid_response_fallback(
-                                attempt_classification.kind.value
+                                attempt_classification.kind.value,
+                                requires_vision=(
+                                    self._count_image_blocks(request_messages) > 0
+                                ),
                             )
                         ):
                             _invalid_response_fallback_done = True
+                            reasoning_only_act_now_message = None
                             fallback_reason = _provider_activity_reason_for_attempt(
                                 attempt_classification.kind
                             )
@@ -10887,7 +12014,7 @@ class Agent:
                             "provider.empty_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             iteration=iterations,
                             retry_attempt=_call_attempt,
                             post_tool_turn=post_tool_turn,
@@ -10897,6 +12024,10 @@ class Agent:
                             iter_output_tokens=iter_output_tokens,
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
+                            configured_max_tokens=max(
+                                0,
+                                int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                            ),
                         )
                         self._record_tool_loop_runtime_event(
                             reason="provider_empty_response_terminal",
@@ -10912,8 +12043,22 @@ class Agent:
                             reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
+                        if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                            if (attempt_classification.stop_reason or "").lower() == "length":
+                                terminal_message = (
+                                    "The provider used the configured output budget for "
+                                    "reasoning without returning a visible answer. Increase "
+                                    "llm.max_tokens or choose another model or provider."
+                                )
+                            else:
+                                terminal_message = (
+                                    "The provider returned reasoning without a visible answer. "
+                                    "Try again or choose another model or provider."
+                                )
+                        else:
+                            terminal_message = "Provider returned an empty response"
                         terminal_error = ErrorEvent(
-                            message="Provider returned an empty response",
+                            message=terminal_message,
                             code="empty_response",
                         )
                         yield terminal_error
@@ -11159,6 +12304,25 @@ class Agent:
                                     provider_error.code,
                                 ),
                                 code=safe_provider_error_code,
+                            )
+                            break
+                        if document_mutation_finalization_pending:
+                            # Preserve the authoritative side-effect fact when
+                            # the one reserved summary call fails. The fallback
+                            # is localized presentation, not a mutation verdict.
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
                             )
                             break
                         if max_iterations_finalization_pending:
@@ -12125,6 +13289,22 @@ class Agent:
                             provider_error.code != "provider_retry_after_deadline"
                             and _fallback.should_retry(kind, _retry_attempt)
                         )
+                        if (
+                            should_retry
+                            and self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
+                        ):
+                            # Restricted document turns reserve exactly one provider call
+                            # after a terminal outcome for the tools-disabled summary. A
+                            # generic provider retry here would consume that boundary and
+                            # produce an extra tool-enabled request before finalization.
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="document_mutation_finalization_reserved",
+                                kind=kind.value,
+                                provider=getattr(self.provider, "provider_name", ""),
+                            )
+                            should_retry = False
                         retry_failed_call_safe = (
                             getattr(
                                 self.provider,
@@ -12142,19 +13322,62 @@ class Agent:
                             )
                             should_retry = False
                         if not should_retry:
-                            yield self._transition(AgentState.ERROR)
-                            terminal_error = ErrorEvent(
-                                message=_safe_provider_terminal_message(
-                                    failure_kind,
-                                    provider_error.code,
-                                ),
-                                code=safe_provider_failure_code(
-                                    provider_error.code,
-                                    failure_kind.value,
-                                ),
-                                failure_kind=failure_kind.value,
-                            )
-                            yield terminal_error
+                            if (
+                                self._artifact_writer_controller() is not None
+                                and document_mutation_attempted
+                                and not document_mutation_finalization_attempted
+                            ):
+                                if (
+                                    document_mutation_outcome is None
+                                    or document_mutation_outcome.get("retryPolicy") == "same_turn"
+                                ):
+                                    prior_outcome = dict(document_mutation_outcome or {})
+                                    document_mutation_outcome = {
+                                        "version": 1,
+                                        "status": str(
+                                            prior_outcome.get("status") or "not_attempted"
+                                        ),
+                                        "phase": str(prior_outcome.get("phase") or "proposal"),
+                                        "retryPolicy": "new_turn",
+                                        "code": "document_mutation_provider_failed",
+                                    }
+                                    for detail_key in ("corrected", "proposalAttempts"):
+                                        if detail_key in prior_outcome:
+                                            document_mutation_outcome[detail_key] = prior_outcome[
+                                                detail_key
+                                            ]
+                                document_mutation_finalization_pending = True
+                                document_mutation_finalization_message = Message(
+                                    role="user",
+                                    content=(
+                                        "The document turn could not continue. Do not call "
+                                        "tools. Summarize only the authoritative mutation "
+                                        "outcome."
+                                    ),
+                                )
+                                final_text_parts.clear()
+                                applied_model_call_boundaries.clear()
+                                yield WarningEvent(
+                                    code="document_mutation_provider_failed",
+                                    message=(
+                                        "The provider failed before the document turn "
+                                        "completed; the no-change outcome was preserved."
+                                    ),
+                                )
+                            else:
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=_safe_provider_terminal_message(
+                                        failure_kind,
+                                        provider_error.code,
+                                    ),
+                                    code=safe_provider_failure_code(
+                                        provider_error.code,
+                                        failure_kind.value,
+                                    ),
+                                    failure_kind=failure_kind.value,
+                                )
+                                yield terminal_error
                             break
                         local_delay = backoff_sleep(
                             _retry_attempt,
@@ -12239,9 +13462,51 @@ class Agent:
                         _call_attempt += 1
 
                 if terminal_error is not None:
-                    break
+                    if (
+                        self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": (
+                                str(document_mutation_outcome.get("status"))
+                                if document_mutation_outcome is not None
+                                else "not_attempted"
+                            ),
+                            "phase": (
+                                str(document_mutation_outcome.get("phase"))
+                                if document_mutation_outcome is not None
+                                else "proposal"
+                            ),
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_provider_terminal",
+                        }
+                        document_mutation_finalization_pending = True
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document turn stopped before completion. Do not call "
+                                "tools. Summarize only the authoritative mutation outcome."
+                            ),
+                        )
+                        final_text_parts.clear()
+                        applied_model_call_boundaries.clear()
+                        terminal_error = None
+                    else:
+                        break
                 if artifact_delivery_degraded_final_response:
                     break
+                if (
+                    document_mutation_finalization_pending
+                    and not document_mutation_finalization_attempted
+                    and not tool_calls
+                ):
+                    # A guarded writer stream ended before dispatch. Skip the
+                    # generic incomplete-response terminalizer and spend the
+                    # reserved next global call on the outcome-only summary.
+                    yield self._transition(AgentState.THINKING)
+                    continue
 
                 response_text = "".join(assistant_text_parts)
                 final_stop_reason = (
@@ -12367,6 +13632,30 @@ class Agent:
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = assembled_text
+                if (
+                    document_mutation_finalization_pending
+                    and document_mutation_finalization_attempted
+                ):
+                    from opensquilla.engine.silent_reply import normalize_silent_reply
+
+                    if normalize_silent_reply(
+                        assembled_text,
+                        run_kind="human",
+                    ).suppressed:
+                        yield WarningEvent(
+                            code="document_mutation_finalization_degraded",
+                            message=(
+                                "The document outcome was preserved, but its generated "
+                                "summary used a deterministic localized fallback."
+                            ),
+                        )
+                    visible_text = _document_mutation_fallback_text()
+                    assistant_text_parts[:] = [visible_text]
+                    yield TextDeltaEvent(
+                        text=visible_text,
+                        presentation="answer",
+                        generation_epoch=generation_epoch,
+                    )
                 if text_only_tool_recovery_pending:
                     text_only_mode = getattr(
                         self.config,
@@ -12415,10 +13704,50 @@ class Agent:
 
                 preflight_tool_results: dict[str, ToolResult] = {}
                 terminal_projection_preflight_error = False
+                writer_calls = [
+                    tc
+                    for tc in tool_calls
+                    if tc.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
+                ]
+                if len(writer_calls) > 1:
+                    for writer_call in writer_calls:
+                        batch_result = ToolResult(
+                            tool_use_id=writer_call.tool_use_id,
+                            tool_name=writer_call.tool_name,
+                            content=json.dumps(
+                                {
+                                    "status": "error",
+                                    "reason": "parallel_document_writers",
+                                    "retry_allowed": False,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "error",
+                                reason="parallel_document_writers",
+                            ),
+                        )
+                        preflight_tool_results[writer_call.tool_use_id] = (
+                            await self._reject_artifact_writer_preflight(
+                                writer_call,
+                                batch_result,
+                                failure_code="parallel_document_writers",
+                                force_finalize=True,
+                            )
+                        )
                 resolved_tool_calls: list[ToolCall] = []
                 for tc in tool_calls:
+                    if tc.tool_use_id in preflight_tool_results:
+                        resolved_tool_calls.append(tc)
+                        continue
                     resolved = self._rehydrate_projected_tool_arguments(tc)
                     if isinstance(resolved, ToolResult):
+                        resolved = await self._reject_artifact_writer_preflight(
+                            tc,
+                            resolved,
+                            failure_code="writer_provider_context_arguments",
+                        )
                         preflight_tool_results[tc.tool_use_id] = resolved
                         if self._is_provider_context_projection_reuse_result(resolved):
                             terminal_projection_preflight_error = True
@@ -12611,6 +13940,17 @@ class Agent:
                     if goal_terminal_final_response_pending:
                         goal_terminal_final_response_pending = False
                         goal_terminal_final_status = None
+                        break
+                    if (
+                        document_mutation_finalization_pending
+                        and document_mutation_finalization_attempted
+                    ):
+                        document_mutation_finalization_pending = False
+                        break
+                    if document_mutation_finalization_pending:
+                        yield self._transition(AgentState.THINKING)
+                        continue
+                    if document_mutation_finalization_attempted:
                         break
                     if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
@@ -13320,6 +14660,8 @@ class Agent:
                 results_by_id: dict[str, ToolResult] = {}
                 executed_tool_calls_by_id: dict[str, ToolCall] = {}
                 path_patch_snapshots_by_id: dict[str, ToolCall] = {}
+                tool_effect_observations_by_id: dict[str, tuple[int, int, int]] = {}
+                tool_cancellation_grace_by_id: dict[str, float] = {}
 
                 def _cap_timeout_by_deadlines(timeout: float) -> float:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
@@ -13354,6 +14696,14 @@ class Agent:
                             arguments=execution_arguments,
                         )
                     executed_tool_calls_by_id[tc.tool_use_id] = execution_tc
+                    cancellation_policy = self._tool_cancellation_policy(execution_tc)
+                    tool_cancellation_grace_by_id.setdefault(
+                        tc.tool_use_id,
+                        STOP_CANCEL_GRACE_SECONDS,
+                    )
+                    tool_effect_observations_by_id[tc.tool_use_id] = (
+                        self._tool_effect_observation()
+                    )
                     tool_timeout = _cap_timeout_by_deadlines(
                         self._tool_execution_timeout(execution_tc)
                     )
@@ -13427,22 +14777,86 @@ class Agent:
                     elif preflight_result is not None:
                         res = preflight_result
                     else:
+                        execution_task: asyncio.Task[ToolResult] | None = None
+                        cancellation_started = False
                         try:
                             turn_irreversible_effect_started = True
-                            res = await asyncio.wait_for(
-                                self._execute_tool(execution_tc), timeout=tool_timeout
+                            execution_task = asyncio.create_task(
+                                self._execute_tool(execution_tc)
                             )
+                            done, _pending = await asyncio.wait(
+                                {execution_task},
+                                timeout=tool_timeout,
+                            )
+                            if done:
+                                res = execution_task.result()
+                            else:
+                                cancellation_started = True
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS,
+                                )
+                                settlement_note = ""
+                                if (
+                                    cancellation_policy == "must_settle"
+                                    and self._tool_effect_observation()
+                                    != tool_effect_observations_by_id[tc.tool_use_id]
+                                ):
+                                    settlement_note = (
+                                        " The filesystem operation exceeded its deadline, "
+                                        "but its effects settled and were recorded before "
+                                        "the turn ended."
+                                    )
+                                res = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=(
+                                        f"Tool '{tc.tool_name}' timed out after "
+                                        f"{tool_timeout}s.{settlement_note}"
+                                    ),
+                                    is_error=True,
+                                    execution_status=runtime_execution_status(
+                                        "timeout",
+                                        reason="runtime_timeout",
+                                        timed_out=True,
+                                    ),
+                                )
+                        except asyncio.CancelledError:
+                            if (
+                                execution_task is not None
+                                and not execution_task.done()
+                                and not cancellation_started
+                            ):
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=tool_cancellation_grace_by_id.get(
+                                        tc.tool_use_id,
+                                        STOP_CANCEL_GRACE_SECONDS,
+                                    ),
+                                )
+                            raise
                         except TimeoutError:
+                            # A TimeoutError raised by the tool itself remains a
+                            # runtime timeout, matching the historical boundary.
                             res = ToolResult(
                                 tool_use_id=tc.tool_use_id,
                                 tool_name=tc.tool_name,
-                                content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
+                                content=f"Tool '{tc.tool_name}' timed out after {tool_timeout}s",
                                 is_error=True,
                                 execution_status=runtime_execution_status(
                                     "timeout",
                                     reason="runtime_timeout",
                                     timed_out=True,
                                 ),
+                            )
+                            res = await self._reject_artifact_writer_preflight(
+                                tc,
+                                res,
+                                failure_code="writer_tool_timed_out",
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
                     self._record_focused_diagnostic_retrieval(execution_tc, res)
@@ -13517,6 +14931,7 @@ class Agent:
                     interval = self._tool_activity_heartbeat_interval()
                     started = time.monotonic()
                     last_event_at = started
+                    cleanup_grace_seconds = TIMEOUT_CANCEL_GRACE_SECONDS
                     try:
                         while pending:
                             remaining = max(0.0, tool_deadline - _loop.time())
@@ -13528,7 +14943,9 @@ class Agent:
                             if remaining <= 0:
                                 for task, tc in list(task_to_tool_call.items()):
                                     if task in pending:
-                                        task.cancel()
+                                        tool_cancellation_grace_by_id[tc.tool_use_id] = (
+                                            TIMEOUT_CANCEL_GRACE_SECONDS
+                                        )
                                         results_by_id[tc.tool_use_id] = ToolResult(
                                             tool_use_id=tc.tool_use_id,
                                             tool_name=tc.tool_name,
@@ -13556,7 +14973,9 @@ class Agent:
                                 ):
                                     for task, tc in list(task_to_tool_call.items()):
                                         if task in pending:
-                                            task.cancel()
+                                            tool_cancellation_grace_by_id[tc.tool_use_id] = (
+                                                TIMEOUT_CANCEL_GRACE_SECONDS
+                                            )
                                             results_by_id[tc.tool_use_id] = ToolResult(
                                                 tool_use_id=tc.tool_use_id,
                                                 tool_name=tc.tool_name,
@@ -13610,13 +15029,51 @@ class Agent:
                                         ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
+                    except (asyncio.CancelledError, GeneratorExit):
+                        cleanup_grace_seconds = STOP_CANCEL_GRACE_SECONDS
+                        raise
                     finally:
-                        for task in pending:
-                            if not task.done():
-                                task.cancel()
-                        for task in pending:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
+                        cleanup_tasks = {
+                            task: self._tool_cancellation_policy(
+                                task_to_tool_call[task]
+                            )
+                            for task in pending
+                        }
+                        try:
+                            await cancel_tasks(
+                                cleanup_tasks,
+                                operation="agent_tool_batch",
+                                grace_seconds=cleanup_grace_seconds,
+                            )
+                        finally:
+                            for task in pending:
+                                tc = task_to_tool_call[task]
+                                result = results_by_id.get(tc.tool_use_id)
+                                if (
+                                    result is None
+                                    or self._tool_cancellation_policy(tc)
+                                    != "must_settle"
+                                    or result.execution_status is None
+                                    or result.execution_status.get("status") != "timeout"
+                                ):
+                                    continue
+                                before = tool_effect_observations_by_id.get(
+                                    tc.tool_use_id
+                                )
+                                if (
+                                    before is not None
+                                    and self._tool_effect_observation() != before
+                                    and "effects settled" not in result.content
+                                ):
+                                    results_by_id[tc.tool_use_id] = replace(
+                                        result,
+                                        content=(
+                                            f"{result.content}. The filesystem operation "
+                                            "exceeded its deadline, but its effects "
+                                            "settled and were recorded before the turn "
+                                            "ended."
+                                        ),
+                                    )
 
                 # Dispatch preserving original order: accumulate consecutive
                 # concurrent/keyed tools into a batch and flush before each
@@ -13970,6 +15427,7 @@ class Agent:
                             is_error=projected_pending.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_pending.execution_status,
+                            effect_outcome=projected_pending.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
                         try:
@@ -14005,6 +15463,7 @@ class Agent:
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
+                            effect_outcome=projected_result.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
                         deferred_user_input_handled = True
@@ -14037,6 +15496,7 @@ class Agent:
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
                             approval_wait_started = _loop.time()
@@ -14121,6 +15581,7 @@ class Agent:
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
                                 # Only a deliberate human refusal is terminal. An
@@ -14151,6 +15612,7 @@ class Agent:
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
                                 replay_event = router_control_replay_event_from_payload(
@@ -14166,6 +15628,7 @@ class Agent:
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
+                            effect_outcome=projected_result.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
                         replay_event = router_control_replay_event_from_payload(
@@ -14176,7 +15639,32 @@ class Agent:
                     executed_results.append(result)
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
-                    if self._is_turn_yield_result(result) or result.terminates_turn:
+                    effect_outcome = result.effect_outcome
+                    if effect_outcome is not None:
+                        raw_mutation_outcome = effect_outcome.safe_details.get(
+                            "documentMutationOutcome"
+                        )
+                        if isinstance(raw_mutation_outcome, dict):
+                            document_mutation_outcome = dict(raw_mutation_outcome)
+                        if effect_outcome.loop_action == "finalize_without_tools":
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document side-effect boundary is closed. "
+                                    "Do not call tools. Give one concise final response in "
+                                    "the user's language based only on the sanitized mutation "
+                                    "outcome supplied by the runtime."
+                                ),
+                            )
+                            # Text emitted before a write result is provisional
+                            # narration. The next actual tools-disabled provider
+                            # response is the only authoritative final answer.
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                        elif effect_outcome.loop_action == "stop":
+                            turn_yielded = True
+                    elif self._is_turn_yield_result(result) or result.terminates_turn:
                         turn_yielded = True
                     tool_result_blocks.append(
                         ContentBlockToolResult(
@@ -14646,6 +16134,41 @@ class Agent:
                 )
                 if terminal_error is None:
                     terminal_error = budget_error
+                if (
+                    terminal_error is not None
+                    and self._artifact_writer_controller() is not None
+                    and document_mutation_attempted
+                    and not document_mutation_finalization_attempted
+                ):
+                    if not document_mutation_finalization_pending:
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": (
+                                str(document_mutation_outcome.get("status"))
+                                if document_mutation_outcome is not None
+                                else "not_attempted"
+                            ),
+                            "phase": (
+                                str(document_mutation_outcome.get("phase"))
+                                if document_mutation_outcome is not None
+                                else "proposal"
+                            ),
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_budget_exhausted",
+                        }
+                    document_mutation_finalization_pending = True
+                    document_mutation_finalization_message = Message(
+                        role="user",
+                        content=(
+                            "The global turn budget is closed. Do not call tools. "
+                            "Summarize the authoritative document mutation outcome."
+                        ),
+                    )
+                    yield WarningEvent(
+                        code="document_mutation_budget_exhausted",
+                        message=terminal_error.message,
+                    )
+                    terminal_error = None
                 if terminal_error is not None:
                     if artifact_delivery_final_response_pending:
                         yield _finish_artifact_delivery_degraded(
@@ -14677,6 +16200,49 @@ class Agent:
                     accepted_goal_terminal_status is None
                     and _loop.time() > tool_deadline
                 ):
+                    if (
+                        self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        prior_outcome = dict(document_mutation_outcome or {})
+                        if (
+                            not document_mutation_finalization_pending
+                            or prior_outcome.get("retryPolicy") == "same_turn"
+                        ):
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": "document_mutation_iteration_timeout",
+                            }
+                            for detail_key in ("corrected", "proposalAttempts"):
+                                if detail_key in prior_outcome:
+                                    document_mutation_outcome[detail_key] = prior_outcome[
+                                        detail_key
+                                    ]
+                        document_mutation_finalization_pending = True
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document iteration ended after tool execution. Do not "
+                                "call tools. Summarize only the authoritative mutation outcome."
+                            ),
+                        )
+                        final_text_parts.clear()
+                        applied_model_call_boundaries.clear()
+                        yield WarningEvent(
+                            code="document_mutation_iteration_timeout",
+                            message=(
+                                "The document iteration deadline was reached; the authoritative "
+                                "mutation outcome was preserved for finalization."
+                            ),
+                        )
+                        yield self._transition(AgentState.THINKING)
+                        continue
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -14910,6 +16476,30 @@ class Agent:
                     reason=f"Agent turn timed out after {self.config.timeout}s",
                     code="agent_runtime_timeout",
                 )
+            elif (
+                self._artifact_writer_controller() is not None
+                and document_mutation_attempted
+            ):
+                if document_mutation_outcome is None:
+                    document_mutation_outcome = {
+                        "version": 1,
+                        "status": "not_attempted",
+                        "phase": "proposal",
+                        "retryPolicy": "new_turn",
+                        "code": "document_mutation_time_budget_exhausted",
+                    }
+                document_mutation_finalization_pending = False
+                response_text = _document_mutation_fallback_text()
+                final_text_parts[:] = [response_text]
+                applied_model_call_boundaries.clear()
+                yield TextDeltaEvent(text=response_text)
+                yield WarningEvent(
+                    code="document_mutation_finalization_degraded",
+                    message=(
+                        "The document outcome was preserved after the turn deadline, "
+                        "using a deterministic localized fallback."
+                    ),
+                )
             else:
                 # Total turn deadline exceeded (raised by manual check above)
                 yield self._transition(AgentState.ERROR)
@@ -14926,6 +16516,50 @@ class Agent:
             turn_messages = [
                 item for item in turn_messages if item is not staged_pending_input_message
             ]
+
+        if (
+            self._artifact_writer_controller() is not None
+            and document_mutation_attempted
+        ):
+            if document_mutation_outcome is None:
+                document_mutation_outcome = {
+                    "version": 1,
+                    "status": "not_attempted",
+                    "phase": "proposal",
+                    "retryPolicy": "new_turn",
+                    "code": "document_mutation_not_proposed",
+                }
+            current_final_text = "".join(final_text_parts)
+            if document_mutation_finalization_attempted:
+                from opensquilla.engine.silent_reply import normalize_silent_reply
+
+                silent_finalizer = normalize_silent_reply(
+                    current_final_text,
+                    run_kind="human",
+                )
+                if silent_finalizer.suppressed:
+                    # The shared TurnRunner withholds a short sentinel prefix
+                    # until Done. Replace the terminal snapshot without
+                    # emitting another text delta so the held control token is
+                    # discarded rather than combined with the fallback.
+                    current_final_text = _document_mutation_fallback_text()
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield WarningEvent(
+                        code="document_mutation_finalization_degraded",
+                        message=(
+                            "The document outcome was preserved, but its generated "
+                            "summary used a deterministic localized fallback."
+                        ),
+                    )
+            # The model may explain the outcome but cannot redefine it. Append
+            # one runtime-owned, localized fact as the final sentence for CLI
+            # and non-card channels, without exposing receipt identifiers.
+            fact_footer = _document_mutation_fallback_text()
+            if not current_final_text.rstrip().endswith(fact_footer):
+                fact_delta = ("\n\n" if current_final_text.strip() else "") + fact_footer
+                final_text_parts.append(fact_delta)
+                yield TextDeltaEvent(text=fact_delta)
 
         if terminal_error is None:
             # Persist successful turns into in-memory history. Error turns are
@@ -15310,7 +16944,7 @@ class Agent:
             or missing_cost_entries
             or total_provider_billed_entries
         )
-        if terminal_error is None or has_usage:
+        if terminal_error is None or has_usage or document_mutation_outcome is not None:
             final_text = "".join(final_text_parts)
             total_codepoints = len(final_text)
             model_call_segments = [
@@ -15350,7 +16984,14 @@ class Agent:
                 message_output_tokens=message_output_tokens,
                 missing_cost_entries=missing_cost_entries,
                 model_call_segments=model_call_segments,
+                document_mutation_outcome=(
+                    dict(document_mutation_outcome)
+                    if document_mutation_outcome is not None
+                    else None
+                ),
                 generation_epoch=generation_epoch,
+                router_model_call_id=router_model_call_id,
+                router_iteration=router_iteration,
             )
             yield done_event
         # Reset for next turn
@@ -17512,18 +19153,21 @@ class Agent:
             stream_iter = stream.__aiter__()
         except (asyncio.CancelledError, UsageAccountingUnavailableError):
             raise
-        except Exception:  # noqa: BLE001 - provider boundary
-            raise _RaisedProviderBoundaryError from None
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
+        close_state = {"deferred": False}
         try:
             async for event in self._stream_provider_events_with_deadline_unclosed(
                 stream_iter,
                 loop=loop,
                 total_deadline=total_deadline,
                 deadline_provider=deadline_provider,
+                close_state=close_state,
             ):
                 yield event
         finally:
-            await self._close_provider_stream(stream_iter)
+            if not close_state["deferred"]:
+                await self._close_provider_stream(stream_iter)
 
     async def _stream_provider_events_with_deadline_unclosed(
         self,
@@ -17532,6 +19176,7 @@ class Agent:
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
         deadline_provider: Callable[[], float | None] | None = None,
+        close_state: dict[str, bool] | None = None,
     ) -> AsyncIterator[Any]:
         while True:
             dynamic_deadline = (
@@ -17547,7 +19192,7 @@ class Agent:
                     else dynamic_deadline
                 )
             # Execution-context-aware composite providers (currently Ensemble)
-            # own streaming inactivity through TurnExecutionContext.  Applying
+            # own streaming inactivity through TurnExecutionContext. Applying
             # the legacy per-iteration read timeout here would create a second,
             # earlier timeout owner and could kill a healthy long fusion run.
             wait_budget: float | None = (
@@ -17571,17 +19216,37 @@ class Agent:
                     total_deadline_limits_wait = True
 
             next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
+
+            async def _cancel_provider_pull(*, grace_seconds: float) -> None:
+                settled = False
+                try:
+                    settled = await cancel_task(
+                        next_event,
+                        policy="bounded",
+                        operation="provider_stream_pull",
+                        grace_seconds=grace_seconds,
+                    )
+                finally:
+                    if (
+                        not settled
+                        and not next_event.done()
+                        and close_state is not None
+                        and not close_state["deferred"]
+                    ):
+                        close_state["deferred"] = True
+                        defer_async_cleanup(
+                            next_event,
+                            lambda: self._close_provider_stream(stream_iter),
+                            operation="provider_stream_deferred_close",
+                        )
+
             try:
                 done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
             except (asyncio.CancelledError, GeneratorExit):
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
+                await _cancel_provider_pull(grace_seconds=STOP_CANCEL_GRACE_SECONDS)
                 raise
             if not done:
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
+                await _cancel_provider_pull(grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS)
                 if total_deadline_limits_wait or (
                     active_deadline is not None
                     and loop.time() >= active_deadline
@@ -17602,11 +19267,12 @@ class Agent:
                 ModelRepetitionLoopError,
             ):
                 raise
-            except Exception:  # noqa: BLE001 - provider boundary
-                # TimeoutError raised *by the provider* is different from the
-                # deadline timeouts raised above by this wrapper.  Project it
-                # through the same content-free provider failure path.
-                raise _RaisedProviderBoundaryError from None
+            except Exception as exc:  # noqa: BLE001 - provider boundary
+                # TimeoutError raised *by the provider* is different from
+                # the deadline timeouts raised above by this wrapper.
+                raise _RaisedProviderBoundaryError(
+                    timeout=isinstance(exc, TimeoutError)
+                ) from None
             yield event
 
     @staticmethod
@@ -17681,6 +19347,8 @@ class Agent:
         return request_messages, sanitize_result
 
     def _runtime_state_capsule_provider_message(self, *, preview: bool = False) -> Message | None:
+        if self._restricted_tool_boundary_active():
+            return None
         mode = str(getattr(self.config, "runtime_state_capsule_mode", "off") or "off")
         if mode not in {"log", "inject"}:
             return None
@@ -18039,6 +19707,12 @@ class Agent:
     ) -> CompactionOutcome | None:
         """Summarize completed live rounds into an ephemeral provider view."""
 
+        if self._restricted_auxiliary_compaction_disabled():
+            self._last_compaction_refusal_reason = (
+                "restricted_turn_compaction_disabled"
+            )
+            return None
+
         boundary = self._live_turn_compaction_boundary(
             messages,
             protected_turn_start_index=protected_turn_start_index,
@@ -18289,6 +19963,12 @@ class Agent:
         ``CompactionEvent``.
         """
 
+        if self._restricted_auxiliary_compaction_disabled():
+            self._last_compaction_refusal_reason = (
+                "restricted_turn_compaction_disabled"
+            )
+            return None, "restricted_turn_compaction_disabled"
+
         limit = int(proof.limit)
         target = limit - self._message_count_headroom(limit)
         if target <= 0:
@@ -18522,6 +20202,211 @@ class Agent:
         ]
         return "\n".join(lines)
 
+    def _restricted_tool_boundary_active(self) -> bool:
+        """Whether this turn has an explicit, non-widenable tool ceiling."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        return bool(
+            self.config.restricted_turn
+            or (ctx is not None and ctx.exclusive_tools is not None)
+        )
+
+    def _restricted_auxiliary_compaction_disabled(self) -> bool:
+        """Whether this turn forbids every auxiliary compaction provider."""
+
+        return self._restricted_tool_boundary_active()
+
+    def _artifact_writer_controller(self) -> Any | None:
+        """Return the single-writer controller for a bound document turn."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        if (
+            ctx is None
+            or ctx.surfaced_tools is None
+            or not (_PROMPT_ANNOTATION_WRITER_TOOLS & ctx.surfaced_tools)
+        ):
+            return None
+        return ctx.artifact_mutation_attempt_controller
+
+    async def _reserve_artifact_writer_intent(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> str | None:
+        """Observe a guarded writer at ToolUseStart without durable state."""
+
+        if tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
+            return None
+        ctx = self._tool_context or current_tool_context.get()
+        if (
+            ctx is None
+            or ctx.surfaced_tools is None
+            or tool_name not in ctx.surfaced_tools
+        ):
+            return None
+        controller = ctx.artifact_mutation_attempt_controller
+        if controller is None:
+            self._write_turn_call_log(
+                "artifact_mutation_intent_rejected",
+                tool_use_id=tool_use_id,
+                reason="mutation_authority_unavailable",
+            )
+            return "rejected"
+        try:
+            observation = await controller.observe_intent(tool_use_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - durable ids/details are not model-visible
+            logger.warning(
+                "agent.artifact_mutation_intent_rejected",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                exc_info=True,
+            )
+            self._write_turn_call_log(
+                "artifact_mutation_intent_rejected",
+                tool_use_id=tool_use_id,
+                reason="mutation_attempt_already_reserved",
+            )
+            return "rejected"
+        created = bool(getattr(observation, "created", False))
+        self._write_turn_call_log(
+            "artifact_mutation_intent_observed" if created else "artifact_mutation_intent_replay",
+            tool_use_id=tool_use_id,
+        )
+        self._active_artifact_writer_intent_id = tool_use_id
+        return "observed" if created else "replay"
+
+    async def _finalize_unresolved_artifact_writer_intent(self) -> None:
+        """Release a pure proposal, or fence a commit interrupted by turn exit."""
+
+        tool_use_id = self._active_artifact_writer_intent_id
+        if not tool_use_id:
+            return
+        controller = self._artifact_writer_controller()
+        if controller is None:
+            return
+        try:
+            if not bool(controller.owns_commit(tool_use_id)):
+                await controller.reject_proposal(tool_use_id)
+                return
+            attempt = await controller.reconcile(tool_use_id)
+            status = getattr(getattr(attempt, "status", None), "value", None)
+            if status == "reserved":
+                await controller.mark_ambiguous(tool_use_id, "writer_turn_closed")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the durable unique row still fences writes
+            logger.warning(
+                "agent.artifact_mutation_turn_close_failed",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                exc_info=True,
+            )
+
+    async def _fail_artifact_writer_intent(
+        self,
+        tool_use_id: str | None,
+        *,
+        failure_code: str,
+    ) -> None:
+        """Release an incomplete pure proposal without creating an attempt."""
+
+        if not tool_use_id:
+            return
+        controller = self._artifact_writer_controller()
+        if controller is None:
+            return
+        try:
+            if bool(controller.owns_commit(tool_use_id)):
+                await controller.mark_ambiguous(tool_use_id, failure_code)
+            else:
+                await controller.reject_proposal(tool_use_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - preserve the original terminal outcome
+            logger.warning(
+                "agent.artifact_mutation_intent_failure_record_failed",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                failure_code=failure_code,
+                exc_info=True,
+            )
+
+    async def _reject_artifact_writer_preflight(
+        self,
+        tool_call: ToolCall,
+        result: ToolResult,
+        *,
+        failure_code: str,
+        force_finalize: bool = False,
+    ) -> ToolResult:
+        """Return a pure proposal error to the loop without a durable attempt."""
+
+        controller = self._artifact_writer_controller()
+        if controller is None or tool_call.tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
+            return result
+        try:
+            await controller.reject_proposal(tool_call.tool_use_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - no durable side effect exists
+            logger.warning(
+                "agent.artifact_mutation_preflight_rejection_failed",
+                session_key=self._session_key,
+                tool_use_id=tool_call.tool_use_id,
+                exc_info=True,
+            )
+        digest = hashlib.sha256(
+            json.dumps(
+                tool_call.arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        no_progress = digest in self._artifact_writer_rejected_proposal_digests
+        self._artifact_writer_rejected_proposal_digests.add(digest)
+        finalize = force_finalize or no_progress
+        retry_policy = "new_turn" if finalize else "same_turn"
+        outcome_code = (
+            "document_parallel_writers"
+            if force_finalize
+            else "document_proposal_no_progress"
+            if no_progress
+            else failure_code
+        )
+        try:
+            payload = json.loads(result.content)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            payload["retry_allowed"] = not finalize
+            payload["retry_policy"] = retry_policy
+            payload["outcome_code"] = outcome_code
+            result.content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        result.is_error = True
+        result.terminates_turn = False
+        result.terminal_response_text = None
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="none",
+            retry_policy=retry_policy,
+            loop_action=("finalize_without_tools" if finalize else "continue"),
+            outcome_code=outcome_code,
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": "not_attempted",
+                    "phase": "proposal",
+                    "retryPolicy": retry_policy,
+                    "code": outcome_code,
+                }
+            },
+        )
+        return result
+
     @staticmethod
     def _runtime_context_message(runtime_context: str) -> Message:
         return Message(role="user", content=runtime_context)
@@ -18664,6 +20549,8 @@ class Agent:
         return list(cache_breakpoints)
 
     def _skills_context_message(self) -> Message | None:
+        if self._restricted_tool_boundary_active():
+            return None
         prompt = self.config.skills_context_prompt
         if not prompt or not prompt.strip():
             return None
@@ -18916,6 +20803,21 @@ class Agent:
                 runtime_context_insert_index=runtime_context_insert_index,
                 protected_turn_start_index=protected_turn_start_index,
             )
+
+        if self._restricted_auxiliary_compaction_disabled():
+            # Never project canonical PromptAnnotation history into an
+            # auxiliary summarizer. The persisted transcript remains intact;
+            # the caller returns a bounded primary-request overflow error.
+            self._last_compaction_refusal_reason = (
+                "restricted_turn_compaction_disabled"
+            )
+            logger.warning(
+                "compaction.restricted_turn_skipped",
+                estimated_context_tokens=estimated_context_tokens,
+                estimated_context_chars=estimated_context_chars,
+                context_window_tokens=pressure_window_tokens,
+            )
+            return None
 
         durable_window_tokens = max(
             1,

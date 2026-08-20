@@ -135,6 +135,12 @@ class SessionNode(SQLModel, table=True):
     auth_profile_override_source: str | None = None
     context_tokens: int | None = None
 
+    # Per-session routing strategy. ``None`` is retained only for rows created
+    # before session routing existed; the manager/storage resolver atomically
+    # materializes it to the then-current global mode before use.
+    model_routing_mode: str | None = None
+    model_routing_revision: int = 0
+
     # Token tracking
     input_tokens: int = 0
     output_tokens: int = 0

@@ -17,6 +17,27 @@ ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
     "Ensemble does not support image input yet. "
     "Switch to a single-model routing mode and try again."
 )
+IMAGE_INPUT_UNSUPPORTED_CODE = "image_input_unsupported"
+IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
+    "The selected model cannot process image input. Choose an image-capable "
+    "model or remove the image and try again."
+)
+_REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE = (
+    "the provider used the configured output budget for reasoning without returning a visible "
+    "answer. increase llm.max_tokens or choose another model or provider."
+)
+_REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE = (
+    "The model used its output budget for reasoning without returning a visible answer. "
+    "Increase llm.max_tokens or choose another model or provider."
+)
+_REASONING_ONLY_EMPTY_ERROR_MESSAGE = (
+    "the provider returned reasoning without a visible answer. try again or choose another "
+    "model or provider."
+)
+_REASONING_ONLY_EMPTY_TERMINAL_MESSAGE = (
+    "The model returned reasoning without a visible answer. "
+    "Try again or choose another model or provider."
+)
 
 # Non-context budget-exhaustion codes. Context-window exhaustion has its own,
 # more specific message via ``is_context_payload_too_large`` and is intentionally
@@ -57,6 +78,7 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "context_overflow",
         "empty_response",
         "ensemble_multimodal_unsupported",
+        "image_input_unsupported",
         "incomplete_stream",
         "incomplete_tool_call",
         "incomplete_tool_stream",
@@ -157,6 +179,16 @@ def build_terminal_reply(
             "preserved the recoverable state; retry with a narrower request "
             "or a larger-context model."
         )
+    if (
+        error_class == "empty_response"
+        and error_message == _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE
+    ):
+        return _REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE
+    if (
+        error_class == "empty_response"
+        and error_message == _REASONING_ONLY_EMPTY_ERROR_MESSAGE
+    ):
+        return _REASONING_ONLY_EMPTY_TERMINAL_MESSAGE
     if reason == "output_truncated" or error_class == "provider_output_truncated":
         return "The provider stopped because the output limit was reached before the task finished."
     if (
@@ -176,6 +208,8 @@ def build_terminal_reply(
         or reason == ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE
     ):
         return ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE
+    if error_class == IMAGE_INPUT_UNSUPPORTED_CODE or reason == IMAGE_INPUT_UNSUPPORTED_CODE:
+        return IMAGE_INPUT_UNSUPPORTED_MESSAGE
     if error_class == "sandbox_threshold_exceeded" or reason == "sandbox_threshold_exceeded":
         return (
             "Automatic execution paused after repeated sandbox denials. Approve the "

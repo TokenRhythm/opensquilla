@@ -36,9 +36,16 @@ export interface SteerDeliveryProjection {
 }
 
 export interface UseChatSteerDeliveryOptions {
+  sessionKey?: Ref<string>
+  activeTurnId?: Ref<string>
   messages: Ref<ChatMessage[]>
   pendingQueue: Ref<ChatPendingItem[]>
-  checkpointForUserMessage?: (turnId: string) => void
+  checkpointForUserMessage?: (turnId: string, boundaryKey?: string) => void
+  acknowledgeSteerBoundary?: (
+    boundaryKey: string,
+    modelCallId?: string,
+    iteration?: number,
+  ) => void
   scheduleHistorySync: () => void
   removePendingItem?: (item: ChatPendingItem) => void
   restoreSteerIntoComposer?: (text: string) => void
@@ -66,6 +73,7 @@ export interface ChatSteerDeliveryApi {
   acknowledgeAcceptedOffscreen: (item: ChatPendingItem) => void
   markStopRequested: (turnId: string) => void
   reconcileDurableMessages: () => void
+  resetTransientBoundaries: () => void
 }
 
 const TERMINAL_DISPOSITIONS = new Set<ChatSteerDisposition>([
@@ -137,14 +145,77 @@ export function useChatSteerDelivery(
   options: UseChatSteerDeliveryOptions,
 ): ChatSteerDeliveryApi {
   const restoredAttemptIds = new Set<string>()
-  const checkpointedAttemptIds = new Set<string>()
+  const orphanBoundaries = new Map<string, SteerDeliveryEvidence>()
 
-  function checkpointOnce(attempt: PendingSteerAttempt) {
-    const request = attempt.request
-    const key = request.client_request_id || request.client_message_id
-    if (!key || checkpointedAttemptIds.has(key)) return
-    options.checkpointForUserMessage?.(request.expected_turn_id)
-    checkpointedAttemptIds.add(key)
+  function boundaryKey(
+    identity: Partial<SteerDeliveryIdentity>,
+    userMessageId = '',
+  ): string {
+    return identity.clientMessageId || identity.clientRequestId || userMessageId
+  }
+
+  function checkpointBoundary(
+    identity: Partial<SteerDeliveryIdentity>,
+    turnId: string,
+    userMessageId = '',
+  ) {
+    const key = boundaryKey(identity, userMessageId)
+    if (!key || !turnId) return
+    // The stream owns lifecycle-local idempotence. Reissuing this projection is
+    // intentional: reset/reconnect clears the in-memory checkpoint while the
+    // durable steer identity remains available for rebuilding it.
+    options.checkpointForUserMessage?.(turnId, key)
+  }
+
+  function projectAdmittedBoundary(
+    evidence: SteerDeliveryEvidence,
+    identity: Partial<SteerDeliveryIdentity>,
+    turnId: string,
+  ) {
+    const disposition = evidence.disposition || 'steering'
+    if (disposition !== 'steering' && disposition !== 'applied') return
+    checkpointBoundary(identity, turnId, evidence.userMessageId)
+    if (disposition === 'applied') {
+      options.acknowledgeSteerBoundary?.(
+        boundaryKey(identity, evidence.userMessageId),
+        evidence.modelCallId || '',
+        evidence.appliedIteration || 0,
+      )
+    }
+  }
+
+  function rememberOrphanBoundary(evidence: SteerDeliveryEvidence) {
+    const identity = {
+      clientRequestId: evidence.clientRequestId || '',
+      clientMessageId: evidence.clientMessageId || '',
+    }
+    const key = boundaryKey(identity, evidence.userMessageId)
+    if (!key) return
+    const evidenceTurnId = evidence.expectedTurnId || evidence.turnId || ''
+    const activeTurnId = options.activeTurnId?.value || ''
+    if (activeTurnId && evidenceTurnId && activeTurnId !== evidenceTurnId) return
+    const current = orphanBoundaries.get(key)
+    const currentRevision = Number(current?.revision)
+    const incomingRevision = Number(evidence.revision)
+    if (
+      current
+      && current.disposition === 'applied'
+      && evidence.disposition !== 'applied'
+    ) return
+    if (
+      Number.isInteger(currentRevision)
+      && Number.isInteger(incomingRevision)
+      && incomingRevision < currentRevision
+    ) return
+    if (!orphanBoundaries.has(key) && orphanBoundaries.size >= 32) {
+      const oldestKey = orphanBoundaries.keys().next().value
+      if (typeof oldestKey === 'string') orphanBoundaries.delete(oldestKey)
+    }
+    orphanBoundaries.set(key, { ...evidence })
+  }
+
+  function resetTransientBoundaries() {
+    orphanBoundaries.clear()
   }
 
   function attemptForItem(item: ChatPendingItem): PendingSteerAttempt | null {
@@ -226,20 +297,29 @@ export function useChatSteerDelivery(
       clientMessageId: evidence.clientMessageId || pendingIdentity?.clientMessageId || '',
       expectedTurnId: evidence.expectedTurnId || pendingIdentity?.expectedTurnId || '',
     }
+    const disposition = evidence.disposition || 'steering'
     let message = options.messages.value.find(candidate => matchesIdentity(candidate, {
       ...identity,
       userMessageId: evidence.userMessageId,
     }))
     let created = false
+    let pendingRemoved = false
     if (!message && pending && (identity.clientRequestId || identity.clientMessageId)) {
-      if (attempt) checkpointOnce(attempt)
+      if (disposition === 'steering' || disposition === 'applied') {
+        checkpointBoundary(identity, identity.expectedTurnId, evidence.userMessageId)
+      }
+      // Settle the transport projection before publishing the durable row.
+      // The synchronous reconciliation watcher would otherwise observe both
+      // at once and checkpoint the same boundary a second time.
+      removePending(pending)
+      pendingRemoved = true
       message = {
         role: 'user',
         text: pending.text,
         ts: new Date().toISOString(),
         clientId: identity.clientMessageId || undefined,
         turnId: identity.expectedTurnId || undefined,
-        inputDisposition: evidence.disposition || 'steering',
+        inputDisposition: disposition,
         steerClientRequestId: identity.clientRequestId || undefined,
         steerClientMessageId: identity.clientMessageId || undefined,
         ...(attempt?.stopRequested ? { steerStopRequested: true } : {}),
@@ -256,11 +336,15 @@ export function useChatSteerDelivery(
     const currentTerminal = message?.inputDisposition
       ? TERMINAL_DISPOSITIONS.has(message.inputDisposition)
       : false
-    const disposition = evidence.disposition || 'steering'
+    const staleMetadata = currentRevision !== undefined
+      && incomingRevision !== undefined
+      && incomingRevision < currentRevision
     const stale = Boolean(message) && (
       (
         currentRevision !== undefined
-        && (incomingRevision === undefined || incomingRevision < currentRevision)
+        && disposition !== message?.inputDisposition
+        && incomingRevision !== undefined
+        && incomingRevision < currentRevision
       )
       || (
         currentTerminal
@@ -274,7 +358,12 @@ export function useChatSteerDelivery(
 
     if (message && !stale) {
       message.inputDisposition = disposition
-      if (incomingRevision !== undefined) message.inputDispositionRevision = incomingRevision
+      if (
+        incomingRevision !== undefined
+        && (currentRevision === undefined || incomingRevision >= currentRevision)
+      ) {
+        message.inputDispositionRevision = incomingRevision
+      }
       if (evidence.userMessageId) message.messageId = evidence.userMessageId
       if (identity.clientRequestId) message.steerClientRequestId = identity.clientRequestId
       if (identity.clientMessageId) message.steerClientMessageId = identity.clientMessageId
@@ -282,10 +371,26 @@ export function useChatSteerDelivery(
         || evidence.turnId
         || identity.expectedTurnId
       if (targetTurnId) message.turnId = targetTurnId
-      if (evidence.appliedIteration !== undefined) {
+      if (!created && (disposition === 'steering' || disposition === 'applied')) {
+        checkpointBoundary(
+          identity,
+          identity.expectedTurnId || targetTurnId || '',
+          evidence.userMessageId || message.messageId,
+        )
+      }
+      if (!staleMetadata && evidence.appliedIteration !== undefined) {
         message.steerAppliedIteration = evidence.appliedIteration
       }
-      if (evidence.modelCallId) message.steerModelCallId = evidence.modelCallId
+      if (!staleMetadata && evidence.modelCallId) {
+        message.steerModelCallId = evidence.modelCallId
+      }
+      if (disposition === 'applied') {
+        options.acknowledgeSteerBoundary?.(
+          boundaryKey(identity, evidence.userMessageId || message.messageId),
+          message.steerModelCallId || evidence.modelCallId || '',
+          message.steerAppliedIteration || evidence.appliedIteration || 0,
+        )
+      }
       if (disposition === 'promoted') {
         message.promotedFromTurnId = evidence.promotedFromTurnId
           || identity.expectedTurnId
@@ -297,7 +402,7 @@ export function useChatSteerDelivery(
 
     // The exact durable row/event/accepted response supersedes pending UI even
     // when its revision is older than a row already on screen.
-    if (pending) removePending(pending)
+    if (pending && !pendingRemoved) removePending(pending)
     if (pending && (disposition === 'cancelled')) restoreOnce(pending, message)
     if ((message || pending) && (!stale || pending)) {
       options.scheduleHistorySync()
@@ -325,6 +430,18 @@ export function useChatSteerDelivery(
     const state = evidence.disposition
     const projection = accept(evidence, pending)
     if (!projection.message && !projection.pending) {
+      if (state === 'steering' || state === 'applied') {
+        const identity = {
+          clientRequestId: evidence.clientRequestId || '',
+          clientMessageId: evidence.clientMessageId || '',
+        }
+        projectAdmittedBoundary(
+          evidence,
+          identity,
+          evidence.expectedTurnId || evidence.turnId || '',
+        )
+        rememberOrphanBoundary(evidence)
+      }
       // The event can beat both local pending hydration and canonical history.
       // Pull history so the durable row is still rendered after reconnect.
       options.scheduleHistorySync()
@@ -382,8 +499,36 @@ export function useChatSteerDelivery(
         matchesIdentity(candidate, attemptIdentity(attempt))
       ))
       if (!message) continue
-      checkpointOnce(attempt)
+      const identity = attemptIdentity(attempt)
+      if (message.inputDisposition === 'steering' || message.inputDisposition === 'applied') {
+        checkpointBoundary(identity, identity.expectedTurnId || message.turnId || '')
+      }
+      if (message.inputDisposition === 'applied') {
+        options.acknowledgeSteerBoundary?.(
+          boundaryKey(identity),
+          message.steerModelCallId || '',
+          message.steerAppliedIteration || 0,
+        )
+      }
       removePending(item)
+    }
+    for (const [key, evidence] of [...orphanBoundaries]) {
+      const evidenceTurnId = evidence.expectedTurnId || evidence.turnId || ''
+      const activeTurnId = options.activeTurnId?.value || ''
+      if (activeTurnId && evidenceTurnId && activeTurnId !== evidenceTurnId) {
+        orphanBoundaries.delete(key)
+        continue
+      }
+      const message = options.messages.value.find(candidate => matchesIdentity(candidate, {
+        clientRequestId: evidence.clientRequestId,
+        clientMessageId: evidence.clientMessageId,
+        userMessageId: evidence.userMessageId,
+      }))
+      if (!message) continue
+      // Remove before accept(): its synchronous message mutations re-enter
+      // this watcher, and the lifecycle projection itself is idempotent.
+      orphanBoundaries.delete(key)
+      accept(evidence)
     }
   }
 
@@ -394,6 +539,12 @@ export function useChatSteerDelivery(
     reconcileDurableMessages,
     { deep: true, flush: 'sync' },
   )
+  if (options.sessionKey) {
+    watch(options.sessionKey, resetTransientBoundaries, { flush: 'sync' })
+  }
+  if (options.activeTurnId) {
+    watch(options.activeTurnId, resetTransientBoundaries, { flush: 'sync' })
+  }
 
   return {
     attemptForItem,
@@ -406,5 +557,6 @@ export function useChatSteerDelivery(
     acknowledgeAcceptedOffscreen,
     markStopRequested,
     reconcileDurableMessages,
+    resetTransientBoundaries,
   }
 }

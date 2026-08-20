@@ -11,6 +11,7 @@ import ntpath
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1052,6 +1053,101 @@ def _base_shell_environment() -> dict[str, str]:
             require_bundled=True,
         )
     return _runtime_shell_environment(dict(os.environ))
+
+
+def _guest_requires_managed_runtime() -> bool:
+    context = current_tool_context.get()
+    return bool(context is not None and context.guest_safe)
+
+
+def _managed_skill_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep strict Guest PATH limited to verified Runtime Packs."""
+
+    if _guest_requires_managed_runtime():
+        return dict(environment)
+    return managed_skill_env(environment)
+
+
+def _direct_runtime_command(
+    command: str,
+    *,
+    windows: bool | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(component, executable)`` for one unwrapped direct runtime call."""
+
+    native_windows = os.name == "nt" if windows is None else windows
+    platform_name = "windows" if native_windows else "linux"
+    try:
+        segments = parse_shell_segments(command, platform=platform_name)
+        if len(segments) != 1 or segments[0].source.strip() != command.strip():
+            return None
+        tokens = shlex.split(segments[0].source, posix=not native_windows)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    executable = tokens[0].strip().strip("'\"")
+    if not executable or any(marker in executable for marker in ("/", "\\", ":", "$", "`")):
+        return None
+    name = _shell_command_basename(executable)
+    if name in {"python", "python3"}:
+        return ("python", executable)
+    if name in {"node", "npm", "npx"}:
+        return ("node", executable)
+    if native_windows and name in {"git", "bash"}:
+        return ("gitBash", executable)
+    return None
+
+
+def _strict_runtime_unavailable_envelope(
+    command: str,
+    environment: dict[str, str],
+) -> dict[str, object] | None:
+    """Classify a missing direct runtime without guessing about compound shell code."""
+
+    if not _guest_requires_managed_runtime():
+        return None
+    runtime_command = _direct_runtime_command(command)
+    if runtime_command is None:
+        return None
+    component_id, executable = runtime_command
+    path_key = next((key for key in environment if key.casefold() == "path"), "PATH")
+    if shutil.which(executable, path=environment.get(path_key, "")) is not None:
+        return None
+    try:
+        from opensquilla.runtime_packs import status_snapshot
+
+        status = status_snapshot()
+        component = next(
+            (
+                item
+                for item in status.components
+                if item.component_id == component_id
+            ),
+            None,
+        )
+        runtime_policy = active_sandbox_policy().runtimes
+        enabled = bool(
+            runtime_policy.enabled
+            and {
+                "python": runtime_policy.python,
+                "node": runtime_policy.node,
+                "gitBash": runtime_policy.git_bash,
+            }[component_id]
+        )
+        if enabled and component is not None and component.availability.value == "ready":
+            return None
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return {
+        "status": "failed",
+        "code": "RUNTIME_UNAVAILABLE",
+        "componentId": component_id,
+        "retryable": False,
+        "message": (
+            f"The managed {component_id} runtime is unavailable for strict execution."
+        ),
+    }
 
 
 def _runtime_shell_environment(
@@ -2127,6 +2223,11 @@ def _append_windows_app_alias_path(
     *,
     runtime: object | None = None,
 ) -> None:
+    # WindowsApps is a host-controlled executable-alias directory.  Strict
+    # Guest execution must keep PATH limited to receipt-verified Runtime Packs,
+    # even when winget or a Store Python alias is present for the desktop user.
+    if _guest_requires_managed_runtime():
+        return
     if os.name != "nt" and not _windows_sandbox_backend_active(runtime):
         return
     candidates: list[Path] = []
@@ -3552,7 +3653,7 @@ def _policy_with_active_tool_mounts(policy: SandboxPolicy) -> SandboxPolicy:
 
 
 def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolicy:
-    """Make activated, receipt-validated toolchains visible read-only."""
+    """Make activated, receipt-validated managed packages visible read-only."""
 
     if not hasattr(policy, "mounts"):
         return policy
@@ -3563,7 +3664,20 @@ def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolic
         (str(mount.host_path), sandbox_path_text(mount.sandbox_path)): mount
         for mount in policy.mounts
     }
-    for path in managed_toolchain_readonly_paths():
+    managed_paths = (
+        []
+        if _guest_requires_managed_runtime()
+        else list(managed_toolchain_readonly_paths())
+    )
+    try:
+        from opensquilla.runtime_packs import runtime_roots
+
+        managed_paths.extend(runtime_roots(active_sandbox_policy().runtimes))
+    except (OSError, RuntimeError, ValueError):
+        # A broken optional Runtime Pack must never weaken or abort sandbox
+        # policy construction; it is simply omitted from PATH and mounts.
+        pass
+    for path in managed_paths:
         key = (str(path), sandbox_path_text(path))
         existing = mounts_by_target.get(key)
         if existing is not None and existing.mode == "rw":
@@ -6326,7 +6440,12 @@ async def _run_full_host_shell_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
-    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(_host_shell_env(merged_env))
@@ -6625,7 +6744,12 @@ async def exec_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
-    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
@@ -6659,6 +6783,10 @@ async def exec_command(
             before=mutation_before,
             output=output,
         )
+
+    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
+    if runtime_unavailable is not None:
+        return finish(json.dumps(runtime_unavailable, ensure_ascii=False))
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
@@ -6824,7 +6952,12 @@ async def _start_host_background_process(
 
     session_id = str(uuid.uuid4())[:8]
     base_env = dict(env) if env is not None else _base_shell_environment()
-    host_env = managed_skill_env(_runtime_shell_environment(base_env))
+    host_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            base_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(host_env)
     host_env = _host_shell_env(host_env)
     _append_windows_app_alias_path(host_env, runtime=runtime)
@@ -7095,9 +7228,12 @@ async def background_process(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
     effective_timeout = _resolve_background_timeout(timeout)
+    merged_env = _managed_skill_environment(_base_shell_environment())
+    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
-        merged_env = managed_skill_env(_base_shell_environment())
         apply_utf8_child_env(merged_env)
         _append_windows_app_alias_path(merged_env, runtime=runtime)
         merged_env = _dedupe_windows_env_keys(merged_env)

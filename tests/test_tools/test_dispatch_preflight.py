@@ -585,6 +585,41 @@ async def test_preflight_rejects_tool_not_in_allowed_list() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exclusive_ceiling_denies_before_hidden_tool_argument_validation() -> None:
+    registry = ToolRegistry()
+    called = False
+
+    async def _hidden(*, secret_path: str) -> str:
+        nonlocal called
+        called = True
+        return secret_path
+
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            description="hidden",
+            parameters={"secret_path": {"type": "string"}},
+            required=["secret_path"],
+        ),
+        _hidden,
+    )
+    ctx = ToolContext(
+        allowed_tools={"read_file", "artifact_reader"},
+        exclusive_tools={"artifact_reader"},
+    )
+    call = ToolCall(tool_use_id="u-exclusive", tool_name="read_file", arguments={})
+
+    preflight = await preflight_tool_call(registry=registry, ctx=ctx, tool_call=call)
+    dispatched = await build_tool_handler(registry, ctx)(call)
+
+    assert preflight is not None
+    assert json.loads(preflight.content)["error_class"] == "PolicyDenied"
+    assert "secret_path" not in preflight.content
+    assert json.loads(dispatched.content)["error_class"] == "PolicyDenied"
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_preflight_blocks_untrusted_origin() -> None:
     """A tool_call whose origin trace lies inside an <untrusted> block is
     refused with an InjectionRefused envelope."""

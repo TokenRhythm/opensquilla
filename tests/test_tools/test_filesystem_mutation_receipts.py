@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -98,6 +100,133 @@ async def test_edit_file_rejects_noop_edit(
 
     assert target.read_text(encoding="utf-8") == "alpha\n"
     assert ctx.workspace_epoch == 0
+
+
+@pytest.mark.asyncio
+async def test_write_file_repeated_stop_waits_for_commit_and_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_context: tuple[Path, ToolContext, list[dict[str, Any]]],
+) -> None:
+    workspace, ctx, _events = workspace_context
+    target = workspace / "src" / "stopped.py"
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    real_write_text = Path.write_text
+
+    def gated_write_text(
+        path: Path,
+        data: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        if path == target:
+            worker_started.set()
+            assert release_worker.wait(timeout=2.0)
+        return real_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", gated_write_text)
+    write_file = _original_async(filesystem.write_file)
+    task = asyncio.create_task(write_file(str(target), "settled = True\n"))
+    assert await asyncio.to_thread(worker_started.wait, 0.5)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not target.exists()
+
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+    assert target.read_text(encoding="utf-8") == "settled = True\n"
+    assert len(ctx.workspace_mutation_receipts) == 1
+    assert ctx.workspace_mutation_receipts[0]["changed"] is True
+    assert ctx.workspace_epoch == 1
+    assert len(ctx.workspace_file_writes) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["write_file", "write_scratch", "create_source", "edit_file", "edit_source"],
+)
+async def test_executor_mutation_tools_settle_before_repeated_stop(
+    tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_context: tuple[Path, ToolContext, list[dict[str, Any]]],
+) -> None:
+    workspace, ctx, _events = workspace_context
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    real_run_executor_mutation = filesystem._run_executor_mutation
+
+    async def gated_run_executor_mutation(
+        worker: Callable[[], Any],
+        *,
+        settle: Callable[[BaseException | None], None],
+    ) -> Any:
+        def gated_worker() -> Any:
+            worker_started.set()
+            assert release_worker.wait(timeout=2.0)
+            return worker()
+
+        return await real_run_executor_mutation(gated_worker, settle=settle)
+
+    monkeypatch.setattr(filesystem, "_run_executor_mutation", gated_run_executor_mutation)
+
+    target = workspace / "src" / f"{tool_name}.py"
+    expected = "after = True\n"
+    if tool_name == "write_file":
+        operation = _original_async(filesystem.write_file)(str(target), expected)
+    elif tool_name == "write_scratch":
+        scratch = workspace / ".opensquilla-scratch"
+        scratch.mkdir()
+        ctx.scratch_dir = str(scratch)
+        target = scratch / "repro.py"
+        operation = _original_async(filesystem.write_scratch)("repro.py", expected)
+    elif tool_name == "create_source":
+        operation = _original_async(filesystem.create_source)(str(target), expected)
+    elif tool_name == "edit_file":
+        target.parent.mkdir()
+        target.write_text("before = False\n", encoding="utf-8")
+        await filesystem.read_file(str(target))
+        operation = _original_async(filesystem.edit_file)(
+            str(target),
+            old_text="before = False\n",
+            new_text=expected,
+        )
+    else:
+        target.parent.mkdir()
+        target.write_text("before = False\n", encoding="utf-8")
+        revision = filesystem.source_revision_for_path(target)
+        operation = _original_async(filesystem.edit_source)(
+            str(target),
+            expected_revision=revision,
+            edits=[{"start_line": 1, "end_line": 1, "replacement": expected}],
+        )
+
+    task = asyncio.create_task(operation)
+    assert await asyncio.to_thread(worker_started.wait, 0.5)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+    assert target.read_text(encoding="utf-8") == expected
+    if tool_name == "write_scratch":
+        assert len(ctx.scratch_file_writes) == 1
+        assert ctx.workspace_mutation_receipts == []
+    else:
+        assert len(ctx.workspace_mutation_receipts) == 1
+        assert ctx.workspace_mutation_receipts[0]["changed"] is True
+        assert len(ctx.workspace_file_writes) == 1
 
 
 @pytest.mark.asyncio

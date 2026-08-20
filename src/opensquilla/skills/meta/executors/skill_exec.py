@@ -4,7 +4,7 @@ Runs a wrapped-CLI skill via its ``entrypoint`` manifest — no LLM, no
 sub-Agent. Resolves ``skill.entrypoint`` from the injected ``skill_loader``,
 renders ``command`` / ``args`` (and optional ``env`` / ``stdin`` / ``assemble``
 templates) against ``inputs`` + ``outputs`` + ``with`` (the step's
-rendered ``with_args``), then runs the subprocess in a worker thread.
+rendered ``with_args``), then runs the subprocess in a task-owned tree.
 Stdout is interpreted per ``parse`` (``text`` | ``json`` |
 ``lines``) and returned as the step output. Text output uses ``\n`` line
 endings on every platform so downstream Meta steps can compare and persist it
@@ -21,7 +21,6 @@ import re
 import shlex
 import subprocess
 import sys
-import threading
 from collections.abc import Mapping
 from pathlib import Path as _Path
 from typing import Any
@@ -29,6 +28,10 @@ from typing import Any
 import jinja2
 import structlog
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.redaction import redact_error_text
 from opensquilla.safety.secret_redaction import is_secret_key
 from opensquilla.skills.capability_runtime import (
@@ -758,52 +761,48 @@ async def run_skill_exec_step(
         stdin_bytes=len(stdin_bytes) if stdin_bytes is not None else 0,
     )
 
-    # Run subprocess.run in a dedicated thread. This avoids asyncio
-    # child-watcher flakiness across repeated pytest event loops without
-    # blocking the gateway event loop for long-running wrapped CLIs.
-    completed_box: dict[str, Any] = {}
-    error_box: dict[str, BaseException] = {}
+    try:
+        process = await create_owned_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workdir,
+            env=child_env,
+        )
+    except FileNotFoundError as err:
+        message = f"skill {effective_skill!r} command not found: {argv[0]!r}"
+        if is_external_paid_step(step):
+            message = encode_paid_replay_safety(message, safe_no_submit=True)
+        raise RuntimeError(message) from err
 
-    def _run_sync() -> None:
-        try:
-            completed_box["completed"] = subprocess.run(  # noqa: S603 - argv is manifest-authored and pre-split.
-                argv,
-                input=stdin_bytes,
-                capture_output=True,
-                cwd=workdir,
-                env=child_env,
-                timeout=timeout,
-                check=False,
-            )
-        except BaseException as exc:  # noqa: BLE001 - re-raised on event-loop thread
-            error_box["error"] = exc
+    process_tree = capture_process_tree_owner(process, isolated=True)
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(input=stdin_bytes),
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+        )
+        raise
+    except TimeoutError as err:
+        await process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+        message = f"skill {effective_skill!r} timed out after {timeout}s"
+        if is_external_paid_step(step):
+            # Once the child starts, a timeout cannot prove whether its
+            # non-idempotent provider POST was accepted.
+            message = encode_paid_replay_safety(message, safe_no_submit=False)
+        raise RuntimeError(message) from err
+    await process_tree.terminate(graceful_timeout=0.0, kill_timeout=1.0)
 
-    thread = threading.Thread(
-        target=_run_sync,
-        name=f"meta-skill-exec-{step.id}",
-        daemon=True,
+    completed = subprocess.CompletedProcess(
+        argv,
+        process.returncode if process.returncode is not None else -1,
+        stdout_bytes,
+        stderr_bytes,
     )
-    thread.start()
-    while thread.is_alive():
-        await asyncio.sleep(0.05)
-
-    if "error" in error_box:
-        err = error_box["error"]
-        if isinstance(err, FileNotFoundError):
-            message = f"skill {effective_skill!r} command not found: {argv[0]!r}"
-            if is_external_paid_step(step):
-                message = encode_paid_replay_safety(message, safe_no_submit=True)
-            raise RuntimeError(message) from err
-        if isinstance(err, subprocess.TimeoutExpired):
-            message = f"skill {effective_skill!r} timed out after {timeout}s"
-            if is_external_paid_step(step):
-                # Once the child starts, a timeout cannot prove whether its
-                # non-idempotent provider POST was accepted.
-                message = encode_paid_replay_safety(message, safe_no_submit=False)
-            raise RuntimeError(message) from err
-        raise err
-
-    completed = completed_box["completed"]
 
     returncode = completed.returncode
     stdout_bytes = completed.stdout

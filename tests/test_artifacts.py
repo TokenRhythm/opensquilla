@@ -13,6 +13,7 @@ import pytest
 from pptx import Presentation
 
 from opensquilla.artifacts import (
+    ARTIFACT_OWNERSHIP_MARKER_NAME,
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     DEFAULT_ARTIFACT_MAX_BYTES,
     INSTALLER_ARTIFACT_MAX_BYTES,
@@ -29,7 +30,7 @@ from opensquilla.engine.types import ToolCall
 from opensquilla.session.plans import PlanRunConflictError
 from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.dispatch import build_tool_handler
-from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.registry import ToolRegistry, get_default_registry
 from opensquilla.tools.types import (
     CallerKind,
     RetryableToolInputError,
@@ -40,6 +41,30 @@ from opensquilla.tools.types import (
 )
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def test_publish_artifact_schema_distinguishes_single_file_and_directory_modes() -> None:
+    definition = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions(
+            ToolContext(
+                is_owner=True,
+                caller_kind=CallerKind.AGENT,
+                allowed_tools={"publish_artifact"},
+            )
+        )
+        if tool.name == "publish_artifact"
+    )
+
+    assert "set bundle='none' and omit bundle_root" in definition.description
+    assert "bundle_root is valid only with bundle='directory'" in definition.description
+    bundle_schema = definition.input_schema.properties["bundle"]
+    assert bundle_schema["enum"] == ["auto", "directory", "none"]
+    assert "Use none for exactly one file" in bundle_schema["description"]
+    assert "directory requires bundle_root" in bundle_schema["description"]
+    bundle_root_description = definition.input_schema.properties["bundle_root"]["description"]
+    assert "Required only when bundle=directory" in bundle_root_description
+    assert "Invalid when bundle is auto or none" in bundle_root_description
 
 
 def _valid_pptx_bytes(title: str = "Validated deliverable") -> bytes:
@@ -124,6 +149,137 @@ def test_artifact_store_lists_stable_backwards_pages_and_gets_metadata(
     assert older.refs == (refs[0],)
     assert older.has_more is False
     assert older.total_count == 3
+
+
+def test_internal_revision_is_resolvable_but_not_listed_or_forked(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    internal = store.publish_bytes(
+        b"draft revision",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="draft.html",
+        mime="text/html",
+        source="artifact_revision",
+        visibility="internal",
+    )
+
+    resolved, path = store.resolve_for_download(internal.id, session_id="session-1")
+    assert resolved.id == internal.id
+    assert path.read_bytes() == b"draft revision"
+    assert store.list_refs(session_id="session-1", limit=10).refs == ()
+    assert (
+        store.copy_session_artifacts(
+            source_session_id="session-1",
+            target_session_id="session-2",
+            target_session_key="agent:main:session-2",
+        )
+        == 0
+    )
+
+
+def test_delete_ref_removes_only_the_requested_artifact(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    first = store.publish_bytes(
+        b"first",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="first.txt",
+        mime="text/plain",
+        source="artifact_revision",
+        visibility="internal",
+    )
+    second = store.publish_bytes(
+        b"second",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="second.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+
+    assert store.delete_ref(session_id="session-1", artifact_id=first.id) is True
+    assert store.delete_ref(session_id="session-1", artifact_id=first.id) is False
+    assert store.resolve_for_download(second.id, session_id="session-1")[0] == second
+
+
+def test_preallocated_artifact_id_is_exclusive_and_restart_deletable(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    artifact_id = store.allocate_artifact_id()
+    ref = store.publish_bytes(
+        b"candidate",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="candidate.html",
+        mime="text/html",
+        source="artifact_html_agent_edit",
+        visibility="internal",
+        artifact_id=artifact_id,
+    )
+
+    assert ref.id == artifact_id
+    assert (
+        store.path_for(ref).parent / ARTIFACT_OWNERSHIP_MARKER_NAME
+    ).read_text(encoding="ascii").strip() == artifact_id
+    with pytest.raises(FileExistsError):
+        store.publish_bytes(
+            b"must-not-overwrite",
+            session_id="session-1",
+            session_key="agent:main:session-1",
+            name="collision.html",
+            mime="text/html",
+            source="artifact_html_agent_edit",
+            artifact_id=artifact_id,
+        )
+    assert (
+        store.resolve_for_download(artifact_id, session_id="session-1")[1].read_bytes()
+        == b"candidate"
+    )
+    assert store.delete_reserved_bucket(
+        session_id="session-1",
+        artifact_id=artifact_id,
+    ) is True
+    assert store.delete_reserved_bucket(
+        session_id="session-1",
+        artifact_id=artifact_id,
+    ) is False
+
+
+def test_reserved_bucket_cleanup_fails_closed_without_ownership_proof(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    artifact_id = store.allocate_artifact_id()
+    ref = store.publish_bytes(
+        b"candidate",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="candidate.html",
+        mime="text/html",
+        source="artifact_html_agent_edit",
+        artifact_id=artifact_id,
+    )
+    marker = store.path_for(ref).parent / ARTIFACT_OWNERSHIP_MARKER_NAME
+    marker.write_text(store.allocate_artifact_id() + "\n", encoding="ascii")
+
+    with pytest.raises(ArtifactIntegrityError, match="marker mismatches"):
+        store.delete_reserved_bucket(session_id="session-1", artifact_id=artifact_id)
+    assert store.path_for(ref).read_bytes() == b"candidate"
+
+
+def test_publish_bytes_rejects_invalid_explicit_artifact_id(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(ValueError, match="artifact id is invalid"):
+        store.publish_bytes(
+            b"candidate",
+            session_id="session-1",
+            session_key="agent:main:session-1",
+            name="candidate.html",
+            mime="text/html",
+            source="artifact_html_agent_edit",
+            artifact_id="../candidate",
+        )
 
 
 def test_artifact_store_metadata_listing_skips_invalid_refs_without_reading_material(

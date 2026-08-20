@@ -147,6 +147,16 @@ def standalone_slash_services_from_runtime(
     flush_transcript = (
         getattr(flush_service, "execute", None) if flush_service is not None else None
     )
+    get_session_routing = (
+        getattr(session_manager, "get_session_routing", None)
+        if session_manager is not None
+        else None
+    )
+    set_session_routing = (
+        getattr(session_manager, "set_session_routing", None)
+        if session_manager is not None
+        else None
+    )
     create_session_callable = (
         cast(_standalone_slash_adapter.StandaloneCreateSession, create_session)
         if callable(create_session)
@@ -184,6 +194,41 @@ def standalone_slash_services_from_runtime(
             session_key,
         )
 
+    async def _get_session_routing(session_key: str) -> dict[str, Any]:
+        assert callable(get_session_routing)
+        from opensquilla.gateway.model_routing import model_routing_snapshot
+
+        config = getattr(svc, "config", None)
+        return cast(
+            dict[str, Any],
+            await get_session_routing(
+                session_key,
+                fallback_mode=model_routing_snapshot(config)["mode"],
+            ),
+        )
+
+    async def _set_session_routing(
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        assert callable(set_session_routing)
+        from opensquilla.gateway.model_routing import model_routing_patches
+
+        # Match the Gateway RPC's capability validation without mutating the
+        # global config. In particular, Ensemble must already have a viable
+        # lineup before a standalone Session can select it.
+        model_routing_patches(getattr(svc, "config", None), mode)
+        return cast(
+            dict[str, Any],
+            await set_session_routing(
+                session_key,
+                mode,
+                expected_revision=expected_revision,
+            ),
+        )
+
     return _standalone_slash_adapter.StandaloneSlashServices(
         create_session=create_session_callable,
         get_session=get_session_callable,
@@ -192,6 +237,12 @@ def standalone_slash_services_from_runtime(
         compact_session=compact_session_callable,
         compact_with_result=compact_with_result_callable,
         flush_transcript=flush_transcript_callable,
+        get_session_routing=(
+            _get_session_routing if callable(get_session_routing) else None
+        ),
+        set_session_routing=(
+            _set_session_routing if callable(set_session_routing) else None
+        ),
         config=getattr(svc, "config", None),
         provider_selector=getattr(svc, "provider_selector", None),
     )

@@ -373,6 +373,9 @@ async function mockControlledEnsembleLifecycle(page: Page) {
 const SCROLL_SESSION_KEY = 'agent:main:webchat:e2e-ensemble-scroll-retention'
 const SCROLL_TASK_ID = 'ensemble-scroll-retention-task'
 const LATE_TEXT = 'Issue 549 late text delta'
+const TINY_SCROLL_TEXT_ONE = 'Tiny scroll retention delta one'
+const TINY_SCROLL_TEXT_TWO = 'Tiny scroll retention delta two'
+const TINY_SCROLL_TEXT_THREE = 'Tiny scroll follow resumed delta'
 const LATE_MODEL = 'openai/gpt-5.4-mini'
 
 async function mockEnsembleScrollRetention(page: Page) {
@@ -383,6 +386,16 @@ async function mockEnsembleScrollRetention(page: Page) {
     window.localStorage.setItem('opensquilla-locale', 'en')
     window.localStorage.setItem('opensquilla.routerVisualEffects', '1')
   })
+  await page.route('**/api/system/update', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({}),
+  }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ enabled: false }),
+  }))
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -455,6 +468,7 @@ async function mockEnsembleScrollRetention(page: Page) {
   }
 
   return {
+    emitText: (text: string) => emit('session.event.text_delta', { text }),
     emitLateText: () => emit('session.event.text_delta', { text: LATE_TEXT }),
     emitLateProgress: () => emit('session.event.ensemble_progress', {
       event_type: 'proposer_start',
@@ -476,14 +490,22 @@ function threadMetrics(page: Page) {
   })
 }
 
-test('ensemble events do not re-pin a reader who left the live edge', async ({ page }) => {
+async function openEnsembleScrollRetention(page: Page) {
   const stream = await mockEnsembleScrollRetention(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SCROLL_SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
   await page.locator('.chat-textarea').fill('Keep streaming while I read earlier content.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  await expect.poll(
+    () => threadMetrics(page).then(metrics => metrics.scrollHeight > 1600),
+    { timeout: 10000 },
+  ).toBe(true)
+  await expect.poll(() => threadMetrics(page).then(metrics => metrics.gap)).toBeLessThanOrEqual(2)
+  return stream
+}
 
-  await expect.poll(() => threadMetrics(page).then(metrics => metrics.scrollHeight > 1600)).toBe(true)
+test('ensemble events do not re-pin a reader who left the live edge', async ({ page }) => {
+  const stream = await openEnsembleScrollRetention(page)
   const beforeLateEvents = await page.locator('.chat-thread').evaluate(el => {
     const thread = el as HTMLElement
     thread.scrollTop = Math.max(0, thread.scrollHeight - thread.clientHeight - 300)
@@ -508,6 +530,48 @@ test('ensemble events do not re-pin a reader who left the live edge', async ({ p
   const afterLateProgress = await threadMetrics(page)
   expect(afterLateProgress.gap).toBeGreaterThan(60)
   await expect(page.locator('.chat-jump-latest')).toBeVisible()
+})
+
+test('a tiny upward wheel pauses an active stream until the reader returns', async ({ page }) => {
+  const stream = await openEnsembleScrollRetention(page)
+  const thread = page.locator('.chat-thread')
+  const latest = page.locator('.chat-jump-latest')
+
+  await thread.hover({ position: { x: 120, y: 120 } })
+  await page.mouse.wheel(0, -8)
+  await expect(latest).toBeVisible()
+  const paused = await threadMetrics(page)
+  expect(paused.gap).toBeGreaterThan(2)
+  expect(paused.gap).toBeLessThan(60)
+
+  // Cross both the 120ms intent window and delayed IntersectionObserver
+  // delivery before proving that later stream deltas preserve the reader.
+  await page.waitForTimeout(150)
+  stream.emitText(TINY_SCROLL_TEXT_ONE)
+  await expect(thread).toContainText(TINY_SCROLL_TEXT_ONE)
+  const afterFirstDelta = await threadMetrics(page)
+  expect(Math.abs(afterFirstDelta.scrollTop - paused.scrollTop)).toBeLessThanOrEqual(1)
+  expect(afterFirstDelta.gap).toBeGreaterThan(2)
+  await expect(latest).toBeVisible()
+
+  stream.emitText(TINY_SCROLL_TEXT_TWO)
+  await expect(thread).toContainText(TINY_SCROLL_TEXT_TWO)
+  const afterSecondDelta = await threadMetrics(page)
+  expect(Math.abs(afterSecondDelta.scrollTop - paused.scrollTop)).toBeLessThanOrEqual(1)
+  expect(afterSecondDelta.gap).toBeGreaterThan(2)
+  await expect(latest).toBeVisible()
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if ((await threadMetrics(page)).gap <= 2) break
+    await page.mouse.wheel(0, 64)
+  }
+  await expect.poll(() => threadMetrics(page).then(metrics => metrics.gap)).toBeLessThanOrEqual(2)
+  await expect(latest).toHaveCount(0)
+
+  stream.emitText(TINY_SCROLL_TEXT_THREE)
+  await expect(thread).toContainText(TINY_SCROLL_TEXT_THREE)
+  await expect.poll(() => threadMetrics(page).then(metrics => metrics.gap)).toBeLessThanOrEqual(2)
+  await expect(latest).toHaveCount(0)
 })
 
 test('ensemble routing reveals members incrementally from ensemble_progress events', async ({ page }) => {

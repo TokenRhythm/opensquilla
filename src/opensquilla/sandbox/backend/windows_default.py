@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import ntpath
 import os
@@ -15,6 +16,9 @@ from dataclasses import replace
 from pathlib import Path, PurePath
 from typing import Any
 
+from opensquilla.process_tree import (
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
@@ -174,7 +178,7 @@ class WindowsDefaultBackend(Backend):
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_owned_subprocess_exec(
                 *helper_argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -189,18 +193,10 @@ class WindowsDefaultBackend(Backend):
                 timeout=helper_wall,
             )
         except asyncio.CancelledError:
-            proc.kill()
-            try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            await asyncio.shield(_terminate_owned_helper(proc))
             raise
         except TimeoutError:
-            proc.kill()
-            try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            await _terminate_owned_helper(proc)
             elapsed = time.monotonic() - started
             return SandboxResult(
                 returncode=124,
@@ -212,6 +208,9 @@ class WindowsDefaultBackend(Backend):
                 timed_out=True,
             )
 
+        owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+        if owner is not None:
+            await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
         elapsed = time.monotonic() - started
         stdout, trunc_out = _decode_capped(stdout_bytes)
         stderr, trunc_err = _decode_capped(stderr_bytes)
@@ -238,6 +237,18 @@ class WindowsDefaultBackend(Backend):
 
 def _support_ready() -> bool:
     return probe_windows_default_support().default_backend_available
+
+
+async def _terminate_owned_helper(proc: Any) -> None:
+    owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+    if owner is not None:
+        await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
+        return
+    # Compatibility for injected subprocess-like embedders. Production owned
+    # launchers always attach a Job-backed owner before returning.
+    proc.kill()
+    with contextlib.suppress(ProcessLookupError):
+        await proc.wait()
 
 
 def _helper_supervision_timeout(command_timeout_s: float) -> float:

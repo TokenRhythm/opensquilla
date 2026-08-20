@@ -215,7 +215,7 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert 'merge_group)\n              base="${{ github.event.merge_group.base_sha }}"' in text
     assert 'head="${{ github.event.merge_group.head_sha }}"' in text
     assert 'git diff --name-only "${base}" "${head}" > "${changed_files}"' in text
-    assert "Merge-group diff is unavailable; running the full CI matrix." in text
+    assert "Merge-group diff is unavailable or empty; running the full CI matrix." in text
     assert 'git diff --name-only "${before}" "${after}" > "${changed_files}"' in text
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
     assert "runtime_changed" in text
@@ -249,10 +249,42 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         "${{ vars.CI_OPTIMIZATION_MODE || 'enforce' }}"
     )
     assert jobs["queue-attestation"]["name"] == "Verify reusable PR CI evidence"
-    assert "if" not in jobs["queue-attestation"]
-    assert "not a merge-group event" in str(jobs["queue-attestation"])
+    assert jobs["queue-attestation"]["if"] == (
+        "${{ github.event_name == 'merge_group' }}"
+    )
+    assert "not a merge-group event" not in str(jobs["queue-attestation"])
     assert "fetch-depth" in str(jobs["queue-attestation"])
     assert "verify-queue" in str(jobs["queue-attestation"])
+    assert "reason_code" in str(jobs["queue-attestation"])
+    assert jobs["classify-changes"]["needs"] == "queue-attestation"
+    assert "always()" in jobs["classify-changes"]["if"]
+    assert "github.event_name != 'merge_group'" in jobs["classify-changes"]["if"]
+    classify_consumers = {
+        job_name: job
+        for job_name, job in jobs.items()
+        if job_name != "ci-result"
+        and "classify-changes"
+        in (
+            [job.get("needs")]
+            if isinstance(job.get("needs"), str)
+            else job.get("needs", [])
+        )
+    }
+    assert classify_consumers
+    for job_name, job in classify_consumers.items():
+        condition = str(job.get("if", ""))
+        assert "always()" in condition, job_name
+        assert "needs.classify-changes.result == 'success'" in condition, job_name
+    for job_name in ("webui-chat-recovery", "desktop-recovery-e2e"):
+        assert "needs.frontend-check.result == 'success'" in str(
+            jobs[job_name]["if"]
+        )
+    queue_checkout = next(
+        step
+        for step in jobs["queue-attestation"]["steps"]
+        if step.get("name") == "Check out merge-group commit"
+    )
+    assert queue_checkout["with"]["ref"] == "${{ github.event.merge_group.head_sha }}"
     assert "full fail-closed matrix" in str(jobs["classify-changes"])
     assert 'CI_OPTIMIZATION_MODE}" == "legacy"' in str(jobs["classify-changes"])
     assert jobs["main-canary"]["name"] == "Main installation and offline gateway canary"
@@ -261,6 +293,21 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert "ci-attestation-${{ steps.attestation.outputs.tree_sha }}" in str(
         jobs["ci-result"]
     )
+
+
+def test_skill_hub_contract_uses_classifier_gate_without_changing_required_names() -> None:
+    workflow = _workflow("skill-hub-contract.yml")
+    jobs = workflow["jobs"]
+    assert jobs["detect"]["name"] == "Detect Skill Hub contract changes"
+    assert jobs["skill-hub-contract"]["needs"] == "detect"
+    assert jobs["skill-hub-contract"]["if"] == (
+        "${{ needs.detect.outputs.run_contract == 'true' }}"
+    )
+    text = (WORKFLOW_DIR / "skill-hub-contract.yml").read_text(encoding="utf-8")
+    assert "classify-ci-changes.sh" in text
+    assert "github.event.pull_request.base.sha" in text
+    assert "github.event.pull_request.head.sha" in text
+    assert "run_contract" in text
 
 
 def test_ci_change_classifier_routes_platform_neutral_gateway_changes(
@@ -476,6 +523,8 @@ def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl()
     assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate["env"]
     assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate["env"]
     assert validate["env"]["OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E"] == "1"
+    setup_uv = next(step for step in validate["steps"] if step.get("name") == "Set up uv")
+    assert setup_uv["with"]["enable-cache"] is True
 
     configure_state = next(
         step
@@ -585,6 +634,8 @@ def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
 
     assert "node scripts/test-desktop-profile-substrate.mjs" in unit_step["run"]
     assert "node scripts/test-desktop-profile-consolidation.mjs" in unit_step["run"]
+    assert "node scripts/test-onboarding-flow-coordinator.mjs" in unit_step["run"]
+    assert "node scripts/test-onboarding-save-telemetry.mjs" in unit_step["run"]
 
 
 def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
@@ -1379,7 +1430,8 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
     assert "python_full_required == 'true'" in jobs["ubuntu-full"]["if"]
     assert jobs["windows-compat"]["if"] == (
-        "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
+        "${{ always() && needs.classify-changes.result == 'success' && "
+        "(needs.classify-changes.outputs.python_changed == 'true' || "
         "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
         "needs.classify-changes.outputs.dependency_changed == 'true' || "
         "needs.classify-changes.outputs.release_changed == 'true') && "
@@ -1496,6 +1548,9 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         if step.get("name")
         == "Run cross-platform production-dist browser session hang contract"
     )
+    playwright_cache = next(
+        step for step in steps if step.get("name") == "Cache Playwright browser"
+    )
     run = next(
         step for step in steps if step.get("name") == "Run compiled Desktop recovery flows"
     )
@@ -1515,10 +1570,20 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert session_recovery["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
     assert "history-hydration.spec.ts" in session_recovery["run"]
     assert '--grep "terminates stalled"' in session_recovery["run"]
+    assert playwright_cache["uses"] == "actions/cache@v4"
+    assert playwright_cache["with"]["path"] == "${{ env.PLAYWRIGHT_BROWSERS_PATH }}"
+    assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
+        "${{ github.workspace }}/.cache/ms-playwright"
+    )
+    assert "${{ runner.arch }}" in playwright_cache["with"]["key"]
+    assert "opensquilla-webui/package-lock.json" in playwright_cache["with"]["key"]
+    assert "restore-keys" not in playwright_cache["with"]
     assert "xvfb-run -a node" in run["run"]
     assert "test-profile-consolidation-flow.mjs" in run["run"]
     assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
+    assert run["run"].count("'onboarding-flow:scripts/test-onboarding-flow.mjs'") == 2
+    assert 'if [[ "${RUNNER_OS}" == "macOS" ]]' in run["run"]
     assert "test-desktop-cleanup-flow.mjs" in run["run"]
     assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
@@ -1614,7 +1679,7 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     )
 
     assert windows_full["name"] == "Windows high-risk (${{ matrix.shard }})"
-    assert windows_full["timeout-minutes"] == 45
+    assert windows_full["timeout-minutes"] == 60
     assert windows_full["strategy"] == {
         "fail-fast": False,
         "matrix": {

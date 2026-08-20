@@ -20,11 +20,12 @@ CI and retain their existing live markers.
 Set the Actions repository variable `CI_OPTIMIZATION_MODE` to one of:
 
 - `shadow`: compute and report whether merge-queue evidence is reusable, but run
-  the normal queue matrix. Change-based PR selection is active so its coverage and duration
-  are observable before queue reuse is enabled.
-- `enforce` (default): reuse an exact trusted PR result in the merge queue; otherwise fail closed to
-  the full queue matrix. Replace the normal `main` push matrix with the installation and
-  offline gateway canary.
+  the classifier-selected merge-group diff matrix. Change-based selection remains observable
+  before queue reuse is enabled.
+- `enforce` (default): reuse an exact trusted PR result in the merge queue; otherwise run the
+  classifier-selected merge-group diff matrix. CI-policy, dependency, unknown, and other
+  high-risk paths still escalate to the full queue matrix. Replace the normal `main` push matrix
+  with the installation and offline gateway canary.
 - `legacy`: emergency rollback mode. It deliberately runs full PR and queue CI and keeps
   the pre-enforcement `main` behavior.
 
@@ -42,8 +43,9 @@ Reusable evidence is accepted only when all of these facts match authoritative G
 4. Every workflow, CI helper, dependency lock/manifest, and `CODEOWNERS` policy input has the
    same digest as `main`.
 
-Missing, expired, malformed, stale, or unverifiable evidence never bypasses tests; it causes
-the queue to run the full matrix. The required branch-protection context remains `CI result`.
+Missing, expired, malformed, stale, or unverifiable evidence never bypasses tests. The exact
+merge-group diff is classified instead; unavailable/empty diffs and high-risk paths run the full
+matrix. The required branch-protection context remains `CI result`.
 
 Before merging this rollout, confirm that the main ruleset requires `CI result` and
 `Validate target branch`, requires conversation resolution, and enforces code-owner review

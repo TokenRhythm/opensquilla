@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -105,6 +106,43 @@ def test_ci_owns_a_package_contract_verifier() -> None:
     verifier = _text(".github/scripts/verify-sandbox-package.mjs")
     workflow = _text(".github/workflows/ci.yml")
     assert "requiredTargets" in verifier
-    assert "package is missing bundled" in verifier
-    assert "asset.executables" in verifier
+    assert "package must not contain bundled developer runtimes" in verifier
+    assert "runtime/runtime-pack-catalog.json" in verifier
+    assert "refusing to publish a desktop package" in verifier
+    assert "asset.sizeBytes" in verifier
+    assert "asset.unpackedSizeBytes" in verifier
+    assert r"\.tar\.xz" in verifier
+    assert "managed upgrade cleanup without a custom recursive delete" in verifier
+    assert "build', 'installer.nsh'" in verifier
     assert "verify-sandbox-package.mjs" in workflow
+
+    package_verifier = _text("desktop/electron/scripts/verify-package.mjs")
+    assert "managed upgrade cleanup without a custom recursive delete" in package_verifier
+    assert "unsafeInstallerInclude" in package_verifier
+
+
+def test_unfinalized_catalog_allows_development_but_blocks_release() -> None:
+    catalog = json.loads(
+        _text("desktop/electron/runtime/runtime-pack-catalog.json")
+    )
+    assert catalog["finalized"] is False
+    assert catalog["targets"] == {}
+
+    development = subprocess.run(
+        ["node", ".github/scripts/verify-sandbox-package.mjs", "--source"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert development.returncode == 0, development.stderr
+
+    release = subprocess.run(
+        ["node", ".github/scripts/verify-sandbox-package.mjs", "--release-source"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert release.returncode == 1
+    assert "catalog is not finalized" in release.stderr

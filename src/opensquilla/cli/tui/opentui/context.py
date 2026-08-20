@@ -129,8 +129,13 @@ async def send_context_update(
         permission=permission,
     )
     await send("context.update", asdict(update))
+    session_routing = _mapping(
+        (snapshot or {}).get("routing")
+        or (snapshot or {}).get("modelRouting")
+        or (snapshot or {}).get("model_routing")
+    )
     runtime = _mapping((snapshot or {}).get("runtime"))
-    routing = _mapping(runtime.get("model_routing"))
+    routing = session_routing or _mapping(runtime.get("model_routing"))
     if routing:
         await send_model_routing_state(output, routing)
 
@@ -144,15 +149,18 @@ async def send_model_routing_state(
     send = getattr(output, "send_message", None)
     if not callable(send):
         return
+    mode = _display_text(snapshot.get("mode") or "direct", limit=16) or "direct"
     update = ModelRoutingState(
-        mode=_display_text(snapshot.get("mode") or "direct", limit=16) or "direct",
-        router_enabled=bool(snapshot.get("router_enabled")),
-        ensemble_enabled=bool(snapshot.get("ensemble_enabled")),
+        mode=mode,
+        router_enabled=bool(snapshot.get("router_enabled", mode == "router")),
+        ensemble_enabled=bool(snapshot.get("ensemble_enabled", mode == "ensemble")),
         selection_mode=_display_text(snapshot.get("selection_mode"), limit=48),
         rollout_phase=_display_text(snapshot.get("rollout_phase") or "observe", limit=16)
         or "observe",
         applies_to=_display_text(
-            snapshot.get("applies_to") or "next_accepted_turn",
+            snapshot.get("applies_to")
+            or snapshot.get("appliesTo")
+            or "next_accepted_turn",
             limit=32,
         )
         or "next_accepted_turn",

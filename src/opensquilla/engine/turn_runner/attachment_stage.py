@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
-from opensquilla.token_estimation import estimate_material_text_tokens
+from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
@@ -103,33 +103,58 @@ def _materialization_stats(
     parse_failure_count = 0
     provider_visible_text_chars = 0
     image_count = 0
+    attachment_blocks: list[Any] = []
     for message in extra_messages:
         content = getattr(message, "content", None)
         if not isinstance(content, list):
             continue
         # The first block is the ordinary prompt. Routing already counts it.
-        for attachment, block in zip(attachments, content[1:], strict=False):
-            block_tokens = 0
-            if isinstance(block, ContentBlockText):
-                provider_visible_text_chars += len(block.text)
-                block_tokens = estimate_material_text_tokens(block.text)
-                parse_failure_count += block.text.count(_UNAVAILABLE_MARKER)
-            elif isinstance(block, ContentBlockImage):
-                image_count += 1
-                block_tokens = estimate_provider_media_tokens(
-                    "image",
-                    _base64_decoded_size(block.data),
-                )
-            estimated_tokens += block_tokens
-            if (
-                generated_normalization_attachment_count > 0
-                and attachment.get("_generated_by")
-                == _GENERATED_TEXT_ATTACHMENT_SOURCE
-                and attachment.get("source") == _GENERATED_TEXT_ATTACHMENT_SOURCE
-                and attachment.get("_provider_inline_policy") == "preview_only"
-            ):
-                generated_normalization_estimated_tokens += block_tokens
-                generated_normalization_attachment_count -= 1
+        attachment_blocks.extend(content[1:])
+
+    block_tokens_by_index: list[int] = []
+    for block in attachment_blocks:
+        block_tokens = 0
+        if isinstance(block, ContentBlockText):
+            provider_visible_text_chars += len(block.text)
+            block_tokens = estimate_attachment_text_tokens(block.text)
+            parse_failure_count += block.text.count(_UNAVAILABLE_MARKER)
+        elif isinstance(block, ContentBlockImage):
+            image_count += 1
+            block_tokens = estimate_provider_media_tokens(
+                "image",
+                _base64_decoded_size(block.data),
+            )
+        estimated_tokens += block_tokens
+        block_tokens_by_index.append(block_tokens)
+
+    # Most attachments render one block. A materialized image renders its
+    # image block plus a standalone workspace marker; advance across both so a
+    # following generated text attachment is attributed to its own block.
+    block_index = 0
+    for attachment in attachments:
+        if block_index >= len(attachment_blocks):
+            break
+        block = attachment_blocks[block_index]
+        block_tokens = block_tokens_by_index[block_index]
+        if (
+            generated_normalization_attachment_count > 0
+            and attachment.get("_generated_by")
+            == _GENERATED_TEXT_ATTACHMENT_SOURCE
+            and attachment.get("source") == _GENERATED_TEXT_ATTACHMENT_SOURCE
+            and attachment.get("_provider_inline_policy") == "preview_only"
+        ):
+            generated_normalization_estimated_tokens += block_tokens
+            generated_normalization_attachment_count -= 1
+        block_index += 1
+        if (
+            isinstance(block, ContentBlockImage)
+            and block_index < len(attachment_blocks)
+            and isinstance(attachment_blocks[block_index], ContentBlockText)
+            and attachment_blocks[block_index].text.startswith(
+                ("[attachment available:", "[attachment unavailable:")
+            )
+        ):
+            block_index += 1
     return AttachmentMaterializationStats(
         attachment_count=len(attachments),
         estimated_tokens=estimated_tokens,

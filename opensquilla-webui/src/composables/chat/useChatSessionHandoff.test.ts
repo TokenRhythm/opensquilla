@@ -302,6 +302,7 @@ describe('chat send session handoff', () => {
       pendingAttachments,
       pendingSessionIntent,
       initialCollaborationMode: ref<'default' | 'plan'>('default'),
+      initialRoutingMode: ref<'direct'>('direct'),
       pendingForkBeforeMessageId: ref('msg-B'),
       aborted,
       activeStreamTaskId,

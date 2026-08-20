@@ -167,6 +167,84 @@ def test_legacy_single_file_with_local_dependencies_is_explicitly_partial(
     assert missing.status_code == 404
 
 
+def test_stale_remote_import_bundle_warning_is_revalidated_for_preview(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    stale_remote_import = store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=(
+                        b"<style>@import url('https://fonts.googleapis.com/css2?family=Inter');"
+                        b"</style><h1>Remote font</h1>"
+                    ),
+                ),
+            ),
+            collection_status="partial",
+            warning_codes=("missing_dependency",),
+        ),
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        name="legacy-remote-font.html",
+        mime="text/html",
+        source="stale-preview-revalidation-test",
+    )
+    actual_missing_dependency = store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=b"<link rel='stylesheet' href='missing.css'><h1>Incomplete</h1>",
+                ),
+            ),
+            collection_status="partial",
+            warning_codes=("missing_dependency",),
+        ),
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        name="actual-missing-dependency.html",
+        mime="text/html",
+        source="stale-preview-revalidation-test",
+    )
+    app, _service = _app(tmp_path)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:18791",
+        client=("127.0.0.1", 51000),
+    ) as client:
+        stale_payload = _create(client, stale_remote_import.id).json()
+        missing_payload = _create(client, actual_missing_dependency.id).json()
+
+    assert stale_payload["source"] == {
+        "kind": "bundle",
+        "collection_status": "complete",
+        "file_count": 1,
+        "total_bytes": stale_remote_import.size,
+        "warning_codes": [],
+    }
+    assert missing_payload["source"] == {
+        "kind": "bundle",
+        "collection_status": "partial",
+        "file_count": 1,
+        "total_bytes": actual_missing_dependency.size,
+        "warning_codes": ["missing_dependency"],
+    }
+    unchanged = store.describe_preview_bundle(
+        stale_remote_import.id,
+        session_id=_SESSION_ID,
+    )
+    assert unchanged is not None
+    assert unchanged.collection_status == "partial"
+    assert unchanged.warning_codes == ("missing_dependency",)
+
+
 def test_full_loopback_lease_uses_isolated_random_localhost_origin(tmp_path: Path) -> None:
     ref = _publish_html(tmp_path)
     app, service = _app(tmp_path)

@@ -54,6 +54,7 @@ function mockConfigSequence(configs: Array<Record<string, unknown>>) {
     if (method === 'channels.status') return { channels: [] }
     if (method === 'config.get') return queue.shift() ?? configs[configs.length - 1] ?? {}
     if (method === 'config.patch.safe') return { restartRequired: false }
+    if (method === 'models.routing.set') return {}
     throw new Error(`Unexpected RPC method: ${method}`)
   })
 }
@@ -72,7 +73,7 @@ afterEach(() => {
 })
 
 describe('useSetupCatalog privacy settings', () => {
-  it('moves automatic memory capture into the privacy dirty/save flow', async () => {
+  it('tracks and saves automatic memory capture from the Memory section', async () => {
     mockConfigSequence([
       {
         privacy: { disable_network_observability: false },
@@ -87,16 +88,15 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setMemoryAutoCapture(false)
 
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(false)
     await api.saveDirtySections()
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
       patches: {
-        'privacy.disable_network_observability': false,
         'memory.auto_capture_enabled': false,
       },
     })
-    expect(api.sectionDirty('privacy')).toBe(false)
+    expect(api.sectionDirty('memory')).toBe(false)
     app.unmount()
   })
 
@@ -108,14 +108,14 @@ describe('useSetupCatalog privacy settings', () => {
     const { api, app } = await mountCatalog()
 
     api.setDisableNetworkObservability(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
 
     await api.savePrivacy()
 
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
       patches: { 'privacy.disable_network_observability': true },
     })
-    expect(api.sectionDirty('privacy')).toBe(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
     expect(pushToast).toHaveBeenCalledWith('Privacy saved.')
     app.unmount()
   })
@@ -143,16 +143,16 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setDisableNetworkObservability(true)
     api.setAutoSessionTitles(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
 
     await api.saveDirtySections()
 
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
       patches: { 'privacy.disable_network_observability': true },
     })
-    expect(api.privacyPanel.value.disableNetworkObservability).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
     app.unmount()
   })
 
@@ -167,11 +167,11 @@ describe('useSetupCatalog privacy settings', () => {
     ])
     const { api, app } = await mountCatalog()
 
-    expect(api.privacyPanel.value.disableNetworkObservability).toBe(false)
-    expect(api.privacyPanel.value.statusText).toBe(
-      'Network reporting is off because an environment setting disables it.',
-    )
-    expect(api.sectionDirty('privacy')).toBe(false)
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: false,
+      networkReportingForcedOff: true,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
     app.unmount()
   })
 
@@ -188,10 +188,11 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setDisableNetworkObservability(false)
 
-    expect(api.privacyPanel.value.statusText).toBe(
-      'Network reporting is on.',
-    )
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
     app.unmount()
   })
 })
@@ -252,7 +253,7 @@ describe('useSetupCatalog capability reset', () => {
     api.setAutoSessionTitles(true)
     api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
 
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     await api.resetCapability('image_generation')
 
@@ -263,7 +264,7 @@ describe('useSetupCatalog capability reset', () => {
       capabilityId: 'image_generation',
     })
     expect(api.sectionDirty('capabilities')).toBe(false)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     app.unmount()
   })
 
@@ -1140,7 +1141,7 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
-  it('marks Model Strategy dirty when selecting the single-model strategy', async () => {
+  it('persists the global new-chat default when selecting the single-model strategy', async () => {
     mockConfigSequence([
       {
         llm: { provider: 'openrouter', model: 'openrouter/auto' },
@@ -1150,11 +1151,175 @@ describe('useSetupCatalog model strategy IA', () => {
     ])
     const { api, app } = await mountCatalog()
 
-    api.setModelStrategy('single')
+    await api.setModelStrategy('single')
 
     expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'direct' })
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    app.unmount()
+  })
+
+  it('rebases a fresh Ensemble activation without losing existing detail drafts', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') {
+        return {
+          mode: 'ensemble',
+          selection_mode: 'static_tokenrhythm_b5',
+          activation_preview: {
+            selection_mode: 'static_tokenrhythm_b5',
+            candidates: [],
+          },
+        }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.setEnsembleMinSuccessful(2)
+
+    await api.setModelStrategy('ensemble')
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
+    expect(api.modelStrategyPanel.value.ensemble.selectionMode).toBe('static_tokenrhythm_b5')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual([])
+    expect(api.modelStrategyPanel.value.ensemble.minSuccessfulProposers).toBe(2)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
-    expect(api.dirtySections.value.map(s => s.id)).toContain('modelStrategy')
+
+    api.setEnsembleMinSuccessful(1)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    app.unmount()
+  })
+
+  it('rolls back a failed fresh Ensemble activation without synthetic lineup dirtiness', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') throw new Error('routing write failed')
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.setEnsembleMinSuccessful(2)
+
+    await api.setModelStrategy('ensemble')
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+    expect(api.modelStrategyPanel.value.ensemble.selectionMode).toBe('custom_b5')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual([])
+    expect(api.modelStrategyPanel.value.ensemble.minSuccessfulProposers).toBe(2)
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+
+    api.setEnsembleMinSuccessful(1)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('routing write failed'),
+      { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('preserves Ensemble lineup edits made while the mode write is pending', async () => {
+    let resolveRouting!: (value: Record<string, unknown>) => void
+    const routingRequest = new Promise<Record<string, unknown>>(resolve => {
+      resolveRouting = resolve
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') return routingRequest
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    const mutation = api.setModelStrategy('ensemble')
+    await vi.waitFor(() => {
+      expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
+    })
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    resolveRouting({
+      mode: 'ensemble',
+      selection_mode: 'custom_b5',
+      activation_preview: {
+        candidates: [
+          { provider: 'openrouter', model: 'server/preview', role: 'primary' },
+        ],
+      },
+    })
+    await mutation
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
+    ]))
+    expect(api.modelStrategyPanel.value.ensemble.candidates).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'server/preview' }),
+    ]))
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    app.unmount()
+  })
+
+  it('preserves Ensemble lineup edits when a pending mode write fails', async () => {
+    let rejectRouting!: (error: Error) => void
+    const routingRequest = new Promise<Record<string, unknown>>((_resolve, reject) => {
+      rejectRouting = reject
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') return {}
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'tokenrhythm', model: 'deepseek-v4-pro' },
+          squilla_router: { enabled: false },
+          llm_ensemble: { enabled: false, selection_configured: false },
+        }
+      }
+      if (method === 'models.routing.set') return routingRequest
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    const mutation = api.setModelStrategy('ensemble')
+    await vi.waitFor(() => {
+      expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
+    })
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    rejectRouting(new Error('routing write failed'))
+    await mutation
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
+    ]))
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('routing write failed'),
+      { tone: 'danger' },
+    )
     app.unmount()
   })
 
@@ -1306,13 +1471,10 @@ describe('useSetupCatalog model strategy IA', () => {
     ])
     const { api, app } = await mountCatalog()
 
-    api.setModelStrategy('single')
-    expect(api.sectionDirty('modelStrategy')).toBe(true)
-
-    await api.discardChanges()
+    await api.setModelStrategy('single')
     expect(api.sectionDirty('modelStrategy')).toBe(false)
 
-    api.setEnsembleEnabled(false)
+    api.setEnsembleEnabled(true)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     expect(api.dirtySections.value.map(s => s.id)).toContain('modelStrategy')
     app.unmount()
@@ -1340,17 +1502,19 @@ describe('useSetupCatalog model strategy IA', () => {
         ensembleSaved = true
         return {}
       }
+      if (method === 'models.routing.set') return {}
       if (method === 'config.patch.safe') return { restartRequired: false }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
     const { api, app } = await mountCatalog()
 
-    api.setModelStrategy('single')
-    api.setEnsembleEnabled(true)
+    await api.setModelStrategy('single')
+    api.setRouterDefaultTier('c2')
+    api.setEnsembleMinSuccessful(2)
     await api.saveDirtySections()
 
     expect(rpcCall).toHaveBeenCalledWith('onboarding.router.configure', expect.any(Object))
-    expect(rpcCall).toHaveBeenCalledWith('onboarding.ensemble.configure', { enabled: true })
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.ensemble.configure', { minSuccessfulProposers: 2 })
     app.unmount()
   })
 
@@ -3296,8 +3460,9 @@ describe('useSetupCatalog configured provider management', () => {
     api.updateCapabilityField('search', 'maxResults', 25)
     api.updateCapabilityField('image', 'size', '512x512')
     api.updateCapabilityField('audio', 'ttsVoice', 'draft-voice')
-    expect(api.sectionDirty('behavior')).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
 
     await api.requestSelectConfiguredProvider('deepseek')
@@ -3305,18 +3470,17 @@ describe('useSetupCatalog configured provider management', () => {
     await expect(api.saveProvider()).resolves.toBe(true)
 
     expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
-    expect(api.privacyPanel.value).toMatchObject({
-      disableNetworkObservability: true,
-      memoryAutoCapture: false,
-    })
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    expect(api.memoryPanel.value.autoCapture).toBe(false)
     expect(api.capabilitiesPanel.value.form).toMatchObject({
       searchMaxResults: 25,
       memoryModel: 'server-refreshed-model',
       imageSize: '512x512',
       audioTtsVoice: 'draft-voice',
     })
-    expect(api.sectionDirty('behavior')).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     expect(api.providerDraftDirty.value).toBe(false)
     expect(api.providerPanel.value.providerSelected).toBe('deepseek')
@@ -3539,7 +3703,7 @@ describe('useSetupCatalog configured provider management', () => {
     await expect(save).resolves.toBe(true)
 
     expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     expect(api.providerDraftDirty.value).toBe(false)
     app.unmount()
   })
@@ -3914,18 +4078,17 @@ describe('useSetupCatalog configured provider management', () => {
     })
     expect(api.sectionDirty('modelStrategy')).toBe(false)
     expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
-    expect(api.privacyPanel.value).toMatchObject({
-      disableNetworkObservability: true,
-      memoryAutoCapture: false,
-    })
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    expect(api.memoryPanel.value.autoCapture).toBe(false)
     expect(api.capabilitiesPanel.value.form).toMatchObject({
       searchMaxResults: 25,
       memoryModel: 'server-refreshed-model',
       imageSize: '512x512',
       audioTtsVoice: 'draft-voice',
     })
-    expect(api.sectionDirty('behavior')).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     app.unmount()
   })
@@ -5075,7 +5238,7 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.providerPanel.value.llmTimeoutSeconds).toBe(321)
     expect(api.modelStrategyPanel.value.single.model).toBe('gpt-4.1')
     expect(api.providerDraftDirty.value).toBe(true)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     app.unmount()
   })

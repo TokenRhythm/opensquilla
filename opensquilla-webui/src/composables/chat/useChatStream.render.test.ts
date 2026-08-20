@@ -202,6 +202,73 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('reconciles the turn clock from authoritative live-task hydration', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    expect(api.streamTurnElapsed.value).toBe('0s')
+    expect(api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: '90000',
+    })).toBe(true)
+    expect(api.streamTurnElapsed.value).toBe('30s')
+
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe('35s')
+    api.cleanup()
+  })
+
+  it('never moves the same task clock forward and resets for a successor task', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 100_000,
+    })
+    expect(api.streamTurnElapsed.value).toBe('30s')
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-successor',
+      startedAt: 115_000,
+    })
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    api.cleanup()
+  })
+
+  it('ignores invalid task timestamps and clears task identity on a live reset', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    expect(api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 'not-a-timestamp',
+    })).toBe(false)
+    expect(api.streamTurnElapsed.value).toBe('0s')
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
+    api.resetLiveTurnState()
+    api.startStreaming()
+    expect(api.streamTurnElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
   it('preserves the authoritative active-task steer capability when streaming starts late', () => {
     const { api, runStatus, applySessionRunState } = makeStream()
     runStatus.value = {
@@ -470,9 +537,9 @@ describe('useChatStream render coalescing', () => {
 
     expect(messages.value[0]?.text).toBe(prefix + suffix)
     expect(messages.value[0]?.timeline).toEqual([
-      { type: 'text', raw: prefix },
+      { type: 'text', raw: prefix, presentation: 'answer' },
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: suffix },
+      { type: 'text', raw: suffix, presentation: 'answer' },
     ])
     api.cleanup()
   })
@@ -721,7 +788,7 @@ describe('useChatStream render coalescing', () => {
   })
 
   it('keeps intermediate and answer text in separate live segments', () => {
-    const { api } = makeStream()
+    const { api, messages } = makeStream()
 
     api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
     api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
@@ -742,6 +809,14 @@ describe('useChatStream render coalescing', () => {
       presentation: item.type === 'text' ? item.presentation : undefined,
       rawText: item.type === 'text' ? item.rawText : undefined,
     })))
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.timeline).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      { type: 'text', raw: 'Checking.', presentation: 'intermediate' },
+      { type: 'text', raw: 'Verified answer.', presentation: 'answer' },
+    ])
     api.cleanup()
   })
 
@@ -772,14 +847,16 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('before')
-    api.checkpointForUserMessage('turn-steered')
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
     messages.value.push({
       role: 'user',
       text: 'adjust',
       ts: new Date().toISOString(),
+      clientId: 'steer-1',
       turnId: 'turn-steered',
       inputDisposition: 'steering',
     })
+    api.acknowledgeSteerBoundary('steer-1', '', 0)
     api.appendDelta('after')
     api.reconcileFinalText('beforeafter')
     api.endStreaming()
@@ -790,6 +867,130 @@ describe('useChatStream render coalescing', () => {
       ['assistant', 'after'],
     ])
     expect(messages.value.every(message => message.turnId === 'turn-steered')).toBe(true)
+    api.cleanup()
+  })
+
+  it('keeps late old-call tokens above the steer until it is applied', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    messages.value = messages.value.map(message => ({ ...message }))
+
+    api.appendDelta('仍属于第一段')
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段仍属于第一段'],
+      ['user', 'Use English'],
+    ])
+    expect(api.foldedTurn.value.rawText).toBe('')
+
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+    api.appendDelta('Second section.')
+    const prefix = '第一段仍属于第一段'
+    const finalText = `${prefix}Second section.`
+    api.reconcileFinalText(finalText, [{
+      model_call_id: '2.0',
+      iteration: 2,
+      start_codepoint: Array.from(prefix).length,
+      end_codepoint: Array.from(finalText).length,
+    }])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', prefix],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('closes an applied steer boundary when an old gateway omits model-call identity', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-legacy')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-legacy',
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    api.acknowledgeSteerBoundary('steer-legacy')
+    api.appendDelta('Second section.')
+    api.reconcileFinalText('第一段Second section.')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段'],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('rebuilds a checkpoint before an existing steer after live-state reset', () => {
+    const { api, messages } = makeStream()
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      messageId: 'steer-message-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-message-1')
+    api.acknowledgeSteerBoundary('steer-message-1')
+    api.appendDelta('Second section.')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段'],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('reuses an orphan checkpoint when history hydrates the steer row later', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('First answer')
+    api.checkpointForUserMessage('turn-steered', 'steer-orphan')
+    api.acknowledgeSteerBoundary('steer-orphan')
+    api.appendDelta('Second answer')
+
+    // History replacement can arrive after the live snapshot and omit the
+    // optimistic assistant prefix. Replaying the same boundary must restore
+    // that stable row before the now-durable user message.
+    messages.value = [{
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      messageId: 'steer-orphan',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    }]
+    api.checkpointForUserMessage('turn-steered', 'steer-orphan')
+    api.acknowledgeSteerBoundary('steer-orphan')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'First answer'],
+      ['user', 'Use English'],
+      ['assistant', 'Second answer'],
+    ])
     api.cleanup()
   })
 
@@ -804,7 +1005,7 @@ describe('useChatStream render coalescing', () => {
     })
     const phaseBeforeSteer = api.streamPhaseLabel.value
 
-    api.checkpointForUserMessage('turn-steered')
+    api.checkpointForUserMessage('turn-steered', 'steer-activity')
 
     expect(messages.value).toHaveLength(1)
     expect(messages.value[0]).toMatchObject({
@@ -835,6 +1036,7 @@ describe('useChatStream render coalescing', () => {
       tool_name: 'web_search',
       result: 'ok',
     })
+    api.acknowledgeSteerBoundary('steer-activity')
     api.appendDelta('after')
     api.reconcileFinalText('beforeafter')
     api.endStreaming()
@@ -947,7 +1149,7 @@ describe('useChatStream render coalescing', () => {
     expect(messages.value[0]?.text).toBe('Canonical answer')
     expect(messages.value[0]?.timeline).toEqual([
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: 'Canonical answer' },
+      { type: 'text', raw: 'Canonical answer', presentation: 'answer' },
     ])
     expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
       tool_use_id: 'tool-1',
@@ -963,10 +1165,11 @@ describe('useChatStream render coalescing', () => {
     api.appendDelta('before')
     expect(api.streamTimelineItems.value).toEqual([])
     expect(api.foldedTurn.value.rawText).toBe('before')
-    api.checkpointForUserMessage('turn-production-steer')
+    api.checkpointForUserMessage('turn-production-steer', 'steer-production')
     expect(messages.value[0]).toMatchObject({ role: 'assistant', text: 'before' })
     expect(api.foldedTurn.value.rawText).toBe('')
 
+    api.acknowledgeSteerBoundary('steer-production')
     api.appendDelta('stale')
     api.reconcileFinalText('canonical')
     expect(api.streamTimelineItems.value).toEqual([])
@@ -1038,7 +1241,9 @@ describe('useChatStream render coalescing', () => {
     api.endStreaming()
 
     expect(messages.value[0]?.text).toBe('streamed fallback')
-    expect(messages.value[0]?.timeline).toEqual([{ type: 'text', raw: 'streamed fallback' }])
+    expect(messages.value[0]?.timeline).toEqual([
+      { type: 'text', raw: 'streamed fallback', presentation: 'answer' },
+    ])
     api.cleanup()
   })
 

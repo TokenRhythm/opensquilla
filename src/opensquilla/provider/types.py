@@ -376,6 +376,9 @@ class QuotaStatus:
     abort_reason: str | None = None
 
 
+VisionSupport = Literal["supported", "unsupported", "unknown"]
+
+
 @dataclass(frozen=True)
 class ModelCapabilities:
     """Per-model capability flags resolved from ModelCatalog."""
@@ -411,6 +414,7 @@ from pydantic import (  # noqa: E402
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SerializerFunctionWrapHandler,
     model_serializer,
 )
@@ -438,6 +442,10 @@ class ToolInputSchema(BaseModel):
     )
 
 
+class _StringItemSchemaProjectionCapability:
+    """Unserializable identity token for trusted registry construction."""
+
+
 class ToolDefinition(BaseModel):
     """Tool definition passed to the LLM."""
 
@@ -447,6 +455,28 @@ class ToolDefinition(BaseModel):
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    # Runtime-only metadata. Provider adapters must never put this field on
+    # the model-facing tool schema.
+    cancellation_policy: Literal["bounded", "must_settle"] = Field(
+        default="bounded",
+        exclude=True,
+    )
+    # Process-local semantic capability. It is deliberately private so an
+    # external ToolDefinition payload cannot opt itself into a lossy provider
+    # projection. Trusted registry construction grants it after validation.
+    _string_item_schema_projection_capability: object | None = PrivateAttr(default=None)
+
+    @property
+    def allow_string_item_schema_projection(self) -> bool:
+        return (
+            self._string_item_schema_projection_capability
+            is _StringItemSchemaProjectionCapability
+        )
+
+    def _enable_string_item_schema_projection(self) -> None:
+        self._string_item_schema_projection_capability = (
+            _StringItemSchemaProjectionCapability
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +566,14 @@ class ChatConfig(BaseModel):
     output_json_schema: dict[str, Any] | None = None
     output_json_schema_strict: bool = True
     model_capabilities: ModelCapabilities | None = None
+    # Runtime-only evidence for the vision field.  ``ModelCapabilities`` keeps
+    # its long-standing boolean contract, while this sidecar distinguishes an
+    # authoritative false value from a synthesized catalog default.
+    model_vision_support: VisionSupport = Field(
+        default="unknown",
+        exclude=True,
+        repr=False,
+    )
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
     # Runtime-only provenance for an explicit global

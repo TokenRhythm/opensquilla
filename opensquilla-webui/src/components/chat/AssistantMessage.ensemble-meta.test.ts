@@ -105,6 +105,71 @@ describe('AssistantMessage ensemble footer metadata', () => {
     app.unmount()
   })
 
+  it('renders numeric ensemble costs without completeness warnings or dashes', async () => {
+    const { app, el } = await mountMessage(assistantMessage({
+      meta: {
+        model: 'free/ensemble',
+        modelShort: 'ensemble',
+        input: 20,
+        output: 4,
+        hasTokens: true,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        costUsd: 0.123,
+        hasSaved: false,
+        savedLabel: '',
+        usageUnknown: true,
+        coverageStatus: 'usage_unknown',
+        ensemble: {
+          profile: 'free',
+          modelCount: 2,
+          totalCandidates: 2,
+          requestCount: 2,
+          fallbackUsed: false,
+          fallbackReason: '',
+          costUsd: 0.123,
+          savedUsd: 0,
+          savedPct: 0,
+          models: [
+            {
+              role: 'proposer',
+              label: 'proposer',
+              provider: 'free',
+              model: 'free/proposer',
+              modelShort: 'proposer',
+              input: 10,
+              output: 2,
+              costUsd: 0,
+            },
+            {
+              role: 'aggregator',
+              label: 'aggregator',
+              provider: 'unknown',
+              model: 'unknown/aggregator',
+              modelShort: 'aggregator',
+              input: 10,
+              output: 2,
+              costUsd: 0.123,
+            },
+          ],
+        },
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
+    await nextTick()
+
+    const rows = Array.from(el.querySelectorAll('.msg-meta-popover__row')).map(row => row.textContent)
+    expect(rows).toContain('cost$0.123')
+    expect(Array.from(el.querySelectorAll('.msg-meta-popover__model-cost')).map(node => node.textContent?.trim())).toEqual([
+      '$0',
+      '$0.123',
+    ])
+    expect(el.textContent).not.toContain('—')
+    expect(el.querySelector('[data-turn-usage-coverage="incomplete"]')).toBeNull()
+    app.unmount()
+  })
+
   it('supports hover, pinning, Escape, focus exit, and outside dismissal', async () => {
     const { app, el } = await mountMessage(assistantMessage({
       meta: {
@@ -189,6 +254,65 @@ describe('AssistantMessage ensemble footer metadata', () => {
     expect(el.querySelector('.savings-indicator')).toBeNull()
     expect(el.querySelector('.msg-meta__ensemble')).toBeNull()
     expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
+    app.unmount()
+  })
+
+  it('uses only Proposer and Aggregator names in the ensemble model list', async () => {
+    const internalRoles = ['primary', 'contrast', 'fast_check', 'critic', 'aggregator']
+    const { app, el } = await mountMessage(assistantMessage({
+      meta: {
+        model: 'tokenrhythm/model-5',
+        modelShort: 'model-5',
+        input: 100,
+        output: 20,
+        hasTokens: true,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        costUsd: 0.05,
+        hasSaved: false,
+        savedLabel: '',
+        ensemble: {
+          profile: 'custom_b5',
+          modelCount: 4,
+          totalCandidates: 4,
+          requestCount: 5,
+          fallbackUsed: false,
+          fallbackReason: '',
+          costUsd: 0.05,
+          savedUsd: 0,
+          savedPct: 0,
+          models: internalRoles.map((role, index) => ({
+            role,
+            label: role,
+            provider: 'tokenrhythm',
+            model: `model-${index + 1}`,
+            modelShort: `model-${index + 1}`,
+            input: 10,
+            output: 2,
+            costUsd: 0.01,
+          })),
+        },
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
+    await nextTick()
+
+    const displayedRoles = Array.from(
+      el.querySelectorAll<HTMLElement>('.msg-meta-popover__model-role'),
+      node => node.textContent?.trim(),
+    )
+    expect(displayedRoles).toEqual([
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Aggregator ·',
+    ])
+    expect(el.textContent).not.toContain('primary')
+    expect(el.textContent).not.toContain('contrast')
+    expect(el.textContent).not.toContain('fast check')
+    expect(el.textContent).not.toContain('critic')
     app.unmount()
   })
 

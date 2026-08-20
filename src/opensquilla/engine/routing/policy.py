@@ -55,6 +55,11 @@ from dataclasses import dataclass, field
 
 import structlog
 
+from opensquilla.engine.routing.artifact_policy import (
+    ArtifactRoutingFacts,
+    ArtifactRoutingUnavailableError,
+    effective_artifact_floor,
+)
 from opensquilla.engine.routing.calibration import (
     CalibrationState,
     apply_bias,
@@ -650,6 +655,7 @@ def budget_gate(
     *,
     valid_tiers: list[str],
     budget: BudgetGateInput | None,
+    minimum_tier: str | None = None,
 ) -> BudgetGateResult:
     """Warn or cap when accumulated session spend crosses the configured limit.
 
@@ -698,6 +704,14 @@ def budget_gate(
         return BudgetGateResult(tier, "under_limit", action=budget.action, **common)  # type: ignore[arg-type]
     if budget.action == "cap":
         target = normalize_text_tier(budget.cap_tier) if budget.cap_tier else None
+        minimum = normalize_text_tier(minimum_tier) if minimum_tier else None
+        if (
+            target is not None
+            and minimum is not None
+            and minimum in valid_tiers
+            and _tier_index(target, valid_tiers) < _tier_index(minimum, valid_tiers)
+        ):
+            target = minimum
         if (
             target is not None
             and target in valid_tiers
@@ -941,6 +955,10 @@ class PolicyInputs:
     # stage a complete no-op (parity with the pre-gate pipeline); a non-``None``
     # input is only assembled when the operator sets an active limit.
     budget: BudgetGateInput | None = None
+    # Validated, content-free Artifact IDE facts. ``None`` preserves the
+    # historical router path exactly.  The resulting floor is a capability
+    # requirement and therefore also constrains the budget cap below.
+    artifact: ArtifactRoutingFacts | None = None
 
 
 @dataclass
@@ -1007,6 +1025,48 @@ class RoutingPolicyEngine:
                 extra,
             )
 
+        artifact = inputs.artifact
+        artifact_floor = effective_artifact_floor(artifact, inputs.valid_tiers)
+        if artifact is not None and artifact_floor is None:
+            raise ArtifactRoutingUnavailableError(artifact, inputs.valid_tiers)
+        if (
+            artifact is not None
+            and artifact_floor is not None
+            and _tier_index(decision.tier, inputs.valid_tiers)
+            < _tier_index(artifact_floor, inputs.valid_tiers)
+        ):
+            from_tier = decision.tier
+            decision = RoutingDecision(
+                tier=artifact_floor,
+                model=inputs.tiers[artifact_floor].get("model", decision.model),
+                confidence=decision.confidence,
+                source="artifact_floor",
+            )
+            metadata_updates.update(artifact.to_telemetry())
+            metadata_updates["artifact_floor_applied"] = True
+            metadata_updates["artifact_floor_from_tier"] = from_tier
+            if extra is not None:
+                extra.setdefault("routing_trail", []).append(
+                    {
+                        "stage": "artifact_floor",
+                        "rule": artifact.operation_class.value,
+                        "from_tier": from_tier,
+                        "to_tier": artifact_floor,
+                    }
+                )
+                extra["final_tier"] = artifact_floor
+                extra["final_route_class"] = route_class_for_tier(artifact_floor)
+                thinking_mode, prompt_policy = reconcile_controller_with_final_tier(
+                    thinking_mode,
+                    prompt_policy,
+                    extra,
+                )
+        elif artifact is not None:
+            # Record only the bounded enum facts even when the classifier was
+            # already strong enough and no rebind was required.
+            metadata_updates.update(artifact.to_telemetry())
+            metadata_updates["artifact_floor_applied"] = False
+
         # Budget gate runs last: it can only hold or lower the tier, never
         # raise it. With ``budget is None`` (the default) the whole block is
         # skipped, so routing is byte-identical to the pre-gate pipeline.
@@ -1023,6 +1083,7 @@ class RoutingPolicyEngine:
                 decision.tier,
                 valid_tiers=budget_tiers,
                 budget=inputs.budget,
+                minimum_tier=artifact_floor,
             )
             decision = apply_budget_gate(
                 decision,

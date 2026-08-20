@@ -307,6 +307,9 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
     ):
         return False
     if ctx is not None:
+        if ctx.exclusive_tools is not None and rt.spec.name not in ctx.exclusive_tools:
+            log.debug("tool_filtered", tool=rt.spec.name, reason="exclusive_ceiling")
+            return False
         if rt.spec.owner_only and not ctx.is_owner:
             log.debug("tool_filtered", tool=rt.spec.name, reason="owner_only")
             return False
@@ -317,6 +320,27 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
             log.debug("tool_filtered", tool=rt.spec.name, reason="denied")
             return False
     return True
+
+
+def apply_exclusive_tool_ceiling(ctx: ToolContext) -> ToolContext:
+    """Apply the final, non-widenable tool ceiling after all policy layers.
+
+    Visibility and dispatch also consult ``exclusive_tools`` directly as
+    defense in depth. This final intersection keeps ``allowed_tools`` truthful
+    for downstream diagnostics and callers that inspect the resolved context.
+    """
+
+    if ctx.exclusive_tools is None:
+        return ctx
+    ceiling = set(ctx.exclusive_tools)
+    ctx.allowed_tools = (
+        ceiling
+        if ctx.allowed_tools is None
+        else set(ctx.allowed_tools) & ceiling
+    )
+    if ctx.surfaced_tools is not None:
+        ctx.surfaced_tools = set(ctx.surfaced_tools) & ceiling
+    return ctx
 
 
 def visible_registered_tools(

@@ -2,11 +2,6 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync,
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
-import {
-  assertRuntimeSetReady,
-  currentRuntimeTarget,
-  loadRuntimeManifest,
-} from './fetch-bundled-runtimes.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -233,11 +228,6 @@ function patchMacLightgbmRuntime() {
 
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
-await assertRuntimeSetReady({
-  manifest: await loadRuntimeManifest(),
-  target: currentRuntimeTarget(),
-  executeCommands: true,
-})
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
 mkdirSync(runtimeGatewayDir, { recursive: true })

@@ -27,6 +27,27 @@ function call(
 }
 
 describe('activity tool detail projection', () => {
+  it.each(['document.read', 'document.update'])(
+    'hides all protocol detail for %s activity',
+    operationKey => {
+      const raw = JSON.stringify({
+        expectedSha256: 'a'.repeat(64),
+        cursor: 'private-cursor',
+        grant: 'one-time-grant',
+        document_apply: true,
+      })
+      const projection = projectActivityToolDetail(call({
+        name: operationKey === 'document.read' ? 'document_read' : 'document_apply',
+        inputRaw: raw,
+        inputPreview: raw,
+        result: raw,
+        resultPreview: raw,
+      }), operationKey)
+
+      expect(projection).toEqual({ lines: [], rawContent: '' })
+    },
+  )
+
   it('shows workspace-relative file details without putting raw paths in lines', () => {
     const projection = projectActivityToolDetail(call({
       inputRaw: JSON.stringify({

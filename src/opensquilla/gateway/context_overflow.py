@@ -489,6 +489,7 @@ async def apply_context_overflow_policy(
     budget_override: int | None = None,
     provider_request_correlation: ProviderRequestCorrelation | None = None,
     root_operation_id: str | None = None,
+    restricted_turn: bool = False,
 ) -> OverflowOutcome:
     """Apply the gateway's overflow policy to the upcoming turn.
 
@@ -547,6 +548,18 @@ async def apply_context_overflow_policy(
         estimated_tokens=estimated,
         budget_tokens=budget,
     )
+
+    if restricted_turn:
+        # Restricted Artifact turns cannot send the canonical transcript to a
+        # gateway compactor or flush model. Fail closed before checkpoint,
+        # flush, or SessionManager.compact_with_result can run.
+        outcome.reason = "restricted_turn_compaction_disabled"
+        outcome.refusal = _build_refusal_envelope(
+            estimated,
+            budget,
+            outcome.reason,
+        )
+        return outcome
 
     if policy == ContextOverflowPolicy.REFUSE:
         outcome.reason = "context_overflow"
