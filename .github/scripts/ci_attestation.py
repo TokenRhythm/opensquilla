@@ -39,15 +39,12 @@ DIGEST_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 PR_QUEUE_REF_RE: Final = re.compile(r"(?:^|/)pr-(?P<number>[1-9][0-9]*)-")
 COMPOSITION_BASELINE_SUITES: Final = frozenset({"readme-locale", "workflow-lint"})
 COMPOSITION_COMBINED_SMOKE_TRUST_ROOT: Final = frozenset()
-TRUST_POLICY_FILES: Final = {
+TRUST_POLICY_PATHS: Final = (
     ".github/CODEOWNERS",
     ".github/ci/suites.v1.json",
-    ".github/scripts/ci_attestation.py",
-    ".github/scripts/check_ci_results.py",
-    ".github/scripts/classify-ci-changes.sh",
-    ".github/scripts/plan_ci.py",
-    WORKFLOW_PATH,
-}
+    ".github/scripts",
+    ".github/workflows",
+)
 
 
 class AttestationError(RuntimeError):
@@ -100,30 +97,23 @@ def _require_sha(value: object, label: str) -> str:
     return value
 
 
-def _policy_paths(repo: Path, ref: str) -> list[str]:
-    paths = _git("ls-tree", "-r", "--name-only", ref, cwd=repo).splitlines()
-    return sorted(path for path in paths if path in TRUST_POLICY_FILES)
+def _policy_entries(repo: Path, ref: str) -> bytes:
+    return subprocess.run(
+        ["git", "ls-tree", "-r", "-z", ref, "--", *TRUST_POLICY_PATHS],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
 
 
 def policy_digest(repo: Path, ref: str = "HEAD") -> str:
     """Hash the small, stable trust root that is allowed to suppress CI suites."""
 
     digest = hashlib.sha256()
-    paths = _policy_paths(repo, ref)
-    if not paths:
+    entries = _policy_entries(repo, ref)
+    if not entries:
         raise AttestationError(f"CI policy is empty at {ref}")
-    for path in paths:
-        content = subprocess.run(
-            ["git", "show", f"{ref}:{path}"],
-            cwd=repo,
-            check=True,
-            capture_output=True,
-        ).stdout
-        encoded_path = path.encode("utf-8")
-        digest.update(len(encoded_path).to_bytes(4, "big"))
-        digest.update(encoded_path)
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
+    digest.update(entries)
     return digest.hexdigest()
 
 

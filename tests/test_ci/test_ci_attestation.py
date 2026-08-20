@@ -179,7 +179,7 @@ def _seed_suite_execution_input_fixtures(repo: Path) -> None:
 
 
 def _merge_preview_repo(
-    tmp_path: Path, *, advance_base: bool = False
+    tmp_path: Path, *, advance_base: bool = False, change_ci_executor: bool = False
 ) -> tuple[Path, str, str, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -188,6 +188,7 @@ def _merge_preview_repo(
     _git(repo, "config", "user.email", "ci@example.invalid")
     _write(repo, ".github/workflows/ci.yml", "name: CI\n")
     _write(repo, ".github/scripts/classify-ci-changes.sh", "#!/bin/sh\n")
+    _write(repo, ".github/scripts/windows_test_shards.py", "TEST_SHARDS = 1\n")
     for relative in (
         ".github/ci/suites.v1.json",
         ".github/scripts/plan_ci.py",
@@ -202,6 +203,9 @@ def _merge_preview_repo(
     _git(repo, "switch", "-c", "feature")
     _write(repo, "src/example.py", "BASE = True\nFEATURE = True\n")
     _git(repo, "add", "src/example.py")
+    if change_ci_executor:
+        _write(repo, ".github/scripts/windows_test_shards.py", "TEST_SHARDS = 2\n")
+        _git(repo, "add", ".github/scripts/windows_test_shards.py")
     _git(repo, "commit", "-m", "feature")
     head_sha = _git(repo, "rev-parse", "HEAD")
 
@@ -283,7 +287,9 @@ def _named_archive(name: str, value: dict[str, object]) -> bytes:
 
 
 def test_create_attestation_pins_merge_parents_tree_and_policy(tmp_path: Path) -> None:
-    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(
+        tmp_path, change_ci_executor=True
+    )
     attestation = create_attestation(
         repo=repo,
         repository="opensquilla/opensquilla",
@@ -300,6 +306,7 @@ def test_create_attestation_pins_merge_parents_tree_and_policy(tmp_path: Path) -
     assert attestation["tested_merge_sha"] == merge_sha
     assert attestation["tested_tree_sha"] == _git(repo, "rev-parse", "HEAD^{tree}")
     assert attestation["trust_policy_digest"] == policy_digest(repo)
+    assert attestation["trust_policy_digest"] != policy_digest(repo, base_sha)
     assert attestation["validation_profile"] == "suite-evidence-v2"
     assert attestation["schema_version"] == 2
     assert attestation["evidence_kind"] == "root"
