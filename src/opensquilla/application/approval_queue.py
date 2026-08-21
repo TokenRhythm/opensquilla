@@ -89,7 +89,16 @@ class PendingApproval:
     _event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-_DEFAULT_APPROVAL_QUEUE_PATH = state_dir("approval_queue.sqlite")
+_DEFAULT_APPROVAL_QUEUE_PATH: Path | None = None
+
+
+def _default_approval_queue_path() -> Path:
+    """Resolve the default after runtime state configuration is finalized."""
+
+    if _DEFAULT_APPROVAL_QUEUE_PATH is not None:
+        return Path(_DEFAULT_APPROVAL_QUEUE_PATH)
+    return state_dir("approval_queue.sqlite")
+
 
 # Listener signature: (event, info) where event is "requested" or "resolved"
 # and info mirrors ``ApprovalQueue.status()`` for the affected approval.
@@ -118,7 +127,9 @@ class ApprovalQueue:
         self._session_run_modes: dict[str, str] = {}
         self._event_listeners: list[ApprovalEventListener] = []
 
-        self._db_path = Path(db_path or os.fspath(_DEFAULT_APPROVAL_QUEUE_PATH))
+        self._db_path = (
+            Path(db_path) if db_path else _default_approval_queue_path()
+        )
         native_db_path = _native_db_path(self._db_path)
         os.makedirs(os.path.dirname(native_db_path) or os.curdir, exist_ok=True)
         self._conn = sqlite3.connect(
@@ -1128,7 +1139,7 @@ def reset_approval_queue() -> None:
         _queue.close()
         _queue = None
     else:
-        path = _DEFAULT_APPROVAL_QUEUE_PATH
+        path = _default_approval_queue_path()
     if os.fspath(path) == ":memory:":
         return
     try:

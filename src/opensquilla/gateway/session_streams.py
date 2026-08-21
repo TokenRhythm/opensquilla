@@ -8,6 +8,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
+
 _JS_MAX_SAFE_INTEGER = (1 << 53) - 1
 _ANSWER_GENERATION_RESET_EVENT = "session.event.answer_generation_reset"
 _GENERATION_LOSSY_EVENTS = frozenset(
@@ -22,6 +24,7 @@ _COMPLETED_TURN_EVENTS = frozenset(
     {
         "session.event.tool_result",
         "session.event.artifact",
+        TURN_COMMITTED_EVENT,
     }
 )
 
@@ -157,6 +160,14 @@ class SessionStreamRegistry:
                 return False
         return True
 
+    @classmethod
+    def _preserve_completed_before_reset(
+        cls,
+        event: BufferedSessionEvent,
+        reset: BufferedSessionEvent,
+    ) -> bool:
+        return event.event_name == TURN_COMMITTED_EVENT or cls._same_turn_identity(event, reset)
+
     def _clear_live_state(self, session_key: str) -> None:
         self._live_events_by_session.pop(session_key, None)
         self._live_task_by_session.pop(session_key, None)
@@ -256,6 +267,37 @@ class SessionStreamRegistry:
         # legacy block, but the sentinel stays internal to snapshot compaction.
         return "__legacy_reasoning__"
 
+    @classmethod
+    def _same_text_model_call(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+    ) -> bool:
+        left_call = cls._identity_value(left, "model_call_id", "modelCallId")
+        right_call = cls._identity_value(right, "model_call_id", "modelCallId")
+        if left_call and right_call and left_call != right_call:
+            return False
+
+        left_iteration = left.get("iteration")
+        right_iteration = right.get("iteration")
+        left_iteration = (
+            left_iteration
+            if isinstance(left_iteration, int) and not isinstance(left_iteration, bool)
+            and left_iteration > 0
+            else None
+        )
+        right_iteration = (
+            right_iteration
+            if isinstance(right_iteration, int) and not isinstance(right_iteration, bool)
+            and right_iteration > 0
+            else None
+        )
+        return not (
+            left_iteration is not None
+            and right_iteration is not None
+            and left_iteration != right_iteration
+        )
+
     @staticmethod
     def _delta_field(payload: dict[str, Any]) -> str:
         for field in ("json_fragment", "jsonFragment", "fragment"):
@@ -339,6 +381,12 @@ class SessionStreamRegistry:
     ) -> None:
         task_id = self._task_id(event.payload)
         current_task_id = self._live_task_by_session.get(session_key)
+
+        if event.event_name == TURN_COMMITTED_EVENT:
+            if task_id is not None and task_id == current_task_id:
+                self._clear_live_state(session_key)
+            return
+
         if task_id and current_task_id and task_id != current_task_id:
             self._clear_live_state(session_key)
         if task_id:
@@ -421,6 +469,9 @@ class SessionStreamRegistry:
                     return
         elif event.event_name == "session.event.text_delta" and len(events) > reset_index + 1:
             if events[-1].event_name == event.event_name:
+                if not self._same_text_model_call(events[-1].payload, event.payload):
+                    events.append(event)
+                    return
                 if (
                     self._generation_epoch(events[-1].payload) is not None
                     and self._generation_epoch(event.payload) is not None
@@ -577,14 +628,14 @@ class SessionStreamRegistry:
                 for event in self._completed_events_by_session.get(session_key, ())
                 if (
                     since_stream_seq < event.stream_seq < first_reset_seq
-                    and self._same_turn_identity(event, first_reset)
+                    and self._preserve_completed_before_reset(event, first_reset)
                 )
             }
             for event in events:
                 if since_stream_seq < event.stream_seq < first_reset_seq:
                     if (
                         self._is_completed_turn_event(event.event_name)
-                        and self._same_turn_identity(event, first_reset)
+                        and self._preserve_completed_before_reset(event, first_reset)
                     ):
                         candidates[event.stream_seq] = event
 

@@ -12,6 +12,12 @@ from opensquilla.engine.runtime_diagnostics import (
     normalize_command_family,
 )
 from opensquilla.engine.runtime_recovery import source_loop_recovery_decision
+from opensquilla.git_runtime import (
+    GitCapability,
+    GitCapabilityState,
+    GitRunResult,
+    GitRunState,
+)
 from opensquilla.provider import DoneEvent as ProviderDoneEvent
 from opensquilla.provider import TextDeltaEvent as ProviderTextDeltaEvent
 from opensquilla.provider import ToolDefinition, ToolInputSchema
@@ -113,6 +119,37 @@ def test_runtime_diagnostics_classifies_paths_and_commands() -> None:
         "npm run:build"
     )
     assert normalize_command_family("git diff HEAD") == "git:diff"
+
+
+def test_runtime_diff_paths_preserve_non_repository_as_unknown(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capability = GitCapability(
+        state=GitCapabilityState.AVAILABLE,
+        executable=workspace / "git",
+        source="test",
+    )
+    result = GitRunResult(
+        state=GitRunState.NOT_REPOSITORY,
+        returncode=128,
+        stdout=b"",
+        stderr=b"not a git repository",
+        capability=capability,
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.run_git",
+        lambda *_args, **_kwargs: result,
+    )
+    agent = Agent(
+        provider=None,  # type: ignore[arg-type]
+        tool_context=ToolContext(workspace_dir=str(workspace)),
+    )
+
+    assert agent._workspace_diff_paths_for_runtime_event() is None
+    assert agent._runtime_git_state is GitRunState.NOT_REPOSITORY
 
 
 def test_source_loop_recovery_log_mode_observes_only() -> None:
@@ -394,6 +431,72 @@ def _tool_def(name: str) -> ToolDefinition:
 
 
 @pytest.mark.asyncio
+async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    unavailable_git_runtime,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool_context = ToolContext(workspace_dir=str(workspace))
+
+    def unexpected_diff_probe(_self) -> Any:
+        raise AssertionError("Git diff diagnostics should stay lazy")
+
+    monkeypatch.setattr(
+        Agent,
+        "_workspace_diff_paths_for_runtime_event",
+        unexpected_diff_probe,
+    )
+    monkeypatch.setattr(
+        Agent,
+        "_workspace_diff_fingerprint_for_runtime_event",
+        unexpected_diff_probe,
+    )
+
+    async def handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="ok",
+        )
+
+    agent = Agent(
+        provider=_ThreeToolProvider(tool_turns=1),
+        config=AgentConfig(max_iterations=2, flush_enabled=False),
+        tool_definitions=[_tool_def("exec_command")],
+        tool_handler=handler,
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("run one command")]
+
+    assert events
+    assert unavailable_git_runtime.resolution_calls
+
+
+@pytest.mark.asyncio
+async def test_plain_chat_finishes_when_git_is_unavailable(
+    tmp_path,
+    unavailable_git_runtime,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _ThreeToolProvider(tool_turns=0)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=1, flush_enabled=False),
+        tool_context=ToolContext(workspace_dir=str(workspace)),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert events
+    assert provider.calls == 1
+    assert unavailable_git_runtime.resolution_calls
+
+
+@pytest.mark.asyncio
 async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -518,6 +621,79 @@ async def test_agent_source_loop_recovery_warns_model_once(
     assert recovery["mode"] == "warn_model"
     assert recovery["injected_to_model"] is True
     assert recovery["evidence"]["diff_paths"] == ["src/lib.rs"]
+
+
+@pytest.mark.asyncio
+async def test_git_unavailable_skips_runtime_recovery_without_extra_model_retry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    unavailable_capability = GitCapability(
+        state=GitCapabilityState.UNAVAILABLE,
+        reason="git_not_found",
+    )
+    unavailable_result = GitRunResult(
+        state=GitRunState.UNAVAILABLE,
+        returncode=None,
+        stdout=b"",
+        stderr=b"git_not_found",
+        capability=unavailable_capability,
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.run_git",
+        lambda *_args, **_kwargs: unavailable_result,
+    )
+    tool_context = ToolContext(workspace_dir=str(workspace), agent_id="agent-1")
+
+    async def handler(call: ToolCall) -> ToolResult:
+        tool_context.workspace_file_writes.append(_write("src/lib.rs"))
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="error[E0592]: duplicate definitions with name `fallback_service`",
+            is_error=True,
+        )
+
+    provider = _ThreeToolProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=5,
+            runtime_events_path=str(runtime_events_path),
+            runtime_recovery_mode="warn_model",
+            progress_watchdog_mode="log",
+            tool_result_projection_max_inline_chars=10_000,
+            tool_failure_loop_block_threshold=0,
+            post_write_convergence_enabled=True,
+        ),
+        tool_definitions=[_tool_def("exec_command")],
+        tool_handler=handler,
+        tool_context=tool_context,
+        session_key="session-1",
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert events
+    assert provider.calls == 4
+    assert "[Runtime recovery]" not in _message_text(provider.messages_by_call[-1])
+    logged = [
+        json.loads(line)
+        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    skipped = [
+        event
+        for event in logged
+        if event.get("name") == "runtime_git_observation.skipped"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0]["git_state"] == "unavailable"
+    assert not any(
+        event.get("mechanism") == "source_loop_recovery" for event in logged
+    )
 
 
 @pytest.mark.asyncio

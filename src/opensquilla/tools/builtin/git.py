@@ -7,6 +7,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+from opensquilla.git_runtime import resolve_git_capability
 from opensquilla.process_tree import (
     capture_process_tree_owner,
     create_owned_subprocess_exec,
@@ -24,7 +25,7 @@ from opensquilla.sandbox.permissions import (
 from opensquilla.sandbox.policy import build_policy, select_level
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
-from opensquilla.tools.run_mode import full_host_access_active
+from opensquilla.tools.run_mode import current_run_mode, full_host_access_active
 from opensquilla.tools.types import current_tool_context
 from opensquilla.tools.write_tracking import summarize_patch_hygiene_warning
 
@@ -54,7 +55,21 @@ def _reject_foreign_git_path(path: str) -> None:
     reject_foreign_host_path(path, platform=os.name, workspace=workspace)
 
 
+def _git_tool_environment() -> dict[str, str]:
+    """Keep Git diagnostics parseable without disabling user interaction."""
+
+    environment = dict(os.environ)
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
+    return environment
+
+
 async def _run_git(*args: str, cwd: str | None = None) -> str:
+    capability = resolve_git_capability(run_mode=current_run_mode())
+    if not capability.available or capability.executable is None:
+        reason = capability.reason or "git_unavailable"
+        raise RuntimeError(f"GIT_UNAVAILABLE: Git is unavailable ({reason}).")
+    git_executable = str(capability.executable)
     runtime = get_runtime()
     reject_windows_guest_process(runtime)
     if (
@@ -102,20 +117,30 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
                 )
                 request_args = _harden_read_only_git_args(args)
         result = await run_under_backend(
-            build_request_for_git(request_args, workspace, action_kind, policy),
+            build_request_for_git(
+                request_args,
+                workspace,
+                action_kind,
+                policy,
+                executable=git_executable,
+            ),
             runtime=runtime,
         )
         output = result.stdout + result.stderr
         if result.returncode != 0:
-            raise RuntimeError(f"git {' '.join(args)} failed (exit {result.returncode}):\n{output}")
+            _raise_git_command_error(args, result.returncode, output)
         return output
-    proc = await create_owned_subprocess_exec(
-        "git",
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=cwd,
-    )
+    try:
+        proc = await create_owned_subprocess_exec(
+            git_executable,
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=cwd,
+            env=_git_tool_environment(),
+        )
+    except OSError as exc:
+        raise RuntimeError("GIT_UNAVAILABLE: Git became unavailable before launch.") from exc
     process_tree = capture_process_tree_owner(proc, isolated=True)
     try:
         stdout, _ = await proc.communicate()
@@ -131,8 +156,27 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
 
     output = decode_subprocess_output(stdout)
     if proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed (exit {proc.returncode}):\n{output}")
+        _raise_git_command_error(args, proc.returncode, output)
     return output
+
+
+def _raise_git_command_error(
+    args: tuple[str, ...],
+    returncode: int | None,
+    output: str,
+) -> None:
+    normalized = output.casefold()
+    code = (
+        "GIT_NOT_REPOSITORY"
+        if (
+            "not a git repository" in normalized
+            or "this operation must be run in a work tree" in normalized
+        )
+        else "GIT_COMMAND_FAILED"
+    )
+    raise RuntimeError(
+        f"{code}: git {' '.join(args)} failed (exit {returncode}):\n{output}"
+    )
 
 
 def _harden_read_only_git_args(args: tuple[str, ...]) -> tuple[str, ...]:
@@ -150,15 +194,22 @@ def _harden_read_only_git_args(args: tuple[str, ...]) -> tuple[str, ...]:
     return (*global_options, *args)
 
 
-def build_request_for_git(args: tuple[str, ...], cwd: Path, action_kind: str, policy):
+def build_request_for_git(
+    args: tuple[str, ...],
+    cwd: Path,
+    action_kind: str,
+    policy,
+    *,
+    executable: str = "git",
+):
     from opensquilla.sandbox.integration import build_request
 
     return build_request(
         action_kind=action_kind,
-        argv=("git", *args),
+        argv=(executable, *args),
         cwd=cwd,
         policy=policy,
-        env={},
+        env={"LC_ALL": "C", "LANG": "C"},
     )
 
 

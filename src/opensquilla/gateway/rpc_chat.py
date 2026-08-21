@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
 
 import structlog
 
+from opensquilla.artifact_session import (
+    ArtifactSessionService,
+    MutationAttempt,
+    MutationAttemptStatus,
+    document_mutation_outcome_from_attempt,
+)
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.flattened_tool_markers import (
     has_flattened_used_tool_line,
@@ -60,6 +67,81 @@ _CHAT_HISTORY_DEFAULT_LIMIT = 50
 _CHAT_HISTORY_MAX_LIMIT = 200
 _CHAT_HISTORY_LOCK_BUDGET_SECONDS = 2.0
 _CHAT_HISTORY_RETRY_AFTER_MS = 100
+_TURN_USAGE_PROJECTION_FIELDS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+        "cost_usd",
+        "billed_cost",
+        "estimated_cost_component_usd",
+        "cost_source",
+        "missing_cost_entries",
+        "coverage_status",
+        "usage_unknown",
+        "unknown_usage_events",
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedTokens",
+        "cacheWriteTokens",
+        "totalTokens",
+        "costUsd",
+        "billedCost",
+        "estimatedCostComponentUsd",
+        "costSource",
+        "missingCostEntries",
+        "coverageStatus",
+        "usageUnknown",
+        "unknownUsageEvents",
+    }
+)
+_TURN_USAGE_PROJECTION_ALIASES = {
+    "input_tokens": "inputTokens",
+    "output_tokens": "outputTokens",
+    "reasoning_tokens": "reasoningTokens",
+    "cached_tokens": "cachedTokens",
+    "cache_write_tokens": "cacheWriteTokens",
+    "total_tokens": "totalTokens",
+    "cost_usd": "costUsd",
+    "billed_cost": "billedCost",
+    "estimated_cost_component_usd": "estimatedCostComponentUsd",
+    "cost_source": "costSource",
+    "missing_cost_entries": "missingCostEntries",
+    "coverage_status": "coverageStatus",
+    "usage_unknown": "usageUnknown",
+    "unknown_usage_events": "unknownUsageEvents",
+}
+_HISTORY_STRUCTURAL_RECEIPT_FIELDS = (
+    ("model_usage_breakdown", "modelUsageBreakdown"),
+    ("ensemble_trace", "ensembleTrace"),
+)
+
+
+def _history_structural_richness(value: object) -> tuple[int, int]:
+    """Rank JSON-like structural receipts without interpreting their schema."""
+    if isinstance(value, Mapping):
+        nested = sum(_history_structural_richness(item)[0] for item in value.values())
+        return nested + len(value), len(value)
+    if isinstance(value, (list, tuple)):
+        nested = sum(_history_structural_richness(item)[0] for item in value)
+        return nested + len(value), len(value)
+    if isinstance(value, str):
+        return (1, len(value)) if value.strip() else (0, 0)
+    return (1, 0) if value is not None else (0, 0)
+
+
+def _clear_history_usage_for_indexes(
+    projected: list[object],
+    indexes: list[int],
+) -> None:
+    for index in indexes:
+        entry = copy.copy(projected[index])
+        setattr(entry, "turn_usage", None)
+        projected[index] = entry
 
 
 def _canonical_webchat_session_key(value: object = None) -> str:
@@ -85,6 +167,24 @@ def _requested_initial_collaboration_mode(params: dict[str, Any]) -> str | None:
         raise ValueError("collaborationMode must be default or plan")
     if params.get("intent") != "new_chat":
         raise ValueError("collaborationMode requires explicit new_chat intent")
+    return mode
+
+
+def _requested_initial_routing_mode(params: dict[str, Any]) -> str | None:
+    """Read the first-turn-only durable model-routing selection."""
+
+    mode = params.get("initialRoutingMode")
+    snake_mode = params.get("initial_routing_mode")
+    if mode is not None and snake_mode is not None and mode != snake_mode:
+        raise ValueError("initialRoutingMode and initial_routing_mode must match")
+    if mode is None:
+        mode = snake_mode
+    if mode is None:
+        return None
+    if not isinstance(mode, str) or mode not in {"direct", "router", "ensemble"}:
+        raise ValueError("initialRoutingMode must be direct, router, or ensemble")
+    if params.get("intent") != "new_chat":
+        raise ValueError("initialRoutingMode requires explicit new_chat intent")
     return mode
 
 
@@ -200,61 +300,135 @@ async def _chat_history_turn_outcomes(
         )
         return outcomes
 
-    missing_turn_ids = turn_ids - outcomes_by_turn.keys()
-    if not missing_turn_ids:
-        return _sorted_outcomes()
-
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
     get_task = getattr(storage, "get_agent_task", None)
     list_tasks = getattr(storage, "list_agent_tasks", None)
+    rows: list[Any] = []
     try:
         if callable(exact_tasks):
-            rows = await exact_tasks(sorted(missing_turn_ids))
+            rows = await exact_tasks(sorted(turn_ids))
         elif callable(get_task):
             rows = [
                 row
-                for turn_id in sorted(missing_turn_ids)
+                for turn_id in sorted(turn_ids)
                 if (row := await get_task(turn_id)) is not None
             ]
         elif callable(list_tasks):
             rows = await list_tasks(session_key=session_key)
-        else:
-            return _sorted_outcomes()
     except Exception:  # noqa: BLE001 - history remains readable without outcomes.
         log.warning(
             "chat.history.turn_outcomes_failed",
             session_key=session_key,
             exc_info=True,
         )
-        return _sorted_outcomes()
+
+    attempts: tuple[MutationAttempt, ...] = ()
+    if storage is not None and callable(getattr(storage, "_write_transaction", None)):
+        artifact_service: ArtifactSessionService | None = None
+        try:
+            artifact_service = await ArtifactSessionService.from_session_storage(storage)
+            attempts = await artifact_service.list_mutation_attempts_by_turn_ids(
+                session_key=session_key,
+                turn_ids=sorted(turn_ids),
+            )
+        except Exception:  # noqa: BLE001 - transcript and task history remain readable.
+            log.warning(
+                "chat.history.document_mutation_outcomes_failed",
+                session_key=session_key,
+                exc_info=True,
+            )
+        finally:
+            if artifact_service is not None:
+                await artifact_service.close()
+
+    attempts_by_turn_id = {attempt.turn_id: attempt for attempt in attempts}
+
+    def with_ledger_facts(
+        attempt: MutationAttempt,
+        task_outcome: dict[str, Any],
+    ) -> dict[str, Any]:
+        canonical = document_mutation_outcome_from_attempt(attempt)
+        mutation_keys = (
+            "documentMutationOutcome",
+            "document_mutation_outcome",
+            "documentMutation",
+            "document_mutation",
+        )
+        prior = next(
+            (
+                task_outcome[key]
+                for key in mutation_keys
+                if isinstance(task_outcome.get(key), dict)
+            ),
+            None,
+        )
+        if isinstance(prior, dict):
+            corrected = prior.get("corrected")
+            if isinstance(corrected, bool):
+                canonical["corrected"] = corrected
+            proposal_attempts = prior.get("proposalAttempts")
+            if (
+                isinstance(proposal_attempts, int)
+                and not isinstance(proposal_attempts, bool)
+                and proposal_attempts >= 0
+            ):
+                canonical["proposalAttempts"] = proposal_attempts
+        projected = {key: value for key, value in task_outcome.items() if key not in mutation_keys}
+        projected["documentMutationOutcome"] = canonical
+        return projected
 
     for row in rows:
+        row_session_key = getattr(row, "session_key", None)
+        if isinstance(row_session_key, str) and row_session_key != session_key:
+            continue
         task_id = getattr(row, "task_id", None)
         details = getattr(row, "details", None)
         details = details if isinstance(details, dict) else {}
         turn_id = details.get("turn_id") or task_id
+        if not isinstance(turn_id, str) or turn_id not in turn_ids:
+            continue
+        attempt = attempts_by_turn_id.pop(turn_id, None)
         status = getattr(row, "status", None)
         status = str(getattr(status, "value", status) or "")
+        projected = outcomes_by_turn.get(turn_id)
         outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
-        if outcome is None:
-            continue
-        if (
-            not isinstance(turn_id, str)
-            or turn_id not in missing_turn_ids
-        ):
-            continue
-        outcomes_by_turn[turn_id] = {
-            "turn_id": turn_id,
-            "task_id": task_id,
-            "status": status,
-            "started_at": getattr(row, "started_at", None),
-            "finished_at": getattr(row, "finished_at", None),
-            "outcome": outcome,
-        }
+        if projected is None:
+            if outcome is None:
+                if attempt is None:
+                    continue
+                outcome = {
+                    "kind": "unknown",
+                    "reason": "mutation_ledger_with_nonterminal_task",
+                }
+            if attempt is not None:
+                outcome = with_ledger_facts(attempt, outcome)
+            projected = {
+                "turn_id": turn_id,
+                "task_id": task_id,
+                "status": status,
+                "started_at": getattr(row, "started_at", None),
+                "finished_at": getattr(row, "finished_at", None),
+                "outcome": outcome,
+            }
+            outcomes_by_turn[turn_id] = projected
+        elif attempt is not None:
+            existing_outcome = projected.get("outcome")
+            projected["outcome"] = with_ledger_facts(
+                attempt,
+                existing_outcome if isinstance(existing_outcome, dict) else {},
+            )
+        accepted_routing = details.get("accepted_model_routing")
+        if isinstance(accepted_routing, dict):
+            accepted_mode = str(accepted_routing.get("effective_mode") or "").strip().lower()
+            if accepted_mode in {"direct", "router", "ensemble"}:
+                projected["accepted_routing_mode"] = accepted_mode
         error_class = getattr(row, "error_class", None)
         if is_usage_accounting_barrier(error_class):
-            projected = outcomes_by_turn[turn_id]
+            if outcome is None:
+                outcome = terminal_turn_outcome(status, projected.get("outcome"))
+            if outcome is None:
+                continue
             replay_proof = usage_barrier_replay_proof(
                 usage_call_index=details.get("usage_call_index"),
                 no_prior_provider_dispatch=details.get(
@@ -293,6 +467,32 @@ async def _chat_history_turn_outcomes(
             )
             if snapshot is not None:
                 projected["activity_snapshot"] = snapshot
+    for turn_id, attempt in attempts_by_turn_id.items():
+        existing = outcomes_by_turn.get(turn_id)
+        if existing is not None:
+            existing_outcome = existing.get("outcome")
+            existing["outcome"] = with_ledger_facts(
+                attempt,
+                existing_outcome if isinstance(existing_outcome, dict) else {},
+            )
+            continue
+        # The durable side-effect fact remains useful after a crash even when
+        # no task row survived. Keep the generic turn state explicitly unknown
+        # instead of manufacturing a successful completion.
+        outcomes_by_turn[turn_id] = {
+            "turn_id": turn_id,
+            "task_id": None,
+            "status": "unknown",
+            "started_at": attempt.created_at,
+            "finished_at": (
+                None if attempt.status is MutationAttemptStatus.RESERVED else attempt.updated_at
+            ),
+            "outcome": {
+                "kind": "unknown",
+                "reason": "mutation_ledger_without_task",
+                "documentMutationOutcome": document_mutation_outcome_from_attempt(attempt),
+            },
+        }
     return _sorted_outcomes()
 
 
@@ -563,39 +763,58 @@ async def _project_missing_history_usage(
     session_key: str,
     entries: list[object],
 ) -> list[object]:
-    """Read-time repair for pre-fix assistant rows missing turn usage."""
+    """Project ledger totals onto every historical assistant turn.
 
-    missing_by_turn: dict[str, list[int]] = {}
-    turns_with_usage: set[str] = set()
+    Existing ``turn_usage`` is often only a partial receipt from the old
+    publication path. Ledger totals are authoritative for numeric usage and
+    coverage, while structural trace/breakdown/routing metadata stays intact.
+    """
+
+    indexes_by_turn: dict[str, list[int]] = {}
     for index, entry in enumerate(entries):
         if getattr(entry, "role", None) != "assistant":
             continue
         turn_id = turn_id_from_context(getattr(entry, "turn_context", None))
         if not turn_id:
             continue
-        if isinstance(getattr(entry, "turn_usage", None), dict):
-            turns_with_usage.add(turn_id)
-        else:
-            missing_by_turn.setdefault(turn_id, []).append(index)
-    for turn_id in turns_with_usage:
-        missing_by_turn.pop(turn_id, None)
-    if not missing_by_turn:
+        indexes_by_turn.setdefault(turn_id, []).append(index)
+    if not indexes_by_turn:
         return entries
 
     storage = getattr(mgr, "storage", None)
     batch_project = getattr(storage, "get_turn_usage_projections", None)
+    probe_continuation = getattr(storage, "get_turn_ids_continuing_after_cursor", None)
     get_session = getattr(mgr, "get_session", None)
     if not callable(batch_project) or not callable(get_session):
         return entries
+
+    # A page is a contiguous keyset slice, so only rows after its last cursor
+    # can hold a turn's terminal assistant row. Probing that suffix keeps the
+    # newest page — the common read — from touching transcript rows at all.
+    page_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[-1]))
+
+    continuing: set[str] = set()
     try:
         session = await get_session(session_key)
         if session is None:
             return entries
+        session_id = str(getattr(session, "session_id", "") or "")
+        session_epoch = max(0, int(getattr(session, "epoch", 0) or 0))
         projections = await batch_project(
-            session_id=str(getattr(session, "session_id", "") or ""),
-            session_epoch=max(0, int(getattr(session, "epoch", 0) or 0)),
-            turn_ids=list(missing_by_turn),
+            session_id=session_id,
+            session_epoch=session_epoch,
+            turn_ids=list(indexes_by_turn),
         )
+        if page_cursor is not None and callable(probe_continuation):
+            created_at, entry_id = page_cursor
+            continuing = set(
+                await probe_continuation(
+                    session_id=session_id,
+                    created_at=created_at,
+                    entry_id=entry_id,
+                    turn_ids=list(indexes_by_turn),
+                )
+            )
     except Exception:  # noqa: BLE001 - usage fallback must not hide transcript history
         log.warning(
             "chat.history.usage_projection_failed",
@@ -608,16 +827,90 @@ async def _project_missing_history_usage(
         return entries
 
     projected = list(entries)
-    for turn_id, indexes in missing_by_turn.items():
+    for turn_id, indexes in indexes_by_turn.items():
         usage = projections.get(turn_id)
         if usage is None:
             continue
-        # A well-formed turn has one assistant row. If damaged legacy history
-        # contains duplicates, attach usage only to its terminal row so the UI
-        # cannot present the same provider spend more than once.
+        if turn_id in continuing:
+            # The terminal row sits on a later page, which will carry the whole
+            # ledger total. Publishing it here too would bill the turn twice
+            # once a client merges the pages.
+            _clear_history_usage_for_indexes(projected, indexes)
+            continue
+
+        # Every row of this turn is inside the page, so its last row is the
+        # terminal one. Damaged legacy history may still hold duplicates.
         index = indexes[-1]
         entry = copy.copy(projected[index])
-        setattr(entry, "turn_usage", usage)
+        existing = getattr(entry, "turn_usage", None)
+        existing_keys = set(existing) if isinstance(existing, dict) else set()
+        if isinstance(existing, dict):
+            merged_usage = dict(existing)
+            for key in _TURN_USAGE_PROJECTION_FIELDS:
+                if key in usage:
+                    merged_usage[key] = usage[key]
+                    alias = _TURN_USAGE_PROJECTION_ALIASES.get(key)
+                    if alias is not None and alias in merged_usage:
+                        merged_usage[alias] = usage[key]
+        else:
+            merged_usage = dict(usage)
+
+        # Earlier duplicate assistant rows may carry only structural details
+        # or a stale partial receipt. Move those non-accounting fields forward
+        # and clear the old receipt, so one turn can never render two spends.
+        structural_sources: list[dict[str, Any]] = []
+        if isinstance(existing, dict):
+            structural_sources.append(existing)
+        duplicate_structural: dict[str, Any] = {}
+        for duplicate_index in indexes[:-1]:
+            duplicate = getattr(projected[duplicate_index], "turn_usage", None)
+            if not isinstance(duplicate, dict):
+                continue
+            structural_sources.append(duplicate)
+            for key, value in duplicate.items():
+                if key in {"provider", "model"} and key not in duplicate_structural:
+                    duplicate_structural[key] = copy.deepcopy(value)
+                if key not in _TURN_USAGE_PROJECTION_FIELDS and key not in merged_usage:
+                    merged_usage[key] = copy.deepcopy(value)
+            duplicate_entry = copy.copy(projected[duplicate_index])
+            setattr(duplicate_entry, "turn_usage", None)
+            projected[duplicate_index] = duplicate_entry
+
+        # A rebuilt continuation can publish a small terminal receipt after an
+        # earlier row already persisted the complete ensemble structure. Keep
+        # the richer structural receipt, while the numeric fields above remain
+        # authoritative ledger projections. Write both aliases when history
+        # contains both spellings so the chosen receipt is not split in two.
+        for snake_key, camel_key in _HISTORY_STRUCTURAL_RECEIPT_FIELDS:
+            candidates: list[object] = []
+            present_keys: set[str] = set()
+            for source in structural_sources:
+                for key in (snake_key, camel_key):
+                    if key in source:
+                        candidates.append(source[key])
+                        present_keys.add(key)
+            if not candidates:
+                continue
+            richest = candidates[0]
+            richest_score = _history_structural_richness(richest)
+            for candidate in candidates[1:]:
+                candidate_score = _history_structural_richness(candidate)
+                if candidate_score > richest_score:
+                    richest = candidate
+                    richest_score = candidate_score
+            for key in present_keys:
+                merged_usage[key] = copy.deepcopy(richest)
+
+        # Provider/model are useful when no historical row had them, but an
+        # existing routed identity is structural metadata and must not be
+        # replaced by the latest physical ledger leg.
+        for key in ("provider", "model"):
+            if key not in existing_keys and key in duplicate_structural:
+                merged_usage[key] = duplicate_structural[key]
+            if key not in merged_usage and key in usage:
+                merged_usage[key] = usage[key]
+
+        setattr(entry, "turn_usage", merged_usage)
         projected[index] = entry
     return projected
 
@@ -677,6 +970,8 @@ async def _enforce_context_overflow(
     ctx: RpcContext,
     session_key: str,
     message: str,
+    *,
+    restricted_turn: bool = False,
 ) -> dict | None:
     """Apply the configured context-overflow policy before a turn runs.
 
@@ -742,15 +1037,14 @@ async def _enforce_context_overflow(
             transcript=transcript,
             session_key=session_key,
             session_manager=ctx.session_manager,
-            compaction_config=await _build_context_overflow_compaction_config(
-                ctx, session_key
-            ),
+            compaction_config=await _build_context_overflow_compaction_config(ctx, session_key),
             flush_service=getattr(ctx, "flush_service", None),
             compaction_marker=getattr(ctx, "turn_runner", None),
             policy_override=policy_override,
             budget_override=budget_override,
             provider_request_correlation=provider_request_correlation,
             root_operation_id=root_operation_id,
+            restricted_turn=restricted_turn,
         )
 
     if outcome.refusal is not None:
@@ -780,15 +1074,32 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
     initial_collaboration_mode = _requested_initial_collaboration_mode(params)
+    initial_routing_mode = _requested_initial_routing_mode(params)
+    prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
+    )
+    document_context = params.get(
+        "documentContext",
+        params.get("document_context"),
+    )
+    if prompt_annotation_ids is not None:
+        if not isinstance(prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if any(not isinstance(item, str) or not item.strip() for item in prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
+        prompt_annotation_ids = [item.strip() for item in prompt_annotation_ids]
 
     # Fresh-WebUI / smoke path: when no session manager is wired (webui
     # simulator, dispatcher-only boot), instant-accept without kicking off a
     # turn. This matches the roundtrip the WebUI observes on first paint
     # before the sessions engine is attached.
     if ctx.session_manager is None:
-        if initial_collaboration_mode is not None:
+        if prompt_annotation_ids or document_context is not None:
+            raise RpcUnavailableError("Artifact context requires durable session storage")
+        if initial_collaboration_mode is not None or initial_routing_mode is not None:
             raise RpcUnavailableError(
-                "Initial collaboration mode requires atomic turn acceptance"
+                "Initial session controls require atomic turn acceptance"
             )
         return {"ok": True, "sessionKey": session_key, "instant_accept": True}
 
@@ -797,8 +1108,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     intent_was_provided = intent is not None
     requested_intent = intent
     if intent is None and (
-        isinstance(params.get("workspaceId"), str)
-        or isinstance(params.get("workspace_id"), str)
+        isinstance(params.get("workspaceId"), str) or isinstance(params.get("workspace_id"), str)
     ):
         # A project draft is always a first-turn request. Keeping this intent
         # stable on retries lets sessions.send consult the durable ingress
@@ -821,9 +1131,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                     if await get_session(session_key) is None:
                         intent = "new_chat"
                 except Exception as exc:
-                    raise RpcUnavailableError(
-                        f"Failed to inspect chat session: {exc}"
-                    ) from exc
+                    raise RpcUnavailableError(f"Failed to inspect chat session: {exc}") from exc
             else:
                 # Compatibility for minimal test/simulator managers that do
                 # not expose storage: retain the historical initializer.
@@ -834,9 +1142,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                         display_name="WebChat",
                     )
                 except Exception as exc:
-                    raise RpcUnavailableError(
-                        f"Failed to initialize chat session: {exc}"
-                    ) from exc
+                    raise RpcUnavailableError(f"Failed to initialize chat session: {exc}") from exc
 
         from opensquilla.gateway.rpc_sessions import _handle_sessions_send
 
@@ -870,6 +1176,12 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("surface_id", "surface_id"),
             ("workspaceId", "workspaceId"),
             ("workspace_id", "workspace_id"),
+            ("promptAnnotationIds", "promptAnnotationIds"),
+            ("prompt_annotation_ids", "promptAnnotationIds"),
+            ("documentContext", "documentContext"),
+            ("document_context", "documentContext"),
+            ("initialRoutingMode", "initialRoutingMode"),
+            ("initial_routing_mode", "initial_routing_mode"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]
@@ -905,14 +1217,18 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
         if initial_collaboration_mode is not None:
             # Both public spellings represent the same logical request. Keep
             # one canonical field in the durable idempotency fingerprint.
-            fingerprint_params["initialCollaborationMode"] = (
-                initial_collaboration_mode
-            )
+            fingerprint_params["initialCollaborationMode"] = initial_collaboration_mode
+        if initial_routing_mode is not None:
+            fingerprint_params["initialRoutingMode"] = initial_routing_mode
+        if prompt_annotation_ids is not None:
+            send_params["promptAnnotationIds"] = prompt_annotation_ids
+            fingerprint_params["promptAnnotationIds"] = prompt_annotation_ids
         result = await _handle_sessions_send(
             send_params,
             ctx,
             fingerprint_params=fingerprint_params,
             initial_collaboration_mode=initial_collaboration_mode,
+            initial_routing_mode=initial_routing_mode,
         )
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}
@@ -1154,9 +1470,7 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         task_runtime = getattr(ctx, "task_runtime", None)
         resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
         if not callable(resolve_user_input):
-            raise RpcUnavailableError(
-                "Deferred user-input resolution is not available"
-            )
+            raise RpcUnavailableError("Deferred user-input resolution is not available")
         result = await resolve_user_input(
             session_key=session_key,
             request_id=request_id,

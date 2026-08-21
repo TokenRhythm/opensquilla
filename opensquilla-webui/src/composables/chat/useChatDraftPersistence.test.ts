@@ -58,6 +58,11 @@ describe('useChatDraftPersistence', () => {
     sessionKey.value = 'agent:main:webchat:a'
     await nextTick()
     expect(inputText.value).toBe('draft for A')
+
+    // Repeated navigation restores B's untouched editor draft.
+    sessionKey.value = 'agent:main:webchat:b'
+    await nextTick()
+    expect(inputText.value).toBe('draft for B')
   })
 
   it('clears the persisted draft once the composer is emptied (after send)', async () => {

@@ -1291,6 +1291,16 @@ async def stream_response_turnrunner(
         _persisted = await session_manager.append_message(session_key, role="user", content=message)
         if _persisted is not None and isinstance(_persisted.content, str):
             message = _persisted.content
+    from opensquilla.gateway.session_model_routing import (
+        capture_accepted_model_routing_config,
+    )
+
+    accepted_config = await capture_accepted_model_routing_config(
+        config,
+        session_manager,
+        session_key=session_key,
+        run_kind="session_turn",
+    )
 
     resolver = local_approval_resolver(session_manager=session_manager, config=config)
     usage: UsageSummary | None = None
@@ -1340,13 +1350,20 @@ async def stream_response_turnrunner(
         reasoning_mid_stream = False
         try:
             try:
-                stream = turn_runner.run(
-                    message,
-                    session_key,
-                    tool_context=tool_ctx,
-                    model=model,
-                    timeout=timeout,
-                    pending_input_provider=pending_input_provider,
+                from opensquilla.gateway.session_model_routing import (
+                    accepted_model_routing_stream,
+                )
+
+                stream = accepted_model_routing_stream(
+                    turn_runner.run(
+                        message,
+                        session_key,
+                        tool_context=tool_ctx,
+                        model=model,
+                        timeout=timeout,
+                        pending_input_provider=pending_input_provider,
+                    ),
+                    accepted_config,
                 )
                 stream = _bind_stream_to_turn_context(stream, turn_runner)
                 async for event in stream_deps.stream_wrapper(stream, svc):
@@ -1682,10 +1699,21 @@ async def handle_image_command_turnrunner(
         return TurnResult(error=str(exc))
 
     session_manager = getattr(svc, "session_manager", None) if svc is not None else None
+    config = getattr(svc, "config", None) if svc is not None else None
     if session_manager is not None:
         _persisted = await session_manager.append_message(session_key, role="user", content=prompt)
         if _persisted is not None and isinstance(_persisted.content, str):
             prompt = _persisted.content
+    from opensquilla.gateway.session_model_routing import (
+        capture_accepted_model_routing_config,
+    )
+
+    accepted_config = await capture_accepted_model_routing_config(
+        config,
+        session_manager,
+        session_key=session_key,
+        run_kind="session_turn",
+    )
 
     usage: UsageSummary | None = None
     model_after: str | None = None
@@ -1707,14 +1735,21 @@ async def handle_image_command_turnrunner(
         )
         try:
             try:
-                stream = turn_runner.run(
-                    prompt,
-                    session_key,
-                    tool_context=tool_ctx,
-                    model=model,
-                    attachments=attachments,
-                    timeout=timeout,
-                    pending_input_provider=pending_input_provider,
+                from opensquilla.gateway.session_model_routing import (
+                    accepted_model_routing_stream,
+                )
+
+                stream = accepted_model_routing_stream(
+                    turn_runner.run(
+                        prompt,
+                        session_key,
+                        tool_context=tool_ctx,
+                        model=model,
+                        attachments=attachments,
+                        timeout=timeout,
+                        pending_input_provider=pending_input_provider,
+                    ),
+                    accepted_config,
                 )
                 stream = _bind_stream_to_turn_context(stream, turn_runner)
                 async for event in stream_deps.stream_wrapper(stream, svc):

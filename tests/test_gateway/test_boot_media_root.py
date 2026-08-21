@@ -65,3 +65,56 @@ async def test_build_services_wires_media_root_into_session_manager(
         assert media_root == media_root_from_config(config)
     finally:
         await services.close()
+
+
+@pytest.mark.asyncio
+async def test_build_services_reconciles_artifact_mutations_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    calls: list[tuple[object, Path]] = []
+
+    def reject_background_task(coro):
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise AssertionError("unit tests must not schedule real sandbox setup")
+
+    async def fake_reconcile(service, store):
+        calls.append((service, store.media_root))
+        return type(
+            "Summary",
+            (),
+            {
+                "examined": 0,
+                "applied": 0,
+                "failed": 0,
+                "ambiguous": 0,
+                "deleted_candidates": 0,
+            },
+        )()
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.boot.create_background_task",
+        reject_background_task,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.artifact_mutation_recovery.reconcile_pending_artifact_mutations",
+        fake_reconcile,
+    )
+    media = tmp_path / "media"
+    services = await build_services(
+        config=GatewayConfig(
+            memory={"flush_enabled": False},
+            attachments={"media_root": str(media)},
+            sandbox={"auto_setup": False},
+        ),
+        session_db_path=":memory:",
+        seed_agent_workspaces=False,
+    )
+    try:
+        assert len(calls) == 1
+        assert calls[0][1] == media
+    finally:
+        await services.close()

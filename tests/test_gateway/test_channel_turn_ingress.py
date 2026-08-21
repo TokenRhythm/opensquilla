@@ -27,8 +27,12 @@ from opensquilla.gateway.channel_dispatch import (
     _RuntimeChannelStreamRelay,
     run_channel_dispatch,
 )
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.routing import RouteEnvelope, build_channel_route_envelope
+from opensquilla.gateway.session_model_routing import (
+    capture_accepted_model_routing_config,
+)
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.project_workspaces import project_path_key
@@ -153,6 +157,7 @@ async def _accept(
     *,
     native_message_id: str = NATIVE_MESSAGE_ID,
     channel: Any | None = None,
+    config: Any = None,
 ) -> tuple[Any | None, str, Any | None, bool]:
     msg = _message(content, native_message_id=native_message_id)
     return await _accept_channel_runtime_turn(
@@ -164,7 +169,7 @@ async def _accept(
         task_runtime=stack.runtime,
         ingested=AttachmentIngestResult(text=content),
         raw_content=content,
-        config=None,
+        config=config,
     )
 
 
@@ -311,9 +316,21 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
     tmp_path: Path,
 ) -> None:
     async with _open_stack(tmp_path / "sessions.db") as stack:
+        config = GatewayConfig()
+
+        async def production_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = production_provider
         handle, persisted_text, stream_relay, replayed = await _accept(
             stack,
             "one durable channel turn",
+            config=config,
         )
         await stack.wait_until_running()
 
@@ -343,6 +360,8 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
         assert task.session_key == SESSION_KEY
         assert task.details["persisted_user_message_id"] == message.message_id
         assert task.details["fresh_user_session"] is True
+        assert task.details["accepted_model_routing"]["effective_mode"] == "direct"
+        assert task.details["accepted_model_routing"]["source"] == "session"
 
         receipt_result = await stack.storage.get_turn_ingress_receipt(
             source_scope=f"channel:slack:{ACCOUNT_ID}",
@@ -359,6 +378,7 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
         assert len(stack.received_runs) == 1
         assert stack.received_runs[0].persisted_user_message_id == message.message_id
         assert stack.received_runs[0].fresh_user_session is True
+        assert stack.received_runs[0].accepted_config.session_mode == "direct"
         assert _table_counts(stack.db_path) == {
             # The accepted channel session plus the post-acceptance main-delivery fallback.
             "sessions": 2,

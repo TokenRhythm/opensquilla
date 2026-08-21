@@ -57,7 +57,13 @@ _TOKENRHYTHM_DSML_MODEL_IDS = (
     "tokenrhythm/deepseek-v4-flash-0731",
     "tokenrhythm/deepseek-v4-pro",
 )
-_TOKENRHYTHM_V4_MODEL_IDS = frozenset(
+_TOKENRHYTHM_0813_MODEL_IDS = frozenset(
+    {
+        "deepseek-v4-pro-0813",
+        "tokenrhythm/deepseek-v4-pro-0813",
+    }
+)
+_TOKENRHYTHM_LEGACY_CUSTOM_REPLAY_MODEL_IDS = frozenset(
     {
         "deepseek-v4-flash",
         "deepseek-v4-flash-0731",
@@ -67,12 +73,17 @@ _TOKENRHYTHM_V4_MODEL_IDS = frozenset(
         "tokenrhythm/deepseek-v4-pro",
     }
 )
-_TOKENRHYTHM_V4_FLASH_MODEL_IDS = frozenset(
+_TOKENRHYTHM_V4_MODEL_IDS = (
+    _TOKENRHYTHM_LEGACY_CUSTOM_REPLAY_MODEL_IDS | _TOKENRHYTHM_0813_MODEL_IDS
+)
+_TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS = frozenset(
     {
         "deepseek-v4-flash",
         "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
         "tokenrhythm/deepseek-v4-flash",
         "tokenrhythm/deepseek-v4-flash-0731",
+        "tokenrhythm/deepseek-v4-pro-0813",
     }
 )
 _OPENROUTER_DSML_MODEL_IDS = (
@@ -81,16 +92,58 @@ _OPENROUTER_DSML_MODEL_IDS = (
 )
 
 
+def _matches_exact_https_endpoint(
+    base_url: str,
+    *,
+    endpoint_hosts: frozenset[str],
+    endpoint_paths: frozenset[str],
+) -> bool:
+    """Whether *base_url* is one of a rule's exact trusted API roots."""
+
+    if not endpoint_hosts:
+        return True
+    normalized_url = str(base_url or "").strip()
+    if "?" in normalized_url or "#" in normalized_url:
+        return False
+    try:
+        parsed = urlsplit(normalized_url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return False
+    path = parsed.path.rstrip("/")
+    return bool(
+        parsed.scheme.lower() == "https"
+        and host in endpoint_hosts
+        and (port is None or port == 443)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and path in endpoint_paths
+    )
+
+
 @dataclass(frozen=True)
 class TextToolModelRule:
     """Allow text-tool dialects only for explicitly matched model ids."""
 
     model_patterns: tuple[str, ...]
     dialects: frozenset[TextToolDialect]
+    endpoint_hosts: frozenset[str] = frozenset()
+    endpoint_paths: frozenset[str] = frozenset()
 
-    def matches(self, model: str) -> bool:
+    def matches(self, model: str, base_url: str = "") -> bool:
         normalized = model.strip().lower()
-        return any(fnmatchcase(normalized, pattern.lower()) for pattern in self.model_patterns)
+        if not any(
+            fnmatchcase(normalized, pattern.lower()) for pattern in self.model_patterns
+        ):
+            return False
+        return _matches_exact_https_endpoint(
+            base_url,
+            endpoint_hosts=self.endpoint_hosts,
+            endpoint_paths=self.endpoint_paths,
+        )
 
 
 @dataclass(frozen=True)
@@ -106,10 +159,14 @@ class TextToolCompatProfile:
     dialects: frozenset[TextToolDialect] = frozenset()
     model_rules: tuple[TextToolModelRule, ...] = ()
 
-    def dialects_for_model(self, model: str) -> frozenset[TextToolDialect]:
+    def dialects_for_model(
+        self,
+        model: str,
+        base_url: str = "",
+    ) -> frozenset[TextToolDialect]:
         enabled = set(self.dialects)
         for rule in self.model_rules:
-            if rule.matches(model):
+            if rule.matches(model, base_url):
                 enabled.update(rule.dialects)
         return frozenset(enabled)
 
@@ -143,24 +200,10 @@ class ReasoningModelRule:
 
         if model.strip().lower() not in self.model_ids:
             return False
-        if not self.endpoint_hosts:
-            return True
-        try:
-            parsed = urlsplit(str(base_url or "").strip())
-            host = (parsed.hostname or "").lower()
-            port = parsed.port
-        except (UnicodeError, ValueError):
-            return False
-        path = parsed.path.rstrip("/")
-        return bool(
-            parsed.scheme.lower() == "https"
-            and host in self.endpoint_hosts
-            and (port is None or port == 443)
-            and parsed.username is None
-            and parsed.password is None
-            and not parsed.query
-            and not parsed.fragment
-            and path in self.endpoint_paths
+        return _matches_exact_https_endpoint(
+            base_url,
+            endpoint_hosts=self.endpoint_hosts,
+            endpoint_paths=self.endpoint_paths,
         )
 
 
@@ -191,6 +234,17 @@ class OpenAICompatPolicy:
 
     # JSON Schema keywords the upstream rejects in tool definitions.
     tool_schema_unsupported_keywords: frozenset[str] = frozenset()
+
+    # Tool names whose itemless arrays may be projected to string items on
+    # this provider's official endpoint. This is deliberately allowlisted:
+    # an itemless JSON Schema array accepts arbitrary values, so a string
+    # fallback is safe only when the tool's wire semantics are textual.
+    tool_schema_string_item_fallback_tools: frozenset[str] = frozenset()
+
+    # Exact API root where the string-item projection is required. A tool
+    # allowlist alone is not sufficient evidence for custom endpoints that
+    # happen to use the same provider kind or hostname.
+    tool_schema_string_item_fallback_api_root: str = ""
 
     # Whether the chat-completions endpoint reliably supports native
     # ``response_format.type=json_schema``.  When false, the OpenAI-compatible
@@ -335,11 +389,26 @@ class OpenAICompatPolicy:
 
         Older diagnostics inspected one provider-wide boolean.  Keep that
         observation surface without letting the boolean control execution;
-        callers that need an answer for one model must use
-        ``text_tool_profile.dialects_for_model(model)``.
+        callers that need an answer for one deployment must use
+        ``text_tool_profile.dialects_for_model(model, base_url)``.
         """
 
         return self.text_tool_profile.enabled
+
+    def allows_string_item_schema_projection(self, tool_name: str, base_url: str) -> bool:
+        """Return whether a trusted tool may use the lossy wire projection."""
+
+        candidate_base_url = str(base_url or "")
+        if not candidate_base_url or candidate_base_url != candidate_base_url.strip():
+            return False
+        return bool(
+            tool_name in self.tool_schema_string_item_fallback_tools
+            and self.tool_schema_string_item_fallback_api_root
+            and base_url_matches_official_api(
+                self.tool_schema_string_item_fallback_api_root,
+                candidate_base_url,
+            )
+        )
 
 
 def effective_reasoning_format(
@@ -445,7 +514,14 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
         require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
-    "gemini": OpenAICompatPolicy(display_name="Gemini"),
+    "gemini": OpenAICompatPolicy(
+        display_name="Gemini",
+        official_host="generativelanguage.googleapis.com",
+        tool_schema_string_item_fallback_tools=frozenset({"create_csv"}),
+        tool_schema_string_item_fallback_api_root=(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ),
+    ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",
         text_tool_profile=TextToolCompatProfile(
@@ -535,6 +611,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "tokenrhythm": OpenAICompatPolicy(
         display_name="TokenRhythm",
         official_host="tokenrhythm.studio",
+        supports_explicit_prompt_cache=True,
         supports_native_json_schema_output=False,
         text_tool_profile=TextToolCompatProfile(
             model_rules=(
@@ -550,6 +627,12 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                     model_patterns=_TOKENRHYTHM_DSML_MODEL_IDS,
                     dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
                 ),
+                TextToolModelRule(
+                    model_patterns=tuple(sorted(_TOKENRHYTHM_0813_MODEL_IDS)),
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                    endpoint_hosts=frozenset({"tokenrhythm.studio"}),
+                    endpoint_paths=frozenset({"", "/v1"}),
+                ),
             ),
         ),
         reasoning_model_rules=(
@@ -561,16 +644,22 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                 require_reasoning_content=True,
                 max_reasoning_content_utf16_units=50_000,
                 reasoning_format="deepseek",
-                low_effort_model_ids=_TOKENRHYTHM_V4_FLASH_MODEL_IDS,
+                low_effort_model_ids=_TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS,
                 thinking_tool_choice_auto_only=True,
                 prefer_pinned_tool_choice_over_thinking=True,
             ),
             # Custom endpoints keep the previous exact-id replay behavior but
             # do not inherit TokenRhythm's official controls or field limit.
             ReasoningModelRule(
-                model_ids=_TOKENRHYTHM_V4_MODEL_IDS,
+                model_ids=_TOKENRHYTHM_LEGACY_CUSTOM_REPLAY_MODEL_IDS,
                 require_reasoning_content=True,
             ),
+        ),
+        # TokenRhythm rejects a required selector for 0813 even when thinking
+        # is explicitly disabled. The request constraint compares basenames,
+        # so this exact entry covers both raw and provider-qualified ids.
+        implicit_thinking_tool_choice_model_ids=frozenset(
+            {"deepseek-v4-pro-0813"}
         ),
         allow_post_terminal_noop_choice=True,
         allow_post_terminal_null_usage_noop_choice=True,

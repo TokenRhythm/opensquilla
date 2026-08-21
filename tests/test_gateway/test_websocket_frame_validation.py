@@ -16,7 +16,11 @@ from typing import Any
 
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
-from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
 from opensquilla.gateway.websocket import WsConnection, get_registry, handle_ws_connection
@@ -159,7 +163,12 @@ async def test_handshake_persists_connect_capabilities_on_connection() -> None:
                 "minProtocol": 1,
                 "role": "operator",
                 "auth": {},
-                "caps": [ANSWER_GENERATION_RESET_CAPABILITY, 7, ""],
+                "caps": [
+                    ANSWER_GENERATION_RESET_CAPABILITY,
+                    TURN_COMMITTED_CAPABILITY,
+                    7,
+                    "",
+                ],
             },
         }
     )
@@ -180,7 +189,14 @@ async def test_handshake_persists_connect_capabilities_on_connection() -> None:
     await handle_ws_connection(ws, _config(), dispatcher=_CapabilityDispatcher())
 
     response = next(frame for frame in ws.responses() if frame["id"] == "caps")
-    assert response["payload"]["client_caps"] == [ANSWER_GENERATION_RESET_CAPABILITY]
+    assert response["payload"]["client_caps"] == [
+        ANSWER_GENERATION_RESET_CAPABILITY,
+        TURN_COMMITTED_CAPABILITY,
+    ]
+    hello = next(
+        json.loads(frame) for frame in ws.sent if json.loads(frame)["type"] == "hello-ok"
+    )
+    assert TURN_COMMITTED_EVENT in hello["features"]["events"]
 
 
 async def test_non_string_req_id_gets_error_res_and_connection_survives() -> None:

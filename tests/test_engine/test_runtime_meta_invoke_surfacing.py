@@ -293,6 +293,83 @@ async def test_runtime_pipeline_restores_mainline_meta_and_coding_order(
 
 
 @pytest.mark.asyncio
+async def test_restricted_artifact_pipeline_projects_no_workspace_or_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def noop_router(ctx: TurnContext) -> TurnContext:
+        ctx.metadata["restricted_router_observed"] = True
+        return ctx
+
+    noop_router.__name__ = "apply_squilla_router"
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", noop_router)
+
+    loader = _make_loader_with_meta(tmp_path)
+    catalog = SimpleNamespace(skills=tuple(loader.load_all()), generation=7)
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            meta_skill=SimpleNamespace(enabled=True, auto_trigger=True),
+            skills=SimpleNamespace(coding_mode=True),
+        ),
+    )
+    runner._skill_loader = loader
+    workspace = tmp_path / "private-workspace"
+    context = ToolContext(
+        workspace_dir=str(workspace),
+        exclusive_tools={"document_inspect", "document_apply"},
+    )
+
+    turn, _provider = await runner._run_pipeline(
+        "please run tiny-meta-trigger for this request",
+        "agent:main:webchat:prompt-annotation",
+        None,
+        None,
+        [
+            ToolDefinition(
+                name="document_inspect",
+                description="read annotations",
+                input_schema=ToolInputSchema(),
+            ),
+            ToolDefinition(
+                name="document_apply",
+                description="edit canonical source",
+                input_schema=ToolInputSchema(),
+            ),
+        ],
+        "restricted base prompt",
+        [],
+        tool_context=context,
+        skill_catalog=catalog,
+    )
+
+    assert turn.metadata["restricted_router_observed"] is True
+    assert turn.metadata["router_vision_followup_gate_decision"] == "not_applicable"
+    assert turn.metadata["router_vision_followup_gate_reason"] == (
+        "prompt_annotation_dom_selection"
+    )
+    assert turn.metadata["router_vision_followup_needs_image"] is False
+    assert turn.metadata["bootstrap_workspace_dir"] == ""
+    assert turn.metadata["skill_count"] == 0
+    assert turn.metadata["skills_rendered_count"] == 0
+    assert turn.metadata["skills_prompt_chars"] == 0
+    assert turn.metadata["filtered_skill_ids"] == []
+    assert turn.skill_catalog is None
+    assert "skill_catalog_generation" not in turn.metadata
+    assert "meta_match" not in turn.metadata
+    assert "pinned_skills" not in turn.metadata
+    assert "meta-tiny" not in str(turn.system_prompt)
+    assert str(workspace) not in str(turn.system_prompt)
+    assert [record.step_name for record in turn.metadata["pipeline_steps"]] == [
+        "resolve_model",
+        "apply_squilla_router",
+        "observe_reasoning_hint",
+        "inject_platform_hint",
+        "apply_prompt_cache",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runtime_pipeline_pins_meta_skill_when_skill_filter_enabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

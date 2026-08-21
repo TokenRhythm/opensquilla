@@ -91,6 +91,31 @@ def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
     assert "'0.0.0.0'" not in start_gateway
 
 
+def test_desktop_artifact_bridge_credentials_reach_only_the_owned_gateway_child() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    child_environment = _section(
+        main_ts,
+        "function desktopChildEnvironment",
+        "// ── Legacy home import detection",
+    )
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]" in child_environment
+    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]" in child_environment
+    assert "await desktopArtifactBridgeLoopback.start()" in start_gateway
+    assert "...artifactBridgeEnvironment" in start_gateway
+    assert start_gateway.index("await desktopArtifactBridgeLoopback.start()") < start_gateway.index(
+        "const port = await findGatewayPort()"
+    )
+    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL" not in preload
+    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN" not in preload
+
+
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
 
@@ -578,6 +603,47 @@ def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None
     assert "document.body.classList.add('recovering', 'errored')" in render_recovery
 
 
+def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    apply_status = _section(
+        boot_html,
+        "function applyStatus(payload)",
+        "function applyError(payload)",
+    )
+    timer = _section(
+        boot_html,
+        "function updateTimer()",
+        "const api = window.opensquillaDesktop",
+    )
+
+    # The phase is announced once, while the visual 100 ms timer stays out of
+    # the live region so assistive technology is not flooded with elapsed time.
+    assert '<section class="status">' in boot_html
+    assert (
+        'id="phase" data-i18n="phaseDefault" role="status" '
+        'aria-live="polite" aria-atomic="true"'
+        in boot_html
+    )
+    assert 'id="timer" aria-hidden="true"' in boot_html
+
+    # Main-process BootStatus.at is the phase anchor. Replaying the same
+    # (phaseId, at) snapshot must not reset it, while a new status identity does.
+    assert "let phaseStartedAt = performance.now()" in boot_html
+    assert "let phaseStatusIdentity = ''" in boot_html
+    assert "const statusAt = payload && payload.at ? String(payload.at) : ''" in apply_status
+    assert "const statusIdentity = phaseId + '\\u0000' + statusAt" in apply_status
+    assert "if (statusIdentity !== phaseStatusIdentity)" in apply_status
+    assert "phaseStatusIdentity = statusIdentity" in apply_status
+    assert "const statusAtMs = Date.parse(statusAt)" in apply_status
+    assert (
+        "const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0"
+        in apply_status
+    )
+    assert "phaseStartedAt = performance.now() - Math.max(0, wallAgeMs)" in apply_status
+    assert "updateTimer()" in apply_status
+    assert "performance.now() - phaseStartedAt" in timer
+
+
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     main_ts = _read("desktop/electron/src/main.ts")
@@ -1007,17 +1073,18 @@ def test_consolidated_safe_storage_failure_cannot_publish_or_ack_as_adopted() ->
     # safeStorage can throw while decrypting ciphertext from another OS
     # keychain. Keep the candidate local to the guarded try until both secrets
     # have been validated, so the catch path leaves the publish guard null.
-    assert "return safeStorage.decryptString(payload)" in decrypt_secret
+    assert "() => safeStorage.decryptString(payload)" in decrypt_secret
+    assert "decryptedSecretCache.resolve(" in decrypt_secret
 
     candidate_index = credential_adoption.index(
         "const candidateCredential = normalizeDesktopCredential("
     )
     provider_validation_index = credential_adoption.index(
-        "!decryptApiKey(candidateCredential)",
+        "resolvedCredentialApiKey = decryptApiKey(candidateCredential)",
         candidate_index,
     )
     search_validation_index = credential_adoption.index(
-        "!decryptSearchApiKey(candidateCredential)",
+        "resolvedCredentialSearchApiKey = decryptSearchApiKey(candidateCredential)",
         provider_validation_index,
     )
     publish_eligibility_index = credential_adoption.index(
@@ -1205,14 +1272,25 @@ def test_desktop_local_web_build_installs_locked_dependencies_first() -> None:
     )
 
 
-def test_desktop_local_packaging_hydrates_and_verifies_bundled_runtimes() -> None:
-    scripts = json.loads(_read("desktop/electron/package.json"))["scripts"]
+def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    scripts = package_json["scripts"]
 
     for local_script in ("dist:local", "pack:local"):
         commands = scripts[local_script].split(" && ")
-        assert commands.index("npm run fetch:runtimes") < commands.index(
-            "npm run build:gateway"
-        )
+        assert "npm run fetch:runtimes" not in commands
+        assert commands.index("npm run build:web") < commands.index("npm run build:gateway")
+
+    runtime_resources = {
+        (entry["from"], entry["to"])
+        for entry in package_json["build"]["extraResources"]
+        if entry["to"].startswith("runtime")
+    }
+    assert runtime_resources == {
+        ("runtime/gateway", "runtime/gateway"),
+        ("runtime/runtime-manifest.json", "runtime/runtime-manifest.json"),
+        ("runtime/runtime-pack-catalog.json", "runtime/runtime-pack-catalog.json"),
+    }
 
     assert scripts["dist"].endswith(" && npm run verify:package")
     assert scripts["pack"].endswith(" && npm run verify:package")
@@ -1220,6 +1298,7 @@ def test_desktop_local_packaging_hydrates_and_verifies_bundled_runtimes() -> Non
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
+    verifier = _read("desktop/electron/scripts/verify-package.mjs")
     onboarding = _section(
         main_ts,
         "async function runOnboarding",
@@ -1227,9 +1306,14 @@ def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     )
 
     assert "const parentWindow = currentMainWindow()" in onboarding
+    assert "const window = new BrowserWindow" in onboarding
     assert "parent: parentWindow ?? undefined" in onboarding
     assert "modal: Boolean(parentWindow)" in onboarding
-    assert "onboardingWindow?.focus()" in onboarding
+    assert "onboardingWindow = window" in onboarding
+    assert "focusOnboardingWindow()" in onboarding
+    assert r"const\s+window\s*=\s*new\s+" in verifier
+    assert r"onboardingWindow\s*=\s*window\b" in verifier
+    assert "onboardingWindowAssignmentIndex < modalOptionIndex" in verifier
 
 
 def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_cta() -> None:
@@ -1267,6 +1351,46 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
         assert visible_cta in accessible_label
 
 
+def test_desktop_onboarding_exposes_immediate_and_slow_submit_feedback() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
+    clear_slow_timer = _section(
+        html,
+        "function clearSubmitSlowTimer()",
+        "function setSubmitting(next)",
+    )
+    submitting = _section(
+        html,
+        "function setSubmitting(next)",
+        "onboardingLocale.addEventListener('change'",
+    )
+    submit = _section(
+        html,
+        "let succeeded = false",
+        "function applyMigrationPrefill",
+    )
+
+    assert (
+        '<span class="submit-status" id="submitStatus" role="status" '
+        'aria-live="polite" aria-atomic="true"></span>'
+        in html
+    )
+    assert "const SUBMIT_SLOW_FEEDBACK_MS = 8_000" in html
+    assert main_ts.count("savingSetup:") == 6
+    assert main_ts.count("setupTakingLonger:") == 6
+    assert "t.savingSetup" in submitting
+    assert "desktopMessage(activeLocale, 'boot.profile')" in submitting
+    assert "t.setupTakingLonger" in submitting
+    assert "setTimeout" in submitting
+    assert "clearTimeout" in clear_slow_timer
+    assert "clearSubmitSlowTimer()" in submitting
+    assert "SUBMIT_SLOW_FEEDBACK_MS" in submitting
+    assert "pagehide" in html
+    assert submit.index("succeeded = true") < submit.index("clearSubmitSlowTimer()")
+    assert "if (!succeeded)" in submit
+    assert "setSubmitting(false)" in submit
+
+
 def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
@@ -1275,6 +1399,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
+    assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
     assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
     assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
@@ -1285,21 +1410,39 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "routerTiers = clone(routerProfiles[profileKeyForMode()]);" in onboarding_html
     assert "return provider.value;" in onboarding_html
     assert "routerDefaultTier: 'c1'," in onboarding_html
-    assert "routerTiers," in onboarding_html
+    assert "routerTiers: clone(routerTiers)," in onboarding_html
     assert "[data-model-routing-mode]" not in onboarding_html
     assert "'selection_mode = \"custom_b5\"'" in main_ts
     assert "'[[llm_ensemble.candidates]]'" in main_ts
     assert "DESKTOP_ENSEMBLE_PROFILES[selectionMode]" in main_ts
 
     expected_models = (
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
         "kimi-k2.7-code",
         "glm-5.2",
         "kimi-k2.6",
     )
     for model in expected_models:
         assert model in tokenrhythm_profile
+    assert "ensembleEnabled: true" in tokenrhythm_profile
+    assert "thinkingLevel" not in tokenrhythm_profile
+    assert "ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}" in main_ts
+
+
+def test_desktop_legacy_inline_router_does_not_inherit_new_c3_ensemble() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    normalizer = _read("desktop/electron/src/router-tier-normalization.ts")
+    package_json = json.loads(_read("desktop/electron/package.json"))
+
+    assert "normalizeRouterTiers" in main_ts
+    assert "for (const tier of Object.values(out)) delete tier.ensembleEnabled" in normalizer
+    assert "hasOwnProperty.call(tier, 'ensembleEnabled')" in normalizer
+    assert "hasOwnProperty.call(tier, 'ensemble_enabled')" in normalizer
+    assert "normalizeBooleanSetting(ensembleEnabled, false)" in normalizer
+    assert package_json["scripts"]["test:router-tier-normalization"] == (
+        "npm run build && node scripts/test-router-tier-normalization.mjs"
+    )
 
 
 def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer() -> None:
@@ -1312,7 +1455,7 @@ def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer
     )
     window_open = _section(
         onboarding,
-        "onboardingWindow.webContents.setWindowOpenHandler",
+        "window.webContents.setWindowOpenHandler",
         "const guardOnboardingNavigation",
     )
 
@@ -1490,12 +1633,14 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     assert "await waitForGateway(url, () => childExitMessage)" in start
     assert "waitForGatewayReadiness({" in wait
     assert "primaryTimeoutMs: 45_000" in wait
-    assert "lateGraceMs: 15_000" in wait
+    assert (
+        "lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000" in wait
+    )
     assert "exitMessage: earlyExitMessage" in wait
     assert "if (result.status === 'exited') throw new Error(result.message)" in wait
 
 
-def test_start_gateway_enriches_child_path_for_code_task_builds() -> None:
+def test_start_gateway_preserves_host_path_without_static_runtime_injection() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     start = _section(
         main_ts,
@@ -1504,9 +1649,10 @@ def test_start_gateway_enriches_child_path_for_code_task_builds() -> None:
     )
 
     assert "function desktopChildPath" in main_ts
-    assert "function desktopNodeBinCandidates" in main_ts
-    assert "packagedRuntimeRoot(), 'node', 'bin'" in main_ts
-    assert "OPENSQUILLA_NODE_BIN_DIR" in start
+    assert "function desktopNodeBinCandidates" not in main_ts
+    assert "packagedRuntimeRoot(), 'node', 'bin'" not in main_ts
+    assert "OPENSQUILLA_NODE_BIN_DIR" not in start
+    assert "optional Runtime Packs are resolved inside Gateway" in main_ts
     assert "PATH: childPath" in start
 
 
@@ -2228,6 +2374,8 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         "does not prefer the onboarding window when focusing",
         "app.asar package.json version is not npm semver",
         "prereleases must use 0.5.0-rc2 style, not 0.5.0rc2",
+        "must not contain bundled developer runtimes",
+        "runtime-pack catalog must declare a boolean finalized flag",
         "process.exit(1)",
     ]:
         assert expected in verifier
@@ -2265,6 +2413,28 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "preservedDraft" in recovery
 
 
+def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electron() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    gate = _read("desktop/electron/scripts/test-offline-document-workbench-e2e.mjs")
+    native = _read("desktop/electron/scripts/test-native-workbench-v2-electron.mjs")
+    ci = _read(".github/workflows/ci.yml")
+
+    assert (
+        package_json["scripts"]["test:offline-document-workbench-e2e"]
+        == "npm run build && node scripts/test-offline-document-workbench-e2e.mjs"
+    )
+    assert "test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable" in gate
+    assert "test-native-workbench-v2-electron.mjs" in gate
+    assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND: '1'" in gate
+    assert "owned-Gateway WebSocket lifecycle" in gate
+    assert "real Electron process" in gate
+    assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
+    assert "requires an unlocked foreground GUI session" in native
+    assert ci.count(
+        "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
+    ) == 3
+
+
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
     build_gateway = _read("desktop/electron/scripts/build-gateway.mjs")
     verifier = _read("desktop/electron/scripts/verify-package.mjs")
@@ -2288,6 +2458,8 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "codesign" in build_gateway
     assert "'--force', '--sign', '-'" in build_gateway
     assert "@loader_path/libomp.dylib" in build_gateway
+    assert "assertRuntimeSetReady" not in build_gateway
+    assert "fetch-bundled-runtimes.mjs" not in build_gateway
     assert "verifyMacLightgbmRuntime" in verifier
     assert "lightgbm/lib/lib_lightgbm.dylib" in verifier
     assert "bundled libomp.dylib" in verifier
@@ -2481,6 +2653,38 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
     assert "DESKTOP_LOG_MAX_BYTES" in log_file
     assert "DESKTOP_LOG_BACKUP_COUNT" in log_file
     assert "appendDesktopLogRecord" in main_ts
+
+
+def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    create_window = _section(
+        main_ts,
+        "async function createMainWindow(): Promise<BrowserWindow>",
+        "async function loadControlUi",
+    )
+    cleanup = _section(
+        create_window,
+        "const releaseRendererOwnedArtifactPreviews = (): void => {",
+        "// Forward renderer console errors",
+    )
+    renderer_gone = _section(
+        create_window,
+        "window.webContents.on('render-process-gone'",
+        "window.webContents.on('unresponsive'",
+    )
+    full_navigation = _section(
+        create_window,
+        "window.webContents.on('did-start-navigation'",
+        "window.on('close'",
+    )
+
+    assert "void nativeWorkbenchSurfaces.destroyAll()" in cleanup
+    assert "void artifactPreviewLeaseBroker.revokeAll()" in cleanup
+    assert "releaseRendererOwnedArtifactPreviews()" in renderer_gone
+    assert (
+        "if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()"
+        in full_navigation
+    )
 
 
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
@@ -3170,11 +3374,17 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
         "ipcMain.handle('desktop:onboarding:save'",
         "ipcMain.handle('desktop:onboarding:cancel'",
     )
+    perform_save = _section(
+        main_ts,
+        "async function performOnboardingSave",
+        "async function withRecoveryOperation",
+    )
 
     assert "reconcileImportedDesktopCredential" in run
     assert "loadPendingMigrationProviderSetup" in onboarding
     assert "pendingProviderSetup" in onboarding
-    assert "clearPendingMigrationProviderSetup" in save
+    assert "onboardingFlows.requestSave" in save
+    assert "clearPendingMigrationProviderSetup" in perform_save
     assert "scrubImportedProviderEnvEntry" not in main_ts
     assert "readImportedProviderKey" not in main_ts
     assert "apiKey: ''" in main_ts

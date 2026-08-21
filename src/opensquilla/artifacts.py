@@ -14,7 +14,7 @@ import secrets
 import shutil
 import stat
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -36,6 +36,8 @@ ARTIFACT_BUNDLE_MANIFEST_NAME = "bundle.json"
 ARTIFACT_BUNDLE_BLOBS_DIR = "blobs"
 ARTIFACT_BUNDLE_VERSION = 1
 ARTIFACT_THUMBNAIL_NAME = "thumb.webp"
+ARTIFACT_INTERNAL_MARKER_NAME = ".internal-revision"
+ARTIFACT_OWNERSHIP_MARKER_NAME = ".artifact-id"
 ARTIFACT_THUMBNAIL_MAX_EDGE = 512
 ARTIFACT_THUMBNAIL_QUALITY = 80
 ARTIFACT_STORE_TOKEN_CHARS = 12
@@ -79,7 +81,7 @@ _CSS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _CSS_IMPORT_RE = re.compile(
-    r"""@import\s+(?:"([^"]+)"|'([^']+)'|([^"'();\s]+))""",
+    r"""@import\s+(?!url\s*\()(?:"([^"]+)"|'([^']+)'|([^"'();\s]+))""",
     re.IGNORECASE,
 )
 _JS_SERVICE_WORKER_RECEIVER_RE = (
@@ -321,6 +323,32 @@ class ArtifactBundleManifest:
         if _artifact_bundle_digest(manifest.to_dict()) != digest:
             raise ArtifactIntegrityError("artifact bundle manifest digest mismatch")
         return manifest
+
+
+def is_complete_single_file_preview_bundle(
+    manifest: ArtifactBundleManifest | None,
+) -> bool:
+    """Return whether a bundle can be handled as its sole canonical source file.
+
+    A warning or partial collection means referenced material may be absent even
+    when the manifest currently contains one file.  Those cases must retain the
+    conservative multi-file bundle behavior.
+    """
+
+    return bool(
+        manifest is not None
+        and manifest.collection_status == "complete"
+        and not manifest.warning_codes
+        and _is_single_file_preview_bundle(manifest)
+    )
+
+
+def _is_single_file_preview_bundle(manifest: ArtifactBundleManifest) -> bool:
+    return bool(
+        manifest.file_count == 1
+        and len(manifest.files) == 1
+        and manifest.files[0].path == manifest.entrypoint
+    )
 
 
 @dataclass(frozen=True)
@@ -1211,6 +1239,12 @@ class ArtifactStore:
     def __init__(self, media_root: str | Path) -> None:
         self.media_root = Path(media_root)
 
+    @staticmethod
+    def allocate_artifact_id() -> str:
+        """Allocate an opaque ID that can be journaled before publication."""
+
+        return _validate_artifact_id(f"art-{secrets.token_urlsafe(18)}")
+
     def publish_bytes(
         self,
         payload: bytes,
@@ -1222,7 +1256,11 @@ class ArtifactStore:
         source: str,
         max_bytes: int | None = DEFAULT_ARTIFACT_MAX_BYTES,
         disk_budget_bytes: int | None = DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
+        visibility: str = "listed",
+        artifact_id: str | None = None,
     ) -> ArtifactRef:
+        if visibility not in {"listed", "internal"}:
+            raise ArtifactError("artifact visibility must be listed or internal")
         if len(payload) == 0:
             raise ArtifactBudgetError("artifact payload is empty")
         if max_bytes is not None and len(payload) > max_bytes:
@@ -1239,7 +1277,11 @@ class ArtifactStore:
 
         session_id = _validate_non_empty("session_id", session_id)
         session_key = _validate_non_empty("session_key", session_key)
-        artifact_id = f"art-{secrets.token_urlsafe(18)}"
+        artifact_id = (
+            self.allocate_artifact_id()
+            if artifact_id is None
+            else _validate_artifact_id(artifact_id)
+        )
         safe_name = _safe_filename(name)
         safe_mime = _safe_mime(mime)
         sha = hashlib.sha256(payload).hexdigest()
@@ -1264,6 +1306,13 @@ class ArtifactStore:
         native_artifact_dir = native_io_path(artifact_dir)
         native_artifact_dir.mkdir(parents=True, exist_ok=False)
         try:
+            # This full-ID marker is the ownership proof used by restart
+            # recovery when a hard crash occurs before meta.json is durable.
+            # It is intentionally the first file written after mkdir.
+            _atomic_write_bytes(
+                artifact_dir / ARTIFACT_OWNERSHIP_MARKER_NAME,
+                (artifact_id + "\n").encode("ascii"),
+            )
             _atomic_write_bytes(artifact_dir / ARTIFACT_MATERIAL_NAME, payload)
             if thumbnail_bytes is not None:
                 _atomic_write_bytes(artifact_dir / ARTIFACT_THUMBNAIL_NAME, thumbnail_bytes)
@@ -1271,6 +1320,8 @@ class ArtifactStore:
                 artifact_dir / "meta.json",
                 json.dumps(ref.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8"),
             )
+            if visibility == "internal":
+                _atomic_write_bytes(artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME, b"1\n")
         except BaseException:
             for path in sorted(native_artifact_dir.glob("*"), reverse=True):
                 try:
@@ -1295,6 +1346,7 @@ class ArtifactStore:
         source: str,
         max_bytes: int | None = DEFAULT_ARTIFACT_MAX_BYTES,
         disk_budget_bytes: int | None = DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
+        visibility: str = "listed",
     ) -> ArtifactRef:
         payload = native_io_path(path).read_bytes()
         return self.publish_bytes(
@@ -1306,6 +1358,7 @@ class ArtifactStore:
             source=source,
             max_bytes=max_bytes,
             disk_budget_bytes=disk_budget_bytes,
+            visibility=visibility,
         )
 
     def publish_bundle(
@@ -1321,9 +1374,12 @@ class ArtifactStore:
         disk_budget_bytes: int | None = DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
         bundle_max_bytes: int = DEFAULT_ARTIFACT_BUNDLE_MAX_BYTES,
         bundle_max_files: int = DEFAULT_ARTIFACT_BUNDLE_MAX_FILES,
+        visibility: str = "listed",
     ) -> ArtifactRef:
         """Atomically publish a static bundle while retaining the legacy entry file."""
 
+        if visibility not in {"listed", "internal"}:
+            raise ArtifactError("artifact visibility must be listed or internal")
         files = list(bundle.files)
         _validate_bundle_file_set(
             files,
@@ -1426,6 +1482,11 @@ class ArtifactStore:
                     "utf-8"
                 ),
             )
+            if visibility == "internal":
+                _atomic_write_bytes(
+                    staging_dir / ARTIFACT_INTERNAL_MARKER_NAME,
+                    b"1\n",
+                )
             os.replace(native_staging_dir, native_artifact_dir)
         except BaseException:
             shutil.rmtree(native_staging_dir, ignore_errors=True)
@@ -1555,6 +1616,47 @@ class ArtifactStore:
             raise ArtifactNotFoundError("artifact not found")
         return ref
 
+    def promote_internal_ref(
+        self,
+        *,
+        session_id: str,
+        artifact_id: str,
+        expected_sha256: str,
+    ) -> ArtifactRef:
+        """Make an immutable internal candidate visible as a listed deliverable.
+
+        Publication callers first journal the candidate, write it as internal,
+        commit the durable publication receipt, and only then remove the marker.
+        Repeating this method is safe and provides response-loss recovery.
+        """
+
+        expected_sha256 = _validate_sha256(expected_sha256)
+        ref, _path = self.resolve_for_download(artifact_id, session_id=session_id)
+        if ref.sha256 != expected_sha256:
+            raise ArtifactIntegrityError("artifact promotion sha256 mismatch")
+        layout = self._preferred_artifact_layout(session_id, ref.id)
+        if layout is None or not layout[2]:
+            raise ArtifactNotFoundError("artifact not found")
+        artifact_dir, _material_name, _safe = layout
+        marker = native_io_path(artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME)
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ArtifactError("artifact promotion failed") from exc
+        if os.name != "nt":
+            directory_fd: int | None = None
+            try:
+                directory_fd = os.open(native_io_path(artifact_dir), os.O_RDONLY)
+                os.fsync(directory_fd)
+            except OSError:
+                # The durable DB receipt remains the recovery authority. A later
+                # idempotent replay rechecks the marker and promotion state.
+                pass
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+        return ref
+
     def list_refs(
         self,
         *,
@@ -1600,6 +1702,8 @@ class ArtifactStore:
             if layout is None or not layout[2]:
                 continue
             artifact_dir, _material_name, _safe = layout
+            if native_io_path(artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME).exists():
+                continue
             selected_meta_path = artifact_dir / "meta.json"
             if native_io_path(selected_meta_path) != native_meta_path:
                 continue
@@ -1638,6 +1742,48 @@ class ArtifactStore:
             session_id=session_id,
         )
         return self._describe_preview_bundle_for_ref(ref, material_path)
+
+    def supports_single_file_editing(
+        self,
+        artifact_id: str,
+        *,
+        session_id: str,
+    ) -> bool:
+        """Return whether an artifact can be copied into one editable document.
+
+        Bundle status is derived metadata. Older collectors could persist a
+        false ``missing_dependency`` warning for a remote CSS ``@import
+        url(...)``. Preserve the immutable manifest, but safely reclassify a
+        partial one-file HTML bundle from its integrity-checked entrypoint.
+        Real local, dynamic, unsafe, or undecodable dependencies remain closed.
+        """
+
+        ref, material_path = self.resolve_for_download(
+            artifact_id,
+            session_id=session_id,
+        )
+        manifest = self._describe_preview_bundle_for_ref(ref, material_path)
+        if manifest is None or is_complete_single_file_preview_bundle(manifest):
+            return True
+        if (
+            manifest.collection_status != "partial"
+            or manifest.warning_codes != ("missing_dependency",)
+        ):
+            return False
+        if not _is_single_file_preview_bundle(manifest):
+            return False
+        entry = manifest.files[0]
+        if entry.mime not in {"application/xhtml+xml", "text/html"} and (
+            Path(entry.path).suffix.casefold() not in {".htm", ".html", ".xhtml"}
+        ):
+            return False
+        try:
+            payload = _read_regular_bundle_file(material_path)
+        except (OSError, ArtifactPathError) as exc:
+            raise ArtifactIntegrityError("artifact bundle entrypoint is unreadable") from exc
+        if len(payload) != ref.size or hashlib.sha256(payload).hexdigest() != ref.sha256:
+            raise ArtifactIntegrityError("artifact bundle entrypoint does not match artifact")
+        return not legacy_html_bundle_warning_codes(manifest.entrypoint, payload)
 
     def _describe_preview_bundle_for_ref(
         self,
@@ -1792,6 +1938,10 @@ class ArtifactStore:
         selected_ids = None if artifact_ids is None else set(artifact_ids)
         copied = 0
         for meta_path in self._iter_session_meta_paths(source_session_id):
+            if native_io_path(
+                meta_path.parent / ARTIFACT_INTERNAL_MARKER_NAME
+            ).exists():
+                continue
             try:
                 ref = ArtifactRef.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
             except (OSError, ValueError, json.JSONDecodeError):
@@ -1808,6 +1958,156 @@ class ArtifactStore:
                 # must not stop the rest. ArtifactError is a ValueError subclass.
                 continue
         return copied
+
+    def copy_artifact_heads_for_fork(
+        self,
+        *,
+        source_session_id: str,
+        target_session_id: str,
+        target_session_key: str,
+        artifact_ids: Sequence[str],
+    ) -> int:
+        """Copy an explicit set of document heads into a forked session.
+
+        Unlike :meth:`copy_session_artifacts`, this method intentionally accepts
+        internal revision blobs because a document's current head may be hidden
+        from the legacy chat-artifact list. Visibility is preserved in the child,
+        and every requested artifact must be resolvable after the copy.
+        """
+
+        source_session_id = _validate_non_empty("source_session_id", source_session_id)
+        target_session_id = _validate_non_empty("target_session_id", target_session_id)
+        target_session_key = _validate_non_empty("target_session_key", target_session_key)
+        if target_session_id == source_session_id:
+            raise ArtifactError("source and target session ids must differ")
+        copied = 0
+        for artifact_id in dict.fromkeys(artifact_ids):
+            ref = self.get_ref(
+                session_id=source_session_id,
+                artifact_id=artifact_id,
+            )
+            source_dir = self.path_for(ref).parent
+            source_is_internal = native_io_path(
+                source_dir / ARTIFACT_INTERNAL_MARKER_NAME
+            ).exists()
+            if self._copy_one_artifact(ref, target_session_id, target_session_key):
+                copied += 1
+            child_ref, child_path = self.resolve_for_download(
+                artifact_id,
+                session_id=target_session_id,
+            )
+            if child_ref.sha256 != ref.sha256:
+                raise ArtifactIntegrityError("forked artifact metadata does not match source")
+            child_marker = child_path.parent / ARTIFACT_INTERNAL_MARKER_NAME
+            if source_is_internal and not native_io_path(child_marker).exists():
+                _atomic_write_bytes(child_marker, b"1\n")
+        return copied
+
+    def delete_ref(self, *, session_id: str, artifact_id: str) -> bool:
+        """Delete one session-owned artifact bucket without following links.
+
+        ArtifactSession calls this when a newly materialized candidate loses a
+        database compare-and-set.  Both identifiers are validated and resolved
+        through the store layout before deletion; callers never supply a path.
+        """
+
+        session_id = _validate_non_empty("session_id", session_id)
+        artifact_id = _validate_artifact_id(artifact_id)
+        try:
+            ref = self.get_ref(session_id=session_id, artifact_id=artifact_id)
+        except ArtifactNotFoundError:
+            return False
+        if ref.session_id != session_id:
+            return False
+        layout = self._preferred_artifact_layout(session_id, artifact_id)
+        if layout is None or not layout[2]:
+            return False
+        artifact_dir = layout[0]
+        native_dir = native_io_path(artifact_dir)
+        if native_dir.is_symlink() or _is_reparse_point(artifact_dir):
+            return False
+        shutil.rmtree(native_dir)
+        return True
+
+    def delete_reserved_bucket(self, *, session_id: str, artifact_id: str) -> bool:
+        """Delete a journal-owned bucket even when publication died before metadata.
+
+        The compact on-disk layout hashes artifact IDs, so a derived path alone
+        is not proof of ownership. Deletion requires an exact full-ID marker,
+        exact safe metadata, or an empty directory left between mkdir and the
+        first marker write. Unsafe or mismatched buckets fail closed.
+        """
+
+        session_id = _validate_non_empty("session_id", session_id)
+        artifact_id = _validate_artifact_id(artifact_id)
+        artifact_dir = self._artifact_dir(session_id, artifact_id)
+        native_dir = native_io_path(artifact_dir)
+        try:
+            root_stat = native_io_path(artifact_dir.parent).lstat()
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or stat.S_ISLNK(root_stat.st_mode)
+            or _is_reparse_point(artifact_dir.parent)
+        ):
+            raise ArtifactIntegrityError("reserved artifact parent is unsafe")
+        try:
+            directory_stat = native_dir.lstat()
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or stat.S_ISLNK(directory_stat.st_mode)
+            or _is_reparse_point(artifact_dir)
+        ):
+            raise ArtifactIntegrityError("reserved artifact bucket is unsafe")
+
+        marker = artifact_dir / ARTIFACT_OWNERSHIP_MARKER_NAME
+        ownership_proven = False
+        try:
+            marker_stat = native_io_path(marker).lstat()
+        except FileNotFoundError:
+            marker_stat = None
+        if marker_stat is not None:
+            if (
+                not stat.S_ISREG(marker_stat.st_mode)
+                or stat.S_ISLNK(marker_stat.st_mode)
+                or _is_reparse_point(marker)
+            ):
+                raise ArtifactIntegrityError("reserved artifact ownership marker is unsafe")
+            try:
+                marker_id = native_io_path(marker).read_text(encoding="ascii").strip()
+            except (OSError, UnicodeError) as exc:
+                raise ArtifactIntegrityError(
+                    "reserved artifact ownership marker is unreadable"
+                ) from exc
+            if marker_id != artifact_id:
+                raise ArtifactIntegrityError("reserved artifact ownership marker mismatches")
+            ownership_proven = True
+        else:
+            try:
+                ref = self.get_ref(session_id=session_id, artifact_id=artifact_id)
+            except ArtifactNotFoundError:
+                ref = None
+            if ref is not None:
+                if ref.id != artifact_id or ref.session_id != session_id:
+                    raise ArtifactIntegrityError("reserved artifact metadata mismatches")
+                ownership_proven = True
+
+        if not ownership_proven:
+            try:
+                if next(native_dir.iterdir(), None) is None:
+                    native_dir.rmdir()
+                    return True
+            except OSError as exc:
+                raise ArtifactIntegrityError(
+                    "reserved artifact bucket could not be inspected"
+                ) from exc
+            raise ArtifactIntegrityError("reserved artifact bucket lacks ownership proof")
+
+        shutil.rmtree(native_dir)
+        return True
 
     def delete_session_artifacts(self, session_id: str) -> int:
         """Remove every current and legacy artifact bucket owned by a session.
@@ -1843,6 +2143,60 @@ class ArtifactStore:
             # pass; a vanished child must not block deletion of the session.
             shutil.rmtree(native_root, ignore_errors=True)
             removed += 1
+        return removed
+
+    def delete_session_internal_artifacts(self, session_id: str) -> int:
+        """Remove only hidden ArtifactSession revision/candidate buckets.
+
+        Listed ``ArtifactRef`` objects are a legacy/public contract and survive
+        session reset/delete.  Internal bytes are identified exclusively by the
+        marker written atomically by ``publish_* visibility='internal'``; names,
+        sources, and database references are not trusted as visibility signals.
+        Link and reparse-point buckets are never followed.
+        """
+
+        session_id = _validate_non_empty("session_id", session_id)
+        removed = 0
+        touched_roots: set[Path] = set()
+        for meta_path in tuple(self._iter_session_meta_paths_for_listing(session_id)):
+            artifact_dir = meta_path.parent
+            marker_path = artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME
+            try:
+                marker_stat = native_io_path(marker_path).lstat()
+                if (
+                    not stat.S_ISREG(marker_stat.st_mode)
+                    or stat.S_ISLNK(marker_stat.st_mode)
+                    or _is_reparse_point(marker_path)
+                ):
+                    continue
+                ref = ArtifactRef.from_dict(
+                    json.loads(native_io_path(meta_path).read_text(encoding="utf-8"))
+                )
+                if ref.session_id != session_id:
+                    continue
+                artifact_stat = native_io_path(artifact_dir).lstat()
+                if (
+                    not stat.S_ISDIR(artifact_stat.st_mode)
+                    or stat.S_ISLNK(artifact_stat.st_mode)
+                    or _is_reparse_point(artifact_dir)
+                ):
+                    continue
+                shutil.rmtree(native_io_path(artifact_dir))
+                removed += 1
+                touched_roots.add(artifact_dir.parent)
+            except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+                # Cleanup is post-commit and retryable. A raced/malformed bucket
+                # is safer to leak than to infer visibility and delete it.
+                continue
+
+        # Empty hashed session roots have no user-visible contents left.  Use
+        # rmdir rather than recursive deletion so a concurrently-created listed
+        # artifact can never be removed by this cleanup pass.
+        for root in sorted(touched_roots, key=lambda item: len(item.parts), reverse=True):
+            try:
+                native_io_path(root).rmdir()
+            except OSError:
+                pass
         return removed
 
     def _iter_session_meta_paths(self, session_id: str) -> Iterator[Path]:

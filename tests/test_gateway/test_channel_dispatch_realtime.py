@@ -1004,7 +1004,12 @@ def test_direct_channel_batch_turn_emits_tool_events_to_webui() -> None:
                 result="outline done",
                 arguments={"kind": "llm_chat", "output_chars": 12},
             )
-            yield TextDeltaEvent(text="ok")
+            yield TextDeltaEvent(
+                text="ok",
+                generation_epoch=4,
+                model_call_id="3.0",
+                iteration=3,
+            )
             yield DoneEvent()
 
     channel = _FakeChannel()
@@ -1044,6 +1049,17 @@ def test_direct_channel_batch_turn_emits_tool_events_to_webui() -> None:
         and payload["arguments"]["kind"] == "llm_chat"
         for _, event_name, payload in bridge.events
     )
+    assert (
+        "agent:main:channel-test",
+        "session.event.text_delta",
+        {
+            "text": "ok",
+            "presentation": "answer",
+            "generation_epoch": 4,
+            "model_call_id": "3.0",
+            "iteration": 3,
+        },
+    ) in bridge.events
     assert channel.sent[-1].content == "ok"
 
 
@@ -2209,7 +2225,12 @@ def test_direct_streaming_path_emits_tool_events_to_webui() -> None:
                 tool_name="meta-step:section_introduction",
                 result="section done",
             )
-            yield TextDeltaEvent(text="finished")
+            yield TextDeltaEvent(
+                text="finished",
+                generation_epoch=3,
+                model_call_id="2.1",
+                iteration=2,
+            )
             yield DoneEvent()
 
     channel = StreamingChannel()
@@ -2245,6 +2266,17 @@ def test_direct_streaming_path_emits_tool_events_to_webui() -> None:
         and payload["result"] == "section done"
         for _, event_name, payload in bridge.events
     )
+    assert (
+        "agent:main:stream-tool-events",
+        "session.event.text_delta",
+        {
+            "text": "finished",
+            "presentation": "answer",
+            "generation_epoch": 3,
+            "model_call_id": "2.1",
+            "iteration": 2,
+        },
+    ) in bridge.events
     assert channel.sent[-1].content == "finished"
 
 

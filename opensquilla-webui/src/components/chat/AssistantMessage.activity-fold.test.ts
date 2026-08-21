@@ -35,6 +35,18 @@ function failedCall(): ChatToolCallRenderItem {
   }
 }
 
+function failedDocumentApplyCall(): ChatToolCallRenderItem {
+  return {
+    ...failedCall(),
+    toolId: 'failed-document-apply',
+    renderKey: 'failed-document-apply',
+    name: 'document_apply',
+    displayName: 'Apply document change',
+    result: 'Proposal validation failed',
+    resultPreview: 'Proposal validation failed',
+  }
+}
+
 function successfulCall(toolId: string, name: string): ChatToolCallRenderItem {
   return {
     ...failedCall(),
@@ -517,7 +529,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.msg-meta-popover')?.textContent).not.toContain('$0')
   })
 
-  it('keeps the ensemble summary but hides exact zero cost for unknown-only legacy usage', async () => {
+  it('keeps numeric ensemble costs without adding an unknown-usage display state', async () => {
     const meta = usageMeta({
       input: 0,
       output: 0,
@@ -562,9 +574,9 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
     const popover = el.querySelector<HTMLElement>('.msg-meta-popover')
     expect(popover?.textContent).toContain('ensemble-review')
-    expect(popover?.textContent).toContain('exact usage total unavailable')
-    expect(popover?.textContent).not.toContain('$0')
-    expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('—')
+    expect(popover?.textContent).not.toContain('exact usage total unavailable')
+    expect(popover?.textContent).toContain('$0')
+    expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('$0')
   })
 
   it('adds compact usage without reordering a canonical-less legacy timeline', async () => {
@@ -1055,6 +1067,41 @@ describe('AssistantMessage activity disclosure', () => {
     const activity = el.querySelector('.assistant-activity')
     expect(activity).toBeNull()
     expect(el.querySelector('.tool-row--error')).toBeNull()
+  })
+
+  it('keeps a failed page update visible and uses the unified successful summary', async () => {
+    const failedApply = timelineGroup(failedDocumentApplyCall())
+    if (failedApply.type !== 'tool-group') throw new Error('expected tool group')
+    failedApply.group.isError = true
+    failedApply.group.status = 'error'
+    const successfulApply = timelineGroup(successfulCall('applied-document', 'document_apply'))
+    const el = mountMessage(baseMessage({
+      timelineItems: [failedApply, successfulApply],
+      toolCalls: [failedDocumentApplyCall(), successfulCall('applied-document', 'document_apply')],
+      parts: [],
+      statusHistory: [],
+      turnOutcome: {
+        turnId: 'turn-document-apply',
+        status: 'succeeded',
+        documentMutationOutcome: {
+          version: 1,
+          status: 'applied',
+          corrected: true,
+          proposalAttempts: 2,
+        },
+      },
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+    expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
+      .toContain('Page updated')
+    expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
+      .not.toMatch(/receipt|reconciliation|revision|document_apply/i)
+    expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
+    expect(activity?.textContent).not.toContain('Proposal validation failed')
   })
 
   it('hides restored failures whose error state only survived on the group', async () => {

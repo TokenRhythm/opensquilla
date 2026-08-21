@@ -146,6 +146,7 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
                     "max_completion_tokens": 131_072,
                     "supports_tools": True,
                     "supports_streaming": True,
+                    "supports_vision": True,
                 }
             ]
         }
@@ -159,6 +160,7 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
                     "max_completion_tokens": 8_192,
                     "supports_tools": False,
                     "supports_streaming": False,
+                    "supports_vision": False,
                 }
             ]
         }
@@ -216,6 +218,18 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
     assert caps_a.supports_streaming is True
     assert caps_b.supports_tools is False
     assert caps_b.supports_streaming is False
+    assert catalog.resolve_deployment_vision_support(
+        "qwen3.8-max",
+        provider="tokenrhythm",
+        api_key="synthetic-authority-key-a",
+        base_url="https://tokenrhythm.studio/v1",
+    ) == "supported"
+    assert catalog.resolve_deployment_vision_support(
+        "qwen3.8-max",
+        provider="tokenrhythm",
+        api_key="synthetic-authority-key-b",
+        base_url="https://tokenrhythm.studio/v1",
+    ) == "unsupported"
 
 
 def test_custom_tokenrhythm_deployment_never_uses_website_projection() -> None:

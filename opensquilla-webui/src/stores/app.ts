@@ -39,6 +39,36 @@ type FeatureWindow = Window & {
   OPENSQUILLA_FEATURES?: Record<string, boolean>
 }
 
+// The release-default annotation surface is safe only when the renderer and
+// Desktop shell were shipped as one complete protocol-v3 unit. This is a
+// synchronous shape check by design: asynchronous runtime capability queries
+// still run when a preview opens and may fail closed for that document.
+const NATIVE_V3_ANNOTATION_BRIDGE_METHODS = [
+  'createArtifactPreviewLease',
+  'renewArtifactPreviewLease',
+  'revokeArtifactPreviewLease',
+  'createSurface',
+  'setSurfaceRect',
+  'activateSurface',
+  'destroySurface',
+  'onSurfaceEvent',
+  'getArtifactAnnotationCapabilities',
+  'setArtifactAnnotationMode',
+  'showArtifactAnnotationOverlay',
+  'closeArtifactAnnotationOverlay',
+  'screenshot',
+] as const
+
+function hasNativeV3AnnotationBridge(): boolean {
+  const platform = getPlatform()
+  const api = platform.workbench.native as unknown as Record<string, unknown> | undefined
+  return Boolean(
+    platform.capabilities.isDesktop
+    && api
+    && NATIVE_V3_ANNOTATION_BRIDGE_METHODS.every(method => typeof api[method] === 'function'),
+  )
+}
+
 function hydrateSidebarWidthPreference(): SidebarWidthPreference {
   try {
     return parseSidebarWidthPreference(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY))
@@ -445,6 +475,15 @@ export const useAppStore = defineStore('app', () => {
     // Application-level artifact Workbench. Operators can temporarily disable
     // it to retain the previous Drawer/lightbox flow for one release cycle.
     artifactWorkbench: true,
+    // Versioned HTML resource preview/edit is the V1 default on every client.
+    // Individual document capabilities still decide which actions are shown.
+    documentWorkbenchResources: true,
+    // DOM selection is Desktop-only and defaults on only for a shell exposing
+    // the complete native protocol-v3 annotation path. Older or partial shells
+    // fail closed while retaining the ordinary HTML Workbench.
+    artifactPromptAnnotations: hasNativeV3AnnotationBridge(),
+    // Keep operator/test overrides last. In particular, an explicit `false`
+    // remains the release emergency kill switch even on a complete Desktop.
     ...((window as FeatureWindow).OPENSQUILLA_FEATURES || {}),
   })
 

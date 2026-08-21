@@ -55,8 +55,7 @@ export const PROVIDER_RECOMMENDED_ENSEMBLE_SELECTION_MODES:
 export const SELECTION_MODE_OWNERSHIP_ROLES:
   Readonly<Record<string, string>> = {"static_openrouter_b5": "static_profile", "static_tokenrhythm_b5": "static_profile", "custom_b5": "custom_profile", "router_dynamic": "router_dynamic"}
 
-export const ENSEMBLE_CANDIDATE_ROLES = ["", "primary", "contrast", "fast_check", "critic", "aggregator"] as const
-export const ENSEMBLE_PROPOSER_ROLES = ["primary", "contrast", "fast_check", "critic"] as const
+export const ENSEMBLE_CANDIDATE_ROLES = ["proposer", "aggregator"] as const
 export const CUSTOM_B5_MIN_PROPOSERS = 2
 export const CUSTOM_B5_MAX_PROPOSERS = 6
 export const CUSTOM_B5_MAX_TOTAL_CALLS = 8

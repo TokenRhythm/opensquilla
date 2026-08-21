@@ -485,16 +485,17 @@ class ModelSelector:
         """
         if not self.has_fallback():
             raise IndexError("No more provider fallbacks available")
-        self._index += 1
-        return _build_provider(self._chain[self._index])
+        next_index = self._index + 1
+        provider = _build_provider(self._chain[next_index])
+        self._index = next_index
+        return provider
 
-    def next_fallback_after_failure(self, primary_failure: Exception) -> LLMProvider:
-        """Advance to the next fallback, consulting ``plugin.failover_hook``.
+    def _fallback_chain_after_failure(
+        self,
+        primary_failure: Exception,
+    ) -> tuple[ProviderConfig, list[ProviderConfig]]:
+        """Resolve and constrain a failure-specific chain without mutating state."""
 
-        When a plugin is registered its ``failover_hook`` return value
-        replaces the static fallback chain from ``SelectorConfig``. An
-        empty chain raises ``IndexError`` exactly like ``next_fallback``.
-        """
         current = self._chain[self._index]
         if self._plugin is not None and hasattr(self._plugin, "failover_hook"):
             chain = resolve_failover_chain(primary_failure, self._config, self._plugin)
@@ -508,13 +509,51 @@ class ModelSelector:
                 for cfg in chain
                 if _capacity_config_identity(cfg) in self._capacity_bounded_fallbacks
             ]
+        return current, chain
+
+    def _activate_fallback_chain(
+        self,
+        current: ProviderConfig,
+        chain: list[ProviderConfig],
+    ) -> LLMProvider:
+        """Build the first candidate before atomically installing its chain."""
+
         if not chain:
             raise IndexError("No fallback chain available")
+        provider = _build_provider(chain[0])
         self._chain = [current, *chain]
         self._index = 1
-        return _build_provider(self._chain[self._index])
+        return provider
 
-    def override_provider_config(self, cfg: ProviderConfig) -> None:
+    def next_fallback_after_failure(self, primary_failure: Exception) -> LLMProvider:
+        """Advance to the next fallback, consulting ``plugin.failover_hook``.
+
+        When a plugin is registered its ``failover_hook`` return value
+        replaces the static fallback chain from ``SelectorConfig``. An
+        empty chain raises ``IndexError`` exactly like ``next_fallback``.
+        """
+
+        current, chain = self._fallback_chain_after_failure(primary_failure)
+        return self._activate_fallback_chain(current, chain)
+
+    def next_fallback_after_failure_matching(
+        self,
+        primary_failure: Exception,
+        *,
+        predicate: Callable[[ProviderConfig], bool],
+    ) -> LLMProvider:
+        """Atomically advance to the first constrained fallback candidate."""
+
+        current, chain = self._fallback_chain_after_failure(primary_failure)
+        matching_chain = [candidate for candidate in chain if predicate(candidate)]
+        return self._activate_fallback_chain(current, matching_chain)
+
+    def override_provider_config(
+        self,
+        cfg: ProviderConfig,
+        *,
+        preserve_existing_tail: bool = True,
+    ) -> None:
         """Replace the active chain head with a full per-turn provider config.
 
         Cross-provider tier execution: unlike ``override_model`` (which keeps
@@ -528,7 +567,10 @@ class ModelSelector:
         original_primary = self._chain[0]
         deduped_fallbacks: list[ProviderConfig] = []
         seen: set[_ProviderConfigIdentity] = {_provider_config_identity(cfg)}
-        for candidate in [original_primary, *self._chain[1:]]:
+        candidates = (
+            [original_primary, *self._chain[1:]] if preserve_existing_tail else []
+        )
+        for candidate in candidates:
             identity = _provider_config_identity(candidate)
             if identity in seen:
                 continue
@@ -621,6 +663,8 @@ class ModelSelector:
         self,
         model: str,
         fallback_chain: list[object],
+        *,
+        preserve_existing_tail: bool = True,
     ) -> None:
         """Override primary model and prefer router-provided fallback models.
 
@@ -631,7 +675,7 @@ class ModelSelector:
         skipped instead of guessing secrets.
         """
         self.override_model(model)
-        if not fallback_chain:
+        if not fallback_chain and preserve_existing_tail:
             return
 
         current = self._chain[0]
@@ -673,7 +717,12 @@ class ModelSelector:
         seen: set[_ProviderConfigIdentity] = {
             _provider_config_identity(current)
         }
-        for cfg in [*router_fallbacks, *existing_tail]:
+        candidates = (
+            [*router_fallbacks, *existing_tail]
+            if preserve_existing_tail
+            else router_fallbacks
+        )
+        for cfg in candidates:
             identity = _provider_config_identity(cfg)
             if identity in seen:
                 continue

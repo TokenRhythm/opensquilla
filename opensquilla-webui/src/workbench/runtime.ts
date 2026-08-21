@@ -7,6 +7,7 @@ import type {
 import type { useWorkbenchStore } from './store'
 import type {
   NativeSurfaceRect,
+  WorkbenchBeforeCloseOptions,
   WorkbenchComponentEvent,
   WorkbenchDisposeReason,
   WorkbenchItem,
@@ -158,8 +159,14 @@ export class WorkbenchRuntimeManager {
     const item = this.items.get(rect.itemId)
     if (!item || !this.openItemIds.has(item.id)) return
     this.enqueue(item.id, async () => {
+      const existing = this.runtimes.get(item.id)
       const runtime = await this.ensureRuntime(item)
-      await runtime?.handleSurfaceRect?.(rect, item)
+      // A rect can arrive before the descriptor's open event has created its
+      // runtime. In that case ensureRuntime replays the stored rect exactly
+      // once; only forward here when this task did not create the runtime.
+      if (runtime && runtime === existing) {
+        await runtime.handleSurfaceRect?.(rect, item)
+      }
     }, item)
   }
 
@@ -193,6 +200,22 @@ export class WorkbenchRuntimeManager {
       return
     }
     await Promise.all([...this.queues.values()])
+  }
+
+  /** Ask the live panel to persist pending work before its store item is removed. */
+  async beforeClose(
+    item: WorkbenchItem,
+    options?: WorkbenchBeforeCloseOptions,
+  ): Promise<boolean> {
+    if (!this.isCurrentDescriptor(item)) return true
+    await this.flush(item.id)
+    const runtime = await this.ensureRuntime(item)
+    try {
+      return await runtime?.beforeClose?.(options) ?? true
+    } catch (error) {
+      this.reportError(error, item)
+      return false
+    }
   }
 
   async disposeAll(reason: WorkbenchDisposeReason = 'runtime-detached'): Promise<void> {
@@ -257,6 +280,10 @@ export class WorkbenchRuntimeManager {
     }
     const runtime = await definition.createRuntime(item, context)
     this.runtimes.set(item.id, runtime)
+    const rect = this.surfaceRects.get(item.id)
+    if (rect && isCurrentRuntime()) {
+      await runtime.handleSurfaceRect?.(rect, item)
+    }
     return runtime
   }
 
@@ -329,6 +356,62 @@ export class WorkbenchRuntimeManager {
                   })
             ),
             revokeArtifactPreviewLease: request => nativeApi.revokeArtifactPreviewLease!(request),
+          }
+        : {}),
+      ...(nativeApi.getArtifactAnnotationCapabilities
+        ? {
+            getArtifactAnnotationCapabilities: () => (
+              isCurrent()
+                ? nativeApi.getArtifactAnnotationCapabilities!()
+                : Promise.resolve({
+                    version: 3 as const,
+                    available: false,
+                    picker: false,
+                    trustedOverlay: false,
+                    reason: 'Workbench surface is no longer active',
+                  })
+            ),
+          }
+        : {}),
+      ...(nativeApi.setArtifactAnnotationMode
+        ? {
+            setArtifactAnnotationMode: request => (
+              mayShow()
+                ? nativeApi.setArtifactAnnotationMode!(request)
+                : Promise.resolve(ignored())
+            ),
+          }
+        : {}),
+      ...(nativeApi.showArtifactAnnotationOverlay
+        ? {
+            showArtifactAnnotationOverlay: request => (
+              mayShow()
+                ? nativeApi.showArtifactAnnotationOverlay!(request)
+                : Promise.resolve(ignored())
+            ),
+          }
+        : {}),
+      ...(nativeApi.closeArtifactAnnotationOverlay
+        ? {
+            closeArtifactAnnotationOverlay: request => (
+              isCurrent()
+                ? nativeApi.closeArtifactAnnotationOverlay!(request)
+                : Promise.resolve(ignored())
+            ),
+          }
+        : {}),
+      ...(nativeApi.screenshot
+        ? {
+            screenshot: request => (
+              mayShow()
+                ? nativeApi.screenshot!(request)
+                : Promise.resolve({
+                    ok: false as const,
+                    method: 'screenshot' as const,
+                    code: 'unavailable',
+                    message: 'Workbench surface is no longer active',
+                  })
+            ),
           }
         : {}),
       async createSurface(request) {

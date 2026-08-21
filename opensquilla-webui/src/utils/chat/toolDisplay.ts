@@ -63,6 +63,9 @@ export function normalizeToolInputText(raw: unknown): string {
 }
 
 export function toolDisplayName(name: string, input: unknown): string {
+  const key = toolOperationKey(name)
+  if (key === 'document.read') return i18n.global.t('chat.tool.readPage')
+  if (key === 'document.update') return i18n.global.t('chat.tool.updatePage')
   if (name === 'publish_artifact') {
     const inputObj = parseToolInput(input)
     const target = inputObj?.name || inputObj?.path
@@ -87,6 +90,12 @@ export function toolIconName(name: string): IconName {
 
 export function toolOperationKey(name: string): string {
   const n = String(name || '').toLowerCase()
+  if (['document_inspect', 'document_read', 'document_locate'].some(tool => (
+    n === tool || n.endsWith(`.${tool}`) || n.endsWith(`/${tool}`) || n.endsWith(`__${tool}`)
+  ))) return 'document.read'
+  if (['document_apply', 'document_patch'].some(tool => (
+    n === tool || n.endsWith(`.${tool}`) || n.endsWith(`/${tool}`) || n.endsWith(`__${tool}`)
+  ))) return 'document.update'
   if (n.includes('web_discover')) return 'web.discover'
   if (n.includes('web_search') || n === 'search' || n.includes('google') || n.includes('bing')) return 'web.search'
   if (n.includes('web_fetch') || n.includes('http') || n.includes('fetch') || n.includes('curl') || n.includes('wget')) return 'web.read'
@@ -113,10 +122,13 @@ export function toolActionLabel(name: string): string {
   if (key === 'file.edit') return t('chat.tool.editFile')
   if (key === 'artifact.create') return t('chat.tool.createFile')
   if (key === 'memory.search') return t('chat.tool.searchMemory')
+  if (key === 'document.read') return t('chat.tool.readPage')
+  if (key === 'document.update') return t('chat.tool.updatePage')
   return name.replace(/[_-]+/g, ' ')
 }
 
 export function toolSecondaryText(toolCall: ChatToolCall): string {
+  if (toolOperationKey(toolCall.name).startsWith('document.')) return ''
   const source = String(toolCall.inputPreview || toolCall.resultPreview || '').replace(/\s+/g, ' ').trim()
   if (isEmptyToolPreview(source)) return ''
   return truncateToolText(source.replace(/^"|"$/g, ''), 86)

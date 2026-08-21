@@ -5,8 +5,8 @@ import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key'
 type LayoutName = 'wide' | 'compact' | 'tight'
+type Action = 'deliverables' | 'share' | 'copy-session-key'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -275,6 +275,17 @@ describe('ChatHeaderActions', () => {
     expect(title.nextElementSibling).toBe(copy)
     expect(identity.nextElementSibling).toBe(spacer)
     expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
+  })
+
+  it('keeps internal workbench resources out of the session header', async () => {
+    const { el } = await mountHeader(800)
+    const deliverables = el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )
+    expect(el.querySelector('[data-testid="chat-session-action-workbench"]')).toBeNull()
+    expect(el.textContent).not.toContain('Workbench')
+    expect(deliverables?.getAttribute('aria-label')).toBe('Deliverables (2)')
+    expect(deliverables?.querySelector('.chat-header__count-badge')?.textContent).toBe('2')
   })
 
   it.each([

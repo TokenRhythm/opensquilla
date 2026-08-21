@@ -81,6 +81,7 @@ export const useRpcStore = defineStore('rpc', () => {
   const policy = ref<Record<string, unknown> | null>(null)
   const auth = ref<Record<string, unknown> | null>(null)
   const methods = ref<string[]>([])
+  const events = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
 
@@ -112,6 +113,7 @@ export const useRpcStore = defineStore('rpc', () => {
         policy.value = null
         auth.value = null
         methods.value = []
+        events.value = []
         unavailableMethods.value = new Set()
       }
     })
@@ -119,12 +121,15 @@ export const useRpcStore = defineStore('rpc', () => {
     rpc.on('_hello', (data: {
       policy?: Record<string, unknown>
       auth?: Record<string, unknown>
-      features?: { methods?: unknown }
+      features?: { methods?: unknown; events?: unknown }
     }) => {
       policy.value = data.policy || null
       auth.value = data.auth || null
       methods.value = Array.isArray(data.features?.methods)
         ? data.features.methods.filter((method): method is string => typeof method === 'string')
+        : []
+      events.value = Array.isArray(data.features?.events)
+        ? data.features.events.filter((event): event is string => typeof event === 'string')
         : []
       unavailableMethods.value = new Set()
     })
@@ -157,6 +162,7 @@ export const useRpcStore = defineStore('rpc', () => {
       policy.value = null
       auth.value = null
       methods.value = []
+      events.value = []
       unavailableMethods.value = new Set()
       client.value.connect(settings.url, settings.token)
     }
@@ -169,11 +175,16 @@ export const useRpcStore = defineStore('rpc', () => {
     policy.value = null
     auth.value = null
     methods.value = []
+    events.value = []
     unavailableMethods.value = new Set()
   }
 
   function supportsMethod(method: string): boolean {
     return methods.value.includes(method) && !unavailableMethods.value.has(method)
+  }
+
+  function supportsEvent(event: string): boolean {
+    return events.value.includes(event)
   }
 
   function markMethodUnavailable(method: string): void {
@@ -220,6 +231,7 @@ export const useRpcStore = defineStore('rpc', () => {
     policy,
     auth,
     methods,
+    events,
     error,
     isConnected,
     isConnecting,
@@ -231,6 +243,7 @@ export const useRpcStore = defineStore('rpc', () => {
     applyLinkTokenFromUrl,
     disconnect,
     supportsMethod,
+    supportsEvent,
     markMethodUnavailable,
     call,
     on,

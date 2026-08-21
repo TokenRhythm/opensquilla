@@ -485,6 +485,58 @@ def _write_demo_migration(migrations_dir: Path, name: str = "V001__demo") -> Non
     )
 
 
+def _write_renumbered_migration_chain(migrations_dir: Path) -> None:
+    migrations_dir.mkdir(exist_ok=True)
+    migrations = (
+        ("V036__session_model_routing", None, "routing_state"),
+        ("V037__artifact_sessions", "V036__session_model_routing", "artifact_sessions"),
+        (
+            "V038__artifact_prompt_annotations",
+            "V037__artifact_sessions",
+            "artifact_prompt_annotations",
+        ),
+        (
+            "V039__artifact_mutation_attempts",
+            "V038__artifact_prompt_annotations",
+            "artifact_mutation_attempts",
+        ),
+        ("V040__document_resources", "V039__artifact_mutation_attempts", "document_resources"),
+    )
+    for migration_id, dependency, table in migrations:
+        depends = "set()" if dependency is None else f"{{{dependency!r}}}"
+        (migrations_dir / f"{migration_id}.py").write_text(
+            "from yoyo import step\n"
+            f"__depends__ = {depends}\n"
+            f"steps = [step('CREATE TABLE IF NOT EXISTS {table} "
+            "(id INTEGER PRIMARY KEY, value TEXT)')]\n",
+            encoding="utf-8",
+        )
+
+
+def _replace_current_ledger_with_legacy_chain(
+    db_path: Path,
+    legacy_hashes: dict[str, tuple[str, str]],
+) -> None:
+    affected_ids = {
+        "V036__session_model_routing",
+        *(replacement_id for replacement_id, _legacy_hash in legacy_hashes.values()),
+    }
+    with sqlite3.connect(db_path) as connection:
+        connection.executemany(
+            "DELETE FROM _yoyo_migration WHERE migration_id = ?",
+            ((migration_id,) for migration_id in affected_ids),
+        )
+        connection.executemany(
+            "INSERT INTO _yoyo_migration "
+            "(migration_hash, migration_id, applied_at_utc) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (
+                (legacy_hash, legacy_id)
+                for legacy_id, (_replacement_id, legacy_hash) in legacy_hashes.items()
+            ),
+        )
+
+
 def _record_applied_migration(db_path: Path, migration_id: str) -> None:
     """Simulate a newer build having applied an extra migration."""
     with sqlite3.connect(db_path) as connection:
@@ -513,6 +565,86 @@ def test_apply_pending_is_idempotent_when_db_matches_code(tmp_path: Path) -> Non
 
     assert first == ["V001__demo"]
     assert second == []  # no SchemaAheadError — every applied id is known
+
+
+def test_apply_pending_atomically_remaps_exact_legacy_migration_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_renumbered_migration_chain(migrations_dir)
+    db_path = tmp_path / "sessions.db"
+    legacy_hashes = {
+        "V036__artifact_sessions": ("V037__artifact_sessions", "legacy-artifact"),
+        "V037__artifact_prompt_annotations": (
+            "V038__artifact_prompt_annotations",
+            "legacy-annotations",
+        ),
+        "V038__artifact_mutation_attempts": (
+            "V039__artifact_mutation_attempts",
+            "legacy-attempts",
+        ),
+        "V039__document_resources": ("V040__document_resources", "legacy-documents"),
+    }
+    monkeypatch.setattr(migrator, "_LEGACY_MIGRATION_ALIASES", legacy_hashes)
+
+    assert apply_pending(str(db_path), migrations_dir) == [
+        "V036__session_model_routing",
+        "V037__artifact_sessions",
+        "V038__artifact_prompt_annotations",
+        "V039__artifact_mutation_attempts",
+        "V040__document_resources",
+    ]
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO artifact_sessions (id, value) VALUES (1, 'preserved')"
+        )
+    _replace_current_ledger_with_legacy_chain(db_path, legacy_hashes)
+
+    applied = apply_pending(str(db_path), migrations_dir)
+
+    assert applied == ["V036__session_model_routing"]
+    assert apply_pending(str(db_path), migrations_dir) == []
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM artifact_sessions WHERE id = 1"
+        ).fetchone() == ("preserved",)
+        recorded = dict(
+            connection.execute(
+                "SELECT migration_id, migration_hash FROM _yoyo_migration"
+            ).fetchall()
+        )
+    current = {
+        migration.id: migration.hash
+        for migration in migrator.read_migrations(str(migrations_dir))
+    }
+    assert all(
+        recorded[migration_id] == migration_hash
+        for migration_id, migration_hash in current.items()
+    )
+
+
+def test_apply_pending_rejects_legacy_migration_with_unexpected_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_renumbered_migration_chain(migrations_dir)
+    db_path = tmp_path / "sessions.db"
+    legacy_hashes = {
+        "V036__artifact_sessions": ("V037__artifact_sessions", "legacy-artifact"),
+    }
+    monkeypatch.setattr(migrator, "_LEGACY_MIGRATION_ALIASES", legacy_hashes)
+    apply_pending(str(db_path), migrations_dir)
+    _replace_current_ledger_with_legacy_chain(db_path, legacy_hashes)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE _yoyo_migration SET migration_hash = 'unexpected' "
+            "WHERE migration_id = 'V036__artifact_sessions'"
+        )
+
+    with pytest.raises(migrator.SchemaAheadError, match="does not match the exact historical"):
+        apply_pending(str(db_path), migrations_dir)
 
 
 def test_apply_pending_raises_when_database_is_ahead_of_code(tmp_path: Path) -> None:

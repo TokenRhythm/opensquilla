@@ -27,13 +27,21 @@ from opensquilla.provider.types import (
     ToolInputSchema,
 )
 
-TOKENRHYTHM_V4_MODELS = (
+TOKENRHYTHM_BARE_V4_MODELS = (
     "deepseek-v4-flash",
     "deepseek-v4-flash-0731",
     "deepseek-v4-pro",
+    "deepseek-v4-pro-0813",
+)
+TOKENRHYTHM_V4_MODELS = TOKENRHYTHM_BARE_V4_MODELS + (
     "tokenrhythm/deepseek-v4-flash",
     "tokenrhythm/deepseek-v4-flash-0731",
     "tokenrhythm/deepseek-v4-pro",
+    "tokenrhythm/deepseek-v4-pro-0813",
+)
+TOKENRHYTHM_0813_MODELS = (
+    "deepseek-v4-pro-0813",
+    "tokenrhythm/deepseek-v4-pro-0813",
 )
 TOKENRHYTHM_REASONING_LIMIT_UTF16_UNITS = 50_000
 
@@ -229,6 +237,32 @@ def test_tokenrhythm_custom_endpoint_keeps_legacy_unbounded_tool_replay() -> Non
     assert "reasoning_effort" not in payload
 
 
+@pytest.mark.parametrize("model", TOKENRHYTHM_0813_MODELS)
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "https://customer-proxy.example/v1",
+        "https://tokenrhythm.studio/v1/custom",
+    ),
+)
+def test_tokenrhythm_0813_custom_endpoint_does_not_replay_reasoning(
+    model: str,
+    base_url: str,
+) -> None:
+    messages = _tool_history("0813 reasoning must remain endpoint-scoped")
+    canonical_before = [message.model_dump(mode="json") for message in messages]
+
+    payload = _payload(
+        _provider(model=model, base_url=base_url),
+        messages,
+    )
+
+    assert "reasoning_content" not in payload["messages"][0]
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload
+    assert [message.model_dump(mode="json") for message in messages] == canonical_before
+
+
 def test_tokenrhythm_v4_policy_requires_exact_provider_kind() -> None:
     payload = _payload(
         _provider(provider_kind="openai"),
@@ -245,8 +279,10 @@ def test_tokenrhythm_v4_policy_requires_exact_provider_kind() -> None:
     (
         "deepseek-v3.2",
         "deepseek-v4-flash-preview",
+        "deepseek-v4-pro-0813-preview",
         "untrusted/deepseek-v4-flash",
         "tokenrhythm/deepseek-v4-flash-preview",
+        "tokenrhythm/deepseek-v4-pro-0813-preview",
     ),
 )
 def test_tokenrhythm_v4_policy_does_not_change_non_exact_model_ids(model: str) -> None:
@@ -260,11 +296,12 @@ def test_tokenrhythm_v4_policy_does_not_change_non_exact_model_ids(model: str) -
     assert "reasoning_effort" not in payload
 
 
-@pytest.mark.parametrize("model", TOKENRHYTHM_V4_MODELS[:3])
+@pytest.mark.parametrize("model", TOKENRHYTHM_BARE_V4_MODELS)
 @pytest.mark.parametrize("kind", ("ascii", "cjk", "emoji"))
 @pytest.mark.parametrize(
     ("units", "is_preserved"),
     (
+        (TOKENRHYTHM_REASONING_LIMIT_UTF16_UNITS - 1, True),
         (TOKENRHYTHM_REASONING_LIMIT_UTF16_UNITS, True),
         (TOKENRHYTHM_REASONING_LIMIT_UTF16_UNITS + 1, False),
     ),
@@ -324,10 +361,19 @@ def test_tokenrhythm_projection_does_not_emit_transport_withheld_metric() -> Non
         ("deepseek-v4-pro", ThinkingLevel.LOW, "high"),
         ("deepseek-v4-pro", ThinkingLevel.XHIGH, "high"),
         ("deepseek-v4-pro", ThinkingLevel.ADAPTIVE, "high"),
+        ("deepseek-v4-pro-0813", ThinkingLevel.MINIMAL, "low"),
+        ("deepseek-v4-pro-0813", ThinkingLevel.LOW, "low"),
+        ("deepseek-v4-pro-0813", ThinkingLevel.MEDIUM, "high"),
+        ("deepseek-v4-pro-0813", ThinkingLevel.HIGH, "high"),
+        ("deepseek-v4-pro-0813", ThinkingLevel.XHIGH, "high"),
+        ("deepseek-v4-pro-0813", ThinkingLevel.ADAPTIVE, "high"),
         ("deepseek-v4-flash", None, "high"),
         ("tokenrhythm/deepseek-v4-flash", ThinkingLevel.LOW, "low"),
         ("tokenrhythm/deepseek-v4-flash-0731", ThinkingLevel.LOW, "low"),
         ("tokenrhythm/deepseek-v4-pro", ThinkingLevel.LOW, "high"),
+        ("tokenrhythm/deepseek-v4-pro-0813", ThinkingLevel.MINIMAL, "low"),
+        ("tokenrhythm/deepseek-v4-pro-0813", ThinkingLevel.LOW, "low"),
+        ("tokenrhythm/deepseek-v4-pro-0813", ThinkingLevel.HIGH, "high"),
     ),
 )
 def test_tokenrhythm_v4_thinking_uses_conservative_model_effort_mapping(
@@ -345,7 +391,7 @@ def test_tokenrhythm_v4_thinking_uses_conservative_model_effort_mapping(
     assert payload["reasoning_effort"] == expected_effort
 
 
-@pytest.mark.parametrize("model", TOKENRHYTHM_V4_MODELS[:3])
+@pytest.mark.parametrize("model", TOKENRHYTHM_BARE_V4_MODELS)
 def test_tokenrhythm_v4_thinking_off_sends_explicit_disabled(model: str) -> None:
     payload = _payload(
         _provider(model=model),
@@ -400,6 +446,61 @@ def test_tokenrhythm_v4_unspecified_thinking_degrades_required_tool_choice() -> 
     assert "reasoning_effort" not in payload
 
 
+@pytest.mark.parametrize("model", TOKENRHYTHM_0813_MODELS)
+@pytest.mark.parametrize(
+    ("thinking", "thinking_level", "expected_thinking", "expected_effort"),
+    (
+        (True, ThinkingLevel.LOW, {"type": "enabled"}, "low"),
+        (True, ThinkingLevel.HIGH, {"type": "enabled"}, "high"),
+        (False, ThinkingLevel.OFF, {"type": "disabled"}, None),
+        (False, None, None, None),
+    ),
+)
+def test_tokenrhythm_0813_degrades_required_in_every_thinking_state(
+    model: str,
+    thinking: bool,
+    thinking_level: ThinkingLevel | None,
+    expected_thinking: dict[str, str] | None,
+    expected_effort: str | None,
+) -> None:
+    payload = _payload(
+        _provider(model=model),
+        [Message(role="user", content="Use a tool.")],
+        config=_config(
+            thinking=thinking,
+            thinking_level=thinking_level,
+            tool_choice="required",
+        ),
+        tools=[LOOKUP_TOOL],
+    )
+
+    assert payload["tool_choice"] == "auto"
+    if expected_thinking is None:
+        assert "thinking" not in payload
+    else:
+        assert payload["thinking"] == expected_thinking
+    if expected_effort is None:
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == expected_effort
+
+
+def test_tokenrhythm_generic_pro_explicit_off_keeps_required_tool_choice() -> None:
+    payload = _payload(
+        _provider(model="deepseek-v4-pro"),
+        [Message(role="user", content="Use a tool.")],
+        config=_config(
+            thinking=False,
+            thinking_level=ThinkingLevel.OFF,
+            tool_choice="required",
+        ),
+        tools=[LOOKUP_TOOL],
+    )
+
+    assert payload["tool_choice"] == "required"
+    assert payload["thinking"] == {"type": "disabled"}
+
+
 def test_tokenrhythm_v4_unspecified_thinking_named_pin_disables_thinking() -> None:
     named_pin = {"type": "function", "function": {"name": "lookup"}}
     payload = _payload(
@@ -408,6 +509,37 @@ def test_tokenrhythm_v4_unspecified_thinking_named_pin_disables_thinking() -> No
         config=_config(
             thinking=False,
             thinking_level=None,
+            tool_choice=named_pin,
+        ),
+        tools=[LOOKUP_TOOL],
+    )
+
+    assert payload["tool_choice"] == named_pin
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in payload
+
+
+@pytest.mark.parametrize("model", TOKENRHYTHM_0813_MODELS)
+@pytest.mark.parametrize(
+    ("thinking", "thinking_level"),
+    (
+        (True, ThinkingLevel.LOW),
+        (False, ThinkingLevel.OFF),
+        (False, None),
+    ),
+)
+def test_tokenrhythm_0813_named_pin_wins_in_every_thinking_state(
+    model: str,
+    thinking: bool,
+    thinking_level: ThinkingLevel | None,
+) -> None:
+    named_pin = {"type": "function", "function": {"name": "lookup"}}
+    payload = _payload(
+        _provider(model=model),
+        [Message(role="user", content="Call the selected tool.")],
+        config=_config(
+            thinking=thinking,
+            thinking_level=thinking_level,
             tool_choice=named_pin,
         ),
         tools=[LOOKUP_TOOL],
@@ -459,6 +591,58 @@ def test_tokenrhythm_v4_named_tool_pin_wins_over_thinking() -> None:
     assert payload["tool_choice"] == named_pin
     assert payload["thinking"] == {"type": "disabled"}
     assert "reasoning_effort" not in payload
+
+
+def test_tokenrhythm_0813_required_rewrite_does_not_retry_reactively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json"},
+            json={
+                "error": {
+                    "code": "MODEL_TOOL_CHOICE_NOT_SUPPORTED",
+                    "message": "synthetic selector rejection",
+                }
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+
+    async def run() -> list[ErrorEvent]:
+        return [
+            event
+            async for event in _provider(model="deepseek-v4-pro-0813").chat(
+                [Message(role="user", content="Use a tool.")],
+                tools=[LOOKUP_TOOL],
+                config=_config(
+                    thinking=False,
+                    thinking_level=ThinkingLevel.OFF,
+                    tool_choice="required",
+                ),
+            )
+            if isinstance(event, ErrorEvent)
+        ]
+
+    errors = asyncio.run(run())
+
+    assert len(requests) == 1
+    assert requests[0]["tool_choice"] == "auto"
+    assert len(errors) == 1
 
 
 def test_tokenrhythm_field_limit_400_is_not_retried_reactively(

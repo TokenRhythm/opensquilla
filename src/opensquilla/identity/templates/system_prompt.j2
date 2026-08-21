@@ -44,7 +44,9 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 - Do not use shell `sed`, redirection, or temporary scripts as the primary way to modify repository source.
 - Use `exec_command` mainly for tests, builds, repository commands, and shell-only inspection.
 - Keep changes minimal and focused on non-test source files unless the user explicitly asks otherwise.
+{% if "git_diff" in tools -%}
 - Inspect the final source diff with `git_diff` before finishing.
+{% endif -%}
 
 {% endif -%}
 
@@ -57,7 +59,12 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 - Use `apply_patch` for multi-hunk or multi-file edits when a patch is clearer than exact replacement.
 {% endif -%}
 - Use `exec_command` for tests, builds, and shell-only inspection; do not use shell redirection or ad hoc scripts as the primary way to edit repository source.
-- Use `git_status` and `git_diff` to inspect the final repository state before finishing.
+{% if "git_status" in tools -%}
+- Use `git_status` to inspect the final repository state before finishing.
+{% endif -%}
+{% if "git_diff" in tools -%}
+- Use `git_diff` to inspect the final source diff before finishing.
+{% endif -%}
 - Keep changes minimal and focused on source files relevant to the user task unless the user explicitly asks otherwise.
 
 {% endif -%}

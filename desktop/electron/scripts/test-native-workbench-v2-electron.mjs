@@ -99,6 +99,7 @@ const server = createServer((request, response) => {
     response.end(`<!doctype html>
       <title>Bundle preview</title>
       <style>
+        body { min-height: 1600px; }
         @font-face {
           font-family: "WorkbenchFixtureFont";
           src: url("/fixture-font.woff2") format("woff2");
@@ -106,7 +107,7 @@ const server = createServer((request, response) => {
           font-style: normal;
           font-weight: 400;
         }
-        #font-probe { font-family: "WorkbenchFixtureFont", sans-serif; }
+        #font-probe { font-family: "WorkbenchFixtureFont", sans-serif; margin-top: 240px; }
         #gsap-probe { width: 20px; height: 20px; background: rgb(20, 80, 200); }
         #lottie-probe { width: 100px; height: 100px; }
       </style>
@@ -115,6 +116,7 @@ const server = createServer((request, response) => {
       <div id="lottie-probe"></div>
       <canvas id="canvas-probe" width="8" height="8"></canvas>
       <video id="video-probe" autoplay muted playsinline></video>
+      <main data-label="😀"><svg viewBox="0 0 10 10"><path aria-label="星😀" d="M0 0"></path></svg></main>
       <script src="/gsap.min.js"></script>
       <script src="/lottie.min.js"></script>
       <script type="module" src="/module.js"></script>
@@ -369,6 +371,7 @@ const server = createServer((request, response) => {
           : withTimeout(new Promise(resolve => {
               lottieAnimation.addEventListener('DOMLoaded', resolve)
             }), 'lottie DOM initialization')
+        window.__lottieReady = lottieReady.then(() => true)
 
         window.__temporalProbe = async () => {
           await lottieReady
@@ -557,7 +560,7 @@ try {
   })
 
   const result = await electronApp.evaluate(
-    async ({ BrowserWindow, webContents }, fixture) => {
+    async ({ app, BrowserWindow, webContents }, fixture) => {
       const Manager = globalThis.__opensquillaNativeWorkbenchSurfaceManager
       if (!Manager) throw new Error('The native Workbench manager fixture was not installed.')
       const events = []
@@ -601,12 +604,39 @@ try {
       async function waitFor(check, label, timeoutMs = 10_000) {
         const deadline = Date.now() + timeoutMs
         while (Date.now() < deadline) {
-          const value = check()
+          const value = await check()
           if (value) return value
           await new Promise(resolveWait => setTimeout(resolveWait, 25))
         }
         throw new Error(`Timed out waiting for ${label}.`)
       }
+
+      async function closeAnnotationOverlayAndDrain(request, label) {
+        const record = manager.surfaces.get(request.surfaceId)
+        const candidate = record?.annotationCandidate ?? null
+        const result = manager.closeArtifactAnnotationOverlay(request)
+        if (record && candidate) {
+          // Closing stops the interval synchronously, but a geometry CDP call
+          // that already started may still finish through its stale-selection
+          // cleanup. Do not let that cleanup cancel the next picker rearm.
+          await waitFor(async () => {
+            if (candidate.geometryRefreshPending) return false
+            await record.cdpQueue
+            return !candidate.geometryRefreshPending && record.annotationCandidate === null
+          }, `${label} geometry cleanup`)
+        }
+        return result
+      }
+
+      // WebContents.isFocused() is only meaningful while the Electron app owns
+      // native foreground focus. Make that lifecycle precondition explicit so
+      // the trusted child-view contract is not coupled to whichever host app
+      // happened to be frontmost when the smoke process launched.
+      if (process.platform === 'darwin') app.focus({ steal: true })
+      owner.show()
+      owner.focus()
+      await new Promise(resolveWait => setTimeout(resolveWait, 100))
+      const annotationNativeOwnerFocusAvailable = owner.isFocused()
 
       function view(surfaceId) {
         const resultView = manager.surfaces.get(surfaceId)?.view
@@ -822,9 +852,904 @@ try {
         event.surfaceId === 'artifact:v2-full'
         && event.version === 2
         && event.type === 'navigation-state')
+      const v2ArtifactBridgeUnavailable = manager.getActiveArtifactBridgeTarget() === null
 
       await manager.destroySurface('artifact:v2-full')
       await waitFor(() => fullContents.isDestroyed(), 'full preview destruction')
+
+      const activePreviewArtifactId = 'art-synthetic-v3-bridge'
+      const v3 = await manager.createSurface({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        kind: 'artifact-preview',
+        payload: {
+          launchUrl: `${fixture.previewOrigin}/index.html`,
+          expectedOrigin: fixture.previewOrigin,
+          scopeId: 'synthetic:v3-bridge',
+          mode: 'full',
+        },
+      }, activePreviewArtifactId)
+      if (!v3.ok) throw new Error(v3.message || 'Protocol-v3 preview failed to load.')
+      const v3View = view('artifact:v3-bridge')
+      const v3Contents = v3View.webContents
+      manager.setSurfaceRect({
+        surfaceId: 'artifact:v3-bridge',
+        x: 400,
+        y: 80,
+        width: 400,
+        height: 500,
+        visible: true,
+      })
+      await waitFor(() => v3View.getVisible(), 'visible protocol-v3 surface')
+      const v3BridgeTarget = manager.getActiveArtifactBridgeTarget()
+      if (!v3BridgeTarget) throw new Error('Protocol-v3 bridge target was unavailable.')
+      const v3BridgeCapabilities = v3BridgeTarget.capabilities
+      const v3AnnotationCapabilities = await manager.getArtifactAnnotationCapabilities()
+      // This fixture intentionally loads a DOM-rendered animation library for
+      // broader preview coverage. Wait for its one-time SVG construction so
+      // the target geometry is stable before entering inspect mode.
+      await v3Contents.executeJavaScript('window.__lottieReady')
+      const annotationUnrelatedNodeCount = await v3Contents.executeJavaScript(`(() => {
+        const branch = document.createElement('section')
+        branch.id = 'runtime-only-large-branch'
+        branch.hidden = true
+        const fragment = document.createDocumentFragment()
+        for (let index = 0; index < 50010; index += 1) {
+          fragment.append(document.createElement('span'))
+        }
+        branch.append(fragment)
+        document.body.append(branch)
+        return branch.childElementCount
+      })()`)
+      await v3Contents.executeJavaScript(`(() => {
+        window.__annotationPageClicks = 0
+        window.__annotationPreviewKeys = 0
+        document.getElementById('font-probe').addEventListener(
+          'click',
+          () => { window.__annotationPageClicks += 1 },
+        )
+        document.addEventListener('keydown', () => { window.__annotationPreviewKeys += 1 })
+      })()`)
+      const annotationTargetRect = await v3Contents.executeJavaScript(`(() => {
+        const rect = document.getElementById('font-probe').getBoundingClientRect()
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+      })()`)
+      const annotationPicker = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      const annotationX = Math.floor(
+        annotationTargetRect.x + Math.max(1, annotationTargetRect.width / 2),
+      )
+      const annotationY = Math.floor(
+        annotationTargetRect.y + Math.max(1, annotationTargetRect.height / 2),
+      )
+      v3Contents.focus()
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: annotationX,
+        y: annotationY,
+        button: 'none',
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: annotationX,
+        y: annotationY,
+        button: 'left',
+        clickCount: 1,
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: annotationX,
+        y: annotationY,
+        button: 'left',
+        clickCount: 1,
+      })
+      const annotationSelectedEvent = await waitFor(
+        () => events.find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && (
+            event.type === 'annotation-selected'
+            || (
+              event.type === 'blocked-action'
+              && event.detail?.action === 'annotation-picker'
+            )
+          )),
+        'protocol-v3 DOM annotation selection or rejection',
+      )
+      if (annotationSelectedEvent.type !== 'annotation-selected') {
+        throw new Error(`DOM annotation selection was rejected: ${JSON.stringify(annotationSelectedEvent)}`)
+      }
+      const selected = annotationSelectedEvent.detail.selection
+      const annotationPageClicks = await v3Contents.executeJavaScript(
+        'Number(window.__annotationPageClicks || 0)',
+      )
+      // A runtime-only change outside the selected element's ancestor chain
+      // must not invalidate its source-backed authorization proof.
+      await v3Contents.executeJavaScript(
+        "document.getElementById('lottie-probe').setAttribute('data-runtime-state', 'ready')",
+      )
+      const resolvedSelection = await v3BridgeTarget.resolveAnnotationSelection(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          selectionId: selected.selectionId,
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      )
+      const annotationWrongArtifactResolveRejected =
+        await v3BridgeTarget.resolveAnnotationSelection(
+          {
+            version: 3,
+            activePreviewArtifactId: 'art-synthetic-other-preview',
+            selectionId: selected.selectionId,
+            tagName: selected.tagName,
+            elementPath: selected.elementPath,
+            elementProofSha256: selected.elementProofSha256,
+          },
+          new AbortController().signal,
+        ).then(() => false, () => true)
+      const annotationOverlayResult = await manager.showArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        selectionId: selected.selectionId,
+        annotationId: 'annotation_electron_fixture',
+        initialBody: 'Initial annotation',
+        overlayCopyVersion: 1,
+        copy: {
+          targetLabel: '区域：示例',
+          contextLabel: '当前选区',
+          bodyLabel: '页面批注',
+          placeholder: '描述希望进行的修改…',
+          newlineHint: process.platform === 'darwin' ? '⇧ Return 换行' : 'Shift + Enter 换行',
+          cancelLabel: '取消',
+          submitLabel: '添加批注',
+          emptyBodyMessage: '请描述希望的修改。',
+        },
+      })
+      const annotationOverlay = manager.annotationOverlays.get(owner)
+      if (!annotationOverlay) throw new Error('Trusted annotation overlay was not created.')
+      await annotationOverlay.ready
+      await waitFor(() => annotationOverlay.view.getVisible(), 'trusted annotation overlay')
+      const overlayPreferences = annotationOverlay.view.webContents.getLastWebPreferences()
+      const annotationOverlaySecurity = {
+        contextIsolation: overlayPreferences.contextIsolation,
+        nodeIntegration: overlayPreferences.nodeIntegration,
+        sandbox: overlayPreferences.sandbox,
+        webSecurity: overlayPreferences.webSecurity,
+        webviewTag: overlayPreferences.webviewTag,
+      }
+      const annotationOverlayVisualStructure =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const form = document.getElementById('annotation-form')
+          const textarea = document.getElementById('annotation-body')
+          const target = document.getElementById('annotation-target')
+          const newlineHint = document.getElementById('annotation-newline-hint')
+          const cancel = document.getElementById('annotation-cancel')
+          const submit = document.getElementById('annotation-submit')
+          const cardStyle = getComputedStyle(form)
+          const textareaStyle = getComputedStyle(textarea)
+          const submitStyle = getComputedStyle(submit)
+          return {
+            role: form.getAttribute('role'),
+            ariaModal: form.getAttribute('aria-modal'),
+            labelledBy: form.getAttribute('aria-labelledby'),
+            textareaLabel: textarea.getAttribute('aria-label'),
+            targetText: target.textContent,
+            newlineHint: newlineHint.textContent,
+            initialBody: textarea.value,
+            submitDisabled: submit.disabled,
+            cardRadius: cardStyle.borderRadius,
+            textareaHeight: textareaStyle.height,
+            submitHeight: submitStyle.height,
+            tabOrder: [textarea.id, cancel.id, submit.id],
+          }
+        })()`)
+      annotationOverlay.view.webContents.openDevTools({ mode: 'detach', activate: false })
+      await new Promise(resolveWait => setTimeout(resolveWait, 100))
+      const annotationOverlayDevToolsBlocked =
+        !annotationOverlay.view.webContents.isDevToolsOpened()
+      // sendInputEvent does not activate a WebContentsView the way a native
+      // OS pointer event does. Restore the trusted view after the deliberately
+      // blocked DevTools request before exercising click and geometry focus.
+      if (process.platform === 'darwin') app.focus({ steal: true })
+      owner.focus()
+      annotationOverlay.view.webContents.focus()
+      await annotationOverlay.view.webContents.executeJavaScript(
+        "document.getElementById('annotation-body').focus()",
+        true,
+      )
+      annotationOverlay.view.webContents.sendInputEvent({
+        type: 'mouseDown',
+        x: 24,
+        y: 64,
+        button: 'left',
+        clickCount: 1,
+      })
+      annotationOverlay.view.webContents.sendInputEvent({
+        type: 'mouseUp',
+        x: 24,
+        y: 64,
+        button: 'left',
+        clickCount: 1,
+      })
+      await waitFor(
+        async () => await annotationOverlay.view.webContents.executeJavaScript(
+          "document.activeElement?.id === 'annotation-body'",
+        ),
+        'trusted annotation textarea focus after blocked DevTools request',
+      )
+      const annotationOverlayBounds = annotationOverlay.view.getBounds()
+      const annotationOverlayOnTop = owner.contentView.children.at(-1) === annotationOverlay.view
+      const annotationOverlayFocusCycles = []
+      let previousOverlayBounds = annotationOverlayBounds
+      for (const [index, scrollDelta] of [96, -24, 24, -32, 32].entries()) {
+        await v3Contents.executeJavaScript(`window.scrollBy(0, ${scrollDelta})`)
+        const movedBounds = await waitFor(() => {
+          const bounds = annotationOverlay.view.getBounds()
+          return bounds.y !== previousOverlayBounds.y ? bounds : null
+        }, `trusted annotation overlay geometry refresh ${index + 1}`)
+        const focusState = await waitFor(
+          async () => {
+            const editorFocused = await annotationOverlay.view.webContents.executeJavaScript(
+              "document.activeElement?.id === 'annotation-body'",
+            )
+            const ownerFocused = owner.isFocused()
+            const nativeFocused = annotationOverlay.view.webContents.isFocused()
+            return editorFocused && (!ownerFocused || nativeFocused)
+              ? { editorFocused, ownerFocused, nativeFocused }
+              : null
+          },
+          `trusted annotation native focus after geometry refresh ${index + 1}`,
+        )
+        annotationOverlayFocusCycles.push({
+          bounds: movedBounds,
+          ...focusState,
+        })
+        previousOverlayBounds = movedBounds
+      }
+      const annotationOverlayMovedBounds = annotationOverlayFocusCycles[0].bounds
+      const annotationOverlayFocusedAfterGeometry =
+        annotationOverlayFocusCycles.every(cycle =>
+          cycle.editorFocused && (!cycle.ownerFocused || cycle.nativeFocused))
+      await annotationOverlay.view.webContents.executeJavaScript(
+        "document.getElementById('annotation-body').select()",
+      )
+      for (const character of 'ASCII annotation ') {
+        annotationOverlay.view.webContents.sendInputEvent({
+          type: 'char',
+          keyCode: character,
+        })
+      }
+      // insertText uses Chromium's text-input/IME commit path rather than
+      // changing the DOM value directly.
+      annotationOverlay.view.webContents.insertText('中文输入')
+      await waitFor(
+        async () => await annotationOverlay.view.webContents.executeJavaScript(
+          "document.getElementById('annotation-body').value === 'ASCII annotation 中文输入'",
+        ),
+        'trusted overlay real keyboard and IME input',
+      )
+      const annotationOverlayTypedValue =
+        await annotationOverlay.view.webContents.executeJavaScript(
+          "document.getElementById('annotation-body').value",
+        )
+      const annotationPreviewKeys = await v3Contents.executeJavaScript(
+        'Number(window.__annotationPreviewKeys || 0)',
+      )
+      const annotationSubmitEventsBeforeEmpty = events.filter(event =>
+        event.type === 'annotation-submit'
+        && event.detail?.annotationId === 'annotation_electron_fixture').length
+      await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+        const textarea = document.getElementById('annotation-body')
+        textarea.value = '   '
+        textarea.dispatchEvent(new Event('input', { bubbles: true }))
+        document.querySelector('button[type=submit]').click()
+      })()`)
+      await new Promise(resolveWait => setTimeout(resolveWait, 100))
+      const annotationEmptySubmitRetained =
+        annotationOverlay.view.getVisible()
+        && annotationOverlay.binding?.annotationId === 'annotation_electron_fixture'
+        && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate?.selection.selectionId
+          === selected.selectionId
+        && events.filter(event =>
+          event.type === 'annotation-submit'
+          && event.detail?.annotationId === 'annotation_electron_fixture').length
+          === annotationSubmitEventsBeforeEmpty
+      await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+        const textarea = document.getElementById('annotation-body')
+        textarea.value = 'Make the heading concise.'
+        textarea.dispatchEvent(new Event('input', { bubbles: true }))
+      })()`)
+      await waitFor(
+        () => events.some(event =>
+          event.type === 'annotation-draft-change'
+          && event.detail?.annotationId === 'annotation_electron_fixture'
+          && event.detail?.body === 'Make the heading concise.'),
+        'trusted overlay draft relay',
+      )
+      await annotationOverlay.view.webContents.executeJavaScript(
+        "document.querySelector('button[type=submit]').click()",
+      )
+      await waitFor(
+        () => events.some(event =>
+          event.type === 'annotation-submit'
+          && event.detail?.annotationId === 'annotation_electron_fixture'
+          && event.detail?.body === 'Make the heading concise.'),
+        'trusted overlay submit relay',
+      )
+      const annotationOverlayRetainedAfterSubmit =
+        annotationOverlay.view.getVisible()
+        && annotationOverlay.binding?.annotationId === 'annotation_electron_fixture'
+        && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate?.selection.selectionId
+          === selected.selectionId
+      await annotationOverlay.view.webContents.executeJavaScript(
+        "document.getElementById('annotation-cancel').click()",
+      )
+      await waitFor(
+        () => events.some(event =>
+          event.type === 'annotation-cancel'
+          && event.detail?.annotationId === 'annotation_electron_fixture'),
+        'trusted overlay cancel relay',
+      )
+      const annotationOverlayRetainedAfterCancel =
+        annotationOverlay.view.getVisible()
+        && annotationOverlay.binding?.annotationId === 'annotation_electron_fixture'
+        && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate?.selection.selectionId
+          === selected.selectionId
+      const annotationWrongAcknowledgement = manager.closeArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        annotationId: 'annotation_wrong_fixture',
+      })
+      const annotationOverlayRetainedAfterWrongAcknowledgement =
+        annotationOverlay.view.getVisible()
+        && annotationOverlay.binding?.annotationId === 'annotation_electron_fixture'
+      // Simulate an IME composition interrupted by the editor being fenced.
+      // The reused trusted view must reset this state on its next init.
+      await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+        const textarea = document.getElementById('annotation-body')
+        textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+      })()`)
+      const annotationOverlayAcknowledgement = await closeAnnotationOverlayAndDrain({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        annotationId: 'annotation_electron_fixture',
+      }, 'trusted annotation acknowledgement')
+      const annotationOverlayClosedAfterAcknowledgement =
+        !annotationOverlay.view.getVisible()
+        && annotationOverlay.binding === null
+        && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate === null
+      const annotationRearmEventsBefore = events.length
+      const annotationPickerRearm = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      const annotationRearmDocument = await v3Contents.debugger.sendCommand('DOM.getDocument', {
+        depth: -1,
+        pierce: false,
+      })
+      const annotationRearmNode = await v3Contents.debugger.sendCommand('DOM.querySelector', {
+        nodeId: annotationRearmDocument.root.nodeId,
+        selector: '#font-probe',
+      })
+      const annotationRearmDescription = await v3Contents.debugger.sendCommand(
+        'DOM.describeNode',
+        { nodeId: annotationRearmNode.nodeId },
+      )
+      await manager.handleAnnotationNodeSelected(
+        manager.surfaces.get('artifact:v3-bridge'),
+        annotationRearmDescription.node.backendNodeId,
+      )
+      const annotationRearmSelectionEvent = await waitFor(
+        () => events.slice(annotationRearmEventsBefore).find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'annotation-selected'),
+        'rearmed annotation selection',
+      )
+      const annotationRearmSelection = annotationRearmSelectionEvent.detail.selection
+      const annotationRearmOverlayResult = await manager.showArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        selectionId: annotationRearmSelection.selectionId,
+        annotationId: 'annotation_rearmed_fixture',
+        initialBody: '',
+        overlayCopyVersion: 1,
+        copy: {
+          targetLabel: 'Button: Rearmed target',
+          contextLabel: 'Selected area',
+          bodyLabel: 'Page annotation',
+          placeholder: 'Describe the next change…',
+          newlineHint: process.platform === 'darwin'
+            ? '⇧ Return for a new line'
+            : 'Shift + Enter for a new line',
+          cancelLabel: 'Cancel',
+          submitLabel: 'Add annotation',
+          emptyBodyMessage: 'Describe the next requested change.',
+        },
+      })
+      await waitFor(
+        async () => await annotationOverlay.view.webContents.executeJavaScript(
+          "document.activeElement?.id === 'annotation-body'",
+        ),
+        'rearmed annotation textarea focus',
+      )
+      const annotationRearmCopy =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => ({
+          target: document.getElementById('annotation-target').textContent,
+          placeholder: document.getElementById('annotation-body').placeholder,
+          newlineHint: document.getElementById('annotation-newline-hint').textContent,
+          newlineHintTitle: document.getElementById('annotation-newline-hint').title,
+          submitTitle: document.getElementById('annotation-submit').title,
+        }))()`)
+      const annotationRearmLayout =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const footer = document.querySelector('footer')
+          const hint = document.getElementById('annotation-newline-hint')
+          const submit = document.getElementById('annotation-submit')
+          const submitText = submit.firstChild
+          const range = document.createRange()
+          range.selectNodeContents(submitText)
+          const footerRect = footer.getBoundingClientRect()
+          const submitRect = submit.getBoundingClientRect()
+          return {
+            hintOverflow: getComputedStyle(hint).overflow,
+            hintTextOverflow: getComputedStyle(hint).textOverflow,
+            submitWhiteSpace: getComputedStyle(submit).whiteSpace,
+            submitTextLineCount: range.getClientRects().length,
+            submitContained: submitRect.top >= footerRect.top
+              && submitRect.right <= footerRect.right
+              && submitRect.bottom <= footerRect.bottom,
+          }
+        })()`)
+      const annotationRearmEmptyBodyMessage =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const form = document.getElementById('annotation-form')
+          const textarea = document.getElementById('annotation-body')
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+          return textarea.validationMessage
+        })()`)
+      annotationOverlay.view.webContents.insertText('Rearmed input')
+      const annotationRearmTypedValue = await waitFor(
+        async () => {
+          const value = await annotationOverlay.view.webContents.executeJavaScript(
+            "document.getElementById('annotation-body').value",
+          )
+          return value === 'Rearmed input' ? value : null
+        },
+        'rearmed annotation overlay input',
+      )
+      const annotationRearmSubmitEventsBeforeNewline = events.filter(event =>
+        event.type === 'annotation-submit'
+        && event.detail?.annotationId === 'annotation_rearmed_fixture').length
+      const annotationRearmShiftEnter =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const textarea = document.getElementById('annotation-body')
+          const event = new KeyboardEvent('keydown', {
+            key: 'Enter',
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+          })
+          const defaultAllowed = textarea.dispatchEvent(event)
+          if (defaultAllowed) {
+            textarea.setRangeText('\\n', textarea.selectionStart, textarea.selectionEnd, 'end')
+            textarea.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              data: '\\n',
+              inputType: 'insertLineBreak',
+            }))
+          }
+          return { defaultAllowed, value: textarea.value }
+        })()`)
+      await new Promise(resolveWait => setTimeout(resolveWait, 50))
+      const annotationRearmShiftEnterDidNotSubmit = events.filter(event =>
+        event.type === 'annotation-submit'
+        && event.detail?.annotationId === 'annotation_rearmed_fixture').length
+        === annotationRearmSubmitEventsBeforeNewline
+      await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+        const textarea = document.getElementById('annotation-body')
+        textarea.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter',
+          bubbles: true,
+          cancelable: true,
+        }))
+      })()`)
+      const annotationRearmSubmitAfterInterruptedComposition = await waitFor(
+        () => events.some(event =>
+          event.type === 'annotation-submit'
+          && event.detail?.annotationId === 'annotation_rearmed_fixture'
+          && event.detail?.body === 'Rearmed input\n'),
+        'reused trusted overlay IME state reset',
+      )
+      const annotationRearmOverlayClose = await closeAnnotationOverlayAndDrain({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        annotationId: 'annotation_rearmed_fixture',
+      }, 'rearmed annotation acknowledgement')
+      const annotationRearmFocusCycles = []
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        const cycleEventsBefore = events.length
+        const cyclePicker = await manager.setArtifactAnnotationMode({
+          version: 3,
+          surfaceId: 'artifact:v3-bridge',
+          enabled: true,
+        })
+        const cycleDocument = await v3Contents.debugger.sendCommand('DOM.getDocument', {
+          depth: -1,
+          pierce: false,
+        })
+        const cycleNode = await v3Contents.debugger.sendCommand('DOM.querySelector', {
+          nodeId: cycleDocument.root.nodeId,
+          selector: '#font-probe',
+        })
+        const cycleDescription = await v3Contents.debugger.sendCommand(
+          'DOM.describeNode',
+          { nodeId: cycleNode.nodeId },
+        )
+        await manager.handleAnnotationNodeSelected(
+          manager.surfaces.get('artifact:v3-bridge'),
+          cycleDescription.node.backendNodeId,
+        )
+        const cycleSelectionEvent = await waitFor(
+          () => events.slice(cycleEventsBefore).find(event =>
+            event.surfaceId === 'artifact:v3-bridge'
+            && event.type === 'annotation-selected'),
+          `annotation rearm selection cycle ${cycle + 1}`,
+        )
+        const cycleAnnotationId = `annotation_rearm_stress_${cycle + 1}`
+        const cycleOverlayResult = await manager.showArtifactAnnotationOverlay({
+          version: 3,
+          surfaceId: 'artifact:v3-bridge',
+          selectionId: cycleSelectionEvent.detail.selection.selectionId,
+          annotationId: cycleAnnotationId,
+          initialBody: '',
+        })
+        await waitFor(
+          async () => await annotationOverlay.view.webContents.executeJavaScript(
+            "document.activeElement?.id === 'annotation-body'",
+          ),
+          `annotation rearm editor focus cycle ${cycle + 1}`,
+        )
+        const cycleBody = `Rearmed IME ${cycle + 1} 中文输入`
+        annotationOverlay.view.webContents.insertText(cycleBody)
+        const typedValue = await waitFor(
+          async () => {
+            const value = await annotationOverlay.view.webContents.executeJavaScript(
+              "document.getElementById('annotation-body').value",
+            )
+            return value === cycleBody ? value : null
+          },
+          `annotation rearm IME input cycle ${cycle + 1}`,
+        )
+        const cycleFocusState = await waitFor(
+          async () => {
+            const editorFocused = await annotationOverlay.view.webContents.executeJavaScript(
+              "document.activeElement?.id === 'annotation-body'",
+            )
+            const ownerFocused = owner.isFocused()
+            const nativeFocused = annotationOverlay.view.webContents.isFocused()
+            return editorFocused && (!ownerFocused || nativeFocused)
+              ? { editorFocused, ownerFocused, nativeFocused }
+              : null
+          },
+          `annotation rearm native focus cycle ${cycle + 1}`,
+        )
+        const cycleClose = await closeAnnotationOverlayAndDrain({
+          version: 3,
+          surfaceId: 'artifact:v3-bridge',
+          annotationId: cycleAnnotationId,
+        }, `annotation rearm close cycle ${cycle + 1}`)
+        annotationRearmFocusCycles.push({
+          picker: cyclePicker.ok,
+          overlay: cycleOverlayResult.ok,
+          ...cycleFocusState,
+          typedValue,
+          closed: cycleClose.ok,
+        })
+      }
+      const v3Record = manager.surfaces.get('artifact:v3-bridge')
+      const annotationScrollBeforeFocus = await v3Contents.executeJavaScript('window.scrollY')
+      const annotationFocus = await v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:v3-bridge',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      )
+      const annotationScrollAfterFocus = await v3Contents.executeJavaScript('window.scrollY')
+      const annotationFocusHighlightArmed = Boolean(v3Record.annotationFocusTimer)
+      const annotationWrongScopeRejected = await v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:other-scope',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      ).then(() => false, () => true)
+      const annotationWrongArtifactFocusRejected = await v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId: 'art-synthetic-other-preview',
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:v3-bridge',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      ).then(() => false, () => true)
+      await v3Contents.executeJavaScript(
+        "document.getElementById('font-probe').setAttribute('data-focus-mismatch', '1')",
+      )
+      const annotationDomMismatchRejected = await v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:v3-bridge',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      ).then(() => false, () => true)
+      await v3Contents.executeJavaScript(
+        "document.getElementById('font-probe').removeAttribute('data-focus-mismatch')",
+      )
+      await v3Contents.executeJavaScript(
+        "document.body.setAttribute('data-ancestor-mismatch', '1')",
+      )
+      const annotationAncestorMismatchRejected = await v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:v3-bridge',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      ).then(() => false, () => true)
+      await v3Contents.executeJavaScript(
+        "document.body.removeAttribute('data-ancestor-mismatch')",
+      )
+      const annotationRefocus = await v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:v3-bridge',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+        },
+        new AbortController().signal,
+      )
+      const annotationFallbackShow = await manager.showArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        selectionId: selected.selectionId,
+        annotationId: 'annotation_fallback_fixture',
+        initialBody: 'Preserved fallback draft',
+      })
+      const annotationFallbackEvent = await waitFor(
+        () => events.find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'annotation-overlay-fallback'
+          && event.detail?.annotationId === 'annotation_fallback_fixture'),
+        'trusted annotation overlay fallback event',
+      )
+      const annotationPreviewHiddenForFallback = !v3View.getVisible()
+      const annotationFallbackClose = manager.closeArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        annotationId: 'annotation_fallback_fixture',
+      })
+      const annotationPreviewRestoredAfterFallback = v3View.getVisible()
+      const annotationGoldenEventsBefore = events.length
+      const annotationGoldenPicker = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      if (!annotationGoldenPicker.ok) {
+        throw new Error(annotationGoldenPicker.message || 'Golden annotation picker failed.')
+      }
+      const annotationDocument = await v3Contents.debugger.sendCommand('DOM.getDocument', {
+        depth: -1,
+        pierce: false,
+      })
+      const annotationGoldenNode = await v3Contents.debugger.sendCommand('DOM.querySelector', {
+        nodeId: annotationDocument.root.nodeId,
+        selector: 'main[data-label] path',
+      })
+      const annotationGoldenDescription = await v3Contents.debugger.sendCommand(
+        'DOM.describeNode',
+        { nodeId: annotationGoldenNode.nodeId },
+      )
+      await manager.handleAnnotationNodeSelected(
+        v3Record,
+        annotationGoldenDescription.node.backendNodeId,
+      )
+      const annotationGoldenSelectionEvent = await waitFor(
+        () => events.slice(annotationGoldenEventsBefore).find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'annotation-selected'
+          && event.detail?.selection?.tagName === 'path'),
+        'Unicode and SVG element proof selection',
+      )
+      const annotationGoldenElementProof =
+        annotationGoldenSelectionEvent.detail.selection.elementProofSha256
+
+      const annotationRollbackCommands = []
+      const originalAnnotationCdpCommand = manager.cdpCommand.bind(manager)
+      let forceAnnotationPostconditionFailure = true
+      manager.cdpCommand = async (record, method, params) => {
+        annotationRollbackCommands.push([
+          method,
+          params?.mode ?? null,
+          Boolean(params?.highlightConfig),
+        ])
+        const result = await originalAnnotationCdpCommand(record, method, params)
+        if (
+          forceAnnotationPostconditionFailure
+          && method === 'Overlay.setInspectMode'
+          && params?.mode === 'searchForNode'
+        ) {
+          forceAnnotationPostconditionFailure = false
+          record.annotationPickerActive = false
+        }
+        return result
+      }
+      const annotationPostconditionFailure = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      manager.cdpCommand = originalAnnotationCdpCommand
+
+      const annotationPickerBeforeHideFailure = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      manager.cdpCommand = async (record, method, params) => {
+        if (method === 'Overlay.hideHighlight') {
+          throw new Error('Synthetic compatibility cleanup failure')
+        }
+        return await originalAnnotationCdpCommand(record, method, params)
+      }
+      const annotationPickerOffWithHideFailure = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: false,
+      })
+      manager.cdpCommand = originalAnnotationCdpCommand
+
+      const annotationPickerBeforeInspectModeFailure = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      manager.cdpCommand = async (record, method, params) => {
+        if (method === 'Overlay.setInspectMode' && params?.mode === 'none') {
+          throw new Error('Synthetic authoritative cleanup failure')
+        }
+        return await originalAnnotationCdpCommand(record, method, params)
+      }
+      const annotationPickerOffWithInspectModeFailure =
+        await manager.setArtifactAnnotationMode({
+          version: 3,
+          surfaceId: 'artifact:v3-bridge',
+          enabled: false,
+        })
+      manager.cdpCommand = originalAnnotationCdpCommand
+      const annotationPickerCleanupRecovery = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: false,
+      })
+
+      const annotationPickerOffEventsBefore = events.length
+      const annotationPageClicksBeforePickerOff = await v3Contents.executeJavaScript(
+        'Number(window.__annotationPageClicks || 0)',
+      )
+      const annotationPickerBeforeOff = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
+      const annotationPickerOff = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: false,
+      })
+      const annotationTargetAfterOff = await v3Contents.executeJavaScript(`(() => {
+        const rect = document.getElementById('font-probe').getBoundingClientRect()
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+      })()`)
+      const annotationOffX = Math.floor(
+        annotationTargetAfterOff.x + Math.max(1, annotationTargetAfterOff.width / 2),
+      )
+      const annotationOffY = Math.floor(
+        annotationTargetAfterOff.y + Math.max(1, annotationTargetAfterOff.height / 2),
+      )
+      v3Contents.focus()
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: annotationOffX,
+        y: annotationOffY,
+        button: 'none',
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: annotationOffX,
+        y: annotationOffY,
+        button: 'left',
+        clickCount: 1,
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: annotationOffX,
+        y: annotationOffY,
+        button: 'left',
+        clickCount: 1,
+      })
+      await new Promise(resolveWait => setTimeout(resolveWait, 100))
+      const annotationPageClicksAfterPickerOff = await v3Contents.executeJavaScript(
+        'Number(window.__annotationPageClicks || 0)',
+      )
+      const annotationSelectionAfterPickerOff = events
+        .slice(annotationPickerOffEventsBefore)
+        .some(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'annotation-selected')
+      const annotationPickerActiveAfterOff =
+        manager.surfaces.get('artifact:v3-bridge')?.annotationPickerActive
+      const v3Screenshot = await v3BridgeTarget.screenshot(
+        { version: 3 },
+        new AbortController().signal,
+      )
+      const v3ReadyEventsBeforeReload = events.filter(event =>
+        event.surfaceId === 'artifact:v3-bridge' && event.type === 'ready').length
+      const v3Reload = await v3BridgeTarget.reloadSurface(
+        { version: 3 },
+        new AbortController().signal,
+      )
+      const annotationFocusClearedOnReload = v3Record.annotationFocusTimer === null
+      await waitFor(
+        () => events.filter(event =>
+          event.surfaceId === 'artifact:v3-bridge' && event.type === 'ready').length
+          > v3ReadyEventsBeforeReload,
+        'protocol-v3 bridge reload',
+      )
+      const v3NavigationEvents = events.filter(event =>
+        event.surfaceId === 'artifact:v3-bridge'
+        && event.version === 3
+        && event.type === 'navigation-state')
+      await manager.destroySurface('artifact:v3-bridge')
+      await waitFor(() => v3Contents.isDestroyed(), 'protocol-v3 preview destruction')
+      const annotationExpiredModeResult = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
 
       const isolated = await manager.createSurface({
         version: 2,
@@ -1339,6 +2264,91 @@ try {
         permissionResponse,
         permissionResult,
         fullNavigationEventCount: fullNavigationEvents.length,
+        v2ArtifactBridgeUnavailable,
+        v3BridgeCapabilities,
+        v3AnnotationCapabilities,
+        annotationPicker,
+        annotationUnrelatedNodeCount,
+        annotationSelected: {
+          tagName: selected.tagName,
+          hasBoundedPath: selected.elementPath.length > 0 && selected.elementPath.length <= 4096,
+          omitsWholeDomDigest: selected.domSha256 === undefined,
+          hasElementProof: /^[a-f0-9]{64}$/.test(selected.elementProofSha256),
+          rect: selected.rect,
+        },
+        annotationPageClicks,
+        resolvedSelection,
+        annotationWrongArtifactResolveRejected,
+        annotationOverlayResult,
+        annotationOverlaySecurity,
+        annotationOverlayVisualStructure,
+        annotationOverlayDevToolsBlocked,
+        annotationOverlayBounds,
+        annotationOverlayMovedBounds,
+        annotationOverlayOnTop,
+        annotationNativeOwnerFocusAvailable,
+        annotationOverlayFocusCycles,
+        annotationOverlayFocusedAfterGeometry,
+        annotationOverlayTypedValue,
+        annotationPreviewKeys,
+        annotationEmptySubmitRetained,
+        annotationOverlayRetainedAfterSubmit,
+        annotationOverlayRetainedAfterCancel,
+        annotationWrongAcknowledgement,
+        annotationOverlayRetainedAfterWrongAcknowledgement,
+        annotationOverlayAcknowledgement,
+        annotationOverlayClosedAfterAcknowledgement,
+        annotationPickerRearm,
+        annotationRearmOverlayResult,
+        annotationRearmCopy,
+        annotationRearmLayout,
+        annotationRearmEmptyBodyMessage,
+        annotationRearmTypedValue,
+        annotationRearmShiftEnter,
+        annotationRearmShiftEnterDidNotSubmit,
+        annotationRearmSubmitAfterInterruptedComposition,
+        annotationRearmOverlayClose,
+        annotationRearmFocusCycles,
+        annotationFocus,
+        annotationScrollBeforeFocus,
+        annotationScrollAfterFocus,
+        annotationFocusHighlightArmed,
+        annotationFocusClearedOnReload,
+        annotationWrongScopeRejected,
+        annotationWrongArtifactFocusRejected,
+        annotationDomMismatchRejected,
+        annotationAncestorMismatchRejected,
+        annotationRefocus,
+        annotationFallbackShow,
+        annotationFallbackEvent,
+        annotationPreviewHiddenForFallback,
+        annotationFallbackClose,
+        annotationPreviewRestoredAfterFallback,
+        annotationGoldenElementProof,
+        annotationPostconditionFailure,
+        annotationRollbackCommands: annotationRollbackCommands.filter(
+          ([method]) => method.startsWith('Overlay.'),
+        ),
+        annotationPickerBeforeHideFailure,
+        annotationPickerOffWithHideFailure,
+        annotationPickerBeforeInspectModeFailure,
+        annotationPickerOffWithInspectModeFailure,
+        annotationPickerCleanupRecovery,
+        annotationPickerBeforeOff,
+        annotationPickerOff,
+        annotationPickerActiveAfterOff,
+        annotationPageClicksBeforePickerOff,
+        annotationPageClicksAfterPickerOff,
+        annotationSelectionAfterPickerOff,
+        annotationExpiredModeResult,
+        v3NavigationEventCount: v3NavigationEvents.length,
+        v3Reload,
+        v3Screenshot: {
+          mime: v3Screenshot.mime,
+          byteLength: v3Screenshot.data.byteLength,
+          width: v3Screenshot.width,
+          height: v3Screenshot.height,
+        },
         isolationState,
         offlineLocal,
         offlineNetworkWarning,
@@ -1386,6 +2396,15 @@ try {
       turnTcpPort: turnTcpAddress.port,
     },
   )
+
+  if (process.env.OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1') {
+    assert.equal(
+      result.annotationNativeOwnerFocusAvailable,
+      true,
+      'the real Electron workbench gate requires an unlocked foreground GUI session; '
+        + 'unlock the macOS login session and rerun with Electron allowed to take focus',
+    )
+  }
 
   assert.equal(result.fullProbes.fetchProbe, true)
   assert.equal(result.fullProbes.workerProbe, 'probe-worker')
@@ -1538,6 +2557,237 @@ try {
   assert.equal(result.permissionResponse.ok, true, 'a current permission request may be answered')
   assert.equal(result.permissionResult, 'denied', 'denied permission must reach web content')
   assert.ok(result.fullNavigationEventCount > 0, 'v2 surfaces must emit navigation state')
+  assert.equal(
+    result.v2ArtifactBridgeUnavailable,
+    true,
+    'v2 surfaces must not gain protocol-v3 agent capabilities implicitly',
+  )
+  assert.deepEqual(
+    result.v3BridgeCapabilities,
+    {
+      captureSelection: false,
+      resolveAnnotationSelection: true,
+      focusAnnotation: true,
+      browserInspect: false,
+      browserAct: false,
+      screenshot: true,
+      officeFlush: false,
+      reloadSurface: true,
+    },
+    'v3 capabilities must default closed except for implemented host operations',
+  )
+  assert.deepEqual(result.v3AnnotationCapabilities, {
+    version: 3,
+    available: true,
+    picker: true,
+    trustedOverlay: true,
+    overlayCopyVersion: 1,
+  })
+  assert.equal(result.annotationPicker.ok, true)
+  assert.equal(
+    result.annotationUnrelatedNodeCount,
+    50010,
+    'an unrelated runtime-only branch larger than the old DOM hash limit must not block selection',
+  )
+  assert.equal(result.annotationSelected.tagName, 'div')
+  assert.equal(result.annotationSelected.hasBoundedPath, true)
+  assert.equal(result.annotationSelected.omitsWholeDomDigest, true)
+  assert.equal(result.annotationSelected.hasElementProof, true)
+  assert.ok(result.annotationSelected.rect.width > 0)
+  assert.ok(result.annotationSelected.rect.height > 0)
+  assert.equal(
+    result.annotationPageClicks,
+    0,
+    'CDP inspect mode must consume the click before artifact handlers receive it',
+  )
+  assert.equal(result.resolvedSelection.selectionId.length > 0, true)
+  assert.equal(result.resolvedSelection.tagName, 'div')
+  assert.equal(result.resolvedSelection.scopeId, 'synthetic:v3-bridge')
+  assert.equal(result.resolvedSelection.activePreviewArtifactId, 'art-synthetic-v3-bridge')
+  assert.equal(result.annotationWrongArtifactResolveRejected, true)
+  assert.equal(result.annotationOverlayResult.ok, true)
+  assert.deepEqual(result.annotationOverlaySecurity, {
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    webSecurity: true,
+    webviewTag: false,
+  })
+  assert.deepEqual(result.annotationOverlayVisualStructure, {
+    role: 'dialog',
+    ariaModal: 'false',
+    labelledBy: 'annotation-title',
+    textareaLabel: '页面批注',
+    targetText: '区域：示例',
+    newlineHint: process.platform === 'darwin' ? '⇧ Return 换行' : 'Shift + Enter 换行',
+    initialBody: 'Initial annotation',
+    submitDisabled: false,
+    cardRadius: '12px',
+    textareaHeight: '73px',
+    submitHeight: '32px',
+    tabOrder: ['annotation-body', 'annotation-cancel', 'annotation-submit'],
+  })
+  assert.equal(result.annotationOverlayDevToolsBlocked, true)
+  assert.ok(result.annotationOverlayBounds.width <= 304)
+  assert.ok(result.annotationOverlayBounds.height <= 160)
+  assert.notEqual(
+    result.annotationOverlayMovedBounds.y,
+    result.annotationOverlayBounds.y,
+    'trusted overlay must follow selected-element geometry changes',
+  )
+  assert.equal(result.annotationOverlayOnTop, true)
+  assert.equal(
+    result.annotationOverlayFocusCycles.length,
+    5,
+    'trusted annotation focus must survive repeated geometry refreshes',
+  )
+  assert.equal(
+    result.annotationOverlayFocusedAfterGeometry,
+    true,
+    'the trusted annotation editor must retain native keyboard focus across geometry refreshes',
+  )
+  assert.equal(result.annotationOverlayTypedValue, 'ASCII annotation 中文输入')
+  assert.equal(
+    result.annotationPreviewKeys,
+    0,
+    'keyboard input for the trusted annotation editor must not reach the untrusted preview',
+  )
+  assert.equal(
+    result.annotationEmptySubmitRetained,
+    true,
+    'an empty submit must stay in the trusted editor without emitting an intent',
+  )
+  assert.equal(
+    result.annotationOverlayRetainedAfterSubmit,
+    true,
+    'submit is only an intent; the trusted editor must remain until acknowledged',
+  )
+  assert.equal(
+    result.annotationOverlayRetainedAfterCancel,
+    true,
+    'cancel is only an intent; the trusted editor must remain until acknowledged',
+  )
+  assert.equal(result.annotationWrongAcknowledgement.ok, false)
+  assert.equal(result.annotationOverlayRetainedAfterWrongAcknowledgement, true)
+  assert.equal(result.annotationOverlayAcknowledgement.ok, true)
+  assert.equal(result.annotationOverlayClosedAfterAcknowledgement, true)
+  assert.equal(result.annotationPickerRearm.ok, true)
+  assert.equal(result.annotationRearmOverlayResult.ok, true)
+  assert.deepEqual(result.annotationRearmCopy, {
+    target: 'Button: Rearmed target',
+    placeholder: 'Describe the next change…',
+    newlineHint: process.platform === 'darwin'
+      ? '⇧ Return for a new line'
+      : 'Shift + Enter for a new line',
+    newlineHintTitle: process.platform === 'darwin'
+      ? '⇧ Return for a new line'
+      : 'Shift + Enter for a new line',
+    submitTitle: 'Add annotation',
+  })
+  assert.deepEqual(result.annotationRearmLayout, {
+    hintOverflow: 'hidden',
+    hintTextOverflow: 'ellipsis',
+    submitWhiteSpace: 'nowrap',
+    submitTextLineCount: 1,
+    submitContained: true,
+  })
+  assert.equal(
+    result.annotationRearmEmptyBodyMessage,
+    'Describe the next requested change.',
+    'a reused overlay must validate with the latest localized copy',
+  )
+  assert.equal(result.annotationRearmTypedValue, 'Rearmed input')
+  assert.deepEqual(result.annotationRearmShiftEnter, {
+    defaultAllowed: true,
+    value: 'Rearmed input\n',
+  })
+  assert.equal(result.annotationRearmShiftEnterDidNotSubmit, true)
+  assert.equal(result.annotationRearmSubmitAfterInterruptedComposition, true)
+  assert.equal(result.annotationRearmOverlayClose.ok, true)
+  assert.equal(result.annotationRearmFocusCycles.length, 3)
+  assert.equal(
+    result.annotationRearmFocusCycles.every(cycle =>
+      cycle.picker
+      && cycle.overlay
+      && cycle.editorFocused
+      && cycle.closed
+      && cycle.typedValue.includes('中文输入')
+      && (!cycle.ownerFocused || cycle.nativeFocused)),
+    true,
+    'trusted annotation editor must survive repeated close/rearm/IME cycles',
+  )
+  assert.deepEqual(result.annotationFocus, {
+    focused: true,
+    activePreviewArtifactId: 'art-synthetic-v3-bridge',
+  })
+  assert.notEqual(
+    result.annotationScrollAfterFocus,
+    result.annotationScrollBeforeFocus,
+    'trusted annotation focus must scroll the selected element into view',
+  )
+  assert.equal(result.annotationFocusHighlightArmed, true)
+  assert.equal(
+    result.annotationFocusClearedOnReload,
+    true,
+    'navigation must synchronously fence a pending annotation highlight',
+  )
+  assert.equal(result.annotationWrongScopeRejected, true)
+  assert.equal(result.annotationWrongArtifactFocusRejected, true)
+  assert.equal(result.annotationDomMismatchRejected, true)
+  assert.equal(result.annotationAncestorMismatchRejected, true)
+  assert.deepEqual(result.annotationRefocus, {
+    focused: true,
+    activePreviewArtifactId: 'art-synthetic-v3-bridge',
+  })
+  assert.equal(result.annotationFallbackShow.ok, false)
+  assert.equal(result.annotationFallbackEvent.detail.reason, 'selection-stale')
+  assert.equal(result.annotationPreviewHiddenForFallback, true)
+  assert.equal(result.annotationFallbackClose.ok, true)
+  assert.equal(result.annotationPreviewRestoredAfterFallback, true)
+  assert.equal(
+    result.annotationGoldenElementProof,
+    '26992606963b33b7d475a826bf0a48ae802e9ac7bfe43ed5cab3aa97b7f0c5c8',
+    'Electron and Gateway element-proof serialization must stay byte-identical',
+  )
+  assert.equal(result.annotationPostconditionFailure.ok, false)
+  assert.deepEqual(result.annotationRollbackCommands, [
+    ['Overlay.setInspectMode', 'searchForNode', true],
+    ['Overlay.setInspectMode', 'none', true],
+    ['Overlay.hideHighlight', null, false],
+  ])
+  assert.equal(result.annotationPickerBeforeHideFailure.ok, true)
+  assert.equal(
+    result.annotationPickerOffWithHideFailure.ok,
+    true,
+    'a compatibility-only hideHighlight failure must not reject a confirmed picker stop',
+  )
+  assert.equal(result.annotationPickerBeforeInspectModeFailure.ok, true)
+  assert.equal(
+    result.annotationPickerOffWithInspectModeFailure.ok,
+    false,
+    'a failed setInspectMode(none) must never be reported as a successful picker stop',
+  )
+  assert.equal(result.annotationPickerCleanupRecovery.ok, true)
+  assert.deepEqual(result.annotationExpiredModeResult, {
+    ok: false,
+    code: 'PREVIEW_CAPABILITY_EXPIRED',
+    retryable: true,
+    message: 'Only the active protocol-v3 HTML artifact preview supports annotations.',
+  })
+  assert.equal(result.annotationPickerBeforeOff.ok, true)
+  assert.equal(result.annotationPickerOff.ok, true)
+  assert.equal(result.annotationPickerActiveAfterOff, false)
+  assert.equal(result.annotationSelectionAfterPickerOff, false)
+  assert.equal(
+    result.annotationPageClicksAfterPickerOff,
+    result.annotationPageClicksBeforePickerOff + 1,
+    'disabling the picker must restore ordinary preview clicks without a residual inspect overlay',
+  )
+  assert.equal(result.v3Screenshot.mime, 'image/png')
+  assert.ok(result.v3Screenshot.byteLength > 0, 'v3 screenshot must return bounded PNG bytes')
+  assert.ok(result.v3Screenshot.width > 0 && result.v3Screenshot.height > 0)
+  assert.equal(result.v3Reload.reloaded, true, 'v3 reload must stay on the active surface')
+  assert.ok(result.v3NavigationEventCount > 0, 'v3 surfaces must preserve v2 navigation events')
   assert.equal(
     result.isolationState.storageWasCleared,
     true,

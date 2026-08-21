@@ -231,7 +231,7 @@ test.describe('Per-session deliverables drawer', () => {
 })
 
 test.describe('Indexed deliverables with the default Workbench', () => {
-  test('unsupported indexed deliverables remain discoverable outside history', async ({ page }) => {
+  test('unsupported indexed deliverables remain downloadable outside history', async ({ page }) => {
     await openSeededSession(page, INDEXED_SESSION_KEY, false, {
       indexedArtifacts: [{
         id: 'art-deliv-indexed',
@@ -243,21 +243,19 @@ test.describe('Indexed deliverables with the default Workbench', () => {
       }],
     })
 
-    // The default Workbench cannot preview CSV, and the current history page
-    // has no artifact card. The index must still expose the complete Drawer.
+    // The current history page has no artifact card. The durable index still
+    // opens a read-only Workbench item with an explicit download action.
     await expect(page.locator('.msg-artifact-chip')).toHaveCount(0)
     const trigger = await deliverablesTrigger(page)
     await expect(trigger).toHaveAccessibleName('Deliverables (1)')
     await trigger.click()
 
-    const drawer = page.locator('.deliv-drawer')
-    await expect(drawer).toBeVisible()
-    await expect(drawer).toHaveAttribute('aria-label', /Deliverables \(1\)/)
-    await expect(page.locator('.deliv-tile')).toHaveCount(1)
-    await expect(page.locator('.deliv-tile__name')).toHaveText('archived-report.csv')
-    await expect(page.locator('.deliv-tile__meta')).toHaveText('CSV · 4 KB')
-    await page.locator('.deliv-tile').click()
-    await expect(page.locator('.deliv-preview')).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Download' })).toBeVisible()
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench).toContainText('archived-report.csv')
+    await expect(workbench.getByRole('button', { name: 'Download archived-report.csv' }))
+      .toBeVisible()
+    await expect(workbench.getByRole('button', { name: 'Download latest version' }))
+      .toBeVisible()
   })
 })

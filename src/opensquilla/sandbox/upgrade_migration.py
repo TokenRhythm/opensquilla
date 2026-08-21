@@ -50,7 +50,12 @@ if ($isDirectory) {
 }
 $propagation = [System.Security.AccessControl.PropagationFlags]::None
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
-$allowed = @($userSid, "S-1-5-18", "S-1-5-32-544") | Select-Object -Unique
+$allowed = @($userSid)
+foreach ($trustedSid in @("S-1-5-18", "S-1-5-32-544")) {
+    if ($allowed -notcontains $trustedSid) {
+        $allowed += $trustedSid
+    }
+}
 foreach ($sidText in $allowed) {
     $sid = [System.Security.Principal.SecurityIdentifier]::new($sidText)
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
@@ -90,12 +95,16 @@ foreach ($rule in $rules) {
     }
 }
 foreach ($sidText in $allowed) {
-    $matches = @($rules | Where-Object {
-        $_.IdentityReference.Translate(
+    $matchCount = 0
+    foreach ($rule in $rules) {
+        $identity = $rule.IdentityReference.Translate(
             [System.Security.Principal.SecurityIdentifier]
-        ).Value -eq $sidText
-    })
-    if ($matches.Count -ne 1) {
+        ).Value
+        if ($identity -eq $sidText) {
+            $matchCount += 1
+        }
+    }
+    if ($matchCount -ne 1) {
         throw "DACL principal verification failed"
     }
 }
@@ -103,6 +112,8 @@ foreach ($sidText in $allowed) {
 _WINDOWS_PRIVATE_ACL_ENCODED = base64.b64encode(
     _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16-le")
 ).decode("ascii")
+_WINDOWS_IDENTITY_TIMEOUT_SECONDS = 10.0
+_WINDOWS_ACL_TIMEOUT_SECONDS = 15.0
 _WINDOWS_DLL_DIRECTORY_LOCK = threading.Lock()
 
 
@@ -138,13 +149,19 @@ def _system_windows_process_context() -> Iterator[None]:
 
 
 def _current_windows_user_sid() -> str:
-    with _system_windows_process_context():
-        completed = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    try:
+        with _system_windows_process_context():
+            completed = subprocess.run(
+                ["whoami", "/user", "/fo", "csv", "/nh"],
+                capture_output=True,
+                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                stdin=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=_WINDOWS_IDENTITY_TIMEOUT_SECONDS,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise OSError("Windows user SID lookup timed out") from exc
     if completed.returncode != 0:
         raise OSError("cannot resolve the current Windows user SID")
     try:
@@ -178,20 +195,29 @@ def _protect_private_path(
             "OPENSQUILLA_UPGRADE_ACL_USER_SID": windows_user_sid,
             "OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY": "1" if directory else "0",
         }
-        with _system_windows_process_context():
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-EncodedCommand",
-                    _WINDOWS_PRIVATE_ACL_ENCODED,
-                ],
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+        try:
+            with _system_windows_process_context():
+                completed = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-NoLogo",
+                        "-EncodedCommand",
+                        _WINDOWS_PRIVATE_ACL_ENCODED,
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                    timeout=_WINDOWS_ACL_TIMEOUT_SECONDS,
+                )
+        except subprocess.TimeoutExpired as exc:
+            detail = " ".join(str(exc.stderr or exc.stdout or "").strip().split())
+            suffix = f" ({detail[-500:]})" if detail else ""
+            raise OSError(f"Windows ACL hardening timed out: {path}{suffix}") from exc
         if completed.returncode != 0:
             detail = " ".join((completed.stderr or completed.stdout).strip().split())
             suffix = f" ({detail[-500:]})" if detail else ""

@@ -3256,7 +3256,13 @@ async def test_agent_preserves_reasoning_content_for_deepseek_text_replay() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "model_id", ["deepseek-v4-flash", "deepseek-v4-flash-0731"]
+    "model_id",
+    [
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
+        "tokenrhythm/deepseek-v4-pro-0813",
+    ],
 )
 async def test_agent_preserves_direct_deepseek_v4_reasoning_without_capabilities(
     model_id: str,

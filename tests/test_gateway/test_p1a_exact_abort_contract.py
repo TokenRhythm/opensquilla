@@ -31,6 +31,53 @@ from tests.test_gateway.test_task_runtime_terminal_cleanup import (
 
 
 @pytest.mark.asyncio
+async def test_exact_abort_auxiliary_cleanup_includes_persisted_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    async def completion(session_key: str, task_id: str) -> int:
+        calls.append(("completion", session_key, task_id))
+        return 1
+
+    async def in_memory(session_key: str, task_id: str) -> int:
+        calls.append(("memory", session_key, task_id))
+        return 2
+
+    async def persisted(state_dir: str, session_key: str, task_id: str) -> int:
+        assert state_dir == "synthetic-runtime-state"
+        calls.append(("persisted", session_key, task_id))
+        return 3
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+        completion,
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
+        in_memory,
+    )
+    monkeypatch.setattr(
+        "opensquilla.process_tree.cancel_persisted_processes_for_task",
+        persisted,
+    )
+
+    result = await rpc_sessions._cancel_task_owned_auxiliary_work(
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+        deadline_at_monotonic=asyncio.get_running_loop().time() + 1.0,
+        process_state_dir="synthetic-runtime-state",
+    )
+
+    assert result == 6
+    assert sorted(calls) == [
+        ("completion", "synthetic-session", "synthetic-task"),
+        ("memory", "synthetic-session", "synthetic-task"),
+        ("persisted", "synthetic-session", "synthetic-task"),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("list_failure", ["raises", "timeout"])
 async def test_exact_abort_still_uses_atomic_cancel_when_runtime_list_fails(
     monkeypatch: pytest.MonkeyPatch,

@@ -8,10 +8,23 @@ export interface ConfirmOptions {
   primaryClass?: string
 }
 
+export interface ConfirmChoiceOptions extends ConfirmOptions {
+  secondaryLabel: string
+  secondaryClass?: string
+  showCancel?: boolean
+}
+
+export type ConfirmChoice = 'cancel' | 'secondary' | 'primary'
+
+type ConfirmResult = boolean | 'secondary'
+
 interface ConfirmRequest extends ConfirmOptions {
   primaryLabel: string
   primaryClass: string
-  resolve: (value: boolean) => void
+  secondaryLabel?: string
+  secondaryClass?: string
+  showCancel?: boolean
+  resolve: (value: ConfirmResult) => void
 }
 
 // Module-level singleton so any composable or component can raise a confirm
@@ -31,7 +44,32 @@ function confirm(options: ConfirmOptions): Promise<boolean> {
       body: options.body,
       primaryLabel: options.primaryLabel ?? i18n.global.t('shared.confirm.defaultPrimary'),
       primaryClass: options.primaryClass ?? 'btn--danger',
-      resolve,
+      resolve: value => resolve(value === true),
+    }
+  })
+}
+
+// A small extension of the standard confirmation model for exits that need a
+// third, non-destructive action (for example, save before closing). Keep the
+// boolean `confirm` API above intact for existing destructive confirmations.
+function confirmChoice(options: ConfirmChoiceOptions): Promise<ConfirmChoice> {
+  if (confirmState.value) {
+    confirmState.value.resolve(false)
+  }
+  return new Promise<ConfirmChoice>(resolve => {
+    confirmState.value = {
+      title: options.title,
+      body: options.body,
+      primaryLabel: options.primaryLabel ?? i18n.global.t('shared.confirm.defaultPrimary'),
+      primaryClass: options.primaryClass ?? 'btn--primary',
+      secondaryLabel: options.secondaryLabel,
+      secondaryClass: options.secondaryClass ?? 'btn--danger',
+      showCancel: options.showCancel,
+      resolve: value => {
+        if (value === true) resolve('primary')
+        else if (value === 'secondary') resolve('secondary')
+        else resolve('cancel')
+      },
     }
   })
 }
@@ -43,6 +81,13 @@ function resolveConfirm(ok: boolean) {
   request.resolve(ok)
 }
 
+function resolveConfirmChoice(choice: Exclude<ConfirmChoice, 'cancel'>) {
+  const request = confirmState.value
+  if (!request) return
+  confirmState.value = null
+  request.resolve(choice === 'primary' ? true : 'secondary')
+}
+
 export function useConfirm() {
-  return { confirm, confirmState, resolveConfirm }
+  return { confirm, confirmChoice, confirmState, resolveConfirm, resolveConfirmChoice }
 }

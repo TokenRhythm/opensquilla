@@ -339,6 +339,11 @@
       </main>
       <AppWorkbench
         :enabled="appStore.features.artifactWorkbench === true"
+        :workbench-resources-enabled="(
+          appStore.features.documentWorkbenchResources === true
+          || appStore.features.artifactPromptAnnotations === true
+        )"
+        :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="currentSessionKey"
         :modal-blocked="workbenchModalBlocked"
@@ -532,10 +537,14 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
-// Chat-only transient chrome is coordinated independently from every modal and
-// from the non-chat topbar. The local menu refs remain authoritative elsewhere.
+// Every transient control in the global topbar shares one active owner. The
+// controls render on chat and non-chat routes, so route-scoped coordination
+// would allow sibling menus such as Language and Theme to overlap.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
-const chatTopbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(isChatRoute)
+const topbarPopoverCoordinationEnabled = ref(true)
+const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
+  topbarPopoverCoordinationEnabled,
+)
 const chatRouteHeader = provideChatRouteHeaderBridge()
 const {
   visible: chatRouteHeaderVisible,
@@ -767,7 +776,7 @@ const themeMenuOpen = ref(false)
 useChatTopbarPopoverCoordination(
   'theme',
   themeMenuOpen,
-  chatTopbarPopoverCoordinator,
+  topbarPopoverCoordinator,
 )
 const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
@@ -794,7 +803,7 @@ function pickTheme(mode: ThemeMode) {
 function openMoreThemes() {
   themeMenuOpen.value = false
   handleNavClick()
-  router.push('/settings/appearance')
+  router.push('/settings/interface')
 }
 
 useDocumentEvent('click', (e) => {
@@ -1660,13 +1669,13 @@ function openSettings() {
 // Topbar connection pill (web): jump straight to the Connection section so the
 // gateway link can be inspected or re-pointed.
 function openConnectionSettings() {
-  router.push('/settings/connection')
+  router.push('/settings/gateway#connection')
 }
 
 // Compact chat headers hand off to the complete Desktop update workflow rather
 // than recreating update actions inside the status summary.
 function openDesktopRuntimeSettings() {
-  router.push('/settings/runtime')
+  router.push('/settings/gateway#runtime')
 }
 
 function scheduleSessionRefresh() {

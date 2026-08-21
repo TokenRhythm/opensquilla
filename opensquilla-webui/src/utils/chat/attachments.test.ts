@@ -74,6 +74,15 @@ describe('model-input image detection', () => {
 })
 
 describe('attachment display normalization', () => {
+  it('preserves the opaque attachment identity used by Workbench actions', () => {
+    expect(normalizeDisplayAttachment({
+      attachment_id: 'att_opaque_fixture',
+      name: 'page.html',
+      mime: 'text/html',
+      sha256_ref: 'a'.repeat(64),
+    }).attachmentId).toBe('att_opaque_fixture')
+  })
+
   it('renders inline HTML history attachments as downloadable file chips without DOM data', () => {
     const attachment = normalizeDisplayAttachment(
       { type: 'text/html', name: 'preview.html', data: 'PGh0bWw+' },

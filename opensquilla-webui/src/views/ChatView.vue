@@ -8,7 +8,10 @@
       'chat--drag-over': threadDragOver,
       'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
       'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
-      'chat--composer-collapsed': composerCollapsed && composerFxEnabled && !isNewChatLanding,
+      'chat--composer-collapsed': composerCollapsed
+        && activePromptAnnotations.length === 0
+        && composerFxEnabled
+        && !isNewChatLanding,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
@@ -103,13 +106,14 @@
         <div
           ref="threadRef"
           class="chat-thread"
+          :class="{ 'chat-thread--reading-history': !autoScroll }"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
           :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
           @wheel.passive="onThreadWheel"
-          @touchmove.passive="markThreadScrollIntent('either')"
+          @touchmove.passive="onThreadTouchMove"
           @pointerdown="markThreadScrollIntent('either')"
           @pointermove="onThreadPointerMove"
           @keydown="onThreadScrollKeydown"
@@ -174,6 +178,10 @@
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
+          :workbench-resource-preview-enabled="attachmentWorkbenchPreviewEnabled"
+          :workbench-resource-edit-enabled="attachmentWorkbenchEditEnabled"
+          :workbench-attachment-resources="attachmentWorkbenchResources"
+          :can-reuse-prompt-annotations="promptAnnotationDesktopAvailable"
           :share-mode="shareMode"
           :selected-message-ids="selectedShareMessageIds"
           :strip-time-prefix="stripTimePrefix"
@@ -198,6 +206,9 @@
           :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
+          @edit-attachment="editAttachmentResource"
+          @preview-attachment="previewAttachmentResource"
+          @reuse-prompt-annotation="reusePromptAnnotation"
           @regenerate-message="handleRegenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
@@ -395,8 +406,19 @@
           @interrupt="onStop"
         />
 
+        <!-- Stop is acknowledged locally before the Gateway reaches terminal.
+             Keep the composer usable while making that settlement phase explicit. -->
+        <div v-if="isStopPending && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+          <div class="msg-ai-main">
+            <div class="thinking-status">
+              <span class="stream-activity-dot" aria-hidden="true" />
+              <span class="thinking-elapsed">{{ t('chat.stoppingResponse') }}</span>
+            </div>
+          </div>
+        </div>
+
         <!-- Thinking indicator -->
-        <div v-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+        <div v-else-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
           <div class="msg-ai-main">
             <div class="thinking-status">
               <span class="stream-activity-dot" aria-hidden="true" />
@@ -440,6 +462,7 @@
         </div>
         <ConversationMinimap
           v-if="!isNewChatLanding && !shareMode && !forkTransition"
+          ref="conversationMinimapRef"
           :messages="renderedMessages"
           :scroll-container="threadRef"
           :ensure-message-visible="messageListRef?.ensureMessageVisible"
@@ -506,6 +529,7 @@
     <Transition name="jump-latest">
       <button
         v-if="showJumpToLatest"
+        ref="jumpToLatestButtonRef"
         type="button"
         class="chat-jump-latest"
         :aria-label="t('chat.jumpToLatest')"
@@ -517,7 +541,7 @@
       </button>
     </Transition>
     <!-- Slash command menu -->
-    <div v-if="slashOpen" class="chat-slash">
+    <div v-if="slashOpen" ref="slashMenuRef" class="chat-slash">
       <div
         v-for="(cmd, i) in filteredSlashCmds"
         :key="cmd.cmd"
@@ -586,8 +610,10 @@
       :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
-      :model-routing-mode="modelRoutingMode"
-      :model-routing-settings-busy="modelRoutingSettingsBusy"
+      :session-routing-mode="modelRoutingMode"
+      :session-routing-busy="modelRoutingSettingsBusy"
+      :session-routing-control-blocked="goalBusy"
+      :session-routing-available="sessionRoutingAvailable"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
       :goal-draft-armed="goalDraftArmed"
@@ -601,6 +627,7 @@
       :project-workspace="activeWorkspace"
       :project-workspace-status="activeWorkspaceStatus"
       :project-status-message="activeProjectStatusMessage"
+      :prompt-annotations="activePromptAnnotations"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="rpc.canChooseProject"
       :agent-options="composerAgentOptions"
@@ -627,7 +654,7 @@
       @retry-attachment="retryAttachment"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
-      @set-model-routing-mode="setComposerModelRoutingMode"
+      @set-session-routing-mode="setComposerSessionRoutingMode"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
@@ -640,6 +667,9 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+      @update-prompt-annotation="updatePromptAnnotation"
+      @discard-prompt-annotation="discardPromptAnnotation"
+      @jump-prompt-annotation="jumpPromptAnnotation"
       @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
     />
@@ -719,8 +749,17 @@ import { useAgentOptions } from '@/composables/useAgentOptions'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
+import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
+import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentContext'
+import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
+import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
+import {
+  focusArtifactPromptAnnotation,
+  notifyArtifactPromptAnnotationsAccepted,
+  reuseArtifactPromptAnnotation,
+} from '@/workbench/promptAnnotations'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
@@ -767,6 +806,7 @@ import {
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
+import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -900,6 +940,12 @@ import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
 } from '@/types/promptCacheKeepalive'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
+import {
+  createWorkbenchResourceRef,
+  workbenchResourceRefId,
+} from '@/types/workbenchResources'
 import type {
   CollaborationMode,
   PlanCardAction,
@@ -910,23 +956,43 @@ import {
   artifactCategory,
   artifactDownloadUrl,
   isInlineMediaArtifact,
+  isOfficeArtifact,
 } from '@/utils/chat/artifacts'
 import {
   artifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
+  initialSectionFromWorkbenchItem,
+  initialSectionRequestIdFromWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
+import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import {
+  artifactPayloadFromWorkbenchResource,
+  createResourceCollectionWorkbenchItem,
+  resourceFromPreparedPreview,
+  workbenchResourceKey,
+} from '@/workbench/workbenchResourceItems'
+import {
+  workbenchResourceActionReasonCode,
+  workbenchResourceUnavailableReasonKey,
+} from '@/workbench/resourceCapabilityPresentation'
 import {
   artifactUsesWorkbenchPreview,
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
+import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
   takeDeferredMetaDrafts,
 } from '@/utils/chat/metaDraftOutbox'
 import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
+import {
+  applyProgrammaticScroll,
+  consumeProgrammaticScroll,
+} from '@/utils/chat/scrollMutation'
 import {
   captureElementScrollAnchor,
   captureVisibleTextScrollAnchor,
@@ -955,7 +1021,7 @@ import {
 } from '@/utils/chat/toolDisplay'
 import {
   collectClipboardFiles,
-  hasSendableModelInputImageAttachment,
+  hasModelInputImageAttachment,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -993,6 +1059,9 @@ type Message = ChatMessage
 
 interface RpcAuthPayload {
   runModePolicy?: RunModePolicy
+  principal?: {
+    authState?: string
+  }
 }
 
 /* ── Constants ─────────────────────────────────────────────────────── */
@@ -1052,6 +1121,22 @@ let releaseOptionalRpcAdmission: (() => void) | null =
 let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
+
+function artifactPreviewItemForExplicitOpen(
+  options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
+) {
+  const item = createArtifactPreviewWorkbenchItem(options)
+  return requestInitialSectionForWorkbenchItem(
+    item,
+    workbenchStore.items.find(candidate => candidate.id === item.id) || null,
+  )
+}
+
+const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
+const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
+const workbenchResourcesStore = useWorkbenchResourcesStore()
+const artifactPromptAnnotationProvider = createRpcArtifactPromptAnnotationProvider(rpc)
+artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1094,7 +1179,10 @@ const chatRootRef = ref<HTMLElement | null>(null)
 const threadRef = ref<HTMLElement | null>(null)
 const goalRunDockRef = ref<HTMLElement | null>(null)
 const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
+const conversationMinimapRef = ref<{ cancelNavigation: () => void } | null>(null)
 const bottomSentinelRef = ref<HTMLElement | null>(null)
+const jumpToLatestButtonRef = ref<HTMLButtonElement | null>(null)
+const slashMenuRef = ref<HTMLElement | null>(null)
 let bottomIntersectionObserver: IntersectionObserver | null = null
 const composerRef = ref<ChatComposerHandle | null>(null)
 /* Floating-composer retract: a pure controller accumulates slow user travel
@@ -1111,7 +1199,6 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
-
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -1148,6 +1235,106 @@ function currentThreadScrollIntent(): ComposerScrollIntent {
 
 watch(composerFxEnabled, resetComposerRetraction, { flush: 'sync' })
 watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
+const promptAnnotationsEnabled = computed(() => (
+  appStore.features.artifactPromptAnnotations === true
+))
+const workbenchResourcesEnabled = computed(() => (
+  appStore.features.documentWorkbenchResources === true
+  || promptAnnotationsEnabled.value
+))
+const attachmentWorkbenchPreviewEnabled = computed(() => (
+  workbenchEnabled.value
+  && workbenchResourcesEnabled.value
+  && rpc.supportsMethod('workbench.resources.list')
+  && rpc.supportsMethod('workbench.resources.get')
+))
+const attachmentWorkbenchEditEnabled = computed(() => (
+  attachmentWorkbenchPreviewEnabled.value
+  && rpc.supportsMethod('documents.import')
+))
+const activePromptAnnotations = computed(() =>
+  promptAnnotationsEnabled.value
+    ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
+    : [])
+const sendablePromptAnnotationIds = computed(() =>
+  promptAnnotationsEnabled.value
+    ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
+      .map(annotation => annotation.annotationId)
+    : [])
+
+function promptAnnotationBlockedMessage(): string {
+  if (!promptAnnotationsEnabled.value) return ''
+  const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
+  if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
+  if (reason === 'empty') return t('chat.promptAnnotations.emptyBlocked')
+  if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
+  return ''
+}
+
+async function updatePromptAnnotation(annotationId: string, body: string) {
+  try {
+    await artifactPromptAnnotationsStore.update(annotationId, body)
+  } catch {
+    pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'danger' })
+  }
+}
+
+async function discardPromptAnnotation(annotationId: string) {
+  try {
+    await artifactPromptAnnotationsStore.discard(annotationId)
+  } catch {
+    pushToast(t('chat.promptAnnotations.discardFailed'), { tone: 'danger' })
+  }
+}
+
+function promptAnnotationRpcErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return ''
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : ''
+}
+
+async function jumpPromptAnnotation(annotationId: string) {
+  const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
+  if (!annotation) return
+  const activated = await focusArtifactPromptAnnotation({
+    annotationId,
+    documentId: annotation.documentId,
+    sessionKey: annotation.sessionKey,
+  })
+  if (!activated) {
+    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
+    return
+  }
+  try {
+    await artifactPromptAnnotationsStore.focus(annotationId)
+  } catch (error) {
+    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED') {
+      pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
+      return
+    }
+    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_ANNOTATION_NOT_DRAFT') {
+      await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
+    }
+    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
+  }
+}
+
+async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
+  if (
+    !promptAnnotationsEnabled.value
+    || !annotation.body.trim()
+    || !sessionKey.value
+    || !workbenchEnabled.value
+  ) return
+  const activated = await reuseArtifactPromptAnnotation({
+    body: annotation.body,
+    documentId: annotation.documentId,
+    sessionKey: sessionKey.value,
+  })
+  if (!activated) {
+    pushToast(t('chat.promptAnnotations.reuseUnavailable'), { tone: 'warn' })
+  }
+}
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
@@ -1155,11 +1342,31 @@ const promptCacheKeepaliveAvailable = computed(() => (
   && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
+const promptAnnotationDesktopAvailable = computed(() => (
+  workbenchEnabled.value
+  && promptAnnotationsEnabled.value
+  && platform.id === 'desktop'
+  && platform.capabilities.hasNativeWorkbenchSurfaces === true
+))
 const inputText = ref('')
 const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
+const LIVE_EDGE_EPSILON_PX = 2
+const SCROLL_DIRECTION_EPSILON_PX = 0.5
+let lastObservedThreadScrollTop: number | null = null
+let readerMovingAway = false
+
+function resetReaderScrollTracking() {
+  lastObservedThreadScrollTop = null
+  readerMovingAway = false
+}
+
+watch(sessionKey, resetReaderScrollTracking, { flush: 'sync' })
+watch(autoScroll, following => {
+  if (following) readerMovingAway = false
+}, { flush: 'sync' })
 const composing = ref(false)
 const messages = ref<Message[]>([])
 
@@ -1305,6 +1512,11 @@ const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
+const isStopPending = computed(() => (
+  Boolean(taskOwnership.stopRequestedTaskId.value)
+  || acceptanceStopPending.value
+  || acceptanceRecoveryPending.value
+))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
@@ -1313,6 +1525,14 @@ const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
 const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
+
+function isProvisionalDraftSession(): boolean {
+  return pendingSessionIntent.value === 'new_chat'
+}
+
+function isDraftSurface(): boolean {
+  return isDraftRoute() || isProvisionalDraftSession()
+}
 
 async function refreshPromptCacheKeepaliveStatus() {
   const key = sessionKey.value
@@ -1697,6 +1917,20 @@ const {
   loadCurrentSessionUsage,
 } = chatUsageWidget
 
+const chatSessionRoute = useChatSessionRoute(sessionKey)
+const {
+  route,
+  createSessionKey,
+  draftAgentId,
+  goToDraft,
+  hasLegacyNewChatQuery,
+  isDraftRoute,
+  persistSession,
+  readProjectFromUrl,
+  readSessionFromUrl,
+  resolveInitialSession,
+} = chatSessionRoute
+
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
   readCallOptions: optionalSessionRpcCallOptions,
@@ -1706,28 +1940,58 @@ const chatFeatureToggles = useChatFeatureToggles({
 const {
   routerSlots,
   routerModels,
-  routerEnabled,
-  modelRoutingMode,
-  modelRoutingSettingsBusy,
+  modelRoutingMode: globalModelRoutingMode,
+  imageInputAdmission,
+  imageInputAdmissionReason,
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
   codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
-  setModelRoutingMode,
   setCodingModeEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+
+const sessionRoutingAvailable = computed(() => {
+  const auth = rpc.auth as RpcAuthPayload | null
+  return rpc.state === 'connected'
+    && auth?.principal?.authState === 'authenticated'
+    && rpc.supportsMethod('sessions.routing.get')
+    && rpc.supportsMethod('sessions.routing.set')
+})
+const chatSessionRouting = useChatSessionRouting({
+  rpc,
+  sessionKey,
+  globalMode: globalModelRoutingMode,
+  available: sessionRoutingAvailable,
+  isStreaming,
+  isDraft: isDraftSurface,
+  notifyError: message => pushToast(
+    t('chat.modelRouting.sessionUpdateFailed', { error: message }),
+    { tone: 'danger', duration: 8000 },
+  ),
+})
+const {
+  mode: modelRoutingMode,
+  busy: modelRoutingSettingsBusy,
+  initialRoutingMode,
+} = chatSessionRouting
+const sessionRoutingSendBlockedReason = computed(() => (
+  modelRoutingSettingsBusy.value ? t('chat.composer.routingUpdateBlocked') : ''
+))
 isQueuedDeliveryBlocked = () => (
   modelRoutingSettingsBusy.value
-  && hasSendableModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+  || (
+    hasModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+    && imageInputAdmission.value === 'blocked'
+  )
 )
 watch(
-  [modelRoutingMode, modelRoutingSettingsBusy],
-  ([mode, busy], [previousMode, wasBusy]) => {
+  [imageInputAdmission, modelRoutingSettingsBusy],
+  ([admission, busy], [previousAdmission, wasBusy]) => {
     const routingUnblocked = (
-      (previousMode === 'llm_ensemble' && mode !== 'llm_ensemble')
+      (previousAdmission === 'blocked' && admission !== 'blocked')
       || (wasBusy && !busy)
     )
     if (!routingUnblocked || pendingQueue.value.length === 0) return
@@ -1736,12 +2000,25 @@ watch(
   },
 )
 
+const activeSteerCapability = computed<ChatSteerCapability | null>(() => {
+  const task = runStatus.value.task
+  return task?.steer_capability || task?.steerCapability || null
+})
+const activeTurnUsesEnsemble = computed(() => (
+  String(activeSteerCapability.value?.reason || '').trim()
+    === 'ensemble_requires_followup_turn'
+))
+const activeTurnId = computed(() => (
+  String(activeSteerCapability.value?.expected_turn_id || '').trim()
+))
+
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
   sessionKey,
   isStreaming,
   autoScroll,
-  modelRoutingMode,
+  activeTurnUsesEnsemble,
+  activeTurnId,
   streamBubble,
   streamHasVisibleOutput,
   startStreaming,
@@ -1758,31 +2035,31 @@ const {
   markEnsembleHandoff,
   flushPendingRouterDecision,
   clearPendingRouterDecision,
+  bindRouterDecisionToModelCall,
+  freezeActiveTurnRoutingMode,
 } = chatRouterDecisionRuntime
+
+watch(
+  [
+    activeTurnUsesEnsemble,
+    activeTurnId,
+    () => messages.value.length,
+  ],
+  ([usesEnsemble, expectedTurnId]) => {
+    if (usesEnsemble) freezeActiveTurnRoutingMode(expectedTurnId)
+  },
+  { immediate: true },
+)
 
 // Gate the live answer's reveal to a [MIN,MAX] window so the model-router panel
 // decides (and animates) first, then the answer follows. Self-cleans via the
 // composable's onScopeDispose.
 const { answerRevealOpen, revealNow } = useChatAnswerReveal({
   isStreaming,
-  routerEnabled,
+  routerEnabled: computed(() => modelRoutingMode.value !== 'off'),
   routerVisualEffectsEnabled,
   routerDecided: () => pendingDecision.value,
 })
-
-const chatSessionRoute = useChatSessionRoute(sessionKey)
-const {
-  route,
-  createSessionKey,
-  draftAgentId,
-  goToDraft,
-  hasLegacyNewChatQuery,
-  isDraftRoute,
-  persistSession,
-  readProjectFromUrl,
-  readSessionFromUrl,
-  resolveInitialSession,
-} = chatSessionRoute
 
 let switchToPlanSession: (key: string) => void | Promise<unknown> = () => {}
 let planMutationAccepted: () => void = () => {}
@@ -1801,7 +2078,7 @@ const chatPlans = useChatPlans({
     { tone: 'danger', duration: 8000 },
   ),
   onMutationAccepted: () => planMutationAccepted(),
-  isDraft: () => isDraftRoute() && pendingSessionIntent.value === 'new_chat',
+  isDraft: isDraftSurface,
 })
 const {
   collaboration,
@@ -1826,7 +2103,6 @@ const chatRenderedMessages = useChatRenderedMessages({
   routerTierConfigs,
   routerVisualEffectsEnabled,
   routerVisualMode,
-  modelRoutingMode,
   isStreaming,
   currentPlanRevisionId,
   renderMarkdown,
@@ -1885,9 +2161,14 @@ const {
 planMutationAccepted = () => scheduleHistorySync()
 
 const steerDelivery = useChatSteerDelivery({
+  sessionKey,
+  activeTurnId: activeStreamTaskId,
   messages,
   pendingQueue,
-  checkpointForUserMessage: turnId => chatStream.checkpointForUserMessage?.(turnId),
+  checkpointForUserMessage: (turnId, boundaryKey) =>
+    chatStream.checkpointForUserMessage?.(turnId, boundaryKey),
+  acknowledgeSteerBoundary: (boundaryKey, modelCallId, iteration) =>
+    chatStream.acknowledgeSteerBoundary?.(boundaryKey, modelCallId, iteration),
   scheduleHistorySync,
   removePendingItem: item => settlePendingDelivery(item, 'accepted'),
   restoreSteerIntoComposer: text => appendComposerText(text),
@@ -1946,10 +2227,13 @@ const chatMessageActions = useChatMessageActions({
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
   aiGeneratedLabel: () => aiGeneratedLabel.value,
-  canDeliver: () => !composerSendBlockedMessage.value,
+  canDeliver: () => (
+    !composerSendBlockedMessage.value
+    && !deliveryBlockedReason.value
+  ),
   notifyDeliveryBlocked: () => {
-    if (liveSendBlockedReason.value) {
-      pushToast(liveSendBlockedReason.value, { tone: 'info' })
+    if (deliveryBlockedReason.value) {
+      pushToast(deliveryBlockedReason.value, { tone: 'info' })
     }
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
@@ -2025,6 +2309,7 @@ const chatSessionSubscription = useChatSessionSubscription({
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
   onSnapshot: snapshot => {
+    chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
@@ -2165,6 +2450,14 @@ const liveSendBlockedReason = computed<string | null>(() => {
       : 'chat.liveSendBlockedConnecting',
   )
 })
+const promptAnnotationSendBlockedReason = computed<string | null>(() =>
+  promptAnnotationBlockedMessage() || null)
+const deliveryBlockedReason = computed<string | null>(() => (
+  sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
+))
+const effectiveSendBlockedReason = computed<string | null>(() => (
+  deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+))
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
   livePhase,
@@ -2427,6 +2720,7 @@ const chatGoals = useChatGoals({
     const sourceKey = sessionKey.value
     const sourceIntent = pendingSessionIntent.value
     const workspaceId = pendingWorkspaceId.value
+    const draftInitialRoutingMode = initialRoutingMode.value
     const created = await rpc.call<{ key?: string }>('sessions.create', {
       agentId: agentIdFromSessionKey(sourceKey),
       kind: 'webchat',
@@ -2441,6 +2735,18 @@ const chatGoals = useChatGoals({
       || pendingSessionIntent.value !== sourceIntent
       || pendingWorkspaceId.value !== workspaceId
     ) return ''
+    if (draftInitialRoutingMode) {
+      await rpc.call('sessions.routing.set', {
+        sessionKey: key,
+        mode: draftInitialRoutingMode,
+        expectedRevision: 0,
+      })
+      if (
+        sessionKey.value !== sourceKey
+        || pendingSessionIntent.value !== sourceIntent
+        || pendingWorkspaceId.value !== workspaceId
+      ) return ''
+    }
     if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
     await switchToSession(key)
     return key
@@ -2593,6 +2899,22 @@ const {
   restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
 
+watch([slashIdx, filteredSlashCmds], () => {
+  slashMenuRef.value
+    ?.querySelector<HTMLElement>('.chat-slash-item--active')
+    ?.scrollIntoView?.({ block: 'nearest' })
+}, { flush: 'post' })
+
+useDocumentEvent('pointerdown', event => {
+  if (!slashOpen.value) return
+  const menu = slashMenuRef.value
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+  if (menu && (path.includes(menu) || (event.target instanceof Node && menu.contains(event.target)))) {
+    return
+  }
+  closeSlashMenu()
+}, true)
+
 const chatComposerShortcuts = useChatComposerShortcuts({
   inputText,
   composing,
@@ -2619,11 +2941,6 @@ const {
 } = chatComposerShortcuts
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
-const activeSteerCapability = computed<ChatSteerCapability | null>(() => {
-  const task = runStatus.value.task
-  return task?.steer_capability || task?.steerCapability || null
-})
-
 const chatSend = useChatSend({
   rpc,
   supportsMethod: method => rpc.supportsMethod(method),
@@ -2637,19 +2954,52 @@ const chatSend = useChatSend({
   busySendMode,
   modelRoutingMode,
   modelRoutingSettingsBusy,
+  imageInputAdmission,
+  initialRoutingMode,
   elevatedMode,
   runMode,
   pendingAttachments,
   composerRevision,
   pendingSessionIntent,
   pendingWorkspaceId,
-  sendBlockedReason: liveSendBlockedReason,
+  sendBlockedReason: effectiveSendBlockedReason,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
   pendingForkBeforeMessageId,
+  promptAnnotationIds: sendablePromptAnnotationIds,
+  idempotentReplayBlockedReason: liveSendBlockedReason,
+  currentDocumentContext: key => (
+    workbenchDocumentContextStore.currentDocumentContext(key)
+  ),
+  prepareDocumentContextForSend: (key, prepareOptions) => (
+    workbenchDocumentContextStore.prepareDocumentContextForSend(key, prepareOptions)
+  ),
+  preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
+    const targetDocuments = new Set(
+      artifactPromptAnnotationsStore.snapshotsForIds(ids).map(item => item.documentId),
+    )
+    for (const documentId of targetDocuments) {
+      const flushed = await workbenchDocumentContextStore.prepareDocumentForSend(
+        sessionKey.value,
+        documentId,
+        prepareOptions,
+      )
+      if (flushed === false) return false
+    }
+    const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
+    return prepared && (prepareOptions?.isCurrent?.() ?? true)
+  },
+  promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
+  acknowledgePromptAnnotations: (requestedIds, acceptedIds, acceptedSessionKey) => {
+    artifactPromptAnnotationsStore.acknowledgeAccepted(requestedIds, acceptedIds)
+    notifyArtifactPromptAnnotationsAccepted({
+      acceptedIds: [...acceptedIds],
+      sessionKey: acceptedSessionKey,
+    })
+  },
   materializeDraftSession: key => {
-    if (!isDraftRoute()) return
+    if (!isProvisionalDraftSession()) return
     const workspaceId = pendingWorkspaceId.value
     if (workspaceId) {
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
@@ -2919,6 +3269,7 @@ const sameTurnSteerUnavailableMessage = computed(() => {
 
 const composerSameTurnSteerAvailable = computed(() => (
   sameTurnSteerAvailable.value
+  && !isStopPending.value
   && pendingAttachments.value.length === 0
   && !pendingSessionIntent.value
   && !pendingForkBeforeMessageId.value
@@ -2933,9 +3284,9 @@ async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
   if (composerSendBlockedMessage.value) return
-  // Serialize an existing-session mode mutation before accepting another
-  // composer turn, so the send cannot race the collaboration CAS update.
-  if (planModeBusy.value) return
+  // Serialize session-routing and plan mutations before accepting another
+  // composer turn, so the send cannot race either CAS update.
+  if (modelRoutingSettingsBusy.value || planModeBusy.value) return
   // Goal draft mode: the composer text is the durable objective and the set
   // mutation atomically accepts its first ordinary user turn.
   if (goalDraftArmed.value) {
@@ -3061,6 +3412,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   sessionRunStatus,
   applySessionRunState,
   queueRouterDecision,
+  bindRouterDecisionToModelCall,
   appendEnsembleProgress,
   markEnsembleHandoff,
   flushPendingRouterDecision,
@@ -3069,6 +3421,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
+  supportsTurnCommitted: () => rpc.supportsEvent('session.event.turn_committed'),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -3493,7 +3846,9 @@ const composerPlaceholder = computed(() => {
 })
 
 const hasSendContent = computed(() => {
-  return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
+  return inputText.value.trim().length > 0
+    || pendingAttachments.value.some(isSendableAttachment)
+    || activePromptAnnotations.value.length > 0
 })
 const composerHasSendContent = computed(() =>
   replanActive.value ? inputText.value.trim().length > 0 : hasSendContent.value,
@@ -3594,13 +3949,14 @@ const queuedImageSendBlockedMessage = computed(() => {
   if (modelRoutingSettingsBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
-  return modelRoutingMode.value === 'llm_ensemble'
+  if (imageInputAdmission.value !== 'blocked') return ''
+  return imageInputAdmissionReason.value === 'ensemble_mode_unsupported'
     ? t('chat.composer.ensembleImageUnsupported')
-    : ''
+    : t('chat.composer.imageInputUnsupported')
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasSendableModelInputImageAttachment(pendingAttachments.value)
+  return hasModelInputImageAttachment(pendingAttachments.value)
     ? queuedImageSendBlockedMessage.value
     : ''
 })
@@ -3645,7 +4001,7 @@ const composerSendBlockedMessage = computed(() =>
       )
     : '')
   || modelImageSendBlockedMessage.value
-  || liveSendBlockedReason.value
+  || effectiveSendBlockedReason.value
   || activeProjectComposerBlockMessage.value,
 )
 
@@ -3816,9 +4172,9 @@ function runComposerSandboxSetupInBackground(): void {
   composerSandboxSetupOpen.value = false
 }
 
-async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
-  await setModelRoutingMode(mode)
-  scheduleHistorySync()
+async function setComposerSessionRoutingMode(mode: ModelRoutingMode) {
+  if (goalBusy.value) return
+  await chatSessionRouting.setMode(mode)
 }
 
 async function setComposerCodingModeEnabled(enabled: boolean) {
@@ -3967,7 +4323,149 @@ async function downloadAttachment(attachment: DisplayAttachment): Promise<boolea
   return true
 }
 
+async function attachmentWorkbenchResource(
+  attachment: DisplayAttachment,
+): Promise<WorkbenchResource | null> {
+  if (!workbenchResourcesEnabled.value || !workbenchEnabled.value) return null
+  if (!attachment.attachmentId || !sessionKey.value) return null
+  const ref = {
+    type: 'attachment' as const,
+    attachmentId: attachment.attachmentId,
+    id: attachment.attachmentId,
+  }
+  let resource = workbenchResourcesStore.find(sessionKey.value, ref)
+  if (!resource) {
+    await workbenchResourcesStore.load(sessionKey.value, true)
+    resource = workbenchResourcesStore.find(sessionKey.value, ref)
+  }
+  if (resource) {
+    resource = await workbenchResourcesStore.resolve(sessionKey.value, ref) || resource
+  }
+  if (!resource) {
+    pushToast(t('workbench.resources.actionFailed'), { tone: 'danger' })
+  }
+  return resource
+}
+
+async function previewAttachmentResource(attachment: DisplayAttachment) {
+  try {
+    const resource = await attachmentWorkbenchResource(attachment)
+    if (!resource || !sessionKey.value) return
+    const current = await workbenchResourcesStore.openCurrent(sessionKey.value, resource)
+    if (current?.disposition === 'document') {
+      const artifact = artifactPayloadFromRevision(current.revision)
+      artifact.documentId = current.document.documentId
+      artifact.revisionId = current.revision.revisionId
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact,
+        initialSection: 'preview',
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: workbenchResourceKey(current.resource.resource),
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    if (!current && resource.resource.type === 'document') {
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact: artifactPayloadFromWorkbenchResource(resource),
+        initialSection: 'preview',
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: workbenchResourceKey(resource.resource),
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    if (
+      !current
+      && resource.resource.type !== 'document'
+      && resource.capabilities.manualEdit
+      && resource.sha256
+    ) {
+      const imported = await workbenchResourcesStore.importDocument(
+        sessionKey.value,
+        resource,
+      )
+      const artifact = artifactPayloadFromRevision(imported.revision)
+      artifact.documentId = imported.document.documentId
+      artifact.revisionId = imported.revision.revisionId
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact,
+        initialSection: 'preview',
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: `document:${imported.document.documentId}`,
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    const readonlyResource = current?.resource || resource
+    if (!readonlyResource.capabilities.preview) {
+      pushToast(t(workbenchResourceUnavailableReasonKey(
+        current?.reasonCode || workbenchResourceActionReasonCode(
+          readonlyResource.capabilities,
+          'preview',
+        ),
+      )), { tone: 'warn' })
+      return
+    }
+    const preview = await workbenchResourcesStore.preview(
+      sessionKey.value,
+      readonlyResource.resource,
+    )
+    if (!preview) return
+    const preparedResource = resourceFromPreparedPreview(preview)
+    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+      initialSection: 'preview',
+      nativeHtml: false,
+      preparedPreview: preview.preview,
+      previewLeaseEligible: false,
+      resourceIdentity: workbenchResourceKey(readonlyResource.resource),
+      sessionKey: sessionKey.value,
+    }))
+    if (!opened) {
+      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    }
+  } catch (error) {
+    const classified = classifyArtifactProductError(error)
+    const translated = t(classified.messageKey)
+    pushToast(
+      translated === classified.messageKey ? classified.fallbackMessage : translated,
+      { tone: 'danger', duration: 9000 },
+    )
+  }
+}
+
+async function editAttachmentResource(attachment: DisplayAttachment) {
+  // Compatibility event for older message renderers. The visible UI exposes a
+  // single Open action, and both paths resolve the same logical file.
+  await previewAttachmentResource(attachment)
+}
+
 async function downloadArtifact(artifact: ArtifactPayload) {
+  // A published delivery is an immutable snapshot. Document-head downloads
+  // are separate workbench actions and must not change what this chat card
+  // resolves to after later edits.
   const token = readAuthToken()
   const url = artifactDownloadUrl(artifact, window.location.origin, {
     sessionKey: sessionKey.value,
@@ -3996,12 +4494,23 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   }
 }
 
+function artifactUsesDocumentWorkbench(artifact: ArtifactPayload): boolean {
+  return artifactUsesWorkbenchPreview(artifact) || isOfficeArtifact(artifact)
+}
+
 const sessionWorkbenchArtifacts = computed(() =>
-  sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
+  sessionArtifacts.value.filter(artifactUsesDocumentWorkbench),
 )
 
 const headerDeliverableCount = computed(() => sessionArtifacts.value.length)
-
+const workbenchResourceSnapshot = computed(() => workbenchResourcesStore.snapshot(sessionKey.value))
+const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResource>>(() => (
+  new Map(
+    workbenchResourceSnapshot.value.resources
+      .filter(resource => resource.resource.type === 'attachment')
+      .map(resource => [workbenchResourceRefId(resource.resource), resource]),
+  )
+))
 const deliverablesOpen = ref(false)
 
 function focusHeaderAction(
@@ -4010,8 +4519,31 @@ function focusHeaderAction(
   void nextTick(() => chatRouteHeaderRegistration.focusAction(action))
 }
 
-function openDeliverables() {
+async function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
+  if (
+    workbenchEnabled.value
+    && workbenchResourcesEnabled.value
+    && sessionKey.value
+  ) {
+    try {
+      const snapshot = await workbenchResourcesStore.load(sessionKey.value)
+      const resources = workbenchResourcesStore.navigationResources(sessionKey.value)
+      if (snapshot.available && resources.length > 0) {
+        const opened = workbenchStore.openItem(createResourceCollectionWorkbenchItem({
+          resources,
+          sessionKey: sessionKey.value,
+          title: t('workbench.resources.title'),
+        }))
+        if (!opened) {
+          pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+        }
+        return
+      }
+    } catch {
+      // Mixed-version or reconnect fallback keeps the existing deliverables flow available.
+    }
+  }
   const allArtifactsUseWorkbench = sessionWorkbenchArtifacts.value.length
     === sessionArtifacts.value.length
   if (workbenchEnabled.value && allArtifactsUseWorkbench) {
@@ -4023,7 +4555,7 @@ function openDeliverables() {
       ) return false
       const artifact = artifactFromWorkbenchItem(item)
       if (!artifact) return false
-      return artifactUsesWorkbenchPreview(artifact)
+      return artifactUsesDocumentWorkbench(artifact)
     })
     if (recentPreview) {
       workbenchStore.activateItem(recentPreview.id)
@@ -4051,8 +4583,24 @@ function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
   )
 }
 
+let workbenchArtifactInventoryFingerprint = ''
+
 watch(sessionArtifacts, artifacts => {
   if (!sessionKey.value) return
+  const nextInventoryFingerprint = [
+    sessionKey.value,
+    ...artifacts.map(artifact => String(
+      artifact.id || artifact.key || artifact.download_url || artifact.name || '',
+    )),
+  ].join('\u0000')
+  if (
+    nextInventoryFingerprint !== workbenchArtifactInventoryFingerprint
+    && workbenchResourcesEnabled.value
+    && workbenchEnabled.value
+  ) {
+    workbenchArtifactInventoryFingerprint = nextInventoryFingerprint
+    void workbenchResourcesStore.load(sessionKey.value, true).catch(() => undefined)
+  }
   artifactImageLightbox.updateNavigation(artifacts, sessionKey.value)
   if (!workbenchEnabled.value) return
   for (const item of workbenchStore.items) {
@@ -4065,12 +4613,159 @@ watch(sessionArtifacts, artifacts => {
     if (!artifact) continue
     workbenchStore.updateItem(createArtifactPreviewWorkbenchItem({
       artifact,
+      initialSection: initialSectionFromWorkbenchItem(item),
+      initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item),
       navigationArtifacts: artifacts,
       nativeHtml: item.hostKind === 'native-webcontents',
+      resourceIdentity: typeof item.payload.resourceIdentity === 'string'
+        ? item.payload.resourceIdentity
+        : undefined,
       sessionKey: sessionKey.value,
     }))
   }
 })
+
+function openLegacyArtifactWorkbench(
+  artifact: ArtifactPayload,
+  initialSection: 'preview' | 'source' = 'preview',
+): boolean {
+  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    artifact,
+    initialSection,
+    navigationArtifacts: sessionArtifacts.value,
+    nativeHtml: Boolean(
+      platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    sessionKey: sessionKey.value,
+  }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+  return opened
+}
+
+async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
+  const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
+  const documentId = typeof artifact.documentId === 'string'
+    ? artifact.documentId.trim()
+    : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
+  if ((!artifactId && !documentId) || !sessionKey.value) {
+    openLegacyArtifactWorkbench(artifact)
+    return
+  }
+  try {
+    const ref = documentId
+      ? createWorkbenchResourceRef('document', documentId)
+      : createWorkbenchResourceRef('deliverable', artifactId)
+    const resource = await workbenchResourcesStore.resolve(sessionKey.value, ref)
+    if (!resource) {
+      openLegacyArtifactWorkbench(artifact)
+      return
+    }
+    const current = await workbenchResourcesStore.openCurrent(sessionKey.value, resource)
+    if (current?.disposition === 'document') {
+      const currentArtifact = artifactPayloadFromRevision(current.revision)
+      currentArtifact.documentId = current.document.documentId
+      currentArtifact.revisionId = current.revision.revisionId
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact: currentArtifact,
+        initialSection: 'preview',
+        navigationArtifacts: sessionArtifacts.value,
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: workbenchResourceKey(current.resource.resource),
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    if (!current && resource.resource.type === 'document') {
+      openLegacyArtifactWorkbench(
+        artifactPayloadFromWorkbenchResource(resource),
+        'preview',
+      )
+      return
+    }
+    if (
+      !current
+      && resource.resource.type !== 'document'
+      && resource.capabilities.manualEdit
+      && resource.sha256
+    ) {
+      const imported = await workbenchResourcesStore.importDocument(
+        sessionKey.value,
+        resource,
+      )
+      const importedArtifact = artifactPayloadFromRevision(imported.revision)
+      importedArtifact.documentId = imported.document.documentId
+      importedArtifact.revisionId = imported.revision.revisionId
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact: importedArtifact,
+        initialSection: 'preview',
+        navigationArtifacts: sessionArtifacts.value,
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: `document:${imported.document.documentId}`,
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    const readonlyResource = current?.resource || resource
+    if (!readonlyResource.capabilities.preview) {
+      pushToast(t(workbenchResourceUnavailableReasonKey(
+        current?.reasonCode || workbenchResourceActionReasonCode(
+          readonlyResource.capabilities,
+          'preview',
+        ),
+      )), { tone: 'warn' })
+      return
+    }
+    const preview = await workbenchResourcesStore.preview(
+      sessionKey.value,
+      readonlyResource.resource,
+    )
+    if (!preview) {
+      openLegacyArtifactWorkbench(artifact)
+      return
+    }
+    const preparedResource = resourceFromPreparedPreview(preview)
+    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+      navigationArtifacts: sessionArtifacts.value,
+      nativeHtml: false,
+      preparedPreview: preview.preview,
+      previewLeaseEligible: false,
+      resourceIdentity: workbenchResourceKey(readonlyResource.resource),
+      sessionKey: sessionKey.value,
+    }))
+    if (!opened) {
+      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    }
+  } catch (error) {
+    // METHOD_NOT_FOUND is normalized to a null open result by the provider and
+    // follows the compatibility path above. Any other failure must remain
+    // visible: silently opening the immutable chat artifact would disguise a
+    // failed current-head resolution as a successful edit action.
+    const classified = classifyArtifactProductError(error)
+    const translated = t(classified.messageKey)
+    pushToast(
+      translated === classified.messageKey ? classified.fallbackMessage : translated,
+      { tone: 'danger', duration: 9000 },
+    )
+  }
+}
 
 function openArtifact(artifact: ArtifactPayload): boolean {
   // Generated images are also inline media. Route every visual artifact to
@@ -4086,24 +4781,27 @@ function openArtifact(artifact: ArtifactPayload): boolean {
   }
   if (
     isInlineMediaArtifact(artifact)
-    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+    || (
+      artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+      && !isOfficeArtifact(artifact)
+    )
   ) {
     return focusInlineDeliverable(artifact)
   }
   if (!workbenchEnabled.value || !sessionKey.value) return false
-  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
-    artifact,
-    navigationArtifacts: sessionArtifacts.value,
-    nativeHtml: Boolean(
-      platform.capabilities.hasNativeWorkbenchSurfaces
-      && platform.workbench.native,
-    ),
-    sessionKey: sessionKey.value,
-  }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  if (
+    attachmentWorkbenchPreviewEnabled.value
+    && artifactWorkbenchPreviewKind(artifact) === 'html'
+    && (
+      (typeof artifact.id === 'string' && artifact.id.trim())
+      || (typeof artifact.documentId === 'string' && artifact.documentId.trim())
+      || (typeof artifact.document_id === 'string' && artifact.document_id.trim())
+    )
+  ) {
+    void openDeliverableWorkbenchResource(artifact)
+    return true
   }
-  return opened
+  return openLegacyArtifactWorkbench(artifact)
 }
 
 function closeDeliverables() {
@@ -4483,7 +5181,9 @@ function scrollToBottom() {
       // below the viewport, so the live answer remains hidden under the dock
       // and the geometric bottom gap equals the composer height. Scroll the
       // container itself to its true maximum instead.
-      threadRef.value.scrollTop = threadRef.value.scrollHeight
+      applyProgrammaticScroll(threadRef.value, () => {
+        threadRef.value!.scrollTop = threadRef.value!.scrollHeight
+      })
     }
   })
 }
@@ -4491,13 +5191,52 @@ function scrollToBottom() {
 function onThreadScroll() {
   const el = threadRef.value
   if (!el) return
+  const currentScrollTop = el.scrollTop
+  const scrollMutation = consumeProgrammaticScroll(el)
+  const previousScrollTop = scrollMutation?.expectedScrollTop
+    ?? lastObservedThreadScrollTop
+  lastObservedThreadScrollTop = currentScrollTop
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  // Virtualized row measurement and other layout corrections can move the
-  // bottom sentinel without any reader gesture. Only release live-edge follow
-  // when the reader expressed scroll intent; arriving back at the bottom may
-  // always re-enable it.
-  const intent = currentThreadScrollIntent()
-  if (gap < 60 || intent !== null) historyNavigationScrollLock.updateFromScroll(gap)
+  // Native scrollbar drags and middle-button auto-scroll can produce only a
+  // scroll event. Application-owned anchor corrections are marked at their
+  // write sites, so every other position change belongs to the reader.
+  const programmatic = scrollMutation?.matched ?? false
+  const intent = programmatic ? null : currentThreadScrollIntent()
+  if (!programmatic && historyNavigationScrollLock.locked && intent !== null) {
+    interruptHistoryNavigationForReader()
+  } else if (!programmatic && !historyNavigationScrollLock.locked) {
+    const movedUp = previousScrollTop !== null
+      && currentScrollTop < previousScrollTop - SCROLL_DIRECTION_EPSILON_PX
+    const movedDown = previousScrollTop !== null
+      && currentScrollTop > previousScrollTop + SCROLL_DIRECTION_EPSILON_PX
+    const leavingLiveEdge = intent === 'up'
+      || (gap > LIVE_EDGE_EPSILON_PX && movedUp)
+      || (
+        previousScrollTop === null
+        && autoScroll.value
+        && gap > LIVE_EDGE_EPSILON_PX
+      )
+
+    if (leavingLiveEdge) {
+      readerMovingAway = true
+      autoScroll.value = false
+    } else if (gap <= LIVE_EDGE_EPSILON_PX) {
+      readerMovingAway = false
+      historyNavigationScrollLock.updateFromScroll(gap)
+    } else if (readerMovingAway) {
+      // Browser scroll anchoring can adjust scrollTop without an input event.
+      // While the reader is paused, only a definite downward gesture may use
+      // the forgiving 60px return threshold; source-less movement must reach
+      // the real live edge before following resumes.
+      if (intent === 'down' && movedDown) {
+        historyNavigationScrollLock.updateFromScroll(gap)
+      }
+    } else if (movedDown) {
+      historyNavigationScrollLock.updateFromScroll(gap)
+    } else {
+      historyNavigationScrollLock.updateFromScroll(gap)
+    }
+  }
   if (isNewChatLanding.value || !composerFxEnabled.value) {
     resetComposerRetraction()
     return
@@ -4506,7 +5245,7 @@ function onThreadScroll() {
   composerCollapsed.value = composerRetraction.observe({
     scrollTop: el.scrollTop,
     bottomGap: gap,
-    intent: currentThreadScrollIntent(),
+    intent,
     canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
     navigationLocked: historyNavigationScrollLock.locked,
   })
@@ -4514,13 +5253,54 @@ function onThreadScroll() {
 }
 
 function onThreadWheel(event: WheelEvent) {
-  if (event.deltaY === 0) return
+  // Browser zoom gestures surface as ctrl+wheel (including trackpad pinch in
+  // Chromium) but do not represent reader movement inside the transcript.
+  if (event.deltaY === 0 || event.ctrlKey) return
+  const el = threadRef.value
+  if (!el) return
+  // Any wheel gesture inside the transcript takes ownership away from an
+  // in-flight minimap animation, including gestures consumed by a nested
+  // reasoning/tool scroller. Outside navigation, only a wheel that reaches the
+  // thread itself may pause live-edge following.
+  if (historyNavigationScrollLock.locked && !event.defaultPrevented) {
+    interruptHistoryNavigationForReader()
+  }
+  if (!threadConsumesWheel(event, el)) return
   markThreadScrollIntent(event.deltaY < 0 ? 'up' : 'down')
+  if (event.deltaY < 0) pauseFollowingForUpwardIntent()
+}
+
+function threadConsumesWheel(event: WheelEvent, thread: HTMLElement): boolean {
+  if (event.defaultPrevented) return false
+  const canScroll = (element: HTMLElement) => event.deltaY < 0
+    ? element.scrollTop > SCROLL_DIRECTION_EPSILON_PX
+    : element.scrollTop + element.clientHeight
+      < element.scrollHeight - SCROLL_DIRECTION_EPSILON_PX
+
+  for (const target of event.composedPath()) {
+    if (target === thread) return canScroll(thread)
+    if (!(target instanceof HTMLElement)) continue
+    const style = getComputedStyle(target)
+    const scrollable = ['auto', 'scroll', 'overlay'].includes(style.overflowY)
+      && target.scrollHeight > target.clientHeight + SCROLL_DIRECTION_EPSILON_PX
+    if (!scrollable) continue
+    if (canScroll(target)) return false
+    if (style.overscrollBehaviorY === 'contain' || style.overscrollBehaviorY === 'none') {
+      return false
+    }
+  }
+  return false
+}
+
+function onThreadTouchMove() {
+  markThreadScrollIntent('either')
+  interruptHistoryNavigationForReader()
 }
 
 function onThreadPointerMove(event: PointerEvent) {
   if (event.buttons !== 0 || event.pointerType === 'touch') {
     markThreadScrollIntent('either')
+    interruptHistoryNavigationForReader()
   }
 }
 
@@ -4535,14 +5315,31 @@ function onThreadScrollKeydown(event: KeyboardEvent) {
     || event.key === 'End'
     || (event.key === ' ' && !event.shiftKey)
   if (up || down) markThreadScrollIntent(up ? 'up' : 'down')
+  if (up) pauseFollowingForUpwardIntent()
 }
 
-function syncComposerRetractionFromThread() {
+function pauseFollowingForUpwardIntent() {
+  const el = threadRef.value
+  if (!el || el.scrollTop <= SCROLL_DIRECTION_EPSILON_PX) return
+  lastObservedThreadScrollTop = el.scrollTop
+  readerMovingAway = true
+  autoScroll.value = false
+}
+
+function interruptHistoryNavigationForReader() {
+  if (!historyNavigationScrollLock.locked) return
+  const firstInterruption = historyNavigationScrollLock.interrupt()
+  readerMovingAway = true
+  autoScroll.value = false
+  if (firstInterruption) conversationMinimapRef.value?.cancelNavigation()
+}
+
+function syncComposerRetractionFromThread(updateFollow = true) {
   const el = threadRef.value
   if (!el) return
   clearPendingComposerScrollIntent()
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  historyNavigationScrollLock.updateFromScroll(gap)
+  if (updateFollow) historyNavigationScrollLock.updateFromScroll(gap)
   composerCollapsed.value = composerRetraction.observe({
     scrollTop: el.scrollTop,
     bottomGap: gap,
@@ -4559,17 +5356,31 @@ function onHistoryNavigate() {
 }
 
 function onHistoryNavigateEnd() {
-  historyNavigationScrollLock.finish()
+  const navigationInterrupted = historyNavigationScrollLock.finish()
   // Smooth-scroll frames and the final arrival are navigation, not transcript
-  // browsing gestures. Establish a baseline without toggling the composer.
-  syncComposerRetractionFromThread()
+  // browsing gestures. If the reader interrupted the motion, establish only a
+  // composer baseline and preserve their pause unless they reached true bottom.
+  syncComposerRetractionFromThread(!navigationInterrupted)
+  if (navigationInterrupted) {
+    const el = threadRef.value
+    const gap = el ? el.scrollHeight - el.scrollTop - el.clientHeight : Infinity
+    if (gap <= LIVE_EDGE_EPSILON_PX) {
+      readerMovingAway = false
+      historyNavigationScrollLock.updateFromScroll(gap)
+    }
+  }
   if (autoScroll.value) expandComposer()
 }
 
 // Show the jump-to-latest affordance whenever the reader has scrolled up off the
-// live edge (autoScroll releases at gap >= 60) and there is content to return to.
-// Re-pinning autoScroll lets the stream resume following the bottom.
+// live edge. Upward reader movement releases the follow immediately; scrolling
+// back within 60px of the bottom resumes it.
 const showJumpToLatest = computed(() => !autoScroll.value && messages.value.length > 0)
+watch(showJumpToLatest, showing => {
+  if (showing || document.activeElement !== jumpToLatestButtonRef.value) return
+  threadRef.value?.focus({ preventScroll: true })
+}, { flush: 'sync' })
+
 function jumpToLatest() {
   cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
@@ -4827,7 +5638,7 @@ function draftProjectHydrationIsCurrent(
   workspaceId: string | null,
 ): boolean {
   return draftProjectHydration.isCurrent(generation)
-    && isDraftRoute()
+    && isDraftSurface()
     && readProjectFromUrl() === workspaceId
 }
 
@@ -4914,7 +5725,16 @@ onMounted(async () => {
     && bottomSentinelRef.value
   ) {
     bottomIntersectionObserver = new IntersectionObserver((entries) => {
-      if (entries.some(entry => entry.isIntersecting) && !historyNavigationScrollLock.locked) {
+      const thread = threadRef.value
+      const bottomGap = thread
+        ? thread.scrollHeight - thread.scrollTop - thread.clientHeight
+        : Number.POSITIVE_INFINITY
+      if (
+        entries.some(entry => entry.isIntersecting)
+        && bottomGap <= LIVE_EDGE_EPSILON_PX
+        && !readerMovingAway
+        && !historyNavigationScrollLock.locked
+      ) {
         autoScroll.value = true
       }
     }, {
@@ -4967,6 +5787,7 @@ onMounted(async () => {
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
   unsubs.push(metaRuns.subscribe())
+  unsubs.push(chatSessionRouting.subscribe())
   unsubs.push(chatPlans.subscribe())
   const sessionBootstrap = startSessionBootstrap({
     includeHistory: !initialSession.draft,
@@ -5021,7 +5842,9 @@ onMounted(async () => {
           composerDockPinFrame = null
           const thread = threadRef.value
           if (thread && autoScroll.value) {
-            thread.scrollTop = thread.scrollHeight
+            applyProgrammaticScroll(thread, () => {
+              thread.scrollTop = thread.scrollHeight
+            })
           }
         })
       }
@@ -5105,6 +5928,7 @@ onUnmounted(() => {
   cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
+  artifactPromptAnnotationsStore.setProvider(null)
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
@@ -5285,10 +6109,12 @@ watch(sessionKey, () => {
   // Retire any in-flight page walk and clear the old Session before starting
   // the new one, so a late response cannot leak deliverables across tabs/routes.
   resetSessionArtifacts()
-  if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
   if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
+  if (sessionKey.value && promptAnnotationsEnabled.value) {
+    void artifactPromptAnnotationsStore.load(sessionKey.value)
+  }
 })
 
 // Hello refreshes method capabilities on reconnect. Retry the durable index
@@ -5301,6 +6127,9 @@ watch(() => rpc.state, (state, previous) => {
     && pendingSessionIntent.value !== 'new_chat'
   ) {
     void loadSessionArtifactsAfterReconnect()
+    if (promptAnnotationsEnabled.value) {
+      void artifactPromptAnnotationsStore.load(sessionKey.value, { force: true })
+    }
   }
 })
 

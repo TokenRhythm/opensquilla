@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Mapping
@@ -31,6 +32,24 @@ ALWAYS_REQUIRED_RESULTS: Final[tuple[tuple[str, str], ...]] = (
     ("RESULT_CLASSIFY", "Classify changed files"),
     ("RESULT_WORKFLOW_LINT", "Workflow lint"),
     ("RESULT_README_LOCALE", "README locale parity"),
+)
+KNOWN_SUITES: Final[frozenset[str]] = frozenset(
+    {
+        "desktop-recovery-e2e",
+        "desktop-static",
+        "frontend",
+        "macos-recovery",
+        "managed-toolchain",
+        "python-full",
+        "python-targeted",
+        "readme-locale",
+        "release-packaging",
+        "tui",
+        "webui-chat-recovery",
+        "windows-compat",
+        "windows-high-risk",
+        "workflow-lint",
+    }
 )
 
 
@@ -64,11 +83,33 @@ def _require_result(
         errors.append(f"{label} must {expectation}; got {result or 'missing'}.")
 
 
+def _read_required_suites(env: Mapping[str, str], errors: list[str]) -> set[str] | None:
+    raw = env.get("REQUIRED_SUITES")
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        errors.append("Suite planner output required_suites must be valid JSON.")
+        return set()
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        errors.append("Suite planner output required_suites must be a list of strings.")
+        return set()
+    if value != sorted(set(value)):
+        errors.append("Suite planner output required_suites must be sorted and duplicate-free.")
+        return set()
+    unknown = sorted(set(value) - KNOWN_SUITES)
+    if unknown:
+        errors.append("Suite planner selected unknown suites: " + ", ".join(unknown))
+    return set(value)
+
+
 def check_ci_results(env: Mapping[str, str]) -> list[str]:
     """Return gate errors; an empty list means the aggregate check may pass."""
 
     errors: list[str] = []
     flags = _read_flags(env, errors)
+    required_suites = _read_required_suites(env, errors)
 
     for variable, label in ALWAYS_REQUIRED_RESULTS:
         _require_result(env, errors, variable, label, required=True)
@@ -84,55 +125,87 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         or flags["dependency_changed"]
         or flags["release_changed"]
     )
+    if required_suites is None:
+        suite_required = {
+            "frontend": (
+                flags["frontend_changed"]
+                or flags["build_wheel_required"]
+                or flags["platform_sensitive_changed"]
+                or flags["desktop_changed"]
+                or full
+            ),
+            "tui": flags["tui_changed"] or full,
+            "desktop-static": flags["desktop_changed"] or full,
+            "python-targeted": flags["python_changed"] or full,
+            "python-full": flags["python_full_required"] or full,
+            "windows-compat": windows_smoke_relevant and not windows_full_required,
+            "windows-high-risk": windows_full_required,
+            "macos-recovery": (
+                flags["platform_sensitive_changed"] or flags["desktop_changed"] or full
+            ),
+            "desktop-recovery-e2e": (
+                flags["platform_sensitive_changed"] or flags["desktop_changed"] or full
+            ),
+            "webui-chat-recovery": (
+                flags["frontend_changed"] or flags["platform_sensitive_changed"] or full
+            ),
+            "release-packaging": flags["release_changed"] or full,
+            "managed-toolchain": flags["toolchain_artifact_changed"] or full,
+        }
+    else:
+        suite_required = {suite: suite in required_suites for suite in KNOWN_SUITES}
     conditional_results = (
         (
             "RESULT_FRONTEND",
-            "Frontend build, tests, and artifact",
-            flags["frontend_changed"]
-            or flags["build_wheel_required"]
-            or flags["platform_sensitive_changed"]
-            or flags["desktop_changed"]
-            or full,
+            "Frontend tests and package validation",
+            suite_required["frontend"],
         ),
-        ("RESULT_TUI", "OpenTUI package tests", flags["tui_changed"] or full),
-        ("RESULT_DESKTOP", "Desktop Electron unit tests", flags["desktop_changed"] or full),
-        ("RESULT_UBUNTU", "Ubuntu quality gate", flags["python_changed"] or full),
+        ("RESULT_TUI", "OpenTUI package tests", suite_required["tui"]),
+        ("RESULT_DESKTOP", "Desktop Electron unit tests", suite_required["desktop-static"]),
+        (
+            "RESULT_UBUNTU",
+            "Ubuntu quality gate",
+            suite_required["python-targeted"] or suite_required["python-full"],
+        ),
         (
             "RESULT_UBUNTU_FULL",
             "Ubuntu full test matrix",
-            flags["python_full_required"] or full,
+            suite_required["python-full"],
         ),
         (
             "RESULT_WINDOWS_SMOKE",
             "Windows compatibility smoke tests",
-            windows_smoke_relevant and not windows_full_required,
+            suite_required["windows-compat"],
         ),
         (
             "RESULT_WINDOWS_FULL",
             "Windows high-risk matrix",
-            windows_full_required,
+            suite_required["windows-high-risk"],
         ),
         (
             "RESULT_MACOS_RECOVERY",
             "macOS profile recovery and native no-replace tests",
-            flags["platform_sensitive_changed"] or flags["desktop_changed"] or full,
+            suite_required["macos-recovery"],
         ),
         (
             "RESULT_DESKTOP_RECOVERY_E2E",
             "Desktop recovery E2E matrix",
-            flags["platform_sensitive_changed"]
-            or flags["desktop_changed"]
-            or full,
+            suite_required["desktop-recovery-e2e"],
+        ),
+        (
+            "RESULT_WEBUI_CHAT_RECOVERY",
+            "WebUI chat recovery browser contracts",
+            suite_required["webui-chat-recovery"],
         ),
         (
             "RESULT_RELEASE",
             "Release packaging contracts",
-            flags["release_changed"] or full,
+            suite_required["release-packaging"],
         ),
         (
             "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",
             "Managed Toolchain Artifact E2E",
-            flags["toolchain_artifact_changed"] or full,
+            suite_required["managed-toolchain"],
         ),
     )
     for variable, label, required in conditional_results:

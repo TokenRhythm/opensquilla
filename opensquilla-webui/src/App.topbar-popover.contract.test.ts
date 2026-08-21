@@ -2,13 +2,16 @@ import { describe, expect, it } from 'vitest'
 
 import appSource from './App.vue?raw'
 
-describe('App chat topbar popover contract', () => {
-  it('provides chat-only arbitration and registers the App-owned theme menu', () => {
+describe('App topbar popover contract', () => {
+  it('provides global arbitration and registers the App-owned theme menu', () => {
     expect(appSource).toContain(
-      'provideChatTopbarPopoverCoordinator(isChatRoute)',
+      'const topbarPopoverCoordinationEnabled = ref(true)',
     )
     expect(appSource).toContain(
-      "'theme',\n  themeMenuOpen,\n  chatTopbarPopoverCoordinator,",
+      'provideChatTopbarPopoverCoordinator(\n  topbarPopoverCoordinationEnabled,\n)',
+    )
+    expect(appSource).toContain(
+      "'theme',\n  themeMenuOpen,\n  topbarPopoverCoordinator,",
     )
     expect(appSource).toContain('data-chat-topbar-popover="theme"')
   })

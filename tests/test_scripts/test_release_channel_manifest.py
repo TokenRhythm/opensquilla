@@ -6,6 +6,7 @@ import pytest
 
 from scripts.release_channel_manifest import (
     ManifestError,
+    build_draft_rehearsal_manifest,
     build_manifest,
     release_is_channel_head,
     should_promote,
@@ -68,6 +69,22 @@ def test_final_release_advances_stable_and_same_base_preview() -> None:
     _, targets = build_manifest(_release("v0.5.0", prerelease=False), _assets("0.5.0"))
 
     assert targets == ("latest.json", "stable.json", "preview/0.5.0.json")
+
+
+def test_draft_rehearsal_manifest_is_ephemeral_but_schema_identical() -> None:
+    draft = _release("v0.5.4", prerelease=False)
+    draft["isDraft"] = True
+
+    manifest = build_draft_rehearsal_manifest(draft, _assets("0.5.4"))
+
+    assert validate_manifest(manifest) == manifest
+    assert manifest["tag"] == "v0.5.4"
+    assert manifest["version"] == "0.5.4"
+    with pytest.raises(ManifestError, match="isDraft must be true"):
+        build_draft_rehearsal_manifest(
+            _release("v0.5.4", prerelease=False),
+            _assets("0.5.4"),
+        )
 
 
 def test_manifest_requires_release_flag_and_assets_to_match_tag() -> None:

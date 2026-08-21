@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it } from 'vitest'
-import { createApp, type App } from 'vue'
+import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import ChatMessageList from './ChatMessageList.vue'
@@ -13,6 +13,77 @@ afterEach(() => {
 })
 
 describe('ChatMessageList history anchors', () => {
+  it('adds an applied result only after an authoritative mutation outcome arrives', async () => {
+    const userMessage: ChatRenderedMessage = {
+      id: 'rendered-user-annotation',
+      messageId: 'message-user-annotation',
+      turnId: 'turn-annotation',
+      turnKey: 'turn:turn-annotation',
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'user',
+      text: '',
+      timeStr: '',
+      showHeader: false,
+      turnOutcome: { turnId: 'turn-annotation', status: 'succeeded' },
+      promptAnnotations: [{
+        annotationId: 'annotation-1',
+        documentId: 'document-1',
+        documentName: 'page.html',
+        revisionId: 'revision-1',
+        generation: 1,
+        anchorId: 'anchor-1',
+        body: 'Make the button red.',
+        tagName: 'button',
+        locator: {},
+        quote: '<button>',
+        sourceExcerpt: null,
+        sentOrder: 0,
+      }],
+    }
+    const messages = ref<ChatRenderedMessage[]>([userMessage])
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(defineComponent({
+      setup: () => () => h(ChatMessageList, {
+        messages: messages.value,
+        shareMode: false,
+        selectedMessageIds: new Set<string>(),
+        stripTimePrefix: (value: string) => value,
+        renderMarkdown: (value: string) => value,
+        fmtTok: (value: number) => String(value),
+        subagentSummary: (value: string) => value,
+        subagentBody: (value: string) => value,
+        toolCallGroups: () => [],
+        isToolGroupOpen: () => false,
+        isToolItemOpen: () => false,
+        toolGroupStatusText: () => '',
+        toolStatusText: () => '',
+        toolSecondaryText: () => '',
+        copyMessage: async () => true,
+        downloadAttachment: async () => true,
+      }),
+    }))
+    app.use(i18n)
+    app.mount(host)
+    apps.push(app)
+
+    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')).toBeNull()
+
+    messages.value = [{
+      ...userMessage,
+      turnOutcome: {
+        turnId: 'turn-annotation',
+        status: 'succeeded',
+        documentMutationOutcome: { version: 1, status: 'applied' },
+      },
+    }]
+    await nextTick()
+
+    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')
+      ?.getAttribute('data-status')).toBe('applied')
+  })
+
   it('renders the same stable user-message anchor consumed by the minimap', () => {
     const userMessage: ChatRenderedMessage = {
       id: 'rendered-user-1',

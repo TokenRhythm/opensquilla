@@ -104,7 +104,9 @@
               }"
               :data-status="model.status || undefined"
             >
-              <span class="router-fx-inspector__role">{{ model.role }}</span>
+              <span class="router-fx-inspector__role">
+                {{ ensembleMemberRoleLabel(model.role) }} <span aria-hidden="true">·</span>
+              </span>
               <span class="router-fx-inspector__model" :title="model.model">{{ model.modelShort }}</span>
               <span class="router-fx-inspector__usage" :title="ensembleModelTitle(model)">
                 <span
@@ -140,6 +142,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 import type { ChatEnsembleMetaModel, ChatRenderedMessage } from '@/types/chat'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 
 const ROUTER_FX_SCAN_STEP_MS = 190
 const ROUTER_FX_SCAN_WINDOW_MS = 600
@@ -794,7 +797,6 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--router-muted);
-  text-transform: uppercase;
   white-space: nowrap;
 }
 

@@ -453,7 +453,10 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
         ("onboarding", "onboarding.status"),
         ("run-mode", "sandbox.run_mode.preference.get"),
         ("config", "config.get"),
+        ("models", "models.routing.get"),
         ("commands", "commands.list_for_surface"),
+        ("usage", "usage.status"),
+        ("artifacts", "artifacts.list"),
         ("agents", "agents.list"),
         ("sessions", "sessions.list"),
     )

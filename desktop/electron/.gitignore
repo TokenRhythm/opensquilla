@@ -4,3 +4,4 @@ node_modules/
 .runtime-cache/
 runtime/*
 !runtime/runtime-manifest.json
+!runtime/runtime-pack-catalog.json

@@ -141,6 +141,16 @@ class GuestRpcPolicy:
         if not owner_id or not _OWNER_ID_RE.fullmatch(str(owner_id)):
             raise GuestRpcPolicyError("Anonymous guest identity is unavailable")
 
+        # Guests may send their first message but cannot choose a cost or
+        # capability profile that their principal is not allowed to mutate.
+        # Keep the global routing default for both immediate and staged sends.
+        if method in {"chat.send", "sessions.pending_inputs.enqueue"} and isinstance(
+            params, dict
+        ):
+            params = dict(params)
+            params.pop("initialRoutingMode", None)
+            params.pop("initial_routing_mode", None)
+
         if method == "sessions.list":
             return params
 

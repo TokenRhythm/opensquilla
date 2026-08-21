@@ -594,6 +594,7 @@ async def test_running_task_wins_when_followup_queues_and_terminal_hands_off() -
         runtime._tasks[first.task_id].cancel_requested = True
     snapshot = await runtime.session_task_snapshot(session.session_key)
     assert snapshot.running_task_id == first.task_id
+    assert snapshot.cancel_requested_task_ids == (first.task_id,)
     async with runtime._state_lock:
         runtime._tasks[first.task_id].cancel_requested = False
 
