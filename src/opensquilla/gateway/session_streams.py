@@ -251,6 +251,7 @@ class SessionStreamRegistry:
             try:
                 self._terminal_task_order.remove(task_id)
             except ValueError:
+                # A snapshot may outlive its bounded-order bookkeeping entry.
                 pass
             return terminal_activity_snapshot(
                 frozen,
