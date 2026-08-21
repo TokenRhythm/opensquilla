@@ -50,6 +50,36 @@
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
+          <UnifiedAssistantActivityTimeline
+            v-if="hasUnifiedActivityOrder"
+            :projection="visibleActivityProjection"
+            :timeline-items="visibleActivityItems"
+            :reasoning-blocks="reasoningBlocks"
+            :reasoning-pace-bursts="reasoningRevealPending"
+            :state-scope="toolStateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+            @reveal-complete="completeTerminalReasoningReveal"
+            @toggle-group="$emit('toggleToolGroup', $event)"
+            @toggle-item="$emit('toggleToolItem', $event)"
+            @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
+          >
+            <template #interrupt="{ part }">
+              <InterruptPart
+                v-if="part.resolution"
+                :part="part"
+                timeline
+                @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
+                @extend="id => $emit('extendInterrupt', id)"
+                @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+                @clarify-dismiss="$emit('clarifyDismiss')"
+              />
+            </template>
+          </UnifiedAssistantActivityTimeline>
+          <template v-else>
           <AssistantActivityTimeline
             v-if="hasBeforeReasoningActivity"
             :projection="visibleActivityProjection"
@@ -109,6 +139,14 @@
               />
             </template>
           </AssistantActivityTimeline>
+          </template>
+          <p
+            v-if="message.activitySnapshotIncomplete"
+            class="assistant-activity-incomplete"
+            role="status"
+          >
+            {{ t('chat.activity.recordIncomplete') }}
+          </p>
         </ActivityDisclosure>
         <div
           v-if="activityProjection.answerPart && !hasPlan"
@@ -401,6 +439,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
+import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import SourcesRow from '@/components/chat/SourcesRow.vue'
@@ -808,7 +847,9 @@ const activityProjection = computed(() =>
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
-      endedAt: epochMilliseconds(props.message.ts),
+      endedAt: epochMilliseconds(
+        props.message.turnOutcome?.finishedAt ?? props.message.ts,
+      ),
     },
   ),
 )
@@ -898,6 +939,20 @@ const visibleActivityProjection = computed(() => ({
   activityClusters: visibleActivityClusters.value,
   statusSteps: visibleActivityStatusSteps.value,
 }))
+function validActivityOrder(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+const hasUnifiedActivityOrder = computed(() => {
+  const orders = [
+    ...visibleActivityStatusSteps.value.map(step => step.activityOrder),
+    ...reasoningBlocks.value.map(block => block.activityOrder),
+    ...visibleActivityItems.value.map(item => (
+      item.activityOrder
+      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
+    )),
+  ]
+  return orders.length > 0 && orders.every(validActivityOrder)
+})
 const hasBeforeReasoningActivity = computed(() =>
   visibleActivityStatusSteps.value.some(isBeforeReasoningActivityStatusStep),
 )
@@ -912,8 +967,8 @@ const hasActivity = computed(() =>
   || visibleActivityStatusSteps.value.length > 0,
 )
 const showActivityDisclosure = computed(() =>
-  activityProjection.value.canSeparateActivity
-  && hasActivity.value,
+  (activityProjection.value.canSeparateActivity && hasActivity.value)
+  || props.message.activitySnapshotIncomplete === true,
 )
 
 const documentApplyFailureCount = computed(() =>
@@ -1145,6 +1200,12 @@ function fmtUsd(value: number): string {
 </script>
 
 <style scoped>
+.assistant-activity-incomplete {
+  margin: 0.375rem 0 0;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 0.75rem;
+}
+
 .msg-ai-main > :deep(.approval-card),
 .msg-ai-main > :deep(.clarify-card) {
   width: 100%;

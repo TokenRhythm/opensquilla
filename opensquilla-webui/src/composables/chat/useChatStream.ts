@@ -275,6 +275,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   })
   const {
     appendFrame,
+    setAcceptedActivityOrder,
     checkpointText,
     finalizeToolInputs,
     peekRawText,
@@ -355,6 +356,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   const reasoningPresentationPending = ref(false)
 
   function resetStreamState() {
+    acceptedActivityStartedAt = 0
     streamRaw.value = ''
     streamSegments.value = []
     streamToolCalls.value = []
@@ -385,26 +387,36 @@ export function useChatStream(options: UseChatStreamOptions) {
   // `key` identifies the activity phase: the elapsed counter restarts only
   // when the phase changes, so label refinements (e.g. tool arguments
   // streaming in) keep the same running clock.
-  function setStreamActivity(label: string, key = label) {
+  let acceptedActivityStartedAt = 0
+
+  function setAcceptedActivityStartedAt(value: number | undefined) {
+    acceptedActivityStartedAt = (
+      typeof value === 'number' && Number.isFinite(value) && value > 0
+        ? value
+        : 0
+    )
+  }
+
+  function setStreamActivity(label: string, key = label, recordActivity = true) {
     noteStreamSignal()
     const current = streamActivity.value
     let isNewPhase = false
     if (current.key === key) {
       if (!current.startedAt) {
-        streamActivity.value = { label, key, startedAt: Date.now() }
+        streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
         isNewPhase = true
       } else if (current.label !== label) {
         streamActivity.value = { label, key, startedAt: current.startedAt }
       }
     } else {
-      streamActivity.value = { label, key, startedAt: Date.now() }
+      streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
       isNewPhase = true
     }
     // Record each accepted phase transition into the append-only log so the
     // finished turn can show the activity timeline. Gated on the reducer like
     // every other frame; OFF mode appends nothing and the history stays empty.
     // Label-only refinements (same key) emit nothing — only a real phase change.
-    if (isNewPhase && useReducer.value) {
+    if (isNewPhase && recordActivity && useReducer.value) {
       const committed = streamActivity.value
       appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt })
       // TurnAccumulator is intentionally non-reactive. A provider phase can be
@@ -417,6 +429,10 @@ export function useChatStream(options: UseChatStreamOptions) {
         streamActivityTick.value++
       }, 1000)
     }
+  }
+
+  function recordActivityPhase(label: string, key = label) {
+    setStreamActivity(label, key, true)
   }
 
   function recordCompactionActivity(payload: CompactionPayload) {
@@ -1016,7 +1032,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       activeModelCallId = modelCallId
       activeModelCallIteration = iteration
     }
-    setStreamActivity('Writing reply', `write:${streamRound.value}`)
+    recordActivityPhase('Writing reply', `write:${streamRound.value}`)
     if (useReducer.value !== true) streamRaw.value += deltaText
 
     if (useReducer.value !== true) {
@@ -1519,6 +1535,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     approvalId: string
     data: InterruptApprovalData | InterruptClarifyData
     at: number
+    activityOrder?: number
   }) {
     noteStreamSignal()
     if (useReducer.value) appendFrame({ kind: 'interrupt', ...input })
@@ -1693,6 +1710,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendToolResult,
     appendArtifact,
     appendInterruptFrame,
+    recordActivityPhase,
+    setAcceptedActivityStartedAt,
     ensureInterruptBubble,
     reconcileFinalText,
     resetStreamIdleTimer,
@@ -1712,6 +1731,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // (which own the thinking ref) append their frame; assertLiveParity is run
     // from a DEV watchEffect; foldedTurn is the fold output (not rendered yet).
     appendFrame,
+    setAcceptedActivityOrder,
     noteReasoningPresentationDelta,
     completeReasoningPresentation,
     useReducer,

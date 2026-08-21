@@ -111,6 +111,8 @@ export interface ChatRpcStreamApi {
   resetStreamIdleTimer: (opts?: { progress?: boolean }) => void
   clearStreamIdleTimer: () => void
   setStreamActivity: (label: string, key?: string) => void
+  recordActivityPhase?: (label: string, key?: string) => void
+  setAcceptedActivityStartedAt?: (value: number | undefined) => void
   restoreStatusHistory?: (entries: readonly StatusPart[]) => void
   recordCompactionActivity?: (payload: CompactionPayload) => void
   showThinkingIndicator: () => void
@@ -118,6 +120,7 @@ export interface ChatRpcStreamApi {
   // live-turn shadow log: the thinking ref lives here, so this composable appends
   // its own thinking frames into the stream-owned log after the legacy mutation.
   appendFrame: (frame: FrameInput) => void
+  setAcceptedActivityOrder?: (order: number | undefined) => void
   noteReasoningPresentationDelta?: (text: string) => void
   useReducer: Ref<FoldLiveTurnMode>
   getThinkingText?: () => string
@@ -610,6 +613,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     return replayPayload
   }
 
+  // Authoritative snapshots and already-accepted pending frames deliberately
+  // replay without their sequence field so they can rebuild local state even
+  // when the browser cursor is newer. Keep the original order in a synchronous
+  // side channel: the fold needs it for chronology, while downstream legacy
+  // callbacks retain the established sequence-free payload shape.
+  let replayActivityOrder: number | undefined
+
   function comparePendingReplayEntries(
     left: BufferedPendingReplayEntry,
     right: BufferedPendingReplayEntry,
@@ -849,49 +859,57 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const payload = entry.replayWithoutSeq
       ? withoutBufferedStreamSeq(entry.payload)
       : entry.payload
-    if (event === 'session.event.answer_generation_reset') {
-      handleRpcAnswerGenerationReset(payload as AnswerGenerationResetPayload)
-    } else if (event === 'session.event.text_delta') {
-      handleRpcTextDelta(payload as TextDeltaPayload)
-    } else if (event === 'session.event.tool_use_start') {
-      handleRpcToolUseStart(payload as ToolUsePayload)
-    } else if (event === 'session.event.tool_use_delta') {
-      handleRpcToolUseDelta(payload as ToolDeltaPayload)
-    } else if (event === 'session.event.tool_use_end') {
-      handleRpcToolUseEnd(payload as ToolEndPayload)
-    } else if (event === 'session.event.tool_result') {
-      handleRpcToolResult(payload as ToolResultPayload)
-    } else if (event === 'session.event.artifact') {
-      handleRpcArtifact(payload as ArtifactPayload)
-    } else if (event === 'session.event.state_change') {
-      handleRpcStateChange(payload)
-    } else if (event === 'session.event.run_heartbeat') {
-      handleRpcRunHeartbeat(payload)
-    } else if (event === 'session.event.provider_activity') {
-      handleRpcProviderActivity(payload as ProviderActivityPayload)
-    } else if (event === 'session.event.router_decision') {
-      handleRpcRouterDecision(payload as RouterDecisionPayload)
-    } else if (event === 'session.event.ensemble_progress') {
-      handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
-    } else if (event === 'session.event.router_control_replay') {
-      handleRpcRouterControlReplay(payload)
-    } else if (event === 'session.event.input_disposition') {
-      handleRpcInputDisposition(payload as InputDispositionPayload)
-    } else if (event === 'session.event.compaction') {
-      // A live snapshot is the authoritative base for the active stream, not
-      // historical replay. Compaction deliberately ignores replayed
-      // non-terminal events, so mark this as live to restore the busy/Stop
-      // state before subscribing from snapshot.current_stream_seq.
-      handleRpcCompaction(payload as CompactionPayload, {
-        authoritativeLive: true,
-        replayed: false,
-      })
-    } else if (
-      event === 'session.event.thinking_start'
-      || event === 'session.event.thinking'
-      || event === 'session.event.thinking_end'
-    ) {
-      handleRpcAny(event, payload)
+    const previousReplayOrder = replayActivityOrder
+    replayActivityOrder = entry.replayWithoutSeq
+      ? bufferedStreamSeq(entry.payload) ?? undefined
+      : undefined
+    try {
+      if (event === 'session.event.answer_generation_reset') {
+        handleRpcAnswerGenerationReset(payload as AnswerGenerationResetPayload)
+      } else if (event === 'session.event.text_delta') {
+        handleRpcTextDelta(payload as TextDeltaPayload)
+      } else if (event === 'session.event.tool_use_start') {
+        handleRpcToolUseStart(payload as ToolUsePayload)
+      } else if (event === 'session.event.tool_use_delta') {
+        handleRpcToolUseDelta(payload as ToolDeltaPayload)
+      } else if (event === 'session.event.tool_use_end') {
+        handleRpcToolUseEnd(payload as ToolEndPayload)
+      } else if (event === 'session.event.tool_result') {
+        handleRpcToolResult(payload as ToolResultPayload)
+      } else if (event === 'session.event.artifact') {
+        handleRpcArtifact(payload as ArtifactPayload)
+      } else if (event === 'session.event.state_change') {
+        handleRpcStateChange(payload)
+      } else if (event === 'session.event.run_heartbeat') {
+        handleRpcRunHeartbeat(payload)
+      } else if (event === 'session.event.provider_activity') {
+        handleRpcProviderActivity(payload as ProviderActivityPayload)
+      } else if (event === 'session.event.router_decision') {
+        handleRpcRouterDecision(payload as RouterDecisionPayload)
+      } else if (event === 'session.event.ensemble_progress') {
+        handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
+      } else if (event === 'session.event.router_control_replay') {
+        handleRpcRouterControlReplay(payload)
+      } else if (event === 'session.event.input_disposition') {
+        handleRpcInputDisposition(payload as InputDispositionPayload)
+      } else if (event === 'session.event.compaction') {
+        // A live snapshot is the authoritative base for the active stream, not
+        // historical replay. Compaction deliberately ignores replayed
+        // non-terminal events, so mark this as live to restore the busy/Stop
+        // state before subscribing from snapshot.current_stream_seq.
+        handleRpcCompaction(payload as CompactionPayload, {
+          authoritativeLive: true,
+          replayed: false,
+        })
+      } else if (
+        event === 'session.event.thinking_start'
+        || event === 'session.event.thinking'
+        || event === 'session.event.thinking_end'
+      ) {
+        handleRpcAny(event, payload)
+      }
+    } finally {
+      replayActivityOrder = previousReplayOrder
     }
   }
 
@@ -922,15 +940,25 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         }]
       })
       .sort(comparePendingReplayEntries)
+    // Open/reset the live reducer before accepting the first authoritative
+    // snapshot frame. startStreaming() clears the prior turn log, including
+    // its accepted activity-order context; doing that from the first event
+    // handler would therefore erase that frame's stream_seq and force the
+    // entire restored turn onto the legacy reordered renderer.
+    if (replayEntries.length > 0 && !stream.isStreaming.value) {
+      stream.startStreaming()
+    }
     for (const entry of replayEntries) {
       if (entry.kind !== 'stream') continue
-      const payload = { ...entry.payload }
       // Snapshot events retain their original sequence for diagnostics, but
       // they form an authoritative base rather than fresh deltas. Replaying
       // them through the normal render handlers without the old sequence
       // rebuilds the bubble even when this client already had a newer cursor.
-      delete payload.stream_seq
-      replayPendingStreamEvent({ event: entry.event, payload })
+      replayPendingStreamEvent({
+        event: entry.event,
+        payload: { ...entry.payload },
+        replayWithoutSeq: true,
+      })
     }
 
     if (
@@ -1204,6 +1232,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           && msg.text.trim() === record.messageText
         if (!matchesTurn && !matchesAnswer) continue
         claimed.add(msg)
+        // A complete terminal v2 snapshot is the canonical chronology. The
+        // local retention log only bridges projections without one; restoring
+        // it here can duplicate a live phase after the durable replacement.
+        if (msg.activitySnapshot?.complete && !msg.activitySnapshotIncomplete) break
         const existing = msg.statusHistory ?? []
         const localPhaseKeys = new Set(record.statusHistory.map(step =>
           `${step.action}\u001f${step.at}\u001f${step.id || ''}`,
@@ -1336,8 +1368,35 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function acceptStreamSeq(payload: StreamEventEnvelope): boolean {
     options.observeStreamGeneration?.(payload)
     const decision = decideStreamSeq(payload, sessionKey.value, lastStreamSeq.value)
-    if (decision.accepted) lastStreamSeq.value = decision.nextStreamSeq
+    if (decision.accepted) {
+      lastStreamSeq.value = decision.nextStreamSeq
+      const rawOrder = payload.stream_seq ?? payload.streamSeq
+      stream.setAcceptedActivityOrder?.(
+        typeof rawOrder === 'number' && Number.isSafeInteger(rawOrder) && rawOrder > 0
+          ? rawOrder
+          : replayActivityOrder,
+      )
+      stream.setAcceptedActivityStartedAt?.(activityStartedAt(payload))
+    }
     return decision.accepted
+  }
+
+  function activityStartedAt(payload: StreamEventEnvelope): number {
+    const value = Number(
+      payload.started_at
+      ?? payload.startedAt
+      ?? payload.emitted_at
+      ?? payload.emittedAt,
+    )
+    return Number.isFinite(value) && value > 0 ? value : Date.now()
+  }
+
+  function recordActivityPhase(label: string, key = label) {
+    if (stream.recordActivityPhase) {
+      stream.recordActivityPhase(label, key)
+    } else {
+      stream.setStreamActivity(label, key)
+    }
   }
 
   function numericGenerationEpoch(raw: unknown): number | null {
@@ -1639,14 +1698,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (activeState) options.markEnsembleHandoff()
     if (to === 'thinking') {
       if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-        stream.setStreamActivity('Planning next step')
+        recordActivityPhase('Planning next step')
       } else if (!stream.streamBubble.value) {
         stream.showThinkingIndicator()
       }
     } else if (to === 'streaming' && stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-      stream.setStreamActivity('Model is generating')
+      recordActivityPhase('Model is generating')
     } else if ((to === 'tool_calling' || to === 'tool_use') && stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-      stream.setStreamActivity('Preparing tool call')
+      recordActivityPhase('Preparing tool call')
     } else if (to && stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
       stream.setStreamActivity('Still running')
     }
@@ -1695,26 +1754,26 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.markEnsembleHandoff()
 
     if (phase === 'requesting') {
-      stream.setStreamActivity('Waiting for model', 'provider:requesting')
+      recordActivityPhase('Waiting for model', 'provider:requesting')
     } else if (phase === 'reasoning') {
-      stream.setStreamActivity('Thinking deeply', 'provider:reasoning')
+      recordActivityPhase('Thinking deeply', 'provider:reasoning')
     } else if (phase === 'retry_wait' && safeReason === 'rate_limited') {
-      stream.setStreamActivity(
+      recordActivityPhase(
         `Rate limited · ${retryAfterSeconds}s`,
         `provider:rate_limited:${retryAfterSeconds}`,
       )
     } else if (phase === 'retry_wait') {
-      stream.setStreamActivity(
+      recordActivityPhase(
         `Waiting to retry · ${retryAfterSeconds}s`,
         `provider:retry_wait:${retryAfterSeconds}`,
       )
     } else if (phase === 'retrying') {
-      stream.setStreamActivity(
+      recordActivityPhase(
         `Retrying ${attempt}/${limit}`,
         `provider:retrying:${attempt}:${limit}`,
       )
     } else if (phase === 'fallback') {
-      stream.setStreamActivity('Switching to backup model', 'provider:fallback')
+      recordActivityPhase('Switching to backup model', 'provider:fallback')
     }
   }
 
@@ -2067,6 +2126,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
+    if (!stream.isStreaming.value) stream.startStreaming()
+    recordActivityPhase('Selecting model', 'router:decided')
     options.queueRouterDecision(payload)
   }
 

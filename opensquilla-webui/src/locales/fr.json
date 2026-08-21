@@ -3653,7 +3653,8 @@
       },
       "more": "{count} de plus",
       "stale": "Toujours en cours — aucun signal récent",
-      "liveStep": "étape {n}"
+      "liveStep": "étape {n}",
+      "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible."
     },
     "suggestedTasks": "Tâches suggérées",
     "greetingMorning": "Bonjour.",

@@ -86,8 +86,23 @@
         />
       </button>
     </div>
-    <div v-else-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
-    <div v-else-if="item.type === 'interrupt'" class="run-trace__interrupt">
+    <div
+      v-else-if="item.type === 'text'"
+      class="msg-ai-text"
+      :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+      :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+      :data-activity-id="presentation === 'activity' ? item.key : undefined"
+      :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
+      v-html="item.html"
+    />
+    <div
+      v-else-if="item.type === 'interrupt'"
+      class="run-trace__interrupt"
+      :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+      :data-activity-type="presentation === 'activity' ? 'interrupt' : undefined"
+      :data-activity-id="presentation === 'activity' ? item.key : undefined"
+      :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
+    >
       <slot name="interrupt" :part="item.part" />
     </div>
     <button
@@ -151,7 +166,15 @@
             tag="div"
             class="step-group-members"
           >
-            <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
+            <div
+              v-for="call in item.group.calls"
+              :key="call.renderKey"
+              class="tool-row-wrap"
+              :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+              :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+              :data-activity-id="presentation === 'activity' ? `tool:${call.toolId}` : undefined"
+              :data-activity-order="presentation === 'activity' ? call.activityOrder : undefined"
+            >
               <button
                 type="button"
                 class="tool-row tool-row--member"
@@ -213,7 +236,15 @@
           </TransitionGroup>
         </template>
         <template v-else>
-          <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
+          <div
+            v-for="call in item.group.calls"
+            :key="call.renderKey"
+            class="tool-row-wrap"
+            :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+            :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+            :data-activity-id="presentation === 'activity' ? `tool:${call.toolId}` : undefined"
+            :data-activity-order="presentation === 'activity' ? call.activityOrder : undefined"
+          >
             <button
               type="button"
               class="tool-row"

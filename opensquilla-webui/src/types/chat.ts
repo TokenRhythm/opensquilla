@@ -180,6 +180,7 @@ export interface ChatToolCall {
   resultPreview: string
   sources?: unknown
   isOpen: boolean
+  activityOrder?: number
 }
 
 export type ChatToolCallRenderItem = ChatToolCall & {
@@ -206,6 +207,7 @@ export interface ChatToolCallGroup {
   isRunning: boolean
   isError: boolean
   status: '' | 'success' | 'error'
+  activityOrder?: number
 }
 
 export type ChatTextPresentation = 'intermediate' | 'answer'
@@ -219,6 +221,7 @@ export interface ChatStreamSegment {
   groupId?: string
   operationKey?: string
   approvalId?: string
+  activityOrder?: number
 }
 
 export type ChatStreamTimelineItem =
@@ -228,13 +231,15 @@ export type ChatStreamTimelineItem =
       html: string
       rawText?: string
       presentation?: ChatTextPresentation
+      activityOrder?: number
     }
-  | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
+  | { type: 'tool-group'; key: string; group: ChatToolCallGroup; activityOrder?: number }
   | {
       type: 'interrupt'
       key: string
       approvalId: string
       part: Extract<import('./parts').ChatPart, { type: 'interrupt' }>
+      activityOrder?: number
     }
 
 export type ChatRole = 'user' | 'assistant' | 'system' | 'error' | 'router' | string
@@ -316,6 +321,7 @@ export interface ChatTurnOutcome {
   replaySafe?: boolean
   userMessageId?: string
   acceptedRoutingMode?: 'direct' | 'router' | 'ensemble'
+  activitySnapshot?: ActivitySnapshotV2
 }
 
 export interface ChatRunTask {
@@ -388,6 +394,7 @@ export interface ChatTimelineSegment extends Record<string, unknown> {
   group_id?: string
   approvalId?: string
   approval_id?: string
+  activityOrder?: number
 }
 
 export interface ChatModelCallSegment {
@@ -528,6 +535,22 @@ export interface ChatReasoning {
   seconds: number
 }
 
+export type ActivitySnapshotEntry = Record<string, unknown> & {
+  type: 'phase' | 'reasoning' | 'segment' | 'interrupt' | 'maintenance'
+  id: string
+  order: number
+}
+
+export interface ActivitySnapshotV2 {
+  version: 2
+  taskId: string
+  turnId: string
+  complete: boolean
+  reasoningUtf16Length?: number
+  entries: ActivitySnapshotEntry[]
+  checksum?: string
+}
+
 /** A non-conversational maintenance event rendered inside transcript chronology. */
 export interface ChatMaintenanceEvent {
   kind: 'context_compaction'
@@ -556,6 +579,8 @@ export interface ChatMessage {
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
   /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
   reasoningPresentationPending?: boolean
+  activitySnapshot?: ActivitySnapshotV2
+  activitySnapshotIncomplete?: boolean
   routerDecision?: import('./rpc').RouterDecisionPayload | null
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
@@ -691,6 +716,8 @@ export interface ChatRenderedMessage {
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
   /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
   reasoningPresentationPending?: boolean
+  activitySnapshot?: ActivitySnapshotV2
+  activitySnapshotIncomplete?: boolean
   interrupted?: boolean
   /** The turn ended with a terminal error after this partial assistant output. */
   terminalFailure?: boolean

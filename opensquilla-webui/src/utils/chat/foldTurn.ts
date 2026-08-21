@@ -216,6 +216,7 @@ export class TurnAccumulator {
     blockIndex: number | undefined,
     at: number,
     contentKind: 'summary' | 'reasoning' = 'reasoning',
+    activityOrder?: number,
   ): ReasoningBlock {
     const id = blockId || 'legacy-reasoning'
     const existing = this.reasoningBlocksById.get(id)
@@ -238,6 +239,7 @@ export class TurnAccumulator {
       status: 'streaming',
       startedAt: at,
       contentKind,
+      activityOrder,
     }
     this.reasoningBlocks.push(block)
     this.reasoningBlocksById.set(id, block)
@@ -276,6 +278,7 @@ export class TurnAccumulator {
     name: string,
     input: string,
     running: boolean,
+    activityOrder?: number,
   ): ChatToolCall {
     const existing = this.toolCallsById.get(toolId)
     if (existing) {
@@ -299,7 +302,7 @@ export class TurnAccumulator {
       : `stream:tool-group:${operationKey}:${this.toolGroupSeq++}`
 
     if (lastSegment?.type !== 'tool-group' || lastSegment.groupId !== groupId) {
-      this.segments.push({ type: 'tool-group', groupId, operationKey })
+      this.segments.push({ type: 'tool-group', groupId, operationKey, activityOrder })
     }
 
     const call: ChatToolCall = {
@@ -315,6 +318,7 @@ export class TurnAccumulator {
       result: '',
       resultPreview: '',
       isOpen: false,
+      activityOrder,
     }
     this.toolCalls.push(call)
     this.toolCallsById.set(toolId, call)
@@ -338,6 +342,7 @@ export class TurnAccumulator {
             html: '',
             dirty: true,
             presentation: frame.presentation,
+            activityOrder: frame.activityOrder,
           })
         } else {
           lastSegment.raw = `${lastSegment.raw || ''}${frame.text}`
@@ -349,7 +354,13 @@ export class TurnAccumulator {
         if (!this.toolTimes.has(frame.toolId)) {
           this.toolTimes.set(frame.toolId, { startedAt: frame.at })
         }
-        this.ensureCall(frame.toolId, frame.name, frame.input, true)
+        this.ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          true,
+          frame.activityOrder,
+        )
         break
       }
       case 'tool-delta': {
@@ -370,7 +381,13 @@ export class TurnAccumulator {
         break
       }
       case 'tool-result': {
-        const call = this.ensureCall(frame.toolId, frame.name, frame.input, false)
+        const call = this.ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          false,
+          frame.activityOrder,
+        )
         if (!frame.input) this.finalizeToolInput(call)
         call.isRunning = false
         call.status = frame.isError ? 'error' : 'success'
@@ -390,6 +407,7 @@ export class TurnAccumulator {
           frame.blockIndex,
           frame.at,
           frame.contentKind,
+          frame.activityOrder,
         )
         break
       case 'thinking': {
@@ -398,6 +416,8 @@ export class TurnAccumulator {
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.text += frame.text
         break
@@ -407,6 +427,8 @@ export class TurnAccumulator {
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.status = frame.status
         block.endedAt = frame.at
@@ -428,7 +450,11 @@ export class TurnAccumulator {
           if (displacedText?.type === 'text' && displacedText.presentation === 'answer') {
             displacedText.dirty = true
           }
-          this.segments.push({ type: 'interrupt', approvalId: frame.approvalId })
+          this.segments.push({
+            type: 'interrupt',
+            approvalId: frame.approvalId,
+            activityOrder: frame.activityOrder,
+          })
         } else {
           this.interrupts[index] = mergeInterruptData(
             this.interrupts[index]!,
@@ -444,6 +470,7 @@ export class TurnAccumulator {
           action: frame.action,
           label: frame.label,
           at: frame.at,
+          activityOrder: frame.activityOrder,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -462,6 +489,7 @@ export class TurnAccumulator {
               ...this.statusHistory[index],
               ...entry,
               at: this.statusHistory[index]!.at,
+              activityOrder: this.statusHistory[index]!.activityOrder,
             }
           }
         } else {
@@ -565,16 +593,26 @@ export class TurnAccumulator {
     const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
       if (segment.type === 'text') {
         const raw = String(segment.raw || '')
-        return raw ? [{ type: 'text', raw, presentation: segment.presentation }] : []
+        return raw ? [{
+          type: 'text',
+          raw,
+          presentation: segment.presentation,
+          activityOrder: segment.activityOrder,
+        }] : []
       }
       if (segment.type === 'interrupt') {
         const approvalId = String(segment.approvalId || '')
-        return approvalId ? [{ type: 'interrupt', approvalId }] : []
+        return approvalId ? [{
+          type: 'interrupt',
+          approvalId,
+          activityOrder: segment.activityOrder,
+        }] : []
       }
       return [{
         type: 'tool-group',
         groupId: segment.groupId,
         operationKey: segment.operationKey,
+        activityOrder: segment.activityOrder,
       }]
     })
     const base = {
@@ -642,6 +680,7 @@ export function foldTurn(
     blockIndex: number | undefined,
     at: number,
     contentKind: 'summary' | 'reasoning' = 'reasoning',
+    activityOrder?: number,
   ): ReasoningBlock {
     const id = blockId || 'legacy-reasoning'
     const existing = reasoningBlocksById.get(id)
@@ -670,6 +709,7 @@ export function foldTurn(
       status: 'streaming',
       startedAt: at,
       contentKind,
+      activityOrder,
     }
     reasoningBlocks.push(block)
     reasoningBlocksById.set(id, block)
@@ -679,7 +719,13 @@ export function foldTurn(
   // Mirror ensureStreamToolCall's group derivation: a tool joins the trailing
   // tool-group segment when the operationKey matches, else opens a new group
   // with a monotonic counter. Returns the existing call when already seen.
-  function ensureCall(toolId: string, name: string, input: string, running: boolean): ChatToolCall {
+  function ensureCall(
+    toolId: string,
+    name: string,
+    input: string,
+    running: boolean,
+    activityOrder?: number,
+  ): ChatToolCall {
     const existing = toolCallsById.get(toolId)
     if (existing) {
       if (input) {
@@ -697,7 +743,7 @@ export function foldTurn(
       : `stream:tool-group:${operationKey}:${toolGroupSeq++}`
 
     if (lastSegment?.type !== 'tool-group' || lastSegment.groupId !== groupId) {
-      segments.push({ type: 'tool-group', groupId, operationKey })
+      segments.push({ type: 'tool-group', groupId, operationKey, activityOrder })
     }
 
     const call: ChatToolCall = {
@@ -713,6 +759,7 @@ export function foldTurn(
       result: '',
       resultPreview: '',
       isOpen: false,
+      activityOrder,
     }
     toolCalls.push(call)
     toolCallsById.set(toolId, call)
@@ -735,6 +782,7 @@ export function foldTurn(
             html: '',
             dirty: true,
             presentation: frame.presentation,
+            activityOrder: frame.activityOrder,
           })
         } else {
           lastSegment.raw = (lastSegment.raw || '') + frame.text
@@ -747,7 +795,13 @@ export function foldTurn(
         if (!toolTimes.has(frame.toolId)) {
           toolTimes.set(frame.toolId, { startedAt: frame.at })
         }
-        ensureCall(frame.toolId, frame.name, frame.input, true)
+        ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          true,
+          frame.activityOrder,
+        )
         break
       }
       case 'tool-delta': {
@@ -762,7 +816,13 @@ export function foldTurn(
         break
       }
       case 'tool-result': {
-        const tc = ensureCall(frame.toolId, frame.name, frame.input, false)
+        const tc = ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          false,
+          frame.activityOrder,
+        )
         tc.isRunning = false
         tc.status = frame.isError ? 'error' : 'success'
         tc.isError = frame.isError
@@ -782,6 +842,7 @@ export function foldTurn(
           frame.blockIndex,
           frame.at,
           frame.contentKind,
+          frame.activityOrder,
         )
         break
       }
@@ -791,6 +852,8 @@ export function foldTurn(
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.text += frame.text
         break
@@ -800,6 +863,8 @@ export function foldTurn(
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.status = frame.status
         block.endedAt = frame.at
@@ -816,7 +881,11 @@ export function foldTurn(
         if (i === undefined) {
           interruptIndex.set(frame.approvalId, interrupts.length)
           interrupts.push({ kind: frame.interruptKind, approvalId: frame.approvalId, data: frame.data })
-          segments.push({ type: 'interrupt', approvalId: frame.approvalId })
+          segments.push({
+            type: 'interrupt',
+            approvalId: frame.approvalId,
+            activityOrder: frame.activityOrder,
+          })
         } else {
           // A later requested-frame for the same id (re-broadcast / hydration
           // backfill) merges richer data without reordering.
@@ -834,6 +903,7 @@ export function foldTurn(
           action: frame.action,
           label: frame.label,
           at: frame.at,
+          activityOrder: frame.activityOrder,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -855,6 +925,7 @@ export function foldTurn(
               ...statusHistory[index],
               ...entry,
               at: statusHistory[index]!.at,
+              activityOrder: statusHistory[index]!.activityOrder,
             }
           }
         } else {
@@ -911,16 +982,26 @@ export function foldTurn(
   const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
     if (segment.type === 'text') {
       const raw = String(segment.raw || '')
-      return raw ? [{ type: 'text', raw, presentation: segment.presentation }] : []
+      return raw ? [{
+        type: 'text',
+        raw,
+        presentation: segment.presentation,
+        activityOrder: segment.activityOrder,
+      }] : []
     }
     if (segment.type === 'interrupt') {
       const approvalId = String(segment.approvalId || '')
-      return approvalId ? [{ type: 'interrupt', approvalId }] : []
+      return approvalId ? [{
+        type: 'interrupt',
+        approvalId,
+        activityOrder: segment.activityOrder,
+      }] : []
     }
     return [{
       type: 'tool-group',
       groupId: segment.groupId,
       operationKey: segment.operationKey,
+      activityOrder: segment.activityOrder,
     }]
   })
   const base = { timelineItems, toolCalls, artifacts, rawText }

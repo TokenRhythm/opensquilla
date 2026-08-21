@@ -3741,7 +3741,8 @@
       },
       "more": "另有 {count} 项",
       "stale": "仍在工作 —— 暂无新信号",
-      "liveStep": "第 {n} 步"
+      "liveStep": "第 {n} 步",
+      "recordIncomplete": "活动记录不完整，已显示兼容历史视图。"
     },
     "suggestedTasks": "推荐任务",
     "greetingMorning": "早上好。",

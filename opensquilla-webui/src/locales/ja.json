@@ -3653,7 +3653,8 @@
       },
       "more": "ほか {count} 項目",
       "stale": "処理を継続中 — 最近の信号はありません",
-      "liveStep": "ステップ {n}"
+      "liveStep": "ステップ {n}",
+      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。"
     },
     "suggestedTasks": "おすすめのタスク",
     "greetingMorning": "おはようございます。",

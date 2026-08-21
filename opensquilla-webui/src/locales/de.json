@@ -3653,7 +3653,8 @@
       },
       "more": "{count} weitere",
       "stale": "Arbeitet weiter — kein aktuelles Signal",
-      "liveStep": "Schritt {n}"
+      "liveStep": "Schritt {n}",
+      "recordIncomplete": "Aktivitätsprotokoll unvollständig; kompatible Verlaufsansicht wird angezeigt."
     },
     "suggestedTasks": "Vorgeschlagene Aufgaben",
     "greetingMorning": "Guten Morgen.",

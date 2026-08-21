@@ -6035,6 +6035,7 @@ class TaskRuntime:
                     failure_kind=failure_kind,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
+                    terminal_at=terminal_update["finished_at"],
                     usage_call_index=usage_call_index,
                     no_prior_provider_dispatch=no_prior_provider_dispatch,
                     replay_safe=replay_safe,
@@ -6593,6 +6594,7 @@ class TaskRuntime:
         failure_kind: str | None,
         retry_after_ms: int | None,
         activity_snapshot: object,
+        terminal_at: int,
         usage_call_index: int | None,
         no_prior_provider_dispatch: bool,
         replay_safe: bool,
@@ -6601,6 +6603,35 @@ class TaskRuntime:
         existing = await self._storage.get_agent_task(task.task_id)
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        durable_activity_snapshot: dict[str, Any] | None = None
+        try:
+            from opensquilla.gateway.session_streams import get_session_streams
+
+            durable_activity_snapshot = get_session_streams().take_terminal_activity_snapshot(
+                task.envelope.session_key,
+                task.task_id,
+                turn_id=task.task_id,
+                terminal_at=terminal_at,
+            )
+        except Exception:  # noqa: BLE001 - terminalization must remain available.
+            log.warning(
+                "task_runtime.activity_snapshot_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                exc_info=True,
+            )
+        if durable_activity_snapshot is None:
+            durable_activity_snapshot = terminal_activity_snapshot(
+                activity_snapshot,
+                task_id=task.task_id,
+                turn_id=task.task_id,
+            )
+        if durable_activity_snapshot is None:
+            log.warning("task_runtime.activity_snapshot_missing")
+        elif durable_activity_snapshot.get("complete") is not True:
+            log.warning("task_runtime.activity_snapshot_incomplete")
+        if durable_activity_snapshot is not None:
+            details["activity_snapshot"] = durable_activity_snapshot
         pending_applied = task.pending_input_provider.pending_applied()
         if pending_applied:
             # If transcript persistence was temporarily unavailable after a
@@ -6677,7 +6708,7 @@ class TaskRuntime:
                     turn_outcome["retry_after_ms"] = safe_retry
                     details["retry_after_ms"] = safe_retry
                 snapshot = terminal_activity_snapshot(
-                    activity_snapshot,
+                    details.get("activity_snapshot", activity_snapshot),
                     task_id=task.task_id,
                     turn_id=task.task_id,
                 )
@@ -6749,6 +6780,13 @@ class TaskRuntime:
         """Retry one terminal task-row update after its public fallback event."""
 
         try:
+            preserved_activity_snapshot: object = activity_snapshot
+            existing_details = terminal_update.get("details")
+            if isinstance(existing_details, dict):
+                preserved_activity_snapshot = existing_details.get(
+                    "activity_snapshot",
+                    activity_snapshot,
+                )
             terminal_update.update(
                 await self._terminal_details_update(
                     task,
@@ -6758,7 +6796,8 @@ class TaskRuntime:
                     error_message=error_message,
                     failure_kind=failure_kind,
                     retry_after_ms=retry_after_ms,
-                    activity_snapshot=activity_snapshot,
+                    activity_snapshot=preserved_activity_snapshot,
+                    terminal_at=int(terminal_update["finished_at"]),
                     usage_call_index=usage_call_index,
                     no_prior_provider_dispatch=no_prior_provider_dispatch,
                     replay_safe=replay_safe,

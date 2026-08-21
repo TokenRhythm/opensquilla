@@ -12,6 +12,10 @@ import {
   terminalActivityStatusHistory,
   usageAccountingErrorCode,
 } from '@/utils/chat/usageAccountingFailure'
+import {
+  activityStatusHistory,
+  normalizeActivitySnapshot,
+} from '@/utils/chat/activitySnapshot'
 
 type RawOutcomeRecord = Record<string, unknown>
 
@@ -309,11 +313,16 @@ export function normalizeTurnOutcome(
     && noPriorState.value === true
   const provedReplaySafe = provedNoPriorProviderDispatch
     && replaySafeState.value === true
-  const statusHistory = terminalActivityStatusHistory(
-    record.activity_snapshot ?? record.activitySnapshot
-      ?? nested.activity_snapshot ?? nested.activitySnapshot,
+  const rawActivitySnapshot = record.activity_snapshot ?? record.activitySnapshot
+    ?? nested.activity_snapshot ?? nested.activitySnapshot
+  const activitySnapshot = normalizeActivitySnapshot(
+    rawActivitySnapshot,
     turnId,
+    taskId,
   )
+  const statusHistory = activitySnapshot?.complete
+    ? activityStatusHistory(activitySnapshot)
+    : terminalActivityStatusHistory(rawActivitySnapshot, turnId)
   const acceptedRoutingModeRaw = text(
     record.accepted_routing_mode
     ?? record.acceptedRoutingMode
@@ -350,6 +359,7 @@ export function normalizeTurnOutcome(
     ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterMs: retryAfter } : {}),
     ...(usageCallIndex !== undefined ? { usageCallIndex } : {}),
     ...(statusHistory.length ? { statusHistory } : {}),
+    ...(activitySnapshot ? { activitySnapshot } : {}),
     ...(acceptedRoutingMode ? { acceptedRoutingMode } : {}),
   }
 }

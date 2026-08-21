@@ -3741,7 +3741,8 @@
       },
       "more": "{count} more",
       "stale": "Still working — no recent signal",
-      "liveStep": "step {n}"
+      "liveStep": "step {n}",
+      "recordIncomplete": "Activity record incomplete; showing the compatible history view."
     },
     "suggestedTasks": "Suggested tasks",
     "greetingMorning": "Good morning.",

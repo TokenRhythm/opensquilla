@@ -312,6 +312,40 @@
               :elapsed-label="streamTurnElapsed"
               :stale="streamActivityStale"
             >
+              <UnifiedAssistantActivityTimeline
+                v-if="liveHasUnifiedActivityOrder"
+                variant="checklist"
+                :projection="liveActivityProjection"
+                :timeline-items="liveActivityTimelineItems"
+                :reasoning-blocks="liveReasoningBlocks"
+                :reasoning-collapse-active="liveReasoningCollapseActive"
+                :reasoning-timeline-phase="false"
+                reasoning-pace-bursts
+                :state-scope="liveToolStateScope"
+                :is-tool-group-open="isToolGroupOpen"
+                :is-tool-item-open="isToolItemOpen"
+                :tool-group-status-text="toolGroupStatusText"
+                :tool-status-text="toolStatusText"
+                :tool-secondary-text="toolSecondaryText"
+                :tool-elapsed-text="liveToolElapsedText"
+                @reveal-complete="completeReasoningPresentation"
+                @toggle-group="toggleToolGroup"
+                @toggle-item="toggleToolItem"
+                @show-result="showToolResultModal"
+              >
+                <template #interrupt="{ part }">
+                  <InterruptPart
+                    v-if="part.resolution"
+                    :part="part"
+                    timeline
+                    @resolve="resolveInterrupt"
+                    @extend="extendInterrupt"
+                    @clarify-submit="(fields, request) => submitClarify(fields, request)"
+                    @clarify-dismiss="dismissClarify"
+                  />
+                </template>
+              </UnifiedAssistantActivityTimeline>
+              <template v-else>
               <ReasoningTimeline
                 v-if="liveReasoningBlocks.length"
                 :blocks="liveReasoningBlocks"
@@ -352,6 +386,7 @@
                   />
                 </template>
               </AssistantActivityTimeline>
+              </template>
             </ActivityDisclosure>
 
             <!-- The gateway marks text as intermediate or answer. Only the
@@ -759,6 +794,7 @@ import {
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
+import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
@@ -1037,6 +1073,7 @@ import {
 } from '@/utils/chat/sessionLoadState'
 import {
   isSemanticActivityStatusStep,
+  isVisibleActivityStatusStep,
   projectAssistantActivityTimeline,
   splitLiveAssistantTimeline,
 } from '@/utils/chat/assistantActivity'
@@ -3504,6 +3541,22 @@ const liveReasoningBlocks = computed<ReasoningBlock[]>(() => {
     startedAt: Date.now() - elapsed * 1000,
     contentKind: 'reasoning',
   }]
+})
+function validLiveActivityOrder(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+const liveHasUnifiedActivityOrder = computed(() => {
+  const orders = [
+    ...liveActivityProjection.value.statusSteps
+      .filter(isVisibleActivityStatusStep)
+      .map(step => step.activityOrder),
+    ...liveReasoningBlocks.value.map(block => block.activityOrder),
+    ...liveActivityTimelineItems.value.map(item => (
+      item.activityOrder
+      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
+    )),
+  ]
+  return orders.length > 0 && orders.every(validLiveActivityOrder)
 })
 // No clamp and no raw status count: the header chip must agree with the
 // visible body, which renders clusters plus only the semantic status steps.

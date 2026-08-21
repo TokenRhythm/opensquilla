@@ -2210,6 +2210,103 @@ describe('useChatHistory optimistic local rows', () => {
     })
   })
 
+  it('accepts a complete v2 atomically and rejects transcript drift without partial mixing', async () => {
+    const assistantMessage = {
+      id: 'assistant-activity-v2',
+      message_id: 'assistant-activity-v2',
+      role: 'assistant' as const,
+      text: 'Final answer.',
+      reasoning_content: ' A😀 ',
+      timestamp: '2026-07-07T10:00:01Z',
+      turn_context: { turn_id: 'turn-activity-v2' },
+      tool_calls: [
+        { type: 'text', text: 'Inspect.' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view', input: {} },
+        { type: 'tool_result', tool_use_id: 'tool-1', name: 'skill_view', result: 'ok' },
+        { type: 'text', text: 'Final answer.' },
+      ],
+    }
+    const entries = [
+      {
+        type: 'phase', id: 'provider:requesting:4', order: 4,
+        kind: 'provider', phase: 'requesting', at: 4_000, ended_at: 5_000,
+      },
+      {
+        type: 'reasoning', id: 'reasoning-1', order: 6, block_index: 0,
+        started_at: 6_000, ended_at: 8_000, status: 'completed',
+        content_kind: 'reasoning', text_start_utf16: 0, text_end_utf16: 5,
+      },
+      {
+        type: 'segment', id: 'text:0', order: 31, segment_type: 'text',
+        text_index: 0, text_utf16_length: 8, at: 31_000, ended_at: 32_000,
+      },
+      {
+        type: 'segment', id: 'tool:tool-1', order: 41, segment_type: 'tool',
+        tool_use_id: 'tool-1', name: 'skill_view', started_at: 41_000,
+        ended_at: 42_000, is_error: false,
+      },
+      {
+        type: 'segment', id: 'text:1', order: 50, segment_type: 'text',
+        text_index: 1, text_utf16_length: 13, at: 50_000, ended_at: 51_000,
+      },
+    ]
+    const outcome = {
+      turn_id: 'turn-activity-v2',
+      task_id: 'turn-activity-v2',
+      status: 'succeeded',
+      activity_snapshot: {
+        version: 2,
+        task_id: 'turn-activity-v2',
+        turn_id: 'turn-activity-v2',
+        complete: true,
+        reasoning_utf16_length: 5,
+        entries,
+      },
+    }
+    const complete = makeHistory(false, {
+      response: {
+        messages: [assistantMessage],
+        turn_outcomes: [outcome],
+        has_more: false,
+      },
+    })
+
+    await complete.api.loadHistory()
+
+    expect(complete.messages.value[0]).toMatchObject({
+      activitySnapshot: { version: 2, complete: true },
+      activitySnapshotIncomplete: false,
+      statusHistory: [{ action: 'provider:requesting', activityOrder: 4 }],
+      reasoningBlocks: [{ id: 'reasoning-1', text: ' A😀 ', activityOrder: 6 }],
+    })
+
+    const corrupted = makeHistory(false, {
+      response: {
+        messages: [assistantMessage],
+        turn_outcomes: [{
+          ...outcome,
+          activity_snapshot: {
+            ...outcome.activity_snapshot,
+            entries: entries.map(entry => entry.id === 'text:1'
+              ? { ...entry, text_utf16_length: 12 }
+              : entry),
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await corrupted.api.loadHistory()
+
+    expect(corrupted.messages.value[0]).toMatchObject({
+      activitySnapshot: { version: 2, complete: false },
+      activitySnapshotIncomplete: true,
+    })
+    expect(corrupted.messages.value[0]?.statusHistory).toEqual([])
+    expect(corrupted.messages.value[0]?.reasoningBlocks).toBeUndefined()
+    expect(corrupted.messages.value[0]?.tool_calls).toHaveLength(4)
+  })
+
   it.each([
     [
       'image_input_unsupported',

@@ -40,6 +40,7 @@ from opensquilla.session.storage import (
 from opensquilla.turn_outcome_projection import (
     attach_fork_terminal_outcome_projection,
     build_fork_terminal_outcome_projection,
+    extract_fork_terminal_outcome_projection,
 )
 
 
@@ -1522,6 +1523,25 @@ async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork
             task_id=turn_id,
             session_key=parent.session_key,
             status=AgentTaskStatus.SUCCEEDED,
+            details={
+                "turn_id": turn_id,
+                "activity_snapshot": {
+                    "version": 2,
+                    "task_id": turn_id,
+                    "turn_id": turn_id,
+                    "complete": True,
+                    "reasoning_utf16_length": 0,
+                    "entries": [{
+                        "type": "phase",
+                        "id": "provider:requesting:4",
+                        "order": 4,
+                        "kind": "provider",
+                        "phase": "requesting",
+                        "at": 1_000,
+                        "ended_at": 2_000,
+                    }],
+                },
+            },
         )
     )
     assert await manager.persist_compaction_result(
@@ -1542,6 +1562,16 @@ async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork
         "agent:main:archived-outcome-child",
         fork_transcript=True,
     )
+    child_page = await manager.get_canonical_transcript_page(child.session_key, limit=20)
+    child_entries = child_page.entries
+    child_projection = extract_fork_terminal_outcome_projection(
+        child_entries[1].turn_context,
+        session_id=child.session_id,
+        session_key=child.session_key,
+        turn_id=turn_id,
+    )
+    assert child_projection is not None
+    assert child_projection["activity_snapshot"]["entries"][0]["order"] == 4
     await manager._storage.delete_session(parent.session_key)
     assert await manager._storage.get_agent_task(turn_id) is None
 
@@ -1555,6 +1585,15 @@ async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork
         "archived question",
         "archived answer",
     ]
+    nested_entries = await manager.get_transcript(nested.session_key)
+    nested_projection = extract_fork_terminal_outcome_projection(
+        nested_entries[1].turn_context,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+        turn_id=turn_id,
+    )
+    assert nested_projection is not None
+    assert nested_projection["activity_snapshot"] == child_projection["activity_snapshot"]
 
 
 @pytest.mark.asyncio

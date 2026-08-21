@@ -128,6 +128,8 @@ export interface AssistantActivityStatusStep {
   key: string
   label: AssistantActivityCodeDescriptor<AssistantActivityStatusCode>
   at: number
+  activityOrder?: number
+  endedAt?: number
   isCurrent: boolean
   id?: string
   category?: 'phase' | 'maintenance'
@@ -1009,6 +1011,8 @@ function projectStatusSteps(
         key: `activity-maintenance:${entry.id || stableHash(`${entry.at}`)}`,
         label,
         at: entry.at,
+        activityOrder: entry.activityOrder,
+        endedAt: entry.endedAt,
         isCurrent: entry.state === 'running',
         id: entry.id,
         category: 'maintenance',
@@ -1027,11 +1031,20 @@ function projectStatusSteps(
       continue
     }
     const previous = steps[steps.length - 1]
-    if (previous?.label.code === label.code) continue
+    // Legacy history has no authoritative order and keeps the old consecutive
+    // label de-duplication. Ordered live/v2 records keep distinct occurrences:
+    // a tool or narration can sit between equal phase labels even though it is
+    // not represented in this status-only projection.
+    if (
+      previous?.label.code === label.code
+      && previous.activityOrder === entry.activityOrder
+    ) continue
     steps.push({
       key: `activity-status:${stableHash(`${entry.action}\u001f${entry.at}`)}`,
       label,
       at: entry.at,
+      activityOrder: entry.activityOrder,
+      endedAt: entry.endedAt,
       isCurrent: false,
       category: 'phase',
     })
@@ -1048,7 +1061,10 @@ function projectStatusSteps(
   const phaseSteps = mergedSteps.filter(step => step.category !== 'maintenance')
   for (const [index, step] of phaseSteps.entries()) {
     const nextAt = phaseSteps[index + 1]?.at
-    const boundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const derivedBoundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const boundary = Number.isFinite(step.endedAt) && Number(step.endedAt) >= step.at
+      ? Number(step.endedAt)
+      : derivedBoundary
     if (!Number.isFinite(boundary) || boundary < step.at) continue
     step.durationSeconds = Math.max(0, Math.floor((boundary - step.at) / 1000))
   }

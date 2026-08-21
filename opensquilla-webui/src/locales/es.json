@@ -3653,7 +3653,8 @@
       },
       "more": "{count} más",
       "stale": "Sigue trabajando — sin señal reciente",
-      "liveStep": "paso {n}"
+      "liveStep": "paso {n}",
+      "recordIncomplete": "El registro de actividad está incompleto; se muestra la vista de historial compatible."
     },
     "suggestedTasks": "Tareas sugeridas",
     "greetingMorning": "Buenos días.",
