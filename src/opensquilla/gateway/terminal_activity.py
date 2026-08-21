@@ -473,8 +473,8 @@ def build_terminal_activity_snapshot(
             if tool_id is None:
                 complete = False
                 continue
-            entry: dict[str, Any] | None = tools.get(tool_id)
-            if entry is None:
+            existing_entry: dict[str, Any] | None = tools.get(tool_id)
+            if existing_entry is None:
                 name = _safe_text(
                     payload.get("tool_name", payload.get("toolName", payload.get("name"))),
                     maximum=128,
@@ -484,7 +484,7 @@ def build_terminal_activity_snapshot(
                 if name is None or _SAFE_TOOL_NAME.fullmatch(name) is None:
                     complete = False
                     continue
-                entry = {
+                existing_entry = {
                     "type": "segment",
                     "id": f"tool:{tool_id}",
                     "order": order,
@@ -493,11 +493,11 @@ def build_terminal_activity_snapshot(
                     "name": name,
                     "started_at": at,
                 }
-                tools[tool_id] = entry
-                append(entry)
+                tools[tool_id] = existing_entry
+                append(existing_entry)
                 complete = False
-            entry["ended_at"] = max(int(entry["started_at"]), _event_end_at(payload))
-            entry["is_error"] = payload.get("is_error", payload.get("isError")) is True
+            existing_entry["ended_at"] = max(int(existing_entry["started_at"]), _event_end_at(payload))
+            existing_entry["is_error"] = payload.get("is_error", payload.get("isError")) is True
 
             result_record = _json_record(
                 payload.get("result", payload.get("content", payload.get("output")))
@@ -673,14 +673,15 @@ def build_terminal_activity_snapshot(
     if effective_terminal_at is None and ordered_events:
         effective_terminal_at = max(_event_end_at(payload) for _, payload, _ in ordered_events)
         complete = False
-    for index, phase in enumerate(phases):
-        started_at = int(phase["at"])
+    for index in range(len(phases)):
+        phase_entry = phases[index]
+        started_at = int(phase_entry["at"])
         next_started_at = (
             int(phases[index + 1]["at"])
             if index + 1 < len(phases)
             else effective_terminal_at
         )
-        phase["ended_at"] = max(
+        phase_entry["ended_at"] = max(
             started_at,
             next_started_at if next_started_at is not None else started_at,
         )
