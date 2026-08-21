@@ -121,12 +121,19 @@ def test_ci_owns_a_package_contract_verifier() -> None:
     assert "unsafeInstallerInclude" in package_verifier
 
 
-def test_unfinalized_catalog_allows_development_but_blocks_release() -> None:
+def test_finalized_catalog_allows_development_and_release() -> None:
     catalog = json.loads(
         _text("desktop/electron/runtime/runtime-pack-catalog.json")
     )
-    assert catalog["finalized"] is False
-    assert catalog["targets"] == {}
+    assert catalog["finalized"] is True
+    assert set(catalog["targets"]) == {
+        "darwin-arm64",
+        "darwin-x64",
+        "linux-arm64",
+        "linux-x64",
+        "windows-arm64",
+        "windows-x64",
+    }
 
     development = subprocess.run(
         ["node", ".github/scripts/verify-sandbox-package.mjs", "--source"],
@@ -144,5 +151,4 @@ def test_unfinalized_catalog_allows_development_but_blocks_release() -> None:
         capture_output=True,
         check=False,
     )
-    assert release.returncode == 1
-    assert "catalog is not finalized" in release.stderr
+    assert release.returncode == 0, release.stderr

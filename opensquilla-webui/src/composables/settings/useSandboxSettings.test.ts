@@ -44,14 +44,14 @@ const readyRuntimeStatus: SandboxRuntimePackStatus = {
   schemaVersion: 1,
   managementSupported: true,
   target: 'windows-x64',
-  catalogVersion: '2026-07-30.1',
+  catalogVersion: '2026-08-21.2',
   sourceOrder: ['oss', 'github'],
   components: [
     {
       componentId: 'python',
       availability: 'ready',
-      catalogVersion: '2026-07-30.1',
-      activeVersion: '3.13.14+20260728',
+      catalogVersion: '2026-08-21.2',
+      activeVersion: '3.13.15+20260814',
       installedBytes: 100,
       removable: true,
       resumeAvailable: false,
@@ -518,7 +518,7 @@ describe('useSandboxSettings runtime packs', () => {
       operationId: 'operation-1',
     })
     expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
-    expect(settings.runtimeStatus.value?.catalogVersion).toBe('2026-07-30.1')
+    expect(settings.runtimeStatus.value?.catalogVersion).toBe('2026-08-21.2')
     scope.stop()
   })
 

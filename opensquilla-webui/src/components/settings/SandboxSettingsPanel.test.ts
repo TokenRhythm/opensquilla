@@ -35,14 +35,14 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
   schemaVersion: 1,
   managementSupported: true,
   target: 'windows-x64',
-  catalogVersion: '2026-07-30.1',
+  catalogVersion: '2026-08-21.2',
   sourceOrder: ['oss', 'github'],
   components: [
     {
       componentId: 'python',
       availability: 'ready',
-      catalogVersion: '2026-07-30.1',
-      activeVersion: '3.13.14+20260728',
+      catalogVersion: '2026-08-21.2',
+      activeVersion: '3.13.15+20260814',
       installedBytes: 1234,
       removable: true,
       resumeAvailable: false,
@@ -53,7 +53,7 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
     {
       componentId: 'node',
       availability: 'missing',
-      catalogVersion: '2026-07-30.1',
+      catalogVersion: '2026-08-21.2',
       activeVersion: null,
       installedBytes: null,
       removable: false,
@@ -65,7 +65,7 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
     {
       componentId: 'gitBash',
       availability: 'missing',
-      catalogVersion: '2026-07-30.1',
+      catalogVersion: '2026-08-21.2',
       activeVersion: null,
       installedBytes: null,
       removable: false,
@@ -607,7 +607,7 @@ describe('SandboxSettingsPanel', () => {
 
     expect(el.querySelectorAll('.sandbox-runtime-row')).toHaveLength(3)
     expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
-      .toContain('Installed · 3.13.14+20260728')
+      .toContain('Installed · 3.13.15+20260814')
     expect(el.querySelector('[data-testid="sandbox-runtime-node"]')?.textContent)
       .toContain('Not installed')
     expect(el.querySelector('[data-testid="sandbox-runtime-install-node"]')).toBeTruthy()
@@ -702,7 +702,7 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     const pythonRow = el.querySelector('[data-testid="sandbox-runtime-python"]')
-    expect(pythonRow?.textContent).toContain('Installed · 3.13.14+20260728 · Not enabled')
+    expect(pythonRow?.textContent).toContain('Installed · 3.13.15+20260814 · Not enabled')
     expect(el.querySelector('[data-testid="sandbox-runtime-enable-python"]')).toBeTruthy()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
     await settle()
@@ -718,6 +718,30 @@ describe('SandboxSettingsPanel', () => {
       }),
     }))
     expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+  })
+
+  it('keeps the successful download source visible after installation', async () => {
+    const installed = structuredClone(runtimePackStatus)
+    installed.components[0].operation = {
+      operationId: 'operation-installed',
+      componentId: 'python',
+      kind: 'install',
+      state: 'completed',
+      source: 'oss',
+      downloadedBytes: 1234,
+      totalBytes: 1234,
+      progressPercent: 100,
+      startedAtMs: 1,
+      updatedAtMs: 2,
+      error: null,
+    }
+    const { el } = await mountPanel({ runtimeStatus: installed })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    const pythonText = el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent
+    expect(pythonText).toContain('1.2 KiB')
+    expect(pythonText).toContain('Beijing OSS')
   })
 
   it('uses exact component action payloads from runtime rows', async () => {

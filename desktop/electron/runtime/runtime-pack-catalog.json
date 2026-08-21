@@ -1,7 +1,146 @@
 {
+  "catalogVersion": "2026-08-21.2",
+  "finalized": true,
+  "releaseTag": "v2026.08.21.2",
   "schemaVersion": 1,
-  "catalogVersion": "2026-07-30.1",
-  "releaseTag": "v2026.07.30.1",
-  "finalized": false,
-  "targets": {}
+  "targets": {
+    "darwin-arm64": {
+      "node": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-node-2026-08-21.2-darwin-arm64.tar.xz",
+        "sha256": "5dd615fe287631ac61d35d5a03e1f13f5248e1125e706ddbbcd3a15ee5d5d348",
+        "sizeBytes": 27536336,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 197373784,
+        "version": "24.19.0"
+      },
+      "python": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-python-2026-08-21.2-darwin-arm64.tar.xz",
+        "sha256": "fe7c547108d6e5ac9421d6b6a1bf7f564b13e396a5dc474460bd8c2ddd5f1ae2",
+        "sizeBytes": 12946500,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 100525574,
+        "version": "3.13.15+20260814"
+      }
+    },
+    "darwin-x64": {
+      "node": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-node-2026-08-21.2-darwin-x64.tar.xz",
+        "sha256": "b227e402954ffe6aeb45a91b82b21551f0c6b2f2695c8e0643c969b43ddb1cb4",
+        "sizeBytes": 29181996,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 199733635,
+        "version": "24.19.0"
+      },
+      "python": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-python-2026-08-21.2-darwin-x64.tar.xz",
+        "sha256": "3a329e6cc15d661dfe3de6c8c45379b03b3de5a12e1d53ef4632f342b4cfcc17",
+        "sizeBytes": 13459412,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 101588325,
+        "version": "3.13.15+20260814"
+      }
+    },
+    "linux-arm64": {
+      "node": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-node-2026-08-21.2-linux-arm64.tar.xz",
+        "sha256": "86641bc30a005ebd4cee61b72d89df2b1ea1c6440935bbf68189e5c464cbd282",
+        "sizeBytes": 30973124,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 198144671,
+        "version": "24.19.0"
+      },
+      "python": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-python-2026-08-21.2-linux-arm64.tar.xz",
+        "sha256": "387819c29c0f3e423ce73c40a7f2a508c28c72b34592a94fee5fb4a81bd26a6d",
+        "sizeBytes": 15828568,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 149532068,
+        "version": "3.13.15+20260814"
+      }
+    },
+    "linux-x64": {
+      "node": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-node-2026-08-21.2-linux-x64.tar.xz",
+        "sha256": "0ca192ae2ca1699334e3744793842c03604d2e405a2dedd9c72f1668eabe5bec",
+        "sizeBytes": 32015440,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 202056529,
+        "version": "24.19.0"
+      },
+      "python": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-python-2026-08-21.2-linux-x64.tar.xz",
+        "sha256": "c68e70f7336851225025ff17cd7012b37b327cfde9df90ca161b798493d06dbb",
+        "sizeBytes": 20748400,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 197014778,
+        "version": "3.13.15+20260814"
+      }
+    },
+    "windows-arm64": {
+      "gitBash": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-gitBash-2026-08-21.2-windows-arm64.tar.xz",
+        "sha256": "abebd0fb577eb21c15879afb24ac4a9224f3d7f643f89ccff11bbb7b74f1102c",
+        "sizeBytes": 76170316,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 391017226,
+        "version": "2.55.0.windows.5"
+      },
+      "node": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-node-2026-08-21.2-windows-arm64.tar.xz",
+        "sha256": "a55cc13d8b93d7eb970db34370c1b22c40a6430fd0728340672c24042f9dcd30",
+        "sizeBytes": 21792796,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 96305343,
+        "version": "24.19.0"
+      },
+      "python": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-python-2026-08-21.2-windows-arm64.tar.xz",
+        "sha256": "e898750b066b20024c4f6ed894894aa1b5c76f0ae58a25d55a6f68ba2e2fa7fe",
+        "sizeBytes": 14324472,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 64974681,
+        "version": "3.13.15+20260814"
+      }
+    },
+    "windows-x64": {
+      "gitBash": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-gitBash-2026-08-21.2-windows-x64.tar.xz",
+        "sha256": "0a3517c8f2b00367bb006d5644d41c76aa39482d34d513ebae86b1918c967023",
+        "sizeBytes": 80870668,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 410353071,
+        "version": "2.55.0.windows.5"
+      },
+      "node": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-node-2026-08-21.2-windows-x64.tar.xz",
+        "sha256": "31cf63f911f22fd3ecdfe8dcb485d40aab739b16c8407e842ddecb91d8ca6575",
+        "sizeBytes": 25075660,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 107829437,
+        "version": "24.19.0"
+      },
+      "python": {
+        "archiveType": "tar.xz",
+        "asset": "OpenSquilla-Runtime-python-2026-08-21.2-windows-x64.tar.xz",
+        "sha256": "65303a1f7a67cadfeafd1346fd4fb5669ca87a31241ee8d0ddde02568b759623",
+        "sizeBytes": 15733188,
+        "trustedArchiveSha256": [],
+        "unpackedSizeBytes": 64914079,
+        "version": "3.13.15+20260814"
+      }
+    }
+  }
 }

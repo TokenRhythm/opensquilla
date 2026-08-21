@@ -14,7 +14,7 @@ import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -541,6 +541,32 @@ def test_tar_extraction_rejects_unsafe_paths(tmp_path: Path, name: str) -> None:
     _write_tar_xz(archive, {name: b"no"})
     with pytest.raises(UnsafeArchiveError):
         manager._extract_archive(archive, tmp_path / "out", "tar.xz", archive.stat().st_size)
+
+
+def test_tar_path_claims_allow_case_distinctions_only_when_explicit() -> None:
+    destination = Path("/synthetic/runtime-pack")
+    upper = PurePosixPath("payload/share/terminfo/E/Eterm")
+    lower = PurePosixPath("payload/share/terminfo/e/eterm")
+
+    portable_seen: set[str] = set()
+    managed_artifacts._claim_destination(destination, upper, portable_seen)
+    with pytest.raises(UnsafeArchiveError, match="Duplicate archive path"):
+        managed_artifacts._claim_destination(destination, lower, portable_seen)
+
+    linux_seen: set[str] = set()
+    managed_artifacts._claim_destination(
+        destination,
+        upper,
+        linux_seen,
+        case_sensitive_paths=True,
+    )
+    managed_artifacts._claim_destination(
+        destination,
+        lower,
+        linux_seen,
+        case_sensitive_paths=True,
+    )
+    assert len(linux_seen) == 2
 
 
 def test_tar_extraction_preserves_only_safe_files_and_execute_bits(tmp_path: Path) -> None:
