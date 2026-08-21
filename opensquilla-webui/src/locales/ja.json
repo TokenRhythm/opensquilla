@@ -60,7 +60,11 @@
     "removeBody": "{name} はサイドバーから消えますが、タスク履歴とファイルは保持されます。",
     "removeBodyWithCronJobs": "{name} はサイドバーから消えます。関連する {count} 件のスケジュールタスクは一時停止して保持され、再関連付けまたは削除を待ちます。タスク履歴とファイルは保持されます。",
     "removeConfirm": "プロジェクトを削除",
-    "removeFailed": "プロジェクトを削除できませんでした: {error}"
+    "removeFailed": "プロジェクトを削除できませんでした: {error}",
+    "sessionMoved": "タスクをプロジェクトに移動しました",
+    "moveSessionFailed": "タスクを移動できませんでした: {error}",
+    "sessionRemoved": "タスクをプロジェクトから削除しました",
+    "removeSessionFailed": "プロジェクトからタスクを削除できませんでした: {error}"
   },
   "updates": {
     "available": "OpenSquilla {version} が利用可能です",
@@ -4275,7 +4279,10 @@
       "bulkDeleteConfirm": "選択分を削除",
       "bulkDeleteDone": "{count} 件のセッションを削除しました",
       "bulkDeletePartial": "{count} 件のセッションを削除できませんでした",
-      "bulkDeleteFailed": "選択したセッションを削除できませんでした"
+      "bulkDeleteFailed": "選択したセッションを削除できませんでした",
+      "moveToProject": "プロジェクトに移動",
+      "moveFromProject": "プロジェクトから削除",
+      "newProject": "新しいプロジェクト…"
     },
     "setupBanner": {
       "ariaLabel": "ゲートウェイのセットアップが必要です",

@@ -9584,6 +9584,63 @@ async def _handle_sessions_rename(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
+@_d.method("sessions.moveToWorkspace", scope="operator.write")
+async def _handle_sessions_move_to_workspace(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Move a session to another project workspace, or remove it from one.
+
+    Pass ``workspaceId`` to bind the session to that workspace; pass
+    ``null`` (or omit it) to remove the session from its current workspace.
+    """
+
+    if not isinstance(params, dict):
+        raise RpcHandlerError("INVALID_PARAMS", "params object required")
+    key = _require_key(params)
+
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise KeyError("No session storage available")
+
+    raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
+    workspace_id: str | None = None
+    if raw_workspace_id is not None:
+        if not isinstance(raw_workspace_id, str) or not raw_workspace_id.strip():
+            raise RpcHandlerError(
+                "INVALID_PARAMS",
+                "workspaceId must be a non-empty string or null",
+            )
+        workspace_id = raw_workspace_id.strip()
+        # Validate the target workspace exists and is active.
+        try:
+            workspace = await storage.get_project_workspace(workspace_id)
+        except Exception as exc:
+            raise RpcHandlerError(
+                "WORKSPACE_LOOKUP_FAILED",
+                f"Failed to look up workspace: {exc}",
+            ) from exc
+        if workspace is None or workspace.removed_at is not None:
+            raise RpcHandlerError("WORKSPACE_NOT_FOUND", "Project workspace not found")
+
+    await storage.bind_session_workspace(session_key=key, workspace_id=workspace_id)
+
+    await _emit_to_subscribers(
+        ctx,
+        key,
+        "sessions.changed",
+        build_sessions_changed_payload(
+            key,
+            "moved",
+            workspaceId=workspace_id,
+        ),
+    )
+
+    return {"key": key, "workspaceId": workspace_id}
+
+
 @_d.method("sessions.reset", scope="operator.write")
 async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Synchronous session reset with FlushReceipt.
