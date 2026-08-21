@@ -322,6 +322,10 @@ def test_known_process_tree_flakes_are_marked_ci_serial() -> None:
         Path("tests/functional/test_gateway_stop_process_tree_e2e.py"),
         "test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task",
     )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_cleanup.py"),
+        "test_cleanup_apply_refuses_running_legacy_gateway",
+    )
 
 
 def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:

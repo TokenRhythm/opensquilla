@@ -598,6 +598,7 @@ def test_cleanup_apply_contends_with_replacement_history_authority(
     assert (user_data / "opensquilla").is_dir()
 
 
+@pytest.mark.ci_serial
 def test_cleanup_apply_refuses_running_legacy_gateway(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
