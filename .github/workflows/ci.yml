@@ -210,7 +210,7 @@ jobs:
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
               else
-                git diff --name-only \
+                git diff --no-renames --name-only \
                   "${{ github.event.pull_request.base.sha }}" \
                   "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
               fi
@@ -226,7 +226,7 @@ jobs:
               before="${{ github.event.before }}"
               after="${{ github.event.after }}"
               if [[ -n "${before}" && "${before}" != "0000000000000000000000000000000000000000" ]]; then
-                git diff --name-only "${before}" "${after}" > "${changed_files}"
+                git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"
               else
                 printf '.ci/run-all\n' > "${changed_files}"
               fi
@@ -1015,11 +1015,12 @@ jobs:
 
           worker_args=()
           if [[ "${{ matrix.shard }}" == "recovery-migration" ||
-                "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
-            # These shards start Windows ``spawn`` children and gateway
-            # subprocesses from several tests.  Keep the other shards at four
-            # workers, but leave headroom for those process-start handshakes
-            # instead of changing their bounded readiness/timing assertions.
+                "${{ matrix.shard }}" == "gateway-sqlite" ||
+                "${{ matrix.shard }}" == "desktop-installer-contracts" ]]; then
+            # These shards start Windows ``spawn`` children, Node/Electron
+            # processes, or gateways from several tests.  Leave runner
+            # headroom for those process-start handshakes instead of changing
+            # their bounded readiness/timing assertions.
             worker_args+=(--workers=2)
           fi
 
@@ -1144,11 +1145,9 @@ jobs:
           retention-days: 14
 
   desktop-recovery-e2e:
-    # Windows hosted runners can retain Chromium network resources briefly
-    # after a heavy Electron test process exits.  Run the independent recovery
-    # groups on fresh Windows runners so an earlier test cannot starve a later
-    # one of local socket buffers. Linux and macOS retain the full serial
-    # contract, which is useful for their native recovery coverage.
+    # Every matrix cell gets a fresh hosted runner.  Keep ownership and the
+    # heavier workbench cell separate on both Windows and macOS so process,
+    # native-focus, and local-socket state cannot leak across those domains.
     name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [classify-changes, frontend-artifact]
     if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'desktop-recovery-e2e') }}
@@ -1165,6 +1164,9 @@ jobs:
       OPENSQUILLA_TURN_CALL_LOG: "0"
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
       CI_E2E_SHARD: ${{ matrix.shard }}
+      # Keep merge-critical workbench coverage deterministic and bounded.
+      # Scheduled/manual runs retain the wider geometry/rearm stress cycles.
+      OPENSQUILLA_WORKBENCH_E2E_MODE: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'smoke' || 'stress' }}
 
     steps:
       - name: Prepare Desktop recovery report
@@ -1179,6 +1181,7 @@ jobs:
             printf 'runner_arch=%s\n' "${RUNNER_ARCH}"
             printf 'commit_sha=%s\n' "${GITHUB_SHA}"
             printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'workbench_e2e_mode=%s\n' "${OPENSQUILLA_WORKBENCH_E2E_MODE}"
           } > "${report_dir}/environment.txt"
           printf 'e2e_status=not_started\n' > "${report_dir}/first-failure.txt"
 
@@ -1326,12 +1329,190 @@ jobs:
             fi
           }
 
-          is_retryable_windows_failure() {
-            local log_path="$1"
-            [[ "${RUNNER_OS}" == "Windows" ]] || return 1
-            grep -Fq 'Gateway did not become healthy' "${log_path}" \
-              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}" \
-              || grep -Fq 'Windows ACL hardening timed out' "${log_path}"
+          classify_retryable_infrastructure_failure() {
+            local name="$1"
+            local log_path="$2"
+            local classifications="${CI_REPORT_DIR}/retry-classifications.jsonl"
+            local evidence_dir="${CI_REPORT_DIR}/retry-evidence"
+            mkdir -p "${evidence_dir}"
+            python3 - "${name}" "${RUNNER_OS}" "${log_path}" "${classifications}" "${evidence_dir}" <<'PY'
+          import hashlib
+          import json
+          import re
+          import shutil
+          import sys
+          from pathlib import Path
+
+          case_name, runner_os, log_name, output_name, evidence_name = sys.argv[1:]
+          log_path = Path(log_name)
+          payload = log_path.read_bytes()
+          text = (
+              payload.decode("utf-8", errors="replace")
+              .replace("\r\n", "\n")
+              .replace("\r", "\n")
+          )
+
+          # Retry only a single case for narrowly identified hosted-runner
+          # handoff/input failures.  Generic timeouts, connection failures,
+          # crashes, assertion errors, and product output mismatches are not
+          # retryable.  Case + OS binding prevents a coincidental message in
+          # another functional assertion from matching.
+          rules = (
+              {
+                  "id": "windows-delete-helper-handoff-timeout-v1",
+                  "os": "Windows",
+                  "cases": {"desktop-cleanup-flow"},
+                  "pattern": re.compile(
+                      r"^Error: Timed out waiting for post-exit delete-all helper completion\."
+                      r"; pending synthetic targets: .+$",
+                      re.MULTILINE,
+                  ),
+                  "companion_patterns": (),
+              },
+              {
+                  "id": "windows-isolated-acl-worker-timeout-v1",
+                  "os": "Windows",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^(?:(?:E\s+)|(?:FAILED\s+\S+\s+-\s+))?"
+                      r"AssertionError: isolated Windows ACL hardening timed out: .+$",
+                      re.MULTILINE,
+                  ),
+                  # pytest can print the same allowed exception once in its
+                  # traceback and again in the short failure summary.  Remove
+                  # only the structural traceback header; any unrelated
+                  # terminal exception inside that traceback remains visible
+                  # to the residual-failure scan below.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^\s*Traceback \(most recent call last\):\s*$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+              {
+                  "id": "macos-electron-foreground-prerequisite-v1",
+                  "os": "macOS",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^(?:(?:Error: )?electronApplication\.evaluate: Error: |Error: )"
+                      r"ELECTRON_FOREGROUND_PREREQUISITE_MISSING: .+$",
+                      re.MULTILINE,
+                  ),
+                  # The outer offline-workbench runner reports the native
+                  # subprocess exit after streaming the structured inner
+                  # exception.  It is part of that same exception stack, not
+                  # a second failure, and is bound to the exact child script.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^Error: .*test-native-workbench-v2-electron\.mjs "
+                          r"failed with exit code 1$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+          )
+          hard_failure_markers = (
+              (
+                  "trusted-overlay-focus-contract-failed-v1",
+                  "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED:",
+              ),
+              (
+                  "trusted-overlay-input-contract-failed-v1",
+                  "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:",
+              ),
+              ("desktop-e2e-phase-timeout-v1", "DESKTOP_E2E_PHASE_TIMEOUT:"),
+              ("desktop-e2e-phase-failed-v1", "DESKTOP_E2E_PHASE_FAILED:"),
+              ("desktop-e2e-process-exited-v1", "DESKTOP_E2E_PROCESS_EXITED:"),
+          )
+          generic_failure_markers = (
+              (
+                  "generic-assertion-error-v1",
+                  re.compile(
+                      r"^\s*(?:E\s+)?AssertionError(?:\s*[:(]|\s*$)",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "generic-error-or-exception-v1",
+                  re.compile(
+                      r"^\s*(?:E\s+)?(?!AssertionError\s*:)(?:Error|Exception|"
+                      r"[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*:",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "python-traceback-v1",
+                  re.compile(
+                      r"^\s*Traceback \(most recent call last\):\s*$",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "fatal-crash-process-exit-v1",
+                  re.compile(
+                      r"^(?:\s*(?:FATAL(?: ERROR)?|PANIC)\s*:|"
+                      r".*\b(?:Segmentation fault|core dumped)\b.*|"
+                      r".*\b(?:process|command)\b.*\b(?:crashed|exited unexpectedly|"
+                      r"failed with exit code|exited with (?:code|signal))\b.*)$",
+                      re.IGNORECASE | re.MULTILINE,
+                  ),
+              ),
+          )
+          matched_rules = [
+              rule
+              for rule in rules
+              if rule["os"] == runner_os
+              and case_name in rule["cases"]
+              and rule["pattern"].search(text) is not None
+          ]
+          matches = [rule["id"] for rule in matched_rules]
+
+          # Remove every occurrence of the one permitted terminal exception,
+          # including duplicate summaries and narrowly bound outer wrappers.
+          # Any other terminal failure left in the combined case log blocks
+          # the retry, even when a permitted signature also occurred.
+          residual = text
+          for rule in matched_rules:
+              residual = rule["pattern"].sub("", residual)
+              for companion_pattern in rule["companion_patterns"]:
+                  residual = companion_pattern.sub("", residual)
+
+          blocked_markers = {
+              marker_id
+              for marker_id, marker_text in hard_failure_markers
+              if marker_text in text
+          }
+          generic_residual = residual
+          for _, marker_text in hard_failure_markers:
+              generic_residual = re.sub(
+                  rf"^.*{re.escape(marker_text)}.*$",
+                  "",
+                  generic_residual,
+                  flags=re.MULTILINE,
+              )
+          blocked_markers.update(
+              marker_id
+              for marker_id, marker_pattern in generic_failure_markers
+              if marker_pattern.search(generic_residual) is not None
+          )
+          retryable = len(matches) == 1 and not blocked_markers
+          record = {
+              "schema_version": 1,
+              "case": case_name,
+              "os": runner_os,
+              "attempt": 1,
+              "classification": matches[0] if retryable else "non_retryable",
+              "retryable": retryable,
+              "blocked_markers": sorted(blocked_markers),
+              "log_sha256": hashlib.sha256(payload).hexdigest(),
+          }
+          with Path(output_name).open("a", encoding="utf-8") as handle:
+              handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+          if retryable:
+              shutil.copy2(log_path, Path(evidence_name) / log_path.name)
+          raise SystemExit(0 if retryable else 1)
+          PY
           }
 
           case "${{ matrix.shard }}" in
@@ -1409,9 +1590,10 @@ jobs:
 
             first_log="${CI_REPORT_DIR}/${name}-attempt-1.log"
             printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
-            if is_retryable_windows_failure "${first_log}"
+            if classify_retryable_infrastructure_failure "${name}" "${first_log}"
             then
-              printf 'retry_case=%s\n' "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
+              printf 'retry_case=%s\nretry_reason=classified_hosted_runner_infrastructure\n' \
+                "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
               if run_case "${name}" "${script}" 2; then
                 continue
               fi
@@ -1429,6 +1611,8 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/environment.txt
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
           if-no-files-found: error
           retention-days: 14
 

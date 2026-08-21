@@ -1,5 +1,11 @@
 {
   "schema_version": 1,
+  "windows_test_assignments": ".github/scripts/windows_test_assignments.json",
+  "macos_recovery_test_inputs": [
+    "tests/test_recovery/**",
+    "tests/test_migration/test_opensquilla_home_migration.py",
+    "tests/test_desktop/test_electron_startup_contract.py"
+  ],
   "baseline_suites": [
     "readme-locale",
     "workflow-lint"
@@ -29,7 +35,11 @@
     },
     {
       "os": "macos-latest",
-      "shard": "ownership-workbench"
+      "shard": "ownership"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "workbench"
     },
     {
       "os": "windows-latest",
@@ -224,6 +234,8 @@
         "src/opensquilla/persistence/**",
         "src/opensquilla/recovery/**",
         "src/opensquilla/session/**",
+        "tests/test_desktop/test_electron_startup_contract.py",
+        "tests/test_migration/test_opensquilla_home_migration.py",
         "tests/test_recovery/**"
       ]
     },

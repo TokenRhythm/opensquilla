@@ -27,6 +27,7 @@ verify_queue = MODULE["verify_queue"]
 list_attestation_artifacts = MODULE["_list_attestation_artifacts"]
 plan_paths = MODULE["_plan_paths"]
 composition_is_safe = MODULE["_composition_is_safe"]
+changed_paths = MODULE["_changed_paths"]
 reconstructed_queue_tree = MODULE["_reconstructed_queue_tree"]
 verify_nightly_health = MODULE["verify_nightly_health"]
 wait_for_base_successful_ci = MODULE["_wait_for_base_successful_ci"]
@@ -154,6 +155,25 @@ def _write(repo: Path, relative: str, value: str) -> None:
     path = repo / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
+
+
+def test_changed_paths_preserves_both_sides_of_a_rename(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "CI Test")
+    _git(repo, "config", "user.email", "ci@example.invalid")
+    old_path = "tests/test_gateway/test_rpc_sessions.py"
+    new_path = "tests/test_gateway/test_rpc_sessions_fork.py"
+    _write(repo, old_path, "def test_old(): pass\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add governed test")
+    before = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "mv", old_path, new_path)
+    _git(repo, "commit", "-m", "rename governed test")
+    after = _git(repo, "rev-parse", "HEAD")
+
+    assert set(changed_paths(repo, before, after)) == {old_path, new_path}
 
 
 def _seed_suite_execution_input_fixtures(repo: Path) -> None:

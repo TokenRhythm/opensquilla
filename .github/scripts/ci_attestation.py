@@ -91,6 +91,14 @@ def _git(*args: str, cwd: Path) -> str:
     return completed.stdout.strip()
 
 
+def _changed_paths(repo: Path, before: str, after: str) -> list[str]:
+    """Return both sides of renames so the planner can route them safely."""
+
+    return _git(
+        "diff", "--no-renames", "--name-only", before, after, cwd=repo
+    ).splitlines()
+
+
 def _require_sha(value: object, label: str) -> str:
     if not isinstance(value, str) or SHA_RE.fullmatch(value) is None:
         raise AttestationError(f"{label} must be a lowercase 40-character SHA")
@@ -745,13 +753,9 @@ def _validate_canonical_source_plan(
         )
         if reconstructed != tested_tree:
             raise AttestationError("attested PR base/head do not reconstruct tested tree")
-        changed_paths = _git(
-            "diff", "--name-only", tested_base, head_sha, cwd=repo
-        ).splitlines()
+        changed_paths = _changed_paths(repo, tested_base, head_sha)
     elif source_event == "merge_group":
-        changed_paths = _git(
-            "diff", "--name-only", tested_base, tested_tree, cwd=repo
-        ).splitlines()
+        changed_paths = _changed_paths(repo, tested_base, tested_tree)
     else:
         raise AttestationError("attestation source event is invalid")
     plan = _plan_paths(repo, changed_paths, ref=tested_tree)
@@ -782,7 +786,7 @@ def _composition_is_safe(
         capture_output=True,
     ).returncode != 0:
         return False, "attested base is not an ancestor of the queue base", ()
-    changed = _git("diff", "--name-only", tested_base_sha, queue_base_sha, cwd=repo).splitlines()
+    changed = _changed_paths(repo, tested_base_sha, queue_base_sha)
     if not changed:
         return False, "advanced-base composition has no verifiable base delta", ()
     plan = _plan_paths(repo, changed)
@@ -1414,7 +1418,7 @@ def _create_command(args: argparse.Namespace) -> int:
             parents = _git("rev-list", "--parents", "-n", "1", "HEAD", cwd=repo).split()
             if len(parents) != 3:
                 raise AttestationError("pull request CI must test a two-parent merge preview")
-            changed_paths = _git("diff", "--name-only", parents[1], head_sha, cwd=repo).splitlines()
+            changed_paths = _changed_paths(repo, parents[1], head_sha)
             plan_basis = "change_set"
         elif isinstance(merge_group, dict):
             base_sha = _require_sha(merge_group.get("base_sha"), "merge-group base SHA")
@@ -1422,9 +1426,7 @@ def _create_command(args: argparse.Namespace) -> int:
                 changed_paths = [".ci/run-all"]
                 plan_basis = "full_fallback"
             else:
-                changed_paths = _git(
-                    "diff", "--name-only", base_sha, "HEAD", cwd=repo
-                ).splitlines()
+                changed_paths = _changed_paths(repo, base_sha, "HEAD")
                 plan_basis = "change_set"
         else:
             raise AttestationError("cannot plan suites outside PR or merge-group CI")
