@@ -3232,6 +3232,7 @@ async def test_prepare_shutdown_fences_resume_waiting_for_goal_transition_lock(
         assert len(runs) == 1
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("lost_boundary", ["subscription", "shutdown"])
 @pytest.mark.asyncio
 async def test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates(

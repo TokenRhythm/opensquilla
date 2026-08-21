@@ -335,6 +335,17 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
     )
 
 
+def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_goal_rpc.py"),
+        "test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_scripts/test_verify_webui_artifact.py"),
+        "test_node_and_python_source_fingerprints_share_order_and_line_endings",
+    )
+
+
 @pytest.mark.parametrize(
     "function_name",
     [
