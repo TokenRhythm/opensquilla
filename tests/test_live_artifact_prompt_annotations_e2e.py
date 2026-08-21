@@ -529,6 +529,7 @@ def test_certification_rejects_case_that_exceeds_its_pre_reserved_calls() -> Non
         asyncio.run(e2e._run_certification(OverrunningDriver(), hard_cap=64))
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_owned_gateway_preflights_use_real_rpc_bridge_and_zero_provider_calls(
     tmp_path: Path,
@@ -553,6 +554,7 @@ async def test_owned_gateway_preflights_use_real_rpc_bridge_and_zero_provider_ca
         await driver.close()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
     tmp_path: Path,
@@ -934,6 +936,7 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
         provider.close()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     tmp_path: Path,
