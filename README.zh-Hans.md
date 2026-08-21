@@ -32,7 +32,7 @@
 
 - 📢 **2026-08-21** —— 技术报告的 PDF 版本现已收录在本仓库中：[English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
 
-- 📢 **2026-07-03** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)**（预览版）已发布，随 OpenSquilla **0.5.0 Preview 1** 一同放出。报告详细介绍了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮。
+- 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型集成路由如何超越 Fable 5**。
 
 ---
 
