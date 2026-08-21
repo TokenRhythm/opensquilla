@@ -132,10 +132,10 @@ def append_activity_phase(
 
 
 def _safe_positive_int(value: object, *, maximum: int = _MAX_TIMESTAMP_MS) -> int | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         return None
     try:
-        parsed = int(value)  # type: ignore[arg-type]
+        parsed = int(value)
     except (TypeError, ValueError, OverflowError):
         return None
     if parsed <= 0 or parsed > maximum:
@@ -144,10 +144,10 @@ def _safe_positive_int(value: object, *, maximum: int = _MAX_TIMESTAMP_MS) -> in
 
 
 def _safe_nonnegative_int(value: object, *, maximum: int = _MAX_TIMESTAMP_MS) -> int | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         return None
     try:
-        parsed = int(value)  # type: ignore[arg-type]
+        parsed = int(value)
     except (TypeError, ValueError, OverflowError):
         return None
     if parsed < 0 or parsed > maximum:
@@ -473,7 +473,7 @@ def build_terminal_activity_snapshot(
             if tool_id is None:
                 complete = False
                 continue
-            entry = tools.get(tool_id)
+            entry: dict[str, Any] | None = tools.get(tool_id)
             if entry is None:
                 name = _safe_text(
                     payload.get("tool_name", payload.get("toolName", payload.get("name"))),
@@ -610,9 +610,9 @@ def build_terminal_activity_snapshot(
                 "ended_at": _event_end_at(payload),
             }
             for field in ("source", "durability"):
-                value = _safe_text(payload.get(field), maximum=64)
-                if value is not None:
-                    entry[field] = value
+                field_value = _safe_text(payload.get(field), maximum=64)
+                if field_value is not None:
+                    entry[field] = field_value
             reason = _safe_text(
                 payload.get("reason", payload.get("skip_reason")),
                 maximum=64,
@@ -666,7 +666,9 @@ def build_terminal_activity_snapshot(
             str(entry["id"]),
         )
     )
-    phases = [entry for entry in entries if entry["type"] == "phase"]
+    phases: list[dict[str, Any]] = [
+        entry for entry in entries if entry["type"] == "phase"
+    ]
     effective_terminal_at = terminal_boundary
     if effective_terminal_at is None and ordered_events:
         effective_terminal_at = max(_event_end_at(payload) for _, payload, _ in ordered_events)

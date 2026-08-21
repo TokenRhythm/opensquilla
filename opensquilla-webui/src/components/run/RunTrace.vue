@@ -146,7 +146,7 @@
                  secondary ("2 web actions"), so the raw call-count pill would
                  repeat it. -->
             <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
-            <span v-if="item.group.secondary" class="tool-row__arg">{{ item.group.secondary }}</span>
+            <span v-if="item.group.secondary && stateScope !== 'live'" class="tool-row__arg">{{ item.group.secondary }}</span>
             <Icon
               v-if="presentation === 'activity'"
               class="step-chevron tool-row__activity-arrow"
@@ -193,7 +193,7 @@
                 />
                 <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
                 <span class="tool-row__label tool-row__label--member">{{ call.displayName }}</span>
-                <span v-if="resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
+                <span v-if="stateScope !== 'live' && resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
                 <Icon
                   v-if="presentation === 'activity' && callHasDetails(call)"
                   class="step-chevron tool-row__activity-arrow"
