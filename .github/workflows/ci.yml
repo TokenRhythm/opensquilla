@@ -1013,11 +1013,21 @@ jobs:
             maxfail_args+=(--maxfail=3)
           fi
 
+          worker_args=()
+          if [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
+            # The recovery shard starts Windows ``spawn`` children from several
+            # tests.  Keep the other shards at four workers, but leave headroom
+            # for those process-start handshakes instead of changing their
+            # bounded readiness assertions.
+            worker_args+=(--workers=2)
+          fi
+
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
+            "${worker_args[@]}" \
             -- \
             -q \
             -m "${markers}" \
@@ -1319,7 +1329,8 @@ jobs:
             local log_path="$1"
             [[ "${RUNNER_OS}" == "Windows" ]] || return 1
             grep -Fq 'Gateway did not become healthy' "${log_path}" \
-              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}"
+              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}" \
+              || grep -Fq 'Windows ACL hardening timed out' "${log_path}"
           }
 
           case "${{ matrix.shard }}" in

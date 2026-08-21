@@ -1651,6 +1651,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "grep -Fq 'Timed out waiting for post-exit delete-all helper completion'"
         in run["run"]
     )
+    assert "grep -Fq 'Windows ACL hardening timed out'" in run["run"]
     assert 'if is_retryable_windows_failure "${first_log}"' in run["run"]
     assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
@@ -1803,6 +1804,9 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert '"${{ github.event_name }}" == "pull_request"' in test_step["run"]
     assert "--maxfail=3" in test_step["run"]
     assert "--maxfail=1" not in test_step["run"]
+    assert 'if [[ "${{ matrix.shard }}" == "recovery-migration" ]]' in test_step["run"]
+    assert "worker_args+=(--workers=2)" in test_step["run"]
+    assert '"${worker_args[@]}"' in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]
     assert 'tee "${CI_REPORT_DIR}/pytest.log"' in test_step["run"]
     assert upload_step["if"] == "${{ always() }}"
