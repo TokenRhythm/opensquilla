@@ -16,6 +16,9 @@ from typing import Any, Final
 
 SCHEMA_VERSION: Final = 1
 DEFAULT_CONFIG: Final = Path(".github/ci/suites.v1.json")
+_WINDOWS_ASSIGNMENTS_CONFIG_KEY: Final = "windows_test_assignments"
+_WINDOWS_ASSIGNMENTS_PATH_KEY: Final = "_windows_test_assignments_path"
+_LOADED_WINDOWS_ASSIGNMENTS_KEY: Final = "_loaded_windows_test_assignments"
 
 _DOC_EXACT: Final = {
     "CHANGELOG.md",
@@ -97,19 +100,6 @@ _MANAGED_TOOLCHAIN_TEST_PREFIXES: Final = (
     "tests/test_skills/test_subtitle_burner",
     "tests/test_skills/test_video_still_animator",
 )
-_PLATFORM_TEST_PREFIXES: Final = (
-    "tests/test_compat/",
-    "tests/test_desktop/",
-    "tests/test_migration/",
-    "tests/test_migrations/",
-    "tests/test_packaging/",
-    "tests/test_persistence/",
-    "tests/test_recovery/",
-    "tests/test_sandbox/",
-    "tests/test_scheduler/",
-    "tests/test_session/",
-    "tests/test_uninstall/",
-)
 _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
     (
         ("src/opensquilla/provider/", "src/opensquilla/router_tiers.py"),
@@ -151,32 +141,6 @@ _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]]
     (("src/opensquilla/observability/",), ("tests/test_observability",)),
     (("src/opensquilla/search/",), ("tests/test_search",)),
     (("src/opensquilla/onboarding/",), ("tests/test_onboarding",)),
-)
-_TEST_TARGET_RULES: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
-    ("tests/test_provider", ("tests/test_provider", "tests/test_provider*.py")),
-    (
-        "tests/test_gateway",
-        (
-            "tests/functional/test_gateway_*_e2e.py",
-            "tests/test_gateway",
-            "tests/test_gateway*.py",
-        ),
-    ),
-    ("tests/test_engine", ("tests/test_engine", "tests/test_engine*.py")),
-    ("tests/test_channels/", ("tests/test_channels",)),
-    ("tests/test_memory", ("tests/test_memory", "tests/test_memory*.py")),
-    (
-        "tests/test_skills",
-        ("tests/test_meta_skill*.py", "tests/test_skills", "tests/test_skills*.py"),
-    ),
-    ("tests/test_cli/", ("tests/test_cli",)),
-    ("tests/integration/cli/", ("tests/integration/cli", "tests/test_cli")),
-    ("tests/test_onboarding/", ("tests/test_onboarding",)),
-    ("tests/test_identity/", ("tests/test_identity",)),
-    ("tests/test_mcp/", ("tests/test_mcp",)),
-    ("tests/test_health/", ("tests/test_health",)),
-    ("tests/test_observability/", ("tests/test_observability",)),
-    ("tests/test_search/", ("tests/test_search",)),
 )
 _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
     "workflow-lint": (("ubuntu-latest", "default"),),
@@ -246,6 +210,60 @@ def _require_string_list(value: object, label: str) -> list[str]:
     return list(value)
 
 
+def _load_windows_test_assignments(
+    path: Path, *, allowed_shards: set[str]
+) -> dict[str, str]:
+    """Load the governed exact test-to-shard map used by Windows CI."""
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlanError(f"cannot read Windows test assignments {path}: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise PlanError("unsupported Windows test assignment schema")
+    baseline = value.get("baseline_assignments")
+    if not isinstance(baseline, dict) or set(baseline) != allowed_shards:
+        raise PlanError(
+            "Windows test assignments must define every configured shard exactly once"
+        )
+
+    assignments: dict[str, str] = {}
+    for shard, raw_paths in baseline.items():
+        paths = _require_string_list(raw_paths, f"Windows shard {shard!r} assignments")
+        for test_path in paths:
+            candidate = PurePosixPath(test_path)
+            if (
+                candidate.as_posix() != test_path
+                or not test_path.startswith("tests/")
+                or not candidate.name.startswith("test_")
+                or candidate.suffix != ".py"
+            ):
+                raise PlanError(f"invalid Windows test assignment path: {test_path!r}")
+            if test_path in assignments:
+                raise PlanError(f"duplicate Windows test assignment: {test_path}")
+            assignments[test_path] = str(shard)
+
+    overrides = value.get("overrides", [])
+    if not isinstance(overrides, list):
+        raise PlanError("Windows test assignment overrides must be a list")
+    seen_overrides: set[str] = set()
+    for raw_override in overrides:
+        if not isinstance(raw_override, dict):
+            raise PlanError("Windows test assignment override must be an object")
+        test_path = raw_override.get("path")
+        from_shard = raw_override.get("from")
+        to_shard = raw_override.get("to")
+        if not isinstance(test_path, str) or test_path in seen_overrides:
+            raise PlanError("Windows test assignment override path is invalid or duplicated")
+        if assignments.get(test_path) != from_shard:
+            raise PlanError(f"Windows test assignment override source drifted: {test_path}")
+        if to_shard not in allowed_shards or to_shard == from_shard:
+            raise PlanError(f"Windows test assignment override target is invalid: {test_path}")
+        assignments[test_path] = str(to_shard)
+        seen_overrides.add(test_path)
+    return assignments
+
+
 def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
     """Load and validate the v1 suite contract."""
 
@@ -303,6 +321,22 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         )
         if not shards:
             raise PlanError(f"full_python_matrix {platform_name} must not be empty")
+
+    assignments_path = value.get(_WINDOWS_ASSIGNMENTS_CONFIG_KEY)
+    if (
+        not isinstance(assignments_path, str)
+        or not assignments_path
+        or PurePosixPath(assignments_path).is_absolute()
+        or PurePosixPath(assignments_path).as_posix() != assignments_path
+        or ".." in PurePosixPath(assignments_path).parts
+    ):
+        raise PlanError(
+            f"{_WINDOWS_ASSIGNMENTS_CONFIG_KEY} must be a normalized repository-relative path"
+        )
+    if repo is not None:
+        # Parsing is intentionally lazy. Digest-only and source-only planning
+        # does not need the test assignment payload; exact test planning does.
+        value[_WINDOWS_ASSIGNMENTS_PATH_KEY] = repo.resolve() / assignments_path
 
     groups = value.get("desktop_groups")
     if not isinstance(groups, dict) or set(groups) != {
@@ -393,12 +427,18 @@ def _add_os_reason_codes(scopes: set[str], reasons: set[str]) -> None:
     reasons.update(labels[scope] for scope in scopes)
 
 
-def _desktop_groups(path: str, config: Mapping[str, Any]) -> set[str]:
-    explicit = {
+def _explicit_desktop_groups(path: str, config: Mapping[str, Any]) -> set[str]:
+    """Return only reviewed path-pattern mappings, without keyword inference."""
+
+    return {
         str(group)
         for group, raw_group in config["desktop_groups"].items()
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in raw_group["path_patterns"])
     }
+
+
+def _desktop_groups(path: str, config: Mapping[str, Any]) -> set[str]:
+    explicit = _explicit_desktop_groups(path, config)
     if explicit:
         return explicit
     lowered = path.casefold()
@@ -424,13 +464,45 @@ def _desktop_cells(
     if "ubuntu-latest" in platforms:
         cells.update(("ubuntu-latest", group) for group in selected_groups)
     if "macos-latest" in platforms:
-        if "profiles" in selected_groups:
-            cells.add(("macos-latest", "profiles"))
-        if selected_groups.intersection({"ownership", "workbench"}):
-            cells.add(("macos-latest", "ownership-workbench"))
+        cells.update(("macos-latest", group) for group in selected_groups)
     if "windows-latest" in platforms:
         cells.update(("windows-latest", group) for group in selected_groups)
     return cells
+
+
+def _path_exists(repo: Path, path: str, *, ref: str | None, directory: bool) -> bool:
+    """Return whether *path* is present in the selected worktree or Git tree."""
+
+    if ref is None:
+        candidate = repo / path
+        return candidate.is_dir() if directory else candidate.is_file()
+    completed = subprocess.run(
+        ["git", "cat-file", "-t", f"{ref}:{path}"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    expected_type = "tree" if directory else "blob"
+    return completed.returncode == 0 and completed.stdout.strip() == expected_type
+
+
+def _safe_test_execution_target(
+    path: str, *, repo: Path, ref: str | None
+) -> str | None:
+    """Use an exact test when present, otherwise its nearest existing test directory."""
+
+    if _path_exists(repo, path, ref=ref, directory=False):
+        return path
+    candidate = PurePosixPath(path).parent
+    while candidate.as_posix() == "tests" or candidate.as_posix().startswith("tests/"):
+        relative = candidate.as_posix()
+        if _path_exists(repo, relative, ref=ref, directory=True):
+            return relative
+        if relative == "tests":
+            break
+        candidate = candidate.parent
+    return None
 
 
 def _add_python_target(
@@ -500,22 +572,44 @@ def _add_python_target(
 
 
 def _add_test_target(
-    path: str, targets: set[str], suites: set[str], reasons: set[str]
+    path: str,
+    targets: set[str],
+    suites: set[str],
+    reasons: set[str],
+    windows_shards: set[str],
+    config: Mapping[str, Any],
+    repo: Path,
+    ref: str | None,
 ) -> bool:
-    if path.startswith(_PLATFORM_TEST_PREFIXES):
-        if "python-full" not in suites:
-            suites.add("python-targeted")
-            targets.add(str(PurePosixPath(path).parent))
-        reasons.add("python_platform_sensitive")
-        return True
-    for prefix, rule_targets in _TEST_TARGET_RULES:
-        if path.startswith(prefix):
-            if "python-full" not in suites:
-                suites.add("python-targeted")
-                targets.update(rule_targets)
-            reasons.add("python_targeted")
-            return True
-    return False
+    """Select an exact governed test and its single Windows responsibility shard."""
+
+    raw_assignments = config.get(_LOADED_WINDOWS_ASSIGNMENTS_KEY)
+    if not isinstance(raw_assignments, Mapping):
+        assignments_path = config.get(_WINDOWS_ASSIGNMENTS_PATH_KEY)
+        if not isinstance(assignments_path, Path):
+            raise PlanError("Windows test assignment path was not loaded with the contract")
+        raw_assignments = _load_windows_test_assignments(
+            assignments_path,
+            allowed_shards=set(config["full_python_matrix"]["windows"]),
+        )
+        if isinstance(config, dict):
+            config[_LOADED_WINDOWS_ASSIGNMENTS_KEY] = raw_assignments
+    shard = raw_assignments.get(path)
+    if not isinstance(shard, str):
+        return False
+    execution_target = _safe_test_execution_target(path, repo=repo, ref=ref)
+    if execution_target is None:
+        reasons.add("deleted_test_without_safe_target")
+        return False
+    if "python-full" not in suites:
+        suites.add("python-targeted")
+        targets.add(execution_target)
+    suites.add("windows-high-risk")
+    windows_shards.add(shard)
+    reasons.add("test_only_targeted")
+    if execution_target != path:
+        reasons.add("deleted_test_targeted")
+    return True
 
 
 def _tracked_blob_ids(repo: Path, ref: str) -> dict[str, tuple[str, str]]:
@@ -669,6 +763,8 @@ def suite_execution_digests(
 def _execution_matrices(
     required_suites: Sequence[str],
     desktop_cells: set[tuple[str, str]],
+    targeted_windows_shards: set[str],
+    windows_full_matrix: bool,
     config: Mapping[str, Any],
 ) -> tuple[dict[str, list[str]], list[dict[str, str]]]:
     """Return canonical Python and all-platform execution matrices."""
@@ -681,7 +777,11 @@ def _execution_matrices(
             else []
         ),
         "windows": (
-            list(config["full_python_matrix"]["windows"])
+            (
+                list(config["full_python_matrix"]["windows"])
+                if windows_full_matrix
+                else sorted(targeted_windows_shards)
+            )
             if "windows-high-risk" in suites
             else []
         ),
@@ -732,6 +832,8 @@ def plan_changes(
     suites = set(config["baseline_suites"])
     reasons: set[str] = set()
     targets: set[str] = set()
+    targeted_windows_shards: set[str] = set()
+    windows_full_matrix = False
     desktop_cells: set[tuple[str, str]] = set()
     full_fallback = False
     all_docs = bool(paths) and not invalid_paths
@@ -766,6 +868,7 @@ def plan_changes(
         if path == ".github/scripts/windows_test_assignments.json":
             suites.update({"python-targeted", "windows-high-risk"})
             targets.add("tests/test_ci/test_windows_test_shards.py")
+            windows_full_matrix = True
             reasons.add("windows_shard_layout_changed")
             continue
         if (
@@ -776,6 +879,44 @@ def plan_changes(
         ):
             full_fallback = True
             reasons.add("ci_policy_changed")
+            continue
+
+        if path.startswith("tests/"):
+            if not _add_test_target(
+                path,
+                targets,
+                suites,
+                reasons,
+                targeted_windows_shards,
+                config,
+                repo,
+                ref,
+            ):
+                full_fallback = True
+                reasons.add("unknown_path")
+                continue
+
+            if path.startswith("tests/test_packaging/") or path == (
+                "tests/test_release_consistency.py"
+            ):
+                suites.add("release-packaging")
+                reasons.add("packaging_changed")
+            if _managed_toolchain_targets(path) is not None:
+                suites.add("managed-toolchain")
+                reasons.add("toolchain_changed")
+
+            # Test filenames often contain product-domain words such as
+            # ``workbench`` or ``recovery``. Those words do not change the
+            # product and must not wake native E2E. A reviewed path_patterns
+            # entry remains the explicit escape hatch for a test that really
+            # owns a Desktop harness contract.
+            groups = _explicit_desktop_groups(path, config)
+            if groups:
+                suites.add("desktop-recovery-e2e")
+                desktop_cells.update(
+                    _desktop_cells(groups=groups, os_scope=_os_scope(path), config=config)
+                )
+                reasons.update(f"desktop_{group}_test_changed" for group in groups)
             continue
 
         if path.startswith("opensquilla-webui/") or path.startswith(
@@ -802,6 +943,7 @@ def plan_changes(
                 suites.add("macos-recovery")
             if not os_scope or "windows-latest" in os_scope:
                 suites.add("windows-high-risk")
+                windows_full_matrix = True
             groups = _desktop_groups(path, config)
             if groups:
                 reasons.update(f"desktop_{group}_changed" for group in groups)
@@ -815,15 +957,17 @@ def plan_changes(
             continue
 
         if path in _PACKAGING_EXACT or path.startswith(
-            ("src/opensquilla/uninstall/", "tests/test_packaging/")
+            ("src/opensquilla/uninstall/",)
         ):
             suites.update({"release-packaging", "windows-high-risk"})
+            windows_full_matrix = True
             reasons.add("packaging_changed")
             continue
 
         managed_toolchain_targets = _managed_toolchain_targets(path)
         if managed_toolchain_targets is not None:
             suites.update({"managed-toolchain", "python-targeted", "windows-high-risk"})
+            windows_full_matrix = True
             targets.update(managed_toolchain_targets)
             reasons.add("toolchain_changed")
             continue
@@ -852,6 +996,7 @@ def plan_changes(
                         suites.add("macos-recovery")
                     if not os_scope or "windows-latest" in os_scope:
                         suites.add("windows-high-risk")
+                        windows_full_matrix = True
                     reasons.update(f"desktop_{group}_changed" for group in groups)
                 elif path.startswith("src/opensquilla/gateway/"):
                     suites.add("webui-chat-recovery")
@@ -860,6 +1005,7 @@ def plan_changes(
                         suites.add("macos-recovery")
                     if not os_scope or "windows-latest" in os_scope:
                         suites.add("windows-high-risk")
+                        windows_full_matrix = True
                     if not groups:
                         desktop_cells.update(
                             _desktop_cells(groups=groups, os_scope=os_scope, config=config)
@@ -871,24 +1017,9 @@ def plan_changes(
                 elif os_scope:
                     if "windows-latest" in os_scope:
                         suites.add("windows-high-risk")
+                        windows_full_matrix = True
                     if "macos-latest" in os_scope:
                         suites.add("macos-recovery")
-                continue
-            full_fallback = True
-            reasons.add("unknown_path")
-            continue
-
-        if path.startswith("tests/"):
-            if _add_test_target(path, targets, suites, reasons):
-                groups = _desktop_groups(path, config)
-                if path.startswith(_PLATFORM_TEST_PREFIXES) or groups:
-                    suites.update({"macos-recovery", "windows-high-risk"})
-                    desktop_cells.update(
-                        _desktop_cells(groups=groups, os_scope=os_scope, config=config)
-                    )
-                    if desktop_cells:
-                        suites.update({"desktop-recovery-e2e", "webui-chat-recovery"})
-                    reasons.update(f"desktop_{group}_changed" for group in groups)
                 continue
             full_fallback = True
             reasons.add("unknown_path")
@@ -904,6 +1035,7 @@ def plan_changes(
                     "windows-high-risk",
                 }
             )
+            windows_full_matrix = True
             targets.update({"tests/test_migration", "tests/test_migrations"})
             desktop_cells.update(
                 _desktop_cells(groups={"profiles"}, os_scope=os_scope, config=config)
@@ -930,6 +1062,7 @@ def plan_changes(
             for cell in config["full_desktop_matrix"]
         }
         targets = {"tests"}
+        windows_full_matrix = True
     elif "python-full" in suites:
         suites.discard("python-targeted")
         suites.discard("windows-compat")
@@ -945,6 +1078,8 @@ def plan_changes(
     python_matrix, platform_matrix = _execution_matrices(
         required_suites,
         desktop_cells,
+        targeted_windows_shards,
+        windows_full_matrix,
         config,
     )
     digests = suite_execution_digests(

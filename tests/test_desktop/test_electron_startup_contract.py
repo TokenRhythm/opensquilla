@@ -2430,6 +2430,24 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "real Electron process" in gate
     assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
     assert "requires an unlocked foreground GUI session" in native
+    assert "OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'" in native
+    assert "const annotationGeometryDeltas = fixture.stressMode" in native
+    assert "? [96, -24, 24, -32, 32]" in native
+    assert "const annotationRearmCycleCount = fixture.stressMode ? 3 : 1" in native
+    assert "restoreTrustedAnnotationInputFocus" in native
+    assert "state.ownerFocused" in native
+    assert "&& state.nativeFocused" in native
+    assert "&& state.documentFocused" in native
+    assert "&& state.editorFocused" in native
+    assert "(!ownerFocused || nativeFocused)" not in native
+    assert "(!cycle.ownerFocused || cycle.nativeFocused)" not in native
+    assert native.count("type: 'char'") == 1
+    assert native.count(".insertText(") == 1
+    assert "window.__opensquillaNativeInputProbe" in native
+    assert "observed.input.length > 0" in native
+    assert "ELECTRON_FOREGROUND_PREREQUISITE_MISSING" in native
+    assert "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED" in native
+    assert "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED" in native
     assert ci.count(
         "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
     ) == 3
@@ -2883,15 +2901,33 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     script = _read(
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
+    main = _read("desktop/electron/src/main.ts")
+    lifecycle = _read("desktop/electron/src/gateway-lifecycle.ts")
 
     assert package_json["scripts"]["test:gateway-orphan-recovery-flow"] == (
         "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
-    assert "await launchDesktop()" in script
+    assert "await launchDesktop(" in script
     assert "loaded.record.pid !== firstRecord.pid" in script
     assert "waitForDesktopGatewayOwnershipRelease" in script
+    assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
+    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main
+    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in script
+    assert "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + CONTROL_UI_ROUTE_TIMEOUT_MS" in script
+    assert (
+        "VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS"
+        in script
+    )
+    assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
+    assert "phase.remainingMs('first-window')" in script
+    assert "phase.remainingMs('control-ui-route')" in script
+    assert "DESKTOP_E2E_PHASE_TIMEOUT:" in script
+    assert "DESKTOP_E2E_PHASE_FAILED:" in script
+    assert "DESKTOP_E2E_PROCESS_EXITED:" in script
+    assert "if (flowSucceeded && stillLive.length === 0)" in script
+    assert "async function waitFor(check, label, timeoutMs = 60_000)" not in script
 
 
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:

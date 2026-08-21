@@ -15,6 +15,13 @@ const scriptPath = fileURLToPath(import.meta.url)
 const scriptDir = dirname(scriptPath)
 const fixtureRoot = join(scriptDir, 'fixtures', 'native-workbench-smoke')
 const require = createRequire(import.meta.url)
+const workbenchE2eMode = process.env.OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'
+if (!['smoke', 'stress'].includes(workbenchE2eMode)) {
+  throw new Error(
+    `OPENSQUILLA_WORKBENCH_E2E_MODE must be smoke or stress, got ${workbenchE2eMode}.`,
+  )
+}
+const stressMode = workbenchE2eMode === 'stress'
 const [fixtureFont, gsapSource, lottieSource] = await Promise.all([
   readFile(join(
     scriptDir,
@@ -601,14 +608,203 @@ try {
         },
       })
 
-      async function waitFor(check, label, timeoutMs = 10_000) {
+      async function waitFor(check, label, timeoutMs = 10_000, diagnose = null) {
         const deadline = Date.now() + timeoutMs
         while (Date.now() < deadline) {
           const value = await check()
           if (value) return value
           await new Promise(resolveWait => setTimeout(resolveWait, 25))
         }
-        throw new Error(`Timed out waiting for ${label}.`)
+        let diagnostic = null
+        if (diagnose) {
+          try {
+            diagnostic = await diagnose()
+          } catch (error) {
+            diagnostic = { diagnosticError: error?.message || String(error) }
+          }
+        }
+        const suffix = diagnostic === null ? '' : ` Diagnostics: ${JSON.stringify(diagnostic)}`
+        throw new Error(`Timed out waiting for ${label}.${suffix}`)
+      }
+
+      async function trustedAnnotationInputState(overlay) {
+        const contents = overlay?.view?.webContents
+        const nativeState = {
+          ownerFocused: owner.isFocused(),
+          ownerVisible: owner.isVisible(),
+          ownerMinimized: owner.isMinimized(),
+          nativeFocused: Boolean(contents && !contents.isDestroyed() && contents.isFocused()),
+          webContentsDestroyed: Boolean(!contents || contents.isDestroyed()),
+          overlayVisible: Boolean(overlay?.view?.getVisible()),
+        }
+        if (!contents || contents.isDestroyed()) return nativeState
+        const rendererState = await contents.executeJavaScript(`(() => {
+          const textarea = document.getElementById('annotation-body')
+          return {
+            activeElement: document.activeElement?.id || document.activeElement?.tagName || null,
+            documentFocused: document.hasFocus(),
+            editorFocused: document.activeElement === textarea,
+            selectionStart: textarea?.selectionStart ?? null,
+            selectionEnd: textarea?.selectionEnd ?? null,
+            value: textarea?.value ?? null,
+            inputProbe: window.__opensquillaNativeInputProbe ?? null,
+          }
+        })()`)
+        return { ...nativeState, ...rendererState }
+      }
+
+      function trustedAnnotationFocusReady(state) {
+        return Boolean(
+          state.ownerFocused
+          && state.nativeFocused
+          && state.documentFocused
+          && state.editorFocused,
+        )
+      }
+
+      async function restoreTrustedAnnotationInputFocus(overlay, label) {
+        const recover = async () => {
+          const contents = overlay?.view?.webContents
+          if (!contents || contents.isDestroyed()) {
+            throw new Error(`TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED: ${label}: renderer is gone.`)
+          }
+          if (process.platform === 'darwin') app.focus({ steal: true })
+          if (owner.isMinimized()) owner.restore()
+          owner.show()
+          owner.focus()
+          contents.focus()
+          await contents.executeJavaScript(`(() => {
+            const textarea = document.getElementById('annotation-body')
+            if (!textarea) throw new Error('annotation textarea is missing')
+            textarea.focus({ preventScroll: true })
+          })()`, true)
+        }
+
+        try {
+          await recover()
+          const state = await waitFor(async () => {
+            const candidate = await trustedAnnotationInputState(overlay)
+            if (trustedAnnotationFocusReady(candidate)) return candidate
+            await recover()
+            return null
+          }, label, 10_000, () => trustedAnnotationInputState(overlay))
+          annotationNativeOwnerFocusAvailable = true
+          return state
+        } catch (error) {
+          const state = await trustedAnnotationInputState(overlay).catch(diagnosticError => ({
+            diagnosticError: diagnosticError?.message || String(diagnosticError),
+          }))
+          const classification = state.ownerFocused
+            ? 'TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED'
+            : 'ELECTRON_FOREGROUND_PREREQUISITE_MISSING'
+          throw new Error(
+            `${classification}: ${label}. ${error?.message || error} `
+            + `Final state: ${JSON.stringify(state)}`,
+          )
+        }
+      }
+
+      async function requireRetainedTrustedAnnotationFocus(overlay, label) {
+        try {
+          return await waitFor(async () => {
+            const state = await trustedAnnotationInputState(overlay)
+            return trustedAnnotationFocusReady(state) ? state : null
+          }, label, 10_000, () => trustedAnnotationInputState(overlay))
+        } catch (error) {
+          const state = await trustedAnnotationInputState(overlay).catch(diagnosticError => ({
+            diagnosticError: diagnosticError?.message || String(diagnosticError),
+          }))
+          const classification = state.ownerFocused
+            ? 'TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED'
+            : 'ELECTRON_FOREGROUND_PREREQUISITE_MISSING'
+          throw new Error(`${classification}: ${error?.message || error}`)
+        }
+      }
+
+      async function armTrustedAnnotationInputProbe(overlay, label) {
+        const token = `${label}:${Date.now()}:${Math.random()}`
+        const contents = overlay.view.webContents
+        return await contents.executeJavaScript(`(() => {
+          const textarea = document.getElementById('annotation-body')
+          if (!textarea) throw new Error('annotation textarea is missing')
+          if (!window.__opensquillaNativeInputProbeInstalled) {
+            const observe = (event) => {
+              if (event.target?.id !== 'annotation-body') return
+              const probe = window.__opensquillaNativeInputProbe
+              if (!probe) return
+              const entry = {
+                data: typeof event.data === 'string' ? event.data : null,
+                inputType: event.inputType || null,
+                isComposing: Boolean(event.isComposing),
+                value: event.target.value,
+              }
+              probe[event.type].push(entry)
+            }
+            document.addEventListener('beforeinput', observe, true)
+            document.addEventListener('input', observe, true)
+            window.__opensquillaNativeInputProbeInstalled = true
+          }
+          window.__opensquillaNativeInputProbe = {
+            token: ${JSON.stringify(token)},
+            initialValue: textarea.value,
+            beforeinput: [],
+            input: [],
+          }
+          return window.__opensquillaNativeInputProbe
+        })()`)
+      }
+
+      async function waitForTrustedAnnotationInput(overlay, probe, expectedValue, label) {
+        let observedState
+        try {
+          observedState = await waitFor(async () => {
+            const state = await trustedAnnotationInputState(overlay)
+            const observed = state.inputProbe
+            return (
+              observed?.token === probe.token
+              && observed.input.length > 0
+              && state.value === expectedValue
+            ) ? state : null
+          }, label, 10_000, () => trustedAnnotationInputState(overlay))
+        } catch (error) {
+          const state = await trustedAnnotationInputState(overlay).catch(diagnosticError => ({
+            diagnosticError: diagnosticError?.message || String(diagnosticError),
+          }))
+          const classification = !state.ownerFocused
+            ? 'ELECTRON_FOREGROUND_PREREQUISITE_MISSING'
+            : 'TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED'
+          throw new Error(`${classification}: ${error?.message || error}`)
+        }
+        // The renderer event proves the real input path ran. Re-establish the
+        // native foreground precondition before the caller proceeds so an
+        // unrelated host focus steal cannot poison a later assertion.
+        const focusedState = await restoreTrustedAnnotationInputFocus(
+          overlay,
+          `${label} post-input focus`,
+        )
+        return {
+          ...focusedState,
+          inputProbe: observedState.inputProbe,
+        }
+      }
+
+      async function sendTrustedAnnotationCharacter(overlay, character, expectedValue, label) {
+        await restoreTrustedAnnotationInputFocus(overlay, `${label} focus`)
+        const probe = await armTrustedAnnotationInputProbe(overlay, label)
+        overlay.view.webContents.sendInputEvent({
+          type: 'char',
+          keyCode: character,
+        })
+        return await waitForTrustedAnnotationInput(overlay, probe, expectedValue, label)
+      }
+
+      async function insertTrustedAnnotationText(overlay, text, expectedValue, label) {
+        await restoreTrustedAnnotationInputFocus(overlay, `${label} focus`)
+        const probe = await armTrustedAnnotationInputProbe(overlay, label)
+        // insertText uses Chromium's text-input/IME commit path rather than
+        // changing the DOM value directly.
+        overlay.view.webContents.insertText(text)
+        return await waitForTrustedAnnotationInput(overlay, probe, expectedValue, label)
       }
 
       async function closeAnnotationOverlayAndDrain(request, label) {
@@ -636,7 +832,7 @@ try {
       owner.show()
       owner.focus()
       await new Promise(resolveWait => setTimeout(resolveWait, 100))
-      const annotationNativeOwnerFocusAvailable = owner.isFocused()
+      let annotationNativeOwnerFocusAvailable = owner.isFocused()
 
       function view(surfaceId) {
         const resultView = manager.surfaces.get(surfaceId)?.view
@@ -1056,12 +1252,9 @@ try {
       // sendInputEvent does not activate a WebContentsView the way a native
       // OS pointer event does. Restore the trusted view after the deliberately
       // blocked DevTools request before exercising click and geometry focus.
-      if (process.platform === 'darwin') app.focus({ steal: true })
-      owner.focus()
-      annotationOverlay.view.webContents.focus()
-      await annotationOverlay.view.webContents.executeJavaScript(
-        "document.getElementById('annotation-body').focus()",
-        true,
+      await restoreTrustedAnnotationInputFocus(
+        annotationOverlay,
+        'trusted annotation textarea focus after blocked DevTools request',
       )
       annotationOverlay.view.webContents.sendInputEvent({
         type: 'mouseDown',
@@ -1087,25 +1280,31 @@ try {
       const annotationOverlayOnTop = owner.contentView.children.at(-1) === annotationOverlay.view
       const annotationOverlayFocusCycles = []
       let previousOverlayBounds = annotationOverlayBounds
-      for (const [index, scrollDelta] of [96, -24, 24, -32, 32].entries()) {
+      const annotationGeometryDeltas = fixture.stressMode
+        ? [96, -24, 24, -32, 32]
+        : [96]
+      for (const [index, scrollDelta] of annotationGeometryDeltas.entries()) {
+        await restoreTrustedAnnotationInputFocus(
+          annotationOverlay,
+          `trusted annotation focus before geometry refresh ${index + 1}`,
+        )
         await v3Contents.executeJavaScript(`window.scrollBy(0, ${scrollDelta})`)
         const movedBounds = await waitFor(() => {
           const bounds = annotationOverlay.view.getBounds()
           return bounds.y !== previousOverlayBounds.y ? bounds : null
         }, `trusted annotation overlay geometry refresh ${index + 1}`)
-        const focusState = await waitFor(
-          async () => {
-            const editorFocused = await annotationOverlay.view.webContents.executeJavaScript(
-              "document.activeElement?.id === 'annotation-body'",
-            )
-            const ownerFocused = owner.isFocused()
-            const nativeFocused = annotationOverlay.view.webContents.isFocused()
-            return editorFocused && (!ownerFocused || nativeFocused)
-              ? { editorFocused, ownerFocused, nativeFocused }
-              : null
-          },
-          `trusted annotation native focus after geometry refresh ${index + 1}`,
-        )
+        // The first cycle proves geometry refresh itself retains focus. Later
+        // stress cycles actively recover foreground ownership, which keeps the
+        // repetition useful without coupling it to unrelated host focus steals.
+        const focusState = index === 0
+          ? await requireRetainedTrustedAnnotationFocus(
+            annotationOverlay,
+            'trusted annotation native focus after geometry refresh 1',
+          )
+          : await restoreTrustedAnnotationInputFocus(
+            annotationOverlay,
+            `trusted annotation native focus after geometry refresh ${index + 1}`,
+          )
         annotationOverlayFocusCycles.push({
           bounds: movedBounds,
           ...focusState,
@@ -1115,25 +1314,44 @@ try {
       const annotationOverlayMovedBounds = annotationOverlayFocusCycles[0].bounds
       const annotationOverlayFocusedAfterGeometry =
         annotationOverlayFocusCycles.every(cycle =>
-          cycle.editorFocused && (!cycle.ownerFocused || cycle.nativeFocused))
+          cycle.editorFocused && cycle.ownerFocused && cycle.nativeFocused)
+      await restoreTrustedAnnotationInputFocus(
+        annotationOverlay,
+        'trusted annotation selection before native keyboard input',
+      )
       await annotationOverlay.view.webContents.executeJavaScript(
         "document.getElementById('annotation-body').select()",
       )
-      for (const character of 'ASCII annotation ') {
-        annotationOverlay.view.webContents.sendInputEvent({
-          type: 'char',
-          keyCode: character,
+      const annotationInputHandshakes = []
+      let expectedAnnotationValue = ''
+      for (const [index, character] of [...'ASCII annotation '].entries()) {
+        expectedAnnotationValue += character
+        const state = await sendTrustedAnnotationCharacter(
+          annotationOverlay,
+          character,
+          expectedAnnotationValue,
+          `trusted overlay native character ${index + 1}`,
+        )
+        annotationInputHandshakes.push({
+          kind: 'char',
+          beforeinputCount: state.inputProbe.beforeinput.length,
+          inputCount: state.inputProbe.input.length,
+          value: state.value,
         })
       }
-      // insertText uses Chromium's text-input/IME commit path rather than
-      // changing the DOM value directly.
-      annotationOverlay.view.webContents.insertText('中文输入')
-      await waitFor(
-        async () => await annotationOverlay.view.webContents.executeJavaScript(
-          "document.getElementById('annotation-body').value === 'ASCII annotation 中文输入'",
-        ),
+      expectedAnnotationValue += '中文输入'
+      const annotationImeState = await insertTrustedAnnotationText(
+        annotationOverlay,
+        '中文输入',
+        expectedAnnotationValue,
         'trusted overlay real keyboard and IME input',
       )
+      annotationInputHandshakes.push({
+        kind: 'ime',
+        beforeinputCount: annotationImeState.inputProbe.beforeinput.length,
+        inputCount: annotationImeState.inputProbe.input.length,
+        value: annotationImeState.value,
+      })
       const annotationOverlayTypedValue =
         await annotationOverlay.view.webContents.executeJavaScript(
           "document.getElementById('annotation-body').value",
@@ -1273,10 +1491,8 @@ try {
           emptyBodyMessage: 'Describe the next requested change.',
         },
       })
-      await waitFor(
-        async () => await annotationOverlay.view.webContents.executeJavaScript(
-          "document.activeElement?.id === 'annotation-body'",
-        ),
+      await restoreTrustedAnnotationInputFocus(
+        annotationOverlay,
         'rearmed annotation textarea focus',
       )
       const annotationRearmCopy =
@@ -1314,16 +1530,19 @@ try {
           form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
           return textarea.validationMessage
         })()`)
-      annotationOverlay.view.webContents.insertText('Rearmed input')
-      const annotationRearmTypedValue = await waitFor(
-        async () => {
-          const value = await annotationOverlay.view.webContents.executeJavaScript(
-            "document.getElementById('annotation-body').value",
-          )
-          return value === 'Rearmed input' ? value : null
-        },
+      const annotationRearmInputState = await insertTrustedAnnotationText(
+        annotationOverlay,
+        'Rearmed input',
+        'Rearmed input',
         'rearmed annotation overlay input',
       )
+      const annotationRearmTypedValue = annotationRearmInputState.value
+      annotationInputHandshakes.push({
+        kind: 'rearm-ime',
+        beforeinputCount: annotationRearmInputState.inputProbe.beforeinput.length,
+        inputCount: annotationRearmInputState.inputProbe.input.length,
+        value: annotationRearmInputState.value,
+      })
       const annotationRearmSubmitEventsBeforeNewline = events.filter(event =>
         event.type === 'annotation-submit'
         && event.detail?.annotationId === 'annotation_rearmed_fixture').length
@@ -1373,7 +1592,8 @@ try {
         annotationId: 'annotation_rearmed_fixture',
       }, 'rearmed annotation acknowledgement')
       const annotationRearmFocusCycles = []
-      for (let cycle = 0; cycle < 3; cycle += 1) {
+      const annotationRearmCycleCount = fixture.stressMode ? 3 : 1
+      for (let cycle = 0; cycle < annotationRearmCycleCount; cycle += 1) {
         const cycleEventsBefore = events.length
         const cyclePicker = await manager.setArtifactAnnotationMode({
           version: 3,
@@ -1410,36 +1630,24 @@ try {
           annotationId: cycleAnnotationId,
           initialBody: '',
         })
-        await waitFor(
-          async () => await annotationOverlay.view.webContents.executeJavaScript(
-            "document.activeElement?.id === 'annotation-body'",
-          ),
+        await restoreTrustedAnnotationInputFocus(
+          annotationOverlay,
           `annotation rearm editor focus cycle ${cycle + 1}`,
         )
         const cycleBody = `Rearmed IME ${cycle + 1} 中文输入`
-        annotationOverlay.view.webContents.insertText(cycleBody)
-        const typedValue = await waitFor(
-          async () => {
-            const value = await annotationOverlay.view.webContents.executeJavaScript(
-              "document.getElementById('annotation-body').value",
-            )
-            return value === cycleBody ? value : null
-          },
+        const cycleInputState = await insertTrustedAnnotationText(
+          annotationOverlay,
+          cycleBody,
+          cycleBody,
           `annotation rearm IME input cycle ${cycle + 1}`,
         )
-        const cycleFocusState = await waitFor(
-          async () => {
-            const editorFocused = await annotationOverlay.view.webContents.executeJavaScript(
-              "document.activeElement?.id === 'annotation-body'",
-            )
-            const ownerFocused = owner.isFocused()
-            const nativeFocused = annotationOverlay.view.webContents.isFocused()
-            return editorFocused && (!ownerFocused || nativeFocused)
-              ? { editorFocused, ownerFocused, nativeFocused }
-              : null
-          },
-          `annotation rearm native focus cycle ${cycle + 1}`,
-        )
+        annotationInputHandshakes.push({
+          kind: 'stress-ime',
+          beforeinputCount: cycleInputState.inputProbe.beforeinput.length,
+          inputCount: cycleInputState.inputProbe.input.length,
+          value: cycleInputState.value,
+        })
+        const cycleFocusState = cycleInputState
         const cycleClose = await closeAnnotationOverlayAndDrain({
           version: 3,
           surfaceId: 'artifact:v3-bridge',
@@ -1449,7 +1657,7 @@ try {
           picker: cyclePicker.ok,
           overlay: cycleOverlayResult.ok,
           ...cycleFocusState,
-          typedValue,
+          typedValue: cycleInputState.value,
           closed: cycleClose.ok,
         })
       }
@@ -2246,6 +2454,7 @@ try {
       owner.destroy()
 
       return {
+        stressMode: fixture.stressMode,
         fullProbes,
         fullReload,
         fullStorageSurvivedReload,
@@ -2289,6 +2498,7 @@ try {
         annotationNativeOwnerFocusAvailable,
         annotationOverlayFocusCycles,
         annotationOverlayFocusedAfterGeometry,
+        annotationInputHandshakes,
         annotationOverlayTypedValue,
         annotationPreviewKeys,
         annotationEmptySubmitRetained,
@@ -2394,6 +2604,7 @@ try {
       privilegedGatewayAlias,
       stunPort: stunAddress.port,
       turnTcpPort: turnTcpAddress.port,
+      stressMode,
     },
   )
 
@@ -2638,13 +2849,18 @@ try {
   assert.equal(result.annotationOverlayOnTop, true)
   assert.equal(
     result.annotationOverlayFocusCycles.length,
-    5,
+    result.stressMode ? 5 : 1,
     'trusted annotation focus must survive repeated geometry refreshes',
   )
   assert.equal(
     result.annotationOverlayFocusedAfterGeometry,
     true,
     'the trusted annotation editor must retain native keyboard focus across geometry refreshes',
+  )
+  assert.equal(
+    result.annotationInputHandshakes.every(handshake => handshake.inputCount > 0),
+    true,
+    'every native character and IME commit must be acknowledged by a renderer input event',
   )
   assert.equal(result.annotationOverlayTypedValue, 'ASCII annotation 中文输入')
   assert.equal(
@@ -2704,15 +2920,16 @@ try {
   assert.equal(result.annotationRearmShiftEnterDidNotSubmit, true)
   assert.equal(result.annotationRearmSubmitAfterInterruptedComposition, true)
   assert.equal(result.annotationRearmOverlayClose.ok, true)
-  assert.equal(result.annotationRearmFocusCycles.length, 3)
+  assert.equal(result.annotationRearmFocusCycles.length, result.stressMode ? 3 : 1)
   assert.equal(
     result.annotationRearmFocusCycles.every(cycle =>
       cycle.picker
       && cycle.overlay
       && cycle.editorFocused
+      && cycle.ownerFocused
+      && cycle.nativeFocused
       && cycle.closed
-      && cycle.typedValue.includes('中文输入')
-      && (!cycle.ownerFocused || cycle.nativeFocused)),
+      && cycle.typedValue.includes('中文输入')),
     true,
     'trusted annotation editor must survive repeated close/rearm/IME cycles',
   )

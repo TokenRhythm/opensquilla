@@ -1626,6 +1626,14 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
         "${{ github.workspace }}/.cache/ms-playwright"
     )
+    assert job["env"]["OPENSQUILLA_WORKBENCH_E2E_MODE"] == (
+        "${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') "
+        "&& 'smoke' || 'stress' }}"
+    )
+    prepare = next(
+        step for step in steps if step.get("name") == "Prepare Desktop recovery report"
+    )
+    assert "workbench_e2e_mode" in prepare["run"]
     assert "${{ runner.arch }}" in playwright_cache["with"]["key"]
     assert "steps.playwright-browser.outputs.revision" in playwright_cache["with"]["key"]
     assert "restore-keys" not in playwright_cache["with"]
@@ -1644,15 +1652,23 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert '--shard "${{ matrix.shard }}"' in run["run"]
     assert '--attempt "${attempt}"' in run["run"]
     assert 'desktop-e2e-cases.jsonl' in run["run"]
-    assert "is_retryable_windows_failure()" in run["run"]
-    assert '[[ "${RUNNER_OS}" == "Windows" ]] || return 1' in run["run"]
-    assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
-    assert (
-        "grep -Fq 'Timed out waiting for post-exit delete-all helper completion'"
-        in run["run"]
+    assert "classify_retryable_infrastructure_failure()" in run["run"]
+    assert 'if classify_retryable_infrastructure_failure "${name}" "${first_log}"' in (
+        run["run"]
     )
-    assert "grep -Fq 'Windows ACL hardening timed out'" in run["run"]
-    assert 'if is_retryable_windows_failure "${first_log}"' in run["run"]
+    assert '"windows-delete-helper-handoff-timeout-v1"' in run["run"]
+    assert '"windows-isolated-acl-worker-timeout-v1"' in run["run"]
+    assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
+    assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
+    assert '"cases": {"offline-document-workbench-e2e"}' in run["run"]
+    assert '"classification": matches[0] if retryable else "non_retryable"' in (
+        run["run"]
+    )
+    assert '"log_sha256": hashlib.sha256(payload).hexdigest()' in run["run"]
+    assert '"TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:"' in run["run"]
+    assert '"DESKTOP_E2E_PHASE_TIMEOUT:"' in run["run"]
+    assert "Gateway did not become healthy" not in run["run"]
+    assert "grep -Fq" not in run["run"]
     assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
     assert summary_upload["if"] == "${{ success() }}"
@@ -1661,6 +1677,8 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "-attempt-${{ github.run_attempt }}"
     )
     assert "desktop-e2e-cases.jsonl" in summary_upload["with"]["path"]
+    assert "retry-classifications.jsonl" in summary_upload["with"]["path"]
+    assert "retry-evidence" in summary_upload["with"]["path"]
     assert "*.log" not in summary_upload["with"]["path"]
     assert failure_upload["if"] == "${{ failure() }}"
     assert failure_upload["with"]["path"] == (
@@ -1672,6 +1690,143 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         if step.get("name") == "Run desktop unit tests"
     )
     assert "node scripts/test-ci-case-telemetry.mjs" in desktop_unit["run"]
+
+
+@pytest.mark.parametrize(
+    ("case_name", "runner_os", "message", "expected_signature"),
+    (
+        (
+            "desktop-cleanup-flow",
+            "Windows",
+            "Error: Timed out waiting for post-exit delete-all helper completion.; "
+            "pending synthetic targets: synthetic-home\n",
+            "windows-delete-helper-handoff-timeout-v1",
+        ),
+        (
+            "offline-document-workbench-e2e",
+            "Windows",
+            "E           AssertionError: isolated Windows ACL hardening timed out: "
+            "stdout='synthetic'\n",
+            "windows-isolated-acl-worker-timeout-v1",
+        ),
+        (
+            "offline-document-workbench-e2e",
+            "macOS",
+            "Error: electronApplication.evaluate: Error: "
+            "ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n",
+            "macos-electron-foreground-prerequisite-v1",
+        ),
+    ),
+)
+def test_desktop_retry_classifier_accepts_only_structured_infrastructure_signatures(
+    tmp_path: Path,
+    case_name: str,
+    runner_os: str,
+    message: str,
+    expected_signature: str,
+) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    log.write_text(message, encoding="utf-8")
+
+    accepted = subprocess.run(
+        [sys.executable, "-", case_name, runner_os, str(log), str(output), str(evidence)],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert accepted.returncode == 0
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == expected_signature
+    assert record["retryable"] is True
+    assert re.fullmatch(r"[0-9a-f]{64}", record["log_sha256"])
+    assert (evidence / log.name).read_text(encoding="utf-8") == message
+
+    # The same wording from a different functional case is not retryable.
+    rejected = subprocess.run(
+        [sys.executable, "-", "theme-flow", runner_os, str(log), str(output), str(evidence)],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode == 1
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["classification"] == "non_retryable"
+    assert records[-1]["retryable"] is False
+
+
+def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Path) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    log.write_text(
+        "AssertionError: expected saved document content to equal the submitted content\n"
+        "Error: Gateway did not become healthy\n",
+        encoding="utf-8",
+    )
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "offline-document-workbench-e2e",
+            "Windows",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == "non_retryable"
+    assert record["retryable"] is False
+    assert list(evidence.iterdir()) == []
+
+    # A functional contract marker always wins even if a runner signature is
+    # also present in the combined diagnostic log.
+    log.write_text(
+        "Error: ELECTRON_FOREGROUND_PREREQUISITE_MISSING: synthetic\n"
+        "Error: TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED: wrong submitted value\n",
+        encoding="utf-8",
+    )
+    hard_failure = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "offline-document-workbench-e2e",
+            "macOS",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+    assert hard_failure.returncode == 1
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["classification"] == "non_retryable"
+    assert records[-1]["blocked_markers"] == ["TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:"]
 
 
 def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> None:
@@ -1806,6 +1961,7 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert "--maxfail=1" not in test_step["run"]
     assert '"${{ matrix.shard }}" == "recovery-migration"' in test_step["run"]
     assert '"${{ matrix.shard }}" == "gateway-sqlite"' in test_step["run"]
+    assert '"${{ matrix.shard }}" == "desktop-installer-contracts"' in test_step["run"]
     assert "worker_args+=(--workers=2)" in test_step["run"]
     assert '"${worker_args[@]}"' in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]

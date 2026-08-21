@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "windows_test_assignments": ".github/scripts/windows_test_assignments.json",
   "baseline_suites": [
     "readme-locale",
     "workflow-lint"
@@ -29,7 +30,11 @@
     },
     {
       "os": "macos-latest",
-      "shard": "ownership-workbench"
+      "shard": "ownership"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "workbench"
     },
     {
       "os": "windows-latest",

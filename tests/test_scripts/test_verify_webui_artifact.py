@@ -271,6 +271,7 @@ def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path) -> None:
         verify_wheel(dist, wheel, webui_root=webui)
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_node_and_python_source_fingerprints_share_order_and_line_endings(
     tmp_path: Path,
