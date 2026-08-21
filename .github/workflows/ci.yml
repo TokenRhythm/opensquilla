@@ -1014,11 +1014,12 @@ jobs:
           fi
 
           worker_args=()
-          if [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
-            # The recovery shard starts Windows ``spawn`` children from several
-            # tests.  Keep the other shards at four workers, but leave headroom
-            # for those process-start handshakes instead of changing their
-            # bounded readiness assertions.
+          if [[ "${{ matrix.shard }}" == "recovery-migration" ||
+                "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+            # These shards start Windows ``spawn`` children and gateway
+            # subprocesses from several tests.  Keep the other shards at four
+            # workers, but leave headroom for those process-start handshakes
+            # instead of changing their bounded readiness/timing assertions.
             worker_args+=(--workers=2)
           fi
 
