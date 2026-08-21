@@ -204,7 +204,7 @@ def _mock_windows_acl(
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         assert "text" not in kwargs
-        assert Path(command[0]).name.casefold() in {"powershell.exe", "pwsh.exe"}
+        assert Path(command[0]).stem.casefold() in {"powershell", "pwsh"}
         assert tuple(command[1:5]) == (
             "-NoProfile",
             "-NonInteractive",
@@ -689,7 +689,7 @@ def test_windows_snapshot_acl_is_applied_in_copy_and_promotion_order(
     )
     assert tmp_path / upgrade_migration.SNAPSHOT_NAME / "manifest.json" in protected_paths
     for _kind, _path, command in (event for event in events if event[0] == "acl"):
-        assert Path(command[0]).name.casefold() in {"powershell.exe", "pwsh.exe"}
+        assert Path(command[0]).stem.casefold() in {"powershell", "pwsh"}
         assert tuple(command[1:5]) == (
             "-NoProfile",
             "-NonInteractive",
