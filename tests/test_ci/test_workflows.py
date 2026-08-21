@@ -1698,6 +1698,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "node scripts/test-ci-case-telemetry.mjs" in desktop_unit["run"]
 
 
+@pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))
 @pytest.mark.parametrize(
     ("case_name", "runner_os", "message", "expected_signature"),
     (
@@ -1739,6 +1740,7 @@ def test_desktop_retry_classifier_accepts_only_structured_infrastructure_signatu
     runner_os: str,
     message: str,
     expected_signature: str,
+    line_ending: str,
 ) -> None:
     run = next(
         step["run"]
@@ -1750,7 +1752,8 @@ def test_desktop_retry_classifier_accepts_only_structured_infrastructure_signatu
     output = tmp_path / "classifications.jsonl"
     evidence = tmp_path / "evidence"
     evidence.mkdir()
-    log.write_text(message, encoding="utf-8")
+    payload = message.replace("\n", line_ending).encode()
+    log.write_bytes(payload)
 
     accepted = subprocess.run(
         [sys.executable, "-", case_name, runner_os, str(log), str(output), str(evidence)],
@@ -1764,7 +1767,7 @@ def test_desktop_retry_classifier_accepts_only_structured_infrastructure_signatu
     assert record["classification"] == expected_signature
     assert record["retryable"] is True
     assert re.fullmatch(r"[0-9a-f]{64}", record["log_sha256"])
-    assert (evidence / log.name).read_text(encoding="utf-8") == message
+    assert (evidence / log.name).read_bytes() == payload
 
     # The same wording from a different functional case is not retryable.
     rejected = subprocess.run(

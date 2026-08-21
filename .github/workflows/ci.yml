@@ -1346,7 +1346,11 @@ jobs:
           case_name, runner_os, log_name, output_name, evidence_name = sys.argv[1:]
           log_path = Path(log_name)
           payload = log_path.read_bytes()
-          text = payload.decode("utf-8", errors="replace")
+          text = (
+              payload.decode("utf-8", errors="replace")
+              .replace("\r\n", "\n")
+              .replace("\r", "\n")
+          )
 
           # Retry only a single case for narrowly identified hosted-runner
           # handoff/input failures.  Generic timeouts, connection failures,
