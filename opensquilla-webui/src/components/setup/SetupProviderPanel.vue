@@ -233,43 +233,41 @@ function discoverErrorDetail(err: unknown): string {
   return String(err ?? 'unknown error')
 }
 
-function normalizeDiscoveredModelRows(payload: Record<string, unknown>): Array<{ id: string; label: string }> {
-  const rows = Array.isArray(payload?.models) ? (payload.models as unknown[]) : []
-  const seen = new Set<string>()
-  const result: Array<{ id: string; label: string }> = []
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') continue
-    const record = row as Record<string, unknown>
-    const id = String(record.id ?? record.model ?? '').trim()
-    if (!id || seen.has(id)) continue
-    seen.add(id)
-    result.push({ id, label: String(record.label ?? record.name ?? id).trim() || id })
-  }
-  return result
-}
-
 async function fetchCustomModels() {
   const baseUrl = customBaseUrl.value.trim()
-  const providerId = customProviderId.value.trim().toLowerCase()
-  if (!baseUrl || !providerId || customFetching.value) return
+  if (!baseUrl || customFetching.value) return
   customFetching.value = true
   customError.value = ''
   try {
-    const params: Record<string, unknown> = {
-      providerId,
-      baseUrl,
-      apiKey: customApiKey.value.trim(),
-      forceRefresh: true,
+    const url = `${baseUrl.replace(/\/+$/, '')}/models`
+    const headers: Record<string, string> = { accept: 'application/json' }
+    const key = customApiKey.value.trim()
+    if (key) headers.authorization = `Bearer ${key}`
+    const response = await fetch(url, { method: 'GET', headers })
+    if (!response.ok) {
+      const hint = response.status === 401 || response.status === 403
+        ? '; check the API key'
+        : ''
+      throw new Error(`${url} answered ${response.status}${hint}`)
     }
-    const method = typeof rpc.supportsMethod === 'function'
-      && rpc.supportsMethod('onboarding.llmProfile.draft.models.discover')
-      ? 'onboarding.llmProfile.draft.models.discover'
-      : 'onboarding.models.discover'
-    const res = await rpc.call<Record<string, unknown>>(method, params)
-    const payload = (res ?? {}) as Record<string, unknown>
-    const discovered = normalizeDiscoveredModelRows(payload)
+    const text = await response.text()
+    const parsed = JSON.parse(text)
+    const rows: Record<string, unknown>[] = Array.isArray(parsed?.data)
+      ? parsed.data
+      : Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.models)
+          ? parsed.models
+          : []
+    const discovered = rows
+      .filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object')
+      .map(row => ({
+        id: String(row.id ?? row.model ?? '').trim(),
+        name: String(row.name ?? row.display_name ?? row.id ?? '').trim(),
+      }))
+      .filter(item => item.id)
     if (discovered.length > 0) {
-      customModels.value = discovered.map(item => ({ id: item.id, name: item.label }))
+      customModels.value = discovered.map(item => ({ id: item.id, name: item.name || item.id }))
       customManualHint.value = false
     } else {
       customManualHint.value = true
