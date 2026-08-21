@@ -475,6 +475,8 @@ let allowGracefulShutdownWhileQuitting = false
 // machine. Synchronous append: lifecycle events are rare, renderer events are
 // rate-limited, and every record must survive an imminent app.exit(). The file
 // sink caps individual records and rotates a bounded backup set.
+const desktopProcessStartedAt = Date.now()
+
 function desktopLog(event: string, detail?: Record<string, unknown>): void {
   try {
     appendDesktopLogRecord(
@@ -1124,6 +1126,7 @@ function assertSupportedMacInstallLocation(): void {
 function sendBootStatus(phaseId: BootPhaseId): void {
   bootStatus = { phaseId, label: desktopT('boot.' + phaseId), at: new Date().toISOString() }
   bootError = null
+  desktopStartupLog('boot_phase', { phaseId })
   mainWindow?.webContents.send('desktop:boot:status', bootStatus)
 }
 
@@ -6757,6 +6760,11 @@ async function probeOnboardingProvider(
 const RECOVERY_PROTOCOL_SCHEMA_VERSION = 1
 const RECOVERY_STDOUT_LIMIT = 2 * 1024 * 1024
 const RECOVERY_COMMAND_TIMEOUT_MS = 60_000
+// Mutating recovery can legitimately scan several profiles, but it must never
+// leave Electron waiting forever (especially while Defender is inspecting a
+// packaged child). Keep this bound separate from the read-only probe budget so
+// a slow repair fails closed without weakening the ordinary inspect timeout.
+const RECOVERY_MUTATING_COMMAND_TIMEOUT_MS = 120_000
 // Mutating recovery commands fail closed with profile_lock_busy the moment
 // another writer holds the profile locks. A short in-CLI wait lets a transient
 // writer (an exiting gateway, a cron tick) finish instead of stranding startup
@@ -7104,6 +7112,8 @@ async function runDesktopProfileConsolidationCli(
   const runtime = await resolveGatewayRuntime()
   const prefix = runtime.args.slice(0, -2)
   return await new Promise((resolveResult, rejectResult) => {
+    const command = commandArgs[0] || 'unknown'
+    const startedAt = Date.now()
     const child = spawn(runtime.command, [
       ...prefix,
       'recovery',
@@ -7119,30 +7129,64 @@ async function runDesktopProfileConsolidationCli(
         PYTHONIOENCODING: 'utf-8:replace',
       }),
     })
+    desktopStartupLog('recovery_child_spawned', {
+      command,
+      pid: child.pid,
+      mutating: true,
+    })
     let stdout = ''
     let oversized = false
     let settled = false
+    let timeout: NodeJS.Timeout | null = null
     const finish = (
       error?: Error,
       result?: DesktopProfileConsolidationResult,
     ) => {
       if (settled) return
       settled = true
+      if (timeout) clearTimeout(timeout)
       if (error) rejectResult(error)
       else resolveResult(result as DesktopProfileConsolidationResult)
     }
+    timeout = setTimeout(() => {
+      desktopStartupLog('recovery_child_timeout', {
+        command,
+        pid: child.pid,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        timeoutMs: RECOVERY_MUTATING_COMMAND_TIMEOUT_MS,
+      })
+      // On Windows ChildProcess.kill() terminates the exact process handle;
+      // do not launch or reuse a Gateway after this fail-closed timeout.
+      child.kill()
+      finish(new Error('Desktop profile consolidation timed out.'))
+    }, RECOVERY_MUTATING_COMMAND_TIMEOUT_MS)
+    timeout.unref()
     child.stdout.on('data', (chunk) => {
       if (oversized) return
       stdout += String(chunk)
       if (stdout.length > RECOVERY_STDOUT_LIMIT) oversized = true
+      if (oversized) child.kill()
     })
     // The protocol result is the only trusted diagnostic surface. stderr can
     // contain local profile paths and is deliberately drained without exposure.
     child.stderr.resume()
-    child.once('error', (error) => finish(
-      error instanceof Error ? error : new Error(String(error)),
-    ))
-    child.once('close', (code) => {
+    child.once('error', (error) => {
+      desktopStartupLog('recovery_child_error', {
+        command,
+        pid: child.pid,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      finish(error instanceof Error ? error : new Error(String(error)))
+    })
+    child.once('close', (code, signal) => {
+      desktopStartupLog('recovery_child_exit', {
+        command,
+        pid: child.pid,
+        code,
+        signal,
+        durationMs: Math.max(0, Date.now() - startedAt),
+      })
       if (oversized) {
         return finish(new Error('Desktop profile consolidation output exceeded its limit.'))
       }
@@ -7266,6 +7310,8 @@ async function runRecoveryCli(
     const runtime = await resolveGatewayRuntime()
     const prefix = runtime.args.slice(0, -2)
     return await new Promise((resolveResult, rejectResult) => {
+      const command = commandArgs[0] || 'unknown'
+      const startedAt = Date.now()
       const child = spawn(runtime.command, [...prefix, 'recovery', ...effectiveArgs], {
         cwd: runtime.cwd,
         windowsHide: true,
@@ -7276,6 +7322,11 @@ async function runRecoveryCli(
           PYTHONUTF8: '1',
           PYTHONIOENCODING: 'utf-8:replace',
         }),
+      })
+      desktopStartupLog('recovery_child_spawned', {
+        command,
+        pid: child.pid,
+        mutating,
       })
       let stdout = ''
       let oversized = false
@@ -7288,13 +7339,20 @@ async function runRecoveryCli(
         if (error) rejectResult(error)
         else resolveResult(result as RecoveryProtocolResult)
       }
-      if (!mutating) {
-        timeout = setTimeout(() => {
-          child.kill()
-          finish(new Error('Recovery command timed out.'))
-        }, RECOVERY_COMMAND_TIMEOUT_MS)
-        timeout.unref()
-      }
+      const timeoutMs = mutating
+        ? RECOVERY_MUTATING_COMMAND_TIMEOUT_MS
+        : RECOVERY_COMMAND_TIMEOUT_MS
+      timeout = setTimeout(() => {
+        desktopStartupLog('recovery_child_timeout', {
+          command,
+          pid: child.pid,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          timeoutMs,
+        })
+        child.kill()
+        finish(new Error('Recovery command timed out.'))
+      }, timeoutMs)
+      timeout.unref()
       child.stdin.once('error', () => {})
       child.stdin.end(stdinPayload ?? '')
       child.stdout.on('data', (chunk) => {
@@ -7302,16 +7360,29 @@ async function runRecoveryCli(
         stdout += String(chunk)
         if (stdout.length > RECOVERY_STDOUT_LIMIT) {
           oversized = true
-          if (!mutating) child.kill()
+          child.kill()
         }
       })
       // The renderer receives only parsed protocol JSON. stderr is drained but
       // never copied into diagnostics because it may contain local details.
       child.stderr.resume()
-      child.once('error', (error) => finish(
-        error instanceof Error ? error : new Error(String(error)),
-      ))
-      child.once('close', (code) => {
+      child.once('error', (error) => {
+        desktopStartupLog('recovery_child_error', {
+          command,
+          pid: child.pid,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          error: error instanceof Error ? error.message : String(error),
+        })
+        finish(error instanceof Error ? error : new Error(String(error)))
+      })
+      child.once('close', (code, signal) => {
+        desktopStartupLog('recovery_child_exit', {
+          command,
+          pid: child.pid,
+          code,
+          signal,
+          durationMs: Math.max(0, Date.now() - startedAt),
+        })
         if (oversized) return finish(new Error('Recovery command output exceeded its limit.'))
         try {
           return finish(undefined, parseRecoveryProtocol(JSON.parse(stdout)))
@@ -7917,7 +7988,11 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
   )
 }
 
-async function waitForGateway(url: string, earlyExitMessage?: () => string | null): Promise<void> {
+async function waitForGateway(
+  url: string,
+  earlyExitMessage?: () => string | null,
+): Promise<void> {
+  const startedAt = Date.now()
   const result = await waitForGatewayReadiness({
     probe: (remainingMs) => healthCheck(url, remainingMs),
     exitMessage: earlyExitMessage,
@@ -7926,6 +8001,11 @@ async function waitForGateway(url: string, earlyExitMessage?: () => string | nul
     pollIntervalMs: 500,
   })
   if (result.status === 'ready') {
+    desktopStartupLog('gateway_health_ready', {
+      port: gatewayState.port,
+      late: result.late,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    })
     if (result.late) {
       desktopLog('gateway_health_ready_after_primary_deadline', { port: gatewayState.port })
     }
@@ -8364,6 +8444,7 @@ async function startGateway(): Promise<GatewayState> {
   })
   gatewayProfileKey = desktopProfileKey(activeProfile)
   desktopLog('gateway_spawned', {
+    elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
     profileKind: activeProfile.kind,
     pid: child.pid,
     port,
@@ -8490,6 +8571,10 @@ async function loadControlUi(window: BrowserWindow, gatewayUrl: string): Promise
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     try {
       await window.loadURL(url)
+      desktopStartupLog('control_ui_ready', {
+        url: gatewayUrl,
+        attempt,
+      })
       return
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
@@ -8624,6 +8709,16 @@ async function createMainWindow(): Promise<BrowserWindow> {
     rendererUnresponsiveAt = null
     const entry = buildRendererStateLogEntry('responsive', durationMs)
     desktopLog(entry.event, entry.detail)
+  })
+
+  window.webContents.once('did-finish-load', () => {
+    desktopStartupLog('splash_ready', { url: window.webContents.getURL() })
+  })
+  window.webContents.on('dom-ready', () => {
+    const url = window.webContents.getURL()
+    if (!url.startsWith('file:')) {
+      desktopStartupLog('renderer_interactive', { url })
+    }
   })
 
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -8894,8 +8989,10 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
       // A whole-profile transaction may have committed immediately before the
       // Electron process stopped. The narrow layout receipt is the authority
       // for finishing provider credential reconciliation.
-      await recoverPendingMigrationReconciliation()
-      inspection = await inspectDesktopProfile(active)
+      const reconciliation = await recoverPendingMigrationReconciliation()
+      if (reconciliation.requiresInspection) {
+        inspection = await inspectDesktopProfile(active)
+      }
     } catch (error) {
       desktopLog('migration_reconciliation_startup_failed', {
         error: error instanceof Error ? error.message : 'unknown error',
@@ -11616,6 +11713,12 @@ interface PendingMigrationProviderSetup extends MigrationProviderPrefill {
   credentialBackupPath: string
 }
 
+interface PendingMigrationReconciliationResult {
+  observedApplyingMarker: boolean
+  stateModified: boolean
+  requiresInspection: boolean
+}
+
 let transientPendingMigrationProviderSetup: PendingMigrationProviderSetup | null = null
 
 function pendingMigrationProviderSetupPath(): string {
@@ -12078,26 +12181,52 @@ async function reconcileImportedDesktopCredential(
   return { requiresSetup: true }
 }
 
-async function recoverPendingMigrationReconciliation(): Promise<void> {
-  const initial = await readPendingMigrationProviderSetup()
-  if (!initial || initial.phase !== 'applying') return
+async function recoverPendingMigrationReconciliation(): Promise<PendingMigrationReconciliationResult> {
   const finishWriter = beginDesktopWriterOperation('recover imported provider settings')
   try {
+    const initial = await readPendingMigrationProviderSetup()
+    if (!initial || initial.phase !== 'applying') {
+      return {
+        observedApplyingMarker: false,
+        stateModified: false,
+        requiresInspection: false,
+      }
+    }
+    // Once an applying marker is observed, retain the post-recovery inspection
+    // even when the marker turns out to have no matching receipt. The marker is
+    // the durable evidence that the previous startup may have changed profile
+    // state; skipping the refresh would let stale revision/action data continue.
+    const result: PendingMigrationReconciliationResult = {
+      observedApplyingMarker: true,
+      stateModified: false,
+      requiresInspection: true,
+    }
     let pending = await readPendingMigrationProviderSetup()
-    if (!pending || pending.phase !== 'applying') return
+    if (!pending || pending.phase !== 'applying') return result
     const receipt = await findAppliedReceiptForIntent(pending)
     if (!receipt) {
       // Profile inspection has already recovered any unfinished replacement
       // transaction. With no new layout receipt, this attempt never committed.
       await clearPendingMigrationProviderSetup()
-      return
+      result.stateModified = true
+      return result
     }
     pending = await bindMigrationIntentToReceipt(pending, receipt)
+    result.stateModified = true
     pending = await prepareImportedCredentialBackup(pending)
     await reconcileImportedDesktopCredential(pending, true)
+    result.stateModified = true
+    return result
   } finally {
     finishWriter()
   }
+}
+
+function desktopStartupLog(event: string, detail?: Record<string, unknown>): void {
+  desktopLog(event, {
+    elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+    ...detail,
+  })
 }
 
 async function refreshPrimaryRecoveryAfterImportAttempt(): Promise<boolean> {
@@ -13512,7 +13641,10 @@ function acquireSingleInstanceLockWithRetry(): boolean {
   for (;;) {
     attempt += 1
     if (app.requestSingleInstanceLock()) {
-      desktopLog('single_instance_lock_acquired', { attempt })
+      desktopLog('single_instance_lock_acquired', {
+        elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+        attempt,
+      })
       return true
     }
     // A Windows protocol launch targets the current instance and does not need
@@ -13537,7 +13669,11 @@ app.on('open-url', (event, rawUrl) => {
   handleDeepLink(rawUrl, 'open-url')
 })
 
-desktopLog('launch', { platform: process.platform, argv: process.argv.length })
+desktopLog('launch', {
+  elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+  platform: process.platform,
+  argv: process.argv.length,
+})
 const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
 
 if (!gotSingleInstanceLock) {

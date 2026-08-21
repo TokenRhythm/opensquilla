@@ -3382,6 +3382,15 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     save_index = reconcile.index("await saveImportedDesktopCredential(")
     assert save_index < reconcile.index("await clearPendingMigrationProviderSetup()", save_index)
 
+    pending_reconciliation = _section(
+        main_ts,
+        "async function recoverPendingMigrationReconciliation",
+        "function desktopStartupLog",
+    )
+    assert pending_reconciliation.index(
+        "beginDesktopWriterOperation('recover imported provider settings')"
+    ) < pending_reconciliation.index("readPendingMigrationProviderSetup()")
+
     encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
     assert "desktopSecretStoragePolicyBackend()" in encryption
     assert "if (availableBackend !== 'safeStorage')" in encryption

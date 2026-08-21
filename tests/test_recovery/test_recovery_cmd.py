@@ -113,6 +113,63 @@ def test_recovery_subprocess_routes_before_cwd_or_profile_dotenv(
     assert payload["effective_workspace"] == str(workspace)
 
 
+def test_packaged_recovery_entry_avoids_runtime_imports(tmp_path: Path) -> None:
+    home = tmp_path / "opensquilla"
+    workspace = _workspace(home / "workspace", "lightweight recovery")
+    (home / "state").mkdir(parents=True)
+    (home / "config.toml").write_text(
+        'state_dir = "state"\nworkspace_dir = "workspace"\n',
+        encoding="utf-8",
+    )
+    repository = Path(__file__).resolve().parents[2]
+    entry = repository / "desktop" / "electron" / "scripts" / "gateway-entry.py"
+    environment = os.environ.copy()
+    environment["OPENSQUILLA_RECOVERY_OFFLINE"] = "1"
+    environment["OPENSQUILLA_USER_STATE_DIR"] = str(tmp_path / "user-state")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(repository / "src"), environment.get("PYTHONPATH", "")) if value
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, runpy, sys\n"
+                "entry, home = sys.argv[1:]\n"
+                "sys.argv = ['gateway-entry.py', 'recovery', 'inspect', "
+                "'--home', home, '--json']\n"
+                "try:\n"
+                "    runpy.run_path(entry, run_name='__main__')\n"
+                "except SystemExit as exc:\n"
+                "    if exc.code not in (None, 0):\n"
+                "        raise\n"
+                "modules = sorted(sys.modules)\n"
+                "print('MODULES=' + json.dumps(modules), file=sys.stderr)\n"
+            ),
+            str(entry),
+            str(home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=repository,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["effective_workspace"] == str(workspace)
+    modules_line = next(
+        line for line in completed.stderr.splitlines() if line.startswith("MODULES=")
+    )
+    modules = json.loads(modules_line.removeprefix("MODULES="))
+    assert not any(
+        name == prefix or name.startswith(prefix + ".")
+        for prefix in ("opensquilla.gateway", "opensquilla.engine", "sqlalchemy", "numpy")
+        for name in modules
+    )
+
+
 def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
     home = tmp_path / "opensquilla"
     workspace = _workspace(home / "workspace", "current identity")
