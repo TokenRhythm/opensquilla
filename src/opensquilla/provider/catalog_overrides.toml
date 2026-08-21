@@ -812,7 +812,7 @@ cache_read_cost_per_mtok = 0.1863799283154122
 
 [tokenrhythm."kimi-k2.7-code"]
 context_window = 256000
-max_output_tokens = 16384
+max_output_tokens = 128000
 supports_reasoning = true
 supports_tools = true
 supports_vision = true
