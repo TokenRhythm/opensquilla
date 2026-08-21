@@ -194,4 +194,36 @@ describe('useSessionInspect canonical pagination', () => {
       before: 'cursor-b2',
     }))
   })
+
+  it('does not append a late history response from another session', async () => {
+    let resolveA!: (value: ReturnType<typeof page>) => void
+    let resolveB!: (value: ReturnType<typeof page>) => void
+    const historyA = new Promise<ReturnType<typeof page>>(resolve => { resolveA = resolve })
+    const historyB = new Promise<ReturnType<typeof page>>(resolve => { resolveB = resolve })
+
+    rpc.call.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'sessions.preview') return { previews: [] }
+      return params?.sessionKey === 'agent:main:webchat:a' ? historyA : historyB
+    })
+
+    const inspect = useSessionInspect()
+    const loadA = inspect.load('agent:main:webchat:a')
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
+      sessionKey: 'agent:main:webchat:a',
+    })))
+
+    const loadB = inspect.load('agent:main:webchat:b')
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
+      sessionKey: 'agent:main:webchat:b',
+    })))
+
+    resolveB(page('b1', 'cursor-b1', false))
+    await loadB
+    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['b1'])
+
+    resolveA(page('a1', 'cursor-a1', false))
+    await loadA
+    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['b1'])
+    expect(inspect.oldestCursor.value).toBe('cursor-b1')
+  })
 })
