@@ -140,7 +140,12 @@ async def test_git_status_run_mode_full_uses_host_subprocess(
 
     assert result == "## main\n"
     assert len(calls) == 1
-    assert calls[0]["args"] == ("/resolved/git", "status", "--short", "--branch")
+    assert calls[0]["args"] == (
+        str(Path("/resolved/git")),
+        "status",
+        "--short",
+        "--branch",
+    )
     kwargs = calls[0]["kwargs"]
     assert kwargs["stdout"] is git.asyncio.subprocess.PIPE
     assert kwargs["stderr"] is git.asyncio.subprocess.STDOUT
@@ -199,7 +204,7 @@ async def test_git_uses_runtime_read_only_profile_and_read_only_mounts(
     assert all(mount.mode == "ro" for mount in request.policy.mounts)
     assert request.env == {"LC_ALL": "C", "LANG": "C"}
     assert request.argv[:4] == (
-        "/resolved/git",
+        str(Path("/resolved/git")),
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",

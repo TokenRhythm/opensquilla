@@ -80,7 +80,7 @@ async def test_execute_code_succeeds_when_git_is_unavailable(
 
     payload = json.loads(result)
     assert payload["exit_code"] == 0
-    assert payload["stdout"] == "opensquilla_no_git\n"
+    assert payload["stdout"].splitlines() == ["opensquilla_no_git"]
     assert unavailable_git_runtime.resolution_calls
 
 

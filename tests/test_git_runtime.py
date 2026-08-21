@@ -231,7 +231,7 @@ def test_darwin_invalid_apple_shim_continues_to_later_host_git(
     monkeypatch.setattr(git_runtime.subprocess, "run", fake_run)
 
     capability = git_runtime.resolve_git_capability(
-        {"PATH": f"{shim.parent}:{homebrew_git.parent}"}
+        {"PATH": os.pathsep.join((str(shim.parent), str(homebrew_git.parent)))}
     )
 
     assert capability.executable == homebrew_git.absolute()
