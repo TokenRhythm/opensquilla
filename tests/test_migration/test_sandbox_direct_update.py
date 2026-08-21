@@ -204,8 +204,8 @@ def _mock_windows_acl(
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         assert "text" not in kwargs
-        assert tuple(command[:5]) == (
-            "powershell",
+        assert Path(command[0]).name.casefold() in {"powershell.exe", "pwsh.exe"}
+        assert tuple(command[1:5]) == (
             "-NoProfile",
             "-NonInteractive",
             "-NoLogo",
@@ -220,10 +220,11 @@ def _mock_windows_acl(
     monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
 
 
-def test_windows_acl_script_does_not_require_powershell_module_autoload() -> None:
+def test_windows_acl_script_keeps_host_specific_acl_apis_bounded() -> None:
     script = upgrade_migration._WINDOWS_PRIVATE_ACL_SCRIPT
 
-    assert "Get-Acl" not in script
+    assert "Get-Acl -LiteralPath $target" in script
+    assert "Set-Acl -LiteralPath $target -AclObject $acl" in script
     assert "Select-Object" not in script
     assert "Where-Object" not in script
     assert "[System.IO.Directory]::GetAccessControl($target)" in script
@@ -265,6 +266,56 @@ def test_windows_acl_batch_round_trips_non_ascii_path_over_ascii_protocol(
         ((target, True),),
         windows_user_sid="S-1-5-21-1234",
     )
+
+
+def test_windows_acl_batch_falls_back_to_windows_powershell_on_privilege_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "snapshot"
+    target.mkdir()
+    calls: list[str] = []
+    timeouts: list[float] = []
+
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_windows_acl_shells",
+        lambda: ("pwsh", "powershell"),
+    )
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(command[0])
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        timeouts.append(timeout)
+        if command[0] == "pwsh":
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"SeSecurityPrivilege",
+            )
+        result = {
+            "count": 1,
+            "ids": ["0"],
+            "pathUtf8Base64": [base64.b64encode(str(target).encode()).decode("ascii")],
+            "pathHashes": [upgrade_migration._acl_path_hash(target)],
+        }
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(result).encode("ascii"),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    upgrade_migration._protect_windows_acl_batch(
+        ((target, True),),
+        windows_user_sid="S-1-5-21-1234",
+        deadline=upgrade_migration.time.monotonic() + 30,
+    )
+
+    assert calls == ["pwsh", "powershell"]
+    assert 0 < timeouts[1] <= timeouts[0]
 
 
 @pytest.mark.parametrize(
@@ -638,8 +689,8 @@ def test_windows_snapshot_acl_is_applied_in_copy_and_promotion_order(
     )
     assert tmp_path / upgrade_migration.SNAPSHOT_NAME / "manifest.json" in protected_paths
     for _kind, _path, command in (event for event in events if event[0] == "acl"):
-        assert command[:5] == (
-            "powershell",
+        assert Path(command[0]).name.casefold() in {"powershell.exe", "pwsh.exe"}
+        assert tuple(command[1:5]) == (
             "-NoProfile",
             "-NonInteractive",
             "-NoLogo",

@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -103,7 +104,37 @@ foreach ($item in $items) {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    if ($isDirectory) {
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        $verified = Get-Acl -LiteralPath $target
+        $needsSet = -not $verified.AreAccessRulesProtected
+        $initialRules = @($verified.Access)
+        if ($initialRules.Count -ne $allowed.Count) { $needsSet = $true }
+        foreach ($rule in $initialRules) {
+            $identity = $rule.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]
+            ).Value
+            if ($allowed -notcontains $identity -or
+                $rule.AccessControlType -ne
+                    [System.Security.AccessControl.AccessControlType]::Allow -or
+                $rule.IsInherited -or
+                $rule.FileSystemRights -ne $fullControl -or
+                $rule.InheritanceFlags -ne $inheritance -or
+                $rule.PropagationFlags -ne $propagation) {
+                $needsSet = $true
+                break
+            }
+        }
+        if ($needsSet) {
+            $inheritanceSddl = if ($isDirectory) { "OICI" } else { "" }
+            $sddl = "D:P" + (($allowed | ForEach-Object {
+                "(A;$inheritanceSddl;FA;;;$_)"
+            }) -join "")
+            $acl = $verified
+            $acl.SetSecurityDescriptorSddlForm($sddl)
+            Set-Acl -LiteralPath $target -AclObject $acl
+            $verified = Get-Acl -LiteralPath $target
+        }
+    } elseif ($isDirectory) {
         [System.IO.Directory]::SetAccessControl($target, $acl)
         $verified = [System.IO.Directory]::GetAccessControl($target)
     } else {
@@ -397,6 +428,13 @@ def _acl_path_hash(path: Path) -> str:
     return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
 
 
+def _windows_acl_shells() -> tuple[str, ...]:
+    preferred = shutil.which("pwsh")
+    fallback = shutil.which("powershell")
+    shells = tuple(item for item in (preferred, fallback) if item is not None)
+    return shells or ("powershell",)
+
+
 def _protect_windows_acl_batch(
     entries: tuple[tuple[Path, bool], ...],
     *,
@@ -416,26 +454,46 @@ def _protect_windows_acl_batch(
         **os.environ,
         "OPENSQUILLA_UPGRADE_ACL_USER_SID": windows_user_sid,
     }
-    try:
-        with _system_windows_process_context():
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-NoLogo",
-                    "-EncodedCommand",
-                    _WINDOWS_PRIVATE_ACL_ENCODED,
-                ],
-                env=environment,
-                input=_acl_batch_payload(entries).encode("ascii"),
-                capture_output=True,
-                check=False,
-                timeout=_remaining_windows_acl_time(deadline),
-                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
-            )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError("Windows ACL migration stage timed out") from exc
+    completed: subprocess.CompletedProcess[bytes] | None = None
+    shells = _windows_acl_shells()
+    for shell_index, shell in enumerate(shells):
+        try:
+            with _system_windows_process_context():
+                completed = subprocess.run(
+                    [
+                        shell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-NoLogo",
+                        "-EncodedCommand",
+                        _WINDOWS_PRIVATE_ACL_ENCODED,
+                    ],
+                    env=environment,
+                    input=_acl_batch_payload(entries).encode("ascii"),
+                    capture_output=True,
+                    check=False,
+                    timeout=_remaining_windows_acl_time(deadline),
+                    creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("Windows ACL migration stage timed out") from exc
+        if completed is None:
+            raise OSError("cannot start Windows ACL helper")
+        if completed.returncode == 0:
+            break
+        detail = " ".join(
+            (completed.stderr or completed.stdout or b"")
+            .decode("utf-8", errors="replace")
+            .strip()
+            .split()
+        )
+        if (
+            shell_index + 1 >= len(shells)
+            or "securityprivilege" not in detail.casefold()
+        ):
+            break
+    if completed is None:
+        raise OSError("cannot start Windows ACL helper")
     if completed.returncode != 0:
         detail = " ".join(
             (completed.stderr or completed.stdout or b"")
@@ -529,7 +587,7 @@ def _create_private_directory(
     protect: bool = True,
     deadline: float | None = None,
 ) -> None:
-    path.mkdir(mode=0o700)
+    path.mkdir(mode=0o777 if _running_on_windows() else 0o700)
     if protect:
         _protect_private_path(
             path,
@@ -607,6 +665,28 @@ def _remove_failed_snapshot(path: Path, *, original_error: Exception) -> None:
             raise OSError("path still exists after cleanup")
     except Exception:
         raise OSError(f"upgrade snapshot failed and cleanup failed: {path}") from original_error
+
+
+def _make_snapshot_staging_directory(home: Path) -> Path:
+    if not _running_on_windows():
+        return Path(
+            tempfile.mkdtemp(
+                prefix=f".{SNAPSHOT_NAME}.",
+                suffix=".tmp",
+                dir=home,
+            )
+        )
+    for _ in range(100):
+        candidate = home / f".{SNAPSHOT_NAME}.{uuid.uuid4().hex}.tmp"
+        try:
+            # Let the profile parent provide the initial Windows DACL.  The
+            # helper hardens this empty directory before any snapshot bytes
+            # are written and rejects any injected entry after hardening.
+            candidate.mkdir(mode=0o777)
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError("cannot create a unique upgrade snapshot staging directory")
 
 
 @dataclass(frozen=True)
@@ -789,13 +869,7 @@ class SandboxUpgradeCoordinator:
                 deadline=deadline,
             )
             return
-        staging = Path(
-            tempfile.mkdtemp(
-                prefix=f".{SNAPSHOT_NAME}.",
-                suffix=".tmp",
-                dir=self.home,
-            )
-        )
+        staging = _make_snapshot_staging_directory(self.home)
         promoted = False
         try:
             _protect_private_path(
