@@ -220,7 +220,10 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     )
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in merge_group_case
     assert "git diff --name-only" not in merge_group_case
-    assert 'git diff --name-only "${before}" "${after}" > "${changed_files}"' in text
+    assert (
+        'git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"'
+        in text
+    )
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
     assert "runtime_changed" in text
     assert "test_changed" in text
@@ -415,7 +418,10 @@ def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
 
     assert 'before="${{ github.event.before }}"' in text
     assert 'after="${{ github.event.after }}"' in text
-    assert 'git diff --name-only "${before}" "${after}" > "${changed_files}"' in text
+    assert (
+        'git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"'
+        in text
+    )
     assert 'workflow_dispatch' in text
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
 
@@ -2137,6 +2143,29 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     assert "--reruns" not in serialized
     assert "pytest-rerunfailures" not in serialized
     assert "|| true" not in test_step["run"]
+
+
+def test_macos_recovery_planner_inputs_match_workflow_pytest_targets() -> None:
+    config = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    expected_targets = {
+        path[:-3] if path.endswith("/**") else path
+        for path in config["macos_recovery_test_inputs"]
+    }
+    job = _workflow("ci.yml")["jobs"]["macos-recovery"]
+    test_step = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Test native profile recovery contracts"
+    )
+    array = re.search(r"pytest_args=\(\n(?P<body>.*?)\n\s*\)", test_step["run"], re.DOTALL)
+
+    assert array is not None
+    workflow_targets = {
+        line.strip()
+        for line in array.group("body").splitlines()
+        if line.strip().startswith("tests/")
+    }
+    assert workflow_targets == expected_targets
 
 
 def test_ubuntu_quality_keeps_targeted_pr_tests_and_full_ci_uses_balanced_matrix() -> None:

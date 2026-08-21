@@ -630,6 +630,33 @@ def _relative_import_name(
     return ".".join(parts)
 
 
+def _static_string_values(value: ast.expr) -> tuple[str, ...] | None:
+    """Return a static string or string sequence without evaluating code."""
+
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return (value.value,)
+    if isinstance(value, (ast.List, ast.Tuple)):
+        values: list[str] = []
+        for item in value.elts:
+            if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                return None
+            values.append(item.value)
+        return tuple(values)
+    return None
+
+
+def _expression_mentions_test_module(value: ast.expr) -> bool:
+    """Return whether a dynamic expression visibly names the test module tree."""
+
+    for node in ast.walk(value):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        literal = node.value
+        if literal.startswith(("tests.", "test_")) or ".test_" in literal:
+            return True
+    return False
+
+
 def _build_test_reverse_dependencies(
     *,
     repo: Path,
@@ -681,7 +708,69 @@ def _build_test_reverse_dependencies(
         except (SyntaxError, ValueError) as exc:
             raise PlanError(f"cannot parse test module {consumer_path}: {exc}") from exc
 
+        importlib_bindings: set[str] = set()
+        import_module_bindings: set[str] = set()
+        builtins_bindings: set[str] = set()
+        builtin_import_bindings: set[str] = {"__import__"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "importlib":
+                        importlib_bindings.add(alias.asname or "importlib")
+                    elif alias.name == "builtins":
+                        builtins_bindings.add(alias.asname or "builtins")
+            elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+                import_module_bindings.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "import_module"
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module == "builtins":
+                builtin_import_bindings.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "__import__"
+                )
+
+        pytest_plugin_modules: list[str] = []
+        for statement in tree.body:
+            value: ast.expr | None = None
+            owns_pytest_plugins = False
+            if isinstance(statement, ast.Assign):
+                owns_pytest_plugins = any(
+                    isinstance(target, ast.Name) and target.id == "pytest_plugins"
+                    for target in statement.targets
+                )
+                value = statement.value
+            elif isinstance(statement, ast.AnnAssign):
+                owns_pytest_plugins = (
+                    isinstance(statement.target, ast.Name)
+                    and statement.target.id == "pytest_plugins"
+                )
+                value = statement.value
+            elif isinstance(statement, ast.AugAssign):
+                owns_pytest_plugins = (
+                    isinstance(statement.target, ast.Name)
+                    and statement.target.id == "pytest_plugins"
+                )
+            if not owns_pytest_plugins:
+                continue
+            if value is None:
+                raise PlanError(
+                    f"cannot resolve pytest_plugins declaration in {consumer_path}"
+                )
+            static_plugins = _static_string_values(value)
+            if static_plugins is None:
+                raise PlanError(
+                    f"cannot resolve pytest_plugins declaration in {consumer_path}"
+                )
+            pytest_plugin_modules.extend(static_plugins)
+
         imported_paths: set[str] = set()
+        for module_name in pytest_plugin_modules:
+            imported = resolve(module_name)
+            if imported is not None and imported != consumer_path:
+                imported_paths.add(imported)
         for node in ast.walk(tree):
             module_names: list[str] = []
             if isinstance(node, ast.Import):
@@ -702,17 +791,29 @@ def _build_test_reverse_dependencies(
                             if alias.name != "*":
                                 module_names.append(f"{base}.{alias.name}")
             elif isinstance(node, ast.Call) and node.args:
-                function_name = ""
+                dynamic_import = False
                 if isinstance(node.func, ast.Name):
-                    function_name = node.func.id
+                    dynamic_import = node.func.id in (
+                        import_module_bindings | builtin_import_bindings
+                    )
                 elif isinstance(node.func, ast.Attribute) and isinstance(
                     node.func.value, ast.Name
                 ):
-                    function_name = f"{node.func.value.id}.{node.func.attr}"
-                if function_name in {"__import__", "importlib.import_module"} and isinstance(
-                    node.args[0], ast.Constant
-                ) and isinstance(node.args[0].value, str):
-                    module_names.append(node.args[0].value)
+                    dynamic_import = (
+                        node.func.attr == "import_module"
+                        and node.func.value.id in importlib_bindings
+                    ) or (
+                        node.func.attr == "__import__"
+                        and node.func.value.id in builtins_bindings
+                    )
+                if dynamic_import:
+                    static_modules = _static_string_values(node.args[0])
+                    if static_modules is not None and len(static_modules) == 1:
+                        module_names.extend(static_modules)
+                    elif _expression_mentions_test_module(node.args[0]):
+                        raise PlanError(
+                            f"cannot resolve dynamic test module import in {consumer_path}"
+                        )
 
             for module_name in module_names:
                 imported = resolve(module_name)

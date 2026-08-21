@@ -201,6 +201,83 @@ def test_cross_shard_test_helper_adds_importing_consumer_and_shard(
     assert "test_dependency_closure" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize(
+    "consumer_source",
+    [
+        (
+            "from importlib import import_module as load_module\n"
+            "helper = load_module('tests.test_skills.test_hub_management_service')\n"
+        ),
+        (
+            "import importlib as loader\n"
+            "helper = loader.import_module("
+            "'tests.test_skills.test_hub_management_service')\n"
+        ),
+    ],
+)
+def test_dynamic_import_alias_adds_cross_shard_consumer(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    consumer_source: str,
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    consumer = "tests/test_skills_hash_consumers.py"
+    _write_test_module(tmp_path, helper)
+    _write_test_module(tmp_path, consumer, consumer_source)
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [helper, consumer]
+    assert plan["python_matrix"]["windows"] == ["core", "recovery-migration"]
+    assert "test_dependency_closure" in plan["reason_codes"]
+
+
+def test_pytest_plugins_adds_cross_shard_consumer(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    consumer = "tests/test_skills_hash_consumers.py"
+    _write_test_module(tmp_path, helper)
+    _write_test_module(
+        tmp_path,
+        consumer,
+        "pytest_plugins = ['tests.test_skills.test_hub_management_service']\n",
+    )
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [helper, consumer]
+    assert plan["python_matrix"]["windows"] == ["core", "recovery-migration"]
+
+
+@pytest.mark.parametrize(
+    "consumer_source",
+    [
+        (
+            "from importlib import import_module\n"
+            "helper = import_module(f'tests.test_skills.{module_name}')\n"
+        ),
+        "pytest_plugins = plugin_modules\n",
+    ],
+)
+def test_uncertain_dynamic_test_loader_fails_closed(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    consumer_source: str,
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    consumer = "tests/test_skills_hash_consumers.py"
+    _write_test_module(tmp_path, helper)
+    _write_test_module(tmp_path, consumer, consumer_source)
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is True
+    assert "test_dependency_analysis_uncertain" in plan["reason_codes"]
+
+
 def test_test_helper_dependency_closure_is_recursive_and_cycle_safe(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:

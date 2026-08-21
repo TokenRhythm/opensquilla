@@ -210,7 +210,7 @@ jobs:
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
               else
-                git diff --name-only \
+                git diff --no-renames --name-only \
                   "${{ github.event.pull_request.base.sha }}" \
                   "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
               fi
@@ -226,7 +226,7 @@ jobs:
               before="${{ github.event.before }}"
               after="${{ github.event.after }}"
               if [[ -n "${before}" && "${before}" != "0000000000000000000000000000000000000000" ]]; then
-                git diff --name-only "${before}" "${after}" > "${changed_files}"
+                git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"
               else
                 printf '.ci/run-all\n' > "${changed_files}"
               fi
