@@ -3664,7 +3664,7 @@
       "ensembleFallbackUsed": "已使用 fallback",
       "ensembleFallbackReason": "降级 · {reason}",
       "ensembleRouterPoolHidden": "普通 router 池已隐藏",
-      "ensembleTokens": "{count} 令牌",
+      "ensembleTokens": "{count} token",
       "ensembleUsed": "已使用",
       "ensembleFailed": "失败",
       "ensembleQuorumSkipped": "阈值已满足 · 已跳过",
