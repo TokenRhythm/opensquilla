@@ -1410,6 +1410,86 @@ describe('useChatHistory canonical pagination', () => {
     ])
   })
 
+  it('keeps an early-steer route bound through a running history refresh', async () => {
+    const turnId = 'turn-running-route'
+    const { api, messages } = makeHistory(false, {
+      preserveLiveTail: true,
+      messages: [
+        {
+          role: 'user',
+          text: 'prepare a summary',
+          ts: 1,
+          messageId: 'user-original',
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          messageId: 'router-1.0',
+          turnId,
+          routerModelCallId: '1.0',
+          routerIteration: 1,
+        },
+        { role: 'assistant', text: 'first segment', ts: 3, turnId },
+        {
+          role: 'user',
+          text: 'add risks',
+          ts: 4,
+          messageId: 'steer-1',
+          turnId,
+          inputDisposition: 'applied',
+          inputDispositionRevision: 2,
+        },
+        { role: 'assistant', text: 'continued segment', ts: 5, turnId },
+      ],
+      response: {
+        messages: [
+          {
+            id: 'user-original',
+            message_id: 'user-original',
+            role: 'user',
+            text: 'prepare a summary',
+            timestamp: '2026-07-06T01:00:00Z',
+            turn_context: { turn_id: turnId },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'add risks',
+            timestamp: '2026-07-06T01:00:01Z',
+            turn_context: {
+              turn_id: turnId,
+              intent: 'steer',
+              disposition: 'applied',
+              revision: 2,
+            },
+          },
+        ],
+        has_more: false,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['user', 'prepare a summary'],
+      ['router', ''],
+      ['assistant', 'first segment'],
+      ['user', 'add risks'],
+      ['assistant', 'continued segment'],
+    ])
+    expect(messages.value.filter(message => message.role === 'router')).toEqual([
+      expect.objectContaining({
+        messageId: 'router-1.0',
+        turnId,
+        routerModelCallId: '1.0',
+        routerIteration: 1,
+      }),
+    ])
+  })
+
   it('bridges forward without dropping loaded pages when a refresh has no message-id overlap', async () => {
     const initial = Array.from({ length: 50 }, (_, index) => historyMessage(`m-${index + 250}`))
     const earlier = Array.from({ length: 50 }, (_, index) => historyMessage(`m-${index + 200}`))
