@@ -140,7 +140,7 @@ def test_live_smoke_env_maps_cover_openai_zhipu_kimi_and_minimax() -> None:
 
     assert smoke._MODEL_ENV["tokenrhythm"] == "TOKENRHYTHM_MODEL"
     assert smoke._BASE_ENV["tokenrhythm"] == "TOKENRHYTHM_BASE_URL"
-    assert smoke._DEFAULT_MODELS["tokenrhythm"] == "deepseek-v4-flash"
+    assert smoke._DEFAULT_MODELS["tokenrhythm"] == "deepseek-v4-pro-0813"
     # Reasoning tokens bill against max_tokens: the default 64 budget would
     # return empty content with finish_reason "length".
     assert smoke._MIN_MAX_TOKENS["tokenrhythm"] == 4096

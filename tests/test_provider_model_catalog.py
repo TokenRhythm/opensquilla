@@ -91,7 +91,7 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     assert catalog.resolve_context_window("glm-5", provider="tokenrhythm") == 1_000_000
     assert catalog.resolve_context_window("kimi-k2.5", provider="tokenrhythm") == 256_000
     assert catalog.resolve_context_window("kimi-k2.7-code", provider="tokenrhythm") == 256_000
-    assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 128_000
+    assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 16_384
     assert catalog.resolve_context_window("qwen3.7-max", provider="tokenrhythm") == 1_000_000
     assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
     # The correction is scoped to TokenRhythm. Direct/provider-less snapshot
@@ -126,6 +126,26 @@ def test_tokenrhythm_v4_flash_0731_offline_metadata_is_exact_and_scoped() -> Non
     ) == 384_000
 
     direct = catalog.resolve_entry("deepseek-v4-flash-0731", provider="deepseek")
+    assert direct.input_cost_per_mtok is None
+    assert direct.output_cost_per_mtok is None
+    assert direct.cache_read_cost_per_mtok is None
+
+
+def test_tokenrhythm_v4_pro_0813_offline_metadata_is_exact_and_scoped() -> None:
+    catalog = ModelCatalog()
+
+    entry = catalog.resolve_entry("deepseek-v4-pro-0813", provider="tokenrhythm")
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 384_000
+    assert entry.supports_reasoning is True
+    assert entry.supports_tools is True
+    assert entry.supports_vision is False
+    assert entry.reasoning_format == "none"
+    assert entry.input_cost_per_mtok == pytest.approx(1.2903225806451613)
+    assert entry.output_cost_per_mtok == pytest.approx(3.870967741935484)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.043010752688172046)
+
+    direct = catalog.resolve_entry("deepseek-v4-pro-0813", provider="deepseek")
     assert direct.input_cost_per_mtok is None
     assert direct.output_cost_per_mtok is None
     assert direct.cache_read_cost_per_mtok is None

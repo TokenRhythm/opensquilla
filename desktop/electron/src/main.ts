@@ -138,6 +138,10 @@ import { appendDesktopLogRecord } from './desktop-log-file.js'
 import {
   ArtifactPreviewLeaseBroker,
 } from './artifact-preview-lease-broker.js'
+import {
+  normalizeRouterTiers,
+  type RouterTier,
+} from './router-tier-normalization.js'
 
 protocol.registerSchemesAsPrivileged([{
   scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
@@ -186,15 +190,6 @@ interface SearchProviderCatalogEntry {
   requiresApiKey: boolean
   note: string
   keyPlaceholder: string
-}
-
-interface RouterTier {
-  provider: string
-  model: string
-  description?: string
-  supportsImage?: boolean
-  imageOnly?: boolean
-  thinkingLevel?: string
 }
 
 interface DesktopConnection {
@@ -1178,7 +1173,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
     id: 'tokenrhythm',
     label: 'TokenRhythm',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-v4-pro-0813',
     baseUrl: 'https://tokenrhythm.studio/v1',
     apiKeyEnv: 'TOKENRHYTHM_API_KEY',
     requiresApiKey: true,
@@ -1551,10 +1546,10 @@ function minimaxRouterProfile(provider: string): Record<string, RouterTier> {
 
 const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
   tokenrhythm: {
-    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash', description: 'Fast DeepSeek route for simple work', supportsImage: false },
-    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro', description: 'Balanced DeepSeek route for normal agent work', supportsImage: false },
-    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi route for harder coding and analysis', supportsImage: false },
-    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest-tier GLM route for deep review and planning', supportsImage: false },
+    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work', supportsImage: false },
+    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work', supportsImage: false },
+    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis', supportsImage: false },
+    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', supportsImage: false, ensembleEnabled: true },
     image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true },
   },
   openrouter: {
@@ -1728,35 +1723,6 @@ function defaultRouterTiers(provider: string, mode: RouterMode): Record<string, 
   return cloneRouterTiers(ROUTER_PROFILES[provider] || ROUTER_PROFILES.openrouter)
 }
 
-function normalizeRouterTiers(raw: unknown, fallback: Record<string, RouterTier>): Record<string, RouterTier> {
-  if (!raw || typeof raw !== 'object') return cloneRouterTiers(fallback)
-  const source = raw as Record<string, unknown>
-  const out = cloneRouterTiers(fallback)
-  for (const [rawName, value] of Object.entries(source)) {
-    if (!value || typeof value !== 'object') continue
-    const name = canonicalTierKey(rawName)
-    // Tier keys are emitted raw into TOML table headers ([squilla_router.tiers.NAME]),
-    // so a key that is not a TOML bare key (spaces, dots, quotes, brackets, newlines)
-    // would produce an unparseable config the gateway rejects on every boot. Drop
-    // such keys and fall back to the profile defaults instead.
-    if (!/^[A-Za-z0-9_-]+$/.test(name)) continue
-    const tier = value as Record<string, unknown>
-    const provider = String(tier.provider || out[name]?.provider || '').trim()
-    const model = String(tier.model || out[name]?.model || '').trim()
-    if (!provider || !model) continue
-    out[name] = {
-      ...out[name],
-      provider,
-      model,
-      description: String(tier.description || out[name]?.description || ''),
-      supportsImage: Boolean(tier.supportsImage ?? tier.supports_image ?? out[name]?.supportsImage),
-      imageOnly: Boolean(tier.imageOnly ?? tier.image_only ?? out[name]?.imageOnly),
-      thinkingLevel: String(tier.thinkingLevel ?? tier.thinking_level ?? out[name]?.thinkingLevel ?? ''),
-    }
-  }
-  return out
-}
-
 function routerDefaultModel(tiers: Record<string, RouterTier>, defaultTier: TextRouterTier): string {
   return tiers[defaultTier]?.model || tiers.c1?.model || tiers.c0?.model || ''
 }
@@ -1808,6 +1774,7 @@ function routerTierTomlLines(name: string, tier: RouterTier): string[] {
   if (tier.supportsImage !== undefined) lines.push(`supports_image = ${tier.supportsImage ? 'true' : 'false'}`)
   if (tier.imageOnly !== undefined) lines.push(`image_only = ${tier.imageOnly ? 'true' : 'false'}`)
   if (tier.thinkingLevel) lines.push(`thinking_level = ${tomlString(tier.thinkingLevel)}`)
+  if (tier.ensembleEnabled !== undefined) lines.push(`ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}`)
   return lines
 }
 

@@ -44,9 +44,9 @@ ladder:
 
 | Tier | Route |
 | --- | --- |
-| C0 | `qwen3.7-flash` |
-| C1 | `deepseek-v4-flash-0731` |
-| C2 | `glm-5.2` |
+| C0 | `deepseek-v4-flash-0731` |
+| C1 | `deepseek-v4-pro-0813` |
+| C2 | `kimi-k2.7-code` |
 | C3 | static TokenRhythm B5 multi-model fusion |
 
 C3 reuses the plan configured under `llm_ensemble`: four proposer models
@@ -57,6 +57,12 @@ tier-specific profile. If the shared plan cannot start or complete, C3 uses the
 global provider/model configured under `[llm]` — the same fixed/direct fallback
 model used by global fusion. The provider/model stored on C3 remains available
 only when C3 is switched back to single-model routing.
+
+The packaged mixed-family ladder leaves tier `thinking_level` unset. Direct
+requests without an explicit thinking setting preserve the provider default;
+Router auto-thinking can still choose a per-turn level (normally `low` on C1).
+Fresh and managed (`preset_binding = "follow_primary"`) configurations receive
+this ladder; custom inline tiers remain authoritative and are not migrated.
 
 For a newly configured C3 tier, the tier-local runtime-policy defaults are one
 successful proposer out of the four-member lineup, one retry after each

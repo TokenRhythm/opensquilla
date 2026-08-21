@@ -54,6 +54,7 @@
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
     "test:onboarding-coordinator": "npm run build && node scripts/test-onboarding-flow-coordinator.mjs",
     "test:onboarding-telemetry": "npm run build && node scripts/test-onboarding-save-telemetry.mjs",
+    "test:router-tier-normalization": "npm run build && node scripts/test-router-tier-normalization.mjs",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
     "pack": "npm run build && electron-builder --dir && npm run verify:package",
