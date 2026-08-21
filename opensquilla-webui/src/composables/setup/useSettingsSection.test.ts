@@ -79,18 +79,19 @@ describe('settings section IA', () => {
     expect(SETTINGS_SECTIONS.find(s => s.id === 'provider')?.label).toBe('Model Service')
   })
 
-  it('keeps Memory as a first-level settings panel and nests profile import', () => {
+  it('makes Memory & Export first-level and preserves the old profile-import deep link', () => {
     const memory = SETTINGS_SECTIONS.find(s => s.id === 'memory')
     expect(memory).toMatchObject({
-      label: 'Memory',
+      label: 'Memory & Export',
       group: 'safetyData',
-      client: false,
+      client: true,
       desktopOnly: false,
     })
-    expect(en.settings.rail.memory).toBe('Memory')
-    expect(zhHans.settings.rail.memory).toBe('记忆')
+    expect(en.settings.rail.memory).toBe('Memory & Export')
+    expect(zhHans.settings.rail.memory).toBe('记忆与导出')
     expect(SETTINGS_SECTIONS.map(s => s.id)).not.toContain('profileImport')
-    expect(sectionFromRouteParam('profileImport')).toBe('profileImport')
+    expect(sectionFromRouteParam('profileImport')).toBe('memory')
+    expect(settingsSectionAliasFor('profileImport')).toEqual({ section: 'memory' })
   })
 
   it('preserves aliases for pages consolidated into the ten-section IA', () => {

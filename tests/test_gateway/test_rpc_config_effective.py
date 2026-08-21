@@ -61,7 +61,7 @@ async def test_effective_envelope_and_provenance(cfg: GatewayConfig) -> None:
     fields = result["fields"]
     assert fields["llm.provider"] == {"value": "tokenrhythm", "source": "default"}
     assert fields["llm.model"] == {
-        "value": "deepseek-v4-flash-0731",
+        "value": "deepseek-v4-pro-0813",
         "source": "default",
     }
     assert fields["squilla_router.tiers.c1.model"]["source"] == "preset"

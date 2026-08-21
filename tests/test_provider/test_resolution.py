@@ -50,7 +50,7 @@ def _catalog_with_model() -> ModelCatalog:
 def test_default_llm_identity_fields_report_default() -> None:
     fields = resolve_effective_llm(_config(), ModelCatalog())
     assert fields["llm.provider"] == ResolvedField("tokenrhythm", "default")
-    assert fields["llm.model"] == ResolvedField("deepseek-v4-flash-0731", "default")
+    assert fields["llm.model"] == ResolvedField("deepseek-v4-pro-0813", "default")
     assert fields["llm.base_url"] == ResolvedField("https://tokenrhythm.studio/v1", "default")
 
 

@@ -39,6 +39,16 @@ jobs:
       queue_base_sha: ${{ steps.verify.outputs.queue_base_sha }}
       queue_head_sha: ${{ steps.verify.outputs.queue_head_sha }}
       queue_tree_sha: ${{ steps.verify.outputs.queue_tree_sha }}
+      source_root_issued_at: ${{ steps.verify.outputs.source_root_issued_at }}
+      source_lineage: ${{ steps.verify.outputs.source_lineage }}
+      source_successful_suites: ${{ steps.verify.outputs.source_successful_suites }}
+      source_planner_digest: ${{ steps.verify.outputs.source_planner_digest }}
+      source_suite_execution_digests: ${{ steps.verify.outputs.source_suite_execution_digests }}
+      combined_smoke_suites: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
+      nightly_healthy: ${{ steps.verify.outputs.nightly_healthy || 'false' }}
+      nightly_reason: ${{ steps.verify.outputs.nightly_reason }}
+      nightly_run_id: ${{ steps.verify.outputs.nightly_run_id }}
+      nightly_age_seconds: ${{ steps.verify.outputs.nightly_age_seconds }}
     steps:
       - name: Validate optimization mode
         id: mode
@@ -89,6 +99,11 @@ jobs:
           QUEUE_BASE_SHA: ${{ steps.verify.outputs.queue_base_sha }}
           QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
           QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
+          COMBINED_SMOKE_SUITES: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
+          NIGHTLY_HEALTHY: ${{ steps.verify.outputs.nightly_healthy || 'false' }}
+          NIGHTLY_REASON: ${{ steps.verify.outputs.nightly_reason }}
+          NIGHTLY_RUN_ID: ${{ steps.verify.outputs.nightly_run_id }}
+          NIGHTLY_AGE_SECONDS: ${{ steps.verify.outputs.nightly_age_seconds }}
         shell: bash
         run: |
           {
@@ -100,6 +115,8 @@ jobs:
             echo "- Candidates: \`${CANDIDATE_COUNT}\`"
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
+            echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
+            echo "- Nightly health: \`${NIGHTLY_HEALTHY}\` (${NIGHTLY_REASON}; run \`${NIGHTLY_RUN_ID}\`, age \`${NIGHTLY_AGE_SECONDS}s\`)"
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
@@ -141,11 +158,32 @@ jobs:
       toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
       full_required: ${{ steps.classify.outputs.full_required }}
       pytest_targets: ${{ steps.classify.outputs.pytest_targets }}
+      nightly_healthy: ${{ steps.nightly.outputs.healthy || 'true' }}
+      nightly_reason: ${{ steps.nightly.outputs.reason }}
+      required_suites: ${{ steps.plan.outputs.required_suites }}
+      desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
+      python_matrix: ${{ steps.plan.outputs.python_matrix }}
+      platform_matrix: ${{ steps.plan.outputs.platform_matrix }}
+      python_targets: ${{ steps.plan.outputs.python_targets }}
+      planner_full_fallback: ${{ steps.plan.outputs.full_fallback }}
+      planner_digest: ${{ steps.plan.outputs.plan_digest }}
+      suite_execution_digests: ${{ steps.plan.outputs.suite_execution_digests }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Verify fresh full-nightly health
+        id: nightly
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/ci_attestation.py verify-nightly-health
+          --repository "${GITHUB_REPOSITORY}"
+          --api-url "${GITHUB_API_URL}"
+          --github-output "${GITHUB_OUTPUT}"
 
       - name: List changed files
         shell: bash
@@ -161,7 +199,13 @@ jobs:
               ;;
           esac
 
-          case "${{ github.event_name }}" in
+          if [[ ("${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group") \
+                && "${CI_OPTIMIZATION_MODE}" != "legacy" \
+                && "${{ steps.nightly.outputs.healthy || 'false' }}" != "true" ]]; then
+            echo "Fresh full-nightly evidence is unavailable; running the full fail-closed matrix." >&2
+            printf '.ci/run-all\n' > "${changed_files}"
+          else
+            case "${{ github.event_name }}" in
             pull_request)
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
@@ -172,21 +216,11 @@ jobs:
               fi
               ;;
             merge_group)
-              base="${{ github.event.merge_group.base_sha }}"
-              head="${{ github.event.merge_group.head_sha }}"
-              if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
-                echo "Legacy mode runs the full fail-closed matrix." >&2
-                printf '.ci/run-all\n' > "${changed_files}"
-              elif [[ -n "${base}" && -n "${head}" ]] \
-                && git cat-file -e "${base}^{commit}" \
-                && git cat-file -e "${head}^{commit}" \
-                && git diff --name-only "${base}" "${head}" > "${changed_files}" \
-                && [[ -s "${changed_files}" ]]; then
-                echo "Queue evidence was unavailable; classifying the exact merge-group diff." >&2
-              else
-                echo "Merge-group diff is unavailable or empty; running the full CI matrix." >&2
-                printf '.ci/run-all\n' > "${changed_files}"
-              fi
+              # Reaching the classifier means the queue fast-path proof was
+              # unavailable or rejected. Do not turn an evidence failure into
+              # a weaker targeted queue run: every such path is fail-closed.
+              echo "Queue evidence was unavailable; running the full fail-closed matrix." >&2
+              printf '.ci/run-all\n' > "${changed_files}"
               ;;
             push)
               before="${{ github.event.before }}"
@@ -200,7 +234,8 @@ jobs:
             *)
               printf '.ci/run-all\n' > "${changed_files}"
               ;;
-          esac
+            esac
+          fi
 
           echo "Changed files:"
           sed 's/^/  /' "${changed_files}"
@@ -210,6 +245,39 @@ jobs:
         id: classify
         shell: bash
         run: bash .github/scripts/classify-ci-changes.sh "${CHANGED_FILES}"
+
+      - name: Build canonical suite plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          plan_json="$(python3 .github/scripts/plan_ci.py "${CHANGED_FILES}" --repo .)"
+          python3 - "${plan_json}" "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
+
+          plan = json.loads(sys.argv[1])
+          output = sys.argv[2]
+          with open(output, "a", encoding="utf-8") as handle:
+              for key in (
+                  "required_suites",
+                  "desktop_matrix",
+                  "python_matrix",
+                  "platform_matrix",
+                  "python_targets",
+                  "full_fallback",
+                  "plan_digest",
+                  "suite_execution_digests",
+              ):
+                  value = plan[key]
+                  if key == "python_targets":
+                      value = ",".join(value)
+                  elif isinstance(value, bool):
+                      value = str(value).lower()
+                  elif isinstance(value, (dict, list)):
+                      value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+                  handle.write(f"{key}={value}\n")
+          PY
 
       - name: Summarize merge-group fallback decision
         if: ${{ github.event_name == 'merge_group' }}
@@ -248,12 +316,12 @@ jobs:
       - name: Run actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color=false
 
-  frontend-check:
-    name: Frontend build, tests, and artifact
+  frontend-artifact:
+    name: Frontend artifact producer
     needs: classify-changes
     # This job owns the generated package input. Source-only Python tests stay
     # parallel; only packaging/browser/desktop consumers wait for this artifact.
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'frontend') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -271,11 +339,6 @@ jobs:
         working-directory: opensquilla-webui
         run: npm ci
 
-      - name: Run frontend unit tests
-        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
-        working-directory: opensquilla-webui
-        run: npm run test:unit
-
       - name: Verify generated dist is not tracked
         shell: bash
         run: |
@@ -289,46 +352,86 @@ jobs:
       - name: Build verified frontend artifact
         working-directory: opensquilla-webui
         shell: bash
-        env:
-          FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
-          FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
         run: |
           # Vite copies public/ verbatim. Prove the canonical normalization
           # strips harmless Finder metadata before the manifest is written.
           printf 'CI-only Finder metadata\n' > public/.DS_Store
-          if [[ "${FRONTEND_CHANGED}" == "true" || "${FULL_REQUIRED}" == "true" ]]; then
-            npm run build
-          else
-            npm run build:artifact
-          fi
+          npm run build:artifact
           if [[ -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
             exit 1
           fi
           npm run verify:release-dist
 
+      - name: Upload verified frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Stable across rerun attempts: "re-run failed jobs" does not rerun
+          # an already-successful producer, so consumers must reuse its name.
+          name: opensquilla-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+          if-no-files-found: error
+          # GitHub permits reruns for 30 days; keep the producer artifact for
+          # the full window so a failed-only consumer rerun can still reuse it.
+          retention-days: 31
+          overwrite: true
+
+  frontend-check:
+    name: Frontend tests and package validation
+    needs: [classify-changes, frontend-artifact]
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download verified frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Run frontend type checks
+        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        working-directory: opensquilla-webui
+        run: npm run typecheck
+
+      - name: Run frontend unit tests
+        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        working-directory: opensquilla-webui
+        run: npm run test:unit
+
       - name: Set up Python
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Verify sdist-to-wheel frontend artifact round trip
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
         shell: bash
         run: |
           package_dir="${RUNNER_TEMP}/webui-package"
           wheel_dir="${RUNNER_TEMP}/webui-wheel"
           mkdir -p "${package_dir}" "${wheel_dir}"
-
-          # Finder metadata is ignored by Git and must not affect the canonical
-          # source fingerprint or enter a source distribution.
           junk="opensquilla-webui/src/.DS_Store"
           trap 'rm -f "${junk}"' EXIT
           printf 'CI-only Finder metadata\n' > "${junk}"
@@ -356,28 +459,16 @@ jobs:
             --forbid-personal-bgm \
             --wheel "${wheels[0]}"
 
-      - name: Upload verified frontend artifact
-        uses: actions/upload-artifact@v4
-        with:
-          # Stable across rerun attempts: "re-run failed jobs" does not rerun
-          # an already-successful producer, so consumers must reuse its name.
-          name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
-          if-no-files-found: error
-          # GitHub permits reruns for 30 days; keep the producer artifact for
-          # the full window so a failed-only consumer rerun can still reuse it.
-          retention-days: 31
-          overwrite: true
-
   webui-chat-recovery:
     name: WebUI chat recovery
-    needs: [classify-changes, frontend-check]
-    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-check.result == 'success' && (needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    needs: [classify-changes, frontend-artifact]
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'webui-chat-recovery') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
       OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -412,9 +503,30 @@ jobs:
         working-directory: opensquilla-webui
         run: npm ci
 
+      - name: Resolve Playwright browser revision
+        id: playwright-browser
+        shell: bash
+        run: |
+          revision="$(node -e "const b=require('./opensquilla-webui/node_modules/playwright-core/browsers.json').browsers.find((item)=>item.name==='chromium'); if(!b)process.exit(2); process.stdout.write(b.revision)")"
+          printf 'revision=%s\n' "${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore Playwright browser
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
+
       - name: Install Chromium
         working-directory: opensquilla-webui
         run: npx playwright install --with-deps chromium
+
+      - name: Seed Playwright browser cache from nightly main
+        if: ${{ github.event_name == 'schedule' && steps.playwright-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
 
       - name: Run production-dist chat and Goal recovery browser contracts
         working-directory: opensquilla-webui
@@ -428,7 +540,7 @@ jobs:
           queue-steer.spec.ts
           share.spec.ts
           --project=chromium
-          --workers=1
+          --workers=2
 
       - name: Upload chat recovery traces
         if: ${{ failure() }}
@@ -442,7 +554,7 @@ jobs:
   tui-check:
     name: OpenTUI package tests
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.tui_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'tui') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -488,7 +600,7 @@ jobs:
   desktop-check:
     name: Desktop Electron unit tests
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'desktop-static') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -535,12 +647,13 @@ jobs:
           node scripts/test-native-workbench-surface.mjs
           node scripts/test-onboarding-flow-coordinator.mjs
           node scripts/test-onboarding-save-telemetry.mjs
+          node scripts/test-ci-case-telemetry.mjs
           node ../../.github/scripts/verify-sandbox-package.mjs --source
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && (contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-targeted') || contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -554,7 +667,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          lfs: ${{ needs.classify-changes.outputs.full_required == 'true' }}
+          lfs: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
 
       - name: Configure runtime directories
         shell: bash
@@ -585,32 +698,16 @@ jobs:
         run: uv run mypy src/opensquilla --show-error-codes
 
       - name: Test targeted PR suite
-        if: ${{ needs.classify-changes.outputs.full_required != 'true' && needs.classify-changes.outputs.python_full_required != 'true' }}
+        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-targeted') && !contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
         shell: bash
         env:
-          TARGETED_PYTEST_TARGETS: ${{ needs.classify-changes.outputs.pytest_targets }}
+          TARGETED_PYTEST_TARGETS: ${{ needs.classify-changes.outputs.python_targets }}
         run: |
           set -euo pipefail
           markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           pytest_targets=(
             tests/unit
-            tests/test_ci
-            tests/test_desktop/test_electron_startup_contract.py
-            tests/test_recovery
-            tests/test_migration/test_opensquilla_home_migration.py
-            tests/test_engine/test_coding_mode.py
-            tests/test_engine/test_cancelled_turn_segments.py
-            tests/test_engine/test_history_silent_reply.py
-            tests/test_engine/test_silent_reply.py
-            tests/test_engine/test_silent_reply_runtime.py
-            tests/test_engine/test_stream_wrappers.py
-            tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py
-            tests/test_engine/turn_runner/test_turn_finalizer_stage_unit.py
-            tests/test_gateway/test_rpc_chat_history.py
-            tests/test_persistence/test_usage_ledger.py
-            tests/functional/test_gateway_silent_reply_process_e2e.py
-            tests/test_tools/test_shell_process_isolation.py
           )
           if [[ -n "${TARGETED_PYTEST_TARGETS}" ]]; then
             IFS=',' read -r -a affected_targets <<< "${TARGETED_PYTEST_TARGETS}"
@@ -637,7 +734,7 @@ jobs:
             -q -m "${markers}" --durations=50
 
       - name: Test Docker build-context exclusions in full CI
-        if: ${{ needs.classify-changes.outputs.full_required == 'true' }}
+        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
         shell: bash
         run: uv run pytest tests/test_ci/test_dockerignore_context.py -q
 
@@ -654,7 +751,7 @@ jobs:
           done
 
       - name: tracemalloc leak smoke test
-        if: ${{ needs.classify-changes.outputs.full_required == 'true' }}
+        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
         shell: bash
         run: |
           uv run python -m pytest tests/test_gateway/test_task_runtime_terminal_cleanup.py::test_no_leak_under_load -v
@@ -662,17 +759,13 @@ jobs:
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.python_full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        shard:
-          - core
-          - gateway-sqlite
-          - recovery-migration
-          - desktop-installer-contracts
+        shard: ${{ fromJSON(needs.classify-changes.outputs.python_matrix).ubuntu }}
 
     env:
       UV_PYTHON: "3.12"
@@ -742,7 +835,7 @@ jobs:
   windows-compat:
     name: Windows compatibility smoke (3.12)
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true') && needs.classify-changes.outputs.windows_full_required != 'true' && needs.classify-changes.outputs.full_required != 'true' }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'windows-compat') }}
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -790,17 +883,13 @@ jobs:
   windows-full:
     name: Windows high-risk (${{ matrix.shard }})
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.windows_full_required == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'windows-high-risk') }}
     runs-on: windows-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard:
-          - core
-          - gateway-sqlite
-          - recovery-migration
-          - desktop-installer-contracts
+        shard: ${{ fromJSON(needs.classify-changes.outputs.python_matrix).windows }}
 
     env:
       UV_PYTHON: "3.12"
@@ -914,40 +1003,6 @@ jobs:
             throw
           }
 
-      - name: Test Windows native recovery move primitives first
-        if: ${{ matrix.shard == 'recovery-migration' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          maxfail_args=()
-          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
-            maxfail_args+=(--maxfail=3)
-          fi
-
-          set +e
-          uv run pytest \
-            tests/test_recovery/test_atomic_and_locking.py::test_native_move_moves_a_regular_tree_between_real_parents \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_real_legacy_lock_survives_profile_move_and_rebind \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_real_replacement_locks_survive_two_profile_moves \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_real_recent_locked_profile_tree_moves_without_metadata_false_positive \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_primitive_collision_preserves_both_trees \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_native_move_refuses_real_cross_volume_move \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_native_move_handles_real_path_longer_than_260_characters \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_native_move_rejects_real_junction_in_source_tree \
-            tests/test_recovery/test_atomic_and_locking.py::test_windows_no_replace_pins_both_parents_during_real_mutation_window \
-            -q \
-            --durations=25 \
-            --junitxml="${CI_REPORT_DIR}/native-move-junit.xml" \
-            "${maxfail_args[@]}" \
-            2>&1 | tee "${CI_REPORT_DIR}/native-move.log"
-          status=${PIPESTATUS[0]}
-          set -e
-          if [[ "${status}" -ne 0 ]]; then
-            printf 'native_move_exit_code=%s\n' "${status}" \
-              > "${CI_REPORT_DIR}/first-failure.txt"
-            exit "${status}"
-          fi
-
       - name: Test Windows shard
         shell: bash
         run: |
@@ -958,11 +1013,22 @@ jobs:
             maxfail_args+=(--maxfail=3)
           fi
 
+          worker_args=()
+          if [[ "${{ matrix.shard }}" == "recovery-migration" ||
+                "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+            # These shards start Windows ``spawn`` children and gateway
+            # subprocesses from several tests.  Keep the other shards at four
+            # workers, but leave headroom for those process-start handshakes
+            # instead of changing their bounded readiness/timing assertions.
+            worker_args+=(--workers=2)
+          fi
+
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
+            "${worker_args[@]}" \
             -- \
             -q \
             -m "${markers}" \
@@ -996,7 +1062,7 @@ jobs:
   macos-recovery:
     name: macOS profile recovery and native no-replace (3.12)
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'macos-recovery') }}
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -1084,22 +1150,12 @@ jobs:
     # one of local socket buffers. Linux and macOS retain the full serial
     # contract, which is useful for their native recovery coverage.
     name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
-    needs: [classify-changes, frontend-check]
-    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-check.result == 'success' && (needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    needs: [classify-changes, frontend-artifact]
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'desktop-recovery-e2e') }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            shard: all
-          - os: macos-latest
-            shard: all
-          - os: windows-latest
-            shard: profiles
-          - os: windows-latest
-            shard: ownership
-          - os: windows-latest
-            shard: workbench
+        include: ${{ fromJSON(needs.classify-changes.outputs.desktop_matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -1108,6 +1164,7 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+      CI_E2E_SHARD: ${{ matrix.shard }}
 
     steps:
       - name: Prepare Desktop recovery report
@@ -1167,17 +1224,29 @@ jobs:
         run: npm ci
 
       - name: Install WebUI recovery dependencies
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
         working-directory: opensquilla-webui
         shell: bash
         run: npm ci
 
-      - name: Cache Playwright browser
-        uses: actions/cache@v4
+      - name: Resolve Playwright browser revision
+        id: playwright-browser
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        shell: bash
+        run: |
+          revision="$(node -e "const b=require('./opensquilla-webui/node_modules/playwright-core/browsers.json').browsers.find((item)=>item.name==='chromium'); if(!b)process.exit(2); process.stdout.write(b.revision)")"
+          printf 'revision=%s\n' "${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore Playwright browser
+        id: playwright-cache
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
-          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('opensquilla-webui/package-lock.json') }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
 
       - name: Install WebUI recovery browser
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
         working-directory: opensquilla-webui
         shell: bash
         run: |
@@ -1188,6 +1257,7 @@ jobs:
           fi
 
       - name: Run cross-platform production-dist browser session hang contract
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
         working-directory: opensquilla-webui
         shell: bash
         env:
@@ -1201,6 +1271,13 @@ jobs:
             --workers=1 \
             --grep "terminates stalled" \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
+
+      - name: Seed Playwright browser cache from nightly main
+        if: ${{ github.event_name == 'schedule' && (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' && steps.playwright-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
 
       - name: Record Desktop recovery tool versions
         shell: bash
@@ -1232,10 +1309,20 @@ jobs:
             local script="$2"
             local attempt="$3"
             local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"
+            local telemetry_path="${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+            local telemetry=(
+              node scripts/ci-case-telemetry.mjs run
+              --case "${name}"
+              --os "${RUNNER_OS}"
+              --shard "${{ matrix.shard }}"
+              --attempt "${attempt}"
+              --output "${telemetry_path}"
+              --
+            )
             if [[ "${RUNNER_OS}" == "Linux" ]]; then
-              xvfb-run -a node "${script}" 2>&1 | tee "${log_path}"
+              "${telemetry[@]}" xvfb-run -a node "${script}" 2>&1 | tee "${log_path}"
             else
-              node "${script}" 2>&1 | tee "${log_path}"
+              "${telemetry[@]}" node "${script}" 2>&1 | tee "${log_path}"
             fi
           }
 
@@ -1243,7 +1330,8 @@ jobs:
             local log_path="$1"
             [[ "${RUNNER_OS}" == "Windows" ]] || return 1
             grep -Fq 'Gateway did not become healthy' "${log_path}" \
-              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}"
+              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}" \
+              || grep -Fq 'Windows ACL hardening timed out' "${log_path}"
           }
 
           case "${{ matrix.shard }}" in
@@ -1285,6 +1373,18 @@ jobs:
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
+            ownership-workbench)
+              entries=(
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
             workbench)
               entries=(
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
@@ -1320,8 +1420,20 @@ jobs:
           done
           printf 'e2e_status=passed\n' >> "${CI_REPORT_DIR}/first-failure.txt"
 
-      - name: Upload Desktop recovery report
-        if: ${{ always() }}
+      - name: Upload Desktop recovery summary
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/desktop-recovery-e2e/environment.txt
+            ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Desktop recovery failure report
+        if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
@@ -1332,7 +1444,7 @@ jobs:
   release-packaging:
     name: Release packaging contracts
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'release-packaging') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -1395,12 +1507,20 @@ jobs:
   managed-toolchain-artifacts:
     name: Managed Toolchain Artifact E2E
     needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true') }}
+    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'managed-toolchain') }}
     uses: ./.github/workflows/managed-toolchain-artifacts.yml
 
   main-canary:
-    name: Main installation and offline gateway canary
-    if: ${{ github.event_name == 'push' && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce' }}
+    name: Queue/main installation and offline gateway canary
+    needs: queue-attestation
+    if: >-
+      ${{ always()
+          && ((github.event_name == 'push'
+               && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')
+              || (github.event_name == 'merge_group'
+                  && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+                  && needs.queue-attestation.result == 'success'
+                  && needs.queue-attestation.outputs.reusable == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -1430,6 +1550,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Node.js
+        if: ${{ github.event_name == 'push' }}
         uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -1440,6 +1561,7 @@ jobs:
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
       - name: Build production WebUI artifact
+        if: ${{ github.event_name == 'push' }}
         working-directory: opensquilla-webui
         run: |
           npm ci
@@ -1447,6 +1569,7 @@ jobs:
           npm run verify:release-dist
 
       - name: Build and install wheel in a clean environment
+        if: ${{ github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1476,6 +1599,7 @@ jobs:
       - classify-changes
       - workflow-lint
       - readme-locale-check
+      - frontend-artifact
       - frontend-check
       - webui-chat-recovery
       - tui-check
@@ -1513,7 +1637,11 @@ jobs:
               echo "ERROR: merge queue fast path lacks trusted green evidence: ${QUEUE_REASON}" >&2
               exit 1
             fi
-            echo "Merge queue reused trusted PR CI evidence: ${QUEUE_REASON}"
+            if [[ "${MAIN_CANARY_RESULT}" != "success" ]]; then
+              echo "ERROR: merge queue combined-tree canary must succeed; got ${MAIN_CANARY_RESULT:-missing}." >&2
+              exit 1
+            fi
+            echo "Merge queue reused trusted CI evidence and passed the combined-tree canary: ${QUEUE_REASON}"
           elif [[ "${MAIN_CANARY_RESULT}" != "success" ]]; then
             echo "ERROR: main canary must succeed; got ${MAIN_CANARY_RESULT:-missing}." >&2
             exit 1
@@ -1523,11 +1651,8 @@ jobs:
 
       - name: Check out repository
         if: >-
-          ${{ !((github.event_name == 'merge_group'
-                 && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
-                 && needs.queue-attestation.outputs.reusable == 'true')
-                || (github.event_name == 'push'
-                    && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
+          ${{ github.event_name != 'push'
+              || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
@@ -1543,30 +1668,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Check WebUI chat recovery result
-        if: >-
-          ${{ !((github.event_name == 'merge_group'
-                 && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
-                 && needs.queue-attestation.outputs.reusable == 'true')
-                || (github.event_name == 'push'
-                    && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
-        env:
-          RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
-          FLAG_FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
-          FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
-          FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
-        shell: bash
-        run: |
-          if [[ "${FLAG_FRONTEND_CHANGED}" == "true" || "${FLAG_PLATFORM_SENSITIVE_CHANGED}" == "true" || "${FLAG_FULL_REQUIRED}" == "true" ]]; then
-            if [[ "${RESULT_WEBUI_CHAT_RECOVERY}" != "success" ]]; then
-              echo "ERROR: WebUI chat recovery must succeed; got ${RESULT_WEBUI_CHAT_RECOVERY:-missing}." >&2
-              exit 1
-            fi
-          elif [[ "${RESULT_WEBUI_CHAT_RECOVERY}" != "success" && "${RESULT_WEBUI_CHAT_RECOVERY}" != "skipped" ]]; then
-            echo "ERROR: WebUI chat recovery must be successful or intentionally skipped; got ${RESULT_WEBUI_CHAT_RECOVERY:-missing}." >&2
-            exit 1
-          fi
 
       - name: Check required CI results
         if: >-
@@ -1588,8 +1689,10 @@ jobs:
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
+          RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
           RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
+          REQUIRED_SUITES: ${{ needs.classify-changes.outputs.required_suites }}
           FLAG_DOCS_ONLY: ${{ needs.classify-changes.outputs.docs_only }}
           FLAG_RUNTIME_CHANGED: ${{ needs.classify-changes.outputs.runtime_changed }}
           FLAG_TEST_CHANGED: ${{ needs.classify-changes.outputs.test_changed }}
@@ -1608,25 +1711,77 @@ jobs:
           FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
         run: python .github/scripts/check_ci_results.py
 
-      - name: Create trusted PR CI attestation
+      - name: Create trusted CI evidence v2
         id: attestation
-        if: ${{ github.event_name == 'pull_request' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
-        run: >-
-          python .github/scripts/ci_attestation.py create
-          --repository "${GITHUB_REPOSITORY}"
-          --event-path "${GITHUB_EVENT_PATH}"
-          --run-id "${GITHUB_RUN_ID}"
-          --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --workflow-ref "${GITHUB_WORKFLOW_REF}"
-          --optimization-mode "${CI_OPTIMIZATION_MODE}"
-          --output "${RUNNER_TEMP}/ci-attestation.json"
-          --github-output "${GITHUB_OUTPUT}"
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        env:
+          QUEUE_REUSABLE: ${{ needs.queue-attestation.outputs.reusable }}
+          SOURCE_RUN_ID: ${{ needs.queue-attestation.outputs.source_run_id }}
+          SOURCE_ROOT_ISSUED_AT: ${{ needs.queue-attestation.outputs.source_root_issued_at }}
+          SOURCE_LINEAGE: ${{ needs.queue-attestation.outputs.source_lineage }}
+          SOURCE_SUCCESSFUL_SUITES: ${{ needs.queue-attestation.outputs.source_successful_suites }}
+          SOURCE_PLANNER_DIGEST: ${{ needs.queue-attestation.outputs.source_planner_digest }}
+          SOURCE_SUITE_EXECUTION_DIGESTS: ${{ needs.queue-attestation.outputs.source_suite_execution_digests }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_args=()
+          if [[ "${GITHUB_EVENT_NAME}" == "merge_group" \
+                && "${CI_OPTIMIZATION_MODE}" == "enforce" \
+                && "${QUEUE_REUSABLE}" == "true" ]]; then
+            source_args=(
+              --source-run-id "${SOURCE_RUN_ID}"
+              --source-root-issued-at "${SOURCE_ROOT_ISSUED_AT}"
+              --source-lineage "${SOURCE_LINEAGE}"
+            )
+          fi
+          python3 .github/scripts/ci_attestation.py create \
+            --repository "${GITHUB_REPOSITORY}" \
+            --event-path "${GITHUB_EVENT_PATH}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --optimization-mode "${CI_OPTIMIZATION_MODE}" \
+            --output "${RUNNER_TEMP}/ci-attestation.json" \
+            --github-output "${GITHUB_OUTPUT}" \
+            "${source_args[@]}"
 
-      - name: Upload trusted PR CI attestation
+      - name: Upload tree-indexed CI evidence v2
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-evidence-v2-tree-${{ steps.attestation.outputs.tree_sha }}
+          path: ${{ runner.temp }}/ci-attestation.json
+          if-no-files-found: error
+          retention-days: 4
+          overwrite: true
+
+      - name: Upload PR-head-indexed CI evidence v2
         if: ${{ github.event_name == 'pull_request' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-attestation-${{ steps.attestation.outputs.tree_sha }}
+          name: ci-evidence-v2-pr-${{ steps.attestation.outputs.pull_request_number }}-${{ steps.attestation.outputs.head_sha }}
           path: ${{ runner.temp }}/ci-attestation.json
           if-no-files-found: error
-          retention-days: 31
+          retention-days: 4
+          overwrite: true
+
+      - name: Create full-nightly health evidence
+        if: ${{ github.event_name == 'schedule' }}
+        run: >-
+          python3 .github/scripts/ci_attestation.py create-nightly-health
+          --repository "${GITHUB_REPOSITORY}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --workflow-ref "${GITHUB_WORKFLOW_REF}"
+          --output "${RUNNER_TEMP}/ci-nightly-health.json"
+
+      - name: Upload full-nightly health evidence
+        if: ${{ github.event_name == 'schedule' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-nightly-health-v1
+          path: ${{ runner.temp }}/ci-nightly-health.json
+          if-no-files-found: error
+          retention-days: 4
+          overwrite: true

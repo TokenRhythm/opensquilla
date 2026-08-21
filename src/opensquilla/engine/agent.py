@@ -16,7 +16,6 @@ import math
 import os
 import re
 import stat
-import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -163,6 +162,7 @@ from opensquilla.execution_status import (
     normalize_execution_status,
     runtime_execution_status,
 )
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.observability.turn_call_log import TurnCallLogger
 from opensquilla.persistence.meta_run_writer import replay_inputs_are_modified
 from opensquilla.provider import (
@@ -3021,6 +3021,9 @@ class Agent:
             tuple[str, str, str, str, str, str], ToolResultRecord
         ] = {}
         self._patch_evidence_ledger: PatchEvidenceLedger | None = None
+        self._runtime_git_state = GitRunState.OK
+        self._runtime_git_skip_states_recorded: set[GitRunState] = set()
+        self._submit_review_git_state = GitRunState.OK
         if self.config.patch_evidence_ledger_path:
             self._patch_evidence_ledger = PatchEvidenceLedger(
                 path=self.config.patch_evidence_ledger_path,
@@ -14172,10 +14175,14 @@ class Agent:
                         and not post_write_convergence_finalization_pending
                     ):
                         gate_status = await self._workspace_git_status_porcelain()
-                        gate_observation = finalize_evidence_tracker.build_observation(
-                            has_workspace_diff=bool(gate_status and gate_status.strip()),
+                        gate_observation = (
+                            finalize_evidence_tracker.build_observation(
+                                has_workspace_diff=bool(gate_status.strip()),
+                            )
+                            if gate_status is not None
+                            else None
                         )
-                        if gate_observation.should_challenge:
+                        if gate_observation is not None and gate_observation.should_challenge:
                             submit_review_red_detected = True
                             gate_key = finalize_evidence_gate_key(gate_observation)
                             # Never spend the run's last LLM call or deadline
@@ -14509,14 +14516,23 @@ class Agent:
                         ) is None and (
                             _total_deadline is None or _loop.time() < _total_deadline
                         )
-                        (
-                            implicit_file_index,
-                            implicit_diff_text,
-                        ) = await self._workspace_submit_review_capture()
-                        implicit_diff_empty = not (
-                            implicit_file_index.strip() or implicit_diff_text.strip()
-                        )
-                        if submit_review_should_fire_implicit(
+                        implicit_capture = await self._workspace_submit_review_capture()
+                        if implicit_capture is None:
+                            self._record_runtime_event(
+                                "submit_review.skipped",
+                                feature="submit_review",
+                                reason="git_observation_unavailable",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=False,
+                                git_state=self._submit_review_git_state.value,
+                            )
+                        else:
+                            implicit_file_index, implicit_diff_text = implicit_capture
+                            implicit_diff_empty = not (
+                                implicit_file_index.strip() or implicit_diff_text.strip()
+                            )
+                        if implicit_capture is not None and submit_review_should_fire_implicit(
                             submit_review_state,
                             enabled=submit_review_enabled,
                             diff_empty=implicit_diff_empty,
@@ -15232,10 +15248,37 @@ class Agent:
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
-                        (
-                            submit_file_index,
-                            submit_diff_text,
-                        ) = await self._workspace_submit_review_capture()
+                        submit_capture = await self._workspace_submit_review_capture()
+                        if submit_capture is None:
+                            unavailable_payload = self._submit_review_git_unavailable_payload(
+                                self._submit_review_git_state
+                            )
+                            submit_result = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name="submit",
+                                content=json.dumps(unavailable_payload, ensure_ascii=False),
+                                is_error=True,
+                                execution_status=runtime_execution_status(
+                                    "error",
+                                    reason=str(unavailable_payload["code"]).lower(),
+                                ),
+                                terminates_turn=True,
+                            )
+                            results_by_id[tc.tool_use_id] = submit_result
+                            dispatch_boundary = submit_result
+                            self._record_runtime_event(
+                                "submit_review.explicit_unavailable",
+                                feature="submit_review",
+                                reason="git_observation_unavailable",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=False,
+                                git_state=self._submit_review_git_state.value,
+                                code=unavailable_payload["code"],
+                                terminates_turn=True,
+                            )
+                            continue
+                        submit_file_index, submit_diff_text = submit_capture
                         submit_diff_empty = not (
                             submit_file_index.strip() or submit_diff_text.strip()
                         )
@@ -15849,12 +15892,38 @@ class Agent:
                 ):
                     recent_failure_anchor_summaries.append(failure_anchor_summary)
                     recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
-                runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-                runtime_diff_fingerprint = (
-                    self._workspace_diff_fingerprint_for_runtime_event()
+                runtime_diff_paths: list[str] | None = None
+                runtime_diff_fingerprint: str | None = None
+                if (
+                    runtime_diagnostics is not None
+                    or post_write_convergence_tracker is not None
+                ):
+                    self._runtime_git_state = GitRunState.OK
+                    runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
+                    if runtime_diff_paths is not None:
+                        runtime_diff_fingerprint = (
+                            self._workspace_diff_fingerprint_for_runtime_event()
+                        )
+                runtime_git_observed = bool(
+                    runtime_diff_paths is not None
+                    and self._runtime_git_state is GitRunState.OK
                 )
+                if (
+                    (runtime_diagnostics is not None or post_write_convergence_tracker is not None)
+                    and not runtime_git_observed
+                ):
+                    self._record_runtime_git_observation_skip(
+                        consumers=(
+                            "runtime_diagnostics",
+                            "post_write_convergence",
+                        )
+                    )
                 runtime_diagnostic_events: list[dict[str, Any]] = []
-                if runtime_diagnostics is not None:
+                if (
+                    runtime_diagnostics is not None
+                    and runtime_git_observed
+                    and runtime_diff_paths is not None
+                ):
                     for runtime_event in runtime_diagnostics.observe_tool_results(
                         iteration=iterations,
                         provider_call_count=turn_llm_calls,
@@ -15873,6 +15942,8 @@ class Agent:
                 if (
                     accepted_goal_terminal_status is None
                     and post_write_convergence_tracker is not None
+                    and runtime_git_observed
+                    and runtime_diff_paths is not None
                 ):
                     continued_activity_after_verification = bool(
                         (
@@ -16815,16 +16886,32 @@ class Agent:
             provider_call_count=turn_llm_calls,
         )
         if runtime_diagnostics is not None and terminal_error is not None:
+            self._runtime_git_state = GitRunState.OK
             runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-            for runtime_event in runtime_diagnostics.observe_finish_error(
-                iteration=iterations,
-                provider_call_count=turn_llm_calls,
-                error_code=terminal_error.code,
-                changed_files=self._relative_paths_from_records(self._workspace_write_records()),
-                diff_paths=runtime_diff_paths,
-                diff_fingerprint=self._workspace_diff_fingerprint_for_runtime_event(),
+            runtime_diff_fingerprint = (
+                self._workspace_diff_fingerprint_for_runtime_event()
+                if runtime_diff_paths is not None
+                else None
+            )
+            if (
+                runtime_diff_paths is not None
+                and self._runtime_git_state is GitRunState.OK
             ):
-                append_runtime_event(self.config.runtime_events_path, runtime_event)
+                for runtime_event in runtime_diagnostics.observe_finish_error(
+                    iteration=iterations,
+                    provider_call_count=turn_llm_calls,
+                    error_code=terminal_error.code,
+                    changed_files=self._relative_paths_from_records(
+                        self._workspace_write_records()
+                    ),
+                    diff_paths=runtime_diff_paths,
+                    diff_fingerprint=runtime_diff_fingerprint,
+                ):
+                    append_runtime_event(self.config.runtime_events_path, runtime_event)
+            else:
+                self._record_runtime_git_observation_skip(
+                    consumers=("runtime_diagnostics_finish",)
+                )
         if bool(getattr(self.config, "final_diff_salvage", False)):
             # Last engine-controlled moment before the runner collects the
             # patch from the worktree: if prior source writes ended in an
@@ -17084,7 +17171,11 @@ class Agent:
                 return True
             if getattr(ctx, "source_diff_candidates", []) or []:
                 return True
-        return bool(self._workspace_tracked_diff_paths_for_nudge())
+        paths = self._workspace_tracked_diff_paths_for_nudge()
+        # Unknown Git state must not manufacture a "no progress" nudge. Treat
+        # it conservatively as possible source evidence and let the turn keep
+        # its normal course without spending another model call.
+        return True if paths is None else bool(paths)
 
     def _workspace_source_fix_beyond_instrumentation(self) -> bool:
         """Whether the tracked diff contains more than diagnostic output.
@@ -17097,6 +17188,8 @@ class Agent:
         """
 
         paths = self._workspace_tracked_diff_paths_for_nudge()
+        if paths is None:
+            return True
         if not paths:
             return False
         ctx = self._tool_context
@@ -17106,26 +17199,19 @@ class Agent:
         if not raw_workspace:
             return True
         workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace_dir), "diff", "HEAD", "--", *paths],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
+        result = run_git(
+            ["diff", "HEAD", "--", *paths],
+            cwd=workspace_dir,
+            timeout=5.0,
+        )
+        if not result.ok:
             return True
-        if result.returncode != 0:
-            return True
-        patch = result.stdout or ""
+        patch = result.stdout_text
         if not patch.strip():
             return False
         return not is_instrumentation_only_patch(patch)
 
-    def _workspace_tracked_diff_paths_for_nudge(self) -> list[str]:
+    def _workspace_tracked_diff_paths_for_nudge(self) -> list[str] | None:
         ctx = self._tool_context
         raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
         if not raw_workspace:
@@ -17135,24 +17221,21 @@ class Agent:
         workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
         if not workspace_dir.exists():
             return []
-        ignored_paths = self._workspace_gitlink_paths(workspace_dir) | (
-            self._workspace_internal_diagnostic_paths(workspace_dir)
+        self._runtime_git_state = GitRunState.OK
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+            workspace_dir
         )
+        if ignored_state is not GitRunState.OK:
+            self._runtime_git_state = ignored_state
+            return None
+        ignored_paths |= self._workspace_internal_diagnostic_paths(workspace_dir)
         paths: set[str] = set()
         for args in (("diff", "--name-only"), ("diff", "--cached", "--name-only")):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
+            for line in result.stdout_text.splitlines():
                 text = line.strip()
                 if text:
                     normalized = _normalize_workspace_relative_path(text)
@@ -17286,6 +17369,8 @@ class Agent:
 
     def _final_diff_contract_observation(self) -> FinalDiffContractObservation | None:
         diff_paths = self._workspace_diff_paths_for_final_diff_contract()
+        if diff_paths is None:
+            return None
         known_scratch_paths = [
             path for path in diff_paths if self._workspace_relative_path_targets_scratch(path)
         ]
@@ -17386,13 +17471,21 @@ class Agent:
         workspace = self._workspace_dir_for_status()
         if workspace is None:
             return []
-        if self._workspace_diff_paths_for_final_diff_contract(include_untracked=False):
+        tracked_diff_paths = self._workspace_diff_paths_for_final_diff_contract(
+            include_untracked=False
+        )
+        if tracked_diff_paths is None:
+            return []
+        if tracked_diff_paths:
             # A tracked path still carries a live diff: the run ends with a
             # non-empty scored patch the agent chose to keep, and candidates
             # for clean paths are exactly the edits it deliberately reverted.
             # Resurrecting those here would corrupt a healthy final diff.
             return []
-        live_diff_paths = set(self._workspace_diff_paths_for_final_diff_contract())
+        current_diff_paths = self._workspace_diff_paths_for_final_diff_contract()
+        if current_diff_paths is None:
+            return []
+        live_diff_paths = set(current_diff_paths)
         deadline = time.monotonic() + self._FINAL_DIFF_SALVAGE_TIME_BUDGET_SECONDS
         applied: list[dict[str, Any]] = []
         handled_paths: set[str] = set()
@@ -17482,24 +17575,17 @@ class Agent:
         *,
         check_only: bool,
     ) -> bool:
-        args = ["git", "-C", str(workspace), "apply"]
+        args = ["apply"]
         if check_only:
             args.append("--check")
         args.append("-")
-        try:
-            result = subprocess.run(
-                args,
-                input=patch,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return result.returncode == 0
+        result = run_git(
+            args,
+            cwd=workspace,
+            timeout=10.0,
+            input_bytes=patch.encode("utf-8"),
+        )
+        return result.ok
 
     def _record_final_diff_salvage_event(
         self,
@@ -17603,19 +17689,21 @@ class Agent:
         return mirror_root.as_posix() in command
 
     @staticmethod
-    def _git_head_blob(workspace: Path, relative_path: str) -> bytes | None:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace), "show", f"HEAD:{relative_path}"],
-                capture_output=True,
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode != 0:
-            return None
-        return result.stdout
+    def _git_head_blob(workspace: Path, relative_path: str) -> tuple[bool, bytes | None]:
+        result = run_git(
+            ["show", "--end-of-options", f"HEAD:{relative_path}"],
+            cwd=workspace,
+            timeout=2.0,
+        )
+        if result.ok:
+            return True, result.stdout
+        error_text = result.stderr_text.casefold()
+        if result.state is GitRunState.FAILED and (
+            "does not exist in 'head'" in error_text
+            or "exists on disk, but not in 'head'" in error_text
+        ):
+            return True, None
+        return False, None
 
     def _scratch_verify_mirror_evidence_credit(self, command: str) -> bool:
         """Anti-weakening hash guard for scratch verify-mirror runs.
@@ -17639,6 +17727,7 @@ class Agent:
         workspace = self._workspace_dir_for_status()
         if workspace is None:
             return False
+        repository_verified = False
         checked = 0
         for mirror_file in sorted(mirror_root.rglob("*")):
             if not mirror_file.is_file():
@@ -17663,7 +17752,21 @@ class Agent:
                 if mirror_digest != original_digest:
                     return False
                 continue
-            head_blob = self._git_head_blob(workspace, relative.as_posix())
+            if not repository_verified:
+                repository_check = run_git(
+                    ["rev-parse", "--is-inside-work-tree"],
+                    cwd=workspace,
+                    timeout=2.0,
+                )
+                if not repository_check.ok:
+                    return False
+                repository_verified = True
+            head_observed, head_blob = self._git_head_blob(
+                workspace,
+                relative.as_posix(),
+            )
+            if not head_observed:
+                return False
             if head_blob is None:
                 # Tracked nowhere: a new check file, not a shadowed original.
                 continue
@@ -17676,65 +17779,131 @@ class Agent:
         if workspace is None:
             return None
 
-        def _run_status() -> str | None:
-            try:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(workspace),
-                        "status",
-                        "--porcelain=v1",
-                        "--untracked-files=all",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return None
-            if result.returncode != 0:
-                return None
-            gitlink_paths = self._workspace_gitlink_paths(workspace)
-            return self._filter_ignored_porcelain_status(result.stdout, gitlink_paths)
+        def _run_status() -> tuple[GitRunState, str | None]:
+            result = run_git(
+                ["status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=workspace,
+                timeout=2.0,
+            )
+            if not result.ok:
+                return result.state, None
+            gitlink_state, gitlink_paths = self._workspace_gitlink_paths_observed(
+                workspace
+            )
+            if gitlink_state is not GitRunState.OK:
+                return gitlink_state, None
+            return (
+                GitRunState.OK,
+                self._filter_ignored_porcelain_status(
+                    result.stdout_text,
+                    gitlink_paths,
+                ),
+            )
 
-        return await asyncio.to_thread(_run_status)
+        state, status = await asyncio.to_thread(_run_status)
+        self._runtime_git_state = state
+        return status
 
-    async def _workspace_submit_review_capture(self) -> tuple[str, str]:
+    async def _workspace_submit_review_capture(self) -> tuple[str, str] | None:
         """Capture ``(per-file summary, unified diff)`` for the submit review.
 
         The per-file summary comes from ``git status`` (so untracked scratch
         files appear even though they are absent from ``git diff``); the diff
-        body is ``git diff HEAD`` for tracked changes. Best-effort: any failure
-        yields an empty diff and the review degrades to the summary alone.
+        body is ``git diff HEAD`` for tracked changes. ``None`` means Git could
+        not authoritatively observe the repository and must never be treated as
+        an empty diff.
         """
         workspace = self._workspace_dir_for_status()
         if workspace is None:
-            return "", ""
+            self._submit_review_git_state = GitRunState.NOT_REPOSITORY
+            return None
 
-        def _run_diff() -> str:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace), "diff", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=4.0,
-                    check=False,
+        def _capture() -> tuple[GitRunState, tuple[str, str] | None]:
+            status_result = run_git(
+                ["status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=workspace,
+                timeout=2.0,
+            )
+            if not status_result.ok:
+                return status_result.state, None
+            diff_result = run_git(["diff", "HEAD"], cwd=workspace, timeout=4.0)
+            if diff_result.ok:
+                diff_text = diff_result.stdout_text
+            else:
+                # ``git diff HEAD`` is invalid in a legitimate unborn
+                # repository. Confirm that this is still a repository with a
+                # symbolic, not-yet-created HEAD before falling back to the
+                # two comparisons that do work there. Other failures remain
+                # unknown and must not be presented as a clean review.
+                repository_result = run_git(
+                    ["rev-parse", "--is-inside-work-tree"],
+                    cwd=workspace,
+                    timeout=2.0,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                return ""
-            if result.returncode != 0:
-                return ""
-            return result.stdout
+                if not repository_result.ok:
+                    return repository_result.state, None
+                if repository_result.stdout_text.strip().casefold() != "true":
+                    return GitRunState.NOT_REPOSITORY, None
+                head_result = run_git(
+                    ["rev-parse", "--verify", "HEAD"],
+                    cwd=workspace,
+                    timeout=2.0,
+                )
+                if head_result.ok:
+                    return diff_result.state, None
+                if head_result.state is not GitRunState.FAILED:
+                    return head_result.state, None
+                symbolic_head_result = run_git(
+                    ["symbolic-ref", "--quiet", "HEAD"],
+                    cwd=workspace,
+                    timeout=2.0,
+                )
+                if not symbolic_head_result.ok:
+                    return symbolic_head_result.state, None
+                cached_result = run_git(
+                    ["diff", "--cached"],
+                    cwd=workspace,
+                    timeout=4.0,
+                )
+                if not cached_result.ok:
+                    return cached_result.state, None
+                worktree_result = run_git(["diff"], cwd=workspace, timeout=4.0)
+                if not worktree_result.ok:
+                    return worktree_result.state, None
+                diff_text = cached_result.stdout_text + worktree_result.stdout_text
+            ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+                workspace
+            )
+            if ignored_state is not GitRunState.OK:
+                return ignored_state, None
+            file_index = self._filter_ignored_porcelain_status(
+                status_result.stdout_text,
+                ignored_paths,
+            )
+            return GitRunState.OK, (file_index, diff_text)
 
-        file_index = await self._workspace_git_status_porcelain() or ""
-        diff_text = await asyncio.to_thread(_run_diff)
-        return file_index, diff_text
+        state, capture = await asyncio.to_thread(_capture)
+        self._submit_review_git_state = state
+        return capture
+
+    @staticmethod
+    def _submit_review_git_unavailable_payload(state: GitRunState) -> dict[str, Any]:
+        code = (
+            "GIT_NOT_REPOSITORY"
+            if state is GitRunState.NOT_REPOSITORY
+            else "GIT_UNAVAILABLE"
+        )
+        return {
+            "status": "unavailable",
+            "code": code,
+            "reason": "submit_review_git_unavailable",
+            "git_state": state.value,
+            "retryable": False,
+            "message": (
+                "OpenSquilla could not inspect the workspace diff for submit review; "
+                "the submit request was ended without treating the workspace as clean."
+            ),
+        }
 
     @staticmethod
     def _porcelain_status_code(line: str) -> str:
@@ -17882,51 +18051,46 @@ class Agent:
 
     @staticmethod
     def _workspace_gitlink_paths(workspace_dir: Path) -> set[str]:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace_dir), "ls-files", "-s"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return set()
-        if result.returncode != 0:
-            return set()
+        _state, paths = Agent._workspace_gitlink_paths_observed(workspace_dir)
+        return paths
+
+    @staticmethod
+    def _workspace_gitlink_paths_observed(
+        workspace_dir: Path,
+    ) -> tuple[GitRunState, set[str]]:
+        result = run_git(["ls-files", "-s"], cwd=workspace_dir, timeout=2.0)
+        if not result.ok:
+            return result.state, set()
+        return GitRunState.OK, Agent._gitlink_paths_from_index_output(result.stdout_text)
+
+    @staticmethod
+    def _gitlink_paths_from_index_output(output: str) -> set[str]:
         paths: set[str] = set()
-        for line in (result.stdout or "").splitlines():
+        for line in output.splitlines():
             parts = line.split(None, 3)
             if len(parts) == 4 and parts[0] == "160000":
                 paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
 
     def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
-        ignored = self._workspace_gitlink_paths(workspace_dir)
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(workspace_dir),
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ignored
-        if result.returncode != 0:
-            return ignored
-        for line in (result.stdout or "").splitlines():
+        _state, ignored = self._workspace_ignored_diff_paths_observed(workspace_dir)
+        return ignored
+
+    def _workspace_ignored_diff_paths_observed(
+        self,
+        workspace_dir: Path,
+    ) -> tuple[GitRunState, set[str]]:
+        gitlink_state, ignored = self._workspace_gitlink_paths_observed(workspace_dir)
+        if gitlink_state is not GitRunState.OK:
+            return gitlink_state, set()
+        status_result = run_git(
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=workspace_dir,
+            timeout=2.0,
+        )
+        if not status_result.ok:
+            return status_result.state, set()
+        for line in status_result.stdout_text.splitlines():
             path = self._porcelain_status_path(line)
             if (
                 path
@@ -17934,7 +18098,7 @@ class Agent:
                 and self._is_root_scratch_artifact_path(path)
             ):
                 ignored.add(path)
-        return ignored
+        return GitRunState.OK, ignored
 
     async def _failed_tool_finalization_recovery_details(
         self,
@@ -18746,12 +18910,37 @@ class Agent:
         }
         append_runtime_event(self.config.runtime_events_path, event)
 
+    def _record_runtime_git_observation_skip(
+        self,
+        *,
+        consumers: tuple[str, ...],
+    ) -> None:
+        """Record one internal-only skip for each unavailable Git state."""
+
+        state = self._runtime_git_state
+        if state is GitRunState.OK:
+            state = GitRunState.FAILED
+            self._runtime_git_state = state
+        self.config.metadata["runtime_git_observation_state"] = state.value
+        if state in self._runtime_git_skip_states_recorded:
+            return
+        self._runtime_git_skip_states_recorded.add(state)
+        self._record_runtime_event(
+            "runtime_git_observation.skipped",
+            feature="runtime_git_observation",
+            reason="git_state_unavailable",
+            git_state=state.value,
+            consumers=list(consumers),
+            injected_to_model=False,
+        )
+
     def _record_tool_loop_runtime_event(self, *, reason: str, **details: Any) -> None:
         if self.config.tool_loop_observer_mode != "log":
             return
         iteration = details.get("iteration")
         hint_text_sha256 = details.pop("hint_text_sha256", None)
         trigger_confidence = details.pop("trigger_confidence", "observed_runtime_signal")
+        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
         event = {
             "feature": "runtime_observer",
             "mechanism": "tool_loop_observer",
@@ -18765,7 +18954,9 @@ class Agent:
             "evidence": details,
             "read_files": self._relative_paths_from_records(self._workspace_read_records()),
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
+            "diff_paths": runtime_diff_paths or [],
+            "git_state": self._runtime_git_state.value,
+            "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": hint_text_sha256,
             "trigger_confidence": trigger_confidence,
@@ -18791,6 +18982,7 @@ class Agent:
             **decision.details,
             **details,
         }
+        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
         event = {
             "feature": "runtime_recovery",
             "mechanism": decision.mechanism,
@@ -18807,7 +18999,9 @@ class Agent:
             "evidence": evidence,
             "read_files": self._relative_paths_from_records(self._workspace_read_records()),
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
+            "diff_paths": runtime_diff_paths or [],
+            "git_state": self._runtime_git_state.value,
+            "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": hint_text_sha256,
             "trigger_confidence": "runtime_recovery_gate",
@@ -18831,6 +19025,7 @@ class Agent:
         if event_name is None:
             return
         evidence = dict(decision.details)
+        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
         event = {
             "feature": "post_write_convergence",
             "mechanism": "stable_verified_workspace_diff",
@@ -18847,7 +19042,9 @@ class Agent:
             "evidence": evidence,
             "read_files": self._relative_paths_from_records(self._workspace_read_records()),
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
+            "diff_paths": runtime_diff_paths or [],
+            "git_state": self._runtime_git_state.value,
+            "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": (
                 hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
@@ -18873,30 +19070,29 @@ class Agent:
                 paths.append(normalized)
         return paths
 
-    def _workspace_diff_paths_for_runtime_event(self) -> list[str]:
+    def _workspace_diff_paths_for_runtime_event(self) -> list[str] | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
-            return []
-        ignored_paths = self._workspace_ignored_diff_paths(workspace_dir)
+            self._runtime_git_state = GitRunState.NOT_REPOSITORY
+            return None
+        self._runtime_git_state = GitRunState.OK
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+            workspace_dir
+        )
+        if ignored_state is not GitRunState.OK:
+            self._runtime_git_state = ignored_state
+            return None
         paths: set[str] = set()
         for args in (
             ("diff", "--name-only"),
             ("diff", "--cached", "--name-only"),
             ("status", "--porcelain=v1", "--untracked-files=all"),
         ):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
+            for line in result.stdout_text.splitlines():
                 if args[0] == "status":
                     text = self._porcelain_status_path(line) or ""
                 else:
@@ -18910,13 +19106,16 @@ class Agent:
 
     def _workspace_diff_paths_for_final_diff_contract(
         self, *, include_untracked: bool = True
-    ) -> list[str]:
+    ) -> list[str] | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
             return []
-        ignored_paths = self._workspace_gitlink_paths(workspace_dir) | (
-            self._workspace_internal_diagnostic_paths(workspace_dir)
+        gitlink_state, ignored_paths = self._workspace_gitlink_paths_observed(
+            workspace_dir
         )
+        if gitlink_state is not GitRunState.OK:
+            return None
+        ignored_paths |= self._workspace_internal_diagnostic_paths(workspace_dir)
         commands: tuple[tuple[str, ...], ...] = (
             ("diff", "--name-only"),
             ("diff", "--cached", "--name-only"),
@@ -18925,19 +19124,13 @@ class Agent:
             commands += (("status", "--porcelain=v1", "--untracked-files=all"),)
         paths: set[str] = set()
         for args in commands:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                # An unavailable Git runtime or a non-repository workspace is
+                # not an authoritative clean diff. Callers must skip their
+                # final-diff gates instead of treating it as empty.
+                return None
+            for line in result.stdout_text.splitlines():
                 if args[0] == "status":
                     text = self._porcelain_status_path(line) or ""
                 else:
@@ -18969,9 +19162,10 @@ class Agent:
     def _workspace_diff_fingerprint_for_runtime_event(self) -> str | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
+            self._runtime_git_state = GitRunState.NOT_REPOSITORY
             return None
         diff_paths = self._workspace_diff_paths_for_runtime_event()
-        if not diff_paths:
+        if diff_paths is None or not diff_paths:
             return None
         payload_parts: list[str] = []
         for args in (
@@ -18979,29 +19173,27 @@ class Agent:
             ("diff", "--cached", "--no-ext-diff", "--binary", "--", *diff_paths),
             ("status", "--porcelain=v1", "--untracked-files=all"),
         ):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
             payload_parts.append(f"$ git {' '.join(args)}\n")
-            stdout = result.stdout or ""
+            stdout = result.stdout_text
             if args[0] == "status":
+                ignored_state, ignored_paths = (
+                    self._workspace_ignored_diff_paths_observed(workspace_dir)
+                )
+                if ignored_state is not GitRunState.OK:
+                    self._runtime_git_state = ignored_state
+                    return None
                 stdout = self._filter_gitlink_porcelain_status(
                     stdout,
-                    self._workspace_ignored_diff_paths(workspace_dir),
+                    ignored_paths,
                 )
             payload_parts.append(stdout)
             if result.stderr:
                 payload_parts.append("\n[stderr]\n")
-                payload_parts.append(result.stderr)
+                payload_parts.append(result.stderr_text)
         payload = "\n".join(payload_parts)
         if not payload.strip():
             return None

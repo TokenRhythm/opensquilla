@@ -1291,6 +1291,35 @@ async def test_image_input_routes_directly_to_vision_model_without_prompt_inject
 
 
 @pytest.mark.asyncio
+async def test_tokenrhythm_default_image_route_skips_kimi_code_c2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    config = GatewayConfig()
+    assert config.squilla_router.tiers["c2"]["model"] == "kimi-k2.7-code"
+    assert config.squilla_router.tiers["c2"]["supports_image"] is False
+    ctx = TurnContext(
+        message="What is in this screenshot?",
+        session_key="test-tokenrhythm-image",
+        config=config,
+        provider=None,
+        model=config.llm.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[{"type": "image", "mime_type": "image/png"}],
+    )
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == "image_model"
+    assert routed.model == "kimi-k2.6"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fusion_config",
     [

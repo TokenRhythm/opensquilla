@@ -212,10 +212,14 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "Release packaging contracts" in text
     assert "CI result" in text
     assert 'push)\n              before="${{ github.event.before }}"' in text
-    assert 'merge_group)\n              base="${{ github.event.merge_group.base_sha }}"' in text
-    assert 'head="${{ github.event.merge_group.head_sha }}"' in text
-    assert 'git diff --name-only "${base}" "${head}" > "${changed_files}"' in text
-    assert "Merge-group diff is unavailable or empty; running the full CI matrix." in text
+    merge_group_case = text.split("            merge_group)", 1)[1].split(
+        "              ;;", 1
+    )[0]
+    assert "Queue evidence was unavailable; running the full fail-closed matrix." in (
+        merge_group_case
+    )
+    assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in merge_group_case
+    assert "git diff --name-only" not in merge_group_case
     assert 'git diff --name-only "${before}" "${after}" > "${changed_files}"' in text
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
     assert "runtime_changed" in text
@@ -256,7 +260,13 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert "fetch-depth" in str(jobs["queue-attestation"])
     assert "verify-queue" in str(jobs["queue-attestation"])
     assert "reason_code" in str(jobs["queue-attestation"])
+    assert jobs["queue-attestation"]["outputs"]["combined_smoke_suites"] == (
+        "${{ steps.verify.outputs.combined_smoke_suites || '[]' }}"
+    )
     assert jobs["classify-changes"]["needs"] == "queue-attestation"
+    assert jobs["classify-changes"]["outputs"]["planner_full_fallback"] == (
+        "${{ steps.plan.outputs.full_fallback }}"
+    )
     assert "always()" in jobs["classify-changes"]["if"]
     assert "github.event_name != 'merge_group'" in jobs["classify-changes"]["if"]
     classify_consumers = {
@@ -276,7 +286,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         assert "always()" in condition, job_name
         assert "needs.classify-changes.result == 'success'" in condition, job_name
     for job_name in ("webui-chat-recovery", "desktop-recovery-e2e"):
-        assert "needs.frontend-check.result == 'success'" in str(
+        assert "needs.frontend-artifact.result == 'success'" in str(
             jobs[job_name]["if"]
         )
     queue_checkout = next(
@@ -287,12 +297,19 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert queue_checkout["with"]["ref"] == "${{ github.event.merge_group.head_sha }}"
     assert "full fail-closed matrix" in str(jobs["classify-changes"])
     assert 'CI_OPTIMIZATION_MODE}" == "legacy"' in str(jobs["classify-changes"])
-    assert jobs["main-canary"]["name"] == "Main installation and offline gateway canary"
+    assert jobs["main-canary"]["name"] == (
+        "Queue/main installation and offline gateway canary"
+    )
     assert "test_gateway_silent_reply_process_e2e.py" in str(jobs["main-canary"])
+    assert all(
+        step.get("name") != "Run overlapping Python domain smoke"
+        for step in jobs["main-canary"]["steps"]
+    )
     assert jobs["ci-result"]["name"] == "CI result"
-    assert "ci-attestation-${{ steps.attestation.outputs.tree_sha }}" in str(
+    assert "ci-evidence-v2-tree-${{ steps.attestation.outputs.tree_sha }}" in str(
         jobs["ci-result"]
     )
+    assert "ci-nightly-health-v1" in str(jobs["ci-result"])
 
 
 def test_skill_hub_contract_uses_classifier_gate_without_changing_required_names() -> None:
@@ -434,9 +451,30 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     workflow = _workflow("ci.yml")
     upload = next(
         step
-        for step in workflow["jobs"]["frontend-check"]["steps"]
+        for step in workflow["jobs"]["frontend-artifact"]["steps"]
         if step.get("name") == "Upload verified frontend artifact"
     )
+    producer = next(
+        step
+        for step in workflow["jobs"]["frontend-artifact"]["steps"]
+        if step.get("name") == "Build verified frontend artifact"
+    )
+    typecheck = next(
+        step
+        for step in workflow["jobs"]["frontend-check"]["steps"]
+        if step.get("name") == "Run frontend type checks"
+    )
+    unit_tests = next(
+        step
+        for step in workflow["jobs"]["frontend-check"]["steps"]
+        if step.get("name") == "Run frontend unit tests"
+    )
+    assert "npm run build:artifact" in producer["run"]
+    assert "npm run build\n" not in producer["run"]
+    assert typecheck["run"] == "npm run typecheck"
+    assert "frontend_changed == 'true'" in typecheck["if"]
+    assert "planner_full_fallback == 'true'" in typecheck["if"]
+    assert "planner_full_fallback == 'true'" in unit_tests["if"]
     assert upload["with"]["retention-days"] >= 31
     assert upload["with"]["overwrite"] is True
     assert "opensquilla-webui-dist-attempt-${{ github.run_attempt }}" not in text
@@ -447,6 +485,19 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     )
     assert "build_wheel_required == 'true'" in wheel["if"]
     assert "full_required == 'true'" in wheel["if"]
+    assert "planner_full_fallback == 'true'" in wheel["if"]
+    setup_python = next(
+        step
+        for step in workflow["jobs"]["frontend-check"]["steps"]
+        if step.get("name") == "Set up Python"
+    )
+    setup_uv = next(
+        step
+        for step in workflow["jobs"]["frontend-check"]["steps"]
+        if step.get("name") == "Set up uv"
+    )
+    assert "planner_full_fallback == 'true'" in setup_python["if"]
+    assert "planner_full_fallback == 'true'" in setup_uv["if"]
 
 
 def test_webui_text_and_docker_context_contracts_are_enforced_in_ci() -> None:
@@ -462,7 +513,8 @@ def test_webui_text_and_docker_context_contracts_are_enforced_in_ci() -> None:
         if step.get("name") == "Test Docker build-context exclusions in full CI"
     )
     assert docker_step["if"] == (
-        "${{ needs.classify-changes.outputs.full_required == 'true' }}"
+        "${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), "
+        "'python-full') }}"
     )
     assert "tests/test_ci/test_dockerignore_context.py" in docker_step["run"]
 
@@ -1422,31 +1474,25 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     jobs = data["jobs"]
 
     assert "tui-check" in jobs
-    assert "frontend_changed == 'true'" in jobs["frontend-check"]["if"]
-    assert "full_required == 'true'" in jobs["frontend-check"]["if"]
-    assert "tui_changed == 'true'" in jobs["tui-check"]["if"]
-    assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
-    assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
-    assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
-    assert "python_full_required == 'true'" in jobs["ubuntu-full"]["if"]
-    assert jobs["windows-compat"]["if"] == (
-        "${{ always() && needs.classify-changes.result == 'success' && "
-        "(needs.classify-changes.outputs.python_changed == 'true' || "
-        "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
-        "needs.classify-changes.outputs.dependency_changed == 'true' || "
-        "needs.classify-changes.outputs.release_changed == 'true') && "
-        "needs.classify-changes.outputs.windows_full_required != 'true' && "
-        "needs.classify-changes.outputs.full_required != 'true' }}"
-    )
-    assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["macos-recovery"]["if"]
-    assert "desktop_changed == 'true'" in jobs["macos-recovery"]["if"]
+    assert "required_suites" in jobs["frontend-artifact"]["if"]
+    assert "'frontend'" in jobs["frontend-artifact"]["if"]
+    assert jobs["frontend-check"]["needs"] == [
+        "classify-changes",
+        "frontend-artifact",
+    ]
+    assert "'tui'" in jobs["tui-check"]["if"]
+    assert "'desktop-static'" in jobs["desktop-check"]["if"]
+    assert "'python-targeted'" in jobs["ubuntu-quality"]["if"]
+    assert "'python-full'" in jobs["ubuntu-quality"]["if"]
+    assert "'python-full'" in jobs["ubuntu-full"]["if"]
+    assert "'windows-compat'" in jobs["windows-compat"]["if"]
+    assert "'windows-high-risk'" in jobs["windows-full"]["if"]
+    assert "'macos-recovery'" in jobs["macos-recovery"]["if"]
     assert "frontend_changed == 'true'" not in jobs["desktop-recovery-e2e"]["if"]
-    assert "frontend_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
-    assert "desktop_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
-    assert "release_changed == 'true'" in jobs["release-packaging"]["if"]
+    assert "'webui-chat-recovery'" in jobs["webui-chat-recovery"]["if"]
+    assert "required_suites" in jobs["desktop-recovery-e2e"]["if"]
+    assert "desktop-recovery-e2e" in jobs["desktop-recovery-e2e"]["if"]
+    assert "'release-packaging'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
     assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
@@ -1456,8 +1502,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "managed-toolchain-artifacts" in jobs["ci-result"]["needs"]
     artifact_e2e = jobs["managed-toolchain-artifacts"]
     assert artifact_e2e["uses"] == "./.github/workflows/managed-toolchain-artifacts.yml"
-    assert "toolchain_artifact_changed == 'true'" in artifact_e2e["if"]
-    assert "full_required == 'true'" in artifact_e2e["if"]
+    assert "'managed-toolchain'" in artifact_e2e["if"]
 
 
 def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> None:
@@ -1474,6 +1519,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "classify-changes",
         "workflow-lint",
         "readme-locale-check",
+        "frontend-artifact",
         "frontend-check",
         "webui-chat-recovery",
         "tui-check",
@@ -1525,13 +1571,9 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     steps = job["steps"]
 
     assert job["strategy"]["fail-fast"] is False
-    assert job["strategy"]["matrix"]["include"] == [
-        {"os": "ubuntu-latest", "shard": "all"},
-        {"os": "macos-latest", "shard": "all"},
-        {"os": "windows-latest", "shard": "profiles"},
-        {"os": "windows-latest", "shard": "ownership"},
-        {"os": "windows-latest", "shard": "workbench"},
-    ]
+    assert job["strategy"]["matrix"]["include"] == (
+        "${{ fromJSON(needs.classify-changes.outputs.desktop_matrix) }}"
+    )
     download = next(
         step for step in steps if step.get("name") == "Download verified frontend artifact"
     )
@@ -1549,13 +1591,18 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         == "Run cross-platform production-dist browser session hang contract"
     )
     playwright_cache = next(
-        step for step in steps if step.get("name") == "Cache Playwright browser"
+        step for step in steps if step.get("name") == "Restore Playwright browser"
     )
     run = next(
         step for step in steps if step.get("name") == "Run compiled Desktop recovery flows"
     )
-    upload = next(
-        step for step in steps if step.get("name") == "Upload Desktop recovery report"
+    summary_upload = next(
+        step for step in steps if step.get("name") == "Upload Desktop recovery summary"
+    )
+    failure_upload = next(
+        step
+        for step in steps
+        if step.get("name") == "Upload Desktop recovery failure report"
     )
 
     assert steps.index(download) < steps.index(setup_node) < steps.index(verify_frontend)
@@ -1568,15 +1615,19 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert session_recovery["working-directory"] == "opensquilla-webui"
     assert session_recovery["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
     assert session_recovery["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert session_recovery["if"] == (
+        "${{ (runner.os == 'Windows' || runner.os == 'macOS') && "
+        "matrix.shard == 'profiles' }}"
+    )
     assert "history-hydration.spec.ts" in session_recovery["run"]
     assert '--grep "terminates stalled"' in session_recovery["run"]
-    assert playwright_cache["uses"] == "actions/cache@v4"
+    assert playwright_cache["uses"] == "actions/cache/restore@v4"
     assert playwright_cache["with"]["path"] == "${{ env.PLAYWRIGHT_BROWSERS_PATH }}"
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
         "${{ github.workspace }}/.cache/ms-playwright"
     )
     assert "${{ runner.arch }}" in playwright_cache["with"]["key"]
-    assert "opensquilla-webui/package-lock.json" in playwright_cache["with"]["key"]
+    assert "steps.playwright-browser.outputs.revision" in playwright_cache["with"]["key"]
     assert "restore-keys" not in playwright_cache["with"]
     assert "xvfb-run -a node" in run["run"]
     assert "test-profile-consolidation-flow.mjs" in run["run"]
@@ -1589,6 +1640,10 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert 'case "${{ matrix.shard }}" in' in run["run"]
     assert 'local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"' in run["run"]
+    assert "node scripts/ci-case-telemetry.mjs run" in run["run"]
+    assert '--shard "${{ matrix.shard }}"' in run["run"]
+    assert '--attempt "${attempt}"' in run["run"]
+    assert 'desktop-e2e-cases.jsonl' in run["run"]
     assert "is_retryable_windows_failure()" in run["run"]
     assert '[[ "${RUNNER_OS}" == "Windows" ]] || return 1' in run["run"]
     assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
@@ -1596,14 +1651,62 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "grep -Fq 'Timed out waiting for post-exit delete-all helper completion'"
         in run["run"]
     )
+    assert "grep -Fq 'Windows ACL hardening timed out'" in run["run"]
     assert 'if is_retryable_windows_failure "${first_log}"' in run["run"]
     assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
-    assert upload["if"] == "${{ always() }}"
-    assert upload["with"]["name"] == (
+    assert summary_upload["if"] == "${{ success() }}"
+    assert summary_upload["with"]["name"] == (
         "desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}"
         "-attempt-${{ github.run_attempt }}"
     )
+    assert "desktop-e2e-cases.jsonl" in summary_upload["with"]["path"]
+    assert "*.log" not in summary_upload["with"]["path"]
+    assert failure_upload["if"] == "${{ failure() }}"
+    assert failure_upload["with"]["path"] == (
+        "${{ runner.temp }}/desktop-recovery-e2e"
+    )
+    desktop_unit = next(
+        step
+        for step in _workflow("ci.yml")["jobs"]["desktop-check"]["steps"]
+        if step.get("name") == "Run desktop unit tests"
+    )
+    assert "node scripts/test-ci-case-telemetry.mjs" in desktop_unit["run"]
+
+
+def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> None:
+    script = Path(
+        "desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs"
+    ).read_text(encoding="utf-8")
+    finally_block = script.index("} finally {")
+    durable_check = script.index(
+        "evidence.durableMutation = await readDurableMutationEvidence", finally_block
+    )
+    failure_capture = script.index(
+        "failureEvidence = await captureFailureEvidence", finally_block
+    )
+    app_close = script.index("await diagnosticCall('Electron shutdown'", finally_block)
+
+    assert durable_check < failure_capture < app_close
+    assert "async function diagnosticCall" in script
+    assert "const gateway = await gatewayHealthSnapshot" in script
+    assert "renderer shell snapshot" in script
+    assert "failure-attempt-${attempt}-${Date.now()}" in script
+
+
+def test_ci_evidence_artifacts_are_replaceable_across_rerun_attempts() -> None:
+    steps = _workflow("ci.yml")["jobs"]["ci-result"]["steps"]
+    names = {
+        "Upload tree-indexed CI evidence v2",
+        "Upload PR-head-indexed CI evidence v2",
+        "Upload full-nightly health evidence",
+    }
+    uploads = {step["name"]: step for step in steps if step.get("name") in names}
+
+    assert set(uploads) == names
+    for upload in uploads.values():
+        assert upload["uses"] == "actions/upload-artifact@v4"
+        assert upload["with"]["overwrite"] is True
 
 
 def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
@@ -1622,13 +1725,14 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         == "Run production-dist chat and Goal recovery browser contracts"
     )
 
-    assert job["needs"] == ["classify-changes", "frontend-check"]
+    assert job["needs"] == ["classify-changes", "frontend-artifact"]
     assert download["with"]["name"] == "opensquilla-webui-dist"
     assert download["with"]["path"] == "src/opensquilla/gateway/static/dist/"
     assert steps.index(download) < steps.index(install_gateway) < steps.index(run)
     assert install_gateway["run"] == "uv sync --frozen"
     assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
     assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert "--workers=2" in run["run"]
     selected_specs = {
         argument
         for argument in run["run"].split()
@@ -1683,12 +1787,9 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert windows_full["strategy"] == {
         "fail-fast": False,
         "matrix": {
-            "shard": [
-                "core",
-                "gateway-sqlite",
-                "recovery-migration",
-                "desktop-installer-contracts",
-            ]
+            "shard": (
+                "${{ fromJSON(needs.classify-changes.outputs.python_matrix).windows }}"
+            )
         },
     }
     checkout = next(step for step in steps if step.get("name") == "Check out repository")
@@ -1703,6 +1804,10 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert '"${{ github.event_name }}" == "pull_request"' in test_step["run"]
     assert "--maxfail=3" in test_step["run"]
     assert "--maxfail=1" not in test_step["run"]
+    assert '"${{ matrix.shard }}" == "recovery-migration"' in test_step["run"]
+    assert '"${{ matrix.shard }}" == "gateway-sqlite"' in test_step["run"]
+    assert "worker_args+=(--workers=2)" in test_step["run"]
+    assert '"${worker_args[@]}"' in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]
     assert 'tee "${CI_REPORT_DIR}/pytest.log"' in test_step["run"]
     assert upload_step["if"] == "${{ always() }}"
@@ -1820,28 +1925,29 @@ def test_ubuntu_quality_keeps_targeted_pr_tests_and_full_ci_uses_balanced_matrix
 
     assert checkout["uses"] == "actions/checkout@v4"
     assert checkout["with"]["lfs"] == (
-        "${{ needs.classify-changes.outputs.full_required == 'true' }}"
+        "${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), "
+        "'python-full') }}"
     )
     assert test_step["if"] == (
-        "${{ needs.classify-changes.outputs.full_required != 'true' && "
-        "needs.classify-changes.outputs.python_full_required != 'true' }}"
+        "${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), "
+        "'python-targeted') && !contains(fromJSON(needs.classify-changes.outputs.required_suites), "
+        "'python-full') }}"
     )
-    assert "full_required == 'true'" in ubuntu_full["if"]
-    assert "python_full_required == 'true'" in ubuntu_full["if"]
+    assert "required_suites" in ubuntu_full["if"]
+    assert "'python-full'" in ubuntu_full["if"]
     assert "uv run pytest" in test_step["run"]
     assert "tests/test_artifacts.py" not in test_step["run"]
     assert "--ignore=tests/test_ci/test_router_artifact_manifest.py" in test_step["run"]
-    assert "tests/test_recovery" in test_step["run"]
-    assert "tests/test_migration/test_opensquilla_home_migration.py" in test_step["run"]
+    assert "tests/unit" in test_step["run"]
+    assert "TARGETED_PYTEST_TARGETS" in test_step["env"]
+    assert 'pytest_targets+=("${target}")' in test_step["run"]
+    assert "tests/test_recovery" not in test_step["run"]
     assert ubuntu_full["strategy"] == {
         "fail-fast": False,
         "matrix": {
-            "shard": [
-                "core",
-                "gateway-sqlite",
-                "recovery-migration",
-                "desktop-installer-contracts",
-            ]
+            "shard": (
+                "${{ fromJSON(needs.classify-changes.outputs.python_matrix).ubuntu }}"
+            )
         },
     }
     assert ubuntu_full["timeout-minutes"] == 20

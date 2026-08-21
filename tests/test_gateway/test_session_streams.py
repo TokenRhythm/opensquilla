@@ -305,6 +305,44 @@ def test_live_turn_snapshot_preserves_text_steer_text_boundary_order() -> None:
     ]
 
 
+def test_live_turn_snapshot_keeps_adjacent_retry_model_calls_distinct() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    session_key = "agent:main:steered-retry"
+    task_id = "task-steered-retry"
+
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {
+            "task_id": task_id,
+            "text": "first attempt",
+            "model_call_id": "2.0",
+            "iteration": 2,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {
+            "task_id": task_id,
+            "text": "retry attempt",
+            "model_call_id": "2.1",
+            "iteration": 2,
+        },
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert [event.payload["text"] for event in snapshot.events] == [
+        "first attempt",
+        "retry attempt",
+    ]
+    assert [event.payload["model_call_id"] for event in snapshot.events] == [
+        "2.0",
+        "2.1",
+    ]
+
+
 def test_live_turn_snapshot_compacts_thinking_per_block_and_preserves_boundaries() -> None:
     registry = SessionStreamRegistry(max_events_per_session=5)
     session_key = "agent:main:reasoning-blocks"

@@ -158,7 +158,7 @@ function createHarness(options: {
 
 describe('useChatRpcEventHandlers route-card ownership', () => {
   it('binds text and thinking events to their physical provider calls', () => {
-    const { api, bindRouterDecisionToModelCall, stop } = createHarness()
+    const { api, stream, bindRouterDecisionToModelCall, stop } = createHarness()
     try {
       api.handlers.onTextDelta({
         session_key: 'agent:main:test',
@@ -199,6 +199,10 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
         ['1.0', 1, 'turn-1'],
         ['2.0', 2, 'turn-1'],
       ])
+      expect(stream.appendDelta).toHaveBeenCalledWith('answer', undefined, {
+        modelCallId: '1.0',
+        iteration: 1,
+      })
     } finally {
       stop()
     }
@@ -553,6 +557,8 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
               session_key: 'agent:main:test',
               task_id: 'task-live',
               text: 'Second answer',
+              model_call_id: '2.0',
+              iteration: 2,
               stream_seq: 12,
             },
           },
@@ -565,6 +571,8 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
               user_message_id: 'steer-message-1',
               intent: 'steer',
               disposition: 'applied',
+              applied_iteration: 2,
+              model_call_id: '2.0',
               stream_seq: 11,
             },
           },
@@ -574,6 +582,8 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
               session_key: 'agent:main:test',
               task_id: 'task-live',
               text: 'First answer',
+              model_call_id: '1.0',
+              iteration: 1,
               stream_seq: 10,
             },
           },
@@ -586,16 +596,16 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       )
       expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
         'steer-message-1',
-        '',
-        0,
+        '2.0',
+        2,
       )
       expect(vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder[0])
         .toBeLessThan(
           vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder[0]!,
         )
-      expect(vi.mocked(stream.appendDelta).mock.calls.map(call => call[0])).toEqual([
-        'First answer',
-        'Second answer',
+      expect(vi.mocked(stream.appendDelta).mock.calls).toEqual([
+        ['First answer', undefined, { modelCallId: '1.0', iteration: 1 }],
+        ['Second answer', undefined, { modelCallId: '2.0', iteration: 2 }],
       ])
     } finally {
       stop()

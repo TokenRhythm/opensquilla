@@ -205,6 +205,7 @@ from opensquilla.execution_status import (
     mark_execution_status_truncated,
     normalize_execution_status,
 )
+from opensquilla.git_runtime import git_run_mode_scope
 from opensquilla.memory.session_flush import SessionFlushService
 from opensquilla.observability.decision_log import (
     DecisionEntry,
@@ -285,6 +286,8 @@ from opensquilla.router_tiers import (
 from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.runtime_packs import runtime_pack_state_scope
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
+from opensquilla.sandbox.integration import sandbox_policy_scope
+from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
@@ -329,6 +332,7 @@ from opensquilla.session.terminal_reply import (
 from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 from opensquilla.token_estimation import estimate_tokens
 from opensquilla.tools.description_overrides import resolve_tool_description_overrides
+from opensquilla.tools.run_mode import effective_run_mode_for_context
 from opensquilla.tools.types import (
     CallerKind,
     InteractionMode,
@@ -4884,6 +4888,17 @@ class TurnRunner:
                 parent_task_id=getattr(effective_tool_context, "parent_task_id", None),
             )
 
+        def policy_scope():
+            policy = getattr(effective_tool_context, "sandbox_policy", None)
+            if isinstance(policy, StoredSandboxPolicy):
+                return sandbox_policy_scope(policy)
+            return contextlib.nullcontext()
+
+        def git_mode_scope():
+            return git_run_mode_scope(
+                effective_run_mode_for_context(effective_tool_context)
+            )
+
         logical_turn_id = (
             root_turn_id.strip()
             if isinstance(root_turn_id, str) and root_turn_id.strip()
@@ -4922,6 +4937,8 @@ class TurnRunner:
                 with (
                     managed_toolchain_state_scope(configured_state_dir),
                     runtime_pack_state_scope(configured_state_dir),
+                    policy_scope(),
+                    git_mode_scope(),
                     process_scope(),
                 ):
                     async for event in self._run_turn(
@@ -4976,6 +4993,8 @@ class TurnRunner:
                     with (
                         managed_toolchain_state_scope(configured_state_dir),
                         runtime_pack_state_scope(configured_state_dir),
+                        policy_scope(),
+                        git_mode_scope(),
                         process_scope(),
                     ):
                         async for event in self._run_turn(
@@ -7793,6 +7812,7 @@ class TurnRunner:
             gateway_config=getattr(self, "_config", None) is not None,
             channel_backing=detected.channel_backing,
             image_generation=detected.image_generation,
+            git_available=detected.git_available,
         )
         return resolve_runtime_tool_surface(ctx, capabilities=capabilities)
 

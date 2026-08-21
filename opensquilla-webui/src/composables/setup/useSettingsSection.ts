@@ -22,6 +22,10 @@ const SECTION_ALIASES: Record<string, SettingsSectionAlias> = {
   router: { section: 'modelStrategy' },
   ensemble: { section: 'modelStrategy' },
   chatModel: { section: 'provider' },
+  // Profile import used to be a child route below the Memory overview. Keep
+  // old bookmarks working while canonicalizing them to the first-level
+  // Memory & Export destination.
+  profileImport: { section: 'memory' },
 }
 
 export function settingsSectionAliasFor(value: unknown): SettingsSectionAlias | null {

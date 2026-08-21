@@ -301,6 +301,9 @@
                     && runtime.status.installedBytes !== null"
                 >
                   {{ formatBytes(runtime.status.installedBytes) }}
+                  <template v-if="runtime.status.operation?.source">
+                    · {{ runtimeSourceLabel(runtime.status.operation.source) }}
+                  </template>
                 </small>
                 <small v-else-if="runtime.status.operation?.source">
                   {{ runtimeSourceLabel(runtime.status.operation.source) }}
@@ -897,9 +900,9 @@ onMounted(() => void load())
   display: grid;
   gap: 1.25rem;
   grid-template-columns: minmax(0, 1fr);
-  max-width: 840px;
+  max-width: none;
   min-width: 0;
-  margin: 0 auto;
+  margin: 0;
   padding: 0.25rem 0 2rem;
   width: 100%;
 }

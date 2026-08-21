@@ -936,9 +936,9 @@ def test_tokenrhythm_inline_router_c0_c3_reconciles_each_physical_request() -> N
     assert preset is not None
     tiers = preset.tier_defaults()
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
     }
 

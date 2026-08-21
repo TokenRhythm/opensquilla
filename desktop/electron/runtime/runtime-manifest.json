@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "runtimeSet": "2026-07-30",
+  "runtimeSet": "2026-08-21",
   "assets": {
     "windows-x64": {
       "python": {
-        "id": "cpython-3.13.14-windows-x64",
-        "version": "3.13.14+20260728",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
-        "sha256": "a091ab914f2b7d2dbc52e9cf4a225190f72709fc79a64ec44bc61ca4d2908a64",
+        "id": "cpython-3.13.15-windows-x64",
+        "version": "3.13.15+20260814",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "07c977bbe4abad07e3bbc314608633e6c74eab482a7bae81f4361cda970b45e6",
         "archiveType": "tar.gz",
         "installDir": "python",
         "stripComponents": 1,
@@ -20,10 +20,10 @@
         }
       },
       "node": {
-        "id": "node-24.18.1-windows-x64",
-        "version": "24.18.1",
-        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-win-x64.zip",
-        "sha256": "ec56b84a7551893ab2324ebdfdc4ab974a63b4781162600b68a1293cc3e53765",
+        "id": "node-24.19.0-windows-x64",
+        "version": "24.19.0",
+        "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-win-x64.zip",
+        "sha256": "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73",
         "archiveType": "zip",
         "installDir": "node",
         "stripComponents": 1,
@@ -37,10 +37,10 @@
         }
       },
       "gitBash": {
-        "id": "git-for-windows-2.55.0.3-x64",
-        "version": "2.55.0.windows.3",
-        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/PortableGit-2.55.0.3-64-bit.7z.exe",
-        "sha256": "ab00566336b5472120f9a52d34f2e79c5406535792acb0548001ffd0bd090e5d",
+        "id": "git-for-windows-2.55.0.5-x64",
+        "version": "2.55.0.windows.5",
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/PortableGit-2.55.0.5-64-bit.7z.exe",
+        "sha256": "5aa8a20f6e9abb2c755f0e73c91c687701a46b309ad84a0ca6509380fa4ae290",
         "archiveType": "7z-sfx",
         "installDir": "git-bash",
         "stripComponents": 0,
@@ -57,10 +57,10 @@
     },
     "windows-arm64": {
       "python": {
-        "id": "cpython-3.13.14-windows-arm64",
-        "version": "3.13.14+20260728",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
-        "sha256": "e28e7108a4b36c0c321da8c842a7addf59358e26b5ec9abe002e9e940130f41f",
+        "id": "cpython-3.13.15-windows-arm64",
+        "version": "3.13.15+20260814",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "f6bf0fa39ad3668dc1996052ec6eff58c54aa126bf203cf3728a47a830af2b5d",
         "archiveType": "tar.gz",
         "installDir": "python",
         "stripComponents": 1,
@@ -70,10 +70,10 @@
         }
       },
       "node": {
-        "id": "node-24.18.1-windows-arm64",
-        "version": "24.18.1",
-        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-win-arm64.zip",
-        "sha256": "ffbc7d3e1baf6804f7431ff94f19b9a885a650568c93ea4ccb1bb0038f6af825",
+        "id": "node-24.19.0-windows-arm64",
+        "version": "24.19.0",
+        "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-win-arm64.zip",
+        "sha256": "8502f4a50b458d4cc38ed8f2001556c2cd239d464920f74017926ccb1e1c157f",
         "archiveType": "zip",
         "installDir": "node",
         "stripComponents": 1,
@@ -85,10 +85,10 @@
         }
       },
       "gitBash": {
-        "id": "git-for-windows-2.55.0.3-arm64",
-        "version": "2.55.0.windows.3",
-        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/PortableGit-2.55.0.3-arm64.7z.exe",
-        "sha256": "3bf26b94d9399b16a890776e468334f501742861576cbcdea2d9134643c374bd",
+        "id": "git-for-windows-2.55.0.5-arm64",
+        "version": "2.55.0.windows.5",
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/PortableGit-2.55.0.5-arm64.7z.exe",
+        "sha256": "49d1dd3158017fa9805d07268433dbab7021b2ec1c1cc3fbabaf8b8255764dd0",
         "archiveType": "7z-sfx",
         "installDir": "git-bash",
         "stripComponents": 0,
@@ -101,10 +101,10 @@
     },
     "linux-x64": {
       "python": {
-        "id": "cpython-3.13.14-linux-x64",
-        "version": "3.13.14+20260728",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "sha256": "6734c3e643c75e860c36ee3a7904e8e6bafbf3232d89b17ffd5fbfa72ab2816c",
+        "id": "cpython-3.13.15-linux-x64",
+        "version": "3.13.15+20260814",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "aaca2af2ab4d7b68a712660d1334c0cfd5ec13c0312ccd30c29122d8d0342320",
         "archiveType": "tar.gz",
         "installDir": "python",
         "stripComponents": 1,
@@ -114,10 +114,10 @@
         }
       },
       "node": {
-        "id": "node-24.18.1-linux-x64",
-        "version": "24.18.1",
-        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-linux-x64.tar.xz",
-        "sha256": "d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0",
+        "id": "node-24.19.0-linux-x64",
+        "version": "24.19.0",
+        "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-x64.tar.xz",
+        "sha256": "14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647",
         "archiveType": "tar.xz",
         "installDir": "node",
         "stripComponents": 1,
@@ -131,10 +131,10 @@
     },
     "linux-arm64": {
       "python": {
-        "id": "cpython-3.13.14-linux-arm64",
-        "version": "3.13.14+20260728",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "sha256": "1eaf979af6c6986553b91a9e3b03647f63ce52a888e00892d3bddc96f43748e9",
+        "id": "cpython-3.13.15-linux-arm64",
+        "version": "3.13.15+20260814",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "985efd78c1c6521b379f7c64c2a25e6a1130f07441d1af8be441aa05260886aa",
         "archiveType": "tar.gz",
         "installDir": "python",
         "stripComponents": 1,
@@ -144,10 +144,10 @@
         }
       },
       "node": {
-        "id": "node-24.18.1-linux-arm64",
-        "version": "24.18.1",
-        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-linux-arm64.tar.xz",
-        "sha256": "7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c",
+        "id": "node-24.19.0-linux-arm64",
+        "version": "24.19.0",
+        "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-arm64.tar.xz",
+        "sha256": "01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc",
         "archiveType": "tar.xz",
         "installDir": "node",
         "stripComponents": 1,
@@ -161,10 +161,10 @@
     },
     "darwin-x64": {
       "python": {
-        "id": "cpython-3.13.14-darwin-x64",
-        "version": "3.13.14+20260728",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-x86_64-apple-darwin-install_only_stripped.tar.gz",
-        "sha256": "aa73c37aebebe3b7264dce1e49923719ab0ac0fc590353adf393eee3e2041c18",
+        "id": "cpython-3.13.15-darwin-x64",
+        "version": "3.13.15+20260814",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "bf87354efcd9ae517da606fcda4e3a3f0d73a6f05ca7cba3c6d3c5270074bfc8",
         "archiveType": "tar.gz",
         "installDir": "python",
         "stripComponents": 1,
@@ -174,10 +174,10 @@
         }
       },
       "node": {
-        "id": "node-24.18.1-darwin-x64",
-        "version": "24.18.1",
-        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-darwin-x64.tar.xz",
-        "sha256": "f892c7895720f40d3750bde24f3554242d36f23602b5167b5b73ec4d13938aef",
+        "id": "node-24.19.0-darwin-x64",
+        "version": "24.19.0",
+        "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-x64.tar.xz",
+        "sha256": "d35e95230f46f6f0751df497c56622c6735e05d5e1fb1630996a005b9d328fe4",
         "archiveType": "tar.xz",
         "installDir": "node",
         "stripComponents": 1,
@@ -191,10 +191,10 @@
     },
     "darwin-arm64": {
       "python": {
-        "id": "cpython-3.13.14-darwin-arm64",
-        "version": "3.13.14+20260728",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-aarch64-apple-darwin-install_only_stripped.tar.gz",
-        "sha256": "aa2a054f5e04bde63ae199e3bb6bbb634e457423efd294842deeb1299e7e5932",
+        "id": "cpython-3.13.15-darwin-arm64",
+        "version": "3.13.15+20260814",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "6d472fc49a4d95e58214a992c4c92aa73fe2a935837a01a9a36bab0bec6d72f3",
         "archiveType": "tar.gz",
         "installDir": "python",
         "stripComponents": 1,
@@ -204,10 +204,10 @@
         }
       },
       "node": {
-        "id": "node-24.18.1-darwin-arm64",
-        "version": "24.18.1",
-        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-darwin-arm64.tar.xz",
-        "sha256": "1d60b703fe5d7e7072489be8187f430f1a095a658c31e5e1e281331a5873fac3",
+        "id": "node-24.19.0-darwin-arm64",
+        "version": "24.19.0",
+        "url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-arm64.tar.xz",
+        "sha256": "3f1cf157479c1480352083105e13faf9d008ede98e7e157746b6df940d197b94",
         "archiveType": "tar.xz",
         "installDir": "node",
         "stripComponents": 1,

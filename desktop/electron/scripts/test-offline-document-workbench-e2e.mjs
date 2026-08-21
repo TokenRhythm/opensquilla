@@ -1,20 +1,30 @@
-import { spawnSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { runCommandWithTelemetry } from './ci-case-telemetry.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const electronRoot = join(scriptDir, '..')
 const repoRoot = join(electronRoot, '..', '..')
 
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+async function run(caseName, command, args, options = {}) {
+  const result = await runCommandWithTelemetry({
+    caseName,
+    os: process.env.RUNNER_OS || process.platform,
+    shard: process.env.OPENSQUILLA_DESKTOP_E2E_SHARD
+      || process.env.CI_E2E_SHARD
+      || 'offline-document-workbench',
+    attempt: process.env.OPENSQUILLA_DESKTOP_E2E_ATTEMPT
+      || process.env.GITHUB_RUN_ATTEMPT
+      || '1',
+    outputPath: process.env.OPENSQUILLA_CI_CASE_TELEMETRY_PATH,
+    command,
+    args,
     cwd: options.cwd || repoRoot,
     env: options.env || process.env,
-    stdio: 'inherit',
   })
-  if (result.error) throw result.error
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.status}`)
+  if (result.exitCode !== 0) {
+    throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`)
   }
 }
 
@@ -33,7 +43,8 @@ function run(command, args, options = {}) {
 //      duplication.
 // Both fixtures are loopback-only and use synthetic bytes and model replies.
 const uv = process.platform === 'win32' ? 'uv.exe' : 'uv'
-run(
+await run(
+  'owned-gateway-html-workbench-lifecycle',
   uv,
   [
     'run',
@@ -43,7 +54,8 @@ run(
   ],
 )
 
-run(
+await run(
+  'native-workbench-v2-electron',
   process.execPath,
   [join(scriptDir, 'test-native-workbench-v2-electron.mjs')],
   {
@@ -55,7 +67,8 @@ run(
   },
 )
 
-run(
+await run(
+  'v1-html-agent-edit-electron',
   process.execPath,
   [join(scriptDir, 'test-v1-html-agent-edit-e2e.mjs')],
   {

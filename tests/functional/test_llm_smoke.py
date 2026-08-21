@@ -114,7 +114,7 @@ async def test_tokenrhythm_live_smoke_returns_expected_token() -> None:
 
     provider = OpenAIProvider(
         api_key=api_key,
-        model=os.environ.get("TOKENRHYTHM_MODEL", "deepseek-v4-flash"),
+        model=os.environ.get("TOKENRHYTHM_MODEL", "deepseek-v4-pro-0813"),
         base_url=os.environ.get("TOKENRHYTHM_BASE_URL", "https://tokenrhythm.studio/v1"),
         provider_kind="tokenrhythm",
     )

@@ -60,6 +60,54 @@ def _isolate_synthetic_archive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime_pack_manager, "_run_probe", probe)
 
 
+def test_default_sources_use_version_scoped_runtime_pack_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_RUNTIME_PACK_OSS_BASE", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_RUNTIME_PACK_GITHUB_BASE", raising=False)
+    bases = runtime_pack_manager._default_source_bases()
+    assert bases[RuntimeSource.OSS] == (
+        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/runtime-packs"
+    )
+    assert bases[RuntimeSource.GITHUB] == (
+        "https://github.com/opensquilla/runtime-packs/releases/download"
+    )
+
+
+@pytest.mark.parametrize(
+    ("locale_name", "expected"),
+    [
+        ("zh_CN", (RuntimeSource.OSS, RuntimeSource.GITHUB)),
+        ("en_US", (RuntimeSource.GITHUB, RuntimeSource.OSS)),
+    ],
+)
+def test_default_source_order_prefers_the_regional_primary_and_keeps_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    locale_name: str,
+    expected: tuple[RuntimeSource, RuntimeSource],
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_RUNTIME_PACK_SOURCE_ORDER", raising=False)
+    for name in ("LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(runtime_pack_manager.locale, "getlocale", lambda: (locale_name, "UTF-8"))
+
+    assert runtime_pack_manager._configured_source_order() == expected
+
+
+def test_windows_runtime_environment_preserves_approved_path_text(tmp_path: Path) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    resolver = RuntimePackResolver(service)
+    resolver.target = "windows-x64"
+
+    environment = resolver.apply_environment(
+        {"PATH": "./approved-path"},
+        mode=RunMode.SAFE,
+    )
+
+    assert environment["PATH"] == "./approved-path"
+
+
 def test_atomic_state_replace_retries_transient_windows_reader_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -168,6 +216,18 @@ class _AssetMemoryOpener:
         assert timeout == 60
         asset = request.full_url.rsplit("/", 1)[-1]
         body = self.bodies[asset]
+        return _Response(body, status=200, start=0, total=len(body))
+
+
+class _PerSourceMemoryOpener:
+    def __init__(self, *, oss: bytes, github: bytes) -> None:
+        self.bodies = {"oss.example.invalid": oss, "github.example.invalid": github}
+        self.urls: list[str] = []
+
+    def __call__(self, request: Any, *, timeout: int) -> _Response:
+        assert timeout == 60
+        self.urls.append(request.full_url)
+        body = next(body for hostname, body in self.bodies.items() if hostname in request.full_url)
         return _Response(body, status=200, start=0, total=len(body))
 
 
@@ -383,6 +443,71 @@ def test_python_probe_runs_declared_executable_with_runtime_only_path(
 
     probe_output = b"Python 3.12.10\n"
     with pytest.raises(runtime_pack_manager.RuntimePackError, match="python probe failed"):
+        _REAL_RUNTIME_PROBE(descriptor, layout, package)
+
+
+def test_node_probe_requires_node_npm_and_npx_with_runtime_only_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "probe-package"
+    bin_dir = package / "payload" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("node", "npm", "npx"):
+        (bin_dir / name).write_bytes(b"synthetic executable placeholder")
+    descriptor = RuntimePackDescriptor(
+        component_id="node",
+        target="linux-x64",
+        asset="OpenSquilla-Runtime-node-test-linux-x64.tar.xz",
+        archive_type="tar.xz",
+        version="24.19.0",
+        size_bytes=1,
+        unpacked_size_bytes=1,
+        sha256="a" * 64,
+        trusted_archive_sha256=(),
+    )
+    layout = runtime_pack_manager.PackLayout(
+        component_id="node",
+        target="linux-x64",
+        version="24.19.0",
+        bin_dirs=("bin",),
+        executables={"node": "bin/node", "npm": "bin/npm", "npx": "bin/npx"},
+    )
+    observed: list[tuple[str, str]] = []
+    failing_name: str | None = None
+
+    def run_probe(
+        command: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        timeout: int,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        del check, capture_output, timeout
+        name = Path(command[0]).name
+        path_key = next(key for key in env if key.casefold() == "path")
+        observed.append((name, env[path_key]))
+        output = b"v24.19.0\n" if name == "node" else b"11.5.1\n"
+        return subprocess.CompletedProcess(
+            command,
+            returncode=1 if name == failing_name else 0,
+            stdout=output,
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(runtime_pack_manager.subprocess, "run", run_probe)
+
+    _REAL_RUNTIME_PROBE(descriptor, layout, package)
+
+    assert observed == [
+        ("node", str(bin_dir)),
+        ("npm", str(bin_dir)),
+        ("npx", str(bin_dir)),
+    ]
+
+    failing_name = "npm"
+    with pytest.raises(runtime_pack_manager.RuntimePackError, match="npm probe failed"):
         _REAL_RUNTIME_PROBE(descriptor, layout, package)
 
 
@@ -604,6 +729,39 @@ def test_corrupt_archive_never_activates(tmp_path: Path) -> None:
     assert completed.error is not None
     assert completed.error.code == "VERIFICATION_FAILED"
     assert service.active_runtime("python") is None
+
+
+@pytest.mark.parametrize(
+    ("source_order", "corrupt_source", "expected_hosts"),
+    [
+        ("oss,github", "oss", ["oss.example.invalid", "github.example.invalid"]),
+        ("github,oss", "github", ["github.example.invalid", "oss.example.invalid"]),
+    ],
+)
+def test_corrupt_primary_bytes_fail_closed_and_fall_back_to_alternate_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_order: str,
+    corrupt_source: str,
+    expected_hosts: list[str],
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_RUNTIME_PACK_SOURCE_ORDER", source_order)
+    body = _runtime_archive(tmp_path)
+    corrupt = body[:-1] + bytes([body[-1] ^ 1])
+    bodies = {"oss": body, "github": body}
+    bodies[corrupt_source] = corrupt
+    opener = _PerSourceMemoryOpener(oss=bodies["oss"], github=bodies["github"])
+    service = _service(tmp_path, body, opener)
+
+    operation = service.start_install("python")
+    completed = service.wait_for_operation(operation.operation_id, timeout=10)
+
+    assert completed is not None
+    assert completed.state is RuntimeOperationState.COMPLETED
+    assert [next(host for host in expected_hosts if host in url) for url in opener.urls] == (
+        expected_hosts
+    )
+    assert service.active_runtime("python") is not None
 
 
 def test_missing_pack_strict_mode_never_inherits_host_path(tmp_path: Path) -> None:

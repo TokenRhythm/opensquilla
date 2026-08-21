@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from opensquilla.engine.final_diff_contract import classify_final_diff_path
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.tools.types import ToolContext
 
 
@@ -19,7 +19,11 @@ def build_runtime_state_capsule(
 ) -> dict[str, Any]:
     """Build a compact, factual capsule of current workspace state."""
 
-    diff_paths = _git_dirty_paths(Path(workspace).expanduser().resolve()) if workspace else []
+    if workspace:
+        git_state, diff_paths = _git_dirty_paths(Path(workspace).expanduser().resolve())
+    else:
+        git_state, diff_paths = GitRunState.NOT_REPOSITORY, []
+    diff_observed = git_state is GitRunState.OK
     source_paths = _paths_by_kind(diff_paths, "source")
     scratch_paths = _paths_by_kind(diff_paths, "scratch")
     test_like_paths = _paths_by_kind(diff_paths, "test-like")
@@ -32,6 +36,11 @@ def build_runtime_state_capsule(
         "schema": "runtime_state_capsule_v1",
         "workspace": {
             "epoch": workspace_epoch,
+            "git_state": git_state.value,
+            "diff_observed": diff_observed,
+            # Keep the v1 bool/list shapes for older capsule consumers. The
+            # additive observed/state fields distinguish these fallback values
+            # from an authoritative clean workspace.
             "diff": bool(diff_paths),
             "diff_paths": diff_paths,
             "source_diff": bool(source_paths),
@@ -48,7 +57,11 @@ def build_runtime_state_capsule(
         "last_mutation": last_mutation,
         "finalization": {
             "source_diff_present": bool(source_paths),
-            "blocking_facts": _blocking_facts(source_paths, scratch_paths, changed_receipts),
+            "blocking_facts": (
+                _blocking_facts(source_paths, scratch_paths, changed_receipts)
+                if diff_observed
+                else []
+            ),
         },
     }
 
@@ -133,20 +146,18 @@ def _paths_by_kind(paths: Sequence[str], kind: str) -> list[str]:
     return [path for path in paths if classify_final_diff_path(path) == kind]
 
 
-def _git_dirty_paths(root: Path) -> list[str]:
-    try:
-        completed = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            cwd=root,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        return []
-    if completed.returncode != 0:
-        return []
-    return _parse_git_status_z(completed.stdout.decode("utf-8", errors="replace"))
+def _git_dirty_paths(root: Path) -> tuple[GitRunState, list[str]]:
+    completed = run_git(
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        cwd=root,
+        timeout=2.0,
+    )
+    if not completed.ok:
+        return completed.state, []
+    return (
+        GitRunState.OK,
+        _parse_git_status_z(completed.stdout.decode("utf-8", errors="replace")),
+    )
 
 
 def _parse_git_status_z(output: str) -> list[str]:

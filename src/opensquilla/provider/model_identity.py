@@ -7,6 +7,7 @@ DEEPSEEK_V4_MODEL_IDS = frozenset(
         "deepseek-v4-flash",
         "deepseek-v4-flash-0731",
         "deepseek-v4-pro",
+        "deepseek-v4-pro-0813",
     }
 )
 

@@ -2238,14 +2238,14 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
     if (providerEnvMissing.value) return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
     return detailStepStatus((status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider)
   }
-  // General/Security/Memory are always-valid preference toggles, not
+  // General/Security/Advanced are always-valid preference toggles, not
   // readiness milestones — a neutral dot (rather than a green "Live" that
   // overstates earned readiness) is honest; the dirty pip already signals
   // unsaved edits.
   if (
     sectionId === 'general'
     || sectionId === 'securityPrivacy'
-    || sectionId === 'memory'
+    || sectionId === 'advanced'
     || sectionId === 'ensemble'
   ) {
     return { label: t('setup.status.appliesOnSave'), tone: 'is-muted' }
@@ -2332,7 +2332,7 @@ function sectionDirty(sectionId: string): boolean {
   if (sectionId === 'provider') return false
   if (sectionId === 'general') return behaviorDirty.value
   if (sectionId === 'securityPrivacy') return securityPrivacyDirty.value
-  if (sectionId === 'memory') return memorySettingsDirty.value
+  if (sectionId === 'advanced') return memorySettingsDirty.value
   if (sectionId === 'modelStrategy') return modelStrategyDirty.value
   if (sectionId === 'capabilities') return capabilitiesDirty.value
   return false
@@ -3724,7 +3724,7 @@ async function saveMemoryAutoCapture(options: SaveOptions = {}): Promise<boolean
     } else {
       await loadData()
     }
-    pushToast(restart ? t('setup.toast.memorySavedRestart') : t('setup.toast.memorySaved'))
+    pushToast(restart ? t('setup.toast.captureSavedRestart') : t('setup.toast.captureSaved'))
     return true
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })

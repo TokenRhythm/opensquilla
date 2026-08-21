@@ -3006,7 +3006,23 @@ async def build_services(
             ensure_sandbox_upgrade_migrated,
         )
 
-        upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        sandbox_upgrade_started_at = time.monotonic()
+        log.info("build_services.sandbox_upgrade_started")
+        try:
+            upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        except Exception as exc:
+            log.exception(
+                "build_services.sandbox_upgrade_failed",
+                duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log.info(
+            "build_services.sandbox_upgrade_finished",
+            ok=upgrade_report.ok,
+            status=upgrade_report.status,
+            duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
+        )
         if not upgrade_report.ok:
             raise RuntimeError(
                 "migration_failed_manual_recovery_required: "

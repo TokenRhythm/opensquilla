@@ -119,6 +119,18 @@ def test_versioned_deepseek_id_prefix_matches_static_entry(
     assert price.input_per_m == pytest.approx(0.435)
 
 
+def test_tokenrhythm_v4_pro_0813_static_price_precedes_generic_pro_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price("deepseek-v4-pro-0813")
+
+    assert price.input_per_m == pytest.approx(1.2903225806451613)
+    assert price.output_per_m == pytest.approx(3.870967741935484)
+    assert price.cache_read_per_m == pytest.approx(0.043010752688172046)
+
+
 def test_price_entry_cache_fields_default_none() -> None:
     entry = PriceEntry(3.0, 15.0)
     assert entry.cache_read_per_m is None

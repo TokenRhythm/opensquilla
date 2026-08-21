@@ -410,7 +410,7 @@ class LlmProviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_LLM_")
 
     provider: str = "tokenrhythm"
-    model: str = "deepseek-v4-flash-0731"
+    model: str = "deepseek-v4-pro-0813"
     api_key: str = ""
     api_key_env: str = ""
     base_url: str = "https://tokenrhythm.studio/v1"

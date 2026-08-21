@@ -912,6 +912,125 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps identified old-call tokens above the steer after applied evidence arrives', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+
+    api.appendDelta('迟到旧段', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.appendDelta('Second section.', 'answer', { modelCallId: '2.0', iteration: 2 })
+    const prefix = '第一段迟到旧段'
+    const finalText = `${prefix}Second section.`
+    api.reconcileFinalText(finalText, [{
+      model_call_id: '2.0',
+      iteration: 2,
+      start_codepoint: Array.from(prefix).length,
+      end_codepoint: Array.from(finalText).length,
+    }])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', prefix],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('routes late deltas across multiple steers and a same-iteration model retry', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('A', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'first adjustment',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+
+    api.appendDelta('B', 'answer', { modelCallId: '2.1', iteration: 2 })
+    api.checkpointForUserMessage('turn-steered', 'steer-2')
+    messages.value.push({
+      role: 'user',
+      text: 'second adjustment',
+      ts: 3,
+      clientId: 'steer-2',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-2', '3.0', 3)
+
+    api.appendDelta('a', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.appendDelta('b', 'answer', { modelCallId: '2.1', iteration: 2 })
+    api.appendDelta('C', 'answer', { modelCallId: '3.0', iteration: 3 })
+    api.reconcileFinalText('AaBbC', [
+      {
+        model_call_id: '2.0',
+        iteration: 2,
+        start_codepoint: 2,
+        end_codepoint: 4,
+      },
+      {
+        model_call_id: '3.0',
+        iteration: 3,
+        start_codepoint: 4,
+        end_codepoint: 5,
+      },
+    ])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'Aa'],
+      ['user', 'first adjustment'],
+      ['assistant', 'Bb'],
+      ['user', 'second adjustment'],
+      ['assistant', 'C'],
+    ])
+    api.cleanup()
+  })
+
+  it('treats client and durable message ids as aliases for one steer boundary', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('before', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'client-steer')
+    messages.value.push({
+      role: 'user',
+      text: 'adjust',
+      ts: 2,
+      clientId: 'client-steer',
+      messageId: 'durable-steer',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+
+    api.checkpointForUserMessage('turn-steered', 'durable-steer')
+    api.acknowledgeSteerBoundary('durable-steer', '2.0', 2)
+    api.appendDelta('after', 'answer', { modelCallId: '2.0', iteration: 2 })
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'before'],
+      ['user', 'adjust'],
+      ['assistant', 'after'],
+    ])
+    api.cleanup()
+  })
+
   it('closes an applied steer boundary when an old gateway omits model-call identity', () => {
     const { api, messages } = makeStream()
 

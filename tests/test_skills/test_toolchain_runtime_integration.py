@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.git_runtime import GitCapability, GitCapabilityState
 from opensquilla.skills import eligibility, runtime_env
 from opensquilla.skills.hub import deps
 from opensquilla.skills.meta.executors import skill_exec
@@ -341,6 +342,85 @@ async def test_skill_exec_receives_managed_runtime_environment(
         })
     assert spawned["argv"] == (sys.executable,)
     assert spawned["kwargs"]["env"] == expected_env
+
+
+@pytest.mark.asyncio
+async def test_skill_exec_pins_resolved_git_ahead_of_apple_shim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = SimpleNamespace(
+        base_dir=str(tmp_path),
+        entrypoint={"command": "python", "parse": "text"},
+        metadata=SimpleNamespace(requires=SimpleNamespace(bins=["git"])),
+    )
+    loader = SimpleNamespace(get_by_name=lambda _name: spec)
+    safe_git = Path("/opt/homebrew/bin/git")
+    monkeypatch.setattr(
+        skill_exec,
+        "resolve_git_capability",
+        lambda: GitCapability(
+            state=GitCapabilityState.AVAILABLE,
+            executable=safe_git,
+            source="host",
+        ),
+    )
+    monkeypatch.setattr(
+        skill_exec,
+        "managed_skill_env",
+        lambda _base: {"PATH": f"/usr/bin{os.pathsep}{safe_git.parent}"},
+    )
+    spawned = _mock_skill_exec_launcher(monkeypatch)
+
+    output = await skill_exec.run_skill_exec_step(
+        MetaStep(id="run", skill="fake", kind="skill_exec"),
+        "fake",
+        {},
+        {},
+        skill_loader=loader,
+        workspace_dir=str(tmp_path),
+    )
+
+    assert output == "ok"
+    assert spawned["kwargs"]["env"]["PATH"] == (
+        f"{safe_git.parent}{os.pathsep}/usr/bin"
+    )
+
+
+@pytest.mark.asyncio
+async def test_git_skill_exec_fails_before_spawn_when_git_becomes_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = SimpleNamespace(
+        base_dir=str(tmp_path),
+        entrypoint={"command": "python", "parse": "text"},
+        metadata=SimpleNamespace(requires=SimpleNamespace(bins=["git"])),
+    )
+    loader = SimpleNamespace(get_by_name=lambda _name: spec)
+    monkeypatch.setattr(
+        skill_exec,
+        "resolve_git_capability",
+        lambda: GitCapability(
+            state=GitCapabilityState.UNAVAILABLE,
+            reason="git_not_found",
+        ),
+    )
+    monkeypatch.setattr(
+        skill_exec,
+        "create_owned_subprocess_exec",
+        lambda *_args, **_kwargs: pytest.fail("unavailable Git must not spawn a skill"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^GIT_UNAVAILABLE:"):
+        await skill_exec.run_skill_exec_step(
+            MetaStep(id="run", skill="fake", kind="skill_exec"),
+            "fake",
+            {},
+            {},
+            skill_loader=loader,
+            workspace_dir=str(tmp_path),
+        )
 
 
 @pytest.mark.parametrize("font_override", ["/operator/fonts", ""])

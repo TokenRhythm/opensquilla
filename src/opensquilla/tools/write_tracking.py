@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import re
-import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from opensquilla.git_runtime import GitRunState, probe_git_repository, run_git
 from opensquilla.tools import write_policy
 from opensquilla.tools.types import RetryableToolInputError, current_tool_context
 
@@ -70,6 +72,38 @@ _SCRATCH_ONLY_NUDGE_COUNTS = frozenset({3, 6, 10})
 _WORKSPACE_WRITE_PROGRESS_COUNTS = frozenset({1, 3, 6, 10})
 
 
+class WorkspaceMutationSnapshot(dict[str, str]):
+    """Git-backed workspace status plus whether that status is authoritative.
+
+    This remains a ``dict`` subclass so existing embedded callers and tests that
+    compare snapshots with dictionaries keep working.  ``git_state`` prevents
+    an unavailable Git runtime or a non-repository workspace from being
+    mistaken for an authoritatively clean workspace.
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, str] | None = None,
+        *,
+        git_state: GitRunState = GitRunState.OK,
+        observed: bool = True,
+        skip_reason: str | None = None,
+    ) -> None:
+        super().__init__(entries or {})
+        self.git_state = git_state
+        self.observed = observed
+        self.skip_reason = skip_reason
+
+    @property
+    def authoritative(self) -> bool:
+        return self.observed and self.git_state is GitRunState.OK
+
+
+def _snapshot_git_state(snapshot: dict[str, str]) -> GitRunState:
+    state = getattr(snapshot, "git_state", GitRunState.OK)
+    return state if isinstance(state, GitRunState) else GitRunState.FAILED
+
+
 def _normalize_relative_path(path: str) -> str:
     normalized = path.replace("\\", "/")
     while normalized.startswith("./"):
@@ -107,33 +141,42 @@ def mutation_ledger_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
-def snapshot_current_workspace_mutations() -> dict[str, str]:
+def snapshot_current_workspace_mutations() -> WorkspaceMutationSnapshot:
     ctx = current_tool_context.get()
     if ctx is None or not ctx.workspace_dir:
-        return {}
+        return WorkspaceMutationSnapshot(
+            git_state=GitRunState.NOT_REPOSITORY,
+            observed=False,
+            skip_reason="missing_workspace",
+        )
+    from opensquilla.tools.run_mode import full_host_access_active
+
+    effect_observation_needed = bool(
+        not full_host_access_active()
+        and write_policy.workspace_write_deny_effect_mode() in {"warn", "revert"}
+        and getattr(ctx, "workspace_write_deny_globs", None)
+    )
+    if ctx.on_runtime_event is None and not effect_observation_needed:
+        return WorkspaceMutationSnapshot(
+            git_state=GitRunState.FAILED,
+            observed=False,
+            skip_reason="no_consumer",
+        )
     return snapshot_workspace_mutations(Path(ctx.workspace_dir).expanduser().resolve())
 
 
-def snapshot_workspace_mutations(workspace: Path) -> dict[str, str]:
-    try:
-        completed = subprocess.run(
-            [
-                "git",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-            ],
-            cwd=workspace,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        return {}
-    if completed.returncode != 0:
-        return {}
-    return _parse_git_status_z(completed.stdout.decode("utf-8", errors="replace"))
+def snapshot_workspace_mutations(workspace: Path) -> WorkspaceMutationSnapshot:
+    result = run_git(
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        cwd=workspace,
+        timeout=2.0,
+    )
+    if not result.ok:
+        return WorkspaceMutationSnapshot(git_state=result.state)
+    return WorkspaceMutationSnapshot(
+        _parse_git_status_z(result.stdout.decode("utf-8", errors="replace")),
+        git_state=GitRunState.OK,
+    )
 
 
 def record_observed_workspace_mutations(
@@ -182,6 +225,10 @@ def diff_workspace_mutations(
     before: dict[str, str],
     after: dict[str, str],
 ) -> list[dict[str, str]]:
+    if _snapshot_git_state(before) is not GitRunState.OK:
+        return []
+    if _snapshot_git_state(after) is not GitRunState.OK:
+        return []
     paths: list[dict[str, str]] = []
     for relative_path in sorted(set(before) | set(after)):
         before_status = before.get(relative_path)
@@ -196,6 +243,43 @@ def diff_workspace_mutations(
             }
         )
     return paths
+
+
+def workspace_write_deny_effect_preflight(
+    *,
+    tool_name: str,
+    before: WorkspaceMutationSnapshot,
+) -> str | None:
+    """Fail closed before a revert-mode command when Git protection is unavailable."""
+
+    if write_policy.workspace_write_deny_effect_mode() != "revert":
+        return None
+    ctx = current_tool_context.get()
+    if (
+        ctx is None
+        or not ctx.workspace_dir
+        or not getattr(ctx, "workspace_write_deny_globs", None)
+    ):
+        return None
+    state = _snapshot_git_state(before)
+    if state is GitRunState.OK:
+        return None
+    return json.dumps(
+        {
+            "status": "blocked",
+            "code": "WORKSPACE_WRITE_PROTECTION_UNAVAILABLE",
+            "reason": "workspace_write_protection_unavailable",
+            "tool": tool_name,
+            "tool_name": tool_name,
+            "git_state": state.value,
+            "retryable": False,
+            "message": (
+                "OpenSquilla cannot safely run this command because Git-backed "
+                "workspace write protection is unavailable."
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 def enforce_workspace_write_deny_effects(
@@ -225,6 +309,15 @@ def enforce_workspace_write_deny_effects(
         return output
     workspace = Path(ctx.workspace_dir).expanduser().resolve()
     after = snapshot_workspace_mutations(workspace)
+    before_state = _snapshot_git_state(before)
+    after_state = _snapshot_git_state(after)
+    if before_state is not GitRunState.OK or after_state is not GitRunState.OK:
+        return _workspace_write_protection_unavailable_warning(
+            tool_name=tool_name,
+            mode=mode,
+            state=(before_state if before_state is not GitRunState.OK else after_state),
+            output=output,
+        )
     tracked_only = write_policy.workspace_write_deny_tracked_only()
     violations: list[dict[str, str]] = []
     for entry in diff_workspace_mutations(before, after):
@@ -299,6 +392,66 @@ def enforce_workspace_write_deny_effects(
     return f"{message}\n\n{output}"
 
 
+def _workspace_write_protection_unavailable_warning(
+    *,
+    tool_name: str,
+    mode: str,
+    state: GitRunState,
+    output: str,
+) -> str:
+    """Inject at most one protection warning per logical turn."""
+
+    ctx = current_tool_context.get()
+    if ctx is None:
+        return output
+    turn_key = (
+        getattr(ctx, "execution_id", None)
+        or getattr(ctx, "task_id", None)
+        or f"session-epoch:{getattr(ctx, 'session_epoch', None)}"
+    )
+    already_warned = any(
+        record.get("operation") == "effect_enforcement_unavailable"
+        and record.get("turn_key") == turn_key
+        for record in getattr(ctx, "workspace_mutation_records", [])
+        if isinstance(record, dict)
+    )
+    if already_warned:
+        return output
+    record: dict[str, Any] = {
+        "tool": tool_name,
+        "tool_name": tool_name,
+        "operation": "effect_enforcement_unavailable",
+        "mode": mode,
+        "git_state": state.value,
+        "turn_key": turn_key,
+    }
+    ctx.workspace_mutation_records.append(record)
+    callback = getattr(ctx, "on_runtime_event", None)
+    if callback is not None:
+        # Runtime telemetry is best-effort and must not alter the tool result.
+        with contextlib.suppress(Exception):
+            callback(
+                {
+                    "feature": "workspace_write_deny",
+                    "name": "effect_enforcement_unavailable",
+                    **record,
+                    "agent_id": getattr(ctx, "agent_id", None),
+                    "session_key": getattr(ctx, "session_key", None),
+                    "injected_to_model": True,
+                }
+            )
+    message = (
+        "[workspace write protection unavailable] OpenSquilla could not verify "
+        f"write-protected workspace paths after {tool_name} because Git state is "
+        f"{state.value}."
+    )
+    if mode == "revert":
+        message += " Automatic restoration could not be guaranteed."
+    else:
+        message += " Review the command's workspace changes before finishing."
+    return f"{message}\n\n{output}"
+
+
 def _effect_enforcement_message(
     *,
     tool_name: str,
@@ -340,16 +493,12 @@ def _workspace_path_present_at_head(workspace: Path, relative_path: str) -> bool
     agent created.
     """
 
-    try:
-        completed = subprocess.run(
-            ["git", "ls-tree", "--name-only", "HEAD", "--", relative_path],
-            cwd=workspace,
-            capture_output=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0 and bool(completed.stdout.strip())
+    result = run_git(
+        ("ls-tree", "--name-only", "HEAD", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
+    )
+    return result.ok and bool(result.stdout.strip())
 
 
 def _revert_workspace_path(workspace: Path, relative_path: str, status: str) -> bool:
@@ -360,37 +509,27 @@ def _revert_workspace_path(workspace: Path, relative_path: str, status: str) -> 
             return True
         except OSError:
             return False
-    try:
-        completed = subprocess.run(
-            ["git", "checkout", "HEAD", "--", relative_path],
-            cwd=workspace,
-            capture_output=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if completed.returncode == 0:
+    completed = run_git(
+        ("checkout", "HEAD", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
+    )
+    if completed.ok:
         return True
     # Staged-new paths (e.g. added via `git add`) have no HEAD version to
     # restore; unstage and remove instead. Restricted to paths absent from
     # HEAD so a failed checkout of a HEAD-tracked file is never destructive.
-    try:
-        ls_tree = subprocess.run(
-            ["git", "ls-tree", "--name-only", "HEAD", "--", relative_path],
-            cwd=workspace,
-            capture_output=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if ls_tree.returncode != 0 or ls_tree.stdout.strip():
-        return False
-    subprocess.run(
-        ["git", "rm", "--cached", "-f", "--", relative_path],
+    ls_tree = run_git(
+        ("ls-tree", "--name-only", "HEAD", "--", relative_path),
         cwd=workspace,
-        capture_output=True,
-        timeout=10,
-        check=False,
+        timeout=10.0,
+    )
+    if not ls_tree.ok or ls_tree.stdout.strip():
+        return False
+    run_git(
+        ("rm", "--cached", "-f", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
     )
     try:
         target.unlink(missing_ok=True)
@@ -659,6 +798,26 @@ def workspace_write_progress_note() -> str:
     workspace_writes = len(getattr(ctx, "workspace_file_writes", []) or [])
     if workspace_writes not in _WORKSPACE_WRITE_PROGRESS_COUNTS and workspace_writes % 10 != 0:
         return ""
+    allowed_tools = getattr(ctx, "allowed_tools", None)
+    git_diff_visible = (
+        "git_diff" not in getattr(ctx, "denied_tools", set())
+        and (allowed_tools is None or "git_diff" in allowed_tools)
+    )
+    workspace_dir = getattr(ctx, "workspace_dir", None)
+    git_repository_available = bool(
+        git_diff_visible
+        and workspace_dir
+        and probe_git_repository(
+            workspace_dir,
+            run_mode=getattr(ctx, "run_mode", None),
+        )
+        is GitRunState.OK
+    )
+    if not git_repository_available:
+        return (
+            " Note: workspace changes are now present. Before final, run focused "
+            "verification for the changed behavior."
+        )
     return (
         " Note: workspace changes are now present. Before final, inspect git_diff "
         "and run focused verification for the changed behavior."

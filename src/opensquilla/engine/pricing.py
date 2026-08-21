@@ -449,6 +449,14 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("gemini-3.1-pro-preview", PriceEntry(2.0, 12.0, cache_read_per_m=0.20)),
     ("claude-haiku-4-5", PriceEntry(1.0, 5.0, cache_read_per_m=0.1, cache_write_per_m=1.25)),
     ("deepseek-v4-flash", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
+    (
+        "deepseek-v4-pro-0813",
+        PriceEntry(
+            1.2903225806451613,
+            3.870967741935484,
+            cache_read_per_m=0.043010752688172046,
+        ),
+    ),
     ("deepseek-v4-pro", PriceEntry(0.435, 0.87, cache_read_per_m=0.003625)),
     ("deepseek-chat", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
     ("deepseek-reasoner", PriceEntry(0.26, 0.38)),

@@ -1399,6 +1399,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
+    assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
     assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
     assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
@@ -1416,14 +1417,32 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "DESKTOP_ENSEMBLE_PROFILES[selectionMode]" in main_ts
 
     expected_models = (
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
         "kimi-k2.7-code",
         "glm-5.2",
         "kimi-k2.6",
     )
     for model in expected_models:
         assert model in tokenrhythm_profile
+    assert "ensembleEnabled: true" in tokenrhythm_profile
+    assert "thinkingLevel" not in tokenrhythm_profile
+    assert "ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}" in main_ts
+
+
+def test_desktop_legacy_inline_router_does_not_inherit_new_c3_ensemble() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    normalizer = _read("desktop/electron/src/router-tier-normalization.ts")
+    package_json = json.loads(_read("desktop/electron/package.json"))
+
+    assert "normalizeRouterTiers" in main_ts
+    assert "for (const tier of Object.values(out)) delete tier.ensembleEnabled" in normalizer
+    assert "hasOwnProperty.call(tier, 'ensembleEnabled')" in normalizer
+    assert "hasOwnProperty.call(tier, 'ensemble_enabled')" in normalizer
+    assert "normalizeBooleanSetting(ensembleEnabled, false)" in normalizer
+    assert package_json["scripts"]["test:router-tier-normalization"] == (
+        "npm run build && node scripts/test-router-tier-normalization.mjs"
+    )
 
 
 def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer() -> None:
@@ -2413,7 +2432,7 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "requires an unlocked foreground GUI session" in native
     assert ci.count(
         "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
-    ) == 2
+    ) == 3
 
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
@@ -3381,6 +3400,15 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     )
     save_index = reconcile.index("await saveImportedDesktopCredential(")
     assert save_index < reconcile.index("await clearPendingMigrationProviderSetup()", save_index)
+
+    pending_reconciliation = _section(
+        main_ts,
+        "async function recoverPendingMigrationReconciliation",
+        "function desktopStartupLog",
+    )
+    assert pending_reconciliation.index(
+        "beginDesktopWriterOperation('recover imported provider settings')"
+    ) < pending_reconciliation.index("readPendingMigrationProviderSetup()")
 
     encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
     assert "desktopSecretStoragePolicyBackend()" in encryption

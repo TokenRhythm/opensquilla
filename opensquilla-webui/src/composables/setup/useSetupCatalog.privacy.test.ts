@@ -73,7 +73,7 @@ afterEach(() => {
 })
 
 describe('useSetupCatalog privacy settings', () => {
-  it('tracks and saves automatic memory capture from the Memory section', async () => {
+  it('tracks and saves automatic memory capture from the Advanced section', async () => {
     mockConfigSequence([
       {
         privacy: { disable_network_observability: false },
@@ -88,7 +88,8 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setMemoryAutoCapture(false)
 
-    expect(api.sectionDirty('memory')).toBe(true)
+    expect(api.sectionDirty('advanced')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(false)
     expect(api.sectionDirty('capabilities')).toBe(false)
     await api.saveDirtySections()
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
@@ -96,7 +97,7 @@ describe('useSetupCatalog privacy settings', () => {
         'memory.auto_capture_enabled': false,
       },
     })
-    expect(api.sectionDirty('memory')).toBe(false)
+    expect(api.sectionDirty('advanced')).toBe(false)
     app.unmount()
   })
 
@@ -3462,7 +3463,7 @@ describe('useSetupCatalog configured provider management', () => {
     api.updateCapabilityField('audio', 'ttsVoice', 'draft-voice')
     expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('securityPrivacy')).toBe(true)
-    expect(api.sectionDirty('memory')).toBe(true)
+    expect(api.sectionDirty('advanced')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
 
     await api.requestSelectConfiguredProvider('deepseek')
@@ -3480,7 +3481,7 @@ describe('useSetupCatalog configured provider management', () => {
     })
     expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('securityPrivacy')).toBe(true)
-    expect(api.sectionDirty('memory')).toBe(true)
+    expect(api.sectionDirty('advanced')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     expect(api.providerDraftDirty.value).toBe(false)
     expect(api.providerPanel.value.providerSelected).toBe('deepseek')
@@ -4088,7 +4089,7 @@ describe('useSetupCatalog configured provider management', () => {
     })
     expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('securityPrivacy')).toBe(true)
-    expect(api.sectionDirty('memory')).toBe(true)
+    expect(api.sectionDirty('advanced')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     app.unmount()
   })

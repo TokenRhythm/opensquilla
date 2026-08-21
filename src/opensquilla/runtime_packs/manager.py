@@ -1901,6 +1901,7 @@ class RuntimePackService:
                     archive_type=descriptor.archive_type,
                     compressed_size=descriptor.size_bytes,
                     max_extracted_bytes=descriptor.unpacked_size_bytes,
+                    case_sensitive_paths=descriptor.target.startswith("linux-"),
                 )
             except UnsafeArchiveError:
                 partial.unlink(missing_ok=True)

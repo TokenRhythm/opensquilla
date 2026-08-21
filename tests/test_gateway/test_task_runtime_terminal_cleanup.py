@@ -2723,6 +2723,7 @@ async def test_exception_path_clears_dicts() -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.ci_serial
 async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     """10 000 tasks, each <=50 ms; dict sizes after GC must be within ±2 of baseline."""
     num_tasks = 10_000

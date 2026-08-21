@@ -12,6 +12,28 @@ test.afterEach(({ page }) => {
 })
 
 test.describe('Chat topbar global controls', () => {
+  test('non-chat language and theme popovers are mutually exclusive', async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+    await page.goto('/control/sessions')
+
+    const language = page.getByTestId('language-switcher-trigger')
+    const theme = page.getByRole('button', { name: 'Theme', exact: true })
+    await expect(language).toBeVisible()
+    await language.click()
+    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(1)
+
+    await theme.click()
+    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(0)
+    await expect(page.locator('[data-chat-topbar-popover="theme"]')).toHaveCount(1)
+    await expect(page.locator('[data-chat-topbar-popover]')).toHaveCount(1)
+
+    await language.click()
+    await expect(page.locator('[data-chat-topbar-popover="theme"]')).toHaveCount(0)
+    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(1)
+    await page.keyboard.press('Escape')
+    await expect(page.locator('[data-chat-topbar-popover]')).toHaveCount(0)
+  })
+
   test('web keeps Desktop updates absent while wide connection and approval stay direct', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1000 })
     await openTopbarSession(page, {

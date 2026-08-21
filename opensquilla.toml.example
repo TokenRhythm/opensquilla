@@ -100,7 +100,7 @@
 
 [llm]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash-0731"
+model = "deepseek-v4-pro-0813"
 # api_key = ""          # TokenRhythm API key; env TOKENRHYTHM_API_KEY also works
 base_url = "https://tokenrhythm.studio/v1"
 # proxy = ""            # e.g. http://127.0.0.1:7890
@@ -147,7 +147,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # reasoning_content, and reasoning tokens count against max_tokens — keep
 # max_tokens = 0 (auto) rather than setting small caps:
 # provider = "tokenrhythm"
-# model = "deepseek-v4-flash-0731"
+# model = "deepseek-v4-pro-0813"
 # api_key = ""          # env TOKENRHYTHM_API_KEY also works
 # base_url = "https://tokenrhythm.studio/v1"
 #
@@ -431,24 +431,25 @@ upgrade_to_c3_compaction_enabled = true
 # that executes on the active provider (or the default tier).
 # tier_provider_mismatch = "route"  # route | veto
 
-# TokenRhythm serves every model in reasoning-streaming mode and rejects
-# thinking-toggle request fields, so these tiers set no thinking_level.
+# This mixed-family TokenRhythm ladder intentionally sets no thinking_level.
+# SquillaRouter auto-thinking can still choose a per-turn level (normally low
+# on C1), and explicit turn settings remain available for compatible models.
 [squilla_router.tiers.c0]
 provider = "tokenrhythm"
-model = "qwen3.7-flash"
-description = "Fast Qwen 3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight vision"
-supports_image = true
+model = "deepseek-v4-flash-0731"
+description = "Fast DeepSeek V4 Flash 0731 route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash-0731"
-description = "Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-v4-pro-0813"
+description = "Default DeepSeek V4 Pro 0813 route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
 provider = "tokenrhythm"
-model = "glm-5.2"
-description = "Stronger GLM 5.2 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "kimi-k2.7-code"
+description = "Stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [squilla_router.tiers.c3]

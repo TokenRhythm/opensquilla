@@ -151,8 +151,12 @@ def _claim_destination(
     destination_root: Path,
     relative: PurePosixPath,
     seen: set[str],
+    *,
+    case_sensitive_paths: bool = False,
 ) -> Path:
-    key = relative.as_posix().casefold()
+    key = relative.as_posix()
+    if not case_sensitive_paths:
+        key = key.casefold()
     if key in seen:
         raise UnsafeArchiveError(f"Duplicate archive path: {relative.as_posix()}")
     seen.add(key)
@@ -196,6 +200,8 @@ def _validate_tar_members(
     destination: Path,
     compressed_size: int,
     max_extracted_bytes: int | None,
+    *,
+    case_sensitive_paths: bool = False,
 ) -> tuple[
     list[tarfile.TarInfo],
     dict[PurePosixPath, PurePosixPath],
@@ -210,7 +216,12 @@ def _validate_tar_members(
             if len(members) >= _MAX_ARCHIVE_MEMBERS:
                 raise UnsafeArchiveError("Archive contains too many entries")
             relative = _safe_archive_name(member.name)
-            _claim_destination(destination, relative, seen)
+            _claim_destination(
+                destination,
+                relative,
+                seen,
+                case_sensitive_paths=case_sensitive_paths,
+            )
             if not (member.isdir() or member.isfile() or member.issym() or member.islnk()):
                 raise UnsafeArchiveError(
                     f"Archive contains a device or special entry: {member.name!r}"
@@ -270,12 +281,15 @@ def _extract_tar_xz(
     destination: Path,
     compressed_size: int,
     max_extracted_bytes: int | None,
+    *,
+    case_sensitive_paths: bool = False,
 ) -> None:
     members, final_targets = _validate_tar_members(
         archive,
         destination,
         compressed_size,
         max_extracted_bytes,
+        case_sensitive_paths=case_sensitive_paths,
     )
     expected = iter(members)
     with tarfile.open(archive, mode="r|xz") as source:
@@ -397,6 +411,8 @@ def _extract_archive(
     archive_type: str,
     compressed_size: int,
     max_extracted_bytes: int | None = None,
+    *,
+    case_sensitive_paths: bool = False,
 ) -> None:
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     if archive_type == "tar.xz":
@@ -405,6 +421,7 @@ def _extract_archive(
             destination,
             compressed_size,
             max_extracted_bytes,
+            case_sensitive_paths=case_sensitive_paths,
         )
         return
     if archive_type == "zip":
@@ -425,6 +442,7 @@ def extract_managed_archive(
     archive_type: str,
     compressed_size: int,
     max_extracted_bytes: int | None = None,
+    case_sensitive_paths: bool = False,
 ) -> None:
     """Safely extract a verified Runtime Pack without sandbox or skill imports."""
 
@@ -444,6 +462,7 @@ def extract_managed_archive(
             archive_type,
             compressed_size,
             max_extracted_bytes,
+            case_sensitive_paths=case_sensitive_paths,
         )
     except (EOFError, lzma.LZMAError, tarfile.TarError, zipfile.BadZipFile) as exc:
         raise UnsafeArchiveError("Managed archive is malformed or truncated") from exc

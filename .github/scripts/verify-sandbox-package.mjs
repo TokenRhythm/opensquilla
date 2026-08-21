@@ -45,11 +45,11 @@ const sha256Pattern = /^[0-9a-f]{64}$/i
 function verifyCatalog(catalog, label, { requireFinalized }) {
   if (!catalog) return
   if (catalog.schemaVersion !== 1) fail(`${label} must use schemaVersion 1`)
-  if (catalog.catalogVersion !== '2026-07-30.1') {
-    fail(`${label} must pin catalogVersion 2026-07-30.1`)
+  if (catalog.catalogVersion !== '2026-08-21.2') {
+    fail(`${label} must pin catalogVersion 2026-08-21.2`)
   }
-  if (catalog.releaseTag !== 'v2026.07.30.1') {
-    fail(`${label} must pin releaseTag v2026.07.30.1`)
+  if (catalog.releaseTag !== 'v2026.08.21.2') {
+    fail(`${label} must pin releaseTag v2026.08.21.2`)
   }
   if (catalog.finalized !== true && catalog.finalized !== false) {
     fail(`${label} must declare a boolean finalized flag`)

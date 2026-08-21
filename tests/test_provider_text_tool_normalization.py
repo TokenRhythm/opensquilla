@@ -331,6 +331,7 @@ def _collect_stream(
     native_tool_call: bool = False,
     native_query: str = "native",
     compat: OpenAICompatPolicy | None = None,
+    base_url: str = "https://api.openai.com",
     raw_body: bytes | None = None,
     config: ChatConfig | None = None,
 ) -> list[Any]:
@@ -363,6 +364,7 @@ def _collect_stream(
     provider = OpenAIProvider(
         api_key="test",
         model=model,
+        base_url=base_url,
         provider_kind=provider_kind,
         compat=compat,
     )
@@ -606,6 +608,90 @@ def test_dsml_executes_only_for_exact_packaged_provider_model_pairs(
     assert ends[0].arguments == {"query": "x"}
     assert ends[0].synthetic_from_text is True
     assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize(
+    "model",
+    ("deepseek-v4-pro-0813", "tokenrhythm/deepseek-v4-pro-0813"),
+)
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "https://tokenrhythm.studio",
+        "https://tokenrhythm.studio/v1",
+        "HTTPS://TOKENRHYTHM.STUDIO:443/v1/",
+    ),
+)
+def test_tokenrhythm_0813_dsml_executes_only_at_official_api_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    base_url: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model=model,
+        base_url=base_url,
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == ""
+    assert len(_tool_starts(events)) == len(_tool_ends(events)) == 1
+    assert _tool_ends(events)[0].arguments == {"query": "x"}
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "http://tokenrhythm.studio/v1",
+        "https://api.tokenrhythm.studio/v1",
+        "https://tokenrhythm.studio.evil.example/v1",
+        "https://customer-proxy.example/v1",
+        "https://tokenrhythm.studio/v1/custom",
+        "https://tokenrhythm.studio:8443/v1",
+        "https://user@tokenrhythm.studio/v1",
+        "https://tokenrhythm.studio/v1?tenant=x",
+        "https://tokenrhythm.studio/v1#fragment",
+        "https://tokenrhythm.studio/v1?",
+        "https://tokenrhythm.studio/v1#",
+    ),
+)
+def test_tokenrhythm_0813_dsml_is_literal_at_untrusted_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model="deepseek-v4-pro-0813",
+        base_url=base_url,
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_starts(events) == []
+    assert _tool_ends(events) == []
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_tokenrhythm_0813_dsml_near_miss_is_literal_at_official_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model="deepseek-v4-pro-0813-preview",
+        base_url="https://tokenrhythm.studio/v1",
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_starts(events) == []
+    assert _tool_ends(events) == []
 
 
 @pytest.mark.parametrize(

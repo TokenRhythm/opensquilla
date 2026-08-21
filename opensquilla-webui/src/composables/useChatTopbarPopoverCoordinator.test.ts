@@ -91,8 +91,8 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
-describe('chat topbar popover coordinator', () => {
-  it('keeps exactly the latest chat popover open across every finite identity', async () => {
+describe('topbar popover coordinator', () => {
+  it('keeps exactly the latest enabled popover open across every finite identity', async () => {
     const { controller, openById } = await mountCoordinator()
     for (const id of POPOVER_IDS) {
       state(openById, id).value = true
@@ -121,7 +121,7 @@ describe('chat topbar popover coordinator', () => {
     expect(controller.activeId.value).toBe('bgm')
   })
 
-  it('leaves local popovers independent outside chat', async () => {
+  it('leaves local popovers independent when coordination is disabled', async () => {
     const { controller, openById } = await mountCoordinator(false)
     state(openById, 'language').value = true
     state(openById, 'bgm').value = true
@@ -132,7 +132,7 @@ describe('chat topbar popover coordinator', () => {
     expect(controller.activeId.value).toBeNull()
   })
 
-  it('closes local carry-over in both directions at a chat route boundary', async () => {
+  it('closes local carry-over when coordination enablement changes', async () => {
     const { controller, enabled, openById } = await mountCoordinator(false)
     state(openById, 'language').value = true
     enabled.value = true

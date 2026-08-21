@@ -631,7 +631,7 @@ try {
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
   assert.equal(await page.locator('#modelEditor').isVisible(), false)
   assert.equal(await page.locator('#modelSummaryLabel').innerText(), '推荐模型')
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro-0813')
   assert.deepEqual(
     await page.evaluate(() => [
       getComputedStyle(document.getElementById('providerSelectLabel')).fontSize,
@@ -742,7 +742,7 @@ try {
 
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm')
   assert.equal(await page.locator('#baseUrl').inputValue(), 'https://tokenrhythm.studio/v1')
-  assert.equal(await page.locator('#model').inputValue(), 'deepseek-v4-pro')
+  assert.equal(await page.locator('#model').inputValue(), 'deepseek-v4-pro-0813')
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
@@ -800,7 +800,7 @@ try {
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro-0813')
   await page.locator('#apiKey').fill('synthetic-tokenrhythm-key')
   assert.equal(await page.locator('.inline-search-section').isVisible(), true)
   assert.equal(await page.locator('#inlineSearchHeading').innerText(), 'Choose web search')
@@ -873,12 +873,25 @@ try {
   assert.equal(credential.modelRoutingMode, 'squilla_router')
   assert.equal(credential.routerMode, 'recommended')
   assert.equal(credential.routerDefaultTier, 'c1')
-  assert.equal(credential.routerTiers.c0.model, 'deepseek-v4-flash')
-  assert.equal(credential.routerTiers.c1.model, 'deepseek-v4-pro')
+  assert.equal(credential.model, 'deepseek-v4-pro-0813')
+  assert.equal(credential.routerTiers.c0.model, 'deepseek-v4-flash-0731')
+  assert.equal(credential.routerTiers.c1.model, 'deepseek-v4-pro-0813')
   assert.equal(credential.routerTiers.c2.model, 'kimi-k2.7-code')
   assert.equal(credential.routerTiers.c3.model, 'glm-5.2')
+  assert.equal(credential.routerTiers.c0.supportsImage, false)
+  assert.equal(credential.routerTiers.c1.supportsImage, false)
+  assert.equal(credential.routerTiers.c2.supportsImage, false)
+  assert.equal(credential.routerTiers.c3.supportsImage, false)
+  assert.equal(credential.routerTiers.c3.ensembleEnabled, true)
+  assert.equal(credential.routerTiers.image_model.model, 'kimi-k2.6')
+  assert.equal(credential.routerTiers.image_model.supportsImage, true)
   assert.match(config, /\[squilla_router\]\nenabled = true/)
-  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-pro"/)
+  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-v4-pro-0813"/)
+  assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-flash-0731"/)
+  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-pro-0813"/)
+  assert.match(config, /\[squilla_router\.tiers\.c2\]\nprovider = "tokenrhythm"\nmodel = "kimi-k2.7-code"/)
+  assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.2"[\s\S]*?ensemble_enabled = true/)
+  assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
 
   console.log(JSON.stringify({

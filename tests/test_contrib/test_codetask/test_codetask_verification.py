@@ -16,6 +16,26 @@ from opensquilla.contrib.codetask.types import (
     RegressionResult,
     TaskState,
 )
+from opensquilla.git_runtime import (
+    GitCapability,
+    GitCapabilityState,
+    GitRunResult,
+    GitRunState,
+)
+
+
+def _git_unavailable_result() -> GitRunResult:
+    capability = GitCapability(
+        state=GitCapabilityState.UNAVAILABLE,
+        reason="git_not_found",
+    )
+    return GitRunResult(
+        state=GitRunState.UNAVAILABLE,
+        returncode=None,
+        stdout=b"",
+        stderr=b"git_not_found",
+        capability=capability,
+    )
 
 
 class TestManifestLoading:
@@ -98,6 +118,27 @@ class TestPathSafety:
             ["tests/ok.py", "/etc/passwd", "../../secret", "a/../b", ""]
         )
         assert safe == ["tests/ok.py"]
+
+
+def test_base_worktree_reports_unavailable_git_without_launching_literal_git(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def unavailable(args, **_kwargs):
+        calls.append(tuple(args))
+        return _git_unavailable_result()
+
+    monkeypatch.setattr(verification, "run_git", unavailable)
+
+    with pytest.raises(verification._WorktreeError, match="Git is unavailable"):
+        with verification._BaseWorktree(tmp_path, "deadbeef"):
+            pass
+
+    assert len(calls) == 1
+    assert calls[0][:3] == ("worktree", "add", "--detach")
+    assert calls[0][-1] == "deadbeef"
 
 
 class TestRegressionFailClosed:

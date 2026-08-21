@@ -17,17 +17,21 @@ export const SETTINGS_SECTIONS = [
   { id: 'general', label: 'General', icon: 'settings', client: false, desktopOnly: false, group: 'preferences' },
   { id: 'interface', label: 'Interface', icon: 'monitor', client: true, desktopOnly: false, group: 'preferences' },
   { id: 'shortcuts', label: 'Shortcuts', icon: 'keyboard', client: true, desktopOnly: false, group: 'preferences' },
-  // --- Safety and data: privacy, sandbox policy, and memory lifecycle ---
+  // --- Safety and data: privacy, sandbox policy, and memory portability ---
   { id: 'securityPrivacy', label: 'Security & Privacy', icon: 'shield', client: false, desktopOnly: false, group: 'safetyData' },
-  { id: 'memory', label: 'Memory', icon: 'user', client: false, desktopOnly: false, group: 'safetyData' },
+  // The import/export action surface owns its RPC gate and has no shared
+  // readiness or dirty state, so omit the catalog status suffix in the rail.
+  { id: 'memory', label: 'Memory & Export', icon: 'user', client: true, desktopOnly: false, group: 'safetyData' },
   // Advanced remains a quiet standalone destination at the bottom of the rail.
-  { id: 'advanced', label: 'Advanced', icon: 'gauge', client: true, desktopOnly: false, group: null },
+  // It mixes browser-local experiments with less-common Gateway-backed memory
+  // controls, so it participates in save/dirty status like other mixed pages.
+  { id: 'advanced', label: 'Advanced', icon: 'gauge', client: false, desktopOnly: false, group: null },
 ] as const
 
 // Data maintenance is a nested Advanced destination rather than a first-level
 // rail tab. Keep its stable route id here so existing deep links continue to
 // resolve without making the destination prominent in Settings navigation.
-export const NESTED_SETTINGS_SECTION_IDS = ['dataMigration', 'profileImport'] as const
+export const NESTED_SETTINGS_SECTION_IDS = ['dataMigration'] as const
 
 export type SettingsRailSectionId = (typeof SETTINGS_SECTIONS)[number]['id']
 export type NestedSettingsSectionId = (typeof NESTED_SETTINGS_SECTION_IDS)[number]

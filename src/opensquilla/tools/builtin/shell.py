@@ -178,6 +178,7 @@ from opensquilla.tools.write_tracking import (
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
     summarize_patch_hygiene_warning,
+    workspace_write_deny_effect_preflight,
 )
 
 log = structlog.get_logger(__name__)
@@ -6292,6 +6293,7 @@ async def _run_windows_host_shell_command_with_stdin(
     env: dict[str, str],
     stdin_bytes: bytes,
     effective_timeout: float,
+    on_process_started: Callable[[], None] | None = None,
 ) -> str:
     try:
         with tempfile.TemporaryFile() as output_file:
@@ -6305,6 +6307,8 @@ async def _run_windows_host_shell_command_with_stdin(
                 env=env,
                 creationflags=creationflags,
             )
+            if on_process_started is not None:
+                on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
             completed = await _communicate_windows_host_shell_process(
                 proc,
@@ -6349,6 +6353,7 @@ async def _run_host_shell_command(
     env: dict[str, str],
     stdin_bytes: bytes | None,
     effective_timeout: float,
+    on_process_started: Callable[[], None] | None = None,
 ) -> str:
     if _use_windows_blocking_exec_stdin() and stdin_bytes is not None:
         return await _run_windows_host_shell_command_with_stdin(
@@ -6357,6 +6362,7 @@ async def _run_host_shell_command(
             env=env,
             stdin_bytes=stdin_bytes,
             effective_timeout=effective_timeout,
+            on_process_started=on_process_started,
         )
     try:
         with tempfile.TemporaryFile() as output_file:
@@ -6383,6 +6389,8 @@ async def _run_host_shell_command(
                 return _exec_timeout_output(effective_timeout, command, output_file.read())
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
+            if on_process_started is not None:
+                on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=True)
             stdin_writer: asyncio.Task[None] | None = None
             remaining = deadline - loop.time()
@@ -6756,13 +6764,21 @@ async def exec_command(
     effective_timeout = _resolve_exec_timeout(timeout)
     stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
     mutation_before = snapshot_current_workspace_mutations()
+    protection_block = workspace_write_deny_effect_preflight(
+        tool_name="exec_command",
+        before=mutation_before,
+    )
+    if protection_block is not None:
+        return protection_block
     source_mutation_signal = (
         _shell_source_mutation_signal(command, cwd)
         if _shell_source_mutation_telemetry_enabled()
         else None
     )
 
-    def finish(output: str) -> str:
+    def finish(output: str, *, executed: bool = True) -> str:
+        if not executed:
+            return output
         metadata: dict[str, Any] = {"command_hash": mutation_ledger_text_hash(command)}
         if source_mutation_signal is not None:
             metadata.update(source_mutation_signal)
@@ -6786,7 +6802,7 @@ async def exec_command(
 
     runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
     if runtime_unavailable is not None:
-        return finish(json.dumps(runtime_unavailable, ensure_ascii=False))
+        return finish(json.dumps(runtime_unavailable, ensure_ascii=False), executed=False)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
@@ -6802,7 +6818,7 @@ async def exec_command(
             ),
         )
         if isinstance(decision, DenialResult):
-            return finish(json.dumps(decision.to_dict()))
+            return finish(json.dumps(decision.to_dict()), executed=False)
         if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             backend_retry_granted = True
@@ -6815,7 +6831,10 @@ async def exec_command(
             )
             if retry_gate is not None:
                 if not retry_gate.allowed:
-                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                    return finish(
+                        json.dumps(retry_gate.to_envelope(), ensure_ascii=False),
+                        executed=False,
+                    )
                 host_execution = True
                 backend_retry_granted = True
             else:
@@ -6839,9 +6858,9 @@ async def exec_command(
                 )
                 preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                 if isinstance(preflight, DenialResult):
-                    return finish(json.dumps(preflight.to_dict()))
+                    return finish(json.dumps(preflight.to_dict()), executed=False)
                 if isinstance(preflight, dict):
-                    return finish(json.dumps(preflight))
+                    return finish(json.dumps(preflight), executed=False)
                 try:
                     sandbox_result = await _run_backend_with_managed_network(
                         backend_request,
@@ -6870,8 +6889,14 @@ async def exec_command(
                     )
                     if escalation is not None:
                         if isinstance(escalation, DenialResult):
-                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
-                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                            return finish(
+                                json.dumps(escalation.to_dict(), ensure_ascii=False),
+                                executed=False,
+                            )
+                        return finish(
+                            json.dumps(escalation.to_envelope(), ensure_ascii=False),
+                            executed=False,
+                        )
                     raise
                 except Exception as exc:
                     raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
@@ -6919,16 +6944,23 @@ async def exec_command(
         )
         merged_env = _host_shell_env(merged_env)
 
+    host_process_started = False
+
+    def mark_host_process_started() -> None:
+        nonlocal host_process_started
+        host_process_started = True
+
     host_output = await _run_host_shell_command(
         command,
         cwd=cwd,
         env=merged_env,
         stdin_bytes=stdin_bytes,
         effective_timeout=effective_timeout,
+        on_process_started=mark_host_process_started,
     )
     exit_code_match = re.match(r"exit_code=(-?\d+)\n", host_output)
     if exit_code_match is None:
-        return finish(host_output)
+        return finish(host_output, executed=host_process_started)
     returncode = int(exit_code_match.group(1))
     output = host_output[exit_code_match.end() :]
     output = _append_patch_hygiene_warning(command, cwd, output)

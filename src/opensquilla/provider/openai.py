@@ -2194,6 +2194,7 @@ def _synthesize_text_tool_events(
     *,
     provider_kind: str,
     model: str,
+    base_url: str = "",
 ) -> list[ToolUseStartEvent | ToolUseEndEvent]:
     """Compatibility helper backed by the scoped, atomic classifier."""
 
@@ -2201,7 +2202,7 @@ def _synthesize_text_tool_events(
     segments = classify_text_tool_segments(
         full_text,
         tools,
-        dialects=policy.text_tool_profile.dialects_for_model(model),
+        dialects=policy.text_tool_profile.dialects_for_model(model, base_url),
         provider_kind=provider_kind,
         model=model,
     )
@@ -3951,7 +3952,10 @@ class OpenAIProvider:
         streamed_thought_signature: str | None = None
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -5894,7 +5898,10 @@ class OpenAIProvider:
         trace_tool_calls: list[dict[str, Any]] = []
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None

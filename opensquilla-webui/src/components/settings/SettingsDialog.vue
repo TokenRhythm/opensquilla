@@ -81,8 +81,8 @@
             :is-desktop="isDesktop"
           />
 
-          <!-- Profile import is nested under Memory and owns its RPC gate. -->
-          <SettingsMemoryPanel v-else-if="section === 'profileImport'" />
+          <!-- Memory & Export is first-level and owns its own RPC gate. -->
+          <SettingsMemoryPanel v-else-if="section === 'memory'" />
 
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
@@ -105,17 +105,13 @@
             :is-desktop="isDesktop"
             @update-network-reporting-enabled="setNetworkReportingEnabled"
           />
-          <SettingsMemoryOverviewPanel
-            v-else-if="section === 'memory'"
-            :auto-capture="memoryPanel.autoCapture"
-            :loaded="loaded"
-            @update-auto-capture="setMemoryAutoCapture"
-            @open-profile-import="openProfileImport"
-          />
           <SettingsAppearancePanel v-else-if="section === 'interface'" />
           <SettingsKeyboardPanel v-else-if="section === 'shortcuts'" />
           <SettingsAdvancedPanel
             v-else-if="section === 'advanced'"
+            :auto-capture="memoryPanel.autoCapture"
+            :loaded="loaded"
+            @update-auto-capture="setMemoryAutoCapture"
             @open-agent-configuration="openAgentConfiguration"
             @open-data-maintenance="openDataMaintenance"
           />
@@ -249,7 +245,6 @@ import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
 import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
 import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
 import SettingsSecurityPrivacyPanel from '@/components/settings/SettingsSecurityPrivacyPanel.vue'
-import SettingsMemoryOverviewPanel from '@/components/settings/SettingsMemoryOverviewPanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
 import {
@@ -345,7 +340,7 @@ const {
 const activeRailSection = computed(() => (
   section.value === 'dataMigration'
     ? 'advanced'
-    : section.value === 'profileImport' ? 'memory' : section.value
+    : section.value
 ))
 
 const modalRef = ref<HTMLElement | null>(null)
@@ -511,7 +506,7 @@ function applyRouteSection() {
       hash: route.hash || alias.hash || '',
     })
   }
-  if (resolved === 'dataMigration' || resolved === 'profileImport') {
+  if (resolved === 'dataMigration') {
     setSection(resolved)
     return
   }
@@ -653,12 +648,6 @@ async function openDataMaintenance() {
   selectSection('dataMigration')
   await nextTick()
   panelRef.value?.querySelector<HTMLElement>('[data-testid="data-migration-heading"]')?.focus()
-}
-
-async function openProfileImport() {
-  selectSection('profileImport')
-  await nextTick()
-  panelRef.value?.querySelector<HTMLElement>('[data-testid="memory-import-heading"]')?.focus()
 }
 
 // One exit prompt shared by every exit path: requestClose (Escape, the close

@@ -408,12 +408,39 @@ def _prepare_existing_private_file(path: Path) -> None:
                     "task process owner registry sidecar is not a private regular file"
                 )
             if os.name == "nt":
-                apply_windows_private_dacl(
-                    path,
-                    directory=False,
-                    expected_device=int(metadata.st_dev),
-                    expected_inode=int(metadata.st_ino),
-                )
+                try:
+                    apply_windows_private_dacl(
+                        path,
+                        directory=False,
+                        expected_device=int(metadata.st_dev),
+                        expected_inode=int(metadata.st_ino),
+                    )
+                except OSError as exc:
+                    # The sidecar can be replaced between the initial lstat
+                    # and the Windows bound-handle open.  Retry only when a
+                    # fresh regular file with a different identity is now at
+                    # the path; ACL failures on the same object remain fatal.
+                    try:
+                        current = os.lstat(path)
+                    except FileNotFoundError:
+                        return
+                    changed = (
+                        stat.S_ISREG(current.st_mode)
+                        and bool(metadata.st_ino)
+                        and (
+                            int(current.st_dev),
+                            int(current.st_ino),
+                        )
+                        != (int(metadata.st_dev), int(metadata.st_ino))
+                    )
+                    if not changed:
+                        raise
+                    if delay is None:
+                        raise _OwnerRegistrySidecarChangedError(
+                            "task process owner registry sidecar changed during privacy hardening"
+                        ) from exc
+                    time.sleep(delay)
+                    continue
                 current = os.lstat(path)
                 if (
                     stat.S_ISLNK(current.st_mode)
@@ -424,7 +451,7 @@ def _prepare_existing_private_file(path: Path) -> None:
                         != (int(metadata.st_dev), int(metadata.st_ino))
                     )
                 ):
-                    raise ProcessTreeOwnershipError(
+                    raise _OwnerRegistrySidecarChangedError(
                         "task process owner registry sidecar changed during privacy hardening"
                     )
             else:
@@ -434,6 +461,13 @@ def _prepare_existing_private_file(path: Path) -> None:
             # Rollback journals are intentionally ephemeral. A replacement can
             # only be created inside the already-hardened registry directory.
             return
+        except _OwnerRegistrySidecarChangedError:
+            # SQLite may replace a rollback journal while its ACL is being
+            # hardened.  Retry that one ephemeral identity race for a bounded
+            # period; a persistent change remains fail-closed below.
+            if os.name != "nt" or delay is None:
+                raise
+            time.sleep(delay)
         except PermissionError as exc:
             if (
                 os.name != "nt"
@@ -1122,6 +1156,10 @@ def _load_owner_records(state_dir: str | Path) -> tuple[_PersistedOwnerRef, ...]
 
 class ProcessTreeOwnershipError(RuntimeError):
     """Raised when a platform cannot safely own a requested process tree."""
+
+
+class _OwnerRegistrySidecarChangedError(ProcessTreeOwnershipError):
+    """An SQLite sidecar changed during one bounded privacy-hardening attempt."""
 
 
 class _PosixTargetExecError(RuntimeError):

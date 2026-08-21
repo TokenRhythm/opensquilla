@@ -12,8 +12,8 @@ const SettingsView = () => import('@/views/web/SettingsView.vue')
 // shares this dialog (plus a desktop-only Runtime section). desktopRoutes no
 // longer defines `/settings`, so there is no collision.
 export const webRoutes: RouteRecordRaw[] = [
-  { path: '/settings', name: 'settings', component: SettingsView, meta: { title: 'Settings', icon: 'settings', platforms: ['web', 'desktop'], viewKey: 'settings', routeTransition: 'none' } },
-  { path: '/settings/:section', name: 'settings-section', component: SettingsView, meta: { title: 'Settings', icon: 'settings', platforms: ['web', 'desktop'], viewKey: 'settings', routeTransition: 'none' } },
+  { path: '/settings', name: 'settings', component: SettingsView, meta: { title: 'Settings', titleKey: 'nav.settings', icon: 'settings', platforms: ['web', 'desktop'], viewKey: 'settings', routeTransition: 'none' } },
+  { path: '/settings/:section', name: 'settings-section', component: SettingsView, meta: { title: 'Settings', titleKey: 'nav.settings', icon: 'settings', platforms: ['web', 'desktop'], viewKey: 'settings', routeTransition: 'none' } },
   { path: '/config', redirect: '/settings' },
   { path: '/setup',  redirect: '/settings/auto' },
 ]
