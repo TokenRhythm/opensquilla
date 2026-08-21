@@ -621,8 +621,12 @@ def test_cleanup_apply_refuses_running_legacy_gateway(
         args=(str(primary), ready, release),
     )
     process.start()
-    assert ready.wait(5)
+    startup_timeout = 15 if sys.platform == "win32" else 5
     try:
+        assert ready.wait(startup_timeout), (
+            "legacy gateway lock holder did not start within "
+            f"{startup_timeout}s (exitcode={process.exitcode})"
+        )
         result = cleanup_apply(
             user_data,
             mode="delete-current-profile",
@@ -634,6 +638,9 @@ def test_cleanup_apply_refuses_running_legacy_gateway(
     finally:
         release.set()
         process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
 
     assert result.outcome == "blocked"
     assert result.stable_code == "legacy_gateway_running"
