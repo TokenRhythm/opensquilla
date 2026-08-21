@@ -1583,6 +1583,105 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     assert database_path.is_file()
 
 
+def test_windows_registry_retries_sidecar_identity_change(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"first")
+    attempts = 0
+
+    def replace_once(
+        path: object,
+        *,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        assert directory is False
+        attempts += 1
+        if attempts == 1:
+            replacement = sidecar.with_name("replacement.sqlite3-journal")
+            replacement.write_bytes(b"replacement")
+            os.replace(replacement, sidecar)
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_once)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == 2
+    assert sidecar.read_bytes() == b"replacement"
+
+
+def test_windows_registry_retries_sidecar_identity_change_before_acl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"first")
+    attempts = 0
+
+    def replace_then_fail(
+        _path: object,
+        *,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        assert directory is False
+        attempts += 1
+        if attempts == 1:
+            replacement = sidecar.with_name("replacement.sqlite3-journal")
+            replacement.write_bytes(b"replacement")
+            os.replace(replacement, sidecar)
+            raise OSError("synthetic bound path changed")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_then_fail)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == 2
+    assert sidecar.read_bytes() == b"replacement"
+
+
+def test_windows_registry_sidecar_identity_change_remains_fail_closed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"initial")
+    attempts = 0
+
+    def replace_always(
+        path: object,
+        *,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        assert directory is False
+        attempts += 1
+        replacement = sidecar.with_name(f"replacement-{attempts}.sqlite3-journal")
+        replacement.write_bytes(str(attempts).encode())
+        os.replace(replacement, sidecar)
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_always)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="sidecar changed during privacy hardening",
+    ):
+        process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == len(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS) + 1
+
+
 def test_owner_registry_hardens_preexisting_sqlite_sidecars(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

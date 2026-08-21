@@ -10,6 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
+# Skill manifests fingerprint complete bundled trees.  Test imports can create
+# derived ``__pycache__`` files between the loader's two integrity scans, so
+# disable bytecode writes for the controller, xdist workers, and child tests.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))

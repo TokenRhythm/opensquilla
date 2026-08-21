@@ -23,6 +23,12 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Final
 
+# Skill manifests fingerprint complete bundled trees.  Keep imports performed
+# by this runner and both pytest phases from creating derived files in those
+# trees while they are being scanned.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 SHARD_NAMES: Final[tuple[str, ...]] = (
     "core",
     "gateway-sqlite",
