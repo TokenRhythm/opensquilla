@@ -612,22 +612,37 @@ export function reconcileRunningHistoryMessages(
   const previousLastUserIndex = lastUserIndex(prev)
   if (previousLastUserIndex < 0) return reconcileHistoryMessages(prev, incoming)
 
+  const incomingById = new Map(
+    incoming
+      .filter((message): message is ChatMessage & { messageId: string } => Boolean(message.messageId))
+      .map(message => [message.messageId, message]),
+  )
+
   // A same-turn steer is another user row with the same explicit turn id. It
   // must not become the anchor that hides the live Router/tool/assistant tail
-  // preceding it. Walk back to the first user row in that causal turn.
+  // preceding it. The optimistic first user can still lack a turn id when an
+  // early steer triggers history sync, so let its durable canonical row or the
+  // explicitly identified live rows before the steer prove the missing turn.
   let liveAnchorUserIndex = previousLastUserIndex
+  let nextUserIndex = previousLastUserIndex
   const liveTurnId = prev[previousLastUserIndex]?.turnId
   if (liveTurnId) {
     for (let index = previousLastUserIndex - 1; index >= 0; index--) {
       const candidate = prev[index]
       if (candidate?.role !== 'user') continue
-      if (candidate.turnId !== liveTurnId) break
+      const candidateTurnId = candidate.turnId
+        ?? (candidate.messageId ? incomingById.get(candidate.messageId)?.turnId : undefined)
+      const ownsVisibleLiveRows = prev
+        .slice(index + 1, nextUserIndex)
+        .some(message => message.turnId === liveTurnId)
+      if (candidateTurnId !== liveTurnId && !ownsVisibleLiveRows) break
       liveAnchorUserIndex = index
+      nextUserIndex = index
     }
   }
 
   const liveAnchor = prev[liveAnchorUserIndex]
-  const incomingIds = new Set(incoming.map(message => message.messageId).filter(Boolean))
+  const incomingIds = new Set(incomingById.keys())
   const preserveConfirmedAnchor = Boolean(
     liveAnchor?.role === 'user'
     && liveAnchor.restoredFromHistory !== true
@@ -649,31 +664,27 @@ export function reconcileRunningHistoryMessages(
 
   const consumedOptimisticRows = new Set<ChatMessage>()
   const merged = reconcileOptimisticTurnFields(prev, incoming, consumedOptimisticRows)
-  const existingIds = new Set(merged.map(msg => msg.messageId).filter(Boolean))
-  const existingFallbackKeys = new Set(merged.map(fallbackMessageKey))
-  const confirmedAnchorToPreserve = (
-    preserveConfirmedAnchor
-    && liveAnchor.messageId
-    && !existingIds.has(liveAnchor.messageId)
-  ) ? [liveAnchor] : []
-  const tailToPreserve = [...confirmedAnchorToPreserve, ...liveTail.filter(msg => {
-    if (consumedOptimisticRows.has(msg)) return false
-    if (msg.messageId) return !existingIds.has(msg.messageId)
-    return !existingFallbackKeys.has(fallbackMessageKey(msg))
-  })]
-  if (tailToPreserve.length === 0) return merged
-  if (confirmedAnchorToPreserve.length > 0) {
-    // The incoming snapshot predates this server-confirmed input. Keep the
-    // complete older transcript in place, then append the confirmed input and
-    // its live tail in causal order.
-    return [...merged, ...tailToPreserve]
+  let insertAfter = preserveConfirmedAnchor
+    ? merged.length - 1
+    : insertionIndexForLiveTail(merged, liveAnchor)
+  const liveRows = preserveConfirmedAnchor ? [liveAnchor, ...liveTail] : liveTail
+
+  // Advance through canonical rows that history already contains and insert
+  // only the missing live rows between them. This preserves an applied steer
+  // as an interior boundary instead of moving its continuation before it.
+  for (const message of liveRows) {
+    if (consumedOptimisticRows.has(message)) continue
+    const existingIndex = message.messageId
+      ? merged.findIndex(candidate => candidate.messageId === message.messageId)
+      : merged.findIndex(candidate => fallbackMessageKey(candidate) === fallbackMessageKey(message))
+    if (existingIndex >= 0) {
+      insertAfter = Math.max(insertAfter, existingIndex)
+      continue
+    }
+    const insertionIndex = insertAfter + 1
+    merged.splice(insertionIndex, 0, message)
+    insertAfter = insertionIndex
   }
 
-  const insertAfter = insertionIndexForLiveTail(merged, prev[liveAnchorUserIndex])
-  if (insertAfter < 0) return [...merged, ...tailToPreserve]
-  return [
-    ...merged.slice(0, insertAfter + 1),
-    ...tailToPreserve,
-    ...merged.slice(insertAfter + 1),
-  ]
+  return merged
 }
