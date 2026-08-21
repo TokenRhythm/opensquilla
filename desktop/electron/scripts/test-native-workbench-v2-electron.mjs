@@ -1116,6 +1116,18 @@ try {
       const annotationOverlayFocusedAfterGeometry =
         annotationOverlayFocusCycles.every(cycle =>
           cycle.editorFocused && (!cycle.ownerFocused || cycle.nativeFocused))
+      // Scroll-triggered geometry refreshes can leave the editor focused in
+      // the renderer while its native WebContentsView is no longer the input
+      // target. Restore the native focus before exercising real key and IME
+      // delivery.
+      owner.focus()
+      annotationOverlay.view.webContents.focus()
+      await waitFor(
+        async () => await annotationOverlay.view.webContents.executeJavaScript(
+          "document.activeElement?.id === 'annotation-body'",
+        ) && annotationOverlay.view.webContents.isFocused(),
+        'trusted annotation native input focus after geometry refresh',
+      )
       await annotationOverlay.view.webContents.executeJavaScript(
         "document.getElementById('annotation-body').select()",
       )
