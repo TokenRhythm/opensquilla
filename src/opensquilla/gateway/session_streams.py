@@ -267,6 +267,37 @@ class SessionStreamRegistry:
         # legacy block, but the sentinel stays internal to snapshot compaction.
         return "__legacy_reasoning__"
 
+    @classmethod
+    def _same_text_model_call(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+    ) -> bool:
+        left_call = cls._identity_value(left, "model_call_id", "modelCallId")
+        right_call = cls._identity_value(right, "model_call_id", "modelCallId")
+        if left_call and right_call and left_call != right_call:
+            return False
+
+        left_iteration = left.get("iteration")
+        right_iteration = right.get("iteration")
+        left_iteration = (
+            left_iteration
+            if isinstance(left_iteration, int) and not isinstance(left_iteration, bool)
+            and left_iteration > 0
+            else None
+        )
+        right_iteration = (
+            right_iteration
+            if isinstance(right_iteration, int) and not isinstance(right_iteration, bool)
+            and right_iteration > 0
+            else None
+        )
+        return not (
+            left_iteration is not None
+            and right_iteration is not None
+            and left_iteration != right_iteration
+        )
+
     @staticmethod
     def _delta_field(payload: dict[str, Any]) -> str:
         for field in ("json_fragment", "jsonFragment", "fragment"):
@@ -438,6 +469,9 @@ class SessionStreamRegistry:
                     return
         elif event.event_name == "session.event.text_delta" and len(events) > reset_index + 1:
             if events[-1].event_name == event.event_name:
+                if not self._same_text_model_call(events[-1].payload, event.payload):
+                    events.append(event)
+                    return
                 if (
                     self._generation_epoch(events[-1].payload) is not None
                     and self._generation_epoch(event.payload) is not None

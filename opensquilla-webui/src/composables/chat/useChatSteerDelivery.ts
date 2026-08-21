@@ -292,7 +292,7 @@ export function useChatSteerDelivery(
       || options.pendingQueue.value.find(item => matchesPending(item, evidence))
     const attempt = pending?.steerAttempt || null
     const pendingIdentity = attempt ? attemptIdentity(attempt) : null
-    const identity: SteerDeliveryIdentity = {
+    let identity: SteerDeliveryIdentity = {
       clientRequestId: evidence.clientRequestId || pendingIdentity?.clientRequestId || '',
       clientMessageId: evidence.clientMessageId || pendingIdentity?.clientMessageId || '',
       expectedTurnId: evidence.expectedTurnId || pendingIdentity?.expectedTurnId || '',
@@ -302,6 +302,16 @@ export function useChatSteerDelivery(
       ...identity,
       userMessageId: evidence.userMessageId,
     }))
+    if (message) {
+      identity = {
+        clientRequestId: identity.clientRequestId || message.steerClientRequestId || '',
+        clientMessageId: identity.clientMessageId
+          || message.steerClientMessageId
+          || message.clientId
+          || '',
+        expectedTurnId: identity.expectedTurnId || evidence.turnId || message.turnId || '',
+      }
+    }
     let created = false
     let pendingRemoved = false
     if (!message && pending && (identity.clientRequestId || identity.clientMessageId)) {

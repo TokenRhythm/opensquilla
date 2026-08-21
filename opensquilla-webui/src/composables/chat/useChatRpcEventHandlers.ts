@@ -63,6 +63,7 @@ import {
   useChatSteerDelivery,
   type ChatSteerDeliveryApi,
 } from './useChatSteerDelivery'
+import type { ChatStreamModelCallIdentity } from './useChatStream'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -86,7 +87,11 @@ export interface ChatRpcStreamApi {
     modelCallId?: string,
     iteration?: number,
   ) => void
-  appendDelta: (text: string, presentation?: 'intermediate' | 'answer') => void
+  appendDelta: (
+    text: string,
+    presentation?: 'intermediate' | 'answer',
+    identity?: ChatStreamModelCallIdentity,
+  ) => void
   scheduleRender: () => void
   appendToolCall: (payload: ToolUsePayload) => void
   appendToolDelta: (payload: ToolDeltaPayload) => void
@@ -1536,15 +1541,25 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.resetStreamIdleTimer()
     const taskId = payloadTaskId(payload) || activeStreamTaskId.value
     if (taskId && options.taskOwnership?.stopRequestedTaskId.value === taskId) return
+    const modelCallId = String(payload.model_call_id || payload.modelCallId || '').trim()
+    const iteration = Number(payload.iteration || 0)
     options.bindRouterDecisionToModelCall?.(
-      String(payload.model_call_id || payload.modelCallId || ''),
-      Number(payload.iteration || 0),
+      modelCallId,
+      iteration,
       String(payload.turn_id || payload.turnId || ''),
     )
     options.markEnsembleHandoff()
+    const identity: ChatStreamModelCallIdentity | undefined = modelCallId || iteration > 0
+      ? { modelCallId, iteration }
+      : undefined
     const presentation = payload.presentation
     if (presentation === 'intermediate' || presentation === 'answer') {
-      stream.appendDelta(payload.text || '', presentation)
+      if (identity) stream.appendDelta(payload.text || '', presentation, identity)
+      else stream.appendDelta(payload.text || '', presentation)
+    } else if (identity) {
+      // Compatibility frames can omit presentation while still carrying the
+      // physical call identity needed for same-turn steer placement.
+      stream.appendDelta(payload.text || '', undefined, identity)
     } else {
       // Compatibility with older gateways that predate semantic text roles.
       stream.appendDelta(payload.text || '')
