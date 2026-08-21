@@ -60,6 +60,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
 import type {
@@ -106,6 +107,8 @@ defineEmits<{
   showResult: [content: string, title: string, context?: ToolResultContext]
   revealComplete: []
 }>()
+
+const { t } = useI18n()
 
 defineSlots<{
   interrupt?: (props: {
@@ -174,20 +177,33 @@ const rows = computed<ActivityRow[]>(() => {
       block,
     })
   }
+  const clusterByCall = new Map(
+    props.projection.activityClusters.flatMap(cluster =>
+      cluster.calls.map(call => [call.renderKey, cluster] as const),
+    ),
+  )
   for (const item of props.timelineItems) {
     if (item.type === 'tool-group') {
       for (const call of item.group.calls) {
         const order = call.activityOrder ?? itemOrder(item)
         if (!validOrder(order)) return []
+        const cluster = clusterByCall.get(call.renderKey)
+        const isRunning = cluster?.isCurrent ?? call.isRunning
         const singleCallItem: ChatStreamTimelineItem = {
           ...item,
           key: `${item.key}:${call.renderKey}`,
           activityOrder: order,
           group: {
             ...item.group,
+            label: cluster
+              ? String(t(cluster.purpose.code, cluster.purpose.params))
+              : item.group.label,
+            secondary: cluster
+              ? String(t(cluster.footprint.code, cluster.footprint.params))
+              : item.group.secondary,
             calls: [call],
             activityOrder: order,
-            isRunning: call.isRunning,
+            isRunning,
             isError: call.isError || call.status === 'error',
             status: call.isError || call.status === 'error'
               ? 'error'

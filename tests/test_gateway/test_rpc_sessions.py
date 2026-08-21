@@ -8710,6 +8710,7 @@ class TestSessionsMessagesSubscribe:
                         "stream_generation": stream_registry.stream_generation,
                         "stream_seq": 1,
                         "emitted_at": ANY,
+                        "ended_at": ANY,
                     },
                 }
             ],
