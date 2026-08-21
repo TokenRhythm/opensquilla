@@ -2185,6 +2185,7 @@ class LlmProviderProfile(BaseModel):
     api_key_env_pool: list[str] = Field(default_factory=list)
     base_url: str = ""
     proxy: str = ""
+    context_window_tokens: int = 0
 
 
 class ModelCatalogConfig(BaseSettings):
