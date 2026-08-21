@@ -41,6 +41,12 @@ def _plan(
     return plan_changes(paths, repo=tmp_path, config=suite_config)
 
 
+def _write_test_module(root: Path, path: str, source: str = "") -> None:
+    candidate = root / path
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text(source, encoding="utf-8")
+
+
 def _matrix(plan: dict[str, Any]) -> set[tuple[str, str]]:
     return {(cell["os"], cell["shard"]) for cell in plan["desktop_matrix"]}
 
@@ -108,18 +114,19 @@ def test_ordinary_python_change_selects_targets_without_full_fallback(
 
 
 def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
-    tmp_path: Path, suite_config: dict[str, Any]
+    suite_config: dict[str, Any],
 ) -> None:
     paths = [
         "tests/test_gateway/test_rpc_sessions.py",
         "tests/test_live_artifact_prompt_annotations_e2e.py",
         "tests/test_recovery/test_recovery_cmd.py",
     ]
+    importing_consumer = "tests/test_gateway/test_p1a_exact_abort_contract.py"
 
-    plan = _plan(tmp_path, suite_config, *paths)
+    plan = plan_changes(paths, repo=Path.cwd(), config=suite_config)
 
     assert plan["full_fallback"] is False
-    assert plan["python_targets"] == sorted(paths)
+    assert plan["python_targets"] == sorted([*paths, importing_consumer])
     assert plan["python_matrix"] == {
         "ubuntu": [],
         "windows": [
@@ -130,12 +137,17 @@ def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
     }
     assert plan["desktop_matrix"] == []
     assert set(plan["required_suites"]) == {
+        "macos-recovery",
         "python-targeted",
         "readme-locale",
         "windows-high-risk",
         "workflow-lint",
     }
-    assert plan["reason_codes"] == ["test_only_targeted"]
+    assert plan["reason_codes"] == [
+        "macos_recovery_test_changed",
+        "test_dependency_closure",
+        "test_only_targeted",
+    ]
 
 
 def test_deleted_governed_test_uses_existing_parent_and_keeps_windows_shard(
@@ -167,6 +179,114 @@ def test_governed_test_rename_targets_old_parent_and_new_exact_file(
     assert plan["python_targets"] == ["tests/test_gateway", new_path]
     assert plan["python_matrix"]["windows"] == ["gateway-sqlite"]
     assert "deleted_test_targeted" in plan["reason_codes"]
+
+
+def test_cross_shard_test_helper_adds_importing_consumer_and_shard(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    consumer = "tests/test_skills_hash_consumers.py"
+    _write_test_module(tmp_path, helper)
+    _write_test_module(
+        tmp_path,
+        consumer,
+        "from tests.test_skills.test_hub_management_service import FakeSource\n",
+    )
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [helper, consumer]
+    assert plan["python_matrix"]["windows"] == ["core", "recovery-migration"]
+    assert "test_dependency_closure" in plan["reason_codes"]
+
+
+def test_test_helper_dependency_closure_is_recursive_and_cycle_safe(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    core = "tests/test_skills/test_hub_management_service.py"
+    recovery = "tests/test_skills_hash_consumers.py"
+    desktop = "tests/test_engine/test_runtime_meta_invoke_surfacing.py"
+    _write_test_module(
+        tmp_path,
+        core,
+        "from tests.test_engine.test_runtime_meta_invoke_surfacing import DesktopHelper\n",
+    )
+    _write_test_module(
+        tmp_path,
+        recovery,
+        "from tests.test_skills.test_hub_management_service import CoreHelper\n",
+    )
+    _write_test_module(
+        tmp_path,
+        desktop,
+        "from tests.test_skills_hash_consumers import RecoveryHelper\n",
+    )
+
+    plan = plan_changes([core], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == sorted([core, recovery, desktop])
+    assert plan["python_matrix"]["windows"] == [
+        "core",
+        "desktop-installer-contracts",
+        "recovery-migration",
+    ]
+    assert "test_dependency_closure" in plan["reason_codes"]
+
+
+def test_ungoverned_test_module_consumer_fails_closed(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    consumer = "tests/unknown/test_helper_consumer.py"
+    _write_test_module(tmp_path, helper)
+    _write_test_module(
+        tmp_path,
+        consumer,
+        "from tests.test_skills.test_hub_management_service import FakeSource\n",
+    )
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is True
+    assert plan["python_targets"] == ["tests"]
+    assert "test_dependency_ungoverned" in plan["reason_codes"]
+    assert "test_dependency_unsafe" in plan["reason_codes"]
+
+
+def test_uncertain_test_module_parse_fails_closed(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    _write_test_module(tmp_path, helper, "def broken(:\n")
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is True
+    assert plan["python_targets"] == ["tests"]
+    assert "test_dependency_analysis_uncertain" in plan["reason_codes"]
+
+
+def test_deleted_test_helper_keeps_cross_directory_consumer(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    helper = "tests/test_skills/test_hub_management_service.py"
+    consumer = "tests/test_skills_hash_consumers.py"
+    (tmp_path / "tests/test_skills").mkdir(parents=True)
+    _write_test_module(
+        tmp_path,
+        consumer,
+        "from tests.test_skills.test_hub_management_service import FakeSource\n",
+    )
+
+    plan = plan_changes([helper], repo=tmp_path, config=suite_config)
+
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == ["tests/test_skills", consumer]
+    assert plan["python_matrix"]["windows"] == ["core", "recovery-migration"]
+    assert "deleted_test_targeted" in plan["reason_codes"]
+    assert "test_dependency_closure" in plan["reason_codes"]
 
 
 def test_deleted_governed_test_at_ref_uses_parent_tree(
@@ -311,8 +431,6 @@ def test_python_native_risk_domains_select_only_corresponding_desktop_group(
         "tests/test_gateway/test_desktop_ownership.py",
         "tests/test_gateway/test_rpc_sandbox_runtime.py",
         "tests/test_gateway/test_rpc_workbench_resources.py",
-        "tests/test_desktop/test_electron_startup_contract.py",
-        "tests/test_recovery/test_recovery_cmd.py",
     ],
 )
 def test_test_only_domain_words_do_not_wake_native_desktop_e2e(
@@ -329,6 +447,53 @@ def test_test_only_domain_words_do_not_wake_native_desktop_e2e(
     assert "desktop-recovery-e2e" not in plan["required_suites"]
     assert "macos-recovery" not in plan["required_suites"]
     assert "test_only_targeted" in plan["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/test_recovery/test_atomic_and_locking.py",
+        "tests/test_recovery/test_engine.py",
+    ],
+)
+def test_darwin_recovery_test_keeps_macos_python_without_native_e2e(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == [path]
+    assert "macos-recovery" in plan["required_suites"]
+    assert _platform_cells(plan, "macos-recovery") == {
+        ("macos-latest", "recovery")
+    }
+    assert "desktop-recovery-e2e" not in plan["required_suites"]
+    assert plan["desktop_matrix"] == []
+    assert "macos_recovery_test_changed" in plan["reason_codes"]
+
+
+def test_macos_recovery_test_routing_is_covered_by_suite_digest(
+    suite_config: dict[str, Any],
+) -> None:
+    assert set(suite_config["macos_recovery_test_inputs"]) <= set(
+        suite_config["suites"]["macos-recovery"]["execution_inputs"]
+    )
+
+
+def test_macos_recovery_test_routing_without_digest_coverage_is_rejected(
+    tmp_path: Path,
+) -> None:
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    config["suites"]["macos-recovery"]["execution_inputs"].remove(
+        "tests/test_recovery/**"
+    )
+    config_path = tmp_path / "suites.v1.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(PlanError, match="must be covered by the macos-recovery"):
+        load_config(config_path)
 
 
 def test_explicit_test_path_pattern_can_select_native_desktop_e2e(

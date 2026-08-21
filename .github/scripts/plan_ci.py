@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
@@ -19,6 +22,7 @@ DEFAULT_CONFIG: Final = Path(".github/ci/suites.v1.json")
 _WINDOWS_ASSIGNMENTS_CONFIG_KEY: Final = "windows_test_assignments"
 _WINDOWS_ASSIGNMENTS_PATH_KEY: Final = "_windows_test_assignments_path"
 _LOADED_WINDOWS_ASSIGNMENTS_KEY: Final = "_loaded_windows_test_assignments"
+_MACOS_RECOVERY_TEST_INPUTS_KEY: Final = "macos_recovery_test_inputs"
 
 _DOC_EXACT: Final = {
     "CHANGELOG.md",
@@ -338,6 +342,36 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         # does not need the test assignment payload; exact test planning does.
         value[_WINDOWS_ASSIGNMENTS_PATH_KEY] = repo.resolve() / assignments_path
 
+    macos_recovery_inputs = _require_string_list(
+        value.get(_MACOS_RECOVERY_TEST_INPUTS_KEY),
+        _MACOS_RECOVERY_TEST_INPUTS_KEY,
+    )
+    for pattern in macos_recovery_inputs:
+        candidate = PurePosixPath(pattern)
+        if (
+            "\\" in pattern
+            or candidate.is_absolute()
+            or candidate.as_posix() != pattern
+            or not pattern.startswith("tests/")
+            or ".." in candidate.parts
+        ):
+            raise PlanError(
+                f"invalid {_MACOS_RECOVERY_TEST_INPUTS_KEY} pattern: {pattern!r}"
+            )
+    macos_recovery_suite = suites.get("macos-recovery")
+    if not isinstance(macos_recovery_suite, Mapping):
+        raise PlanError("suite 'macos-recovery' must be configured")
+    missing_digest_inputs = sorted(
+        set(macos_recovery_inputs)
+        - set(macos_recovery_suite["execution_inputs"])
+    )
+    if missing_digest_inputs:
+        raise PlanError(
+            f"{_MACOS_RECOVERY_TEST_INPUTS_KEY} must be covered by the "
+            "macos-recovery execution digest: "
+            + ", ".join(missing_digest_inputs)
+        )
+
     groups = value.get("desktop_groups")
     if not isinstance(groups, dict) or set(groups) != {
         "profiles",
@@ -505,6 +539,213 @@ def _safe_test_execution_target(
     return None
 
 
+def _windows_test_assignments(config: Mapping[str, Any]) -> Mapping[str, str]:
+    """Return the effective governed assignment map, loading it once per plan."""
+
+    raw_assignments = config.get(_LOADED_WINDOWS_ASSIGNMENTS_KEY)
+    if isinstance(raw_assignments, Mapping):
+        return raw_assignments
+    assignments_path = config.get(_WINDOWS_ASSIGNMENTS_PATH_KEY)
+    if not isinstance(assignments_path, Path):
+        raise PlanError("Windows test assignment path was not loaded with the contract")
+    assignments = _load_windows_test_assignments(
+        assignments_path,
+        allowed_shards=set(config["full_python_matrix"]["windows"]),
+    )
+    if isinstance(config, dict):
+        config[_LOADED_WINDOWS_ASSIGNMENTS_KEY] = assignments
+    return assignments
+
+
+def _is_test_module_path(path: str) -> bool:
+    candidate = PurePosixPath(path)
+    return (
+        path.startswith("tests/")
+        and candidate.name.startswith("test_")
+        and candidate.suffix == ".py"
+    )
+
+
+def _test_module_name(path: str) -> str:
+    candidate = PurePosixPath(path)
+    if not _is_test_module_path(path):
+        raise PlanError(f"cannot derive test module name from {path!r}")
+    return ".".join((*candidate.parts[:-1], candidate.stem))
+
+
+def _test_module_sources(
+    repo: Path, *, ref: str | None
+) -> dict[str, str]:
+    """Read every current test module without executing repository code."""
+
+    sources: dict[str, str] = {}
+    if ref is None:
+        for path in _repository_files_for_validation(repo):
+            if not _is_test_module_path(path):
+                continue
+            candidate = repo / path
+            if candidate.is_symlink():
+                raise PlanError(f"test dependency analysis rejects symlink: {path}")
+            try:
+                sources[path] = candidate.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError) as exc:
+                raise PlanError(f"cannot read test module {path}: {exc}") from exc
+        return sources
+
+    try:
+        completed = subprocess.run(
+            ["git", "archive", "--format=tar", ref, "--", "tests"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+            for member in archive.getmembers():
+                path = PurePosixPath(member.name).as_posix()
+                if not _is_test_module_path(path):
+                    continue
+                if not member.isfile():
+                    raise PlanError(
+                        f"test dependency analysis rejects non-file at {ref}: {path}"
+                    )
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise PlanError(f"cannot read test module at {ref}: {path}")
+                sources[path] = extracted.read().decode("utf-8-sig", errors="strict")
+    except (OSError, subprocess.CalledProcessError, tarfile.TarError, UnicodeError) as exc:
+        raise PlanError(f"cannot inspect test modules at ref {ref!r}: {exc}") from exc
+    return sources
+
+
+def _relative_import_name(
+    importer_module: str, *, level: int, module: str | None
+) -> str:
+    package = importer_module.split(".")[:-1]
+    keep = len(package) - (level - 1)
+    if level <= 0 or keep <= 0:
+        raise PlanError(f"invalid relative import in test module {importer_module}")
+    parts = package[:keep]
+    if module:
+        parts.extend(module.split("."))
+    return ".".join(parts)
+
+
+def _build_test_reverse_dependencies(
+    *,
+    repo: Path,
+    ref: str | None,
+    governed_paths: Iterable[str],
+) -> dict[str, frozenset[str]]:
+    """Return test-module consumers keyed by the helper module they import.
+
+    Governed paths are included in the module index even when a file was
+    deleted in the selected tree. That lets a remaining consumer of a deleted
+    helper participate in the safe execution closure.
+    """
+
+    sources = _test_module_sources(repo, ref=ref)
+    known_paths = set(sources)
+    known_paths.update(governed_paths)
+    module_to_path: dict[str, str] = {}
+    suffix_to_paths: dict[str, set[str]] = {}
+    for path in sorted(known_paths):
+        module_name = _test_module_name(path)
+        previous = module_to_path.setdefault(module_name, path)
+        if previous != path:
+            raise PlanError(f"duplicate test module identity: {module_name}")
+        parts = module_name.split(".")
+        for offset in range(len(parts)):
+            suffix_to_paths.setdefault(".".join(parts[offset:]), set()).add(path)
+
+    def resolve(module_name: str) -> str | None:
+        exact = module_to_path.get(module_name)
+        if exact is not None:
+            return exact
+        matches = suffix_to_paths.get(module_name, set())
+        if len(matches) == 1:
+            return next(iter(matches))
+        looks_like_test = module_name.rsplit(".", 1)[-1].startswith("test_")
+        if len(matches) > 1 and looks_like_test:
+            raise PlanError(f"ambiguous imported test module: {module_name}")
+        if not matches and looks_like_test and (
+            module_name.startswith("tests.") or ".test_" in module_name
+        ):
+            raise PlanError(f"unresolved imported test module: {module_name}")
+        return None
+
+    reverse: dict[str, set[str]] = {}
+    for consumer_path, source in sorted(sources.items()):
+        importer_module = _test_module_name(consumer_path)
+        try:
+            tree = ast.parse(source, filename=consumer_path)
+        except (SyntaxError, ValueError) as exc:
+            raise PlanError(f"cannot parse test module {consumer_path}: {exc}") from exc
+
+        imported_paths: set[str] = set()
+        for node in ast.walk(tree):
+            module_names: list[str] = []
+            if isinstance(node, ast.Import):
+                module_names.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = _relative_import_name(
+                        importer_module,
+                        level=node.level,
+                        module=node.module,
+                    )
+                else:
+                    base = node.module or ""
+                if base:
+                    module_names.append(base)
+                    if resolve(base) is None:
+                        for alias in node.names:
+                            if alias.name != "*":
+                                module_names.append(f"{base}.{alias.name}")
+            elif isinstance(node, ast.Call) and node.args:
+                function_name = ""
+                if isinstance(node.func, ast.Name):
+                    function_name = node.func.id
+                elif isinstance(node.func, ast.Attribute) and isinstance(
+                    node.func.value, ast.Name
+                ):
+                    function_name = f"{node.func.value.id}.{node.func.attr}"
+                if function_name in {"__import__", "importlib.import_module"} and isinstance(
+                    node.args[0], ast.Constant
+                ) and isinstance(node.args[0].value, str):
+                    module_names.append(node.args[0].value)
+
+            for module_name in module_names:
+                imported = resolve(module_name)
+                if imported is not None and imported != consumer_path:
+                    imported_paths.add(imported)
+
+        for imported in imported_paths:
+            reverse.setdefault(imported, set()).add(consumer_path)
+    return {path: frozenset(consumers) for path, consumers in reverse.items()}
+
+
+def _test_dependency_closure(
+    path: str, reverse_dependencies: Mapping[str, frozenset[str]]
+) -> set[str]:
+    selected = {path}
+    pending = [path]
+    while pending:
+        imported = pending.pop()
+        for consumer in sorted(reverse_dependencies.get(imported, ())):
+            if consumer in selected:
+                continue
+            selected.add(consumer)
+            pending.append(consumer)
+    return selected
+
+
+def _is_macos_recovery_test(path: str, config: Mapping[str, Any]) -> bool:
+    return any(
+        _matches_input(path, pattern)
+        for pattern in config[_MACOS_RECOVERY_TEST_INPUTS_KEY]
+    )
+
+
 def _add_python_target(
     path: str, targets: set[str], suites: set[str], reasons: set[str]
 ) -> str | None:
@@ -577,39 +818,43 @@ def _add_test_target(
     suites: set[str],
     reasons: set[str],
     windows_shards: set[str],
-    config: Mapping[str, Any],
+    assignments: Mapping[str, str],
+    reverse_dependencies: Mapping[str, frozenset[str]],
     repo: Path,
     ref: str | None,
-) -> bool:
-    """Select an exact governed test and its single Windows responsibility shard."""
+) -> set[str] | None:
+    """Select one governed test plus every recursive test-module consumer."""
 
-    raw_assignments = config.get(_LOADED_WINDOWS_ASSIGNMENTS_KEY)
-    if not isinstance(raw_assignments, Mapping):
-        assignments_path = config.get(_WINDOWS_ASSIGNMENTS_PATH_KEY)
-        if not isinstance(assignments_path, Path):
-            raise PlanError("Windows test assignment path was not loaded with the contract")
-        raw_assignments = _load_windows_test_assignments(
-            assignments_path,
-            allowed_shards=set(config["full_python_matrix"]["windows"]),
-        )
-        if isinstance(config, dict):
-            config[_LOADED_WINDOWS_ASSIGNMENTS_KEY] = raw_assignments
-    shard = raw_assignments.get(path)
-    if not isinstance(shard, str):
-        return False
+    if not isinstance(assignments.get(path), str):
+        return None
     execution_target = _safe_test_execution_target(path, repo=repo, ref=ref)
     if execution_target is None:
         reasons.add("deleted_test_without_safe_target")
-        return False
+        return None
+
+    selected_paths = _test_dependency_closure(path, reverse_dependencies)
+    selected_targets = {path: execution_target}
+    for selected_path in sorted(selected_paths - {path}):
+        shard = assignments.get(selected_path)
+        if not isinstance(shard, str):
+            reasons.add("test_dependency_ungoverned")
+            return None
+        if not _path_exists(repo, selected_path, ref=ref, directory=False):
+            reasons.add("test_dependency_missing")
+            return None
+        selected_targets[selected_path] = selected_path
+
     if "python-full" not in suites:
         suites.add("python-targeted")
-        targets.add(execution_target)
+        targets.update(selected_targets.values())
     suites.add("windows-high-risk")
-    windows_shards.add(shard)
+    windows_shards.update(str(assignments[selected_path]) for selected_path in selected_paths)
     reasons.add("test_only_targeted")
     if execution_target != path:
         reasons.add("deleted_test_targeted")
-    return True
+    if len(selected_paths) > 1:
+        reasons.add("test_dependency_closure")
+    return selected_paths
 
 
 def _tracked_blob_ids(repo: Path, ref: str) -> dict[str, tuple[str, str]]:
@@ -835,6 +1080,8 @@ def plan_changes(
     targeted_windows_shards: set[str] = set()
     windows_full_matrix = False
     desktop_cells: set[tuple[str, str]] = set()
+    test_reverse_dependencies: dict[str, frozenset[str]] | None = None
+    test_dependency_analysis_failed = False
     full_fallback = False
     all_docs = bool(paths) and not invalid_paths
 
@@ -882,41 +1129,75 @@ def plan_changes(
             continue
 
         if path.startswith("tests/"):
-            if not _add_test_target(
+            assignments = _windows_test_assignments(config)
+            if not isinstance(assignments.get(path), str):
+                full_fallback = True
+                reasons.add("unknown_path")
+                continue
+            if test_dependency_analysis_failed:
+                full_fallback = True
+                reasons.add("test_dependency_analysis_uncertain")
+                continue
+            if test_reverse_dependencies is None:
+                try:
+                    test_reverse_dependencies = _build_test_reverse_dependencies(
+                        repo=repo,
+                        ref=ref,
+                        governed_paths=assignments,
+                    )
+                except PlanError:
+                    test_dependency_analysis_failed = True
+                    full_fallback = True
+                    reasons.add("test_dependency_analysis_uncertain")
+                    continue
+
+            selected_test_paths = _add_test_target(
                 path,
                 targets,
                 suites,
                 reasons,
                 targeted_windows_shards,
-                config,
+                assignments,
+                test_reverse_dependencies,
                 repo,
                 ref,
-            ):
+            )
+            if selected_test_paths is None:
                 full_fallback = True
-                reasons.add("unknown_path")
+                reasons.add("test_dependency_unsafe")
                 continue
 
-            if path.startswith("tests/test_packaging/") or path == (
-                "tests/test_release_consistency.py"
-            ):
-                suites.add("release-packaging")
-                reasons.add("packaging_changed")
-            if _managed_toolchain_targets(path) is not None:
-                suites.add("managed-toolchain")
-                reasons.add("toolchain_changed")
+            for selected_test_path in sorted(selected_test_paths):
+                if selected_test_path.startswith("tests/test_packaging/") or (
+                    selected_test_path == "tests/test_release_consistency.py"
+                ):
+                    suites.add("release-packaging")
+                    reasons.add("packaging_changed")
+                if _managed_toolchain_targets(selected_test_path) is not None:
+                    suites.add("managed-toolchain")
+                    reasons.add("toolchain_changed")
+                if _is_macos_recovery_test(selected_test_path, config):
+                    suites.add("macos-recovery")
+                    reasons.add("macos_recovery_test_changed")
 
-            # Test filenames often contain product-domain words such as
-            # ``workbench`` or ``recovery``. Those words do not change the
-            # product and must not wake native E2E. A reviewed path_patterns
-            # entry remains the explicit escape hatch for a test that really
-            # owns a Desktop harness contract.
-            groups = _explicit_desktop_groups(path, config)
-            if groups:
-                suites.add("desktop-recovery-e2e")
-                desktop_cells.update(
-                    _desktop_cells(groups=groups, os_scope=_os_scope(path), config=config)
-                )
-                reasons.update(f"desktop_{group}_test_changed" for group in groups)
+                # Test filenames often contain product-domain words such as
+                # ``workbench`` or ``recovery``. Those words do not change the
+                # product and must not wake native E2E. A reviewed path_patterns
+                # entry remains the explicit escape hatch for a test that really
+                # owns a Desktop harness contract.
+                groups = _explicit_desktop_groups(selected_test_path, config)
+                if groups:
+                    suites.add("desktop-recovery-e2e")
+                    desktop_cells.update(
+                        _desktop_cells(
+                            groups=groups,
+                            os_scope=_os_scope(selected_test_path),
+                            config=config,
+                        )
+                    )
+                    reasons.update(
+                        f"desktop_{group}_test_changed" for group in groups
+                    )
             continue
 
         if path.startswith("opensquilla-webui/") or path.startswith(
