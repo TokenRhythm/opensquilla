@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import shutil
 from collections.abc import Iterable, Mapping
@@ -86,6 +87,20 @@ def _dedupe(paths: Iterable[str | Path], *, windows: bool) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _dedupe_path_text(paths: Iterable[str], *, windows: bool) -> tuple[str, ...]:
+    """Deduplicate PATH entries without rewriting the approved environment text."""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in paths:
+        key = ntpath.normcase(value) if windows else value
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return tuple(result)
+
+
 class RuntimePackResolver:
     """Resolve only activated and integrity-checked Runtime Packs."""
 
@@ -161,15 +176,20 @@ class RuntimePackResolver:
         result = dict(environment or {})
         path_key = next((key for key in result if key.casefold() == "path"), "PATH")
         host = tuple(
-            Path(part) for part in result.get(path_key, "").split(os.pathsep) if part.strip()
+            part for part in result.get(path_key, "").split(os.pathsep) if part.strip()
         )
-        resolved = self.path_for(
-            mode,
-            host,
-            policy=policy,
-            require_managed=require_managed,
+        managed = tuple(str(path) for path in self.managed_path(policy))
+        if require_managed:
+            combined = managed
+        elif normalize_run_mode(mode) is RunMode.FULL:
+            combined = (*host, *managed)
+        else:
+            combined = (*managed, *host)
+        resolved = _dedupe_path_text(
+            combined,
+            windows=self.target.startswith("windows-"),
         )
-        result[path_key] = os.pathsep.join(str(path) for path in resolved)
+        result[path_key] = os.pathsep.join(resolved)
         return result
 
     def resolve_component_binary(

@@ -94,6 +94,20 @@ def test_default_source_order_prefers_the_regional_primary_and_keeps_fallback(
     assert runtime_pack_manager._configured_source_order() == expected
 
 
+def test_windows_runtime_environment_preserves_approved_path_text(tmp_path: Path) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    resolver = RuntimePackResolver(service)
+    resolver.target = "windows-x64"
+
+    environment = resolver.apply_environment(
+        {"PATH": "./approved-path"},
+        mode=RunMode.SAFE,
+    )
+
+    assert environment["PATH"] == "./approved-path"
+
+
 def test_atomic_state_replace_retries_transient_windows_reader_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
