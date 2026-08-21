@@ -30,6 +30,8 @@
 
 ## お知らせ
 
+- 📢 **2026-08-21** — 技術レポートの PDF 版を本リポジトリに収録しました: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
+
 - 📢 **2026-07-03** — 技術レポート **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)**（プレビュー版）を、OpenSquilla **0.5.0 Preview 1** と同時に公開しました。harness ネイティブなルーターが日々の Agent トラフィックを自己改善型のデータフライホイールへと変える仕組みを詳しく解説しています。
 
 ---

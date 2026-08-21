@@ -30,6 +30,8 @@
 
 ## Neuigkeiten
 
+- 📢 **2026-08-21** — PDF-Versionen unseres technischen Berichts sind jetzt in diesem Repository verfügbar: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
+
 - 📢 **2026-07-03** — Unser technischer Bericht **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)** (Vorschau) ist erschienen und wurde zusammen mit OpenSquilla **0.5.0 Preview 1** veröffentlicht. Er beschreibt, wie der harness-native Router alltäglichen Agent-Traffic in ein sich selbst verbesserndes Daten-Schwungrad verwandelt.
 
 ---
