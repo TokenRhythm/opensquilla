@@ -239,31 +239,20 @@ async function fetchCustomModels() {
   customFetching.value = true
   customError.value = ''
   try {
-    const url = `${baseUrl.replace(/\/+$/, '')}/models`
-    const headers: Record<string, string> = { accept: 'application/json' }
-    const key = customApiKey.value.trim()
-    if (key) headers.authorization = `Bearer ${key}`
-    const response = await fetch(url, { method: 'GET', headers })
-    if (!response.ok) {
-      const hint = response.status === 401 || response.status === 403
-        ? '; check the API key'
-        : ''
-      throw new Error(`${url} answered ${response.status}${hint}`)
+    const res = await rpc.call<Record<string, unknown>>('onboarding.customProvider.models.discover', {
+      baseUrl,
+      apiKey: customApiKey.value.trim(),
+    })
+    const payload = (res ?? {}) as Record<string, unknown>
+    if (payload.ok === false) {
+      throw new Error(String(payload.error ?? 'unknown error'))
     }
-    const text = await response.text()
-    const parsed = JSON.parse(text)
-    const rows: Record<string, unknown>[] = Array.isArray(parsed?.data)
-      ? parsed.data
-      : Array.isArray(parsed)
-        ? parsed
-        : Array.isArray(parsed?.models)
-          ? parsed.models
-          : []
-    const discovered = rows
-      .filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object')
+    const models = Array.isArray(payload.models) ? payload.models : []
+    const discovered = models
+      .filter((row: unknown): row is Record<string, unknown> => Boolean(row) && typeof row === 'object')
       .map(row => ({
-        id: String(row.id ?? row.model ?? '').trim(),
-        name: String(row.name ?? row.display_name ?? row.id ?? '').trim(),
+        id: String(row.id ?? '').trim(),
+        name: String(row.label ?? row.id ?? '').trim(),
       }))
       .filter(item => item.id)
     if (discovered.length > 0) {

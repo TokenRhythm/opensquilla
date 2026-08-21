@@ -456,6 +456,7 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.llmProfile.models.discover": ADMIN_SCOPE,
     "onboarding.llmProfile.draft.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.draft.models.discover": ADMIN_SCOPE,
+    "onboarding.customProvider.models.discover": ADMIN_SCOPE,
     # Model discovery is read-shaped but admin-scoped for the same reason as
     # the probe: its params accept candidate credentials (apiKey/apiKeyEnv),
     # which must never be acceptable from a read/write-tier caller.
