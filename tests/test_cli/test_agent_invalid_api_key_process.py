@@ -35,6 +35,7 @@ def _isolated_agent_env(tmp_path: Path, base_url: str) -> dict[str, str]:
             "OPENSQUILLA_HOME": str(tmp_path / "home"),
             "OPENSQUILLA_STATE_DIR": str(tmp_path / "state"),
             "OPENSQUILLA_USER_STATE_DIR": str(tmp_path / "user-state"),
+            "OPENSQUILLA_TEST_PROFILE_LOCK_ROOT": "1",
             "OPENSQUILLA_LOG_DIR": str(tmp_path / "logs"),
             "OPENSQUILLA_LOG_FILE_ENABLED": "false",
             "OPENSQUILLA_LLM_PROVIDER": "openai",
@@ -103,6 +104,7 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
     server_thread.start()
     host, port = server.server_address
     env = _isolated_agent_env(tmp_path, f"http://{host}:{port}/v1")
+    assert env["OPENSQUILLA_TEST_PROFILE_LOCK_ROOT"] == "1"
     process = subprocess.Popen(
         [
             sys.executable,
