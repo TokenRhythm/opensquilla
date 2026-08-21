@@ -5917,6 +5917,7 @@ class TestSessionsAbort:
         ]
         assert runtime.wait_calls == ["task-live"]
 
+    @pytest.mark.ci_serial
     @pytest.mark.asyncio
     async def test_abort_runtime_drain_waits_concurrently_under_one_deadline(
         self,
@@ -5962,6 +5963,7 @@ class TestSessionsAbort:
         assert runtime.active_waits == 0
         assert elapsed < 0.15
 
+    @pytest.mark.ci_serial
     @pytest.mark.asyncio
     async def test_abort_runtime_drain_does_not_join_stubborn_cancelled_waiter(
         self,
@@ -5999,6 +6001,7 @@ class TestSessionsAbort:
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=0.2)
 
+    @pytest.mark.ci_serial
     @pytest.mark.asyncio
     async def test_abort_slow_session_lookup_does_not_delay_compaction_cancel(
         self,
@@ -6053,6 +6056,7 @@ class TestSessionsAbort:
         assert owner.cancelled() is True
         assert elapsed < 0.15
 
+    @pytest.mark.ci_serial
     @pytest.mark.asyncio
     async def test_abort_slow_runtime_cancel_cannot_extend_shared_stop_budget(
         self,

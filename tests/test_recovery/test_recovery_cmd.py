@@ -16,6 +16,9 @@ from opensquilla.cli.recovery_cmd import recovery_app
 from opensquilla.recovery.cleanup import cleanup_inspect
 from opensquilla.recovery.locking import ProfileOperationLock
 
+# Keep the contract bounded while allowing for cold CLI imports on saturated CI runners.
+_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS = 30
+
 
 def _workspace(path: Path, marker: str) -> Path:
     path.mkdir(parents=True)
@@ -409,7 +412,7 @@ def test_delete_all_helper_waits_for_parent_pipe_eof_before_reinspection(
         process.stdin.write(_cleanup_approval(inspected))
         process.stdin.flush()
         process.stdin.close()
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS) == 0
         assert process.stdout is not None
         payload = json.loads(process.stdout.read())
         assert payload["outcome"] == "complete"
@@ -481,7 +484,7 @@ def test_delete_all_helper_allows_confirmed_chromium_entry_to_disappear_at_exit(
         process.stdin.write(_cleanup_approval(inspected))
         process.stdin.flush()
         process.stdin.close()
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS) == 0
         assert process.stdout is not None
         payload = json.loads(process.stdout.read())
         assert payload["outcome"] == "complete"
@@ -553,7 +556,7 @@ def test_delete_all_helper_refuses_a_new_unconfirmed_scope_after_parent_exit(
         process.stdin.write(_cleanup_approval(inspected))
         process.stdin.flush()
         process.stdin.close()
-        assert process.wait(timeout=10) == 2
+        assert process.wait(timeout=_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS) == 2
         assert process.stdout is not None
         payload = json.loads(process.stdout.read())
         assert payload["outcome"] == "blocked"
