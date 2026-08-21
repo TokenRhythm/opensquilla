@@ -8292,7 +8292,7 @@ async function startGateway(): Promise<GatewayState> {
     return gatewayState
   }
 
-  sendBootStatus('gateway-health')
+  sendBootStatus('profile')
   await recoverVerifiedOrphanGatewayBeforeSpawn()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 

@@ -169,6 +169,7 @@
     }
 
     .status-line {
+      --boot-progress: 0%;
       height: 5px;
       overflow: hidden;
       border-radius: 999px;
@@ -176,20 +177,18 @@
     }
 
     .status-line::before {
-      animation: progress 1.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
-      background: linear-gradient(90deg, transparent, var(--accent) 28%, var(--accent) 72%, transparent);
+      background: var(--accent);
       content: "";
       display: block;
       height: 100%;
-      width: 46%;
+      width: var(--boot-progress);
       border-radius: inherit;
     }
 
-    /* On a startup failure the splash is paused, not working — freeze every
-       indeterminate animation so it doesn't contradict the paused state. */
+    /* The bar is determinate and therefore freezes naturally on failure. Dim
+       the completed portion while the active startup attempt is paused. */
     body.errored .status-line::before {
-      animation: none;
-      opacity: 0.2;
+      opacity: 0.45;
     }
 
     body.errored .loader::before,
@@ -202,6 +201,20 @@
       display: flex;
       justify-content: space-between;
       gap: 18px;
+    }
+
+    .status-metrics {
+      align-items: center;
+      display: flex;
+      flex: 0 0 auto;
+      gap: 10px;
+    }
+
+    .progress-count {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
     }
 
     .phase {
@@ -448,12 +461,6 @@
       box-shadow: 0 6px 18px -10px var(--accent);
     }
 
-    @keyframes progress {
-      0% { transform: translateX(-115%); opacity: 0.35; }
-      28%, 68% { opacity: 1; }
-      100% { transform: translateX(250%); opacity: 0.35; }
-    }
-
     @keyframes loader-segment {
       0%, 12.5% {
         background: var(--accent);
@@ -521,10 +528,21 @@
       </section>
 
       <section class="status">
-        <div class="status-line" aria-hidden="true"></div>
+        <div
+          class="status-line"
+          id="startupProgress"
+          role="progressbar"
+          aria-labelledby="phase"
+          aria-valuemin="0"
+          aria-valuemax="4"
+          aria-valuenow="0"
+        ></div>
         <div class="status-copy">
           <span class="phase" id="phase" data-i18n="phaseDefault" role="status" aria-live="polite" aria-atomic="true">Preparing desktop profile</span>
-          <span class="timer" id="timer" aria-hidden="true">00.0s</span>
+          <span class="status-metrics" aria-hidden="true">
+            <span class="progress-count" id="progressCount">0/4</span>
+            <span class="timer" id="timer" aria-hidden="true">00.0s</span>
+          </span>
         </div>
         <div class="steps" aria-hidden="true">
           <span class="step active" data-step="profile" data-i18n="stepProfile">Profile</span>
@@ -740,8 +758,20 @@
 
     let phaseStartedAt = performance.now();
     let phaseStatusIdentity = '';
+    const BOOT_PROGRESS_MAX = 4;
+    const bootProgressByPhase = Object.freeze({
+      profile: 0,
+      'gateway-start': 1,
+      'gateway-health': 2,
+      control: 3,
+      ready: 4,
+    });
+    let completedBootMilestones = 0;
+    let resetBootProgressOnNextStatus = false;
     const phase = document.getElementById('phase');
     const timer = document.getElementById('timer');
+    const startupProgress = document.getElementById('startupProgress');
+    const progressCount = document.getElementById('progressCount');
     const errorPanel = document.getElementById('errorPanel');
     const errorMessage = document.getElementById('errorMessage');
     const recoveryPanel = document.getElementById('recoveryPanel');
@@ -795,8 +825,25 @@
       }
     }
 
+    function renderBootProgress() {
+      const value = Math.max(0, Math.min(BOOT_PROGRESS_MAX, completedBootMilestones));
+      startupProgress.style.setProperty('--boot-progress', `${(value / BOOT_PROGRESS_MAX) * 100}%`);
+      startupProgress.setAttribute('aria-valuenow', String(value));
+      progressCount.textContent = `${value}/${BOOT_PROGRESS_MAX}`;
+    }
+
     function applyStatus(payload) {
       const phaseId = payload && payload.phaseId ? String(payload.phaseId) : 'profile';
+      if (resetBootProgressOnNextStatus) {
+        completedBootMilestones = 0;
+        resetBootProgressOnNextStatus = false;
+        renderBootProgress();
+      }
+      const reportedProgress = bootProgressByPhase[phaseId];
+      if (Number.isInteger(reportedProgress)) {
+        completedBootMilestones = Math.max(completedBootMilestones, reportedProgress);
+        renderBootProgress();
+      }
       const statusAt = payload && payload.at ? String(payload.at) : '';
       const statusIdentity = phaseId + '\u0000' + statusAt;
       if (statusIdentity !== phaseStatusIdentity) {
@@ -814,10 +861,12 @@
       errorPanel.classList.remove('visible');
       recoveryPanel.classList.remove('visible');
       document.body.classList.remove('recovering');
-      // Leaving the error state: resume the sweep and the elapsed timer.
+      // Leaving the error state: resume the elapsed timer. The determinate
+      // progress bar advances only when a real milestone is reported.
       document.body.classList.remove('errored');
       if (!timerInterval) timerInterval = setInterval(updateTimer, 100);
-      setStepState(stepMap[phaseId] || 'profile', phaseId === 'ready');
+      const activeStep = stepMap[phaseId];
+      if (activeStep) setStepState(activeStep, phaseId === 'ready');
     }
 
     function applyError(payload) {
@@ -834,6 +883,7 @@
       // the .errored class), and drop the active step highlight so a failed phase
       // is not shown as still running.
       document.body.classList.add('errored');
+      resetBootProgressOnNextStatus = true;
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       for (const step of Object.values(steps)) {
         if (step) step.classList.remove('active');
@@ -852,6 +902,7 @@
 
       const wasVisible = recoveryPanel.classList.contains('visible');
       document.body.classList.add('recovering', 'errored');
+      resetBootProgressOnNextStatus = true;
       errorPanel.classList.remove('visible');
       recoveryPanel.classList.add('visible');
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }

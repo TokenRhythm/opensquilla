@@ -577,7 +577,7 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert boot_html.count("profileInUse:") == 6
 
 
-def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None:
+def test_boot_error_and_recovery_states_freeze_determinate_progress() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     paused_styles = _section(
         boot_html,
@@ -595,12 +595,16 @@ def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None
         "async function runRecoveryAction",
     )
 
-    assert "animation: none" in paused_styles
+    assert "opacity: 0.45" in paused_styles
+    assert "@keyframes progress" not in boot_html
+    assert "animation: progress" not in boot_html
     assert "body.errored .loader::before" in paused_styles
     assert "body.errored .loader span" in paused_styles
     assert "animation-play-state: paused" in paused_styles
     assert "document.body.classList.add('errored')" in apply_error
     assert "document.body.classList.add('recovering', 'errored')" in render_recovery
+    assert "resetBootProgressOnNextStatus = true" in apply_error
+    assert "resetBootProgressOnNextStatus = true" in render_recovery
 
 
 def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() -> None:
@@ -642,6 +646,65 @@ def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() 
     assert "phaseStartedAt = performance.now() - Math.max(0, wallAgeMs)" in apply_status
     assert "updateTimer()" in apply_status
     assert "performance.now() - phaseStartedAt" in timer
+
+
+def test_boot_progress_reports_only_completed_startup_milestones() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    main_ts = _read("desktop/electron/src/main.ts")
+    apply_status = _section(
+        boot_html,
+        "function applyStatus(payload)",
+        "function applyError(payload)",
+    )
+    render_progress = _section(
+        boot_html,
+        "function renderBootProgress()",
+        "function applyStatus(payload)",
+    )
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert 'id="startupProgress"' in boot_html
+    assert 'role="progressbar"' in boot_html
+    assert 'aria-labelledby="phase"' in boot_html
+    assert 'aria-valuemin="0"' in boot_html
+    assert 'aria-valuemax="4"' in boot_html
+    assert 'aria-valuenow="0"' in boot_html
+    assert 'id="progressCount">0/4<' in boot_html
+
+    for phase, value in {
+        "profile": 0,
+        "'gateway-start'": 1,
+        "'gateway-health'": 2,
+        "control": 3,
+        "ready": 4,
+    }.items():
+        assert f"{phase}: {value}" in boot_html
+
+    assert "Math.max(completedBootMilestones, reportedProgress)" in apply_status
+    assert "if (Number.isInteger(reportedProgress))" in apply_status
+    assert "if (resetBootProgressOnNextStatus)" in apply_status
+    assert "resetBootProgressOnNextStatus = false" in apply_status
+    assert "const activeStep = stepMap[phaseId]" in apply_status
+    assert "if (activeStep) setStepState" in apply_status
+    assert "stepMap[phaseId] || 'profile'" not in apply_status
+    assert "--boot-progress" in render_progress
+    assert "aria-valuenow" in render_progress
+    assert "progressCount.textContent" in render_progress
+
+    assert (
+        "sendBootStatus('profile')\n"
+        "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
+        in start_gateway
+    )
+    assert (
+        "sendBootStatus('gateway-health')\n"
+        "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
+        not in start_gateway
+    )
 
 
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
