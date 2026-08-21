@@ -138,15 +138,15 @@ describe('UnifiedAssistantActivityTimeline', () => {
       'Model response',
       '思考一',
       '第一段',
-      'skill_view',
+      'Used tools',
       'Model response',
       '思考二',
       '第二段',
-      'write_file',
+      'Edited files',
       'Model response',
       '思考三',
       '马上发布',
-      'publish_artifact',
+      'Created artifacts',
       'Answer composition',
     ]) {
       const next = visible.indexOf(token, cursor + 1)
