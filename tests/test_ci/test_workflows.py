@@ -1705,15 +1705,24 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         (
             "offline-document-workbench-e2e",
             "Windows",
+            "Traceback (most recent call last):\n"
+            "    at synthetic_allowed_stack\n"
             "E           AssertionError: isolated Windows ACL hardening timed out: "
-            "stdout='synthetic'\n",
+            "stdout='synthetic'\n"
+            "FAILED tests/synthetic.py - AssertionError: isolated Windows ACL hardening "
+            "timed out: stdout='synthetic'\n",
             "windows-isolated-acl-worker-timeout-v1",
         ),
         (
             "offline-document-workbench-e2e",
             "macOS",
-            "Error: electronApplication.evaluate: Error: "
-            "ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n",
+            "electronApplication.evaluate: Error: "
+            "ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n"
+            "    at synthetic_allowed_stack (native-workbench.mjs:1:1)\n"
+            "Error: /synthetic/test-native-workbench-v2-electron.mjs failed with exit "
+            "code 1\n"
+            "    at synthetic_outer_stack (offline-workbench.mjs:1:1)\n"
+            "Error: ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n",
             "macos-electron-foreground-prerequisite-v1",
         ),
     ),
@@ -1826,7 +1835,70 @@ def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Pat
     assert hard_failure.returncode == 1
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert records[-1]["classification"] == "non_retryable"
-    assert records[-1]["blocked_markers"] == ["TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:"]
+    assert records[-1]["blocked_markers"] == [
+        "trusted-overlay-input-contract-failed-v1"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("additional_failure", "expected_marker"),
+    (
+        (
+            "AssertionError: submitted document content differs from the saved revision\n",
+            "generic-assertion-error-v1",
+        ),
+        (
+            "FATAL: renderer process crashed while committing the document\n",
+            "fatal-crash-process-exit-v1",
+        ),
+    ),
+)
+def test_desktop_retry_classifier_rejects_allowed_signature_with_another_terminal_failure(
+    tmp_path: Path,
+    additional_failure: str,
+    expected_marker: str,
+) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    log.write_text(
+        "electronApplication.evaluate: Error: "
+        "ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n"
+        "    at synthetic_allowed_stack (native-workbench.mjs:1:1)\n"
+        "Error: /synthetic/test-native-workbench-v2-electron.mjs failed with exit code 1\n"
+        + additional_failure,
+        encoding="utf-8",
+    )
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "offline-document-workbench-e2e",
+            "macOS",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == "non_retryable"
+    assert record["retryable"] is False
+    assert record["blocked_markers"] == [expected_marker]
+    assert all("submitted document content" not in marker for marker in record["blocked_markers"])
+    assert list(evidence.iterdir()) == []
 
 
 def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> None:

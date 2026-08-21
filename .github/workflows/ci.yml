@@ -1363,14 +1363,27 @@ jobs:
                       r"; pending synthetic targets: .+$",
                       re.MULTILINE,
                   ),
+                  "companion_patterns": (),
               },
               {
                   "id": "windows-isolated-acl-worker-timeout-v1",
                   "os": "Windows",
                   "cases": {"offline-document-workbench-e2e"},
                   "pattern": re.compile(
-                      r"^(?:E\s+)?AssertionError: isolated Windows ACL hardening timed out: .+$",
+                      r"^(?:(?:E\s+)|(?:FAILED\s+\S+\s+-\s+))?"
+                      r"AssertionError: isolated Windows ACL hardening timed out: .+$",
                       re.MULTILINE,
+                  ),
+                  # pytest can print the same allowed exception once in its
+                  # traceback and again in the short failure summary.  Remove
+                  # only the structural traceback header; any unrelated
+                  # terminal exception inside that traceback remains visible
+                  # to the residual-failure scan below.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^\s*Traceback \(most recent call last\):\s*$",
+                          re.MULTILINE,
+                      ),
                   ),
               },
               {
@@ -1378,27 +1391,107 @@ jobs:
                   "os": "macOS",
                   "cases": {"offline-document-workbench-e2e"},
                   "pattern": re.compile(
-                      r"^Error: (?:electronApplication\.evaluate: Error: )?"
+                      r"^(?:(?:Error: )?electronApplication\.evaluate: Error: |Error: )"
                       r"ELECTRON_FOREGROUND_PREREQUISITE_MISSING: .+$",
                       re.MULTILINE,
+                  ),
+                  # The outer offline-workbench runner reports the native
+                  # subprocess exit after streaming the structured inner
+                  # exception.  It is part of that same exception stack, not
+                  # a second failure, and is bound to the exact child script.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^Error: .*test-native-workbench-v2-electron\.mjs "
+                          r"failed with exit code 1$",
+                          re.MULTILINE,
+                      ),
                   ),
               },
           )
           hard_failure_markers = (
-              "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED:",
-              "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:",
-              "DESKTOP_E2E_PHASE_TIMEOUT:",
-              "DESKTOP_E2E_PHASE_FAILED:",
-              "DESKTOP_E2E_PROCESS_EXITED:",
+              (
+                  "trusted-overlay-focus-contract-failed-v1",
+                  "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED:",
+              ),
+              (
+                  "trusted-overlay-input-contract-failed-v1",
+                  "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:",
+              ),
+              ("desktop-e2e-phase-timeout-v1", "DESKTOP_E2E_PHASE_TIMEOUT:"),
+              ("desktop-e2e-phase-failed-v1", "DESKTOP_E2E_PHASE_FAILED:"),
+              ("desktop-e2e-process-exited-v1", "DESKTOP_E2E_PROCESS_EXITED:"),
           )
-          matches = [
-              rule["id"]
+          generic_failure_markers = (
+              (
+                  "generic-assertion-error-v1",
+                  re.compile(
+                      r"^\s*(?:E\s+)?AssertionError(?:\s*[:(]|\s*$)",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "generic-error-or-exception-v1",
+                  re.compile(
+                      r"^\s*(?:E\s+)?(?!AssertionError\s*:)(?:Error|Exception|"
+                      r"[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*:",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "python-traceback-v1",
+                  re.compile(
+                      r"^\s*Traceback \(most recent call last\):\s*$",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "fatal-crash-process-exit-v1",
+                  re.compile(
+                      r"^(?:\s*(?:FATAL(?: ERROR)?|PANIC)\s*:|"
+                      r".*\b(?:Segmentation fault|core dumped)\b.*|"
+                      r".*\b(?:process|command)\b.*\b(?:crashed|exited unexpectedly|"
+                      r"failed with exit code|exited with (?:code|signal))\b.*)$",
+                      re.IGNORECASE | re.MULTILINE,
+                  ),
+              ),
+          )
+          matched_rules = [
+              rule
               for rule in rules
               if rule["os"] == runner_os
               and case_name in rule["cases"]
               and rule["pattern"].search(text) is not None
           ]
-          blocked_markers = sorted(marker for marker in hard_failure_markers if marker in text)
+          matches = [rule["id"] for rule in matched_rules]
+
+          # Remove every occurrence of the one permitted terminal exception,
+          # including duplicate summaries and narrowly bound outer wrappers.
+          # Any other terminal failure left in the combined case log blocks
+          # the retry, even when a permitted signature also occurred.
+          residual = text
+          for rule in matched_rules:
+              residual = rule["pattern"].sub("", residual)
+              for companion_pattern in rule["companion_patterns"]:
+                  residual = companion_pattern.sub("", residual)
+
+          blocked_markers = {
+              marker_id
+              for marker_id, marker_text in hard_failure_markers
+              if marker_text in text
+          }
+          generic_residual = residual
+          for _, marker_text in hard_failure_markers:
+              generic_residual = re.sub(
+                  rf"^.*{re.escape(marker_text)}.*$",
+                  "",
+                  generic_residual,
+                  flags=re.MULTILINE,
+              )
+          blocked_markers.update(
+              marker_id
+              for marker_id, marker_pattern in generic_failure_markers
+              if marker_pattern.search(generic_residual) is not None
+          )
           retryable = len(matches) == 1 and not blocked_markers
           record = {
               "schema_version": 1,
@@ -1407,7 +1500,7 @@ jobs:
               "attempt": 1,
               "classification": matches[0] if retryable else "non_retryable",
               "retryable": retryable,
-              "blocked_markers": blocked_markers,
+              "blocked_markers": sorted(blocked_markers),
               "log_sha256": hashlib.sha256(payload).hexdigest(),
           }
           with Path(output_name).open("a", encoding="utf-8") as handle:
