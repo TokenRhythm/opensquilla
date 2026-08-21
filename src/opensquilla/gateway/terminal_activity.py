@@ -496,7 +496,10 @@ def build_terminal_activity_snapshot(
                 tools[tool_id] = existing_entry
                 append(existing_entry)
                 complete = False
-            existing_entry["ended_at"] = max(int(existing_entry["started_at"]), _event_end_at(payload))
+            existing_entry["ended_at"] = max(
+                int(existing_entry["started_at"]),
+                _event_end_at(payload),
+            )
             existing_entry["is_error"] = payload.get("is_error", payload.get("isError")) is True
 
             result_record = _json_record(
