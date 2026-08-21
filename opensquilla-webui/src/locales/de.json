@@ -60,7 +60,11 @@
     "removeBody": "{name} verschwindet aus der Seitenleiste. Aufgabenverlauf und Dateien bleiben erhalten.",
     "removeBodyWithCronJobs": "{name} verschwindet aus der Seitenleiste. {count} verknüpfte geplante Aufgabe(n) werden pausiert und bis zur erneuten Bindung oder Löschung beibehalten. Aufgabenverlauf und Dateien bleiben erhalten.",
     "removeConfirm": "Projekt entfernen",
-    "removeFailed": "Projekt konnte nicht entfernt werden: {error}"
+    "removeFailed": "Projekt konnte nicht entfernt werden: {error}",
+    "sessionMoved": "Aufgabe in Projekt verschoben",
+    "moveSessionFailed": "Aufgabe konnte nicht verschoben werden: {error}",
+    "sessionRemoved": "Aufgabe aus Projekt entfernt",
+    "removeSessionFailed": "Aufgabe konnte nicht aus Projekt entfernt werden: {error}"
   },
   "updates": {
     "available": "OpenSquilla {version} ist verfügbar",
@@ -4292,7 +4296,10 @@
       "bulkDeleteConfirm": "Ausgewählte löschen",
       "bulkDeleteDone": "{count} Sitzungen gelöscht",
       "bulkDeletePartial": "{count} Sitzungen konnten nicht gelöscht werden",
-      "bulkDeleteFailed": "Ausgewählte Sitzungen konnten nicht gelöscht werden"
+      "bulkDeleteFailed": "Ausgewählte Sitzungen konnten nicht gelöscht werden",
+      "moveToProject": "In Projekt verschieben",
+      "moveFromProject": "Aus Projekt entfernen",
+      "newProject": "Neues Projekt…"
     },
     "setupBanner": {
       "ariaLabel": "Gateway-Einrichtung erforderlich",

@@ -60,7 +60,11 @@
     "removeBody": "{name} disparaîtra de la barre latérale. Son historique et ses fichiers seront conservés.",
     "removeBodyWithCronJobs": "{name} disparaîtra de la barre latérale. {count} tâche(s) planifiée(s) liée(s) seront suspendues et conservées jusqu’à leur réassociation ou suppression. L’historique et les fichiers seront conservés.",
     "removeConfirm": "Retirer le projet",
-    "removeFailed": "Impossible de retirer le projet : {error}"
+    "removeFailed": "Impossible de retirer le projet : {error}",
+    "sessionMoved": "Tâche déplacée vers le projet",
+    "moveSessionFailed": "Impossible de déplacer la tâche : {error}",
+    "sessionRemoved": "Tâche retirée du projet",
+    "removeSessionFailed": "Impossible de retirer la tâche du projet : {error}"
   },
   "updates": {
     "available": "OpenSquilla {version} est disponible",
@@ -4292,7 +4296,10 @@
       "bulkDeleteConfirm": "Supprimer la sélection",
       "bulkDeleteDone": "{count} sessions supprimées",
       "bulkDeletePartial": "{count} sessions n'ont pas pu être supprimées",
-      "bulkDeleteFailed": "Impossible de supprimer les sessions sélectionnées"
+      "bulkDeleteFailed": "Impossible de supprimer les sessions sélectionnées",
+      "moveToProject": "Déplacer vers le projet",
+      "moveFromProject": "Retirer du projet",
+      "newProject": "Nouveau projet…"
     },
     "setupBanner": {
       "ariaLabel": "Configuration de la passerelle requise",

@@ -774,6 +774,11 @@ summary.control-row--divider:focus-visible {
 .sidebar-group__body {
   display: grid;
   grid-template-rows: 1fr;
+  /* Clamp the column track: an implicit auto track sizes to the rows'
+     min-content, so a long non-wrapping session title would stretch every
+     row wider than the sidebar and push the absolute ⋯ trigger out of
+     reach. minmax(0, 1fr) cuts that min-content propagation. */
+  grid-template-columns: minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -781,6 +786,7 @@ summary.control-row--divider:focus-visible {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 /* Subagent indent: a left rail mirrors the console list's nested look. The
@@ -788,6 +794,8 @@ summary.control-row--divider:focus-visible {
 .sidebar-history-row {
   padding-left: calc(var(--row-depth, 0) * 14px);
   position: relative;
+  min-width: 0;
+  max-width: 100%;
 }
 .sidebar-history-rail {
   position: absolute;

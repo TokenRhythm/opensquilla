@@ -60,7 +60,11 @@
     "removeBody": "{name} desaparecerá de la barra lateral. Se conservarán el historial y los archivos.",
     "removeBodyWithCronJobs": "{name} desaparecerá de la barra lateral. Se pausarán y conservarán {count} tarea(s) programada(s) vinculada(s) hasta que se vuelvan a vincular o se eliminen. Se conservarán el historial y los archivos.",
     "removeConfirm": "Quitar proyecto",
-    "removeFailed": "No se pudo quitar el proyecto: {error}"
+    "removeFailed": "No se pudo quitar el proyecto: {error}",
+    "sessionMoved": "Tarea movida al proyecto",
+    "moveSessionFailed": "No se pudo mover la tarea: {error}",
+    "sessionRemoved": "Tarea removida del proyecto",
+    "removeSessionFailed": "No se pudo remover la tarea del proyecto: {error}"
   },
   "updates": {
     "available": "OpenSquilla {version} ya está disponible",
@@ -4292,7 +4296,10 @@
       "bulkDeleteConfirm": "Eliminar seleccionadas",
       "bulkDeleteDone": "{count} sesiones eliminadas",
       "bulkDeletePartial": "No se pudieron eliminar {count} sesiones",
-      "bulkDeleteFailed": "No se pudieron eliminar las sesiones seleccionadas"
+      "bulkDeleteFailed": "No se pudieron eliminar las sesiones seleccionadas",
+      "moveToProject": "Mover al proyecto",
+      "moveFromProject": "Quitar del proyecto",
+      "newProject": "Nuevo proyecto…"
     },
     "setupBanner": {
       "ariaLabel": "Es necesaria la configuración de la puerta de enlace",
