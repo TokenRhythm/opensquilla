@@ -405,6 +405,7 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=10)
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
     tmp_path: Path,

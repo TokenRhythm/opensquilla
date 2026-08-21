@@ -11,6 +11,7 @@ import { normalizeTurnOutcome, turnOutcomePresentation } from '@/utils/chat/turn
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 
 export const SESSION_LIST_VIEW = 'session-list-v1'
+const SESSION_LIST_PAGE_SIZE = 200
 
 export type { RawSessionItem } from '@/types/rpc'
 
@@ -750,6 +751,8 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
   const hasMore = ref(false)
   const nextCursor = ref<string | null>(null)
   let requestGeneration = 0
+  let loadedPageCount = 0
+  let pageCursors = new Set<string>()
 
   const allSessions = computed((): SessionItem[] =>
     sessionsList.value
@@ -766,7 +769,11 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
       : rpc.call<SessionsListResponse>('sessions.list', params)
   }
 
-  function applyPageState(data: SessionsListResponse | null | undefined, requestedCursor?: string) {
+  function pageState(
+    data: SessionsListResponse | null | undefined,
+    seenCursors: Set<string>,
+    requestedCursor?: string,
+  ) {
     const rawHasMore = data?.hasMore ?? data?.has_more
     const rawNextCursor = data?.nextCursor ?? data?.next_cursor
     const candidate = typeof rawNextCursor === 'string' && rawNextCursor
@@ -777,30 +784,85 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
     const usable = rawHasMore === true
       && candidate !== null
       && candidate !== requestedCursor
-    hasMore.value = usable
-    nextCursor.value = usable ? candidate : null
+      && !seenCursors.has(candidate)
+    if (usable && candidate) seenCursors.add(candidate)
+    return {
+      hasMore: usable,
+      nextCursor: usable ? candidate : null,
+    }
+  }
+
+  function appendUniqueSessions(
+    target: RawSessionListEntry[],
+    page: RawSessionListEntry[],
+  ) {
+    const seen = new Set(target.map(itemKey))
+    let added = 0
+    for (const item of page) {
+      const key = itemKey(item)
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      target.push(item)
+      added += 1
+    }
+    return added
   }
 
   async function loadSessions() {
     const generation = ++requestGeneration
+    const pagesToReload = Math.max(1, loadedPageCount)
     isLoading.value = true
     isLoadingMore.value = false
     sessionListError.value = false
     loadMoreError.value = false
     try {
       await waitForSessionRpcConnection(rpc, readCallOptions)
-      const params = { limit: 200, view: SESSION_LIST_VIEW }
-      const data = await callSessionsList(params)
       if (generation !== requestGeneration) return
-      const raw = data?.sessions || data?.keys || []
-      sessionsList.value = raw.filter(s => !!itemKey(s))
-      applyPageState(data)
+      const refreshed: RawSessionListEntry[] = []
+      const refreshedCursors = new Set<string>()
+      let requestedCursor: string | undefined
+      let refreshedPageCount = 0
+      let refreshedPageState = { hasMore: false, nextCursor: null as string | null }
+
+      while (refreshedPageCount < pagesToReload) {
+        const params: Record<string, unknown> = {
+          limit: SESSION_LIST_PAGE_SIZE,
+          view: SESSION_LIST_VIEW,
+        }
+        if (requestedCursor) params.cursor = requestedCursor
+        const data = await callSessionsList(params)
+        if (generation !== requestGeneration) return
+        const raw = (data?.sessions || data?.keys || []).filter(s => !!itemKey(s))
+        const added = appendUniqueSessions(refreshed, raw)
+        refreshedPageCount += 1
+        refreshedPageState = pageState(data, refreshedCursors, requestedCursor)
+        if (added === 0) {
+          refreshedPageState = { hasMore: false, nextCursor: null }
+          break
+        }
+        if (!refreshedPageState.hasMore || !refreshedPageState.nextCursor) break
+        requestedCursor = refreshedPageState.nextCursor
+      }
+
+      if (generation !== requestGeneration) return
+      sessionsList.value = refreshed
+      loadedPageCount = refreshedPageCount
+      pageCursors = refreshedCursors
+      hasMore.value = refreshedPageState.hasMore
+      nextCursor.value = refreshedPageState.nextCursor
     } catch (err: unknown) {
       if (generation !== requestGeneration) return
       console.error('[useSessions] sessions.list error:', err instanceof Error ? err.message : err)
-      sessionListError.value = true
-      hasMore.value = false
-      nextCursor.value = null
+      // A reconnect/event refresh must not collapse an already useful ledger.
+      // Keep the last complete traversal and its retry cursor until a whole
+      // replacement snapshot succeeds.
+      if (sessionsList.value.length === 0) {
+        sessionListError.value = true
+        hasMore.value = false
+        nextCursor.value = null
+        loadedPageCount = 0
+        pageCursors = new Set<string>()
+      }
     } finally {
       if (generation === requestGeneration) isLoading.value = false
     }
@@ -814,21 +876,21 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
     loadMoreError.value = false
     try {
       await waitForSessionRpcConnection(rpc, readCallOptions)
+      if (generation !== requestGeneration || nextCursor.value !== cursor) return
       const data = await callSessionsList({
-        limit: 200,
+        limit: SESSION_LIST_PAGE_SIZE,
         view: SESSION_LIST_VIEW,
         cursor,
       })
       if (generation !== requestGeneration || nextCursor.value !== cursor) return
       const raw = (data?.sessions || data?.keys || []).filter(s => !!itemKey(s))
-      const existingKeys = new Set(sessionsList.value.map(itemKey))
-      const additions = raw.filter(item => !existingKeys.has(itemKey(item)))
-      sessionsList.value = [...sessionsList.value, ...additions]
-      applyPageState(data, cursor)
-      if (raw.length === 0) {
-        hasMore.value = false
-        nextCursor.value = null
-      }
+      const appended = [...sessionsList.value]
+      const added = appendUniqueSessions(appended, raw)
+      sessionsList.value = appended
+      loadedPageCount += 1
+      const nextPageState = pageState(data, pageCursors, cursor)
+      hasMore.value = added > 0 && nextPageState.hasMore
+      nextCursor.value = hasMore.value ? nextPageState.nextCursor : null
     } catch (err: unknown) {
       if (generation !== requestGeneration) return
       console.error('[useSessions] sessions.list next page error:', err instanceof Error ? err.message : err)

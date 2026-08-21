@@ -103,10 +103,30 @@ def apply_bundled_runtime_path(
 
     result = dict(environment or {})
     path_key = next((key for key in result if key.casefold() == "path"), "PATH")
+    # Runtime Packs are independent from the application bundle and from Gateway
+    # boot.  A finalized application-owned catalog takes precedence over the old
+    # v0.5.3 bundled layout even when no optional component is installed.
+    try:
+        from opensquilla.runtime_packs import apply_runtime_environment, status_snapshot
+
+        if status_snapshot().management_supported:
+            return apply_runtime_environment(
+                result,
+                mode=mode,
+                policy=policy,
+                require_managed=require_bundled,
+            )
+    except (OSError, RuntimeError, ValueError):
+        # Runtime Pack state is deliberately fail-open for application startup.
+        # Strict guest execution is handled below by clearing PATH.
+        pass
     resolver = bundled_runtime_resolver()
     if resolver is None:
+        if require_bundled:
+            result[path_key] = ""
         return result
-    resolved = resolver.path_for(mode, split_path(result.get(path_key)), policy=policy)
+    host_path = () if require_bundled else split_path(result.get(path_key))
+    resolved = resolver.path_for(mode, host_path, policy=policy)
     result[path_key] = os.pathsep.join(str(path) for path in resolved)
     return result
 

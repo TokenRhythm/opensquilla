@@ -56,6 +56,8 @@ def _ctx(*, owner_id: str = "a" * 64, session_manager=None) -> RpcContext:
         "skills.list",
         "sessions.subscribe",
         "sessions.send",
+        "sessions.routing.get",
+        "sessions.routing.set",
     ],
 )
 def test_guest_policy_denies_global_control_plane(method: str) -> None:
@@ -184,6 +186,37 @@ def test_guest_chat_send_forces_every_memory_capture_alias_true() -> None:
     assert normalized["no_memory_capture"] is True
     assert normalized["_source"]["noMemoryCapture"] is True
     assert normalized["_source"]["no_memory_capture"] is True
+
+
+def test_guest_first_turn_cannot_override_session_routing() -> None:
+    ctx = _ctx()
+    owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
+
+    immediate = GuestRpcPolicy.authorize(
+        "chat.send",
+        {
+            "sessionKey": owned,
+            "message": "hello",
+            "intent": "new_chat",
+            "initialRoutingMode": "ensemble",
+            "initial_routing_mode": "router",
+        },
+        ctx,
+    )
+    staged = GuestRpcPolicy.authorize(
+        "sessions.pending_inputs.enqueue",
+        {
+            "key": owned,
+            "initialRoutingMode": "ensemble",
+            "initial_routing_mode": "router",
+        },
+        ctx,
+    )
+
+    assert "initialRoutingMode" not in immediate
+    assert "initial_routing_mode" not in immediate
+    assert "initialRoutingMode" not in staged
+    assert "initial_routing_mode" not in staged
 
 
 def test_guest_policy_normalizes_verified_chat_key_alias_for_handler() -> None:

@@ -93,14 +93,30 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "workspaces.list",
     }
 )
-_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"}).union(
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
+    {"meta.drafts.list", "skills.install"}
+).union(
     _CONCURRENT_OPTIONAL_READ_METHODS
 )
-# A fresh WebUI connection starts one draft read plus seven advertised optional
-# reads before the first responses can arrive. Keep that bootstrap fan-out
-# detached while retaining a finite per-connection bound.
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = 8
+# Reserve one bounded slot for every method that may legitimately run detached.
+# A fresh WebUI can issue every optional metadata read plus draft recovery before
+# the first responses arrive; keeping this derived from the allowlist prevents a
+# newly advertised read from silently outgrowing the bootstrap budget again.
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = len(_DETACHED_RPC_METHODS)
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
+
+
+def _should_detach_rpc_request(method: str, params: Any) -> bool:
+    if method not in _DETACHED_RPC_METHODS:
+        return False
+    if method != "skills.install":
+        return True
+    if not isinstance(params, dict):
+        return False
+    return any(
+        isinstance(params.get(key), str) and bool(params[key].strip())
+        for key in ("operationId", "operation_id")
+    )
 
 
 @dataclass(slots=True)
@@ -318,11 +334,14 @@ class WsConnection:
     ) -> None:
         if self._closing:
             return
-        event, payload = project_session_event_for_client(
+        projected = project_session_event_for_client(
             event,
             payload,
             client_caps=self.client_caps,
         )
+        if projected is None:
+            return
+        event, payload = projected
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -1344,7 +1363,11 @@ async def _message_loop(
                 meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 skill_management_service=skill_management_service,
-                skill_management_state=skill_management_state or {},
+                skill_management_state=(
+                    skill_management_state
+                    if skill_management_state is not None
+                    else {}
+                ),
                 cron_scheduler=cron_scheduler,
                 turn_runner=turn_runner,
                 task_runtime=task_runtime,
@@ -1359,7 +1382,7 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
-            if method in _DETACHED_RPC_METHODS:
+            if _should_detach_rpc_request(method, params):
                 if (
                     len(conn._detached_request_tasks)
                     >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
@@ -1368,7 +1391,7 @@ async def _message_loop(
                         make_error_res(
                             req_id,
                             ERROR_UNAVAILABLE,
-                            "Too many optional recovery requests are already running",
+                            "Too many detached requests are already running",
                             retryable=True,
                         )
                     )
@@ -1430,6 +1453,7 @@ async def _dispatch_and_send(
 
 
 def _build_features(dispatcher: RpcDispatcher) -> Any:
+    from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
 
     methods = dispatcher.list_methods()
@@ -1444,5 +1468,6 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "health",
         "heartbeat",
         "cron",
+        TURN_COMMITTED_EVENT,
     ]
     return FeaturesInfo(methods=methods, events=events)

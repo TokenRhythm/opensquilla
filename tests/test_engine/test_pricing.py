@@ -8,6 +8,7 @@ from opensquilla.engine.pricing import (
     PricingCache,
     lookup_price,
     reset_live_price_cache_for_tests,
+    resolve_model_price,
     seed_live_price_cache_for_tests,
 )
 
@@ -17,6 +18,22 @@ def reset_pricing_cache() -> Iterator[None]:
     reset_live_price_cache_for_tests()
     yield
     reset_live_price_cache_for_tests()
+
+
+def test_default_test_session_disables_live_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_fetch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("default tests must not fetch live OpenRouter pricing")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.pricing._fetch_live_openrouter_price",
+        unexpected_fetch,
+    )
+
+    resolved = resolve_model_price("vendor/synthetic-model", provider="openrouter")
+
+    assert resolved.source == "default"
 
 
 def test_deepseek_v4_pro_static_price_matches_current_official(
@@ -100,6 +117,18 @@ def test_versioned_deepseek_id_prefix_matches_static_entry(
     price = lookup_price("deepseek/deepseek-v4-pro-20260423")
 
     assert price.input_per_m == pytest.approx(0.435)
+
+
+def test_tokenrhythm_v4_pro_0813_static_price_precedes_generic_pro_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price("deepseek-v4-pro-0813")
+
+    assert price.input_per_m == pytest.approx(1.2903225806451613)
+    assert price.output_per_m == pytest.approx(3.870967741935484)
+    assert price.cache_read_per_m == pytest.approx(0.043010752688172046)
 
 
 def test_price_entry_cache_fields_default_none() -> None:

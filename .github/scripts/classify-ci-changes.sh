@@ -156,6 +156,15 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       # Changes to the gate itself must exercise every path it can suppress.
       mark_full_required
       ;;
+    .github/scripts/windows_test_durations.json)
+      # Historical timing data is scheduling metadata, not executable policy.
+      mark_non_docs_changed
+      ;;
+    .github/scripts/windows_test_assignments.json)
+      # Run every Windows shard; the runner validates duplicate-free inventory coverage.
+      mark_non_docs_changed
+      windows_full_required=true
+      ;;
     .github/workflows/wheelhouse-release.yml)
       mark_ci_changed
       mark_release_changed

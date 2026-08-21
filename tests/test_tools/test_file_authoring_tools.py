@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import csv
 import json
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from pptx import Presentation
 from pypdf import PdfReader
 
 from opensquilla.artifacts import ArtifactStore
+from opensquilla.engine.types import ToolCall
 from opensquilla.tools.builtin import file_authoring
 from opensquilla.tools.builtin.file_authoring import (
     create_csv,
@@ -17,6 +19,8 @@ from opensquilla.tools.builtin.file_authoring import (
     create_pptx,
     create_xlsx,
 )
+from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import (
     CallerKind,
     RetryableToolInputError,
@@ -51,6 +55,42 @@ def _published_material(ctx: ToolContext, result: str) -> tuple[dict[str, object
         session_id=str(payload["artifact"]["session_id"]),
     )
     return payload["artifact"], path.read_bytes()
+
+
+def test_create_csv_authoritative_schema_keeps_mixed_cell_types() -> None:
+    definition = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+
+    rows = definition.input_schema.properties["rows"]
+    assert rows["items"] == {"type": "array"}
+    assert definition.allow_string_item_schema_projection is True
+    assert "allow_string_item_schema_projection" not in definition.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_create_csv_dispatch_accepts_legacy_mixed_cell_types(tmp_path: Path) -> None:
+    ctx = _channel_artifact_context(tmp_path)
+    handler = build_tool_handler(get_default_registry(), ctx)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-create-csv-mixed",
+            tool_name="create_csv",
+            arguments={
+                "name": "mixed.csv",
+                "rows": [["text", 1, True, None, {"x": 1}, ["nested"]]],
+            },
+        )
+    )
+
+    assert result.is_error is False
+    _, material = _published_material(ctx, result.content)
+    assert list(csv.reader(StringIO(material.decode("utf-8-sig")))) == [
+        ["text", "1", "True", "", '{"x": 1}', '["nested"]']
+    ]
 
 
 @pytest.mark.asyncio

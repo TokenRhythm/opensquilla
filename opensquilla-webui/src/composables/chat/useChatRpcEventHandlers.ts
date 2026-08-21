@@ -1,6 +1,7 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
+  ChatModelCallSegment,
   ChatPendingItem,
   ChatRunStatus,
   ChatRunStatusSource,
@@ -25,6 +26,7 @@ import type {
   ToolEndPayload,
   ToolResultPayload,
   ToolUsePayload,
+  TurnCommittedPayload,
   WarningPayload,
 } from '@/types/rpc'
 import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
@@ -61,6 +63,7 @@ import {
   useChatSteerDelivery,
   type ChatSteerDeliveryApi,
 } from './useChatSteerDelivery'
+import type { ChatStreamModelCallIdentity } from './useChatStream'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -78,15 +81,27 @@ export interface ChatRpcStreamApi {
   streamHasVisibleOutput: Ref<boolean>
   startStreaming: () => void
   endStreaming: (opts?: { reason?: string, suppressed?: boolean }) => void
-  checkpointForUserMessage?: (turnId: string) => void
-  appendDelta: (text: string, presentation?: 'intermediate' | 'answer') => void
+  checkpointForUserMessage?: (turnId: string, boundaryKey?: string) => void
+  acknowledgeSteerBoundary?: (
+    boundaryKey: string,
+    modelCallId?: string,
+    iteration?: number,
+  ) => void
+  appendDelta: (
+    text: string,
+    presentation?: 'intermediate' | 'answer',
+    identity?: ChatStreamModelCallIdentity,
+  ) => void
   scheduleRender: () => void
   appendToolCall: (payload: ToolUsePayload) => void
   appendToolDelta: (payload: ToolDeltaPayload) => void
   appendToolEnd?: (payload: ToolEndPayload) => void
   appendToolResult: (payload: ToolResultPayload) => void
   appendArtifact: (payload: ArtifactPayload) => void
-  reconcileFinalText: (finalText: string | null | undefined) => void
+  reconcileFinalText: (
+    finalText: string | null | undefined,
+    modelCallSegments?: ChatModelCallSegment[] | null,
+  ) => void
   resetLiveTurnState?: () => void
   resetAnswerGeneration?: (options?: {
     textSnapshot?: string
@@ -132,6 +147,11 @@ export interface UseChatRpcEventHandlersOptions {
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   queueRouterDecision: (payload: RouterDecisionPayload) => void
+  bindRouterDecisionToModelCall?: (
+    modelCallId: string,
+    iteration?: number,
+    turnId?: string,
+  ) => void
   appendEnsembleProgress: (payload: EnsembleProgressPayload) => void
   markEnsembleHandoff: () => void
   flushPendingRouterDecision: () => void
@@ -143,7 +163,8 @@ export interface UseChatRpcEventHandlersOptions {
   ) => ChatCompactionPresentationResult
   getCompactionPlacement?: (compactionId: string) => ChatCompactionPlacement | undefined
   showWarningToast: (message: string) => void
-  scheduleHistorySync: () => void
+  supportsTurnCommitted?: () => boolean
+  scheduleHistorySync: (preserveLocalTail?: boolean) => void
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
   restoreSteerIntoComposer?: (text: string) => void
@@ -181,6 +202,8 @@ type ChatDoneUsageFields = {
   usageUnknown?: boolean
   unknown_usage_events?: number
   unknownUsageEvents?: number
+  model_call_segments?: ChatModelCallSegment[]
+  modelCallSegments?: ChatModelCallSegment[]
   decision_id?: string
 }
 
@@ -219,6 +242,8 @@ type BufferedPendingReplayEntry =
 
 const MAX_PENDING_TASK_BUCKETS = 8
 const MAX_PENDING_STREAM_EVENTS_PER_TASK = 64
+const MAX_TRACKED_COMMITTED_TURNS = 64
+const TURN_COMMIT_TIMEOUT_MS = 5_000
 const SERVER_CLOCK_TOLERANCE_MS = 5_000
 const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
 const PROVIDER_ACTIVITY_PHASES = new Set([
@@ -384,9 +409,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream,
   } = options
   const steerDelivery = options.steerDelivery || useChatSteerDelivery({
+    sessionKey,
+    activeTurnId: activeStreamTaskId,
     messages,
     pendingQueue,
     checkpointForUserMessage: stream.checkpointForUserMessage,
+    acknowledgeSteerBoundary: stream.acknowledgeSteerBoundary,
     scheduleHistorySync: options.scheduleHistorySync,
     restoreSteerIntoComposer: options.restoreSteerIntoComposer,
   })
@@ -401,7 +429,119 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
   const settledTaskIds = new Set<string>()
+  const committedTaskIds = new Set<string>()
+  const taskSucceededSyncedIds = new Set<string>()
+  const awaitingCommitTaskIds = ref(new Set<string>())
+  const awaitingCommitTimers = new Map<string, ReturnType<typeof setTimeout>>()
   let pendingSuccessorRenderTaskId = ''
+
+  function replaceAwaitingCommitTaskIds(mutator: (taskIds: Set<string>) => void) {
+    const next = new Set(awaitingCommitTaskIds.value)
+    mutator(next)
+    awaitingCommitTaskIds.value = next
+  }
+
+  function clearAwaitingTurnCommit(taskId: string) {
+    const timer = awaitingCommitTimers.get(taskId)
+    if (timer) clearTimeout(timer)
+    awaitingCommitTimers.delete(taskId)
+    replaceAwaitingCommitTaskIds(taskIds => taskIds.delete(taskId))
+  }
+
+  function clearTurnCommitTracking() {
+    for (const timer of awaitingCommitTimers.values()) clearTimeout(timer)
+    awaitingCommitTimers.clear()
+    awaitingCommitTaskIds.value = new Set()
+    committedTaskIds.clear()
+    taskSucceededSyncedIds.clear()
+  }
+
+  function rememberTrackedTask(taskIds: Set<string>, taskId: string): boolean {
+    if (taskIds.has(taskId)) return false
+    if (taskIds.size >= MAX_TRACKED_COMMITTED_TURNS) {
+      const oldestTaskId = taskIds.values().next().value
+      if (typeof oldestTaskId === 'string') taskIds.delete(oldestTaskId)
+    }
+    taskIds.add(taskId)
+    return true
+  }
+
+  function waitForTurnCommit(payload: SessionEventPayload): boolean {
+    if (options.supportsTurnCommitted?.() !== true) return false
+    if (payload.reason === 'aborted') return false
+    const taskId = payloadTaskId(payload)
+    if (
+      !taskId
+      || committedTaskIds.has(taskId)
+      || awaitingCommitTaskIds.value.has(taskId)
+    ) return false
+
+    if (awaitingCommitTaskIds.value.size >= MAX_TRACKED_COMMITTED_TURNS) {
+      const oldestTaskId = awaitingCommitTaskIds.value.values().next().value
+      if (typeof oldestTaskId === 'string') clearAwaitingTurnCommit(oldestTaskId)
+    }
+    replaceAwaitingCommitTaskIds(taskIds => taskIds.add(taskId))
+    const expectedSessionKey = sessionKey.value
+    const timer = setTimeout(() => {
+      awaitingCommitTimers.delete(taskId)
+      if (
+        sessionKey.value !== expectedSessionKey
+        || !awaitingCommitTaskIds.value.has(taskId)
+        || committedTaskIds.has(taskId)
+      ) return
+      options.scheduleHistorySync(true)
+    }, TURN_COMMIT_TIMEOUT_MS)
+    awaitingCommitTimers.set(taskId, timer)
+    return true
+  }
+
+  function validOptionalString(payload: TurnCommittedPayload, field: string): boolean {
+    const value = payload[field]
+    return value === undefined || typeof value === 'string'
+  }
+
+  function validOptionalSequence(payload: TurnCommittedPayload, field: string): boolean {
+    const value = payload[field]
+    return value === undefined
+      || (typeof value === 'number' && Number.isInteger(value) && value >= 0)
+  }
+
+  function handleRpcTurnCommitted(payload: TurnCommittedPayload) {
+    if (options.supportsTurnCommitted?.() !== true) return
+    if (isStaleEpoch(payload)) return
+
+    const committedSessionKey = typeof payload.session_key === 'string'
+      ? payload.session_key.trim()
+      : ''
+    const taskId = typeof payload.task_id === 'string' ? payload.task_id.trim() : ''
+    const turnId = typeof payload.turn_id === 'string' ? payload.turn_id.trim() : ''
+    if (
+      payload.schema_version !== 1
+      || !committedSessionKey
+      || committedSessionKey !== sessionKey.value
+      || !taskId
+      || !turnId
+      || payload.status !== 'succeeded'
+      || payload.terminal_reason !== 'completed'
+      || typeof payload.finished_at !== 'number'
+      || !Number.isInteger(payload.finished_at)
+      || payload.finished_at < 0
+      || !validOptionalString(payload, 'session_id')
+      || !validOptionalString(payload, 'client_message_id')
+      || !validOptionalString(payload, 'user_message_id')
+      || !validOptionalString(payload, 'surface_id')
+      || !validOptionalString(payload, 'stream_generation')
+      || !validOptionalSequence(payload, 'stream_seq')
+      || !validOptionalSequence(payload, 'emitted_at')
+    ) return
+    if (!acceptStreamSeq(payload)) return
+    if (!rememberTrackedTask(committedTaskIds, taskId)) return
+
+    clearAwaitingTurnCommit(taskId)
+    taskSucceededSyncedIds.delete(taskId)
+    options.taskOwnership?.noteTerminal(taskId, false)
+    options.scheduleHistorySync(true)
+  }
 
   function compactionStatus(payload: CompactionPayload): string {
     const status = String(payload.status || '').toLowerCase()
@@ -735,6 +875,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
     } else if (event === 'session.event.router_control_replay') {
       handleRpcRouterControlReplay(payload)
+    } else if (event === 'session.event.input_disposition') {
+      handleRpcInputDisposition(payload as InputDispositionPayload)
     } else if (event === 'session.event.compaction') {
       // A live snapshot is the authoritative base for the active stream, not
       // historical replay. Compaction deliberately ignores replayed
@@ -756,6 +898,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function restoreLiveTurnSnapshot(snapshot: SessionMessagesSnapshotResponse) {
     if (!snapshot || snapshot.key !== sessionKey.value) return
 
+    steerDelivery.resetTransientBoundaries()
     stream.resetLiveTurnState?.()
     clearLiveThinking()
     clearGenerationTracking()
@@ -768,9 +911,20 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       ? snapshot.task_id
       : ''
 
-    for (const entry of snapshot.events || []) {
-      if (!entry || typeof entry.event !== 'string') continue
-      const payload = { ...(entry.payload || {}) }
+    const replayEntries: BufferedPendingReplayEntry[] = (snapshot.events || [])
+      .flatMap((entry, order): BufferedPendingReplayEntry[] => {
+        if (!entry || typeof entry.event !== 'string') return []
+        return [{
+          kind: 'stream',
+          event: entry.event,
+          payload: { ...(entry.payload || {}) },
+          order,
+        }]
+      })
+      .sort(comparePendingReplayEntries)
+    for (const entry of replayEntries) {
+      if (entry.kind !== 'stream') continue
+      const payload = { ...entry.payload }
       // Snapshot events retain their original sequence for diagnostics, but
       // they form an authoritative base rather than fresh deltas. Replaying
       // them through the normal render handlers without the old sequence
@@ -1138,6 +1292,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     pendingTerminalEvents.clear()
     pendingStreamEvents.clear()
     settledTaskIds.clear()
+    clearTurnCommitTracking()
     pendingSuccessorRenderTaskId = ''
     // The newly shown session has its own (possibly running) task; forget the
     // previous session's active task so we stay lenient until it re-asserts.
@@ -1160,6 +1315,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       clearGenerationTracking()
     }
   }, { flush: 'sync' })
+
+  onScopeDispose(clearTurnCommitTracking)
 
   function isStaleEpoch(payload: StreamEventEnvelope): boolean {
     return payloadIsStaleEpoch(payload, currentEpoch.value)
@@ -1382,10 +1539,27 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
+    const taskId = payloadTaskId(payload) || activeStreamTaskId.value
+    if (taskId && options.taskOwnership?.stopRequestedTaskId.value === taskId) return
+    const modelCallId = String(payload.model_call_id || payload.modelCallId || '').trim()
+    const iteration = Number(payload.iteration || 0)
+    options.bindRouterDecisionToModelCall?.(
+      modelCallId,
+      iteration,
+      String(payload.turn_id || payload.turnId || ''),
+    )
     options.markEnsembleHandoff()
+    const identity: ChatStreamModelCallIdentity | undefined = modelCallId || iteration > 0
+      ? { modelCallId, iteration }
+      : undefined
     const presentation = payload.presentation
     if (presentation === 'intermediate' || presentation === 'answer') {
-      stream.appendDelta(payload.text || '', presentation)
+      if (identity) stream.appendDelta(payload.text || '', presentation, identity)
+      else stream.appendDelta(payload.text || '', presentation)
+    } else if (identity) {
+      // Compatibility frames can omit presentation while still carrying the
+      // physical call identity needed for same-turn steer placement.
+      stream.appendDelta(payload.text || '', undefined, identity)
     } else {
       // Compatibility with older gateways that predate semantic text roles.
       stream.appendDelta(payload.text || '')
@@ -1928,6 +2102,29 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // replayed/normalised payloads.
     if (isStaleEpoch(payloadObj)) return
     if (!isCurrentSessionPayload(payloadObj)) return
+    if (rawEvent === 'session.event.turn_committed') {
+      handleRpcTurnCommitted(payloadObj as TurnCommittedPayload)
+      return
+    }
+    if (rawEvent === 'task.succeeded') {
+      const succeededTaskId = payloadTaskId(payloadObj)
+      if (
+        succeededTaskId
+        && (
+          awaitingCommitTaskIds.value.has(succeededTaskId)
+          || committedTaskIds.has(succeededTaskId)
+        )
+      ) {
+        if (!acceptStreamSeq(payloadObj)) return
+        if (
+          awaitingCommitTaskIds.value.has(succeededTaskId)
+          && rememberTrackedTask(taskSucceededSyncedIds, succeededTaskId)
+        ) {
+          options.scheduleHistorySync(true)
+        }
+        return
+      }
+    }
     if (rawEvent === 'session.event.answer_generation_reset') {
       handleRpcAnswerGenerationReset(payloadObj as AnswerGenerationResetPayload)
       return
@@ -1945,6 +2142,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // name. Without this, a successor whose done frame was buffered behind A
     // remains marked running after replay and blocks every future drain.
     const terminalTaskId = terminalEvent ? payloadTaskId(payloadObj) : ''
+    if (
+      terminalStatus
+      && terminalStatus !== 'succeeded'
+      && terminalTaskId
+      && awaitingCommitTaskIds.value.has(terminalTaskId)
+    ) {
+      clearAwaitingTurnCommit(terminalTaskId)
+      taskSucceededSyncedIds.delete(terminalTaskId)
+    }
     const rawStatus = payloadObj.run_status || payloadObj.runStatus || payloadObj.status || ''
     const normalizedStatus = options.normalizeRunStatus(String(rawStatus))
     if (
@@ -2032,9 +2238,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
     if (event === 'session.event.thinking') {
       if (aborted.value) return
-      const thinkingText = (payload as SessionEventPayload).text
+      const thinkingPayload = payload as SessionEventPayload
+      const thinkingText = thinkingPayload.text
       if (typeof thinkingText !== 'string' || !thinkingText) return
       stream.resetStreamIdleTimer()
+      options.bindRouterDecisionToModelCall?.(
+        String(thinkingPayload.model_call_id || thinkingPayload.modelCallId || ''),
+        Number(thinkingPayload.iteration || 0),
+        String(thinkingPayload.turn_id || thinkingPayload.turnId || ''),
+      )
       appendThinkingDelta(thinkingText, payload)
       return
     }
@@ -2048,6 +2260,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
     if (event.endsWith('.done') || event === 'chat.done') {
       markTaskSettled(payload)
+      const awaitingDurableCommit = !taskSucceededFallback && waitForTurnCommit(payload)
       const donePayload = payload as ChatDoneUsagePayload
       const u = donePayload.usage || donePayload || {}
       const doneSuppressed = payload?.reason !== 'aborted'
@@ -2062,7 +2275,19 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (u.model) usageModel.value = u.model
       options.saveWidgetState()
 
-      stream.reconcileFinalText(doneSuppressed ? '' : doneTextSnapshot(donePayload, u))
+      const rawModelCallSegments = u.model_call_segments
+        ?? u.modelCallSegments
+        ?? donePayload.model_call_segments
+        ?? donePayload.modelCallSegments
+      const terminalText = doneSuppressed ? '' : doneTextSnapshot(donePayload, u)
+      if (Array.isArray(rawModelCallSegments)) {
+        stream.reconcileFinalText(
+          terminalText,
+          rawModelCallSegments as ChatModelCallSegment[],
+        )
+      } else {
+        stream.reconcileFinalText(terminalText)
+      }
 
       if (payload?.reason === 'aborted') {
         options.clearPendingRouterDecision()
@@ -2143,7 +2368,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           completedAssistant.reasoningBlocks,
         )
       }
-      options.scheduleHistorySync()
+      if (taskSucceededFallback || !awaitingDurableCommit) {
+        options.scheduleHistorySync()
+      }
 
       if (payload?.reason === 'aborted') {
         const cancelledRunState = { run_status: 'cancelled', last_task: { ...(payload || {}), status: 'cancelled' } }
@@ -2332,5 +2559,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     streamThinkingText,
     streamThinkingElapsedText,
     attachTurnReasoning,
+    awaitingCommitTaskIds,
   }
 }

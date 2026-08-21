@@ -11,6 +11,7 @@ import ntpath
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -177,6 +178,7 @@ from opensquilla.tools.write_tracking import (
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
     summarize_patch_hygiene_warning,
+    workspace_write_deny_effect_preflight,
 )
 
 log = structlog.get_logger(__name__)
@@ -1052,6 +1054,101 @@ def _base_shell_environment() -> dict[str, str]:
             require_bundled=True,
         )
     return _runtime_shell_environment(dict(os.environ))
+
+
+def _guest_requires_managed_runtime() -> bool:
+    context = current_tool_context.get()
+    return bool(context is not None and context.guest_safe)
+
+
+def _managed_skill_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep strict Guest PATH limited to verified Runtime Packs."""
+
+    if _guest_requires_managed_runtime():
+        return dict(environment)
+    return managed_skill_env(environment)
+
+
+def _direct_runtime_command(
+    command: str,
+    *,
+    windows: bool | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(component, executable)`` for one unwrapped direct runtime call."""
+
+    native_windows = os.name == "nt" if windows is None else windows
+    platform_name = "windows" if native_windows else "linux"
+    try:
+        segments = parse_shell_segments(command, platform=platform_name)
+        if len(segments) != 1 or segments[0].source.strip() != command.strip():
+            return None
+        tokens = shlex.split(segments[0].source, posix=not native_windows)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    executable = tokens[0].strip().strip("'\"")
+    if not executable or any(marker in executable for marker in ("/", "\\", ":", "$", "`")):
+        return None
+    name = _shell_command_basename(executable)
+    if name in {"python", "python3"}:
+        return ("python", executable)
+    if name in {"node", "npm", "npx"}:
+        return ("node", executable)
+    if native_windows and name in {"git", "bash"}:
+        return ("gitBash", executable)
+    return None
+
+
+def _strict_runtime_unavailable_envelope(
+    command: str,
+    environment: dict[str, str],
+) -> dict[str, object] | None:
+    """Classify a missing direct runtime without guessing about compound shell code."""
+
+    if not _guest_requires_managed_runtime():
+        return None
+    runtime_command = _direct_runtime_command(command)
+    if runtime_command is None:
+        return None
+    component_id, executable = runtime_command
+    path_key = next((key for key in environment if key.casefold() == "path"), "PATH")
+    if shutil.which(executable, path=environment.get(path_key, "")) is not None:
+        return None
+    try:
+        from opensquilla.runtime_packs import status_snapshot
+
+        status = status_snapshot()
+        component = next(
+            (
+                item
+                for item in status.components
+                if item.component_id == component_id
+            ),
+            None,
+        )
+        runtime_policy = active_sandbox_policy().runtimes
+        enabled = bool(
+            runtime_policy.enabled
+            and {
+                "python": runtime_policy.python,
+                "node": runtime_policy.node,
+                "gitBash": runtime_policy.git_bash,
+            }[component_id]
+        )
+        if enabled and component is not None and component.availability.value == "ready":
+            return None
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return {
+        "status": "failed",
+        "code": "RUNTIME_UNAVAILABLE",
+        "componentId": component_id,
+        "retryable": False,
+        "message": (
+            f"The managed {component_id} runtime is unavailable for strict execution."
+        ),
+    }
 
 
 def _runtime_shell_environment(
@@ -2127,6 +2224,11 @@ def _append_windows_app_alias_path(
     *,
     runtime: object | None = None,
 ) -> None:
+    # WindowsApps is a host-controlled executable-alias directory.  Strict
+    # Guest execution must keep PATH limited to receipt-verified Runtime Packs,
+    # even when winget or a Store Python alias is present for the desktop user.
+    if _guest_requires_managed_runtime():
+        return
     if os.name != "nt" and not _windows_sandbox_backend_active(runtime):
         return
     candidates: list[Path] = []
@@ -3552,7 +3654,7 @@ def _policy_with_active_tool_mounts(policy: SandboxPolicy) -> SandboxPolicy:
 
 
 def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolicy:
-    """Make activated, receipt-validated toolchains visible read-only."""
+    """Make activated, receipt-validated managed packages visible read-only."""
 
     if not hasattr(policy, "mounts"):
         return policy
@@ -3563,7 +3665,20 @@ def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolic
         (str(mount.host_path), sandbox_path_text(mount.sandbox_path)): mount
         for mount in policy.mounts
     }
-    for path in managed_toolchain_readonly_paths():
+    managed_paths = (
+        []
+        if _guest_requires_managed_runtime()
+        else list(managed_toolchain_readonly_paths())
+    )
+    try:
+        from opensquilla.runtime_packs import runtime_roots
+
+        managed_paths.extend(runtime_roots(active_sandbox_policy().runtimes))
+    except (OSError, RuntimeError, ValueError):
+        # A broken optional Runtime Pack must never weaken or abort sandbox
+        # policy construction; it is simply omitted from PATH and mounts.
+        pass
+    for path in managed_paths:
         key = (str(path), sandbox_path_text(path))
         existing = mounts_by_target.get(key)
         if existing is not None and existing.mode == "rw":
@@ -6178,6 +6293,7 @@ async def _run_windows_host_shell_command_with_stdin(
     env: dict[str, str],
     stdin_bytes: bytes,
     effective_timeout: float,
+    on_process_started: Callable[[], None] | None = None,
 ) -> str:
     try:
         with tempfile.TemporaryFile() as output_file:
@@ -6191,6 +6307,8 @@ async def _run_windows_host_shell_command_with_stdin(
                 env=env,
                 creationflags=creationflags,
             )
+            if on_process_started is not None:
+                on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
             completed = await _communicate_windows_host_shell_process(
                 proc,
@@ -6235,6 +6353,7 @@ async def _run_host_shell_command(
     env: dict[str, str],
     stdin_bytes: bytes | None,
     effective_timeout: float,
+    on_process_started: Callable[[], None] | None = None,
 ) -> str:
     if _use_windows_blocking_exec_stdin() and stdin_bytes is not None:
         return await _run_windows_host_shell_command_with_stdin(
@@ -6243,6 +6362,7 @@ async def _run_host_shell_command(
             env=env,
             stdin_bytes=stdin_bytes,
             effective_timeout=effective_timeout,
+            on_process_started=on_process_started,
         )
     try:
         with tempfile.TemporaryFile() as output_file:
@@ -6269,6 +6389,8 @@ async def _run_host_shell_command(
                 return _exec_timeout_output(effective_timeout, command, output_file.read())
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
+            if on_process_started is not None:
+                on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=True)
             stdin_writer: asyncio.Task[None] | None = None
             remaining = deadline - loop.time()
@@ -6326,7 +6448,12 @@ async def _run_full_host_shell_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
-    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(_host_shell_env(merged_env))
@@ -6625,20 +6752,33 @@ async def exec_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
-    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
     effective_timeout = _resolve_exec_timeout(timeout)
     stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
     mutation_before = snapshot_current_workspace_mutations()
+    protection_block = workspace_write_deny_effect_preflight(
+        tool_name="exec_command",
+        before=mutation_before,
+    )
+    if protection_block is not None:
+        return protection_block
     source_mutation_signal = (
         _shell_source_mutation_signal(command, cwd)
         if _shell_source_mutation_telemetry_enabled()
         else None
     )
 
-    def finish(output: str) -> str:
+    def finish(output: str, *, executed: bool = True) -> str:
+        if not executed:
+            return output
         metadata: dict[str, Any] = {"command_hash": mutation_ledger_text_hash(command)}
         if source_mutation_signal is not None:
             metadata.update(source_mutation_signal)
@@ -6660,6 +6800,10 @@ async def exec_command(
             output=output,
         )
 
+    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
+    if runtime_unavailable is not None:
+        return finish(json.dumps(runtime_unavailable, ensure_ascii=False), executed=False)
+
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
             _apply_windows_session_tmp_env(merged_env)
@@ -6674,7 +6818,7 @@ async def exec_command(
             ),
         )
         if isinstance(decision, DenialResult):
-            return finish(json.dumps(decision.to_dict()))
+            return finish(json.dumps(decision.to_dict()), executed=False)
         if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             backend_retry_granted = True
@@ -6687,7 +6831,10 @@ async def exec_command(
             )
             if retry_gate is not None:
                 if not retry_gate.allowed:
-                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                    return finish(
+                        json.dumps(retry_gate.to_envelope(), ensure_ascii=False),
+                        executed=False,
+                    )
                 host_execution = True
                 backend_retry_granted = True
             else:
@@ -6711,9 +6858,9 @@ async def exec_command(
                 )
                 preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                 if isinstance(preflight, DenialResult):
-                    return finish(json.dumps(preflight.to_dict()))
+                    return finish(json.dumps(preflight.to_dict()), executed=False)
                 if isinstance(preflight, dict):
-                    return finish(json.dumps(preflight))
+                    return finish(json.dumps(preflight), executed=False)
                 try:
                     sandbox_result = await _run_backend_with_managed_network(
                         backend_request,
@@ -6742,8 +6889,14 @@ async def exec_command(
                     )
                     if escalation is not None:
                         if isinstance(escalation, DenialResult):
-                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
-                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                            return finish(
+                                json.dumps(escalation.to_dict(), ensure_ascii=False),
+                                executed=False,
+                            )
+                        return finish(
+                            json.dumps(escalation.to_envelope(), ensure_ascii=False),
+                            executed=False,
+                        )
                     raise
                 except Exception as exc:
                     raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
@@ -6791,16 +6944,23 @@ async def exec_command(
         )
         merged_env = _host_shell_env(merged_env)
 
+    host_process_started = False
+
+    def mark_host_process_started() -> None:
+        nonlocal host_process_started
+        host_process_started = True
+
     host_output = await _run_host_shell_command(
         command,
         cwd=cwd,
         env=merged_env,
         stdin_bytes=stdin_bytes,
         effective_timeout=effective_timeout,
+        on_process_started=mark_host_process_started,
     )
     exit_code_match = re.match(r"exit_code=(-?\d+)\n", host_output)
     if exit_code_match is None:
-        return finish(host_output)
+        return finish(host_output, executed=host_process_started)
     returncode = int(exit_code_match.group(1))
     output = host_output[exit_code_match.end() :]
     output = _append_patch_hygiene_warning(command, cwd, output)
@@ -6824,7 +6984,12 @@ async def _start_host_background_process(
 
     session_id = str(uuid.uuid4())[:8]
     base_env = dict(env) if env is not None else _base_shell_environment()
-    host_env = managed_skill_env(_runtime_shell_environment(base_env))
+    host_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            base_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(host_env)
     host_env = _host_shell_env(host_env)
     _append_windows_app_alias_path(host_env, runtime=runtime)
@@ -7095,9 +7260,12 @@ async def background_process(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
     effective_timeout = _resolve_background_timeout(timeout)
+    merged_env = _managed_skill_environment(_base_shell_environment())
+    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
-        merged_env = managed_skill_env(_base_shell_environment())
         apply_utf8_child_env(merged_env)
         _append_windows_app_alias_path(merged_env, runtime=runtime)
         merged_env = _dedupe_windows_env_keys(merged_env)

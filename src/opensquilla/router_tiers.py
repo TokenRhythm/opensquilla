@@ -124,17 +124,12 @@ LEGACY_OPENROUTER_MODEL_OPTIONS: tuple[str, ...] = (
     "minimax/minimax-m3",
 )
 
-# Candidate roles are part of the persisted selection metadata contract.  An
-# empty role is the legacy/unassigned value; the aggregator is structural.
+# Candidate roles describe the only two runtime responsibilities. Legacy
+# advisory proposer aliases are normalized by the config model.
 ENSEMBLE_CANDIDATE_ROLES = (
-    "",
-    "primary",
-    "contrast",
-    "fast_check",
-    "critic",
+    "proposer",
     "aggregator",
 )
-CUSTOM_B5_PROPOSER_ROLES = ("primary", "contrast", "fast_check", "critic")
 CUSTOM_B5_MIN_PROPOSERS = 2
 CUSTOM_B5_MAX_PROPOSERS = 6
 CUSTOM_B5_MAX_TOTAL_CALLS = 8

@@ -129,10 +129,25 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
+    "sessions.routing.get": READ_SCOPE,
     "sessions.pending_inputs.list": READ_SCOPE,
     "sessions.promptCacheKeepalive.status": READ_SCOPE,
     "artifacts.list": READ_SCOPE,
     "artifacts.get": READ_SCOPE,
+    # Artifact IDE reads are additive to the immutable artifact download
+    # surface above.  They expose session-scoped metadata and bounded source
+    # views only; every state transition is classified separately below.
+    "artifacts.edit.capabilities": READ_SCOPE,
+    "artifacts.documents.list": READ_SCOPE,
+    "artifacts.documents.get": READ_SCOPE,
+    "artifacts.revisions.list": READ_SCOPE,
+    "artifacts.changes.list": READ_SCOPE,
+    "artifacts.changes.get": READ_SCOPE,
+    "artifacts.prompt_annotations.list": READ_SCOPE,
+    "artifacts.source.read": READ_SCOPE,
+    "workbench.resources.list": READ_SCOPE,
+    "workbench.resources.get": READ_SCOPE,
+    "workbench.previews.create": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
     "system-presence": READ_SCOPE,
@@ -161,6 +176,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.capability.status": READ_SCOPE,  # OpenSquilla-only; real Safe capability.
     "sandbox.policy.get": READ_SCOPE,  # OpenSquilla-only; versioned Safe settings.
     "sandbox.policy.defaults": READ_SCOPE,  # OpenSquilla-only; immutable Safe rules.
+    "sandbox.runtime.status": READ_SCOPE,  # OpenSquilla-only; optional runtime inventory.
     "sandbox.tokens.list": READ_SCOPE,  # OpenSquilla-only; owner token metadata.
     "sandbox.explain": READ_SCOPE,  # OpenSquilla-only; deterministic sandbox explanation.
     "sandbox.run_context.get": READ_SCOPE,  # OpenSquilla-only; session sandbox mode.
@@ -212,16 +228,35 @@ METHOD_SCOPES: dict[str, str] = {
     "chat.send": WRITE_SCOPE,
     "chat.abort": WRITE_SCOPE,
     "chat.clarify_submit": WRITE_SCOPE,
+    "artifacts.documents.open": WRITE_SCOPE,
+    "artifacts.documents.close": WRITE_SCOPE,
+    "artifacts.documents.rename": WRITE_SCOPE,
+    "artifacts.revisions.restore": WRITE_SCOPE,
+    "artifacts.changes.revert": WRITE_SCOPE,
+    "artifacts.prompt_annotations.create": WRITE_SCOPE,
+    "artifacts.prompt_annotations.focus": WRITE_SCOPE,
+    "artifacts.prompt_annotations.update": WRITE_SCOPE,
+    "artifacts.prompt_annotations.discard": WRITE_SCOPE,
+    "artifacts.source.patch": WRITE_SCOPE,
+    "artifacts.mutations.resolve": WRITE_SCOPE,
+    "workbench.resources.open": WRITE_SCOPE,
+    "documents.import": WRITE_SCOPE,
+    "documents.publish": WRITE_SCOPE,
+    "documents.editSessions.start": WRITE_SCOPE,
+    "documents.editSessions.heartbeat": WRITE_SCOPE,
+    "documents.editSessions.close": WRITE_SCOPE,
     "search.query": WRITE_SCOPE,
     "sessions.create": WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.forkThroughTurn": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
+    "sessions.routing.set": WRITE_SCOPE,
     "sessions.pending_inputs.enqueue": WRITE_SCOPE,
     "sessions.pending_inputs.update": WRITE_SCOPE,
     "sessions.pending_inputs.reorder": WRITE_SCOPE,
     "sessions.pending_inputs.cancel": WRITE_SCOPE,
     "sessions.pending_inputs.dispatch": WRITE_SCOPE,
+    "sessions.pending_inputs.steer": WRITE_SCOPE,
     "plans.capabilities": READ_SCOPE,
     "plans.setMode": WRITE_SCOPE,
     "plans.implement": WRITE_SCOPE,
@@ -334,10 +369,17 @@ METHOD_SCOPES: dict[str, str] = {
     "agents.delete": ADMIN_SCOPE,
     "agents.files.set": ADMIN_SCOPE,
     "skills.install": ADMIN_SCOPE,
+    "skills.install.cancel": ADMIN_SCOPE,
     "skills.update": ADMIN_SCOPE,
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,
     "skills.deps.install": ADMIN_SCOPE,
+    # Optional developer runtimes execute native, catalog-pinned payloads and
+    # mutate profile-local managed state, so every lifecycle mutation remains
+    # authenticated admin in addition to the handlers' local-owner proof.
+    "sandbox.runtime.install": ADMIN_SCOPE,
+    "sandbox.runtime.cancel": ADMIN_SCOPE,
+    "sandbox.runtime.remove": ADMIN_SCOPE,
     "meta.setup.install": ADMIN_SCOPE,
     "meta.runs.show": ADMIN_SCOPE,
     "meta.runs.draft": ADMIN_SCOPE,

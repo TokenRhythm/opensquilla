@@ -37,6 +37,8 @@ export interface RawSessionTask {
   finishedAt?: number | string
   turn_outcome?: Record<string, unknown>
   turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
   steer_capability?: import('./chat').ChatSteerCapability
   steerCapability?: import('./chat').ChatSteerCapability
 }
@@ -304,6 +306,15 @@ export interface WarningPayload extends SessionEventPayload {
   code?: string
 }
 
+/** Content-free invalidation signal for one stable Artifact IDE document. */
+export interface ArtifactStateEventPayload extends SessionEventPayload {
+  artifactEventSeq?: number
+  documentId?: string
+  revisionId?: string | null
+  changeSetId?: string | null
+  action?: string
+}
+
 export type ProviderActivityPhase =
   | 'requesting'
   | 'reasoning'
@@ -378,6 +389,9 @@ export interface TextDeltaPayload extends SessionEventPayload {
   text?: string
   /** Gateway-owned semantic role for this text span. */
   presentation?: 'intermediate' | 'answer'
+  model_call_id?: string
+  modelCallId?: string
+  iteration?: number
 }
 
 export type AssistantDelivery = 'visible' | 'suppressed'
@@ -399,6 +413,21 @@ export interface SessionDonePayload extends SessionEventPayload {
   inputMode?: string
   run_kind?: string
   runKind?: string
+}
+
+/** Durable-success receipt emitted only after transcript and task commits. */
+export interface TurnCommittedPayload extends SessionEventPayload {
+  schema_version: 1
+  session_key: string
+  session_id?: string
+  task_id: string
+  turn_id: string
+  status: 'succeeded'
+  terminal_reason: 'completed'
+  finished_at: number
+  client_message_id?: string
+  user_message_id?: string
+  surface_id?: string
 }
 
 export interface ToolUsePayload extends SessionEventPayload {
@@ -472,6 +501,16 @@ export interface SessionProjectWorkspaceSnapshot {
   availabilityReason?: string
 }
 
+/** Durable, session-owned model routing selection. */
+export interface SessionRoutingSnapshot {
+  key?: string
+  sessionKey?: string
+  session_key?: string
+  mode?: import('./modelRouting').GatewayModelRoutingMode
+  revision?: number
+  source?: 'session' | 'legacy_initialized' | string
+}
+
 export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
   hydration_complete?: boolean
@@ -496,6 +535,9 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   }
   workspaceId?: string
   projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+  routing?: SessionRoutingSnapshot
+  modelRouting?: SessionRoutingSnapshot
+  model_routing?: SessionRoutingSnapshot
   collaboration?: import('./plans').CollaborationSnapshot
   currentPlan?: import('./plans').PlanRevisionSnapshot | null
   current_plan?: unknown
@@ -516,6 +558,12 @@ export interface ChatSendAttachmentPayload {
   file_uuid?: string
 }
 
+/** Exact editable document head bound to one chat send attempt. */
+export interface ChatDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
 export interface ChatSendParams {
   message: string
   sessionKey: string
@@ -523,10 +571,16 @@ export interface ChatSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
+  /** Ordered durable drafts consumed atomically with this chat ingress. */
+  promptAnnotationIds?: string[]
+  /** Current editable document head made available only to this turn. */
+  documentContext?: ChatDocumentContext
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
   workspaceId?: string
   collaborationMode?: import('./plans').CollaborationMode
+  /** Session routing mode atomically captured when a new chat is materialized. */
+  initialRoutingMode?: import('./modelRouting').GatewayModelRoutingMode
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]
@@ -549,6 +603,8 @@ export interface ChatSendResponse {
   terminal_message?: string
   terminalMessage?: string
   reason?: string
+  acceptedPromptAnnotationIds?: string[]
+  accepted_prompt_annotation_ids?: string[]
 }
 
 /** Server-owned recovery record for one unaccepted manual MetaSkill launch. */
@@ -580,6 +636,9 @@ export interface SessionSteerV2Params {
   expected_turn_id: string
   client_request_id: string
   client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
   surface_id?: string
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
 }
@@ -634,6 +693,8 @@ export interface ChatHistoryAttachmentPayload {
   dataUrl?: unknown
   data_url?: unknown
   sha256_ref?: unknown
+  attachmentId?: unknown
+  attachment_id?: unknown
   download_url?: unknown
   kind?: unknown
   [key: string]: unknown
@@ -647,6 +708,8 @@ export interface ChatHistoryMessage {
   id?: string
   message_id?: string
   attachments?: ChatHistoryAttachmentPayload[]
+  promptAnnotations?: unknown[]
+  prompt_annotations?: unknown[]
   artifacts?: ArtifactPayload[]
   router_decision?: RouterDecisionPayload | null
   routerDecision?: RouterDecisionPayload | null
@@ -708,6 +771,8 @@ export interface ChatHistoryTurnOutcome {
   started_at?: string | number
   finished_at?: string | number
   outcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
   code?: string
   error_class?: string
   retryable?: boolean
@@ -718,6 +783,7 @@ export interface ChatHistoryTurnOutcome {
   no_prior_provider_dispatch?: boolean
   replay_safe?: boolean
   user_message_id?: string
+  accepted_routing_mode?: 'direct' | 'router' | 'ensemble'
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -881,6 +947,7 @@ export interface RpcEventMap {
   'session.event.tool_use_end': ToolEndPayload
   'session.event.tool_result': ToolResultPayload
   'session.event.artifact': ArtifactPayload
+  'session.event.artifact_state': ArtifactStateEventPayload
   'session.event.router_decision': RouterDecisionPayload
   'session.event.ensemble_progress': EnsembleProgressPayload
   'session.event.router_control_replay': SessionEventPayload
@@ -904,4 +971,5 @@ export interface RpcEventMap {
   'session.event.meta_step_state': MetaStepStatePayload
   'session.event.meta_run_completed': MetaRunCompletedPayload
   'session.event.done': SessionDonePayload
+  'session.event.turn_committed': TurnCommittedPayload
 }

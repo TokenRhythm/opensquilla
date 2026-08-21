@@ -7,6 +7,7 @@ import pytest
 from opensquilla.sandbox.runtime_launcher import (
     ChildRole,
     InternalChildDispatchError,
+    apply_bundled_runtime_path,
     dispatch_internal_child,
     internal_child_argv,
 )
@@ -77,3 +78,19 @@ def test_dispatch_rejects_missing_or_unknown_role() -> None:
         dispatch_internal_child([])
     with pytest.raises(InternalChildDispatchError, match="unknown"):
         dispatch_internal_child(["shell"])
+
+
+def test_strict_runtime_path_does_not_inherit_host_when_no_pack_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/host/bin")
+    monkeypatch.delenv("OPENSQUILLA_BUNDLED_RUNTIME_ROOT", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_RUNTIME_MANIFEST", raising=False)
+
+    result = apply_bundled_runtime_path(
+        {"PATH": "/host/bin"},
+        mode="safe",
+        require_bundled=True,
+    )
+
+    assert result["PATH"] == ""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from opensquilla.execution_status import (
@@ -24,6 +25,77 @@ _SYNTHETIC_USER_PREFIXES = (
     "[Request context for this turn]",
     "[Runtime context for this turn]",
 )
+
+
+@dataclass(frozen=True)
+class RestrictedHistoryProjectionResult:
+    """Counts from stripping historical tool protocol at a restricted turn."""
+
+    tool_uses_removed: int = 0
+    tool_results_removed: int = 0
+    empty_messages_removed: int = 0
+    synthetic_messages_removed: int = 0
+
+
+def strip_historical_tool_pairs(
+    messages: list[Message],
+) -> tuple[list[Message], RestrictedHistoryProjectionResult]:
+    """Remove historical tool protocol from a provider-only request view.
+
+    PromptAnnotation turns must not inherit paths, commands, or tool payloads
+    from earlier unrestricted turns. All historical tool-use and tool-result
+    blocks are removed together, while ordinary text and media are preserved.
+    Persisted transcript rows are never mutated.
+    """
+
+    projected: list[Message] = []
+    uses_removed = 0
+    results_removed = 0
+    empty_removed = 0
+    synthetic_removed = 0
+    for message in messages:
+        if (
+            isinstance(message.content, str)
+            and message.content.startswith(_SYNTHETIC_USER_PREFIXES)
+        ):
+            synthetic_removed += 1
+            continue
+        if not isinstance(message.content, list):
+            projected.append(message)
+            continue
+        content: list[Any] = []
+        changed = False
+        for block in message.content:
+            if isinstance(block, ContentBlockToolUse):
+                uses_removed += 1
+                changed = True
+                continue
+            if isinstance(block, ContentBlockToolResult):
+                results_removed += 1
+                changed = True
+                continue
+            content.append(block)
+        if not changed:
+            projected.append(message)
+            continue
+        if not content:
+            empty_removed += 1
+            continue
+        projected.append(
+            Message(
+                role=message.role,
+                content=content,
+                # Reasoning attached to a historical tool call may itself
+                # describe paths or command arguments, so it is not retained.
+                reasoning_content=None,
+            )
+        )
+    return projected, RestrictedHistoryProjectionResult(
+        tool_uses_removed=uses_removed,
+        tool_results_removed=results_removed,
+        empty_messages_removed=empty_removed,
+        synthetic_messages_removed=synthetic_removed,
+    )
 
 
 def _is_real_user_turn(message: Message) -> bool:

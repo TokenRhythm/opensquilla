@@ -35,6 +35,10 @@ from opensquilla.gateway.uploads import (
 )
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
 from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabilities
+from opensquilla.provider.protocol import (
+    IMAGE_INPUT_UNSUPPORTED_CODE,
+    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+)
 from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
@@ -136,6 +140,15 @@ class _FakeModelCatalog:
     ) -> ModelCapabilities:
         return ModelCapabilities(supports_vision=model_id == _VISION_MODEL)
 
+    def resolve_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider_name: str = "openrouter",  # noqa: ARG002
+        base_url: str = "",  # noqa: ARG002
+    ) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
+
 
 class _EventSink:
     authenticated = True
@@ -151,6 +164,22 @@ class _EventSink:
         meta: dict[str, Any] | None = None,  # noqa: ARG002
     ) -> None:
         self.events.append((event, dict(payload or {})))
+
+
+class _UsageSink:
+    def __init__(self) -> None:
+        self.started: list[Any] = []
+        self.finalized: list[tuple[Any, Any]] = []
+        self.unknown: list[tuple[Any, str]] = []
+
+    async def start(self, call: Any) -> None:
+        self.started.append(call)
+
+    async def finalize(self, call: Any, result: Any) -> None:
+        self.finalized.append((call, result))
+
+    async def mark_unknown(self, call: Any, reason: str) -> None:
+        self.unknown.append((call, reason))
 
 
 class _TextTierStrategy:
@@ -207,6 +236,9 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
     config.squilla_router.default_tier = "c1"
     config.llm.provider = "openrouter"
     config.llm.model = _TEXT_MODEL
+    # Synthetic model ids are absent from the production catalog. Declare the
+    # deployment contract exercised by this end-to-end fixture explicitly.
+    config.llm.context_window_tokens = 128_000
     return config
 
 
@@ -234,6 +266,7 @@ async def _send_session_turn(
     sink: _EventSink,
     message: str,
     attachments: list[dict[str, Any]] | None = None,
+    expected_error_code: str | None = None,
 ) -> None:
     done_before = sum(1 for event, _payload in sink.events if event == "session.event.done")
     event_count_before = len(sink.events)
@@ -271,6 +304,16 @@ async def _send_session_turn(
             if event == "session.event.error"
         ]
         if new_errors:
+            if (
+                expected_error_code
+                and new_errors[-1].get("code") == expected_error_code
+            ):
+                if task is not None:
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=_TURN_TASK_DRAIN_TIMEOUT_SECONDS,
+                    )
+                return
             raise AssertionError(f"turn emitted error events: {sink.events!r}")
         if task is not None and task.done():
             if task.cancelled():
@@ -330,11 +373,13 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             _VISION_MODEL: vision_provider,
         }
     )
+    usage_sink = _UsageSink()
     runner = TurnRunner(
         provider_selector=selector,
         session_manager=manager,
         config=config,
         model_catalog=_FakeModelCatalog(),
+        usage_event_sink=usage_sink,
     )
     bootstrap_configs: list[AgentConfig] = []
     original_bootstrap_run = runner._agent_bootstrap_stage.run
@@ -384,12 +429,65 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "store": store,
             "subscription_manager": subscription_manager,
             "text_provider": text_provider,
+            "usage_sink": usage_sink,
             "vision_provider": vision_provider,
         }
     finally:
         get_registry().unregister(sink.conn_id)
         set_upload_store(None)
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_single_text_model_returns_structured_error_without_provider_call(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    usage_sink: _UsageSink = _e2e_stack["usage_sink"]
+    config.squilla_router.enabled = False
+    key = "agent:main:single-text-model-image"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+    for index in range(6):
+        await manager.append_message(key, "user", f"history-{index}:" + "u" * 5_000)
+        await manager.append_message(key, "assistant", "a" * 5_000)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    gate_calls_before = len(gate_provider.calls)
+    text_calls_before = len(text_provider.calls)
+    vision_calls_before = len(vision_provider.calls)
+    usage_started_before = len(usage_sink.started)
+    usage_finalized_before = len(usage_sink.finalized)
+    usage_unknown_before = len(usage_sink.unknown)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="请分析这张图片。",
+        attachments=[_file_uuid_attachment(file_uuid)],
+        expected_error_code=IMAGE_INPUT_UNSUPPORTED_CODE,
+    )
+
+    assert len(gate_provider.calls) == gate_calls_before
+    assert len(text_provider.calls) == text_calls_before
+    assert len(vision_provider.calls) == vision_calls_before
+    assert len(usage_sink.started) == usage_started_before
+    assert len(usage_sink.finalized) == usage_finalized_before
+    assert len(usage_sink.unknown) == usage_unknown_before
+    assert _event_payloads(sink, "session.event.text_delta") == []
+    errors = _event_payloads(sink, "session.event.error")
+    assert errors[-1]["code"] == IMAGE_INPUT_UNSUPPORTED_CODE
+    assert errors[-1]["message"] == IMAGE_INPUT_UNSUPPORTED_MESSAGE
+    assert _event_payloads(sink, "session.event.done") == []
+    transcript = await manager.get_transcript(key)
+    assert transcript[-1].role == "system"
+    assert IMAGE_INPUT_UNSUPPORTED_MESSAGE in str(transcript[-1].content or "")
 
 
 @pytest.mark.asyncio

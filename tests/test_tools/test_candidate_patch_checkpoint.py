@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from opensquilla.git_runtime import GitRunState
 from opensquilla.tools.candidate_patch_checkpoint import (
     _git_show_head_path,
     create_candidate_patch_checkpoint,
@@ -16,14 +20,18 @@ def test_git_show_head_path_disambiguates_revision_like_paths(
 ) -> None:
     recorded: list[str] = []
 
-    def fake_run(command: list[str], **kwargs):
-        recorded.extend(command)
-        return subprocess.CompletedProcess(command, 0, stdout=b"content")
+    def fake_run(args, **kwargs):
+        del kwargs
+        recorded.extend(args)
+        return SimpleNamespace(ok=True, stdout=b"content")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "opensquilla.tools.candidate_patch_checkpoint.run_git",
+        fake_run,
+    )
 
     assert _git_show_head_path(tmp_path, "--help") == b"content"
-    assert recorded == ["git", "show", "--end-of-options", "HEAD:--help"]
+    assert recorded == ["show", "--end-of-options", "HEAD:--help"]
 
 
 def _init_git_workspace(path: Path) -> None:
@@ -81,3 +89,53 @@ def test_candidate_patch_checkpoint_preserves_preexisting_dirty_state(
     restore_candidate_patch_checkpoint(checkpoint)
 
     assert source.read_text(encoding="utf-8") == "print('accepted')\n"
+
+
+def test_candidate_checkpoint_unknown_git_skips_restore_without_claiming_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.tools.candidate_patch_checkpoint.run_git",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=False,
+            state=GitRunState.UNAVAILABLE,
+            stdout=b"",
+        ),
+    )
+    checkpoint = create_candidate_patch_checkpoint(tmp_path, label="unknown")
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("keep me\n", encoding="utf-8")
+
+    result = restore_candidate_patch_checkpoint(checkpoint)
+
+    assert checkpoint.git_state is GitRunState.UNAVAILABLE
+    assert result["status"] == "skipped"
+    assert result["git_state"] == "unavailable"
+    assert candidate.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_candidate_checkpoint_removes_staged_new_candidate(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _init_git_workspace(workspace)
+    _commit_file(workspace, "src/app.py", "print('base')\n")
+    checkpoint = create_candidate_patch_checkpoint(workspace, label="clean")
+    candidate = workspace / "candidate.py"
+    candidate.write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "candidate.py"], cwd=workspace, check=True)
+
+    result = restore_candidate_patch_checkpoint(checkpoint)
+
+    assert result["status"] == "restored"
+    assert not candidate.exists()
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""

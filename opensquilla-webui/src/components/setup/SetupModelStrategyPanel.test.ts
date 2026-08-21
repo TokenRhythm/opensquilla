@@ -986,7 +986,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('adds and imports proposers without assigning an advisory role', async () => {
+  it('adds and imports candidates with the canonical proposer role', async () => {
     const onAddEnsembleCandidate = vi.fn()
     const onImportEnsembleTierCandidates = vi.fn()
     const onRequestProviderModels = vi.fn()
@@ -1037,7 +1037,7 @@ describe('SetupModelStrategyPanel', () => {
     expect(add?.disabled).toBe(false)
     add?.click()
     await nextTick()
-    expect(onAddEnsembleCandidate).toHaveBeenCalledWith('deepseek', 'claude-opus', '')
+    expect(onAddEnsembleCandidate).toHaveBeenCalledWith('deepseek', 'claude-opus', 'proposer')
 
     el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-import-tiers"]')?.click()
     await nextTick()

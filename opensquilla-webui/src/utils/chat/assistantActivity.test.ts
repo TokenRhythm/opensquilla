@@ -76,6 +76,55 @@ function toolGroup(
 }
 
 describe('projectAssistantActivity', () => {
+  it('hides persisted mutation protocol echoes while keeping structured activity', () => {
+    const leaked = (
+      'TheUserInstructions {"documentMutationOutcome":{"status":"applied"}} '
+      + 'User(internal control text)'
+    )
+    const projection = projectAssistantActivity(
+      message({
+        text: `${leaked}\n\nPage updated.`,
+        timelineItems: [
+          toolGroup([call('apply', { name: 'document_apply' })], 'apply'),
+          { type: 'text', key: 'leaked-answer', html: leaked, rawText: leaked },
+        ],
+        turnOutcome: {
+          turnId: 'turn-contained-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(JSON.stringify(projection)).not.toContain('TheUserInstructions')
+    expect(JSON.stringify(projection)).not.toContain('documentMutationOutcome')
+  })
+
+  it('keeps an ordinary localized mutation result visible', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Page updated.',
+        turnOutcome: {
+          turnId: 'turn-safe-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart?.rawText).toBe('Page updated.')
+  })
+
   it('fails open when an ordinary tool group did not settle successfully', () => {
     const failed = call('failed', {
       status: 'error',
@@ -218,6 +267,41 @@ describe('projectAssistantActivity', () => {
       'opening',
       'middle',
       'verify',
+    ])
+  })
+
+  it('keeps an explicit intermediate span out of the adjacent final answer', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting.Working note.Final answer.',
+        timelineItems: [
+          { type: 'text', key: 'opening', html: 'Inspecting.', rawText: 'Inspecting.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Working note.',
+            rawText: 'Working note.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'inspect',
+      'work',
     ])
   })
 

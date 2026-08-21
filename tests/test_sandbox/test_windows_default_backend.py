@@ -1288,7 +1288,7 @@ async def test_backend_readonly_cwd_does_not_prepare_or_rehome_cache(
     monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
     monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
     monkeypatch.setattr(mod, "_windows_tool_path_roots", lambda *args, **kwargs: ())
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     await WindowsDefaultBackend().run(request)
 
@@ -1322,7 +1322,7 @@ async def test_backend_returns_helper_result(
 
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     result = await WindowsDefaultBackend().run(_request(tmp_path))
 
@@ -1372,7 +1372,7 @@ async def test_backend_cancellation_kills_and_reaps_helper(
 
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     task = asyncio.create_task(WindowsDefaultBackend().run(_request(tmp_path)))
     await communicating.wait()
@@ -1408,7 +1408,7 @@ async def test_frozen_backend_uses_internal_child_role(
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     await WindowsDefaultBackend().run(_request(tmp_path))
 
@@ -1444,7 +1444,7 @@ async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
     monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-123", raising=False)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     with pytest.raises(SandboxBackendError, match="execution lease is busy"):
         await WindowsDefaultBackend().run(_request(tmp_path))
@@ -1477,7 +1477,7 @@ async def test_backend_waits_for_helper_grace_beyond_command_timeout(
     request = _request(tmp_path)
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
 
     result = await WindowsDefaultBackend().run(request)

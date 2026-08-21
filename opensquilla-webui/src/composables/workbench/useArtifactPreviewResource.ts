@@ -83,6 +83,11 @@ export interface ArtifactPreviewResourceController {
 }
 
 class ArtifactPreviewTooLargeError extends Error {}
+class ArtifactPreviewInvalidContentError extends Error {}
+class ArtifactPreviewIntegrityError extends Error {}
+
+const INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN =
+  /^data:([a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*(?:;charset=[^;,]+)?);base64,([a-z0-9+/=]*)$/i
 
 const GENERIC_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
   avif: 'image/avif',
@@ -110,6 +115,74 @@ function isSameOriginHttpUrl(url: string, baseOrigin: string): boolean {
   } catch {
     return false
   }
+}
+
+function isInlineWorkbenchAttachmentUrl(artifact: ArtifactPayload, url: string): boolean {
+  if (artifact.workbenchResourceType !== 'attachment') return false
+  // Inline transcript attachments are returned only by the authenticated
+  // read-only resource lookup. Keep the exception narrow: base64 data with a
+  // concrete MIME type, never an arbitrary URL or executable data shorthand.
+  return INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN.test(url)
+}
+
+function inlineWorkbenchAttachmentResponse(url: string, limit: number): Response {
+  const match = url.match(INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN)
+  if (!match) throw new ArtifactPreviewInvalidContentError()
+
+  const contentType = match[1] || ''
+  const encoded = match[2] || ''
+  // Reject an oversized payload before atob allocates its decoded binary
+  // string. The decoded-length check below handles padding and boundary cases.
+  if (encoded.length > Math.ceil(limit / 3) * 4) {
+    throw new ArtifactPreviewTooLargeError()
+  }
+
+  let decoded = ''
+  try {
+    decoded = globalThis.atob(encoded)
+  } catch {
+    throw new ArtifactPreviewInvalidContentError()
+  }
+  if (decoded.length > limit) throw new ArtifactPreviewTooLargeError()
+
+  const bytes = new Uint8Array(decoded.length)
+  for (let index = 0; index < decoded.length; index += 1) {
+    bytes[index] = decoded.charCodeAt(index)
+  }
+  return new Response(bytesToArrayBuffer(bytes), {
+    status: 200,
+    headers: {
+      'Content-Length': String(bytes.byteLength),
+      'Content-Type': contentType,
+    },
+  })
+}
+
+async function verifyInlineWorkbenchAttachmentIntegrity(
+  artifact: ArtifactPayload,
+  bytes: Uint8Array,
+): Promise<void> {
+  if (artifact.size !== undefined && artifact.size !== null && artifact.size !== '') {
+    const expectedSize = Number(artifact.size)
+    if (
+      !Number.isSafeInteger(expectedSize)
+      || expectedSize < 0
+      || bytes.byteLength !== expectedSize
+    ) {
+      throw new ArtifactPreviewIntegrityError()
+    }
+  }
+
+  if (artifact.sha256 === undefined || artifact.sha256 === null || artifact.sha256 === '') return
+  const expectedSha256 = String(artifact.sha256).trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(expectedSha256) || !globalThis.crypto?.subtle) {
+    throw new ArtifactPreviewIntegrityError()
+  }
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytesToArrayBuffer(bytes))
+  const actualSha256 = [...new Uint8Array(digest)]
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('')
+  if (actualSha256 !== expectedSha256) throw new ArtifactPreviewIntegrityError()
 }
 
 function defaultCreateObjectUrl(blob: Blob): string {
@@ -324,15 +397,9 @@ export function createArtifactPreviewResource(
 
     const baseOrigin = options.baseOrigin?.() || defaultBaseOrigin()
     const url = artifactAccessUrl(artifact, baseOrigin)
-    if (!url || !isSameOriginHttpUrl(url, baseOrigin)) {
+    const inlineAttachment = isInlineWorkbenchAttachmentUrl(artifact, url)
+    if (!url || (!inlineAttachment && !isSameOriginHttpUrl(url, baseOrigin))) {
       setFailure('error', 'missing-url')
-      return
-    }
-
-    const fetchImpl = options.fetchImpl
-      || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : null)
-    if (!fetchImpl) {
-      setFailure('error', 'download-failed')
       return
     }
 
@@ -342,17 +409,28 @@ export function createArtifactPreviewResource(
     state.value = 'loading'
 
     try {
-      const response = await fetchImpl(url, {
-        method: 'GET',
-        credentials: 'same-origin',
-        headers: artifactAccessHeaders(url, {
-          authToken: options.authToken?.() || '',
-          baseOrigin,
-          sessionKey: options.sessionKey?.() || '',
-        }),
-        redirect: 'error',
-        signal: controller.signal,
-      })
+      let response: Response
+      if (inlineAttachment) {
+        response = inlineWorkbenchAttachmentResponse(url, limit)
+      } else {
+        const fetchImpl = options.fetchImpl
+          || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : null)
+        if (!fetchImpl) {
+          setFailure('error', 'download-failed')
+          return
+        }
+        response = await fetchImpl(url, {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: artifactAccessHeaders(url, {
+            authToken: options.authToken?.() || '',
+            baseOrigin,
+            sessionKey: options.sessionKey?.() || '',
+          }),
+          redirect: 'error',
+          signal: controller.signal,
+        })
+      }
       if (disposed || suspended || run !== generation) {
         await cancelResponseBody(response)
         return
@@ -379,6 +457,10 @@ export function createArtifactPreviewResource(
         if (!disposed && run === generation) progress.value = value
       })
       if (disposed || suspended || run !== generation) return
+      if (inlineAttachment) {
+        await verifyInlineWorkbenchAttachmentIntegrity(artifact, bytes)
+        if (disposed || suspended || run !== generation) return
+      }
 
       const responseBaseMime = responseMime.split(';', 1)[0].trim().toLowerCase()
       const declaredMime = String(artifact.mime || '').split(';', 1)[0].trim().toLowerCase()
@@ -442,6 +524,10 @@ export function createArtifactPreviewResource(
       if (disposed || run !== generation || isAbortError(error)) return
       if (error instanceof ArtifactPreviewTooLargeError) {
         setFailure('unsupported', 'too-large')
+      } else if (error instanceof ArtifactPreviewInvalidContentError) {
+        setFailure('error', 'invalid-content')
+      } else if (error instanceof ArtifactPreviewIntegrityError) {
+        setFailure('error', 'integrity-error')
       } else if (isOfflineError(error)) {
         setFailure('offline', 'offline')
       } else {

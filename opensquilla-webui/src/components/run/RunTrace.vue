@@ -192,21 +192,23 @@
                   <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
                 </span>
               </button>
-              <div v-if="callOpen(call)" class="tool-row-body">
-                <ActivityToolDetails
-                  v-if="presentation === 'activity'"
-                  :call="call"
-                  :label="call.displayName"
-                  :operation-key="operationKey(call)"
-                  @show-result="forwardShowResult"
-                />
-                <ToolRowSections
-                  v-else
-                  :call="call"
-                  :label="call.displayName"
-                  @show-result="forwardShowResult"
-                />
-              </div>
+              <Transition name="activity-tool-detail" :css="presentation === 'activity'">
+                <div v-if="callOpen(call)" class="tool-row-body">
+                  <ActivityToolDetails
+                    v-if="presentation === 'activity'"
+                    :call="call"
+                    :label="call.displayName"
+                    :operation-key="operationKey(call)"
+                    @show-result="forwardShowResult"
+                  />
+                  <ToolRowSections
+                    v-else
+                    :call="call"
+                    :label="call.displayName"
+                    @show-result="forwardShowResult"
+                  />
+                </div>
+              </Transition>
             </div>
           </TransitionGroup>
         </template>
@@ -250,21 +252,23 @@
                 <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
               </span>
             </button>
-            <div v-if="callOpen(call)" class="tool-row-body">
-              <ActivityToolDetails
-                v-if="presentation === 'activity'"
-                :call="call"
-                :label="item.group.label"
-                :operation-key="operationKey(call)"
-                @show-result="forwardShowResult"
-              />
-              <ToolRowSections
-                v-else
-                :call="call"
-                :label="item.group.label"
-                @show-result="forwardShowResult"
-              />
-            </div>
+            <Transition name="activity-tool-detail" :css="presentation === 'activity'">
+              <div v-if="callOpen(call)" class="tool-row-body">
+                <ActivityToolDetails
+                  v-if="presentation === 'activity'"
+                  :call="call"
+                  :label="item.group.label"
+                  :operation-key="operationKey(call)"
+                  @show-result="forwardShowResult"
+                />
+                <ToolRowSections
+                  v-else
+                  :call="call"
+                  :label="item.group.label"
+                  @show-result="forwardShowResult"
+                />
+              </div>
+            </Transition>
           </div>
         </template>
       </div>
@@ -755,6 +759,7 @@ function withoutFailedActivityRows(
 
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
+    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
 
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
@@ -764,24 +769,32 @@ function withoutFailedActivityRows(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
+      && !documentApplyGroup
     ) {
       return []
     }
 
     const calls = item.group.calls.filter(
-      call => !call.isError && call.status !== 'error',
+      call => (
+        (!call.isError && call.status !== 'error')
+        || isDocumentApplyToolName(call.name)
+      ),
     )
     if (calls.length === 0) return []
 
     const isRunning = calls.some(call => call.isRunning)
+    const isError = calls.some(call => call.isError || call.status === 'error')
+      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
         ...item.group,
         calls,
         isRunning,
-        isError: false,
-        status: isRunning
+        isError,
+        status: isError
+          ? 'error'
+          : isRunning
           ? ''
           : calls.every(call => call.status === 'success')
             ? 'success'
@@ -789,6 +802,13 @@ function withoutFailedActivityRows(
       },
     }]
   })
+}
+
+function isDocumentApplyToolName(value: string | undefined): boolean {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  const segments = normalized.split(/[.:/]/)
+  return segments[segments.length - 1] === 'document_apply'
 }
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
@@ -1880,6 +1900,28 @@ function fmtTok(n?: number | null): string {
   padding: 0 0 0.125rem 1.625rem;
 }
 
+.tool-timeline--activity .activity-tool-detail-enter-active {
+  transform-origin: top left;
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+  will-change: opacity, transform;
+}
+
+.tool-timeline--activity .activity-tool-detail-leave-active {
+  transform-origin: top left;
+  transition:
+    opacity var(--dur-fast) var(--ease-in),
+    transform var(--dur-fast) var(--ease-in);
+  will-change: opacity, transform;
+}
+
+.tool-timeline--activity .activity-tool-detail-enter-from,
+.tool-timeline--activity .activity-tool-detail-leave-to {
+  opacity: 0;
+  transform: translateY(-0.25rem);
+}
+
 .tool-timeline--activity .step-group-members {
   padding-left: 1.5rem;
 }
@@ -2010,6 +2052,17 @@ function fmtTok(n?: number | null): string {
   .tool-member-enter-active,
   .tool-member-move {
     transition: none;
+  }
+
+  .tool-timeline--activity .activity-tool-detail-enter-active,
+  .tool-timeline--activity .activity-tool-detail-leave-active {
+    transition: none;
+  }
+
+  .tool-timeline--activity .activity-tool-detail-enter-from,
+  .tool-timeline--activity .activity-tool-detail-leave-to {
+    opacity: 1;
+    transform: none;
   }
 
   .tool-timeline--checklist .tool-row--running,

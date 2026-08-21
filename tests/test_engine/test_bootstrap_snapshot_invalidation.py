@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from opensquilla.bootstrap_types import BootstrapFileReport
 from opensquilla.engine.runtime import BootstrapSnapshot, MemorySnapshot, TurnRunner
+from opensquilla.engine.turn_runner.harness import _TurnRunnerSystemPromptRefreshAdapter
 from opensquilla.identity.workspace import filter_workspace_filenames_for_session
 from opensquilla.tools.types import ToolContext
 
@@ -136,6 +137,91 @@ def test_prompt_reports_the_effective_execution_workspace(tmp_path) -> None:
     base_prompt = assembled[0] if isinstance(assembled, tuple) else assembled
     assert f"Working directory: {project_workspace}" in base_prompt
     assert f"Working directory: {default_workspace}" not in base_prompt
+
+
+def test_restricted_prompt_projection_reads_no_workspace_or_local_paths(tmp_path) -> None:
+    secret_marker = "PROMPT_ANNOTATION_WORKSPACE_SECRET"
+    for filename in (
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "TOOLS.md",
+        "USER.md",
+        "BOOTSTRAP.md",
+        "HEARTBEAT.md",
+    ):
+        (tmp_path / filename).write_text(
+            f"{secret_marker}:{filename}\n",
+            encoding="utf-8",
+        )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            workspace_dir=str(tmp_path),
+            memory=SimpleNamespace(source="workspace"),
+            tools=SimpleNamespace(profile=None),
+        ),
+    )
+    metadata: dict[str, object] = {}
+
+    assembled = runner._assemble_prompt(
+        "main",
+        [],
+        session_key="agent:main:webchat:prompt-annotation",
+        prompt_metadata=metadata,
+        bootstrap_context_mode="restricted_tool_boundary",
+        workspace_dir=str(tmp_path / "selected-project"),
+    )
+
+    full_prompt = "\n".join(assembled) if isinstance(assembled, tuple) else assembled
+    assert secret_marker not in full_prompt
+    assert str(tmp_path) not in full_prompt
+    assert "Working directory:" not in full_prompt
+    assert "## Workspace Files (injected)" not in full_prompt
+    assert "## Runtime" not in full_prompt
+    assert metadata["injected_workspace_files_count"] == 0
+    assert metadata["bootstrap_files"] == []
+    assert metadata["memory_md_present"] is False
+    assert (
+        "main",
+        "agent:main:webchat:prompt-annotation",
+        "restricted_tool_boundary",
+    ) not in runner._bootstrap_snapshots
+
+
+def test_restricted_compaction_refresh_keeps_workspace_projection_empty(tmp_path) -> None:
+    secret_marker = "COMPACTION_WORKSPACE_SECRET"
+    (tmp_path / "AGENTS.md").write_text(secret_marker, encoding="utf-8")
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            workspace_dir=str(tmp_path),
+            memory=SimpleNamespace(source="workspace"),
+            tools=SimpleNamespace(profile=None),
+        ),
+    )
+    refreshed: list[str] = []
+    agent = SimpleNamespace(
+        _tool_context=ToolContext(
+            workspace_dir=str(tmp_path),
+            exclusive_tools={"document_inspect", "document_apply"},
+        ),
+        config=SimpleNamespace(workspace_dir=str(tmp_path)),
+        refresh_system_prompt=refreshed.append,
+    )
+
+    _TurnRunnerSystemPromptRefreshAdapter(runner).refresh_system_prompt(
+        agent=agent,
+        agent_id="main",
+        tool_defs=[],
+        session_key="agent:main:webchat:prompt-annotation",
+        bootstrap_context_mode="full",
+    )
+
+    assert len(refreshed) == 1
+    assert secret_marker not in refreshed[0]
+    assert str(tmp_path) not in refreshed[0]
+    assert "Working directory:" not in refreshed[0]
 
 
 def test_prompt_metadata_uses_effective_memory_retrieval_metadata(tmp_path) -> None:

@@ -772,8 +772,15 @@ summary.control-row--divider:focus-visible {
 }
 
 .sidebar-group__body {
+  display: grid;
+  grid-template-rows: 1fr;
+  overflow: hidden;
+}
+
+.sidebar-group__content {
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
 
 /* Subagent indent: a left rail mirrors the console list's nested look. The

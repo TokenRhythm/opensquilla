@@ -14,14 +14,15 @@ if [[ ! "${label}" =~ ^[A-Za-z0-9._-]{1,80}$ ]]; then
 fi
 
 sandbox="${RUNNER_TEMP}/opensquilla-release-preservation-${label}"
-old_dir="${sandbox}/rc3"
-old_mount="${sandbox}/rc3-mount"
+old_dir="${sandbox}/v0.5.3"
+old_mount="${sandbox}/v0.5.3-mount"
 candidate_mount="${sandbox}/candidate-mount"
 install_root="${sandbox}/Applications"
 user_data="${sandbox}/user-data/OpenSquilla"
 profile="${user_data}/opensquilla"
 probe="${GITHUB_WORKSPACE}/.github/scripts/verify-release-profile-preservation.py"
-old_asset="OpenSquilla-0.5.0-rc3-mac-arm64.dmg"
+external_sentinels="${sandbox}/synthetic-system-tools"
+old_asset="OpenSquilla-0.5.3-mac-arm64.dmg"
 mkdir -p "${old_dir}" "${old_mount}" "${candidate_mount}" "${install_root}" "${user_data}"
 
 cleanup() {
@@ -34,7 +35,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gh release download v0.5.0rc3 \
+gh release download v0.5.3 \
   --repo opensquilla/opensquilla \
   --pattern "${old_asset}" \
   --dir "${old_dir}"
@@ -45,14 +46,23 @@ test -f "${candidate_dmg}"
 hdiutil attach -nobrowse -readonly -mountpoint "${old_mount}" "${old_dmg}"
 ditto "${old_mount}/OpenSquilla.app" "${install_root}/OpenSquilla.app"
 hdiutil detach "${old_mount}" -quiet
+old_runtime="${install_root}/OpenSquilla.app/Contents/Resources/runtime/developer/darwin-arm64"
+test -x "${old_runtime}/python/bin/python3"
+test -x "${old_runtime}/node/bin/node"
 
-python "${probe}" seed --home "${profile}" --label "${label}"
+python "${probe}" seed --home "${profile}" --label "${label}" \
+  --external-root "${external_sentinels}"
 
 hdiutil attach -nobrowse -readonly -mountpoint "${candidate_mount}" "${candidate_dmg}"
-mv "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.rc3.app"
+mv "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.v0.5.3.app"
 ditto "${candidate_mount}/OpenSquilla.app" "${install_root}/OpenSquilla.app"
 hdiutil detach "${candidate_mount}" -quiet
-python "${probe}" verify --home "${profile}" --label "${label}"
+candidate_runtime="${install_root}/OpenSquilla.app/Contents/Resources/runtime"
+test ! -e "${candidate_runtime}/developer"
+test -f "${candidate_runtime}/runtime-manifest.json"
+test -f "${candidate_runtime}/runtime-pack-catalog.json"
+python "${probe}" verify --home "${profile}" --label "${label}" \
+  --external-root "${external_sentinels}"
 
 app_binary="${install_root}/OpenSquilla.app/Contents/MacOS/OpenSquilla"
 test -x "${app_binary}"
@@ -90,9 +100,10 @@ configured_state = [
 assert len(configured_state) == 1, report
 assert Path(configured_state[0]["path"]).resolve() == home / "state", report
 PY
-python "${probe}" verify --home "${profile}" --label "${label}"
+python "${probe}" verify --home "${profile}" --label "${label}" \
+  --external-root "${external_sentinels}"
 
-python - "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.rc3.app" <<'PY'
+python - "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.v0.5.3.app" <<'PY'
 import shutil
 import sys
 
@@ -100,5 +111,6 @@ for app_path in sys.argv[1:]:
     shutil.rmtree(app_path)
 PY
 test ! -e "${install_root}/OpenSquilla.app"
-test ! -e "${install_root}/OpenSquilla.rc3.app"
-python "${probe}" verify --home "${profile}" --label "${label}"
+test ! -e "${install_root}/OpenSquilla.v0.5.3.app"
+python "${probe}" verify --home "${profile}" --label "${label}" \
+  --external-root "${external_sentinels}"

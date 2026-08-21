@@ -196,7 +196,7 @@ _APPROVAL_EVENTS = frozenset(
         "plugin.approval.resolved",
     }
 )
-_MODEL_ROUTING_EVENTS = frozenset({"models.routing.changed"})
+_MODEL_ROUTING_EVENTS = frozenset({"sessions.routing.changed"})
 
 
 def _flatten_event_frame(frame: dict[str, Any]) -> dict[str, Any]:
@@ -527,13 +527,22 @@ async def _watch_model_routing_events(
     deps: GatewayRuntimeDependencies,
     scope: GatewayRuntimeScope,
 ) -> None:
-    """Mirror WebUI or another TUI's global strategy write immediately."""
+    """Mirror model-routing writes for the TUI's current Session only."""
 
     async for frame in subscription:
-        if str(frame.get("event") or "") != "models.routing.changed":
+        if str(frame.get("event") or "") != "sessions.routing.changed":
             continue
         payload = frame.get("payload")
         snapshot = payload if isinstance(payload, dict) else {}
+        event_key = str(
+            snapshot.get("sessionKey")
+            or snapshot.get("session_key")
+            or snapshot.get("key")
+            or ""
+        )
+        current_key = str(scope.get("session_key") or "")
+        if event_key and event_key != current_key:
+            continue
         output = await _wait_for_output(deps, scope)
         await send_model_routing_state(output, snapshot)
 

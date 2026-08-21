@@ -177,7 +177,7 @@ export interface NativeWorkbenchCreateSurfaceRequestV1 {
 }
 
 export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
-  version: 2
+  version: 2 | 3
   surfaceId: string
   kind: 'artifact-preview'
   payload: {
@@ -189,7 +189,7 @@ export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
 }
 
 export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
-  version: 2
+  version: 2 | 3
   surfaceId: string
   kind: 'url-preview'
   payload: {
@@ -204,9 +204,81 @@ export type NativeWorkbenchCreateSurfaceRequest =
   | NativeWorkbenchCreateUrlSurfaceRequestV2
 
 export interface NativeWorkbenchCapabilities {
-  protocolVersions: Array<1 | 2>
+  protocolVersions: Array<1 | 2 | 3>
   modes: WorkbenchPreviewMode[]
   maxSurfaces: number
+}
+
+export interface NativeArtifactAnnotationCapabilities {
+  version: 3
+  available: boolean
+  picker?: boolean
+  trustedOverlay?: boolean
+  overlayCopyVersion?: 1
+  reason?: string
+}
+
+export interface NativeArtifactAnnotationModeRequest {
+  version: 3
+  surfaceId: string
+  enabled: boolean
+}
+
+export interface NativeArtifactAnnotationOverlayRequest {
+  version: 3
+  surfaceId: string
+  selectionId: string
+  annotationId: string
+  initialBody?: string
+  overlayCopyVersion?: 1
+  copy?: {
+    targetLabel: string
+    contextLabel: string
+    bodyLabel: string
+    placeholder: string
+    newlineHint: string
+    cancelLabel: string
+    submitLabel: string
+    emptyBodyMessage: string
+  }
+}
+
+export interface NativeArtifactAnnotationOverlayCloseRequest {
+  version: 3
+  surfaceId: string
+  annotationId?: string
+}
+
+export interface NativeArtifactScreenshotRequest {
+  version: 3
+}
+
+export interface NativeArtifactScreenshotValue {
+  mime: 'image/png'
+  data: Uint8Array
+  width: number
+  height: number
+}
+
+export type NativeArtifactScreenshotResult = {
+  ok: true
+  method: 'screenshot'
+  value: NativeArtifactScreenshotValue
+} | {
+  ok: false
+  method: 'screenshot'
+  code: string
+  message: string
+}
+
+export interface NativeArtifactAnnotationSelection {
+  selectionId: string
+  tagName: string
+  elementPath: string
+  elementProofSha256: string
+  /** Compatibility diagnostic emitted by current Desktop shells. */
+  domSha256?: string
+  rect: { x: number; y: number; width: number; height: number }
 }
 
 export interface NativeWorkbenchSurfaceRectRequest {
@@ -220,6 +292,8 @@ export interface NativeWorkbenchSurfaceRectRequest {
 
 export interface NativeWorkbenchSurfaceResult {
   ok: boolean
+  code?: string
+  retryable?: boolean
   message?: string
 }
 
@@ -236,9 +310,14 @@ export type NativeWorkbenchSurfaceEventType =
   | 'error'
   | 'crashed'
   | 'escape'
+  | 'annotation-selected'
+  | 'annotation-draft-change'
+  | 'annotation-submit'
+  | 'annotation-cancel'
+  | 'annotation-overlay-fallback'
 
 export interface NativeWorkbenchSurfaceEvent {
-  version: 1 | 2
+  version: 1 | 2 | 3
   surfaceId: string
   type: NativeWorkbenchSurfaceEventType
   detail?: {
@@ -255,18 +334,21 @@ export interface NativeWorkbenchSurfaceEvent {
     message?: string
     path?: string
     reason?: string
+    annotationId?: string
+    selection?: NativeArtifactAnnotationSelection
+    body?: string
   }
 }
 
 export interface NativeWorkbenchNavigateRequest {
-  version: 2
+  version: 2 | 3
   surfaceId: string
   action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
   url?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
-  version: 2
+  version: 2 | 3
   surfaceId: string
   requestId: string
   allow: boolean
@@ -300,6 +382,19 @@ export type NativeArtifactPreviewLeaseBrokerResult = {
 
 export interface NativeWorkbenchApi {
   getCapabilities?(): Promise<NativeWorkbenchCapabilities>
+  getArtifactAnnotationCapabilities?(): Promise<NativeArtifactAnnotationCapabilities>
+  setArtifactAnnotationMode?(
+    request: NativeArtifactAnnotationModeRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  showArtifactAnnotationOverlay?(
+    request: NativeArtifactAnnotationOverlayRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  closeArtifactAnnotationOverlay?(
+    request: NativeArtifactAnnotationOverlayCloseRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  screenshot?(
+    request: NativeArtifactScreenshotRequest,
+  ): Promise<NativeArtifactScreenshotResult>
   createArtifactPreviewLease?(
     request: NativeArtifactPreviewLeaseCreateRequest,
   ): Promise<NativeArtifactPreviewLeaseBrokerResult>

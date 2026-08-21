@@ -84,6 +84,41 @@ describe('workbench runtime registry', () => {
     expect(manager.hasRuntime('a')).toBe(false)
   })
 
+  it('lets a live panel reject removal before the store drops its descriptor', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const beforeClose = vi.fn(async () => false)
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: () => ({ beforeClose }),
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('dirty')
+    manager.handle({ type: 'open', item: descriptor })
+    await manager.flush()
+
+    await expect(manager.beforeClose(descriptor)).resolves.toBe(false)
+    expect(beforeClose).toHaveBeenCalledOnce()
+    expect(manager.hasRuntime(descriptor.id)).toBe(true)
+  })
+
+  it('forwards a preserve-runtime flush without disposing the live panel', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const beforeClose = vi.fn(async () => true)
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: () => ({ beforeClose }),
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('send-flush')
+    manager.handle({ type: 'open', item: descriptor })
+    await manager.flush()
+
+    await expect(manager.beforeClose(descriptor, { preserveRuntime: true }))
+      .resolves.toBe(true)
+    expect(beforeClose).toHaveBeenCalledWith({ preserveRuntime: true })
+    expect(manager.hasRuntime(descriptor.id)).toBe(true)
+  })
+
   it('recreates dispose-on-suspend resources when resumed', async () => {
     const registry = new WorkbenchPanelRegistry()
     const runtimes: WorkbenchPanelRuntime[] = []
@@ -159,6 +194,34 @@ describe('workbench runtime registry', () => {
 
     expect(createRuntime).toHaveBeenCalledOnce()
     expect(manager.hasRuntime(descriptor.id)).toBe(false)
+  })
+
+  it('replays a surface rect that arrives before its descriptor opens', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const handleSurfaceRect = vi.fn()
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: () => ({ handleSurfaceRect }),
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('late-open')
+    const rect = {
+      itemId: descriptor.id,
+      x: 480,
+      y: 70,
+      width: 600,
+      height: 480,
+      visible: true,
+    }
+
+    manager.handleSurfaceRect(rect)
+    expect(handleSurfaceRect).not.toHaveBeenCalled()
+
+    manager.handle({ type: 'open', item: descriptor })
+    await manager.flush()
+
+    expect(handleSurfaceRect).toHaveBeenCalledOnce()
+    expect(handleSurfaceRect).toHaveBeenCalledWith(rect, descriptor)
   })
 
   it('keeps a reopened descriptor with the same id reachable after close', async () => {
@@ -543,5 +606,103 @@ describe('workbench runtime registry', () => {
     })).toEqual([
       expect.objectContaining({ id: 'take-control', label: 'Return control' }),
     ])
+  })
+
+  it('forwards the v3 annotation and screenshot bridge only for the active surface', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    let scoped: NativeWorkbenchApi | undefined
+    const getCapabilities = vi.fn(async () => ({
+      version: 3 as const,
+      available: true,
+      picker: true,
+      trustedOverlay: true,
+    }))
+    const setMode = vi.fn(async () => ({ ok: true as const }))
+    const showOverlay = vi.fn(async () => ({ ok: true as const }))
+    const closeOverlay = vi.fn(async () => ({ ok: true as const }))
+    const screenshot = vi.fn(async () => ({
+      ok: true as const,
+      method: 'screenshot' as const,
+      value: {
+        mime: 'image/png' as const,
+        data: new Uint8Array([1, 2, 3]),
+        width: 10,
+        height: 10,
+      },
+    }))
+    const nativeApi: NativeWorkbenchApi = {
+      getArtifactAnnotationCapabilities: getCapabilities,
+      setArtifactAnnotationMode: setMode,
+      showArtifactAnnotationOverlay: showOverlay,
+      closeArtifactAnnotationOverlay: closeOverlay,
+      screenshot,
+      createSurface: vi.fn(async () => ({ ok: true })),
+      setSurfaceRect: vi.fn(async () => ({ ok: true })),
+      activateSurface: vi.fn(async () => ({ ok: true })),
+      destroySurface: vi.fn(async () => ({ ok: true })),
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    const descriptor: WorkbenchItem = {
+      ...item('annotation-native'),
+      hostKind: 'native-webcontents',
+    }
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: (_item, context) => {
+        scoped = context.nativeWorkbenchApi
+        return {}
+      },
+    })
+    const manager = new WorkbenchRuntimeManager(registry, { nativeWorkbenchApi: nativeApi })
+    manager.handle({ type: 'open', item: descriptor })
+    manager.handle({ type: 'resume', item: descriptor })
+    manager.handleSurfaceRect({
+      itemId: descriptor.id,
+      x: 0,
+      y: 0,
+      width: 640,
+      height: 480,
+      visible: true,
+    })
+    await manager.flush()
+
+    await expect(scoped?.getArtifactAnnotationCapabilities?.()).resolves.toMatchObject({
+      available: true,
+    })
+    await scoped?.setArtifactAnnotationMode?.({
+      version: 3,
+      surfaceId: descriptor.id,
+      enabled: true,
+    })
+    await scoped?.showArtifactAnnotationOverlay?.({
+      version: 3,
+      surfaceId: descriptor.id,
+      selectionId: 'selection-1',
+      annotationId: 'annotation-1',
+    })
+    await scoped?.closeArtifactAnnotationOverlay?.({
+      version: 3,
+      surfaceId: descriptor.id,
+      annotationId: 'annotation-1',
+    })
+    await expect(scoped?.screenshot?.({ version: 3 })).resolves.toMatchObject({
+      ok: true,
+      method: 'screenshot',
+    })
+    expect(getCapabilities).toHaveBeenCalledOnce()
+    expect(setMode).toHaveBeenCalledOnce()
+    expect(showOverlay).toHaveBeenCalledOnce()
+    expect(closeOverlay).toHaveBeenCalledOnce()
+    expect(screenshot).toHaveBeenCalledOnce()
+
+    manager.handle({ type: 'suspend', item: descriptor })
+    await manager.flush()
+    await expect(scoped?.showArtifactAnnotationOverlay?.({
+      version: 3,
+      surfaceId: descriptor.id,
+      selectionId: 'selection-2',
+      annotationId: 'annotation-2',
+    })).resolves.toMatchObject({ ok: false })
+    expect(showOverlay).toHaveBeenCalledOnce()
   })
 })

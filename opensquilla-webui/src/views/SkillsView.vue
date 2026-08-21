@@ -167,12 +167,15 @@
       :registry-search-error="registrySearchError"
       :activities="installActivities"
       :running-source="runningSource"
+      :cancellable-install-source="cancellableInstallSource"
+      :cancelling-source="cancellingSource"
       :mutation-blocked="mutationBusy && !queueRunning"
       @close="addSkillOpen = false"
       @search="searchRegistry"
       @install-github="installGithub"
       @install="installSkill"
       @retry="retryQueueItem"
+      @cancel-install="cancelInstall"
       @clear-activity="clearInstallActivity"
     />
 
@@ -337,6 +340,8 @@ const {
   registrySearchError,
   installActivities,
   runningSource,
+  cancellableInstallSource,
+  cancellingSource,
   queueRunning,
   mutationBusy,
   installingDepsId,
@@ -345,6 +350,7 @@ const {
   installGithub,
   installSkill,
   retryQueueItem,
+  cancelInstall,
   clearInstallActivity,
   installDeps,
   uninstallSkill,

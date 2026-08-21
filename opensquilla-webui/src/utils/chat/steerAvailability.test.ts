@@ -27,7 +27,6 @@ describe('steerUnavailableReason', () => {
   it.each([
     [{ isStreaming: false }, 'noActiveTurn'],
     [{ methodAvailable: false }, 'gatewayUnsupported'],
-    [{ modelRoutingMode: 'llm_ensemble' }, 'ensemble'],
     [{ capability: null }, 'capabilityPending'],
     [{ activeTaskId: 'task-2' }, 'taskMismatch'],
     [{ capability: { ...availableCapability, expected_turn_id: '' } }, 'taskMismatch'],
@@ -37,6 +36,24 @@ describe('steerUnavailableReason', () => {
     [{ capability: { mode: 'queue_only' } }, 'queueOnly'],
   ] as const)('maps local gate state %o to %s', (overrides, expected) => {
     expect(reason(overrides)).toBe(expected)
+  })
+
+  it('uses an authoritative same-turn capability after the next-turn mode changes', () => {
+    expect(reason({ modelRoutingMode: 'llm_ensemble' })).toBeNull()
+  })
+
+  it('uses the session mode only as a fallback while capability is pending', () => {
+    expect(reason({ modelRoutingMode: 'llm_ensemble', capability: null })).toBe('ensemble')
+  })
+
+  it('keeps an accepted ensemble turn unavailable after the next-turn mode changes', () => {
+    expect(reason({
+      modelRoutingMode: 'manual',
+      capability: {
+        mode: 'queue_only',
+        reason: 'ensemble_requires_followup_turn',
+      },
+    })).toBe('ensemble')
   })
 
   it.each([

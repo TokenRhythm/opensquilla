@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="0"
+          :failure-count="documentApplyFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -284,10 +284,7 @@
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.ensemble') }}</span>
                   <span class="msg-meta-popover__value">{{ ensembleSummary }}</span>
                 </div>
-                <div
-                  v-if="message.meta.ensemble.costUsd || message.meta.costUsd || !usageIncomplete"
-                  class="msg-meta-popover__row"
-                >
+                <div class="msg-meta-popover__row">
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
                   <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.ensemble.costUsd || message.meta.costUsd) }}</span>
                 </div>
@@ -298,13 +295,15 @@
                 <div class="msg-meta-popover__models" :aria-label="t('chat.msgMeta.ensembleModelsAria')">
                   <div
                     v-for="member in message.meta.ensemble.models"
-                    :key="`${member.role}:${member.provider}:${member.model}`"
+                    :key="`${member.role}:${member.provider}:${member.model}:${member.sampleIndex || 0}`"
                     class="msg-meta-popover__model"
                   >
-                    <span class="msg-meta-popover__model-role">{{ ensembleRole(member.role, member.label) }}</span>
+                    <span class="msg-meta-popover__model-role">
+                      {{ ensembleMemberRoleLabel(member.role) }} <span aria-hidden="true">·</span>
+                    </span>
                     <span class="msg-meta-popover__model-name" :title="member.model">{{ member.modelShort }}</span>
                     <span class="msg-meta-popover__model-cost">
-                      {{ member.costUsd || !usageIncomplete ? fmtUsd(member.costUsd) : '—' }}
+                      {{ fmtUsd(member.costUsd) }}
                     </span>
                   </div>
                 </div>
@@ -449,6 +448,7 @@ import {
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 import {
   isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
@@ -697,11 +697,8 @@ const hasMetaDetails = computed(() => {
   )
 })
 
-const usageIncomplete = computed(() => (
-  props.message.meta ? hasIncompleteUsageCoverage(props.message.meta) : false
-))
 const usageCoverageDetail = computed(() => (
-  props.message.meta
+  props.message.meta && !props.message.meta.ensemble
     ? usageCoverageText(
         props.message.meta,
         (key, named) => String(named ? t(key, named) : t(key)),
@@ -821,6 +818,7 @@ function withoutFailedActivity(
 ): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
+    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
     )
@@ -830,24 +828,33 @@ function withoutFailedActivity(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
+      && !documentApplyGroup
     ) {
       return []
     }
     const calls = item.group.calls.filter(
-      call => !call.isError
-        && call.status !== 'error'
-        && !createdSessionCallIds.value.has(call.toolId),
+      call => (
+        (
+          (!call.isError && call.status !== 'error')
+          || isDocumentApplyToolName(call.name)
+        )
+        && !createdSessionCallIds.value.has(call.toolId)
+      ),
     )
     if (calls.length === 0) return []
     const isRunning = calls.some(call => call.isRunning)
+    const isError = calls.some(call => call.isError || call.status === 'error')
+      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
         ...item.group,
         calls,
         isRunning,
-        isError: false,
-        status: isRunning
+        isError,
+        status: isError
+          ? 'error'
+          : isRunning
           ? ''
           : calls.every(call => call.status === 'success')
             ? 'success'
@@ -855,6 +862,13 @@ function withoutFailedActivity(
       },
     }]
   })
+}
+
+function isDocumentApplyToolName(value: string | undefined): boolean {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  const segments = normalized.split(/[.:/]/)
+  return segments[segments.length - 1] === 'document_apply'
 }
 
 const visibleActivityItems = computed(() =>
@@ -872,7 +886,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    !cluster.isFailure
+    (!cluster.isFailure || cluster.calls.some(call => isDocumentApplyToolName(call.name)))
     && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
@@ -900,6 +914,20 @@ const hasActivity = computed(() =>
 const showActivityDisclosure = computed(() =>
   activityProjection.value.canSeparateActivity
   && hasActivity.value,
+)
+
+const documentApplyFailureCount = computed(() =>
+  visibleActivityItems.value.reduce((count, item) => {
+    if (item.type !== 'tool-group') return count
+    return count + item.group.calls.filter(call =>
+      isDocumentApplyToolName(call.name)
+      && (call.isError || call.status === 'error'),
+    ).length
+  }, 0),
+)
+
+const documentMutationOutcome = computed(() =>
+  props.message.turnOutcome?.documentMutationOutcome,
 )
 
 const activityStepCount = computed(() => Math.max(
@@ -1055,6 +1083,20 @@ function withMaintenanceSummary(label: string): string {
 }
 
 const activitySummaryLabel = computed(() => {
+  const mutationStatus = documentMutationOutcome.value?.status
+  const mutationSummaryKey = mutationStatus === 'applied'
+    ? 'applied'
+    : mutationStatus === 'ambiguous'
+      ? 'ambiguous'
+      : mutationStatus
+        ? 'not_applied'
+        : ''
+  if (mutationSummaryKey) {
+    return withMaintenanceSummary([
+      String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',
@@ -1100,13 +1142,6 @@ function fmtUsd(value: number): string {
   return `$${n.toFixed(6).replace(/\.?0+$/, '')}`
 }
 
-function ensembleRole(role: string, label: string): string {
-  const normalized = String(role || '').replace(/_/g, ' ')
-  if (normalized === 'proposer') return 'proposer'
-  if (normalized === 'aggregator') return 'aggregator'
-  if (normalized === 'fallback single') return 'fallback'
-  return label || normalized || 'member'
-}
 </script>
 
 <style scoped>

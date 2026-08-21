@@ -36,6 +36,7 @@ from opensquilla.attachment_refs import (
     transcript_material_path,
     write_transcript_material,
 )
+from opensquilla.prompt_annotations import normalize_prompt_annotation_snapshots
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,12 @@ log = logging.getLogger(__name__)
 _MISSING_ATTACHMENT_TEMPLATE = "[attachment unavailable: {name}]"
 _WINDOWS_REPLACE_RETRIES = 3
 _WINDOWS_REPLACE_RETRY_DELAY_S = 0.02
+
+
+def _new_attachment_id() -> str:
+    """Allocate a logical occurrence id independent of content-addressed bytes."""
+
+    return f"att_{secrets.token_urlsafe(18)}"
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -96,6 +103,7 @@ def build_transcript_attachment_envelope(
     media_root: Path,
     persist_enabled: bool,
     disk_budget_bytes: int | None = None,
+    prompt_annotations: object = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the JSON envelope written to ``transcript_entries.content``.
 
@@ -119,6 +127,7 @@ def build_transcript_attachment_envelope(
             sha = attachment["sha256"]
             persisted_attachments.append(
                 {
+                    "attachment_id": _new_attachment_id(),
                     "sha256_ref": sha,
                     "name": name,
                     "mime": media_type,
@@ -164,6 +173,7 @@ def build_transcript_attachment_envelope(
 
             persisted_attachments.append(
                 {
+                    "attachment_id": _new_attachment_id(),
                     "sha256_ref": sha,
                     "name": name,
                     "mime": media_type,
@@ -193,12 +203,20 @@ def build_transcript_attachment_envelope(
             )
         else:
             persisted_attachments.append(
-                {"type": media_type, "name": name, "data": data}
+                {
+                    "attachment_id": _new_attachment_id(),
+                    "type": media_type,
+                    "name": name,
+                    "data": data,
+                }
             )
 
     envelope_payload: dict[str, Any] = {"text": text, "attachments": persisted_attachments}
     if display_text is not None:
         envelope_payload["display_text"] = display_text
+    normalized_annotations = normalize_prompt_annotation_snapshots(prompt_annotations)
+    if normalized_annotations:
+        envelope_payload["prompt_annotations"] = list(normalized_annotations)
     envelope = json.dumps(envelope_payload)
     return envelope, disk_writes
 

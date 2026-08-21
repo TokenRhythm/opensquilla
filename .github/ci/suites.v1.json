@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "baseline_suites": [
+    "readme-locale",
+    "workflow-lint"
+  ],
+  "full_suites": [
+    "desktop-recovery-e2e",
+    "desktop-static",
+    "frontend",
+    "macos-recovery",
+    "managed-toolchain",
+    "python-full",
+    "readme-locale",
+    "release-packaging",
+    "tui",
+    "webui-chat-recovery",
+    "windows-high-risk",
+    "workflow-lint"
+  ],
+  "full_desktop_matrix": [
+    {
+      "os": "ubuntu-latest",
+      "shard": "all"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "profiles"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "ownership-workbench"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "ownership"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "workbench"
+    }
+  ],
+  "full_python_matrix": {
+    "ubuntu": [
+      "core",
+      "gateway-sqlite",
+      "recovery-migration",
+      "desktop-installer-contracts"
+    ],
+    "windows": [
+      "core",
+      "gateway-sqlite",
+      "recovery-migration",
+      "desktop-installer-contracts"
+    ]
+  },
+  "desktop_groups": {
+    "profiles": {
+      "keywords": [
+        "cleanup",
+        "consolidat",
+        "import",
+        "migration",
+        "onboarding",
+        "persistence",
+        "profile",
+        "recovery",
+        "repair",
+        "session"
+      ],
+      "path_patterns": [
+        "desktop/electron/scripts/test-onboarding*.mjs",
+        "desktop/electron/scripts/test-profile*.mjs",
+        "desktop/electron/scripts/test-primary-repair*.mjs",
+        "desktop/electron/scripts/test-desktop-cleanup*.mjs"
+      ]
+    },
+    "ownership": {
+      "keywords": [
+        "gateway-lifecycle",
+        "gateway_lifecycle",
+        "lifecycle",
+        "orphan",
+        "ownership",
+        "process-tree",
+        "process_tree",
+        "sandbox",
+        "shell",
+        "theme",
+        "window-background"
+      ],
+      "path_patterns": [
+        "desktop/electron/scripts/test-desktop-gateway-ownership.mjs",
+        "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
+        "desktop/electron/scripts/test-desktop-window-background-flow.mjs",
+        "desktop/electron/scripts/test-desktop-theme-flow.mjs"
+      ]
+    },
+    "workbench": {
+      "keywords": [
+        "artifact",
+        "document",
+        "editor",
+        "preview",
+        "workbench",
+        "zoom"
+      ],
+      "path_patterns": [
+        "desktop/electron/scripts/test-native-workbench*.mjs",
+        "desktop/electron/scripts/test-desktop-zoom*.mjs",
+        "desktop/electron/scripts/test-native-workbench-v2-electron.mjs",
+        "desktop/electron/scripts/test-offline-document-workbench-e2e.mjs",
+        "desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs",
+        "desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs"
+      ]
+    }
+  },
+  "suites": {
+    "workflow-lint": {
+      "execution_inputs": [
+        ".github/workflows/**",
+        ".github/scripts/check_ci_results.py",
+        ".github/scripts/classify-ci-changes.sh",
+        ".github/scripts/plan_ci.py",
+        ".github/ci/suites.v1.json"
+      ]
+    },
+    "readme-locale": {
+      "execution_inputs": [
+        "CONTRIBUTING.md",
+        "README*.md",
+        "RELEASES.md",
+        "desktop/electron/README.md",
+        "docs/README.md",
+        "docs/quickstart.md",
+        "docs/web-ui.md",
+        "opensquilla-webui/.node-version",
+        "opensquilla-webui/package.json",
+        "opensquilla-webui/scripts/check-readme-locales.mjs",
+        "opensquilla-webui/src/components/LanguageSwitcher.vue",
+        "opensquilla-webui/src/i18n/index.ts"
+      ]
+    },
+    "frontend": {
+      "execution_inputs": [
+        "opensquilla-webui/**",
+        "src/opensquilla/gateway/static/**",
+        "pyproject.toml"
+      ]
+    },
+    "webui-chat-recovery": {
+      "execution_inputs": [
+        "opensquilla-webui/e2e/**",
+        "opensquilla-webui/src/**",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/session/**"
+      ]
+    },
+    "tui": {
+      "execution_inputs": [
+        "src/opensquilla/cli/tui/**",
+        "packages/opensquilla-tui-host/**",
+        "scripts/build_tui_host_companion.py",
+        "scripts/smoke_tui_host_companion.py"
+      ]
+    },
+    "desktop-static": {
+      "execution_inputs": [
+        "desktop/**",
+        "opensquilla-webui/src/platform/**",
+        "src/opensquilla/gateway/**"
+      ]
+    },
+    "desktop-recovery-e2e": {
+      "execution_inputs": [
+        "desktop/electron/**",
+        "opensquilla-webui/**",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/persistence/**",
+        "src/opensquilla/recovery/**",
+        "src/opensquilla/session/**",
+        "tests/test_desktop/**",
+        "tests/test_recovery/**"
+      ]
+    },
+    "python-targeted": {
+      "execution_inputs": [
+        ".github/scripts/windows_test_assignments.json",
+        ".github/scripts/windows_test_durations.json",
+        "migrations/**",
+        "pyproject.toml",
+        "scripts/**",
+        "service-units/**",
+        "src/opensquilla/**",
+        "tests/**",
+        "uv.lock"
+      ]
+    },
+    "python-full": {
+      "execution_inputs": [
+        "**"
+      ]
+    },
+    "windows-compat": {
+      "execution_inputs": [
+        "install.ps1",
+        "start.ps1",
+        "src/opensquilla/**",
+        "tests/test_compat/**"
+      ]
+    },
+    "windows-high-risk": {
+      "execution_inputs": [
+        "**"
+      ]
+    },
+    "macos-recovery": {
+      "execution_inputs": [
+        "desktop/**",
+        "src/opensquilla/persistence/**",
+        "src/opensquilla/recovery/**",
+        "src/opensquilla/session/**",
+        "tests/test_recovery/**"
+      ]
+    },
+    "release-packaging": {
+      "execution_inputs": [
+        "README.release.md",
+        "RELEASES.md",
+        "desktop/electron/package*.json",
+        "install.*",
+        "pyproject.toml",
+        "scripts/build_wheelhouse_zip.py",
+        "scripts/install_source.*",
+        "start.*",
+        "tests/test_packaging/**",
+        "tests/test_release_consistency.py",
+        "uv.lock"
+      ]
+    },
+    "managed-toolchain": {
+      "execution_inputs": [
+        "scripts/validate_managed_toolchain_artifacts*.py",
+        "src/opensquilla/skills/bundled/meta-paper-write/**",
+        "src/opensquilla/skills/bundled/meta-short-drama/**",
+        "src/opensquilla/skills/bundled/paper-*/**",
+        "src/opensquilla/skills/bundled/subtitle-burner/**",
+        "src/opensquilla/skills/bundled/video-still-animator/**",
+        "src/opensquilla/skills/runtime_env.py",
+        "src/opensquilla/skills/toolchains/**",
+        "tests/test_skills/test_managed_toolchains.py",
+        "tests/test_skills/test_meta_paper*.py",
+        "tests/test_skills/test_meta_short_drama*.py",
+        "tests/test_skills/test_paper_*.py",
+        "tests/test_skills/test_subtitle_burner.py",
+        "tests/test_skills/test_toolchain_*.py"
+      ]
+    }
+  }
+}

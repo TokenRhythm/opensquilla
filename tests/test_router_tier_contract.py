@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
 from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
     model_has_request_capacity,
@@ -600,6 +601,67 @@ def test_large_context_capacity_block_stops_selector_execution() -> None:
     assert selector.calls == []
 
 
+def test_attachment_legacy_selector_keeps_proven_head_without_opaque_fallbacks(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {"openai/proven-head": {"context_window": 128_000}}
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = _StubSelector()
+    selector.active_provider_id = "openai"
+    selector.override_model_with_bounded_fallback_chain = None
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [{"tier": "c0", "model": "opaque-fallback"}],
+        "large_context_capacity_required": True,
+        "large_context_material_tokens": 2_000,
+        "large_context_request_input_tokens": 10_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "proven-head",
+    }
+
+    apply_model_override(
+        selector,
+        "proven-head",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert selector.calls == [("override_model", "proven-head")]
+
+
+def test_attachment_legacy_custom_selector_missing_capacity_is_actionable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        ModelCatalog(),
+    )
+    selector = _StubSelector()
+    selector.active_provider_id = "custom"
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [],
+        "large_context_capacity_required": True,
+        "large_context_material_tokens": 2_000,
+        "large_context_request_input_tokens": 10_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "private-model",
+    }
+
+    with pytest.raises(LargeContextCapacityError, match="llm.context_window_tokens"):
+        apply_model_override(
+            selector,
+            "private-model",
+            turn_metadata=metadata,
+            realign_routed_model=False,
+        )
+
+    assert metadata["large_context_capacity_blocked"] is True
+
+
 def test_large_context_floor_keeps_only_definitely_capable_configured_fallbacks(
     monkeypatch,
 ) -> None:
@@ -755,6 +817,100 @@ def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) ->
         material_tokens=60_000,
         thinking_budget_tokens=20_000,
     )
+
+
+def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/boundary-model": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    safe_input_tokens = (
+        ContextBudgetGovernor.from_values(
+            context_window_tokens=32_000,
+            max_output_tokens=4_000,
+            thinking_budget_tokens=0,
+            context_overflow_threshold=0.85,
+        ).snapshot().provider_request_max_chars
+        // CHARS_PER_TOKEN
+    )
+
+    assert model_has_request_capacity(
+        provider="openai",
+        model="boundary-model",
+        material_tokens=1,
+        request_input_tokens=safe_input_tokens,
+        thinking_budget_tokens=0,
+    )
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="boundary-model",
+        material_tokens=1,
+        request_input_tokens=safe_input_tokens + 1,
+        thinking_budget_tokens=0,
+    )
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="unknown-model",
+        material_tokens=1,
+        request_input_tokens=1,
+        thinking_budget_tokens=0,
+    )
+
+
+def test_complete_attachment_request_filters_every_fallback_without_large_floor(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/router-small": {"context_window": 32_000},
+            "openai/router-safe": {"context_window": 128_000},
+            "openai/routed-safe": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openai",
+                "configured-unknown",
+                api_key="test-key",
+            )
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [
+            {"tier": "c0", "model": "router-small"},
+            {"tier": "c0", "model": "router-unknown"},
+            {"tier": "c0", "model": "router-safe"},
+        ],
+        "large_context_capacity_required": True,
+        "large_context_material_tokens": 20_000,
+        "large_context_request_input_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-safe",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-safe",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-safe",
+        "router-safe",
+    ]
 
 
 def test_capacity_admission_honors_global_context_and_output_overrides(

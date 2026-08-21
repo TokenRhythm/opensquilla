@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.tools.types import SafeToolError, ToolContext, current_tool_context
 
 # Env levers in the workspace-write-deny family. Values are read at dispatch
@@ -252,28 +252,27 @@ def _workspace_path_is_git_tracked(
         return True
     if not relative or relative == ".":
         return True
-    try:
-        if as_directory:
-            completed = subprocess.run(
-                ["git", "ls-files", "--", f"{relative}/"],
-                cwd=str(workspace),
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if completed.returncode != 0:
-                return True
-            return bool(completed.stdout.strip())
-        completed = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", relative],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=2,
+    if as_directory:
+        completed = run_git(
+            ("ls-files", "--", f"{relative}/"),
+            cwd=workspace,
+            timeout=2.0,
         )
-    except (OSError, subprocess.SubprocessError):
+        if not completed.ok:
+            return True
+        return bool(completed.stdout.strip())
+    completed = run_git(
+        ("ls-files", "--error-unmatch", "--", relative),
+        cwd=workspace,
+        timeout=2.0,
+    )
+    if completed.state in {
+        GitRunState.UNAVAILABLE,
+        GitRunState.NOT_REPOSITORY,
+        GitRunState.TIMED_OUT,
+    }:
         return True
-    if completed.returncode == 0:
+    if completed.ok:
         return True
     # --error-unmatch exits 1 for a valid repo with no matching tracked file;
     # any other status (e.g. 128 outside a repo) is a lookup failure.

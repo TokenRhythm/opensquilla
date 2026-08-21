@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from .types import (
     ChatConfig,
+    ContentBlockImage,
+    ContentBlockToolResult,
     ErrorEvent,
     Message,
     ModelInfo,
@@ -16,6 +18,13 @@ from .types import (
     QuotaStatus,
     StreamEvent,
     ToolDefinition,
+    VisionSupport,
+)
+
+IMAGE_INPUT_UNSUPPORTED_CODE = "image_input_unsupported"
+IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
+    "The selected model cannot process image input. Choose an image-capable "
+    "model or remove the image and try again."
 )
 
 if TYPE_CHECKING:
@@ -254,6 +263,81 @@ def validate_provider_chat_request(
     except Exception:  # noqa: BLE001 - optional preflight must stay best-effort
         return None
     return validation_error if isinstance(validation_error, ErrorEvent) else None
+
+
+def count_provider_image_blocks(messages: Sequence[object]) -> int:
+    """Count typed images in the exact provider request, including tool results."""
+
+    count = 0
+    for message in messages:
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, ContentBlockImage):
+                count += 1
+                continue
+            if not isinstance(block, ContentBlockToolResult):
+                continue
+            if isinstance(block.content, list):
+                count += sum(
+                    1 for item in block.content if isinstance(item, ContentBlockImage)
+                )
+    return count
+
+
+def image_input_admission_error(
+    messages: Sequence[object],
+    *,
+    vision_support: VisionSupport,
+    reject_unknown: bool = False,
+) -> ErrorEvent | None:
+    """Return the stable image admission error when capability evidence rejects."""
+
+    if count_provider_image_blocks(messages) <= 0:
+        return None
+    if vision_support == "supported":
+        return None
+    if vision_support == "unknown" and not reject_unknown:
+        return None
+    return ErrorEvent(
+        message=IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+        code=IMAGE_INPUT_UNSUPPORTED_CODE,
+    )
+
+
+def validate_provider_chat_admission(
+    provider: object | None,
+    messages: list[Message],
+    config: ChatConfig | None,
+) -> ErrorEvent | None:
+    """Run typed admission, then the legacy request validator as a fallback."""
+
+    raw_vision_support = getattr(config, "model_vision_support", "unknown")
+    vision_support: VisionSupport = (
+        cast(VisionSupport, raw_vision_support)
+        if raw_vision_support in {"supported", "unsupported", "unknown"}
+        else "unknown"
+    )
+    capability_error = image_input_admission_error(
+        messages,
+        vision_support=vision_support,
+    )
+    if capability_error is not None:
+        return capability_error
+    if provider is not None:
+        admission_fn = getattr(provider, "validate_chat_admission", None)
+        if callable(admission_fn):
+            try:
+                result = admission_fn(messages, config)
+            except Exception:  # noqa: BLE001 - optional capability must be isolated
+                pass
+            else:
+                if isinstance(result, ErrorEvent):
+                    return result
+                if result is None:
+                    return None
+    return validate_provider_chat_request(provider, messages)
 
 
 @runtime_checkable

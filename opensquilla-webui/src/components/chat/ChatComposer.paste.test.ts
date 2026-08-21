@@ -40,8 +40,8 @@ const BASE_PROPS = {
   allowedRunModes: ['standard', 'trusted', 'full'],
   runModeLocked: false,
   runModeLockMessage: '',
-  modelRoutingMode: 'llm_ensemble',
-  modelRoutingSettingsBusy: false,
+  sessionRoutingMode: 'llm_ensemble',
+  sessionRoutingBusy: false,
   routerVisualEffectsEnabled: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
@@ -88,8 +88,8 @@ const ComposerWrapper = defineComponent({
       :allowed-run-modes="['standard', 'trusted', 'full']"
       :run-mode-locked="false"
       run-mode-lock-message=""
-      :model-routing-mode="'llm_ensemble'"
-      :model-routing-settings-busy="false"
+      :session-routing-mode="'llm_ensemble'"
+      :session-routing-busy="false"
       :router-visual-effects-enabled="true"
       :coding-mode-enabled="false"
       :coding-mode-settings-busy="false"

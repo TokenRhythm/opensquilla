@@ -358,6 +358,8 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> Any | None:
     description=(
         "Register an existing workspace file as a generated artifact for the current surface. "
         "Only files inside the active workspace are allowed. "
+        "For exactly one file, including self-contained HTML, set bundle='none' and omit "
+        "bundle_root. bundle_root is valid only with bundle='directory'. "
         "The active surface handles download chips or native channel delivery; do not include "
         "any URL in your reply — just confirm the file is ready."
     ),
@@ -378,15 +380,18 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> Any | None:
             "type": "string",
             "enum": ["auto", "directory", "none"],
             "description": (
-                "Static webpage packaging mode. auto follows literal local dependencies "
-                "for HTML, directory snapshots bundle_root, and none publishes one file. "
-                "Defaults to auto."
+                "Static webpage packaging mode. Use none for exactly one file, including "
+                "self-contained HTML, and omit bundle_root. Use auto to follow statically "
+                "discoverable local dependencies for an HTML entrypoint, also without "
+                "bundle_root. Use directory to snapshot a dedicated workspace subdirectory; "
+                "directory requires bundle_root. Defaults to auto."
             ),
         },
         "bundle_root": {
             "type": "string",
             "description": (
-                "Dedicated workspace subdirectory to snapshot when bundle=directory."
+                "Required only when bundle=directory: a dedicated workspace subdirectory "
+                "containing path. Invalid when bundle is auto or none; omit it in those modes."
             ),
         },
     },
@@ -400,6 +405,11 @@ async def publish_artifact(
     bundle: str = "auto",
     bundle_root: str | None = None,
 ) -> str:
+    # Some provider adapters materialize omitted optional strings as blank values.
+    # Treat those wire-equivalent values as absent without accepting a real root in
+    # modes where it is forbidden.
+    if bundle_root is not None and not bundle_root.strip():
+        bundle_root = None
     ctx = current_tool_context.get()
     if ctx is None:
         raise ToolError("publish_artifact requires tool context")

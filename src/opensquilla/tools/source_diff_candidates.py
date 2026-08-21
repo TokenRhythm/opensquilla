@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from opensquilla.git_runtime import run_git
 from opensquilla.tools.types import ToolContext
 
 MAX_CANDIDATES = 8
@@ -196,19 +196,14 @@ def _workspace_path(ctx: ToolContext) -> Path | None:
 
 
 def _git_diff_for_path(workspace: Path, relative_path: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--", relative_path],
-            cwd=workspace,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
+    result = run_git(
+        ("diff", "--", relative_path),
+        cwd=workspace,
+        timeout=5.0,
+    )
+    if not result.ok:
         return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
+    return result.stdout_text
 
 
 def _normalize_relative_path(path: str) -> str:

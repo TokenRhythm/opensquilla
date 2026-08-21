@@ -353,6 +353,101 @@ def test_model_routing_snapshot_maps_config_to_one_public_mode(
     assert model_routing_snapshot(config)["mode"] == expected
 
 
+def test_model_routing_snapshot_exposes_direct_image_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            return "unsupported"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        llm={"provider": "openrouter", "model": "text-only"},
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+        llm_ensemble={"enabled": False},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["image_input"] == {
+        "admission": "blocked",
+        "reason": "model_vision_unsupported",
+    }
+    assert "api_key" not in str(snapshot)
+    assert "proxy" not in str(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("tiers", "vision_support", "expected"),
+    [
+        (
+            {"image_model": {"model": "vision-model", "supports_image": True}},
+            "supported",
+            {
+                "admission": "allowed",
+                "reason": "router_image_route_available",
+            },
+        ),
+        (
+            {"image_model": {"model": "text-only-model", "supports_image": True}},
+            "unsupported",
+            {
+                "admission": "blocked",
+                "reason": "model_vision_unsupported",
+            },
+        ),
+        (
+            {"image_model": {"model": "unlisted-model", "supports_image": True}},
+            "unknown",
+            {
+                "admission": "unknown",
+                "reason": "capability_unknown",
+            },
+        ),
+        (
+            {"image_model": {"model": "", "supports_image": True}},
+            "supported",
+            {
+                "admission": "blocked",
+                "reason": "router_image_route_unavailable",
+            },
+        ),
+    ],
+)
+def test_model_routing_snapshot_applies_image_route_in_observe(
+    tiers: dict[str, Any],
+    vision_support: str,
+    expected: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            return vision_support
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        squilla_router={
+            "enabled": True,
+            "rollout_phase": "observe",
+            "tiers": tiers,
+        },
+        llm_ensemble={"enabled": False},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["mode"] == "direct"
+    assert snapshot["image_input"] == expected
+
+
 @pytest.mark.parametrize(
     ("selection_mode", "router_enabled"),
     [

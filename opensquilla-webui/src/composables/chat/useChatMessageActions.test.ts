@@ -890,6 +890,34 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     )
   })
 
+  it('copies only the explicit final answer after intermediate commentary', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working note.Final answer.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Working note.',
+          rawText: 'Working note.',
+          presentation: 'intermediate',
+        },
+        {
+          type: 'text',
+          key: 'answer',
+          html: 'Final answer.',
+          rawText: 'Final answer.',
+          presentation: 'answer',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
+  })
+
   it('copies the complete terminal Markdown answer from an ordinary tool transcript', async () => {
     const { api } = makeOptions([], text => text, () => 'AI generated')
 

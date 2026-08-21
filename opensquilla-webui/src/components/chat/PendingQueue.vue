@@ -119,6 +119,15 @@
         </div>
       </div>
     </article>
+    <p
+      v-if="showSteerUnavailableStatus"
+      key="steer-unavailable"
+      class="chat-pending-steer-status"
+      role="status"
+      aria-live="polite"
+    >
+      {{ steerUnavailableMessage }}
+    </p>
     <span key="reorder-announcement" class="chat-pending-announcement" aria-live="polite">
       {{ reorderAnnouncement }}
     </span>
@@ -142,6 +151,7 @@ const { t } = useI18n()
 interface PendingQueueItem {
   pendingUiId: string
   text: string
+  pendingInputId?: string
   displayTextOverride?: string
   hiddenControl?: boolean
   attachments?: Attachment[]
@@ -164,6 +174,7 @@ const props = withDefaults(defineProps<{
   reorderPending?: boolean
   imageBlockedMessage?: string
   steerAvailable?: boolean
+  durableSteerAvailable?: boolean
   steerUnavailableMessage?: string
 }>(), {
   reorderEnabled: true,
@@ -202,6 +213,18 @@ const effectiveMaxPending = computed(() => (
       ? 1
       : 0
   )
+))
+const showSteerUnavailableStatus = computed(() => (
+  props.steerAvailable === false
+  && Boolean(props.steerUnavailableMessage?.trim())
+  && !props.items.some(item => (
+    isSteering(item)
+    || item.deliveryState === 'retryable'
+    || isSteerRetry(item)
+  ))
+  && props.items.some(item => (
+    !item.hiddenControl
+  ))
 ))
 
 function displayText(item: PendingQueueItem): string {
@@ -297,6 +320,11 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
   if (isControlInput(item.text)) return 'controlInput'
   if (item.attachments?.length) return 'attachment'
+  if (
+    item.pendingInputId
+    && item.pendingPersistenceState === 'staged'
+    && props.durableSteerAvailable !== true
+  ) return 'capability'
   if (!props.steerAvailable && item.deliveryState !== 'retryable' && !isSteerRetry(item)) {
     return 'capability'
   }
@@ -318,6 +346,13 @@ function steerTitle(item: PendingQueueItem): string {
     case 'attachment':
       return attachmentBlockMessage(item) || t('chat.pending.steerUnavailable.attachment')
     case 'capability':
+      if (
+        item.pendingInputId
+        && item.pendingPersistenceState === 'staged'
+        && props.durableSteerAvailable !== true
+      ) {
+        return t('chat.pending.steerUnavailable.gatewayUnsupported')
+      }
       return props.steerUnavailableMessage?.trim() || t('chat.sendQueues')
     case 'otherDelivery':
       return t('chat.pending.steerUnavailable.deliveryInProgress')
@@ -536,6 +571,7 @@ onBeforeUnmount(() => {
   position: relative;
   display: flex;
   align-items: center;
+  min-width: 0;
   min-height: 50px;
   gap: 10px;
   padding: 9px 10px 9px 15px;
@@ -627,6 +663,13 @@ onBeforeUnmount(() => {
   margin-top: 2px;
   line-height: 1.35;
   white-space: normal;
+}
+
+.chat-pending-steer-status {
+  margin: -2px 4px 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
 }
 
 .chat-pending-actions {

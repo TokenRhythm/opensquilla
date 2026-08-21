@@ -1180,8 +1180,8 @@ async def test_run_filters_env_and_returns_nonzero_without_raise(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -1229,8 +1229,8 @@ async def test_run_injects_proxy_env_for_proxy_allowlist(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -1289,8 +1289,8 @@ async def test_run_timeout_returns_timed_out_result(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(seatbelt_mod.os, "killpg", lambda pid, sig: None)
@@ -1320,7 +1320,7 @@ async def test_run_caller_cancel_terminates_process_group(
             await asyncio.Event().wait()
 
     async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> FakeProcess:
-        assert kwargs["start_new_session"] is True
+        assert "start_new_session" not in kwargs
         return FakeProcess()
 
     async def fake_terminate(proc: FakeProcess) -> tuple[bytes, bytes]:
@@ -1334,8 +1334,8 @@ async def test_run_caller_cancel_terminates_process_group(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(seatbelt_mod, "_terminate_process_group", fake_terminate)
@@ -1609,7 +1609,7 @@ async def test_real_seatbelt_shell_can_write_slash_tmp_when_available(
     request = SandboxRequest(
         argv=(
             "sh",
-            "-lc",
+            "-c",
             f"printf '%s\\n' shell-temp-ok > {target} && cat {target} && rm {target}",
         ),
         cwd=tmp_path,
@@ -1852,7 +1852,7 @@ async def test_run_populates_backend_notes_on_denial(
     monkeypatch.setattr(
         seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/usr/bin/sandbox-exec"
     )
-    monkeypatch.setattr(seatbelt_mod.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", fake_create)
 
     result = await SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path))
 
@@ -1885,7 +1885,7 @@ async def test_run_populates_backend_notes_for_zero_exit_ping_packet_loss(
     monkeypatch.setattr(
         seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/usr/bin/sandbox-exec"
     )
-    monkeypatch.setattr(seatbelt_mod.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", fake_create)
     policy = _policy(
         tmp_path,
         network=NetworkMode.PROXY_ALLOWLIST,
@@ -1924,7 +1924,7 @@ async def test_run_backend_notes_empty_on_success(
     monkeypatch.setattr(
         seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/usr/bin/sandbox-exec"
     )
-    monkeypatch.setattr(seatbelt_mod.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", fake_create)
 
     result = await SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path))
 

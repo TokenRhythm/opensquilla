@@ -173,6 +173,11 @@ def _mock_windows_acl(
         path = Path(environment["OPENSQUILLA_UPGRADE_ACL_TARGET"])
         assert environment["OPENSQUILLA_UPGRADE_ACL_USER_SID"] == "S-1-5-21-1234"
         assert environment["OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY"] in {"0", "1"}
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["timeout"] == upgrade_migration._WINDOWS_ACL_TIMEOUT_SECONDS
+        assert kwargs["creationflags"] == int(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
         event = ("acl", path, tuple(command))
         events.append(event)
         failed = fail_when is not None and fail_when(path, events)
@@ -189,8 +194,34 @@ def test_windows_acl_script_does_not_require_powershell_module_autoload() -> Non
     script = upgrade_migration._WINDOWS_PRIVATE_ACL_SCRIPT
 
     assert "Get-Acl" not in script
+    assert "Select-Object" not in script
+    assert "Where-Object" not in script
     assert "[System.IO.Directory]::GetAccessControl($target)" in script
     assert "[System.IO.File]::GetAccessControl($target)" in script
+
+
+def test_windows_acl_process_timeout_is_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        raise subprocess.TimeoutExpired(
+            command,
+            upgrade_migration._WINDOWS_ACL_TIMEOUT_SECONDS,
+        )
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    with pytest.raises(OSError, match="Windows ACL hardening timed out"):
+        upgrade_migration._protect_private_path(
+            snapshot,
+            directory=True,
+            windows_user_sid="S-1-5-21-1234",
+        )
 
 
 def test_frozen_windows_acl_process_restores_packaged_dll_directory(
@@ -326,10 +357,11 @@ def test_windows_snapshot_acl_is_applied_in_copy_and_promotion_order(
     )
     assert tmp_path / upgrade_migration.SNAPSHOT_NAME / "manifest.json" in protected_paths
     for _kind, _path, command in (event for event in events if event[0] == "acl"):
-        assert command[:4] == (
+        assert command[:5] == (
             "powershell",
             "-NoProfile",
             "-NonInteractive",
+            "-NoLogo",
             "-EncodedCommand",
         )
 

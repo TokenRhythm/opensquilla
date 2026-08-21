@@ -35,6 +35,7 @@ from opensquilla.provider.openai import OpenAIProvider, _DeferredStreamEventBuff
 from opensquilla.provider.text_tool_normalizer import (
     PLAIN_TOOL_INTERSTITIAL_WHITESPACE_MAX,
     LiteralTextSegment,
+    RejectedTextToolSegment,
     SyntheticToolSegment,
     TextToolStreamNormalizer,
     _raw_html_code_ranges,
@@ -330,6 +331,7 @@ def _collect_stream(
     native_tool_call: bool = False,
     native_query: str = "native",
     compat: OpenAICompatPolicy | None = None,
+    base_url: str = "https://api.openai.com",
     raw_body: bytes | None = None,
     config: ChatConfig | None = None,
 ) -> list[Any]:
@@ -362,6 +364,7 @@ def _collect_stream(
     provider = OpenAIProvider(
         api_key="test",
         model=model,
+        base_url=base_url,
         provider_kind=provider_kind,
         compat=compat,
     )
@@ -484,6 +487,47 @@ def _tool_ends(events: list[Any]) -> list[ToolUseEndEvent]:
     return [event for event in events if isinstance(event, ToolUseEndEvent)]
 
 
+def _tool_starts(events: list[Any]) -> list[ToolUseStartEvent]:
+    return [event for event in events if isinstance(event, ToolUseStartEvent)]
+
+
+def _assert_rejected_tool_lifecycle(
+    events: list[Any],
+    *,
+    expected_names: list[str],
+) -> None:
+    starts = _tool_starts(events)
+    assert [event.tool_name for event in starts] == expected_names
+    assert all(event.synthetic_from_text for event in starts)
+    assert not any(isinstance(event, ToolUseDeltaEvent) for event in events)
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    errors = [
+        event
+        for event in events
+        if isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+    ]
+    assert len(errors) == 1
+    if starts:
+        assert max(events.index(event) for event in starts) < events.index(errors[0])
+
+
+def _assert_rejected_segment(
+    segments: list[Any],
+    *,
+    dialect: TextToolDialect,
+    tool_name: str,
+) -> None:
+    assert segments == [
+        RejectedTextToolSegment(
+            dialect=dialect,
+            reason="text_schema_invalid",
+            call_count=1,
+            recognized_tool_names=(tool_name,),
+        )
+    ]
+
+
 def _plain_profile() -> OpenAICompatPolicy:
     return OpenAICompatPolicy(
         display_name="Explicit plain-text test profile",
@@ -564,6 +608,90 @@ def test_dsml_executes_only_for_exact_packaged_provider_model_pairs(
     assert ends[0].arguments == {"query": "x"}
     assert ends[0].synthetic_from_text is True
     assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize(
+    "model",
+    ("deepseek-v4-pro-0813", "tokenrhythm/deepseek-v4-pro-0813"),
+)
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "https://tokenrhythm.studio",
+        "https://tokenrhythm.studio/v1",
+        "HTTPS://TOKENRHYTHM.STUDIO:443/v1/",
+    ),
+)
+def test_tokenrhythm_0813_dsml_executes_only_at_official_api_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    base_url: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model=model,
+        base_url=base_url,
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == ""
+    assert len(_tool_starts(events)) == len(_tool_ends(events)) == 1
+    assert _tool_ends(events)[0].arguments == {"query": "x"}
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "http://tokenrhythm.studio/v1",
+        "https://api.tokenrhythm.studio/v1",
+        "https://tokenrhythm.studio.evil.example/v1",
+        "https://customer-proxy.example/v1",
+        "https://tokenrhythm.studio/v1/custom",
+        "https://tokenrhythm.studio:8443/v1",
+        "https://user@tokenrhythm.studio/v1",
+        "https://tokenrhythm.studio/v1?tenant=x",
+        "https://tokenrhythm.studio/v1#fragment",
+        "https://tokenrhythm.studio/v1?",
+        "https://tokenrhythm.studio/v1#",
+    ),
+)
+def test_tokenrhythm_0813_dsml_is_literal_at_untrusted_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model="deepseek-v4-pro-0813",
+        base_url=base_url,
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_starts(events) == []
+    assert _tool_ends(events) == []
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_tokenrhythm_0813_dsml_near_miss_is_literal_at_official_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model="deepseek-v4-pro-0813-preview",
+        base_url="https://tokenrhythm.studio/v1",
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_starts(events) == []
+    assert _tool_ends(events) == []
 
 
 @pytest.mark.parametrize(
@@ -1113,16 +1241,22 @@ def test_no_tools_means_protocol_text_is_immediately_literal(
 
 
 @pytest.mark.parametrize(
-    "literal",
+    ("literal", "expected_names", "rejected"),
     [
-        '<tool_call>{"name":"unknown","arguments":{}}</tool_call>',
-        '<tool_call>{"name":"search","arguments":{"query":7}}</tool_call>',
-        '<tool_call>{"name":"search","arguments":{"query":"x"}}',
+        ('<tool_call>{"name":"unknown","arguments":{}}</tool_call>', [], False),
+        (
+            '<tool_call>{"name":"search","arguments":{"query":7}}</tool_call>',
+            ["search"],
+            True,
+        ),
+        ('<tool_call>{"name":"search","arguments":{"query":"x"}}', [], False),
     ],
 )
-def test_unknown_schema_invalid_and_incomplete_qwen_calls_replay_exactly(
+def test_only_complete_allowlisted_qwen_schema_failures_claim_protocol(
     monkeypatch: pytest.MonkeyPatch,
     literal: str,
+    expected_names: list[str],
+    rejected: bool,
 ) -> None:
     events = _collect_stream(
         monkeypatch,
@@ -1131,8 +1265,64 @@ def test_unknown_schema_invalid_and_incomplete_qwen_calls_replay_exactly(
         text_chunks=list(literal),
         tools=[_SEARCH_TOOL],
     )
-    assert _text(events) == literal
-    assert _tool_ends(events) == []
+    if rejected:
+        assert _text(events) == ""
+        _assert_rejected_tool_lifecycle(events, expected_names=expected_names)
+    else:
+        assert _text(events) == literal
+        assert _tool_starts(events) == []
+        assert _tool_ends(events) == []
+        assert not any(
+            isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+            for event in events
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "model", "literal", "tool", "compat", "tool_name"),
+    [
+        (
+            "minimax",
+            "MiniMax-M2.7",
+            (
+                '<minimax:tool_call><invoke name="typed">'
+                '<parameter name="count">10x</parameter></invoke>'
+                "</minimax:tool_call>"
+            ),
+            _TYPED_TOOL,
+            None,
+            "typed",
+        ),
+        (
+            "profile_test",
+            "profile-test",
+            'search{"query":7}',
+            _SEARCH_TOOL,
+            _plain_profile(),
+            "search",
+        ),
+    ],
+)
+def test_complete_allowlisted_schema_failures_emit_start_then_error(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+    model: str,
+    literal: str,
+    tool: ToolDefinition,
+    compat: OpenAICompatPolicy | None,
+    tool_name: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind=provider_kind,
+        model=model,
+        text_chunks=list(literal),
+        tools=[tool],
+        compat=compat,
+    )
+
+    assert _text(events) == ""
+    _assert_rejected_tool_lifecycle(events, expected_names=[tool_name])
 
 
 @pytest.mark.parametrize(
@@ -1944,12 +2134,15 @@ def test_invalid_native_arguments_fail_closed_in_stream_and_non_stream(
         finish_reason="tool_calls",
         compat=_plain_profile(),
         native_arguments=raw_arguments,
+        native_tool_name="document_apply",
     )
 
     assert any(isinstance(event, ToolUseStartEvent) for event in stream_events)
-    assert not any(
-        event.kind.startswith("tool_use_") for event in non_stream_events
-    )
+    non_stream_starts = [
+        event for event in non_stream_events if isinstance(event, ToolUseStartEvent)
+    ]
+    assert len(non_stream_starts) == 1
+    assert non_stream_starts[0].tool_name == "document_apply"
     for events in (stream_events, non_stream_events):
         assert _tool_ends(events) == []
         assert not any(isinstance(event, DoneEvent) for event in events)
@@ -1958,6 +2151,9 @@ def test_invalid_native_arguments_fail_closed_in_stream_and_non_stream(
             for event in events
             if isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
         )
+        starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
+        assert starts
+        assert all(events.index(start) < events.index(error) for start in starts)
         assert raw_arguments not in error.message
         assert "_raw" not in error.message
 
@@ -1976,12 +2172,15 @@ def test_non_stream_native_batch_is_atomic_when_later_call_is_invalid(
         ],
     )
 
-    assert not any(event.kind.startswith("tool_use_") for event in events)
+    starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
+    assert [event.tool_name for event in starts] == ["search", "search"]
     assert not any(isinstance(event, DoneEvent) for event in events)
-    assert any(
-        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+    error = next(
+        event
         for event in events
+        if isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
     )
+    assert all(events.index(start) < events.index(error) for start in starts)
 
 
 def test_stream_native_batch_keeps_diagnostics_but_no_end_when_later_call_is_invalid(
@@ -2367,7 +2566,7 @@ def test_permanently_missing_native_name_fails_closed_without_empty_start(
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999"])
-def test_text_tool_json_dialects_replay_nonfinite_numbers_atomically(
+def test_complete_allowlisted_nonfinite_json_calls_fail_closed_atomically(
     monkeypatch: pytest.MonkeyPatch,
     constant: str,
 ) -> None:
@@ -2393,10 +2592,10 @@ def test_text_tool_json_dialects_replay_nonfinite_numbers_atomically(
         tools=[_NUMBER_TOOL],
     )
 
-    assert _text(qwen_events) == qwen_call
-    assert _text(plain_events) == plain_call
-    assert _tool_ends(qwen_events) == []
-    assert _tool_ends(plain_events) == []
+    assert _text(qwen_events) == ""
+    assert _text(plain_events) == ""
+    _assert_rejected_tool_lifecycle(qwen_events, expected_names=["number_tool"])
+    _assert_rejected_tool_lifecycle(plain_events, expected_names=["number_tool"])
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "length", None])
@@ -2671,12 +2870,12 @@ def test_xml_parameters_decode_schema_types_in_batch_and_stream(
         ),
     ],
 )
-def test_ambiguous_xml_union_is_literal_in_batch_and_stream(
+def test_ambiguous_xml_union_is_a_complete_schema_rejection(
     dialect: TextToolDialect,
     call: str,
 ) -> None:
     batch = _direct_classify(call, dialect=dialect, tool=_AMBIGUOUS_TOOL)
-    assert batch == [LiteralTextSegment(call)]
+    _assert_rejected_segment(batch, dialect=dialect, tool_name="ambiguous")
     visible, segments = _direct_stream(
         call,
         dialect=dialect,
@@ -2684,7 +2883,7 @@ def test_ambiguous_xml_union_is_literal_in_batch_and_stream(
         split=len(call) // 2,
     )
     assert visible == ""
-    assert segments == [LiteralTextSegment(call)]
+    _assert_rejected_segment(segments, dialect=dialect, tool_name="ambiguous")
 
 
 @pytest.mark.parametrize(
@@ -2703,13 +2902,15 @@ def test_ambiguous_xml_union_is_literal_in_batch_and_stream(
         ),
     ],
 )
-def test_invalid_typed_xml_value_is_literal(
+def test_invalid_typed_xml_value_is_a_complete_schema_rejection(
     dialect: TextToolDialect,
     call: str,
 ) -> None:
-    assert _direct_classify(call, dialect=dialect, tool=_TYPED_TOOL) == [
-        LiteralTextSegment(call)
-    ]
+    _assert_rejected_segment(
+        _direct_classify(call, dialect=dialect, tool=_TYPED_TOOL),
+        dialect=dialect,
+        tool_name="typed",
+    )
 
 
 def test_plain_json_word_boundary_is_identical_for_every_split(

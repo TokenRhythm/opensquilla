@@ -124,6 +124,32 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       expect.objectContaining({ type: 'text', rawText: 'Checking.', presentation: 'intermediate' }),
       expect.objectContaining({ type: 'text', rawText: 'Answer', presentation: 'answer' }),
     ])
+    expect(f.timelineSegments).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      { type: 'text', raw: 'Checking.', presentation: 'intermediate' },
+      { type: 'text', raw: 'Answer', presentation: 'answer' },
+    ])
+  })
+
+  it('does not merge an authoritative answer suffix into intermediate commentary', () => {
+    const f = fold([
+      { kind: 'tool-result', seq: 0, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 1 },
+      { kind: 'text', seq: 1, text: 'Working note.', presentation: 'intermediate' },
+      { kind: 'final-text', seq: 2, text: 'Working note.Final answer.' },
+    ])
+
+    expect(f.rawText).toBe('Working note.Final answer.')
+    expect(f.timelineItems).toHaveLength(3)
+    expect(f.timelineItems[1]).toMatchObject({
+      type: 'text',
+      rawText: 'Working note.',
+      presentation: 'intermediate',
+    })
+    expect(f.timelineItems[2]).toMatchObject({
+      type: 'text',
+      rawText: 'Final answer.',
+      presentation: 'answer',
+    })
   })
 
   it('replaces stale text around tools with one canonical terminal segment', () => {

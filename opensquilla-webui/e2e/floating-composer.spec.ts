@@ -169,7 +169,7 @@ async function openChat(page: Page, sessionKey = SESSION_A, enabled = true) {
     : sessionKey === SESSION_B
       ? 'Session B message 48.'
       : 'Session A message 48.'
-  await expect(page.getByText(expectedText, { exact: false })).toBeVisible()
+  await expect(page.getByText(expectedText, { exact: false })).toBeVisible({ timeout: 15000 })
   await expect.poll(() => page.locator('.chat-thread').evaluate(el => (
     el.scrollHeight > el.clientHeight
   ))).toBe(true)
@@ -179,6 +179,31 @@ async function scrollGap(page: Page) {
   return page.locator('.chat-thread').evaluate(el => (
     el.scrollHeight - el.scrollTop - el.clientHeight
   ))
+}
+
+async function visibleRowAnchor(page: Page, expectedKey?: string) {
+  return page.locator('.chat-thread').evaluate((el, key) => {
+    const thread = el as HTMLElement
+    const threadRect = thread.getBoundingClientRect()
+    const rows = Array.from(
+      thread.querySelectorAll<HTMLElement>('[data-testid="chat-message-row"]'),
+    )
+    const index = key
+      ? rows.findIndex(row => row.dataset.chatMessageKey === key)
+      : rows.findIndex(row => {
+          const rect = row.getBoundingClientRect()
+          return rect.top >= threadRect.top + 1 && rect.bottom <= threadRect.bottom - 1
+        })
+    if (index < 0) throw new Error(`Unable to resolve visible chat row ${key || ''}`)
+    const row = rows[index]!
+    return {
+      key: row.dataset.chatMessageKey || '',
+      offset: row.getBoundingClientRect().top - threadRect.top,
+      prefixHeight: rows
+        .slice(0, index)
+        .reduce((height, item) => height + item.getBoundingClientRect().height, 0),
+    }
+  }, expectedKey)
 }
 
 async function expectDockClearance(page: Page) {
@@ -275,6 +300,250 @@ test('floating composer reacts only to user scroll and resets across sessions', 
   await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
   await expect(page.getByText('Session B message 48.', { exact: false })).toBeVisible()
   await expect(chat).not.toHaveClass(/chat--composer-collapsed/)
+})
+
+test('hands keyboard focus to the thread when Jump to latest disappears', async ({ page }) => {
+  await openChat(page)
+  const thread = page.locator('.chat-thread')
+  const latest = page.locator('.chat-jump-latest')
+
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = Math.max(0, thread.scrollHeight - thread.clientHeight - 300)
+    thread.dispatchEvent(new Event('scroll'))
+  })
+  await expect(latest).toBeVisible()
+  await latest.focus()
+  await expect(latest).toBeFocused()
+  await page.keyboard.press('Enter')
+
+  await expect(latest).toHaveCount(0)
+  await expect(thread).toBeFocused()
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+})
+
+test('treats a native-scrollbar-only event as reader navigation and resumes on fine wheel input', async ({ page }) => {
+  await openChat(page)
+  const thread = page.locator('.chat-thread')
+
+  // Native scrollbar thumbs and some middle-button auto-scroll implementations
+  // can change scrollTop without a wheel or pointer event on the thread.
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = thread.scrollHeight
+  })
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  await thread.evaluate(() => new Promise<void>(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  }))
+
+  // Trackpad pinch and Ctrl+wheel are browser zoom gestures, not transcript
+  // navigation, so they must leave live-edge following intact.
+  await thread.evaluate(el => {
+    el.dispatchEvent(new WheelEvent('wheel', {
+      bubbles: true,
+      ctrlKey: true,
+      deltaY: -8,
+    }))
+  })
+  await expect(page.locator('.chat-jump-latest')).toHaveCount(0)
+  await expect(thread).not.toHaveClass(/chat-thread--reading-history/)
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+
+  // A down gesture that is still outside the 60px recovery zone must retain
+  // the reader latch. A later source-less layout correction may cross that
+  // threshold, but must not silently resume live following.
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = Math.max(0, thread.scrollTop - 100)
+    thread.dispatchEvent(new Event('scroll'))
+  })
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(60)
+  await thread.hover({ position: { x: 120, y: 120 } })
+  await page.mouse.wheel(0, 8)
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(60)
+  await page.waitForTimeout(150)
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = thread.scrollHeight - thread.clientHeight - 40
+    thread.dispatchEvent(new Event('scroll'))
+  })
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(2)
+  expect(await scrollGap(page)).toBeLessThan(60)
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  const bareScrollGap = await thread.evaluate(async el => {
+    const thread = el as HTMLElement
+    const latest = document.querySelector<HTMLButtonElement>('.chat-jump-latest')
+    if (!latest) throw new Error('Jump to latest is unavailable')
+    latest.click()
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await Promise.resolve()
+      const gap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+      if (gap <= 1) break
+    }
+    const pinnedTop = thread.scrollTop
+    const pinnedGap = thread.scrollHeight - pinnedTop - thread.clientHeight
+    if (pinnedGap > 1) throw new Error('Programmatic live-edge pin did not run')
+    thread.scrollTop = Math.max(0, pinnedTop - 5)
+    thread.dispatchEvent(new Event('scroll'))
+    return thread.scrollHeight - thread.scrollTop - thread.clientHeight
+  })
+  expect(bareScrollGap).toBeGreaterThan(2)
+  expect(bareScrollGap).toBeLessThan(60)
+  await expect(thread).toHaveClass(/chat-thread--reading-history/)
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(2)
+  expect(await scrollGap(page)).toBeLessThan(60)
+
+  // Native scroll anchoring can move scrollTop downward while text reflows.
+  // A source-less correction inside the 60px recovery zone must not be
+  // mistaken for a deliberate reader gesture back to the live edge.
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = Math.min(
+      thread.scrollHeight - thread.clientHeight,
+      thread.scrollTop + 1,
+    )
+    thread.dispatchEvent(new Event('scroll'))
+  })
+  await expect(thread).toHaveClass(/chat-thread--reading-history/)
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(2)
+
+  // Browsers expose both a physical mouse wheel and a trackpad gesture as
+  // WheelEvents. Fine deltas model the latter and must be enough to reach the
+  // live edge without needing the Jump to latest button.
+  await thread.hover({ position: { x: 120, y: 120 } })
+  for (const delta of [64, 64, 64, 64, 64, 64]) {
+    await page.mouse.wheel(0, delta)
+  }
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  await expect(page.locator('.chat-jump-latest')).toHaveCount(0)
+
+  // Upward keyboard navigation pauses before the browser performs its default
+  // scroll; End returns to the live edge through the normal downward path.
+  await thread.focus()
+  await page.keyboard.press('ArrowUp')
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(2)
+  expect(await scrollGap(page)).toBeLessThan(60)
+  await page.keyboard.press('End')
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  await expect(page.locator('.chat-jump-latest')).toHaveCount(0)
+})
+
+test('keeps live follow while a nested transcript scroller consumes the wheel', async ({ page }) => {
+  await openChat(page)
+  const thread = page.locator('.chat-thread')
+  const latest = page.locator('.chat-jump-latest')
+
+  await thread.evaluate(el => { el.scrollTop = el.scrollHeight })
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  await thread.evaluate(el => {
+    const scroller = document.createElement('div')
+    scroller.dataset.testid = 'nested-transcript-scroller'
+    Object.assign(scroller.style, {
+      background: 'white',
+      height: '80px',
+      left: '320px',
+      overflowY: 'auto',
+      position: 'fixed',
+      top: '180px',
+      width: '220px',
+      zIndex: '9999',
+    })
+    const content = document.createElement('div')
+    content.style.height = '320px'
+    scroller.append(content)
+    el.append(scroller)
+    scroller.scrollTop = 120
+  })
+  const nested = page.getByTestId('nested-transcript-scroller')
+  const before = await nested.evaluate(el => el.scrollTop)
+
+  await nested.hover()
+  await page.mouse.wheel(0, -8)
+
+  await expect.poll(() => nested.evaluate(el => el.scrollTop)).toBeLessThan(before)
+  await expect(latest).toHaveCount(0)
+  await expect(thread).not.toHaveClass(/chat-thread--reading-history/)
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+})
+
+test('pins the live edge across viewport changes without moving a historical reader', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 760 })
+  await openChat(page)
+  const thread = page.locator('.chat-thread')
+  const list = page.locator('.chat-message-list')
+
+  await thread.evaluate(el => { el.scrollTop = el.scrollHeight })
+  await expect(list).toHaveAttribute('data-virtualized', 'false')
+  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
+  await page.setViewportSize({ width: 900, height: 760 })
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  await expect(page.locator('.chat-jump-latest')).toHaveCount(0)
+  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
+
+  await page.setViewportSize({ width: 1280, height: 760 })
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  await page.setViewportSize({ width: 1280, height: 520 })
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = Math.max(0, thread.scrollHeight - thread.clientHeight - 800)
+    thread.dispatchEvent(new Event('scroll'))
+  })
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  const readerTop = await thread.evaluate(el => el.scrollTop)
+
+  await page.setViewportSize({ width: 1280, height: 680 })
+  await expect.poll(() => scrollGap(page)).toBeGreaterThan(60)
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  expect(Math.abs(await thread.evaluate(el => el.scrollTop) - readerTop)).toBeLessThanOrEqual(1)
+})
+
+test('preserves a non-virtualized reader anchor across width reflow', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 760 })
+  await openChat(page)
+  const thread = page.locator('.chat-thread')
+  const list = page.locator('.chat-message-list')
+
+  await expect(list).toHaveAttribute('data-virtualized', 'false')
+  await thread.evaluate(el => {
+    const thread = el as HTMLElement
+    thread.scrollTop = Math.max(0, thread.scrollHeight - thread.clientHeight - 1800)
+    thread.dispatchEvent(new Event('scroll'))
+  })
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  await expect(thread).toHaveClass(/chat-thread--reading-history/)
+  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('auto')
+  const wideAnchor = await visibleRowAnchor(page)
+
+  await page.setViewportSize({ width: 900, height: 760 })
+  await expect.poll(async () => {
+    const anchor = await visibleRowAnchor(page, wideAnchor.key)
+    return Math.abs(anchor.prefixHeight - wideAnchor.prefixHeight)
+  }).toBeGreaterThan(1)
+  await expect.poll(async () => {
+    const anchor = await visibleRowAnchor(page, wideAnchor.key)
+    return Math.abs(anchor.offset - wideAnchor.offset)
+  }).toBeLessThanOrEqual(2)
+  const narrowAnchor = await visibleRowAnchor(page, wideAnchor.key)
+  expect(Math.abs(narrowAnchor.offset - wideAnchor.offset)).toBeLessThanOrEqual(2)
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
+  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('auto')
+
+  await page.setViewportSize({ width: 1280, height: 760 })
+  await expect.poll(async () => {
+    const anchor = await visibleRowAnchor(page, wideAnchor.key)
+    return Math.abs(anchor.prefixHeight - wideAnchor.prefixHeight)
+  }).toBeLessThanOrEqual(1)
+  await expect.poll(async () => {
+    const anchor = await visibleRowAnchor(page, wideAnchor.key)
+    return Math.abs(anchor.offset - wideAnchor.offset)
+  }).toBeLessThanOrEqual(2)
+  await expect(page.locator('.chat-jump-latest')).toBeVisible()
 })
 
 test('disabled preference restores the established docked layout', async ({ page }) => {

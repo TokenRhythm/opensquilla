@@ -196,6 +196,25 @@ describe('RunTrace activity presentation', () => {
     )
   })
 
+  it('fades only activity detail bodies and disables the motion when requested', () => {
+    expect(runTraceSource).toContain(
+      '<Transition name="activity-tool-detail" :css="presentation === \'activity\'">',
+    )
+    expect(ruleBody('.tool-timeline--activity .activity-tool-detail-enter-active')).toContain(
+      'opacity var(--dur-base) var(--ease-out)',
+    )
+    expect(ruleBody('.tool-timeline--activity .activity-tool-detail-enter-from,')).toContain(
+      'opacity: 0;',
+    )
+
+    const reducedMotionStart = runTraceSource.indexOf('@media (prefers-reduced-motion: reduce)')
+    const reducedMotion = runTraceSource.slice(reducedMotionStart)
+    expect(reducedMotion).toContain(
+      '.tool-timeline--activity .activity-tool-detail-enter-active',
+    )
+    expect(reducedMotion).toContain('transition: none;')
+  })
+
   const completedGroup = group('completed-group', [
     call('completed-one'),
     call('completed-two'),
@@ -346,7 +365,7 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.activity-tool-details')).toBeNull()
   })
 
-  it('keeps compact semantic details and explicit raw forwarding available', async () => {
+  it('shows long activity details in one bounded preview and preserves raw forwarding', async () => {
     const result = 'file contents\n'.repeat(30)
     const onShowResult = vi.fn()
     // A read-shaped call: content-size summaries are reserved for read
@@ -366,22 +385,22 @@ describe('RunTrace activity presentation', () => {
     })
 
     const details = el.querySelector('.activity-tool-details')
-    const summary = el.querySelector('.activity-tool-details__summary')
-    const detailTrigger = el.querySelector<HTMLButtonElement>(
-      '.activity-tool-details__hit-target',
+    const window = el.querySelector('.activity-tool-details__window')
+    const viewFull = el.querySelector<HTMLButtonElement>(
+      '.activity-tool-details__view',
     )
     expect(details).not.toBeNull()
-    expect(summary).not.toBeNull()
-    expect(summary?.textContent).toContain('30 lines')
-    expect(summary?.textContent).not.toContain('view details')
-    expect(el.querySelectorAll('.activity-tool-details__summary')).toHaveLength(1)
-    expect(el.querySelector('.activity-tool-details__view')).toBeNull()
+    expect(details?.classList.contains('activity-tool-details--bounded')).toBe(true)
+    expect(window?.textContent).toContain('file contents')
+    expect(window?.textContent).toContain('view full')
+    expect(el.querySelector('.activity-tool-details__summary')).toBeNull()
+    expect(el.querySelectorAll('.activity-tool-details__window')).toHaveLength(1)
     expect(el.querySelector('.tool-row-section')).toBeNull()
-    expect(detailTrigger?.tagName).toBe('BUTTON')
-    expect(detailTrigger?.hasAttribute('data-share-control')).toBe(true)
-    expect(detailTrigger?.getAttribute('aria-label')?.toLowerCase()).toContain('view details')
+    expect(el.querySelector('.activity-tool-details__fade')).not.toBeNull()
+    expect(viewFull?.tagName).toBe('BUTTON')
+    expect(viewFull?.hasAttribute('data-share-control')).toBe(true)
 
-    detailTrigger?.click()
+    viewFull?.click()
 
     expect(onShowResult).toHaveBeenCalledWith(
       `INPUT\n{}\n\nRESULT\n${result.trim()}`,

@@ -33,7 +33,7 @@ TOKENRHYTHM_BASE_URL = "https://tokenrhythm.studio/v1"
 def test_keyless_default_resolves_tokenrhythm() -> None:
     cfg = GatewayConfig()
     assert cfg.llm.provider == "tokenrhythm"
-    assert cfg.llm.model == "deepseek-v4-flash-0731"
+    assert cfg.llm.model == "deepseek-v4-pro-0813"
     assert cfg.llm.base_url == TOKENRHYTHM_BASE_URL
 
 
@@ -178,9 +178,9 @@ def test_tokenrhythm_default_binds_router_tiers_to_tokenrhythm() -> None:
     cfg = GatewayConfig()
     tiers = cfg.squilla_router.tiers
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }
@@ -188,6 +188,9 @@ def test_tokenrhythm_default_binds_router_tiers_to_tokenrhythm() -> None:
         assert tiers[name]["provider"] == "tokenrhythm"
         assert tiers[name]["model"] == model
     assert tiers["c3"]["ensemble_enabled"] is True
+    assert tiers["c0"]["supports_image"] is False
+    assert tiers["c2"]["supports_image"] is False
+    assert all("thinking_level" not in tier for tier in tiers.values())
     assert "ensemble_selection_mode" not in tiers["c3"]
     assert cfg.squilla_router.tier_profile is None
 
@@ -198,7 +201,7 @@ def test_tokenrhythm_curated_ladder_is_not_rebound_to_the_direct_model() -> None
     # packaged profiles.
     cfg = GatewayConfig(llm={"provider": "tokenrhythm", "model": "glm-5.2"})
     assert cfg.llm.model == "glm-5.2"
-    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek-v4-flash-0731"
+    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek-v4-pro-0813"
 
 
 def test_tokenrhythm_custom_tiers_are_preserved() -> None:

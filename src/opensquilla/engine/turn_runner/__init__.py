@@ -77,6 +77,7 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     SystemPromptRefreshPort,
     WarningTransformer,
 )
+from opensquilla.engine.turn_runner.transcript_snapshot import TurnTranscriptSnapshot
 from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     CostRollupResult,
     SessionTotalsPort,
@@ -145,6 +146,7 @@ __all__ = [
     "ToolBuilderPort",
     "TranscriptAppendPort",
     "TranscriptAppendResult",
+    "TurnTranscriptSnapshot",
     "TurnContext",
     "TurnExecutionContext",
     "TurnErrorPersistPort",

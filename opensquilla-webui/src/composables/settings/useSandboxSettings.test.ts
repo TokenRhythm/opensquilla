@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EffectScope } from 'vue'
-import type { SandboxPolicy } from '@/types/sandbox'
+import type { SandboxPolicy, SandboxRuntimePackStatus } from '@/types/sandbox'
 
 const policy: SandboxPolicy = {
   schemaVersion: 2,
@@ -40,6 +40,29 @@ const unavailableReport = {
   capabilities: [],
 }
 
+const readyRuntimeStatus: SandboxRuntimePackStatus = {
+  schemaVersion: 1,
+  managementSupported: true,
+  target: 'windows-x64',
+  catalogVersion: '2026-07-30.1',
+  sourceOrder: ['oss', 'github'],
+  components: [
+    {
+      componentId: 'python',
+      availability: 'ready',
+      catalogVersion: '2026-07-30.1',
+      activeVersion: '3.13.14+20260728',
+      installedBytes: 100,
+      removable: true,
+      resumeAvailable: false,
+      resumeBytes: 0,
+      operation: null,
+      lastError: null,
+    },
+  ],
+  nextPollAfterMs: 750,
+}
+
 async function settle(): Promise<void> {
   for (let index = 0; index < 8; index += 1) await Promise.resolve()
 }
@@ -51,13 +74,34 @@ async function createSandboxSettings(options: {
   setupState?: 'not_setup' | 'ready'
   policyUpdate?: (params: Record<string, unknown>) => unknown | Promise<unknown>
   runModeSetError?: Error
+  runtimeStatus?: unknown | (() => unknown | Promise<unknown>)
+  runtimeStatusError?: Error
+  runtimeAction?: (method: string, params?: Record<string, unknown>) => unknown
 } = {}) {
   vi.resetModules()
   const pushToast = vi.fn()
   const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'sandbox.policy.get') return structuredClone(policy)
-    if (method === 'sandbox.policy.defaults') return {}
+    if (method === 'sandbox.policy.defaults') {
+      return {
+        runtimeTarget: 'windows-x64',
+        runtimeVersions: { python: { version: '3.13.14', available: true } },
+      }
+    }
     if (method === 'sandbox.run_mode.preference.get') return { runMode: 'full' }
+    if (method === 'sandbox.runtime.status') {
+      if (options.runtimeStatusError) throw options.runtimeStatusError
+      if (typeof options.runtimeStatus === 'function') return options.runtimeStatus()
+      if (options.runtimeStatus !== undefined) return options.runtimeStatus
+      throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+    }
+    if (
+      method === 'sandbox.runtime.install'
+      || method === 'sandbox.runtime.cancel'
+      || method === 'sandbox.runtime.remove'
+    ) {
+      return options.runtimeAction?.(method, params) ?? { status: readyRuntimeStatus }
+    }
     if (method === 'sandbox.capability.status') {
       if (options.capabilityError) throw new Error('probe failed')
       return options.capabilityResult ?? unavailableReport
@@ -408,5 +452,192 @@ describe('useSandboxSettings capability checks', () => {
 
     expect(settings.capability.value).toBeNull()
     expect(capabilityCalls(call)).toHaveLength(1)
+  })
+})
+
+describe('useSandboxSettings runtime packs', () => {
+  it('loads runtime status independently without blocking the policy page on failure', async () => {
+    const { scope, settings } = await createSandboxSettings({
+      runtimeStatusError: new Error('runtime service unavailable'),
+    })
+
+    await settings.load()
+    await settle()
+
+    expect(settings.ready.value).toBe(true)
+    expect(settings.loadError.value).toBe('')
+    expect(settings.runtimeStatus.value).toBeNull()
+    expect(settings.runtimeStatusError.value).toBe('runtime service unavailable')
+    scope.stop()
+  })
+
+  it('quietly falls back to legacy runtime versions for an old Gateway', async () => {
+    const { scope, settings } = await createSandboxSettings()
+
+    await settings.load()
+    await settle()
+
+    expect(settings.runtimeStatusSupported.value).toBe(false)
+    expect(settings.runtimeStatusError.value).toBe('')
+    expect(settings.runtimeVersions.value.python?.version).toBe('3.13.14')
+    scope.stop()
+  })
+
+  it('uses exact action payloads and accepts direct operations or wrapped status', async () => {
+    const queuedOperation = {
+      operationId: 'operation-1',
+      componentId: 'python',
+      kind: 'install',
+      state: 'queued',
+      downloadedBytes: 0,
+      totalBytes: 100,
+      progressPercent: 0,
+      source: null,
+      startedAtMs: 1,
+      updatedAtMs: 1,
+      error: null,
+    }
+    const { call, scope, settings } = await createSandboxSettings({
+      runtimeStatus: readyRuntimeStatus,
+      runtimeAction: method => method === 'sandbox.runtime.install'
+        ? queuedOperation
+        : { status: structuredClone(readyRuntimeStatus) },
+    })
+    await settings.load()
+    await settle()
+
+    await expect(settings.installRuntime('python')).resolves.toBe(true)
+    expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
+      .toBe('operation-1')
+    await expect(settings.cancelRuntime('python', 'operation-1')).resolves.toBe(true)
+    await expect(settings.removeRuntime('python')).resolves.toBe(true)
+
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.install', { componentId: 'python' })
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.cancel', {
+      componentId: 'python',
+      operationId: 'operation-1',
+    })
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
+    expect(settings.runtimeStatus.value?.catalogVersion).toBe('2026-07-30.1')
+    scope.stop()
+  })
+
+  it('ignores a status response that predates a successful runtime action', async () => {
+    let resolveStaleStatus!: (value: SandboxRuntimePackStatus) => void
+    const staleStatus = new Promise<SandboxRuntimePackStatus>((resolve) => {
+      resolveStaleStatus = resolve
+    })
+    let statusCalls = 0
+    const queuedOperation = {
+      operationId: 'operation-1',
+      componentId: 'python',
+      kind: 'install',
+      state: 'queued',
+      downloadedBytes: 0,
+      totalBytes: 100,
+      progressPercent: 0,
+      source: null,
+      startedAtMs: 1,
+      updatedAtMs: 1,
+      error: null,
+    }
+    const { scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => {
+        statusCalls += 1
+        return statusCalls === 1 ? readyRuntimeStatus : staleStatus
+      },
+      runtimeAction: () => queuedOperation,
+    })
+    await settings.load()
+    await settle()
+
+    settings.setRuntimeViewActive(true)
+    await settle()
+    expect(statusCalls).toBe(2)
+    await expect(settings.installRuntime('python')).resolves.toBe(true)
+    expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
+      .toBe('operation-1')
+
+    resolveStaleStatus(structuredClone(readyRuntimeStatus))
+    await settle()
+
+    expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
+      .toBe('operation-1')
+    expect(settings.runtimeStatusLoading.value).toBe(false)
+    scope.stop()
+  })
+
+  it('polls after 750 ms only while the runtime view has an active operation', async () => {
+    vi.useFakeTimers()
+    let statusCalls = 0
+    const downloading = structuredClone(readyRuntimeStatus)
+    downloading.components[0] = {
+      ...downloading.components[0],
+      availability: 'missing',
+      activeVersion: null,
+      removable: false,
+      operation: {
+        operationId: 'operation-1',
+        componentId: 'python',
+        kind: 'install',
+        state: 'downloading',
+        source: 'oss',
+        downloadedBytes: 50,
+        totalBytes: 100,
+        progressPercent: 50,
+        startedAtMs: 1,
+        updatedAtMs: 2,
+        error: null,
+      },
+    }
+    const { scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => {
+        statusCalls += 1
+        return statusCalls === 1 ? downloading : readyRuntimeStatus
+      },
+    })
+
+    settings.setRuntimeViewActive(true)
+    await settle()
+    expect(statusCalls).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(749)
+    expect(statusCalls).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await settle()
+    expect(statusCalls).toBe(2)
+
+    await vi.advanceTimersByTimeAsync(750)
+    await settle()
+    expect(statusCalls).toBe(2)
+    settings.setRuntimeViewActive(false)
+    scope.stop()
+  })
+
+  it('retries a transient status failure after five seconds while the runtime view is open', async () => {
+    vi.useFakeTimers()
+    let statusCalls = 0
+    const { scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => {
+        statusCalls += 1
+        if (statusCalls === 1) throw new Error('temporary status failure')
+        return readyRuntimeStatus
+      },
+    })
+
+    settings.setRuntimeViewActive(true)
+    await settle()
+    expect(statusCalls).toBe(1)
+    expect(settings.runtimeStatusError.value).toBe('temporary status failure')
+
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(statusCalls).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await settle()
+
+    expect(statusCalls).toBe(2)
+    expect(settings.runtimeStatus.value?.managementSupported).toBe(true)
+    expect(settings.runtimeStatusError.value).toBe('')
+    scope.stop()
   })
 })

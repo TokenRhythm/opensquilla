@@ -1,11 +1,87 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+
+
+@pytest.mark.parametrize("run_mode", ["safe", "full"])
+@pytest.mark.asyncio
+async def test_shell_echo_succeeds_when_git_is_unavailable(
+    run_mode: str,
+    tmp_path: Path,
+    unavailable_git_runtime: SimpleNamespace,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import shell
+
+    configure_runtime(
+        SandboxSettings(run_mode="safe", backend="noop", allow_legacy_mode=True),
+        workspace=tmp_path,
+    )
+    runtime_events: list[dict[str, object]] = []
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            session_key=f"no-git-shell-{run_mode}",
+            run_mode=run_mode,
+            workspace_dir=str(tmp_path),
+            on_runtime_event=runtime_events.append,
+        )
+    )
+    try:
+        result = await shell.exec_command("echo opensquilla_no_git", workdir=str(tmp_path))
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    assert "opensquilla_no_git" in result
+    assert "exit_code=0" in result
+    assert unavailable_git_runtime.resolution_calls
+
+
+@pytest.mark.parametrize("run_mode", ["safe", "full"])
+@pytest.mark.asyncio
+async def test_execute_code_succeeds_when_git_is_unavailable(
+    run_mode: str,
+    tmp_path: Path,
+    unavailable_git_runtime: SimpleNamespace,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import code_exec
+
+    configure_runtime(
+        SandboxSettings(run_mode="safe", backend="noop", allow_legacy_mode=True),
+        workspace=tmp_path,
+    )
+    runtime_events: list[dict[str, object]] = []
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            session_key=f"no-git-code-{run_mode}",
+            run_mode=run_mode,
+            workspace_dir=str(tmp_path),
+            on_runtime_event=runtime_events.append,
+        )
+    )
+    try:
+        result = await code_exec.execute_code("print('opensquilla_no_git')")
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    payload = json.loads(result)
+    assert payload["exit_code"] == 0
+    assert payload["stdout"].splitlines() == ["opensquilla_no_git"]
+    assert unavailable_git_runtime.resolution_calls
 
 
 @pytest.mark.asyncio

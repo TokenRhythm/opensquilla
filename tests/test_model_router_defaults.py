@@ -197,9 +197,9 @@ def test_direct_legacy_openrouter_router_defaults_are_migrated(provider_id: str)
 
 
 TOKENRHYTHM_EXPECTED_TIER_MODELS = {
-    "c0": "qwen3.7-flash",
-    "c1": "deepseek-v4-flash-0731",
-    "c2": "glm-5.2",
+    "c0": "deepseek-v4-flash-0731",
+    "c1": "deepseek-v4-pro-0813",
+    "c2": "kimi-k2.7-code",
     "c3": "glm-5.2",
 }
 
@@ -215,7 +215,7 @@ def test_unset_tier_profile_seeds_tokenrhythm_curated_inline_tiers() -> None:
     for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
         assert cfg.squilla_router.tiers[tier]["provider"] == "tokenrhythm"
         assert cfg.squilla_router.tiers[tier]["model"] == model
-    assert cfg.squilla_router.tiers["c0"]["supports_image"] is True
+    assert cfg.squilla_router.tiers["c0"]["supports_image"] is False
     assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
     assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
     assert cfg.squilla_router.tiers["image_model"]["model"] == "kimi-k2.6"
@@ -241,6 +241,7 @@ def test_tokenrhythm_follow_primary_binding_refreshes_managed_inline_tiers() -> 
 
     for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
         assert cfg.squilla_router.tiers[tier]["model"] == model
+        assert "thinking_level" not in cfg.squilla_router.tiers[tier]
     assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
     assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
 
@@ -274,6 +275,7 @@ def test_tokenrhythm_boot_seed_respects_custom_inline_tiers() -> None:
     )
 
     assert cfg.squilla_router.tier_profile is None
+    assert cfg.squilla_router.preset_binding is None
     for tier in ("c0", "c1", "c2", "c3"):
         assert cfg.squilla_router.tiers[tier]["model"] == "glm-5"
 
@@ -439,7 +441,7 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     squilla_router = data["squilla_router"]
 
     assert data["llm"]["provider"] == "tokenrhythm"
-    assert data["llm"]["model"] == "deepseek-v4-flash-0731"
+    assert data["llm"]["model"] == "deepseek-v4-pro-0813"
     assert data["llm_ensemble"]["enabled"] is False
     assert data["llm_ensemble"]["selection_mode"] == "static_tokenrhythm_b5"
     assert squilla_router["enabled"] is True
@@ -458,15 +460,16 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     assert squilla_router["require_router_runtime"] is True
 
     tiers = squilla_router["tiers"]
-    # The packaged mixed-family ladder preserves provider defaults; explicit
-    # turn-level V4 controls do not become tier-wide settings.
+    # The packaged mixed-family ladder has no tier-wide thinking settings;
+    # Router auto-thinking or explicit turn controls may still select one.
     for name in ("c0", "c1", "c2", "c3", "image_model"):
         assert tiers[name]["provider"] == "tokenrhythm"
         assert "thinking_level" not in tiers[name]
-    assert tiers["c0"]["model"] == "qwen3.7-flash"
-    assert tiers["c0"]["supports_image"] is True
-    assert tiers["c1"]["model"] == "deepseek-v4-flash-0731"
-    assert tiers["c2"]["model"] == "glm-5.2"
+    assert tiers["c0"]["model"] == "deepseek-v4-flash-0731"
+    assert tiers["c0"]["supports_image"] is False
+    assert tiers["c1"]["model"] == "deepseek-v4-pro-0813"
+    assert tiers["c2"]["model"] == "kimi-k2.7-code"
+    assert tiers["c2"]["supports_image"] is False
     assert tiers["c3"]["model"] == "glm-5.2"
     assert tiers["c3"]["ensemble_enabled"] is True
     assert "ensemble_selection_mode" not in tiers["c3"]

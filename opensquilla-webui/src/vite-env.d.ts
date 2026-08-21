@@ -106,6 +106,19 @@ declare global {
       payload: NativeArtifactPreviewLeaseControlRequest,
     ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
     getWorkbenchCapabilities?: () => Promise<unknown>
+    getArtifactAnnotationCapabilities?: () => Promise<unknown>
+    setArtifactAnnotationMode?: (
+      payload: import('./platform/types').NativeArtifactAnnotationModeRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    showArtifactAnnotationOverlay?: (
+      payload: import('./platform/types').NativeArtifactAnnotationOverlayRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    closeArtifactAnnotationOverlay?: (
+      payload: import('./platform/types').NativeArtifactAnnotationOverlayCloseRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    screenshot?: (
+      payload: import('./platform/types').NativeArtifactScreenshotRequest,
+    ) => Promise<unknown>
     navigateWorkbenchSurface?: (
       payload: NativeWorkbenchNavigateRequest,
     ) => Promise<NativeWorkbenchSurfaceResult>

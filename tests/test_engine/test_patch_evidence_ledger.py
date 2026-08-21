@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
+from opensquilla.git_runtime import GitRunState
 from opensquilla.tools.types import ToolContext, current_tool_context
 from opensquilla.tools.write_tracking import record_workspace_file_read
 
@@ -103,6 +107,47 @@ def test_patch_evidence_ledger_redacts_secret_like_text(tmp_path: Path) -> None:
     text = ledger_path.read_text(encoding="utf-8")
     assert secret not in text
     assert "env.OPENROUTER_API_KEY=[REDACTED]" in text
+
+
+def test_patch_evidence_ledger_records_unknown_git_without_claiming_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path = tmp_path / "ledger.json"
+    calls: list[tuple[str, ...]] = []
+
+    def unavailable(args, **_kwargs):
+        calls.append(tuple(args))
+        return SimpleNamespace(ok=False, state=GitRunState.NOT_REPOSITORY)
+
+    monkeypatch.setattr(
+        "opensquilla.engine.patch_evidence_ledger.run_git",
+        unavailable,
+    )
+    ledger = PatchEvidenceLedger(
+        path=str(ledger_path),
+        workspace_dir=str(tmp_path),
+        session_key="session-1",
+        agent_id="main",
+    )
+
+    ledger.write_final(
+        read_records=[],
+        write_records=[{"relative_path": "src/app.py", "operation": "edit"}],
+        scratch_records=[],
+        final_status="ok",
+        iterations=1,
+        provider_call_count=1,
+    )
+
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert calls == [("status", "--porcelain=v1", "--untracked-files=all")]
+    assert payload["git_state"] == "not_repository"
+    assert payload["git_diff_observed"] is False
+    # Keep the v1 list/int shape for older ledger consumers; the additive
+    # observed flag is the authoritative distinction from a clean workspace.
+    assert payload["diff_paths"] == []
+    assert payload["summary"]["diff_path_count"] == 0
 
 
 def test_record_workspace_file_read_tracks_workspace_relative_path(tmp_path: Path) -> None:
