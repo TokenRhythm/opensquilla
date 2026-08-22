@@ -379,7 +379,9 @@ class ArtifactCandidateLoopController:
                 except Exception:
                     recovered = None
                 if recovered is not None:
-                    existing = recovered
+                    # The surrounding cleanup reloads this turn-local row;
+                    # this check preserves the recovery wait before re-raising.
+                    pass
                 raise
             except Exception:
                 # The insert may have committed before an ordinary response
