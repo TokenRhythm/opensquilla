@@ -115,6 +115,7 @@ import {
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
+  type NativeWorkbenchCandidatePreviewBinding,
 } from './native-workbench-surface.js'
 import {
   parseNativeWorkbenchAnnotationModeRequest,
@@ -578,6 +579,8 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
       : null
   ),
   getWindow: () => currentMainWindow(),
+  resolveCandidatePreview: resolveCandidatePreviewFromGateway,
+  releaseCandidatePreview: releaseCandidatePreviewFromGateway,
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
@@ -610,6 +613,124 @@ const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport
     }),
   },
 )
+
+async function resolveCandidatePreviewFromGateway(
+  candidateHandle: string,
+  signal: AbortSignal,
+): Promise<NativeWorkbenchCandidatePreviewBinding> {
+  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
+    ? gatewayState.url
+    : null
+  const token = desktopArtifactBridgeLoopback.token()
+  if (!gatewayOrigin || !token) {
+    throw new Error('The Desktop candidate preview service is unavailable.')
+  }
+  const response = await fetch(
+    new URL('/api/v1/desktop-artifact-candidate-preview/resolve', gatewayOrigin),
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ version: 1, candidateHandle }),
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal,
+    },
+  )
+  const contentType = response.headers.get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase()
+  const declaredLength = response.headers.get('content-length')
+  if (
+    contentType !== 'application/json'
+    || (declaredLength !== null && (
+      !/^\d+$/.test(declaredLength)
+      || Number(declaredLength) > 1024 * 1024
+    ))
+  ) throw new Error('The Desktop candidate preview response is invalid.')
+  const text = await response.text()
+  if (!response.ok || text.length > 1024 * 1024) {
+    throw new Error('The Desktop candidate preview service rejected the request.')
+  }
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    throw new Error('The Desktop candidate preview response is invalid.')
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('The Desktop candidate preview response is invalid.')
+  }
+  const value = raw as Record<string, unknown>
+  const launchUrl = value.launch_url
+  const expectedOrigin = value.preview_origin
+  const candidateArtifactId = value.candidate_artifact_id
+  const leaseId = value.lease_id
+  const scopeId = value.scope_id
+  const effectiveMode = value.effective_mode
+  if (
+    typeof launchUrl !== 'string'
+    || typeof expectedOrigin !== 'string'
+    || typeof candidateArtifactId !== 'string'
+    || typeof leaseId !== 'string'
+    || typeof scopeId !== 'string'
+    || scopeId.length === 0
+    || scopeId.length > 512
+    || /[\u0000-\u001f\u007f]/.test(scopeId)
+    // Candidate previews are always rendered in the offline realm. Keep this
+    // check at the Gateway→Electron boundary as well as in the native surface
+    // so a compromised/stale response cannot widen browser-action authority.
+    || effectiveMode !== 'offline'
+    || value.candidate_handle !== candidateHandle
+  ) throw new Error('The Desktop candidate preview response is invalid.')
+  return {
+    candidateHandle,
+    candidateArtifactId,
+    leaseId,
+    launchUrl,
+    expectedOrigin,
+    scopeId,
+    mode: effectiveMode,
+  }
+}
+
+async function releaseCandidatePreviewFromGateway(
+  candidateHandle: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
+    ? gatewayState.url
+    : null
+  const token = desktopArtifactBridgeLoopback.token()
+  // A missing Gateway/bridge identity is not a successful restore.  Native
+  // cleanup callers may intentionally swallow this error during shutdown,
+  // while the interactive discard path must retain the candidate handle and
+  // retry instead of claiming that the canonical preview was restored.
+  if (!gatewayOrigin || !token) {
+    throw new Error('The Desktop candidate preview cleanup service is unavailable.')
+  }
+  const response = await fetch(
+    new URL(
+      `/api/v1/desktop-artifact-candidate-preview/${encodeURIComponent(candidateHandle)}`,
+      gatewayOrigin,
+    ),
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal,
+    },
+  )
+  if (!response.ok) {
+    throw new Error('The Desktop candidate preview cleanup was rejected.')
+  }
+}
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }

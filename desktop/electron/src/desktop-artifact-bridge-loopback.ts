@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net'
 import {
   DESKTOP_ARTIFACT_BRIDGE_METHODS,
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS,
   type DesktopArtifactBridgeMethod,
 } from './desktop-artifact-bridge-contract.js'
 import {
@@ -178,6 +179,8 @@ export class DesktopArtifactBridgeLoopbackTransport {
   private endpoint: string | null = null
   private tokenText: string | null = null
   private startPromise: Promise<DesktopArtifactBridgeLoopbackEnvironment> | null = null
+  /** Invalidates a bind that is still racing with application shutdown. */
+  private lifecycleEpoch = 0
 
   constructor(
     private readonly bridge: DesktopArtifactBridge,
@@ -187,7 +190,7 @@ export class DesktopArtifactBridgeLoopbackTransport {
   start(): Promise<DesktopArtifactBridgeLoopbackEnvironment> {
     if (this.endpoint && this.tokenText) return Promise.resolve(this.environment())
     if (this.startPromise) return this.startPromise
-    this.startPromise = this.startServer()
+    this.startPromise = this.startServer(this.lifecycleEpoch)
     return this.startPromise
   }
 
@@ -201,7 +204,13 @@ export class DesktopArtifactBridgeLoopbackTransport {
     }
   }
 
+  /** Process-local credential for the Gateway's candidate materialization RPC. */
+  token(): string | null {
+    return this.tokenText
+  }
+
   async close(): Promise<void> {
+    this.lifecycleEpoch += 1
     const server = this.server
     this.server = null
     this.endpoint = null
@@ -211,7 +220,9 @@ export class DesktopArtifactBridgeLoopbackTransport {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 
-  private async startServer(): Promise<DesktopArtifactBridgeLoopbackEnvironment> {
+  private async startServer(
+    lifecycleEpoch: number,
+  ): Promise<DesktopArtifactBridgeLoopbackEnvironment> {
     const tokenText = randomBytes(32).toString('base64url')
     const tokenBytes = Buffer.from(tokenText, 'utf8')
     const server = createServer((request, response) => {
@@ -235,6 +246,10 @@ export class DesktopArtifactBridgeLoopbackTransport {
         server.once('listening', onListening)
         server.listen(0, LOOPBACK_HOST)
       })
+      if (lifecycleEpoch !== this.lifecycleEpoch) {
+        await new Promise<void>(resolve => server.close(() => resolve()))
+        throw new Error('The Desktop artifact bridge transport was closed while starting.')
+      }
       const address = server.address() as AddressInfo | null
       if (!address || address.address !== LOOPBACK_HOST || address.family !== 'IPv4') {
         throw new Error('Desktop artifact bridge failed to bind IPv4 loopback.')
@@ -245,8 +260,8 @@ export class DesktopArtifactBridgeLoopbackTransport {
       this.tokenText = tokenText
       return this.environment()
     } catch (error) {
-      server.close()
-      this.startPromise = null
+      try { server.close() } catch {}
+      if (lifecycleEpoch === this.lifecycleEpoch) this.startPromise = null
       throw error
     }
   }
@@ -281,7 +296,9 @@ export class DesktopArtifactBridgeLoopbackTransport {
         if (
           !isObjectRecord(body)
           || !exactKeys(body, ['version'])
-          || body.version !== DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+          || !DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS.includes(
+            body.version as (typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS)[number],
+          )
         ) {
           throw new TransportRequestError(400, 'invalid-request', 'The capabilities request is invalid.')
         }
@@ -298,8 +315,19 @@ export class DesktopArtifactBridgeLoopbackTransport {
       if (!isObjectRecord(body) || !exactKeys(body, ['version', 'method', 'request'])) {
         throw new TransportRequestError(400, 'invalid-request', 'The bridge invocation is invalid.')
       }
+      // The envelope and typed request must negotiate the same protocol.  A
+      // mismatched pair could otherwise smuggle a v4-only candidate method
+      // through a v3 envelope during a rolling upgrade.
+      if (!isObjectRecord(body.request) || body.request.version !== body.version) {
+        throw new TransportRequestError(400, 'invalid-request', 'The bridge invocation is invalid.')
+      }
       const method = bridgeMethod(body.method)
-      if (body.version !== DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION || method === null) {
+      if (
+        !DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS.includes(
+          body.version as (typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS)[number],
+        )
+        || method === null
+      ) {
         throw new TransportRequestError(400, 'invalid-request', 'The bridge invocation is invalid.')
       }
       operation = method

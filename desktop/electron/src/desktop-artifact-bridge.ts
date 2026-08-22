@@ -1,15 +1,19 @@
 import {
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
   DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES,
   parseDesktopArtifactBrowserActRequest,
   parseDesktopArtifactBrowserInspectRequest,
+  parseDesktopArtifactBindCandidatePreviewRequest,
   parseDesktopArtifactCaptureSelectionRequest,
   parseDesktopArtifactFocusAnnotationRequest,
   parseDesktopArtifactOfficeFlushRequest,
   parseDesktopArtifactReloadSurfaceRequest,
+  parseDesktopArtifactRestoreCanonicalPreviewRequest,
   parseDesktopArtifactResolveAnnotationSelectionRequest,
   parseDesktopArtifactScreenshotRequest,
   type DesktopArtifactBridgeCapabilities,
+  type DesktopArtifactBridgeProtocolVersion,
   type DesktopArtifactBridgeMethod,
   type DesktopArtifactBridgeRequestByMethod,
   type DesktopArtifactBridgeValueByMethod,
@@ -49,6 +53,8 @@ type DesktopArtifactBridgeHandler<M extends DesktopArtifactBridgeMethod> = (
  * Deliberately has no surface identifier, URL, JavaScript or CDP escape hatch.
  */
 export interface DesktopArtifactBridgeTarget {
+  /** Protocol negotiated by the active native surface, when known. */
+  protocolVersion?: DesktopArtifactBridgeProtocolVersion
   capabilities: Partial<Record<DesktopArtifactBridgeMethod, boolean>>
   isCurrent(): boolean
   captureSelection?: DesktopArtifactBridgeHandler<'captureSelection'>
@@ -56,6 +62,9 @@ export interface DesktopArtifactBridgeTarget {
   focusAnnotation?: DesktopArtifactBridgeHandler<'focusAnnotation'>
   browserInspect?: DesktopArtifactBridgeHandler<'browserInspect'>
   browserAct?: DesktopArtifactBridgeHandler<'browserAct'>
+  /** Optional v4 lifecycle hooks. Implementations must accept only opaque handles. */
+  bindCandidatePreview?: DesktopArtifactBridgeHandler<'bindCandidatePreview'>
+  restoreCanonicalPreview?: DesktopArtifactBridgeHandler<'restoreCanonicalPreview'>
   screenshot?: DesktopArtifactBridgeHandler<'screenshot'>
   officeFlush?: DesktopArtifactBridgeHandler<'officeFlush'>
   reloadSurface?: DesktopArtifactBridgeHandler<'reloadSurface'>
@@ -72,9 +81,11 @@ const REQUEST_PARSERS = {
   focusAnnotation: parseDesktopArtifactFocusAnnotationRequest,
   browserInspect: parseDesktopArtifactBrowserInspectRequest,
   browserAct: parseDesktopArtifactBrowserActRequest,
+  bindCandidatePreview: parseDesktopArtifactBindCandidatePreviewRequest,
   screenshot: parseDesktopArtifactScreenshotRequest,
   officeFlush: parseDesktopArtifactOfficeFlushRequest,
   reloadSurface: parseDesktopArtifactReloadSurfaceRequest,
+  restoreCanonicalPreview: parseDesktopArtifactRestoreCanonicalPreviewRequest,
 } satisfies {
   [M in DesktopArtifactBridgeMethod]: (
     value: unknown,
@@ -110,13 +121,21 @@ export class DesktopArtifactBridge {
       return { ...DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES }
     }
     return {
-      version: DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+      // Keep the transport contract at v4 while reporting the active
+      // surface's negotiated version.  This prevents a v3 legacy preview
+      // from being mistaken for an autonomous v4 browser surface by the
+      // Gateway, without removing its old screenshot/reload operations.
+      version: target.protocolVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+        ? DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+        : DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
       available: true,
       captureSelection: this.methodAvailable(target, 'captureSelection'),
       resolveAnnotationSelection: this.methodAvailable(target, 'resolveAnnotationSelection'),
       focusAnnotation: this.methodAvailable(target, 'focusAnnotation'),
       browserInspect: this.methodAvailable(target, 'browserInspect'),
       browserAct: this.methodAvailable(target, 'browserAct'),
+      bindCandidatePreview: this.methodAvailable(target, 'bindCandidatePreview'),
+      restoreCanonicalPreview: this.methodAvailable(target, 'restoreCanonicalPreview'),
       screenshot: this.methodAvailable(target, 'screenshot'),
       officeFlush: this.methodAvailable(target, 'officeFlush'),
       reloadSurface: this.methodAvailable(target, 'reloadSurface'),
@@ -156,6 +175,20 @@ export class DesktopArtifactBridge {
     signal?: AbortSignal,
   ): Promise<DesktopArtifactBridgeResult<'browserAct'>> {
     return this.invoke('browserAct', value, signal)
+  }
+
+  bindCandidatePreview(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'bindCandidatePreview'>> {
+    return this.invoke('bindCandidatePreview', value, signal)
+  }
+
+  restoreCanonicalPreview(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'restoreCanonicalPreview'>> {
+    return this.invoke('restoreCanonicalPreview', value, signal)
   }
 
   screenshot(
@@ -205,7 +238,7 @@ export class DesktopArtifactBridge {
         ok: false,
         method,
         code: 'unavailable',
-        message: 'No active protocol-v3 Desktop artifact surface is available.',
+        message: 'No active protocol-v4 Desktop artifact surface is available.',
       })
     }
 

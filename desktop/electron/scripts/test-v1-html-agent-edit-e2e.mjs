@@ -52,6 +52,7 @@ const DUPLICATED_TARGET_HTML = UNRELATED_HTML.replace(
 )
 const ANNOTATION_BODY = 'Explain this synthetic paragraph without editing it.'
 const SECOND_ANNOTATION_BODY = 'Keep this heading concise and accessible.'
+const FOLLOW_UP_ANNOTATION_BODY = 'Confirm the heading remains readable after the first answer.'
 const AMBIGUOUS_ANNOTATION_BODY = 'Remove only the paragraph I selected.'
 const GENERATE_MESSAGE = 'Create and publish the requested synthetic single-file HTML page.'
 const ANNOTATION_MESSAGE = 'Answer the selected annotations without changing the document.'
@@ -61,6 +62,7 @@ const EXPECTED_ANNOTATION_TOOLS = [
   'document_apply',
   'document_inspect',
   'document_locate',
+  'document_patch',
   'document_read',
 ]
 const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
@@ -1197,21 +1199,42 @@ async function selectElementInNativePreview(electronApp, selector, expectedSourc
   return await electronApp.evaluate(async ({ webContents }, input) => {
     const { targetSelector, expectedMarker } = input
     let contents = null
+    const candidates = []
     for (const candidate of webContents.getAllWebContents()) {
       try {
         const url = new URL(candidate.getURL())
-        if (!url.hostname.endsWith('.localhost')) continue
         const owner = candidate.getOwnerBrowserWindow()
         const view = owner?.contentView.children.find(item => (
           item.webContents?.id === candidate.id
         ))
-        if (view?.getVisible?.() !== true) continue
+        const snapshot = {
+          id: candidate.id,
+          url: candidate.getURL().startsWith('data:')
+            ? `${candidate.getURL().slice(0, 32)}…`
+            : candidate.getURL(),
+          host: url.hostname,
+          visible: view?.getVisible?.() === true,
+          bounds: view?.getBounds?.() || null,
+          ownerDestroyed: owner?.isDestroyed?.() ?? null,
+        }
+        if (!url.hostname.endsWith('.localhost')) {
+          candidates.push(snapshot)
+          continue
+        }
+        if (view?.getVisible?.() !== true) {
+          candidates.push(snapshot)
+          continue
+        }
         if (expectedMarker) {
           const source = await candidate.executeJavaScript(
             'document.documentElement?.outerHTML || ""',
             true,
           )
-          if (!source.includes(expectedMarker)) continue
+          snapshot.markerMatched = source.includes(expectedMarker)
+          if (!snapshot.markerMatched) {
+            candidates.push(snapshot)
+            continue
+          }
         }
         contents = candidate
         break
@@ -1219,7 +1242,9 @@ async function selectElementInNativePreview(electronApp, selector, expectedSourc
         continue
       }
     }
-    if (!contents) throw new Error('Native HTML preview WebContents was not found.')
+    if (!contents) {
+      throw new Error(`Native HTML preview WebContents was not found: ${JSON.stringify(candidates)}`)
+    }
     const rect = await contents.executeJavaScript(`(() => {
       const element = document.querySelector(${JSON.stringify(targetSelector)})
       if (!element) return null
@@ -1399,6 +1424,8 @@ const evidence = {
   annotationAcceptanceEvents: [],
   annotationModeAfterAcceptance: null,
   annotationRequests: 0,
+  followUpAnnotationRequests: 0,
+  followUpAnnotationModeExited: false,
   annotationsPrepared: 0,
   contextualLocateCalls: 0,
   contextualCandidateErrors: 0,
@@ -1734,7 +1761,7 @@ try {
   await waitFor(
     () => provider.requests.slice(annotationRequestStart)
       .some(payload => annotationToolNames(payload).length > 0),
-    'annotation exact4 provider request',
+    'annotation document-tool provider request',
     TIMEOUT_MS,
   )
   await waitForSettledTurn(page)
@@ -1779,9 +1806,69 @@ try {
 
   const annotationRequests = provider.requests.slice(annotationRequestStart)
     .filter(payload => annotationToolNames(payload).length > 0)
-  assert.equal(annotationRequests.length, 1, 'annotation answer must use one exact4 request')
+  assert.equal(annotationRequests.length, 1, 'annotation answer must use one document-tool request')
   assert.deepEqual(annotationToolNames(annotationRequests[0]), EXPECTED_ANNOTATION_TOOLS)
   evidence.annotationRequests = annotationRequests.length
+
+  // Regression for the reported flow: after one accepted selection/question,
+  // arm the picker again, create a new selection, and send it as a second
+  // independent turn. The acceptance handoff must not leave the native picker
+  // pressed or consume the second annotation as ordinary chat text.
+  await armAnnotationPicker(page, page.getByRole('button', { name: 'Annotate preview' }))
+  await waitForReadyArtifactPreview(page)
+  const followUpSelected = await selectElementInNativePreview(
+    app,
+    '#editable-heading',
+    MANUAL_HEADING,
+  )
+  assert.equal(followUpSelected.tagName, 'h1')
+  await waitForFreshAnnotationOverlay(
+    app,
+    MANUAL_HEADING,
+    'follow-up trusted annotation overlay',
+  )
+  await typeAndSubmitAnnotation(app, FOLLOW_UP_ANNOTATION_BODY)
+  await page.locator('.chat-prompt-annotation-chip').filter({
+    hasText: FOLLOW_UP_ANNOTATION_BODY,
+  }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await waitFor(async () => !await annotationOverlayState(app),
+    'follow-up annotation editor acknowledged and closed', TIMEOUT_MS)
+  const followUpRequestStart = provider.requests.length
+  await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
+  await submitChatComposer(page)
+  await waitFor(
+    () => provider.requests.slice(followUpRequestStart)
+      .some(payload => annotationToolNames(payload).length > 0),
+    'follow-up annotation document-tool provider request',
+    TIMEOUT_MS,
+  )
+  await waitForSettledTurn(page)
+  await waitFor(
+    async () => {
+      const state = await page.evaluate(() => ({
+        statusCount: document.querySelectorAll(
+          '[data-testid="workbench-annotation-mode-status"]',
+        ).length,
+        stopButtonCount: [...document.querySelectorAll('button')]
+          .filter(button => button.getAttribute('aria-label') === 'Stop annotating')
+          .length,
+      }))
+      return state.stopButtonCount === 0 && state.statusCount === 0
+    },
+    'follow-up annotation mode exit after accepted send',
+    TIMEOUT_MS,
+  )
+  assert.equal(
+    await page.locator('.chat-prompt-annotation-chip').count(),
+    0,
+    'the second accepted annotation must leave the composer',
+  )
+  const followUpAnnotationRequests = provider.requests.slice(followUpRequestStart)
+    .filter(payload => annotationToolNames(payload).length > 0)
+  assert.equal(followUpAnnotationRequests.length, 1)
+  assert.deepEqual(annotationToolNames(followUpAnnotationRequests[0]), EXPECTED_ANNOTATION_TOOLS)
+  evidence.followUpAnnotationRequests = followUpAnnotationRequests.length
+  evidence.followUpAnnotationModeExited = true
 
   // Create a new selection, then move the original element and introduce two
   // indistinguishable candidates. The accepted turn may ask AI to help, but a
@@ -1790,7 +1877,7 @@ try {
   const ambiguousSelected = await selectElementInNativePreview(
     app,
     '#preserved-copy',
-    'unrelated source change',
+    MANUAL_HEADING,
   )
   assert.equal(ambiguousSelected.tagName, 'p')
   await waitForFreshAnnotationOverlay(
@@ -2043,7 +2130,7 @@ try {
       evidence.durableMutation = await readDurableMutationEvidence(isolationRoot)
       assert.deepEqual(evidence.durableMutation, {
         allAttemptsLinked: 4,
-        annotations: 3,
+        annotations: 4,
         appliedAttempts: 4,
         attemptLinksCommittedObjects: 4,
         bindingTargetsDocument: true,
@@ -2057,7 +2144,7 @@ try {
         originalDeliverableUnchanged: true,
         revisionOneReusesDeliverable: true,
         revisions: 5,
-        sentAnnotations: 3,
+        sentAnnotations: 4,
         sourceBindings: 1,
       })
     } catch (error) {

@@ -28,6 +28,8 @@ const target = {
     focusAnnotation: true,
     browserInspect: false,
     browserAct: false,
+    bindCandidatePreview: false,
+    restoreCanonicalPreview: false,
     screenshot: true,
     officeFlush: false,
     reloadSurface: true,
@@ -104,13 +106,15 @@ const capabilities = await capabilitiesResponse.json()
 assert.deepEqual(capabilities, {
   ok: true,
   value: {
-    version: 3,
+    version: 4,
     available: true,
     captureSelection: false,
     resolveAnnotationSelection: true,
     focusAnnotation: true,
     browserInspect: false,
     browserAct: false,
+    bindCandidatePreview: false,
+    restoreCanonicalPreview: false,
     screenshot: true,
     officeFlush: false,
     reloadSurface: true,
@@ -299,6 +303,14 @@ const unknownMethodResponse = await post('/v1/invoke', {
 })
 assert.equal(unknownMethodResponse.status, 400)
 assert.equal((await unknownMethodResponse.json()).code, 'invalid-request')
+
+const mismatchedProtocolResponse = await post('/v1/invoke', {
+  version: 3,
+  method: 'reloadSurface',
+  request: { version: 4 },
+})
+assert.equal(mismatchedProtocolResponse.status, 400)
+assert.equal((await mismatchedProtocolResponse.json()).code, 'invalid-request')
 
 const oversizedResponse = await post('/v1/capabilities', 'x'.repeat(64 * 1024 + 1))
 assert.equal(oversizedResponse.status, 413)

@@ -6,10 +6,12 @@ import {
   DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES,
   parseDesktopArtifactBrowserActRequest,
   parseDesktopArtifactBrowserInspectRequest,
+  parseDesktopArtifactBindCandidatePreviewRequest,
   parseDesktopArtifactCaptureSelectionRequest,
   parseDesktopArtifactFocusAnnotationRequest,
   parseDesktopArtifactOfficeFlushRequest,
   parseDesktopArtifactReloadSurfaceRequest,
+  parseDesktopArtifactRestoreCanonicalPreviewRequest,
   parseDesktopArtifactResolveAnnotationSelectionRequest,
   parseDesktopArtifactScreenshotRequest,
 } from '../dist/desktop-artifact-bridge-contract.js'
@@ -57,6 +59,116 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
+  /NATIVE_WORKBENCH_BROWSER_SNAPSHOT_FUNCTION/,
+  'v4 HTML surfaces must expose a fixed browser snapshot function',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /NATIVE_WORKBENCH_BROWSER_TYPE_FUNCTION/,
+  'v4 HTML surfaces must expose bounded text input',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /closest\('form'\)[\s\S]*?side-effect-node/,
+  'browser actions must reject form and navigation side effects',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /Runtime\.exceptionThrown[\s\S]*?browserRuntimeException/,
+  'runtime exceptions must invalidate browser verification',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /record\.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4[\s\S]*?browserInspect:/,
+  'browser inspection must be gated on protocol-v4',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /browserDocumentReady[\s\S]*?did-finish-load/,
+  'browser inspection must wait for a completed preview load',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /activePreviewArtifactId: record\.activePreviewArtifactId[\s\S]*?candidateHandle: record\.candidatePreview\?\.handle \?\? null/,
+  'browser snapshots must carry the active candidate identity',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /anchor\.candidateHandle !== \(record\.candidatePreview\?\.handle \?\? null\)/,
+  'browser anchors must remain bound to the candidate handle that carries SHA/epoch authority',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /async inspectBrowser\([\s\S]*?assertCandidateRequestBinding\(record, request\.candidateHandle\)[\s\S]*?record\.browserAnchors = anchors/,
+  'stale candidate inspections must not overwrite the active anchor table',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /record\.kind === 'artifact-preview'[\s\S]*?record\.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4[\s\S]*?targetUrl !== record\.documentUrl[\s\S]*?agent-preview-navigation-denied/,
+  'v4 agent previews must reject renderer top-level navigation away from the trusted URL',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /record\.kind === 'artifact-preview'[\s\S]*?request\.action === 'back'[\s\S]*?request\.action === 'open-external'[\s\S]*?NAVIGATION_BLOCKED/,
+  'v4 agent preview IPC must reject history and external navigation bypasses',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /browserAct:\s*\([\s\S]*?record\.candidatePreview !== null[\s\S]*?record\.activePreviewArtifactId === record\.candidatePreview\.artifactId[\s\S]*?record\.mode === 'offline'/,
+  'browser actions must be advertised only for an offline candidate preview',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /async actBrowser\([\s\S]*?record\.candidatePreview === null[\s\S]*?record\.mode !== 'offline'/,
+  'browser actions must fail closed when the candidate binding is absent or full-network',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /assertCandidateRequestBinding\([\s\S]*?candidateHandle !== candidate\.handle[\s\S]*?candidateHandle !== undefined/,
+  'browser side effects must remain bound to the opaque candidate handle observed by the turn',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /binding\.mode !== 'offline'[\s\S]*?effectiveCandidateMode = 'offline'/,
+  'candidate preview bindings must be offline-only even when the process override is disabled',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /restoreCanonicalPreview\(\s*record,[\s\S]*?candidateHandle[\s\S]*?candidate\.handle !== candidateHandle/,
+  'a stale turn must not restore a newer candidate preview',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /const isCurrentRecord = this\.surfaces\.get\(record\.id\) === record[\s\S]*?if \(isCurrentRecord && this\.activeSurfaceId === record\.id\)/,
+  'a stale replacement teardown must not clear the new active surface binding',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /activeCandidatePreview[\s\S]*?nativeWorkbenchDownloadAllowed\(item\.hasUserGesture\(\), activeCandidatePreview\)/,
+  'candidate previews must never be downloadable while canonical previews retain gesture-gated saves',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /NATIVE_WORKBENCH_OFFLINE_REALM_GUARD\s*=\s*nativeWorkbenchOfflineRealmGuardSource\(false\)/,
+  'legacy offline previews must retain the WebRTC-only compatibility guard',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /NATIVE_WORKBENCH_CANDIDATE_OFFLINE_REALM_GUARD\s*=\s*\n?\s*nativeWorkbenchOfflineRealmGuardSource\(true\)/,
+  'candidate previews must use the stricter network side-effect guard',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /installOfflineRealmGuard\(record, true\)/,
+  'the strict offline guard must only be installed for a candidate bind',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /restoreCanonicalPreview[\s\S]*?removeOfflineRealmGuard\(record, true\)/,
+  'restoring canonical preview must remove the candidate-only guard first',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
   /if \(!request\.enabled\) \{[\s\S]*?cancelAnnotationInteraction\([\s\S]*?if \(cleanupFailure\)[\s\S]*?return \{[\s\S]*?ok: false,[\s\S]*?code: 'ANNOTATION_BUSY',[\s\S]*?message: cleanupFailure/,
   'explicit picker disable must report a failed native-overlay cleanup',
 )
@@ -67,8 +179,8 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
-  /annotationRecordForCleanupRequest\(surfaceId\) \{[\s\S]*?record\.kind === 'artifact-preview'[\s\S]*?record\.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3[\s\S]*?!record\.disposed/,
-  'picker cleanup lookup must remain scoped to an undisposed protocol-v3 artifact preview',
+  /annotationRecordForCleanupRequest\(surfaceId\) \{[\s\S]*?record\.kind === 'artifact-preview'[\s\S]*?isArtifactBridgeProtocolVersion\(record\.version\)[\s\S]*?!record\.disposed/,
+  'picker cleanup lookup must remain scoped to an undisposed artifact preview',
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
@@ -123,9 +235,9 @@ assert.equal(
 )
 
 assert.deepEqual(NATIVE_WORKBENCH_CAPABILITIES, {
-  latestVersion: 3,
-  protocolVersions: [1, 2, 3],
-  versions: [1, 2, 3],
+  latestVersion: 4,
+  protocolVersions: [1, 2, 3, 4],
+  versions: [1, 2, 3, 4],
   kinds: ['artifact-html', 'artifact-preview', 'url-preview'],
   modes: ['full', 'offline'],
   navigationActions: ['navigate', 'back', 'forward', 'reload', 'stop', 'open-external'],
@@ -179,6 +291,18 @@ assert.deepEqual(parsedArtifactV3, {
     mode: 'offline',
   },
 })
+const parsedArtifactV4 = parseNativeWorkbenchCreateRequest({
+  version: 4,
+  surfaceId: 'artifact:v4',
+  kind: 'artifact-preview',
+  payload: {
+    launchUrl: `${previewOrigin}/sites/index.html`,
+    expectedOrigin: previewOrigin,
+    scopeId: 'synthetic:v4',
+    mode: 'offline',
+  },
+})
+assert.equal(parsedArtifactV4.version, 4)
 assert.deepEqual(
   parseNativeWorkbenchCreateRequest({
     version: 2,
@@ -558,6 +682,50 @@ assert.deepEqual(
   { version: 3, scope: 'viewport', maxNodes: 100 },
 )
 assert.deepEqual(
+  parseDesktopArtifactBrowserInspectRequest({
+    version: 4,
+    scope: 'document',
+    maxNodes: 20,
+    identityOnly: true,
+    candidateHandle: 'candidate_0123456789abcdef',
+  }),
+  {
+    version: 4,
+    scope: 'document',
+    maxNodes: 20,
+    identityOnly: true,
+    candidateHandle: 'candidate_0123456789abcdef',
+  },
+)
+assert.deepEqual(
+  parseDesktopArtifactBrowserActRequest({
+    version: 4,
+    action: 'click',
+    anchor: 'a1',
+    candidateHandle: 'candidate_0123456789abcdef',
+  }),
+  {
+    version: 4,
+    action: 'click',
+    anchor: 'a1',
+    candidateHandle: 'candidate_0123456789abcdef',
+  },
+)
+assert.deepEqual(
+  parseDesktopArtifactBindCandidatePreviewRequest({
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  }),
+  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
+)
+assert.deepEqual(
+  parseDesktopArtifactRestoreCanonicalPreviewRequest({
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  }),
+  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
+)
+assert.deepEqual(
   parseDesktopArtifactBrowserActRequest({
     version: 3,
     action: 'type',
@@ -574,8 +742,22 @@ assert.deepEqual(
   },
 )
 assert.deepEqual(parseDesktopArtifactScreenshotRequest({ version: 3 }), { version: 3 })
+assert.deepEqual(
+  parseDesktopArtifactScreenshotRequest({
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  }),
+  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
+)
 assert.deepEqual(parseDesktopArtifactOfficeFlushRequest({ version: 3 }), { version: 3 })
 assert.deepEqual(parseDesktopArtifactReloadSurfaceRequest({ version: 3 }), { version: 3 })
+assert.deepEqual(
+  parseDesktopArtifactReloadSurfaceRequest({
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  }),
+  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
+)
 
 for (const [parse, payload] of [
   [parseDesktopArtifactCaptureSelectionRequest, { version: 3, surfaceId: 'model-choice' }],
@@ -611,6 +793,12 @@ for (const [parse, payload] of [
     maxNodes: 20,
     expression: 'document.cookie',
   }],
+  [parseDesktopArtifactBrowserInspectRequest, {
+    version: 4,
+    scope: 'document',
+    maxNodes: 20,
+    candidateHandle: 'not-a-candidate-handle',
+  }],
   [parseDesktopArtifactBrowserActRequest, {
     version: 3,
     action: 'click',
@@ -622,9 +810,23 @@ for (const [parse, payload] of [
     action: 'click',
     selector: '#dangerous-arbitrary-selector',
   }],
+  [parseDesktopArtifactBrowserActRequest, {
+    version: 4,
+    action: 'press',
+    key: 'Enter',
+    candidateHandle: 'https://example.invalid/candidate',
+  }],
   [parseDesktopArtifactScreenshotRequest, { version: 3, surfaceId: 'model-choice' }],
+  [parseDesktopArtifactScreenshotRequest, {
+    version: 4,
+    candidateHandle: 'not-a-candidate-handle',
+  }],
   [parseDesktopArtifactOfficeFlushRequest, { version: 3, adapter: 'renderer-chosen' }],
   [parseDesktopArtifactReloadSurfaceRequest, { version: 3, url: 'file:///secret' }],
+  [parseDesktopArtifactReloadSurfaceRequest, {
+    version: 4,
+    candidateHandle: 'not-a-candidate-handle',
+  }],
 ]) {
   assert.throws(() => parse(payload), /Desktop artifact|browser anchor/)
 }
@@ -648,7 +850,7 @@ assert.deepEqual(
     ok: false,
     method: 'captureSelection',
     code: 'unavailable',
-    message: 'No active protocol-v3 Desktop artifact surface is available.',
+    message: 'No active protocol-v4 Desktop artifact surface is available.',
   },
 )
 assert.equal(
@@ -665,6 +867,8 @@ const missingHandlerBridge = new DesktopArtifactBridge({
       focusAnnotation: false,
       browserInspect: false,
       browserAct: false,
+      bindCandidatePreview: false,
+      restoreCanonicalPreview: false,
       screenshot: false,
       officeFlush: false,
       reloadSurface: false,
@@ -675,6 +879,20 @@ assert.equal(missingHandlerBridge.getCapabilities().available, true)
 assert.equal(missingHandlerBridge.getCapabilities().captureSelection, false)
 assert.equal(
   (await missingHandlerBridge.captureSelection({ version: 3 })).code,
+  'unsupported',
+)
+assert.equal(
+  (await missingHandlerBridge.bindCandidatePreview({
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  })).code,
+  'unsupported',
+)
+assert.equal(
+  (await missingHandlerBridge.restoreCanonicalPreview({
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  })).code,
   'unsupported',
 )
 
@@ -688,6 +906,8 @@ const controlledBridge = new DesktopArtifactBridge({
       focusAnnotation: true,
       browserInspect: true,
       browserAct: true,
+      bindCandidatePreview: false,
+      restoreCanonicalPreview: false,
       screenshot: true,
       officeFlush: false,
       reloadSurface: true,
@@ -744,13 +964,15 @@ const controlledBridge = new DesktopArtifactBridge({
   }),
 })
 assert.deepEqual(controlledBridge.getCapabilities(), {
-  version: 3,
+  version: 4,
   available: true,
   captureSelection: true,
   resolveAnnotationSelection: true,
   focusAnnotation: true,
   browserInspect: true,
   browserAct: true,
+  bindCandidatePreview: false,
+  restoreCanonicalPreview: false,
   screenshot: true,
   officeFlush: false,
   reloadSurface: true,
@@ -801,6 +1023,44 @@ assert.deepEqual(
     'reloadSurface',
   ],
 )
+
+const candidateBridgeCalls = []
+const candidateBridge = new DesktopArtifactBridge({
+  getActiveTarget: () => ({
+    isCurrent: () => true,
+    capabilities: {
+      bindCandidatePreview: true,
+      restoreCanonicalPreview: true,
+    },
+    bindCandidatePreview: async request => {
+      candidateBridgeCalls.push(['bindCandidatePreview', request])
+      return { bound: true, candidateHandle: request.candidateHandle }
+    },
+    restoreCanonicalPreview: async request => {
+      candidateBridgeCalls.push(['restoreCanonicalPreview', request])
+      return { restored: true }
+    },
+  }),
+})
+assert.equal((await candidateBridge.bindCandidatePreview({
+  version: 4,
+  candidateHandle: 'candidate_0123456789abcdef',
+})).ok, true)
+assert.equal((await candidateBridge.restoreCanonicalPreview({
+  version: 4,
+  candidateHandle: 'candidate_0123456789abcdef',
+})).ok, true)
+assert.equal((await candidateBridge.bindCandidatePreview({
+  version: 3,
+  candidateHandle: 'candidate_0123456789abcdef',
+})).code, 'invalid-request')
+assert.deepEqual(candidateBridgeCalls, [
+  ['bindCandidatePreview', { version: 4, candidateHandle: 'candidate_0123456789abcdef' }],
+  ['restoreCanonicalPreview', {
+    version: 4,
+    candidateHandle: 'candidate_0123456789abcdef',
+  }],
+])
 
 let staleTargetCurrent = true
 let staleTargetCalled = false
@@ -966,6 +1226,16 @@ assert.equal(
   false,
 )
 assert.equal(nativeWorkbenchDownloadAllowed(true), true)
+assert.equal(
+  nativeWorkbenchDownloadAllowed(true, true),
+  false,
+  'candidate preview downloads must remain blocked even with a user gesture',
+)
+assert.equal(
+  nativeWorkbenchDownloadAllowed(false, true),
+  false,
+  'candidate preview downloads must remain blocked without a user gesture',
+)
 for (const untrustedGesture of [false, undefined, null, 1, 'true']) {
   assert.equal(
     nativeWorkbenchDownloadAllowed(untrustedGesture),

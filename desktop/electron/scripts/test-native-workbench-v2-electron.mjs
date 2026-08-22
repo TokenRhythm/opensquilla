@@ -565,7 +565,6 @@ try {
       no_proxy: '127.0.0.1,localhost,.localhost',
     },
   })
-
   const result = await electronApp.evaluate(
     async ({ app, BrowserWindow, webContents }, fixture) => {
       const Manager = globalThis.__opensquillaNativeWorkbenchSurfaceManager
@@ -2781,6 +2780,11 @@ try {
       focusAnnotation: true,
       browserInspect: false,
       browserAct: false,
+      bindCandidatePreview: false,
+      restoreCanonicalPreview: false,
+      // Legacy v3 annotation capture/reload remain available to old clients;
+      // autonomous browser inspection/action and candidate preview binding are
+      // still v4-only.
       screenshot: true,
       officeFlush: false,
       reloadSurface: true,
@@ -2989,7 +2993,7 @@ try {
     ok: false,
     code: 'PREVIEW_CAPABILITY_EXPIRED',
     retryable: true,
-    message: 'Only the active protocol-v3 HTML artifact preview supports annotations.',
+    message: 'Only the active protocol-v4 HTML artifact preview supports annotations.',
   })
   assert.equal(result.annotationPickerBeforeOff.ok, true)
   assert.equal(result.annotationPickerOff.ok, true)
