@@ -1177,7 +1177,7 @@ jobs:
       # Electron's postinstall download is otherwise repeated on every fresh
       # hosted runner. Keep it beside the Playwright cache so a cold macOS
       # worker cannot spend the case watchdog budget downloading the binary.
-      ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
       CI_E2E_SHARD: ${{ matrix.shard }}
       # Keep merge-critical workbench coverage deterministic and bounded.
       # Scheduled/manual runs retain the wider geometry/rearm stress cycles.

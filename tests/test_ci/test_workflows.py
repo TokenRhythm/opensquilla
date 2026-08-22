@@ -1652,7 +1652,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
         "${{ github.workspace }}/.cache/ms-playwright"
     )
-    assert job["env"]["ELECTRON_CACHE"] == "${{ runner.temp }}/electron-cache"
+    assert job["env"]["ELECTRON_CACHE"] == "${{ github.workspace }}/.cache/electron"
     assert job["env"]["OPENSQUILLA_DESKTOP_CASE_TIMEOUT_MS"] == "900000"
     assert electron_cache["uses"] == "actions/cache/restore@v4"
     assert electron_cache["with"]["path"] == "${{ env.ELECTRON_CACHE }}"
