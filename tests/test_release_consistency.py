@@ -59,13 +59,19 @@ def test_desktop_electron_release_config_matches_current_release() -> None:
     assert build["nsis"]["allowToChangeInstallationDirectory"] is True
     assert build["nsis"]["deleteAppDataOnUninstall"] is False
     assert build["nsis"].get("guid") is None  # electron-builder derives it from the stable appId.
-    assert "include" not in build["nsis"]
+    assert build["nsis"]["include"] == "scripts/nsis/installer-progress.nsh"
+    assert "script" not in build["nsis"]
     assert not Path("desktop/electron/build/installer.nsh").exists()
     package_verifier = Path("desktop/electron/scripts/verify-package.mjs").read_text(
         encoding="utf-8"
     )
     assert "deleteAppDataOnUninstall !== false" in package_verifier
-    assert "managed upgrade cleanup without a custom recursive delete" in package_verifier
+    assert "verifyInstallerProgressPolicy" in package_verifier
+    installer_policy = Path(
+        "desktop/electron/scripts/installer-progress-policy.mjs"
+    ).read_text(encoding="utf-8")
+    assert "NSIS must not define a custom full installer script" in installer_policy
+    assert "NSIS default build/installer.nsh override must not be present" in installer_policy
 
 
 def test_release_workflow_builds_desktop_installers() -> None:
