@@ -247,6 +247,9 @@ const FILE_INSPECT_TOOLS = new Set([
   'document_inspect',
   'document_read',
   'document_locate',
+  'document_browser_inspect',
+  'document_browser_screenshot',
+  'document_browser_reload',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -258,6 +261,8 @@ const FILE_CHANGE_TOOLS = new Set([
   'apply_patch',
   'document_apply',
   'document_patch',
+  'document_browser_act',
+  'document_finish',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',

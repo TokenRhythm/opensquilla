@@ -1,5 +1,9 @@
 export type PlatformId = 'web' | 'desktop'
 
+/** Native Workbench protocol versions accepted during the v3→v4 rollout. */
+export type NativeWorkbenchProtocolVersion = 1 | 2 | 3 | 4
+export type NativeWorkbenchInteractiveProtocolVersion = 2 | 3 | 4
+
 export interface GatewayStatus {
   url: string
   port: number
@@ -177,7 +181,7 @@ export interface NativeWorkbenchCreateSurfaceRequestV1 {
 }
 
 export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
-  version: 2 | 3
+  version: 2 | 3 | 4
   surfaceId: string
   kind: 'artifact-preview'
   payload: {
@@ -189,7 +193,7 @@ export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
 }
 
 export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
-  version: 2 | 3
+  version: 2 | 3 | 4
   surfaceId: string
   kind: 'url-preview'
   payload: {
@@ -204,13 +208,13 @@ export type NativeWorkbenchCreateSurfaceRequest =
   | NativeWorkbenchCreateUrlSurfaceRequestV2
 
 export interface NativeWorkbenchCapabilities {
-  protocolVersions: Array<1 | 2 | 3>
+  protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
   maxSurfaces: number
 }
 
 export interface NativeArtifactAnnotationCapabilities {
-  version: 3
+  version: 3 | 4
   available: boolean
   picker?: boolean
   trustedOverlay?: boolean
@@ -219,13 +223,13 @@ export interface NativeArtifactAnnotationCapabilities {
 }
 
 export interface NativeArtifactAnnotationModeRequest {
-  version: 3
+  version: 3 | 4
   surfaceId: string
   enabled: boolean
 }
 
 export interface NativeArtifactAnnotationOverlayRequest {
-  version: 3
+  version: 3 | 4
   surfaceId: string
   selectionId: string
   annotationId: string
@@ -244,13 +248,13 @@ export interface NativeArtifactAnnotationOverlayRequest {
 }
 
 export interface NativeArtifactAnnotationOverlayCloseRequest {
-  version: 3
+  version: 3 | 4
   surfaceId: string
   annotationId?: string
 }
 
 export interface NativeArtifactScreenshotRequest {
-  version: 3
+  version: 3 | 4
 }
 
 export interface NativeArtifactScreenshotValue {
@@ -317,7 +321,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'annotation-overlay-fallback'
 
 export interface NativeWorkbenchSurfaceEvent {
-  version: 1 | 2 | 3
+  version: NativeWorkbenchProtocolVersion
   surfaceId: string
   type: NativeWorkbenchSurfaceEventType
   detail?: {
@@ -341,14 +345,14 @@ export interface NativeWorkbenchSurfaceEvent {
 }
 
 export interface NativeWorkbenchNavigateRequest {
-  version: 2 | 3
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
   url?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
-  version: 2 | 3
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   requestId: string
   allow: boolean

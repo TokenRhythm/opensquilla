@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="documentApplyFailureCount"
+          :failure-count="documentWriterFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -417,6 +417,10 @@ import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
+import {
+  isDocumentAgentToolName,
+  isDocumentWriterToolName,
+} from '@/utils/chat/toolDisplay'
 import {
   hasIncompleteUsageCoverage,
   usageCoverageText,
@@ -818,7 +822,8 @@ function withoutFailedActivity(
 ): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
+    const documentAgentGroup = item.group.operationKey.startsWith('document.')
+      || isDocumentAgentToolName(item.group.operationKey)
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
     )
@@ -828,23 +833,28 @@ function withoutFailedActivity(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
-      && !documentApplyGroup
+      && !documentAgentGroup
     ) {
       return []
     }
+    const groupLevelWriterError = documentAgentGroup
+      && (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
     const calls = item.group.calls.filter(
       call => (
         (
           (!call.isError && call.status !== 'error')
-          || isDocumentApplyToolName(call.name)
+          || isDocumentAgentToolName(call.name)
         )
         && !createdSessionCallIds.value.has(call.toolId)
       ),
-    )
+    ).map(call => groupLevelWriterError
+      ? { ...call, isError: true, status: 'error' as const }
+      : call)
     if (calls.length === 0) return []
     const isRunning = calls.some(call => call.isRunning)
     const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
+      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
@@ -864,13 +874,6 @@ function withoutFailedActivity(
   })
 }
 
-function isDocumentApplyToolName(value: string | undefined): boolean {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (!normalized) return false
-  const segments = normalized.split(/[.:/]/)
-  return segments[segments.length - 1] === 'document_apply'
-}
-
 const visibleActivityItems = computed(() =>
   withoutFailedActivity(activityProjection.value.activityItems),
 )
@@ -886,7 +889,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    (!cluster.isFailure || cluster.calls.some(call => isDocumentApplyToolName(call.name)))
+    (!cluster.isFailure || cluster.calls.some(call => isDocumentAgentToolName(call.name)))
     && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
@@ -916,11 +919,11 @@ const showActivityDisclosure = computed(() =>
   && hasActivity.value,
 )
 
-const documentApplyFailureCount = computed(() =>
+const documentWriterFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {
     if (item.type !== 'tool-group') return count
     return count + item.group.calls.filter(call =>
-      isDocumentApplyToolName(call.name)
+      isDocumentWriterToolName(call.name)
       && (call.isError || call.status === 'error'),
     ).length
   }, 0),
@@ -1094,6 +1097,12 @@ const activitySummaryLabel = computed(() => {
   if (mutationSummaryKey) {
     return withMaintenanceSummary([
       String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
+  if (documentWriterFailureCount.value > 0) {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
       activityCompactElapsedLabel.value,
     ].filter(Boolean).join(' · '))
   }

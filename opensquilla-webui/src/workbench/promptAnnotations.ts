@@ -29,6 +29,8 @@ export interface ArtifactPromptAnnotationReuseDetail
 export interface ArtifactPromptAnnotationsAcceptedDetail {
   acceptedIds: string[]
   sessionKey: string
+  /** The key used by the send request before a draft/session was materialized. */
+  requestSessionKey?: string
 }
 
 function requestArtifactPromptAnnotationActivation(
@@ -82,10 +84,14 @@ export function notifyArtifactPromptAnnotationsAccepted(
   detail: ArtifactPromptAnnotationsAcceptedDetail,
 ): void {
   if (typeof window === 'undefined' || !detail.sessionKey || detail.acceptedIds.length === 0) return
+  const requestSessionKey = detail.requestSessionKey?.trim()
   window.dispatchEvent(new CustomEvent(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, {
     detail: {
       acceptedIds: [...detail.acceptedIds],
       sessionKey: detail.sessionKey,
+      ...(requestSessionKey && requestSessionKey !== detail.sessionKey
+        ? { requestSessionKey }
+        : {}),
     },
   }))
 }

@@ -579,6 +579,7 @@ import type {
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import {
   toolGroupStatusText as defaultToolGroupStatusText,
+  isDocumentAgentToolName,
   toolSecondaryText as defaultToolSecondaryText,
   toolStatusText as defaultToolStatusText,
   toolIconName,
@@ -759,7 +760,8 @@ function withoutFailedActivityRows(
 
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
+    const documentAgentGroup = item.group.operationKey.startsWith('document.')
+      || isDocumentAgentToolName(item.group.operationKey)
 
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
@@ -769,22 +771,27 @@ function withoutFailedActivityRows(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
-      && !documentApplyGroup
+      && !documentAgentGroup
     ) {
       return []
     }
 
+    const groupLevelWriterError = documentAgentGroup
+      && (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
     const calls = item.group.calls.filter(
       call => (
         (!call.isError && call.status !== 'error')
-        || isDocumentApplyToolName(call.name)
+        || isDocumentAgentToolName(call.name)
       ),
-    )
+    ).map(call => groupLevelWriterError
+      ? { ...call, isError: true, status: 'error' as const }
+      : call)
     if (calls.length === 0) return []
 
     const isRunning = calls.some(call => call.isRunning)
     const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
+      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
@@ -802,13 +809,6 @@ function withoutFailedActivityRows(
       },
     }]
   })
-}
-
-function isDocumentApplyToolName(value: string | undefined): boolean {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (!normalized) return false
-  const segments = normalized.split(/[.:/]/)
-  return segments[segments.length - 1] === 'document_apply'
 }
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {

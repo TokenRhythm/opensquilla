@@ -2965,11 +2965,17 @@ const chatSend = useChatSend({
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
-  acknowledgePromptAnnotations: (requestedIds, acceptedIds, acceptedSessionKey) => {
+  acknowledgePromptAnnotations: (
+    requestedIds,
+    acceptedIds,
+    acceptedSessionKey,
+    requestSessionKey,
+  ) => {
     artifactPromptAnnotationsStore.acknowledgeAccepted(requestedIds, acceptedIds)
     notifyArtifactPromptAnnotationsAccepted({
       acceptedIds: [...acceptedIds],
       sessionKey: acceptedSessionKey,
+      requestSessionKey,
     })
   },
   materializeDraftSession: key => {

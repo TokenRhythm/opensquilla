@@ -313,6 +313,41 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('[role="status"]')).toBeNull()
   })
 
+  it.each(['document_apply', 'document_patch'])(
+    'keeps a failed %s activity call visible',
+    async (writerName) => {
+      const el = await mountTimeline([
+        group(writerName, [
+          call(`failed-${writerName}`, {
+            name: writerName,
+            status: 'error',
+            isError: true,
+            result: 'failed',
+            resultPreview: 'failed',
+          }),
+        ]),
+      ], { presentation: 'activity' })
+
+      expect(el.querySelector('.tool-row--error')).not.toBeNull()
+      expect(el.textContent).toContain(writerName)
+    },
+  )
+
+  it('keeps a restored document writer group-level failure visible', async () => {
+    const restoredFailure = group('document.update', [
+      call('restored-writer', {
+        name: 'document_patch',
+        status: 'success',
+      }),
+    ])
+    restoredFailure.group.isError = true
+    restoredFailure.group.status = 'error'
+    const el = await mountTimeline([restoredFailure], { presentation: 'activity' })
+
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain("Didn't complete")
+  })
+
   it('omits cancelled activity even when it has injected status copy', async () => {
     const el = await mountTimeline([
       group('single-cancelled-group', [

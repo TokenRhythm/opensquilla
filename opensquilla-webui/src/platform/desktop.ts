@@ -109,12 +109,12 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
   if (!payload || typeof payload !== 'object') return null
   const raw = payload as Record<string, unknown>
   if (
-    (raw.version !== 1 && raw.version !== 2 && raw.version !== 3)
+    (raw.version !== 1 && raw.version !== 2 && raw.version !== 3 && raw.version !== 4)
     || typeof raw.surfaceId !== 'string'
     || !NATIVE_SURFACE_EVENT_TYPES.has(raw.type as NativeWorkbenchSurfaceEventType)
   ) return null
   const annotationEvent = typeof raw.type === 'string' && raw.type.startsWith('annotation-')
-  if (annotationEvent && raw.version !== 3) return null
+  if (annotationEvent && raw.version !== 3 && raw.version !== 4) return null
   const rawDetail = raw.detail && typeof raw.detail === 'object'
     ? raw.detail as Record<string, unknown>
     : null
@@ -239,7 +239,9 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
         : {}
       const versions = Array.isArray(raw.protocolVersions)
         ? raw.protocolVersions.filter(
-            (value): value is 1 | 2 | 3 => value === 1 || value === 2 || value === 3,
+            (value): value is 1 | 2 | 3 | 4 => (
+              value === 1 || value === 2 || value === 3 || value === 4
+            ),
           )
         : []
       const modes = Array.isArray(raw.modes)
@@ -268,8 +270,8 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
               ? payload as Record<string, unknown>
               : {}
             return {
-              version: 3 as const,
-              available: raw.version === 3 && raw.available === true,
+              version: raw.version === 4 ? 4 as const : 3 as const,
+              available: (raw.version === 3 || raw.version === 4) && raw.available === true,
               ...(typeof raw.picker === 'boolean' ? { picker: raw.picker } : {}),
               ...(typeof raw.trustedOverlay === 'boolean'
                 ? { trustedOverlay: raw.trustedOverlay }

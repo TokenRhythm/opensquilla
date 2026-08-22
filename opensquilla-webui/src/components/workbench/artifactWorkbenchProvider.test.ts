@@ -1631,6 +1631,179 @@ describe('artifact Workbench provider', () => {
     }
   })
 
+  it('recovers a missing native surface without resurrecting stale picker state', async () => {
+    const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
+    const workspace = {
+      ...legacy,
+      source: 'document-api' as const,
+      document: {
+        ...legacy.document,
+        documentId: 'document-1',
+        headRevisionId: 'revision-1',
+        capabilities: {
+          ...legacy.document.capabilities,
+          preview: true,
+          edit: true,
+          source: true,
+          manualEdit: true,
+          agentEdit: true,
+          selectionContext: true,
+          promptAnnotations: true,
+        },
+      },
+    }
+    let leaseSequence = 0
+    const createSurface = vi.fn(async () => ({ ok: true as const }))
+    let missingSurface = true
+    const setSurfaceRect = vi.fn(async (request: { visible: boolean }) => {
+      if (missingSurface && request.visible) {
+        missingSurface = false
+        return {
+          ok: false as const,
+          message: 'The native Workbench surface no longer exists.',
+        }
+      }
+      return { ok: true as const }
+    })
+    const nativeApi: NativeWorkbenchApi = {
+      getCapabilities: vi.fn(async () => ({
+        protocolVersions: [4] as Array<4>,
+        modes: ['full', 'offline'] as Array<'full' | 'offline'>,
+        maxSurfaces: 8,
+      })),
+      getArtifactAnnotationCapabilities: vi.fn(async () => ({
+        version: 4 as const,
+        available: true,
+        picker: true,
+        trustedOverlay: true,
+        overlayCopyVersion: 1 as const,
+      })),
+      setArtifactAnnotationMode: vi.fn(async () => ({ ok: true as const })),
+      showArtifactAnnotationOverlay: vi.fn(async () => ({ ok: true as const })),
+      closeArtifactAnnotationOverlay: vi.fn(async () => ({ ok: true as const })),
+      createArtifactPreviewLease: vi.fn(async () => {
+        leaseSequence += 1
+        const token = String(leaseSequence).padStart(32, '0')
+        return {
+          ok: true as const,
+          status: 201,
+          payload: {
+            version: 1 as const,
+            lease_id: `apl-missing-${leaseSequence}`,
+            effective_mode: 'full' as const,
+            launch_url: `http://p-${token}.localhost:48721/index.html`,
+            entrypoint: 'index.html',
+            expires_at: '2099-01-01T00:00:00Z',
+            preview_origin: `http://p-${token}.localhost:48721`,
+            idle_timeout_seconds: 28_800,
+            source: {
+              kind: 'single_file' as const,
+              collection_status: 'not_applicable' as const,
+              file_count: 1,
+              total_bytes: 128,
+              warning_codes: [],
+            },
+          },
+        }
+      }),
+      renewArtifactPreviewLease: vi.fn(async () => ({
+        ok: true as const,
+        status: 200,
+        payload: {
+          version: 1 as const,
+          lease_id: `apl-missing-${leaseSequence}`,
+          expires_at: '2099-01-01T00:00:00Z',
+        },
+      })),
+      revokeArtifactPreviewLease: vi.fn(async () => ({
+        ok: true as const,
+        status: 204,
+        payload: undefined,
+      })),
+      createSurface,
+      setSurfaceRect,
+      activateSurface: vi.fn(async () => ({ ok: true as const })),
+      destroySurface: vi.fn(async () => ({ ok: true as const })),
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    const renderState: Record<string, unknown> = {}
+    const reportError = vi.fn()
+    const pushToast = vi.fn()
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: true,
+      sessionKey: 'session-a',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      artifactDocuments: {
+        load: vi.fn(async () => undefined),
+        snapshot: vi.fn(() => ({
+          key: 'fixture',
+          loading: false,
+          loaded: true,
+          stale: false,
+          error: null,
+          workspace,
+        })),
+        headArtifact: vi.fn(() => artifact),
+      },
+      promptAnnotations: {
+        create: vi.fn(async () => { throw new Error('unused') }),
+        update: vi.fn(async () => null),
+        discard: vi.fn(async () => true),
+        setActiveDocument: vi.fn(),
+      },
+      authToken: () => 'synthetic-token',
+      baseOrigin: 'http://127.0.0.1:18791',
+      confirmRemoteResources: vi.fn(async () => true),
+      currentSessionId: () => 'session-a',
+      openArtifact: vi.fn(),
+      platform: {
+        id: 'desktop',
+        capabilities: { canOpenArtifactsNatively: true },
+        files: {},
+      } as unknown as Platform,
+      previewLeasesEnabled: true,
+      pushToast,
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-preview')!
+    const runtime = await definition.createRuntime!(item, {
+      nativeWorkbenchApi: nativeApi,
+      getRenderState: () => renderState,
+      updateRenderState: patch => Object.assign(renderState, patch),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError,
+    })
+
+    await runtime.handleSurfaceRect?.({
+      itemId: item.id,
+      x: 300,
+      y: 40,
+      width: 600,
+      height: 500,
+      visible: true,
+    }, item)
+
+    expect(createSurface).toHaveBeenCalledTimes(2)
+    expect(renderState.nativeSurfaceState).toBe('ready')
+    expect(renderState.annotationAvailable).toBe(true)
+    expect(reportError).not.toHaveBeenCalled()
+    expect(pushToast).not.toHaveBeenCalled()
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(true)
+    await runtime.handleComponentEvent?.({
+      type: 'preview-state-change',
+      payload: 'loading',
+    }, item)
+    expect(renderState).toMatchObject({
+      annotationAvailable: false,
+      annotationMode: false,
+      nativeSurfaceState: 'loading',
+    })
+    await runtime.dispose?.('closed')
+  })
+
   it('refreshes annotation capability after reactivating a replacement surface', async () => {
     const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
     const workspace = {
@@ -1794,6 +1967,11 @@ describe('artifact Workbench provider', () => {
     await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
 
     expect(renderState.annotationAvailable).toBe(true)
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: item.id,
+      type: 'ready',
+    }, item)
     const activationOrder = activateSurface.mock.invocationCallOrder
     const capabilityOrder = getArtifactAnnotationCapabilities.mock.invocationCallOrder
     expect(activationOrder[activationOrder.length - 1])
@@ -1830,6 +2008,11 @@ describe('artifact Workbench provider', () => {
       width: 600,
       height: 500,
       visible: true,
+    }, item)
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: item.id,
+      type: 'ready',
     }, item)
     expect(renderState.annotationAvailable).toBe(true)
     expect(renderState.annotationMode).toBe(true)
@@ -2473,6 +2656,11 @@ describe('artifact Workbench provider', () => {
     expect(pushToast.mock.calls.filter(
       ([message]) => message === 'workbench.artifactAnnotation.closeFailed',
     )).toHaveLength(closeFailureToastCount)
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: item.id,
+      type: 'ready',
+    }, item)
     expect(definition.getToolbarItems?.(item, {
       active: true,
       hostAvailable: true,

@@ -704,5 +704,20 @@ describe('workbench runtime registry', () => {
       annotationId: 'annotation-2',
     })).resolves.toMatchObject({ ok: false })
     expect(showOverlay).toHaveBeenCalledOnce()
+
+    // Disabling the picker is cleanup, not a request to show anything. It
+    // must still reach the native bridge while the preview is suspended so a
+    // response handoff cannot leave the orange picker active for the next
+    // selection.
+    await scoped?.setArtifactAnnotationMode?.({
+      version: 3,
+      surfaceId: descriptor.id,
+      enabled: false,
+    })
+    expect(setMode).toHaveBeenLastCalledWith({
+      version: 3,
+      surfaceId: descriptor.id,
+      enabled: false,
+    })
   })
 })

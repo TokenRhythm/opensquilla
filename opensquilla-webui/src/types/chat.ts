@@ -64,6 +64,8 @@ export interface ChatPendingItem {
   /** Stable local identity for keyed rendering and UI actions across peer edits. */
   pendingUiId: string
   text: string
+  /** Annotation batch retained when a follow-up is queued behind an active turn. */
+  promptAnnotationIds?: string[]
   attachments: Attachment[]
   intent: string | null
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */

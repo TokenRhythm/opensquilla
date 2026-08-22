@@ -62,6 +62,48 @@ describe('AppWorkbench annotation mode status', () => {
     )
   })
 
+  it('routes source.patched invalidations through resource and preview refresh', () => {
+    const start = appWorkbenchSource.indexOf('function onArtifactState(')
+    const end = appWorkbenchSource.indexOf('\nfunction promptAnnotationItem(', start)
+    const source = appWorkbenchSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('workbenchResources.load(activeSessionKey, true)')
+    expect(source).toContain('refreshResourceCollectionItem(activeSessionKey)')
+    expect(source).toContain('void refreshArtifactDocumentItem(item)')
+    // Artifact actions, including source.patched, share one content-free
+    // invalidation path; filtering by action here would leave Preview stale.
+    expect(source).not.toContain('event.action')
+    expect(appWorkbenchSource).toContain(
+      "rpc.on('session.event.artifact_state', onArtifactState)",
+    )
+  })
+
+  it('matches annotation acceptance across provisional and canonical session keys', () => {
+    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationsAccepted')
+    const end = appWorkbenchSource.indexOf('\nasync function beforeCloseItem', start)
+    const source = appWorkbenchSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('promptAnnotationAcceptanceQueue.enqueue(detail)')
+    expect(source).toContain('schedulePromptAnnotationAcceptanceFlush()')
+    expect(appWorkbenchSource).toContain(
+      'const stopPromptAnnotationLifecycle = store.onLifecycle',
+    )
+    expect(appWorkbenchSource).toContain(
+      "const artifactItems = store.items.filter(item => item.kind === 'artifact-preview')",
+    )
+    expect(appWorkbenchSource).toContain(
+      'if (!runtimeManager.hasRuntime(item.id)) return false',
+    )
+    expect(appWorkbenchSource).toContain(
+      "!Object.prototype.hasOwnProperty.call(state, 'annotationMode')",
+    )
+    expect(appWorkbenchSource).not.toContain(
+      'for (let attempt = 0; attempt < 3; attempt += 1)',
+    )
+  })
+
   it('surfaces a localized readonly reason instead of a generic open failure', () => {
     const start = appWorkbenchSource.indexOf('async function openWorkbenchResource(')
     const end = appWorkbenchSource.indexOf('\nasync function importWorkbenchResourceForSession', start)

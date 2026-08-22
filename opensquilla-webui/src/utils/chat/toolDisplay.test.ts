@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  isDocumentAgentToolName,
+  isDocumentWriterToolName,
   toolActionLabel,
   toolDisplayName,
   toolOperationKey,
@@ -63,9 +65,46 @@ describe('toolResultCount', () => {
 
 describe('page tool product presentation', () => {
   it.each([
+    'document_inspect',
+    'document_read',
+    'document_locate',
+    'document_apply',
+    'document_patch',
+    'document_browser_inspect',
+    'document_browser_act',
+    'document_browser_screenshot',
+    'document_browser_reload',
+    'document_finish',
+    'mcp__document_browser_act',
+  ])('recognizes %s as document-agent activity', (name) => {
+    expect(isDocumentAgentToolName(name)).toBe(true)
+  })
+
+  it.each([
+    'document_apply',
+    'document_patch',
+    'gateway.document_apply',
+    'gateway/document_patch',
+    'gateway:document_apply',
+    'gateway__document_patch',
+  ])('recognizes %s as a document writer', (name) => {
+    expect(isDocumentWriterToolName(name)).toBe(true)
+  })
+
+  it('does not classify ordinary file writers as document writers', () => {
+    expect(isDocumentWriterToolName('apply_patch')).toBe(false)
+    expect(isDocumentWriterToolName('edit_file')).toBe(false)
+  })
+
+  it.each([
     ['document_read', 'document.read', 'Read page'],
     ['document_locate', 'document.read', 'Read page'],
     ['gateway.document_inspect', 'document.read', 'Read page'],
+    ['document_browser_inspect', 'document.read', 'Read page'],
+    ['document_browser_screenshot', 'document.read', 'Read page'],
+    ['document_browser_reload', 'document.read', 'Read page'],
+    ['document_browser_act', 'document.update', 'Update page'],
+    ['document_finish', 'document.update', 'Update page'],
     ['document_apply', 'document.update', 'Update page'],
     ['document_patch', 'document.update', 'Update page'],
   ])('maps %s to a product action', (name, operation, label) => {
