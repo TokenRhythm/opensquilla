@@ -430,7 +430,7 @@ def test_tool_filter_skips_denial_then_benched_compatible_fallback() -> None:
             fallbacks=[denied, benched, healthy],
         )
     )
-    provider = selector.resolve()
+    selector.resolve()
     provider = selector.next_fallback()
     ledger = _ledger()
     ledger.record_failure("ollama", "model-c", ProviderFailureKind.RATE_LIMITED)
@@ -458,7 +458,7 @@ def test_tool_filter_keeps_only_compatible_candidate_despite_bench() -> None:
             fallbacks=[compatible, denied],
         )
     )
-    provider = selector.resolve()
+    selector.resolve()
     provider = selector.next_fallback()
     ledger = _ledger()
     ledger.record_failure("ollama", "model-b", ProviderFailureKind.RATE_LIMITED)
@@ -484,7 +484,7 @@ def test_capacity_filter_keeps_only_compatible_candidate_despite_bench() -> None
             fallbacks=[larger, too_small],
         )
     )
-    provider = selector.resolve()
+    selector.resolve()
     provider = selector.next_fallback()
     ledger = _ledger()
     ledger.record_failure("ollama", "model-b", ProviderFailureKind.RATE_LIMITED)

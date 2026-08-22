@@ -932,10 +932,10 @@ def register_artifact_preview_routes(
             return _api_error("Artifact bundle version is unsupported", "BUNDLE_UNSUPPORTED", 409)
         except ArtifactIntegrityError:
             return _api_error("Artifact integrity check failed", "INTEGRITY_ERROR", 409)
-        except (ArtifactNotFoundError, PreviewLeaseNotFoundError, ValueError):
-            return _api_error("Candidate preview not found", "NOT_FOUND", 404)
         except PreviewLeaseError:
             return _api_error("Preview listener is unavailable", "PREVIEW_UNAVAILABLE", 503)
+        except (ArtifactNotFoundError, ValueError):
+            return _api_error("Candidate preview not found", "NOT_FOUND", 404)
         response = JSONResponse(payload, status_code=200)
         _set_control_no_store(response)
         return response

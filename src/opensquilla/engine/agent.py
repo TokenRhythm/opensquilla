@@ -6721,7 +6721,7 @@ class Agent:
                     continue
             try:
                 candidate_cleanup.result()
-            except BaseException:  # noqa: BLE001 - cleanup must not mask turn outcome
+            except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
                 logger.warning(
                     "agent.candidate_loop_cleanup_task_failed",
                     session_key=self._session_key,
@@ -20857,7 +20857,7 @@ class Agent:
         if callable(reconcile):
             try:
                 await asyncio.shield(reconcile())
-            except BaseException:  # noqa: BLE001 - discard remains best effort
+            except Exception:  # noqa: BLE001 - discard remains best effort
                 logger.warning(
                     "agent.candidate_loop_reconcile_failed",
                     session_key=self._session_key,
@@ -20992,7 +20992,7 @@ class Agent:
                             )
                         )
                         setattr(ctx, "_artifact_source_patched_emitted", True)
-                except BaseException:  # noqa: BLE001 - notification is best effort
+                except Exception:  # noqa: BLE001 - notification is best effort
                     logger.warning(
                         "agent.candidate_commit_event_retry_failed",
                         session_key=self._session_key,
@@ -21021,7 +21021,7 @@ class Agent:
                         restored = bool(
                             await asyncio.shield(restore(preview_handle))
                         )
-                except BaseException:  # noqa: BLE001 - a later UI refresh may retry
+                except Exception:  # noqa: BLE001 - a later UI refresh may retry
                     logger.warning(
                         "agent.candidate_preview_commit_cleanup_retry_failed",
                         session_key=self._session_key,

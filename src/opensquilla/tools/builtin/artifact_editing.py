@@ -707,7 +707,7 @@ async def _stage_prepared_document_mutation(
             # cancellable in a future implementation.
             setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", True)
             raise
-        except BaseException:  # noqa: BLE001 - source candidate remains recoverable
+        except Exception:  # noqa: BLE001 - source candidate remains recoverable
             # Never let a stale mapping for the same opaque handle be reused for
             # this newer candidate.  Source staging remains recoverable, but a
             # visual bind is forbidden until the Gateway can register the exact
@@ -738,7 +738,7 @@ async def _stage_prepared_document_mutation(
             # release the mapping under a shielded cleanup task.
             setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", True)
             raise
-        except BaseException:  # noqa: BLE001 - preserve cleanup state on bridge faults
+        except Exception:  # noqa: BLE001 - preserve cleanup state on bridge faults
             setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", True)
             return _json(
                 {
