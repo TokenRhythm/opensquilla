@@ -2586,13 +2586,23 @@ def _llm_profile_storage_keys(
 
 
 def _profile_reference_labels(config: GatewayConfig, provider_id: str) -> list[str]:
-    """Return stable, non-secret config paths that reference a provider profile."""
+    """Return stable, non-secret config paths that reference a provider profile.
+
+    Only operator-owned configuration counts. ``squilla_router.tiers`` and the
+    legacy ``llm_ensemble.selection_mode`` carry packaged openrouter-preset
+    defaults that are never persisted and regenerate on every load, so they
+    cannot dangle after the profile is removed — treating them as references
+    made a freshly added openrouter profile impossible to delete (#1297).
+    """
     provider = str(provider_id or "").strip().lower()
     references: list[str] = []
+    default_tiers = _default_tiers()
     tiers = getattr(getattr(config, "squilla_router", None), "tiers", {}) or {}
     if isinstance(tiers, Mapping):
         for tier_name, tier in tiers.items():
             if not isinstance(tier, Mapping):
+                continue
+            if tier == default_tiers.get(tier_name):
                 continue
             tier_provider = str(tier.get("provider") or "").strip().lower()
             if tier_provider == provider:
@@ -2607,7 +2617,7 @@ def _profile_reference_labels(config: GatewayConfig, provider_id: str) -> list[s
 
         selection_mode = str(getattr(ensemble, "selection_mode", "") or "")
         static_provider = STATIC_B5_SELECTION_MODE_PROVIDERS.get(selection_mode, "")
-        if static_provider == provider:
+        if static_provider == provider and ensemble_selection_configured(config):
             references.append("llm_ensemble.selection_mode")
     return references
 
