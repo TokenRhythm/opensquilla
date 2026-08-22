@@ -272,7 +272,7 @@ async function verifyBootPhaseTimer(app) {
   assert.notEqual(await timer.innerText(), frozenText, 'a new retry status must resume phase timing')
 }
 
-async function launchIsolatedOnboarding(prefix, gatewayPort) {
+async function launchIsolatedOnboarding(prefix) {
   const userDataRoot = await mkdtemp(join(tmpdir(), prefix))
   const userDataDir = join(userDataRoot, 'chromium-user-data')
   const isolatedHome = join(userDataRoot, 'home')
@@ -289,7 +289,6 @@ async function launchIsolatedOnboarding(prefix, gatewayPort) {
       USERPROFILE: isolatedHome,
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
-      OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(gatewayPort),
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION: '',
       LANG: 'en_US.UTF-8',
@@ -419,7 +418,6 @@ async function assertSubmitRestored(
 async function verifySubmitFeedbackAndSingleFlight() {
   const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
     'opensquilla-electron-onboarding-submit-test-',
-    18896,
   )
   try {
     const page = await setupWindow(app)
@@ -549,7 +547,6 @@ await verifySubmitFeedbackAndSingleFlight()
 
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
   'opensquilla-electron-onboarding-test-',
-  18897,
 )
 
 try {

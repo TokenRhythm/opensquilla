@@ -33,6 +33,7 @@ const credentialOnlyRecoveryId = '51234567-89ab-4cde-8fab-0123456789ab'
 const newerCredentialMarker = 'synthetic-newest-recovery-credential'
 const observedRendererPages = new WeakSet()
 const rendererDiagnostics = []
+const PROFILE_CLI_TIMEOUT_MS = 120_000
 
 async function waitFor(check, label, timeoutMs = 120_000) {
   const startedAt = Date.now()
@@ -81,7 +82,6 @@ function launchEnvironment(isolatedHome, sourceEnvironment = process.env) {
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
-    OPENSQUILLA_DESKTOP_GATEWAY_PORT: '18898',
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
     OPENSQUILLA_GATEWAY_WORKSPACE_DIR: '',
@@ -121,11 +121,16 @@ function runProfileConsolidationCli(userData, primaryHome, isolatedHome) {
         UV_CACHE_DIR: join(tmpdir(), 'opensquilla-consolidation-e2e-uv-cache'),
       },
       maxBuffer: 4 * 1024 * 1024,
+      timeout: PROFILE_CLI_TIMEOUT_MS,
+      killSignal: 'SIGTERM',
     },
   )
-  if (result.status !== 0) {
+  if (result.error || result.signal || result.status !== 0) {
+    const outcome = result.error?.code === 'ETIMEDOUT'
+      ? `timed out after ${PROFILE_CLI_TIMEOUT_MS}ms`
+      : `status=${result.status ?? 'null'} signal=${result.signal ?? 'null'}`
     throw new Error(
-      `Profile consolidation fixture command failed (${result.status}): `
+      `Profile consolidation fixture command failed (${outcome}): `
       + `${result.stderr || result.stdout}`,
     )
   }

@@ -2750,18 +2750,24 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline_envelope = len(rt._last_envelope_by_session)
 
     # --- run 10 000 tasks ---
-    handles = []
-    for i in range(num_tasks):
-        sk = f"agent-1::sess-load-{i % session_count}"
-        env = _make_envelope(sk)
-        h = await rt.enqueue(env, f"msg-{i}")
-        handles.append(h)
-
-    # Wait for all to complete under one shared deadline. Giving every waiter
-    # its own timer schedules 10 000 timeout callbacks and makes this leak
-    # check sensitive to event-loop scheduling on slower CI runners.
-    async with asyncio.timeout(60.0):
-        await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+    # Keep the workload at 10 000 tasks, but drain it in bounded batches. A
+    # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
+    # waiter tasks and timer bookkeeping on top of the runtime workload; that
+    # amplification is what made this quantitative check consume a minute on
+    # loaded Windows runners. The shared deadline still catches a stuck task.
+    batch_size = 500
+    deadline = asyncio.get_running_loop().time() + 60.0
+    for batch_start in range(0, num_tasks, batch_size):
+        handles = []
+        for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
+            sk = f"agent-1::sess-load-{i % session_count}"
+            env = _make_envelope(sk)
+            handles.append(await rt.enqueue(env, f"msg-{i}"))
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("task runtime leak workload exceeded its shared deadline")
+        async with asyncio.timeout(remaining):
+            await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
 
     # --- post-GC snapshot ---
     gc.collect()

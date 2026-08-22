@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator
@@ -669,6 +670,34 @@ def _combined_pytest_exit_code(
     return 0
 
 
+def _run_pytest_subprocess(root: Path, pytest_args: list[str], *, phase: str) -> int:
+    """Run a pytest phase in a fresh interpreter and report its duration.
+
+    The shard deliberately has a parallel and a serial phase.  Calling
+    ``pytest.main`` twice in this controller process lets process-wide state
+    (notably structlog lazy logger bindings and plugin registries) leak from
+    one phase into the other.  A fresh interpreter keeps the phase boundary
+    real while preserving the same working tree and environment.
+    """
+
+    environment = os.environ.copy()
+    root_text = str(root)
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (root_text, existing_pythonpath) if value
+    )
+    started_at = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", *pytest_args],
+        cwd=root,
+        env=environment,
+        check=False,
+    )
+    elapsed = time.monotonic() - started_at
+    print(f"{phase} pytest phase finished with exit={result.returncode} in {elapsed:.2f}s")
+    return int(result.returncode)
+
+
 def _pytest_phase_inputs(
     raw_args: list[str],
 ) -> tuple[list[str], str | None]:
@@ -885,7 +914,11 @@ def _run(args: argparse.Namespace) -> int:
                 f"Running parallel bulk phase with {args.workers} workers "
                 "(--dist loadfile; excludes ci_serial)"
             )
-            parallel_exit_code = int(pytest.main(parallel_args))
+            parallel_exit_code = _run_pytest_subprocess(
+                root,
+                parallel_args,
+                phase="parallel",
+            )
 
             serial_args = [
                 *pytest_args,
@@ -894,8 +927,15 @@ def _run(args: argparse.Namespace) -> int:
                 *file_args,
                 f"--junitxml={serial_junit}",
             ]
-            print("Running serial phase in the controller process (ci_serial only)")
-            raw_serial_exit_code = int(pytest.main(serial_args))
+            print(
+                "Running serial phase in the controller process "
+                "(fresh subprocess; ci_serial only)"
+            )
+            raw_serial_exit_code = _run_pytest_subprocess(
+                root,
+                serial_args,
+                phase="serial",
+            )
     except (
         ImportError,
         OSError,

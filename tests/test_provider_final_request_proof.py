@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from opensquilla.provider import anthropic as anthropic_module
 from opensquilla.provider import openai as openai_module
 from opensquilla.provider.anthropic import AnthropicProvider
 from opensquilla.provider.openai import OpenAIProvider
@@ -513,12 +514,17 @@ def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
         return real_async_client(*args, **kwargs)
 
     monkeypatch.setattr("opensquilla.provider.anthropic.httpx.AsyncClient", patched_async_client)
-    monkeypatch.setattr(
-        "opensquilla.provider.anthropic.log.info",
-        lambda event, **kwargs: (
-            proofs.append(kwargs) if event == "provider.request_proof" else None
-        ),
-    )
+    real_log = anthropic_module.log
+
+    class _ProofLogShim:
+        def info(self, event: str, **kwargs: Any) -> None:
+            if event == "provider.request_proof":
+                proofs.append(kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(anthropic_module, "log", _ProofLogShim())
     provider = AnthropicProvider(api_key="test", model="claude-test")
     messages = [
         Message(
