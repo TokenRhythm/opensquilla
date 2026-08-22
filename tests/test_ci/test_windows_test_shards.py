@@ -68,6 +68,9 @@ OFFLINE_MARKER_EXCLUSIONS = {
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_ci/test_plan_ci.py",
+    "tests/test_git_runtime.py",
+    "tests/test_tools/test_gitless_write_tracking.py",
     "tests/test_gateway/test_artifact_product_errors.py",
     "tests/test_scripts/test_bench_skill_integrity.py",
     "tests/test_skills_hash_consumers.py",

@@ -48,6 +48,40 @@ def _synthetic_owner_reference(
     )
 
 
+@pytest.mark.parametrize(
+    ("frozen", "expected_prefix"),
+    [
+        (False, ("/synthetic/python", "-m", "opensquilla.process_tree")),
+        (True, ("/synthetic/gateway", "--internal-child", "process-tree")),
+    ],
+)
+def test_process_tree_child_argv_is_fixed_for_source_and_frozen_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    frozen: bool,
+    expected_prefix: tuple[str, ...],
+) -> None:
+    executable = "/synthetic/gateway" if frozen else "/synthetic/python"
+    monkeypatch.setattr(process_tree.sys, "executable", executable)
+    monkeypatch.setattr(process_tree.sys, "frozen", frozen, raising=False)
+
+    argv = process_tree._process_tree_child_argv(
+        "--windows-owned-launch",
+        "gate",
+        "ready",
+        "--",
+        "cmd",
+    )
+
+    assert argv == (
+        *expected_prefix,
+        "--windows-owned-launch",
+        "gate",
+        "ready",
+        "--",
+        "cmd",
+    )
+
+
 @pytest.mark.asyncio
 async def test_posix_anchor_creation_waits_for_ready(
     monkeypatch: pytest.MonkeyPatch,

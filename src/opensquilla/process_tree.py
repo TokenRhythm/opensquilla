@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -71,6 +71,17 @@ _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 _POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
 _DARWIN_PROC_PIDTBSDINFO = 3
+
+
+def _process_tree_child_argv(*args: str) -> tuple[str, ...]:
+    """Build the source or frozen argv for one process-tree helper."""
+
+    prefix = (
+        (sys.executable, "--internal-child", "process-tree")
+        if getattr(sys, "frozen", False)
+        else (sys.executable, "-m", "opensquilla.process_tree")
+    )
+    return (*prefix, *args)
 
 
 @dataclass(frozen=True)
@@ -1862,12 +1873,11 @@ async def _create_posix_anchor(
     if control_path is not None:
         _prepare_private_directory(control_path.parent)
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "opensquilla.process_tree",
-        "--posix-group-anchor",
-        owner_id,
-        *(str(control_path) if control_path is not None else "-",),
+        *_process_tree_child_argv(
+            "--posix-group-anchor",
+            owner_id,
+            *(str(control_path) if control_path is not None else "-",),
+        ),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -2015,14 +2025,13 @@ async def _create_owned_posix_subprocess(
             status_write_fd,
         )
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "opensquilla.process_tree",
-            "--posix-owned-launch",
-            str(gate.read_fd),
-            str(status_write_fd),
-            "--",
-            *argv,
+            *_process_tree_child_argv(
+                "--posix-owned-launch",
+                str(gate.read_fd),
+                str(status_write_fd),
+                "--",
+                *argv,
+            ),
             **child_kwargs,
         )
         gate.close_child_end()
@@ -2102,10 +2111,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
         )
         child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-        helper_argv = (
-            sys.executable,
-            "-m",
-            "opensquilla.process_tree",
+        helper_argv = _process_tree_child_argv(
             "--windows-owned-launch",
             gate.gate_name,
             gate.ready_name,
@@ -2196,16 +2202,13 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
     )
     child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-    helper_argv = [
-        sys.executable,
-        "-m",
-        "opensquilla.process_tree",
+    helper_argv = _process_tree_child_argv(
         "--windows-owned-launch",
         gate.gate_name,
         gate.ready_name,
         "--",
         *argv,
-    ]
+    )
     process: Any | None = None
     persisted_owner: _PersistedOwnerRef | None = None
     try:
@@ -2838,8 +2841,10 @@ async def reconcile_persisted_processes(state_dir: str | Path | None) -> int:
     return await _terminate_owner_records(records)
 
 
-def _main() -> int:
-    args = sys.argv[1:]
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one fixed process-tree helper mode."""
+
+    args = list(sys.argv[1:] if argv is None else argv)
     if (
         len(args) == 3
         and args[0] == "--posix-group-anchor"
@@ -2877,10 +2882,11 @@ __all__ = [
     "create_owned_popen",
     "create_owned_subprocess_exec",
     "create_owned_subprocess_shell",
+    "main",
     "reconcile_persisted_processes",
     "task_process_scope",
 ]
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    raise SystemExit(main())
