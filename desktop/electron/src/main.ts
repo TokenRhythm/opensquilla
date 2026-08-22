@@ -385,6 +385,19 @@ interface BootStatus {
 interface BootError {
   message: string
   at: string
+  code?: BootErrorCode
+}
+
+type BootErrorCode = 'keychain_unavailable'
+
+class DesktopStartupError extends Error {
+  constructor(
+    readonly code: BootErrorCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'DesktopStartupError'
+  }
 }
 
 interface MacInstallContext {
@@ -1239,6 +1252,21 @@ function assertSupportedMacInstallLocation(): void {
   if (message) throw new Error(message)
 }
 
+const MAC_KEYCHAIN_ACCESS_PATHS = [
+  '/System/Library/CoreServices/Applications/Keychain Access.app',
+  '/Applications/Utilities/Keychain Access.app',
+] as const
+
+async function openMacKeychainAccess(): Promise<boolean> {
+  if (process.platform !== 'darwin') return false
+  for (const applicationPath of MAC_KEYCHAIN_ACCESS_PATHS) {
+    if (!existsSync(applicationPath)) continue
+    const error = await shell.openPath(applicationPath)
+    if (!error) return true
+  }
+  return false
+}
+
 function sendBootStatus(phaseId: BootPhaseId): void {
   bootStatus = { phaseId, label: desktopT('boot.' + phaseId), at: new Date().toISOString() }
   bootError = null
@@ -1250,6 +1278,7 @@ function sendBootError(error: unknown): void {
   bootError = {
     message: error instanceof Error ? error.message : String(error),
     at: new Date().toISOString(),
+    ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
   }
   mainWindow?.webContents.send('desktop:boot:error', bootError)
 }
@@ -2019,13 +2048,17 @@ function desktopSecretStorageBackend(): SecretEncryption {
   return secretStorageBackendCache
 }
 
+function invalidateSecretStorageBackendCache(): void {
+  secretStorageBackendCache = null
+}
+
 function encryptSecret(secret: string): { value: string; encryption: SecretEncryption } {
   const policyBackend = desktopSecretStoragePolicyBackend()
   const availableBackend = desktopSecretStorageBackend()
   if (policyBackend === 'safeStorage') {
     if (availableBackend !== 'safeStorage') {
       throw new Error(
-        'The OS keychain is unavailable. Unlock it and reopen OpenSquilla before saving credentials.'
+        'The OS keychain is unavailable. Unlock it and try saving credentials again.'
       )
     }
     try {
@@ -6526,7 +6559,8 @@ async function runOnboarding(): Promise<DesktopConnection> {
       || Boolean(existing?.encryptedApiKey && existing.encryption === 'safeStorage')
     )
   ) {
-    throw new Error(
+    throw new DesktopStartupError(
+      'keychain_unavailable',
       'OpenSquilla needs the OS keychain to read or safely adopt this credential, '
       + 'but the keychain is currently unavailable. Unlock it and reopen '
       + 'OpenSquilla, or use "Reset setup" to start over.'
@@ -13009,6 +13043,10 @@ async function performOnboardingSave(
         () => readPendingMigrationProviderSetup(),
       )
       credential = await telemetry.stage('settings_persist', async () => {
+        // Keychain availability may have changed while the onboarding window
+        // remained open. Re-check it on every save attempt instead of carrying
+        // a transient locked-keychain result across a user unlock.
+        invalidateSecretStorageBackendCache()
         if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
           return await saveImportedDesktopCredential(
             pendingMigration,
@@ -13303,6 +13341,11 @@ ipcMain.handle('desktop:boot:state', () => ({
   recovery: recoveryStateSnapshot(),
 }))
 
+ipcMain.handle('desktop:boot:open-keychain', async (event) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Keychain access request.')
+  return await openMacKeychainAccess()
+})
+
 interface BootResumeAuthority {
   child: ChildProcessWithoutNullStreams
   profileKey: string
@@ -13333,7 +13376,8 @@ function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
     && desktopOpenFlowRevision === authority.openFlowRevision
 }
 
-async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
+async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?: BootErrorCode }> {
+  invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
   bootError = null
@@ -13366,7 +13410,11 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
     // direct resume, an exit handler or a newer quit/reset/restart owns any
     // state after this exact child/profile/revision loses authority.
     if (pendingStart || !initialAuthority || !bootResumeAuthorityIsCurrent(initialAuthority)) {
-      return { ok: false, error: message }
+      return {
+        ok: false,
+        error: message,
+        ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
+      }
     }
     if (gatewayState.status !== 'ready') {
       gatewayState.status = 'error'
@@ -13393,6 +13441,7 @@ ipcMain.handle('desktop:boot:resume', async () => {
   }
 })
 ipcMain.handle('desktop:boot:retry', async () => {
+  invalidateSecretStorageBackendCache()
   // The Control UI "Restart runtime" action intentionally forces a new child.
   // The boot page uses desktop:boot:resume instead so a slow owned child can be
   // accepted after it becomes healthy instead of being torn down first.

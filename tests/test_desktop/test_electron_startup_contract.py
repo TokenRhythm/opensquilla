@@ -298,6 +298,7 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
     # awaited before respawn rather than reused. The boot page has a separate
     # non-destructive resume path below.
     assert "if (gatewayStartPromise)" in retry
+    assert "invalidateSecretStorageBackendCache()" in retry
     join_call = "const exited = await stopAndJoinAllLifecycleOwnedGateways()"
     assert join_call in retry
     assert "if (!exited)" in retry
@@ -354,6 +355,8 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     )
 
     assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
+    assert "openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain')" in preload
+    assert "invalidateSecretStorageBackendCache()" in resume_flow
     assert "const pendingStart = gatewayStartPromise" in resume_flow
     assert "await resumeOwnedGatewayStartup(" in resume_flow
     assert "if (!gateway)" in resume_flow
@@ -554,7 +557,8 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert "const result = await resumeStartup()" in retry_flow
     assert "result && result.ok === false" in retry_flow
     assert "result.error || msg.errorDefault" in retry_flow
-    assert "applyError({ message: result.error || msg.errorDefault })" in retry_flow
+    assert "message: result.error || msg.errorDefault" in retry_flow
+    assert "code: result.code" in retry_flow
     assert "errorPanel.classList.add('visible')" in apply_error
     assert "retryButton.disabled = false" in retry_flow
     assert "recoveryRetryButton.disabled = false" in retry_flow
@@ -575,6 +579,44 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     )
     assert "rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')" in apply_error
     assert boot_html.count("profileInUse:") == 6
+
+
+def test_keychain_startup_recovery_is_actionable_without_plaintext_fallback() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    boot_html = _read("desktop/electron/src/boot.html")
+
+    assert "type BootErrorCode = 'keychain_unavailable'" in main_ts
+    assert "code?: BootErrorCode" in main_ts
+    assert "throw new DesktopStartupError(" in main_ts
+    assert "'keychain_unavailable'" in main_ts
+    assert "...(error instanceof DesktopStartupError ? { code: error.code } : {})" in main_ts
+    assert "function invalidateSecretStorageBackendCache(): void" in main_ts
+    assert "const MAC_KEYCHAIN_ACCESS_PATHS = [" in main_ts
+    assert "/System/Library/CoreServices/Applications/Keychain Access.app" in main_ts
+    assert "/Applications/Utilities/Keychain Access.app" in main_ts
+    assert "if (process.platform !== 'darwin') return false" in main_ts
+
+    open_keychain = _section(
+        main_ts,
+        "ipcMain.handle('desktop:boot:open-keychain'",
+        "interface BootResumeAuthority",
+    )
+    assert "trustedRecoveryIpc(event)" in open_keychain
+    assert "openMacKeychainAccess()" in open_keychain
+    assert "ipcRenderer.invoke('desktop:boot:open-keychain')" in preload
+
+    assert 'id="openKeychain"' in boot_html
+    assert 'data-i18n="openKeychain"' in boot_html
+    assert "payload.code === 'keychain_unavailable'" in boot_html
+    assert "openKeychainButton.hidden = !keychainUnavailable" in boot_html
+    assert "api.openKeychainAccess()" in boot_html
+    assert "keychainUnavailable:" in boot_html
+    assert boot_html.count("openKeychain:") == 6
+    assert boot_html.count("keychainUnavailable:") == 6
+
+    encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
+    assert "catch {\n      return plainSecret(secret)" not in encryption
 
 
 def test_boot_error_and_recovery_states_freeze_determinate_progress() -> None:
@@ -808,6 +850,8 @@ def test_primary_repair_ui_is_accessible_without_profile_choices() -> None:
 def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     locale_keys = (
+        "openKeychain",
+        "keychainUnavailable",
         "recoveryTitle",
         "recoveryTitleLockBusy",
         "recoveryTitleUpdate",
