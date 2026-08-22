@@ -518,6 +518,14 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 
+/* Keep the split resizer's chat-side hit area outside the clipped workbench.
+   The native browser surface starts at the workbench edge and can consume
+   pointer events on its side of the handle, so the handle must remain
+   reachable from the adjacent chat pane. */
+.workbench-host--split {
+  overflow: visible;
+}
+
 .workbench-host--overlay {
   position: fixed;
   z-index: 220;
