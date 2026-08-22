@@ -2,7 +2,11 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { applyProgrammaticScroll, consumeProgrammaticScroll } from './scrollMutation'
+import {
+  applyProgrammaticScroll,
+  clearProgrammaticScroll,
+  consumeProgrammaticScroll,
+} from './scrollMutation'
 
 function container(top = 0): HTMLElement {
   const element = document.createElement('div')
@@ -61,6 +65,17 @@ describe('chat scroll mutation ownership', () => {
       expectedScrollTop: 240,
       matched: true,
     })
+  })
+
+  it('clears a pending application correction explicitly', () => {
+    const thread = container(24)
+
+    applyProgrammaticScroll(thread, () => {
+      thread.scrollTop = 180
+    })
+    clearProgrammaticScroll(thread)
+
+    expect(consumeProgrammaticScroll(thread)).toBeNull()
   })
 
   it('retains the pending target when reader movement coalesces with the correction', () => {

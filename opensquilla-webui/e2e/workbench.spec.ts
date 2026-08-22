@@ -423,8 +423,74 @@ test.describe('Application Workbench', () => {
           && Number(request.height) > 0)
       })).toBe(true)
 
-      // No resize, panel drag, modal, or preview-mode switch occurs in this
-      // flow. The dynamic slot insertion itself must cause the visible rect.
+      const resizer = page.getByTestId('workbench-resizer')
+      await expect(resizer).toBeVisible()
+      const workbenchBox = await workbench.boundingBox()
+      const resizerBox = await resizer.boundingBox()
+      expect(workbenchBox).not.toBeNull()
+      expect(resizerBox).not.toBeNull()
+      expect(resizerBox!.x).toBeLessThan(workbenchBox!.x)
+      expect(resizerBox!.width).toBeGreaterThanOrEqual(16)
+
+      const initialValue = Number(await resizer.getAttribute('aria-valuenow'))
+      const initialNativeWidth = await page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            rectRequests: Array<{ visible?: boolean; width?: number }>
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        const visibleWidths = probe.rectRequests
+          .filter(request => request.visible === true)
+          .map(request => Number(request.width))
+          .filter(width => Number.isFinite(width))
+        return visibleWidths.at(-1) ?? 0
+      })
+
+      // Start from the chat-side half of the handle while the pointer is over
+      // the native preview's content area. This is the regression case for the
+      // clipped/covered resizer hit target.
+      const dragY = workbenchBox!.y + workbenchBox!.height / 2
+      await page.mouse.move(resizerBox!.x + 3, dragY)
+      await page.mouse.down()
+      await page.mouse.move(resizerBox!.x - 37, dragY, { steps: 4 })
+      await expect.poll(async () => Number(await resizer.getAttribute('aria-valuenow')))
+        .toBeGreaterThan(initialValue)
+      await page.mouse.up()
+
+      await expect.poll(() => page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            rectRequests: Array<{ visible?: boolean; width?: number }>
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        const visibleWidths = probe.rectRequests
+          .filter(request => request.visible === true)
+          .map(request => Number(request.width))
+          .filter(width => Number.isFinite(width))
+        return visibleWidths.at(-1) ?? 0
+      })).toBeGreaterThan(initialNativeWidth)
+
+      await expect.poll(() => page.evaluate(() => {
+        const raw = localStorage.getItem('opensquilla.workbench.width.v1')
+        if (!raw) return null
+        try {
+          return JSON.parse(raw) as { source?: string; width?: number }
+        } catch {
+          return null
+        }
+      })).toMatchObject({ source: 'user' })
+      expect(await page.evaluate(() => {
+        const raw = localStorage.getItem('opensquilla.workbench.width.v1')
+        if (!raw) return 0
+        try {
+          return Number((JSON.parse(raw) as { width?: number }).width)
+        } catch {
+          return 0
+        }
+      })).toBeGreaterThan(initialValue)
+
+      // The native bridge must remain active after the divider drag and keep
+      // reporting a visible surface.
       expect(await page.evaluate(() => {
         const probe = (window as unknown as {
           __opensquillaNativeWorkbenchProbe: {

@@ -311,8 +311,8 @@ defineExpose({ cancel: rollback })
   position: absolute;
   z-index: 2;
   inset-block: 0;
-  inset-inline-start: -5px;
-  width: 10px;
+  inset-inline-start: -8px;
+  width: 16px;
   padding: 0;
   border: 0;
   background: transparent;
@@ -323,9 +323,9 @@ defineExpose({ cancel: rollback })
 .workbench-resizer::before {
   position: absolute;
   inset-block: 0;
-  inset-inline-start: 5px;
-  width: 1px;
-  background: var(--border);
+  inset-inline-start: 8px;
+  width: 2px;
+  background: var(--border-strong);
   content: '';
   transition:
     width var(--dur-fast) var(--ease-out),
