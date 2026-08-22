@@ -703,6 +703,100 @@ async def test_chat_send_binds_current_document_head_as_additive_runtime_context
 
 
 @pytest.mark.asyncio
+async def test_chat_send_carries_latest_annotation_focus_into_document_followup(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-followup.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-followup-1",
+        )
+        document = await service.get_document(draft.document_id)
+        revision = await service.get_revision(draft.revision_id)
+        anchor = await service.get_anchor(draft.anchor_id)
+        snapshot = {
+            "version": 1,
+            "annotationId": draft.annotation_id,
+            "order": 0,
+            "body": draft.body,
+            "targetText": "Original",
+            "targetKind": "heading",
+            "targetStatus": "ready",
+            "targetReason": None,
+            "document": {
+                "id": document.document_id,
+                "name": document.name,
+                "kind": document.kind.value,
+            },
+            "revision": {
+                "id": revision.revision_id,
+                "generation": revision.generation,
+                "sha256": revision.artifact_sha256,
+            },
+            "anchor": {
+                "id": anchor.anchor_id,
+                "kind": anchor.kind.value,
+                "tagName": "h1",
+                "locator": anchor.locator,
+                "quote": anchor.quote,
+            },
+        }
+        session = await stack.storage.get_session(SESSION_KEY)
+        assert session is not None
+        await stack.storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=stack.session_id,
+                session_key=SESSION_KEY,
+                message_id="annotation-followup-history-1",
+                role="user",
+                content=json.dumps(
+                    {
+                        "text": "？",
+                        "attachments": [],
+                        "prompt_annotations": [snapshot],
+                    },
+                    ensure_ascii=False,
+                ),
+                created_at=1,
+            ),
+            expected_epoch=session.epoch,
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-followup",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "删除这个标题",
+                "clientRequestId": "document-context-followup-1",
+                "documentContext": {
+                    "documentId": document.document_id,
+                    "headRevisionId": revision.revision_id,
+                },
+            },
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert isinstance(bound, BoundDocumentContext)
+        assert "<previous_annotation_focus readonly='true'>" in bound.request_context_prompt
+        assert "page.html" in bound.request_context_prompt
+        assert "Original" in bound.request_context_prompt
+        assert "<previous_intent>Change this heading to Accepted.</previous_intent>" in (
+            bound.request_context_prompt
+        )
+        assert draft.annotation_id not in bound.request_context_prompt
+        assert revision.revision_id not in bound.request_context_prompt
+        assert revision.artifact_sha256 not in bound.request_context_prompt
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
 async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
     tmp_path: Path,
 ) -> None:

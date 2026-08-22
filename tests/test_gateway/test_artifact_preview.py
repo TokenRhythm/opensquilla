@@ -15,6 +15,7 @@ from opensquilla.artifacts import (
     ArtifactBundleSourceFile,
     ArtifactStore,
 )
+from opensquilla.gateway import desktop_artifact_bridge as bridge_module
 from opensquilla.gateway.artifact_preview import (
     ArtifactPreviewLeaseService,
     PreviewLeaseExpiredError,
@@ -30,6 +31,16 @@ _AUTH_HEADERS = {
     "Authorization": "Bearer secret",
     "x-opensquilla-session-key": _SESSION_KEY,
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolate_desktop_bridge_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep preview auth tests independent from process-level bridge state."""
+
+    monkeypatch.setattr(bridge_module, "_runtime_client_initialized", False)
+    monkeypatch.setattr(bridge_module, "_runtime_client", None)
+    monkeypatch.delenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN", raising=False)
 
 
 class _SessionManager:
@@ -333,6 +344,43 @@ def test_desktop_candidate_preview_materialization_is_opaque_and_session_fenced(
     assert payload["launch_url"].startswith("http://p-")
     assert ref.id not in handle
     assert released.status_code == 204
+
+
+def test_candidate_preview_authentication_precedes_request_validation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ref = _publish_html(tmp_path, b"<!doctype html><h1>candidate</h1>")
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    bridge_token = "desktop-bridge-secret"
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN", bridge_token)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:18791",
+        client=("127.0.0.1", 51000),
+    ) as client:
+        unauthorized = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle, "mode": "bogus"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        malformed = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle, "mode": "bogus"},
+            headers={"Authorization": f"Bearer {bridge_token}"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert malformed.status_code == 400
 
 
 def test_candidate_preview_is_always_offline_even_with_canonical_full(

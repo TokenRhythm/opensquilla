@@ -3349,6 +3349,69 @@ def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
     return f"{caller_kind}:{channel_kind}:{principal_role}"[:256]
 
 
+async def _load_followup_annotation_focus(
+    storage: SessionStorage,
+    *,
+    session_id: str,
+    document_id: str,
+) -> str | None:
+    """Return a short read-only focus for the current document follow-up.
+
+    This is intentionally derived from the accepted transcript envelope rather
+    than reusing an annotation authority.  The current document context still
+    performs the normal owner, session, head, and CAS checks below.
+    """
+
+    try:
+        get_transcript = getattr(storage, "get_canonical_transcript", None)
+        if not callable(get_transcript):
+            get_transcript = storage.get_transcript
+        entries = await get_transcript(session_id)
+        from opensquilla.prompt_annotations import (
+            prompt_annotations_from_transcript_envelope,
+            render_followup_prompt_annotation_focus,
+        )
+
+        user_entries: list[tuple[int, Any, tuple[dict[str, Any], ...]]] = []
+        for index, entry in enumerate(entries):
+            if getattr(entry, "role", None) != "user":
+                continue
+            snapshots = prompt_annotations_from_transcript_envelope(
+                getattr(entry, "content", None)
+            )
+            if snapshots:
+                user_entries.append((index, entry, snapshots))
+        if not user_entries:
+            return None
+
+        annotation_index, _entry, snapshots = user_entries[-1]
+        matching = tuple(
+            snapshot
+            for snapshot in snapshots
+            if isinstance(snapshot.get("document"), Mapping)
+            and snapshot["document"].get("id") == document_id
+        )
+        if not matching:
+            return None
+
+        later_user_turns = sum(
+            1
+            for entry in entries[annotation_index + 1 :]
+            if getattr(entry, "role", None) == "user"
+        )
+        if later_user_turns > 1:
+            return None
+        return render_followup_prompt_annotation_focus(matching)
+    except Exception:  # noqa: BLE001 - context continuity must fail open.
+        log.debug(
+            "sessions.followup_annotation_focus_unavailable",
+            session_id=session_id,
+            document_id=document_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _accepted_turn_response(
     result: TurnAcceptanceResult,
     *,
@@ -4420,6 +4483,27 @@ async def _handle_sessions_send_impl(
                     retryable=False,
                     accepted=False,
                 )
+            followup_focus = await _load_followup_annotation_focus(
+                storage,
+                session_id=session_id,
+                document_id=document.document_id,
+            )
+            base_document_context_prompt = (
+                "<active_document_context>\n"
+                "The currently opened HTML document is bound to this turn. If the user asks "
+                "to inspect or modify the open page, use the bound document tools, not "
+                "workspace file tools. The first source read MUST be document_read with "
+                "view=source and no cursor, or cursor=\"\" only when the provider adapter "
+                "requires that field. Never invent a non-empty cursor: only pass the exact "
+                "nextCursor returned by the preceding document_read response when hasMore "
+                "is true. To modify the open page, call document_patch with the sha256 "
+                "returned by document_read and exact, unique expectedText from the returned "
+                "source. write_file, edit_file, and apply_patch operate on workspace files; "
+                "they do not update this Document and MUST NOT substitute for document_patch. "
+                "Those workspace mutators are unavailable while this Document is bound; do "
+                "not attempt to call them.\n"
+                "</active_document_context>"
+            )
             artifact_turn_context = BoundDocumentContext(
                 session_key=key,
                 session_id=session_id,
@@ -4428,21 +4512,10 @@ async def _handle_sessions_send_impl(
                 artifact_format="html",
                 tool_names=DOCUMENT_CONTEXT_TOOL_NAMES,
                 operation_class="document_edit",
-                request_context_prompt=(
-                    "<active_document_context>\n"
-                    "The currently opened HTML document is bound to this turn. If the user asks "
-                    "to inspect or modify the open page, use the bound document tools, not "
-                    "workspace file tools. The first source read MUST be document_read with "
-                    "view=source and no cursor, or cursor=\"\" only when the provider adapter "
-                    "requires that field. Never invent a non-empty cursor: only pass the exact "
-                    "nextCursor returned by the preceding document_read response when hasMore "
-                    "is true. To modify the open page, call document_patch with the sha256 "
-                    "returned by document_read and exact, unique expectedText from the returned "
-                    "source. write_file, edit_file, and apply_patch operate on workspace files; "
-                    "they do not update this Document and MUST NOT substitute for document_patch. "
-                    "Those workspace mutators are unavailable while this Document is bound; do "
-                    "not attempt to call them.\n"
-                    "</active_document_context>"
+                request_context_prompt="\n\n".join(
+                    part
+                    for part in (base_document_context_prompt, followup_focus)
+                    if part
                 ),
             )
             artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
