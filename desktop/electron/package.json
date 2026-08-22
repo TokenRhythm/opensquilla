@@ -20,6 +20,7 @@
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
     "verify:gateway-smoke": "node scripts/smoke-gateway.mjs",
+    "test:installer-progress": "node scripts/test-installer-progress-contract.mjs",
     "test:bundled-runtimes": "node scripts/test-bundled-runtimes.mjs",
     "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
     "test:packaged-first-send-renderer": "node scripts/test-packaged-first-send-renderer.mjs",
@@ -162,6 +163,7 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": false,
+      "include": "scripts/nsis/installer-progress.nsh",
       "installerIcon": "assets/icon.ico",
       "uninstallerIcon": "assets/icon.ico"
     }

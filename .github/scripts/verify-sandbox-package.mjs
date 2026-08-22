@@ -3,11 +3,14 @@ import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
+import { verifyInstallerProgressPolicy } from '../../desktop/electron/scripts/installer-progress-policy.mjs'
+
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const runtimeRoot = join(repoRoot, 'desktop', 'electron', 'runtime')
+const desktopPackageRoot = join(repoRoot, 'desktop', 'electron')
 const manifestPath = join(runtimeRoot, 'runtime-manifest.json')
 const catalogPath = join(runtimeRoot, 'runtime-pack-catalog.json')
-const packageJsonPath = join(repoRoot, 'desktop', 'electron', 'package.json')
+const packageJsonPath = join(desktopPackageRoot, 'package.json')
 const failures = []
 
 function fail(message) {
@@ -153,11 +156,8 @@ if (packageJson) {
     }
   }
 
-  if (packageJson.build?.nsis?.include !== undefined) {
-    fail('Electron NSIS must use managed upgrade cleanup without a custom recursive delete')
-  }
-  if (isFile(join(repoRoot, 'desktop', 'electron', 'build', 'installer.nsh'))) {
-    fail('Electron NSIS custom installer cleanup must not be present')
+  for (const installerProgressFailure of await verifyInstallerProgressPolicy(desktopPackageRoot, packageJson)) {
+    fail(installerProgressFailure)
   }
 }
 

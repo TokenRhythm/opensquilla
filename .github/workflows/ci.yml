@@ -632,6 +632,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          node scripts/test-installer-progress-contract.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs

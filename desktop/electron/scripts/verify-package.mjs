@@ -5,6 +5,8 @@ import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
+import { verifyInstallerProgressPolicy } from './installer-progress-policy.mjs'
+
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
@@ -374,12 +376,8 @@ async function verifyInstallerDataPolicy() {
   if (packageJson.build?.nsis?.deleteAppDataOnUninstall !== false) {
     fail('NSIS uninstall must preserve Desktop profile data (deleteAppDataOnUninstall=false)')
   }
-  if (packageJson.build?.nsis?.include !== undefined) {
-    fail('NSIS must use electron-builder managed upgrade cleanup without a custom recursive delete')
-  }
-  const unsafeInstallerInclude = join(packageRoot, 'build', 'installer.nsh')
-  if (await pathExists(unsafeInstallerInclude)) {
-    fail('NSIS custom installer cleanup must not be present')
+  for (const installerProgressFailure of await verifyInstallerProgressPolicy(packageRoot, packageJson)) {
+    fail(installerProgressFailure)
   }
   const protocols = packageJson.build?.protocols
   if (
