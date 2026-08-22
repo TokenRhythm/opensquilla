@@ -3133,7 +3133,7 @@ def build_tool_handler(
                             _budget_tracker_for(effective_ctx),
                             registered,
                         )
-                    except BaseException as finalize_exception:
+                    except Exception as finalize_exception:
                         if candidate_loop:
                             recovered_result = await _candidate_terminal_receipt(
                                 tool_call=tool_call,

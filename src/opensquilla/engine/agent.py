@@ -21202,7 +21202,7 @@ class Agent:
                         restored = bool(
                             await asyncio.shield(restore(preview_handle))
                         )
-                except BaseException:  # noqa: BLE001 - fallback retirement still runs
+                except Exception:  # noqa: BLE001 - fallback retirement still runs
                     logger.warning(
                         "agent.candidate_preview_restore_failed",
                         session_key=self._session_key,

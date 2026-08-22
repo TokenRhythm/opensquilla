@@ -898,8 +898,15 @@ def register_artifact_preview_routes(
                         session_id=binding.session_id,
                         session_key=binding.session_key,
                     )
-                except PreviewLeaseError:
-                    pass
+                except PreviewLeaseError as exc:
+                    log.debug(
+                        "gateway.artifact_preview_candidate_revoke_failed",
+                        lease_id=lease.lease_id,
+                        session_id=binding.session_id,
+                        artifact_id=binding.artifact_id,
+                        candidate_handle=body["candidateHandle"],
+                        error=str(exc),
+                    )
                 raise PreviewLeaseNotFoundError("candidate preview not found")
             if previous_lease_id and previous_lease_id != lease.lease_id:
                 try:
@@ -909,8 +916,15 @@ def register_artifact_preview_routes(
                         session_id=binding.session_id,
                         session_key=binding.session_key,
                     )
-                except PreviewLeaseError:
-                    pass
+                except PreviewLeaseError as exc:
+                    log.debug(
+                        "gateway.artifact_preview_previous_lease_revoke_failed",
+                        lease_id=previous_lease_id,
+                        session_id=binding.session_id,
+                        artifact_id=binding.artifact_id,
+                        candidate_handle=body["candidateHandle"],
+                        error=str(exc),
+                    )
             launch_url = lease_service.full_launch_url(token, lease.entrypoint)
             payload = _lease_payload(
                 lease_service,

@@ -1342,6 +1342,8 @@ async def test_candidate_loop_preserves_receipt_when_lease_acquisition_conflicts
             try:
                 await service.release_writer_lease(lease=lease, actor=USER)
             except Exception:
+                # Teardown is best-effort and must not mask the primary test
+                # outcome when the lease was already released by recovery.
                 pass
         await service.close()
 

@@ -363,7 +363,7 @@ class ArtifactCandidateLoopController:
                     summary=summary,
                     candidate_loop=True,
                 )
-            except BaseException as create_error:
+            except asyncio.CancelledError:
                 # The insert may have committed before its response was lost,
                 # including while the turn is being cancelled.  Reload the
                 # exact turn-local row so cleanup can reject it instead of
@@ -378,11 +378,25 @@ class ArtifactCandidateLoopController:
                     )
                 except Exception:
                     recovered = None
+                if recovered is not None:
+                    existing = recovered
+                raise
+            except Exception:
+                # The insert may have committed before an ordinary response
+                # failure. Reload the exact turn-local row so cleanup can
+                # reject it instead of leaking an empty DRAFT.
+                try:
+                    recovered = await asyncio.shield(
+                        self._service.get_change_set_by_turn(
+                            document_id=self._document_id,
+                            turn_id=self._turn_id,
+                        )
+                    )
+                except Exception:
+                    recovered = None
                 if recovered is None:
                     raise
                 existing = recovered
-                if isinstance(create_error, asyncio.CancelledError):
-                    raise
         # A document turn may already have an ordinary agent/review DRAFT
         # with the same (document, turn) key.  Its turn-scoped identity is not
         # sufficient ownership proof: only the immutable creation audit marker
@@ -892,6 +906,8 @@ class ArtifactCandidateLoopController:
                             actor=actor,
                         )
                     except Exception:
+                        # Lease release is best-effort and must not mask the
+                        # durable commit result.
                         pass
             self._change_set = result[1]
             self._status = "committed"
@@ -975,6 +991,8 @@ class ArtifactCandidateLoopController:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    # Recovery metadata restoration is best-effort; a later
+                    # reconcile can retry without changing the commit result.
                     pass
             return None
 
