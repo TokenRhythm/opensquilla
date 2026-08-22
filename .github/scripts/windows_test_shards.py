@@ -698,6 +698,16 @@ def _run_pytest_subprocess(root: Path, pytest_args: list[str], *, phase: str) ->
     return int(result.returncode)
 
 
+@contextmanager
+def _pytest_file_selection_arg(files: tuple[str, ...]) -> Iterator[str]:
+    """Keep the selected test files out of Windows' bounded command line."""
+
+    with tempfile.TemporaryDirectory(prefix="opensquilla-pytest-args-") as temp_dir:
+        argfile = Path(temp_dir) / "test-files.txt"
+        argfile.write_text("\n".join(files) + "\n", encoding="utf-8")
+        yield f"@{argfile}"
+
+
 def _pytest_phase_inputs(
     raw_args: list[str],
 ) -> tuple[list[str], str | None]:
@@ -881,7 +891,6 @@ def _run(args: argparse.Namespace) -> int:
         )
 
     pytest_args, marker_expression = _pytest_phase_inputs(args.pytest_args)
-    file_args = [str(root / path) for path in files]
     parallel_junit = _phase_junit_path(args.junit, "parallel")
     serial_junit = _phase_junit_path(args.junit, "serial")
     runner_error_junit = _phase_junit_path(args.junit, "runner-error")
@@ -898,7 +907,10 @@ def _run(args: argparse.Namespace) -> int:
     parallel_exit_code: int | None = None
     raw_serial_exit_code: int | None = None
     try:
-        with _prebuilt_core_wheel_environment(root, files):
+        with (
+            _prebuilt_core_wheel_environment(root, files),
+            _pytest_file_selection_arg(files) as file_selection_arg,
+        ):
             parallel_args = [
                 *pytest_args,
                 "-m",
@@ -907,7 +919,7 @@ def _run(args: argparse.Namespace) -> int:
                 str(args.workers),
                 "--dist",
                 "loadfile",
-                *file_args,
+                file_selection_arg,
                 f"--junitxml={parallel_junit}",
             ]
             print(
@@ -924,7 +936,7 @@ def _run(args: argparse.Namespace) -> int:
                 *pytest_args,
                 "-m",
                 _phase_marker(marker_expression, "ci_serial"),
-                *file_args,
+                file_selection_arg,
                 f"--junitxml={serial_junit}",
             ]
             print(
