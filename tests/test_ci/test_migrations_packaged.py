@@ -124,7 +124,9 @@ def test_installed_wheel_resolves_migrations(
         capture_output=True,
         timeout=120,
     )
-    py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / "python"
+    py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python"
+    )
 
     # Use uv's installer against the fresh interpreter instead of seeding pip
     # and then invoking a second resolver. This keeps the clean-install
