@@ -146,6 +146,21 @@ export interface ArtifactUrlOptions {
   includeSessionKey?: boolean
 }
 
+function artifactUrlsShareOrigin(candidate: URL, base: URL): boolean {
+  if (candidate.origin !== 'null' || base.origin !== 'null') {
+    return candidate.origin === base.origin
+  }
+  return candidate.protocol === 'opensquilla-app:'
+    && base.protocol === 'opensquilla-app:'
+    && candidate.hostname === 'desktop'
+    && base.hostname === 'desktop'
+    && candidate.port === base.port
+    && !candidate.username
+    && !candidate.password
+    && !base.username
+    && !base.password
+}
+
 export function artifactDownloadUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,
@@ -157,7 +172,7 @@ export function artifactDownloadUrl(
   try {
     const url = new URL(raw, baseOrigin)
     const base = new URL(baseOrigin)
-    const sameOrigin = url.origin === base.origin
+    const sameOrigin = artifactUrlsShareOrigin(url, base)
     if (sameOrigin) {
       url.searchParams.delete('token')
       url.searchParams.delete('sessionKey')

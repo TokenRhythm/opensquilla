@@ -125,7 +125,7 @@ async function selectRuntimeGateway() {
   return sourceRuntimeGatewayDir
 }
 
-function smokeEnv(tempHome, config) {
+function smokeEnv(tempHome, config, runtimeGatewayDir) {
   const env = {}
   for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith('OPENSQUILLA_')) continue
@@ -143,6 +143,7 @@ function smokeEnv(tempHome, config) {
     // Runtime databases still live below H/state; config must remain at H/config.toml.
     OPENSQUILLA_STATE_DIR: tempHome,
     OPENSQUILLA_GATEWAY_CONFIG_PATH: config,
+    OPENSQUILLA_CONTROL_UI_DIST: join(runtimeGatewayDir, 'control-ui-dist'),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
@@ -430,7 +431,7 @@ async function main() {
       'utf8'
     )
 
-    const env = smokeEnv(tempHome, config)
+    const env = smokeEnv(tempHome, config, runtimeGatewayDir)
     verifyGatewayCaStore(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
 

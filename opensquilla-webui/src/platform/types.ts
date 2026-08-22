@@ -9,6 +9,25 @@ export interface GatewayStatus {
   error?: string
 }
 
+export type DesktopGatewayConnectionStatus = 'starting' | 'ready' | 'stopped' | 'error'
+
+/**
+ * Connection facts published only to the trusted Desktop main frame. The
+ * instance-scoped auth token is derived from the owned Gateway launch and
+ * expires with that process; it is never the operator's configured token.
+ */
+export interface DesktopGatewayConnection {
+  schemaVersion: 1
+  revision: number
+  status: DesktopGatewayConnectionStatus
+  instanceId: string | null
+  profileFingerprint: string
+  httpUrl: string | null
+  wsUrl: string | null
+  authToken?: string | null
+  error: string | null
+}
+
 export interface DesktopRetryStartupResult {
   ok: boolean
   error?: string
@@ -437,6 +456,10 @@ export interface CliInvocation {
 
 export interface PlatformGatewayApi {
   getStatus(): Promise<GatewayStatus>
+  getConnection?: () => Promise<DesktopGatewayConnection>
+  onConnection?: (
+    callback: (connection: DesktopGatewayConnection) => void,
+  ) => () => void
   revealLog?: () => Promise<boolean>
   retryStartup?: () => Promise<DesktopRetryStartupResult>
   /** null when the shell predates the bridge or the lookup fails; callers

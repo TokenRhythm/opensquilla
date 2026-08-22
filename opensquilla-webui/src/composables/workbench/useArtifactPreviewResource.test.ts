@@ -228,6 +228,32 @@ describe('createArtifactPreviewResource', () => {
     expect(controller.errorCode.value).toBe('integrity-error')
   })
 
+  it.each([
+    { name: 'notes.txt', mime: 'text/plain', body: 'Desktop text' },
+    { name: 'notes.md', mime: 'text/markdown', body: '# Desktop markdown' },
+    { name: 'report.pdf', mime: 'application/pdf', body: new Uint8Array([0x25, 0x50, 0x44, 0x46]) },
+  ])('loads $name through the exact Desktop API proxy', async ({ name, mime, body }) => {
+    const createObjectUrl = vi.fn(() => 'blob:desktop-preview')
+    const fetchImpl = vi.fn().mockResolvedValue(response(body, mime))
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({ name, mime }),
+      baseOrigin: () => 'opensquilla-app://desktop',
+      createObjectUrl,
+      fetchImpl,
+    })
+
+    await controller.load()
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      '/api/v1/artifacts/artifact-1',
+      expect.objectContaining({ credentials: 'same-origin', redirect: 'error' }),
+    )
+    expect(controller.state.value).toBe('ready')
+    if (mime === 'application/pdf') {
+      expect(controller.objectUrl.value).toBe('blob:desktop-preview')
+    }
+  })
+
   it('emits native HTML bytes and reports unresolved relative resources', async () => {
     const nativeReady = vi.fn<(resource: NativeHtmlArtifactResource) => void>()
     const controller = createArtifactPreviewResource({

@@ -83,6 +83,18 @@ const MANUAL_TEST_WINDOW_HEIGHT = 900
 const execFileAsync = promisify(execFile)
 const uvExecutable = process.platform === 'win32' ? 'uv.exe' : 'uv'
 
+function isDesktopMaterializedChatUrl(value) {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'opensquilla-app:'
+      && url.hostname === 'desktop'
+      && url.pathname === '/chat'
+      && url.searchParams.has('session')
+  } catch {
+    return false
+  }
+}
+
 function jsonFromToolContent(content) {
   const text = String(content || '')
   const start = text.indexOf('{')
@@ -1452,7 +1464,7 @@ try {
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
   // A fresh real-provider profile intentionally opens native setup before the
-  // Gateway-backed Control UI exists. Report that setup is interactive, but do
+  // Gateway-backed capabilities exist. Report that setup is interactive, but do
   // not claim the feature client is ready until the Gateway and renderer are
   // both connected.
   if (MANUAL_MODE && MANUAL_REAL_PROVIDER) {
@@ -1465,12 +1477,12 @@ try {
       credentials: MANUAL_REUSE_PROFILE
         ? 'existing isolated Desktop credential retained'
         : 'none preconfigured; enter the API key in Desktop settings',
-      next: 'The harness will report ready only after the Control UI is connected.',
+      next: 'The harness will report ready only after the Desktop renderer is connected.',
     }, null, 2))
   }
   await waitFor(
-    () => page.url().includes('/control/chat'),
-    'owned-Gateway Control UI',
+    () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'owned-Gateway Desktop renderer',
     MANUAL_MODE && MANUAL_REAL_PROVIDER ? MANUAL_SETUP_TIMEOUT_MS : STARTUP_TIMEOUT_MS,
   )
   await page.locator('.conn-pill.connected').waitFor({
@@ -1535,7 +1547,11 @@ try {
 
   await page.locator('.chat-textarea').fill(GENERATE_MESSAGE)
   await submitChatComposer(page)
-  await waitFor(() => /\/control\/chat\?session=/.test(page.url()), 'materialized V1 session', TIMEOUT_MS)
+  await waitFor(
+    () => isDesktopMaterializedChatUrl(page.url()),
+    'materialized V1 session',
+    TIMEOUT_MS,
+  )
   evidence.sessionUrl = page.url()
   await waitForSettledTurn(page)
   await generatedArtifactCard(page).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
@@ -1990,8 +2006,8 @@ try {
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
   await waitFor(
-    () => recoveredPage.url().includes('/control/chat'),
-    'restarted owned-Gateway Control UI',
+    () => recoveredPage.url().startsWith('opensquilla-app://desktop/chat'),
+    'restarted owned-Gateway Desktop renderer',
     STARTUP_TIMEOUT_MS,
   )
   await recoveredPage.locator('.conn-pill.connected').waitFor({

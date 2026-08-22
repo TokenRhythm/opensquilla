@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-contextBridge.exposeInMainWorld('opensquillaDesktop', {
+if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
   isDesktopUpdateManaged: () => ipcRenderer.invoke('desktop:update:managed'),
@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   relaunchToUpdate: () => ipcRenderer.invoke('desktop:update:relaunch'),
   dismissUpdate: () => ipcRenderer.invoke('desktop:update:dismiss'),
   getGatewayStatus: () => ipcRenderer.invoke('gateway:status'),
+  getGatewayConnection: () => ipcRenderer.invoke('gateway:connection'),
   getCliInvocation: () => ipcRenderer.invoke('gateway:cli-invocation'),
   revealGatewayLog: () => ipcRenderer.invoke('gateway:reveal-log'),
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
@@ -121,6 +122,11 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:boot:error', listener)
     return () => ipcRenderer.removeListener('desktop:boot:error', listener)
+  },
+  onGatewayConnectionChanged: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
+    ipcRenderer.on('gateway:connection-changed', listener)
+    return () => ipcRenderer.removeListener('gateway:connection-changed', listener)
   },
   onRecoveryState: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)

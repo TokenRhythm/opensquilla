@@ -253,11 +253,16 @@ async function controlPage(app) {
       await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
       let pathname = ''
       try { pathname = new URL(page.url()).pathname } catch { pathname = '' }
-      if (!['/control/chat', '/control/chat/new'].includes(pathname)) continue
+      if (!page.url().startsWith('opensquilla-app://desktop/')) continue
+      if (!['/chat', '/chat/new'].includes(pathname)) continue
+      const connection = await page.evaluate(
+        () => window.opensquillaDesktop?.getGatewayConnection?.(),
+      ).catch(() => null)
+      if (connection?.status !== 'ready') continue
       if (await page.locator('.chat-textarea').count().catch(() => 0)) return page
     }
     return null
-  }, 'Desktop Control UI', 120_000)
+  }, 'Desktop renderer', 120_000)
 }
 
 async function selectOllamaAndCompleteOnboarding(page) {

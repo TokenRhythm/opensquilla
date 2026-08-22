@@ -25,6 +25,7 @@ const sourceInputRoots = [
   '.env.local',
   '.env.production',
   '.env.production.local',
+  'desktop.html',
   'index.html',
   'package.json',
   'package-lock.json',
@@ -167,7 +168,8 @@ export function sourceFingerprint(rootDirectory = webuiRoot) {
 }
 
 function referencedEntryAssets(indexHtml) {
-  const references = [...indexHtml.matchAll(/\b(?:src|href)="([^"]+)"/g)]
+  const assetHtml = indexHtml.replace(/<base\b[^>]*>/gi, '')
+  const references = [...assetHtml.matchAll(/\b(?:src|href)="([^"]+)"/g)]
     .map((match) => match[1])
     .filter((value) => !value.startsWith('data:'))
     .filter((value) => !value.startsWith('http://'))
@@ -188,8 +190,10 @@ function referencedEntryAssets(indexHtml) {
 
 export function writeManifest(distDir = defaultDistDir) {
   const root = resolve(distDir)
-  if (!existsSync(resolve(root, 'index.html'))) {
-    throw new Error(`Built Web UI entrypoint is missing: ${resolve(root, 'index.html')}`)
+  for (const entry of ['index.html', 'desktop.html']) {
+    if (!existsSync(resolve(root, entry))) {
+      throw new Error(`Built Web UI entrypoint is missing: ${resolve(root, entry)}`)
+    }
   }
   const manifest = {
     schemaVersion: 1,
@@ -210,9 +214,13 @@ export function verifyDist(
 ) {
   const root = resolve(distDir)
   const indexPath = resolve(root, 'index.html')
+  const desktopPath = resolve(root, 'desktop.html')
   const manifestPath = resolve(root, MANIFEST_NAME)
   if (!existsSync(indexPath)) {
     throw new Error(`Built Web UI entrypoint is missing: ${indexPath}`)
+  }
+  if (!existsSync(desktopPath)) {
+    throw new Error(`Built Desktop UI entrypoint is missing: ${desktopPath}`)
   }
   if (!existsSync(manifestPath)) {
     throw new Error(`Web UI artifact manifest is missing: ${manifestPath}`)
@@ -282,17 +290,18 @@ export function verifyDist(
     }
   }
 
-  const indexHtml = readFileSync(indexPath, 'utf8')
-  const references = referencedEntryAssets(indexHtml)
-  if (!references.some((path) => path.endsWith('.js'))) {
-    throw new Error('Web UI index.html does not reference an entry JavaScript module.')
-  }
-  if (!references.some((path) => path.endsWith('.css'))) {
-    throw new Error('Web UI index.html does not reference an entry stylesheet.')
-  }
-  for (const asset of references) {
-    if (!existsSync(resolve(root, asset))) {
-      throw new Error(`Web UI index.html references a missing asset: ${asset}`)
+  for (const entry of ['index.html', 'desktop.html']) {
+    const references = referencedEntryAssets(readFileSync(resolve(root, entry), 'utf8'))
+    if (!references.some((path) => path.endsWith('.js'))) {
+      throw new Error(`Web UI ${entry} does not reference an entry JavaScript module.`)
+    }
+    if (!references.some((path) => path.endsWith('.css'))) {
+      throw new Error(`Web UI ${entry} does not reference an entry stylesheet.`)
+    }
+    for (const asset of references) {
+      if (!existsSync(resolve(root, asset))) {
+        throw new Error(`Web UI ${entry} references a missing asset: ${asset}`)
+      }
     }
   }
 

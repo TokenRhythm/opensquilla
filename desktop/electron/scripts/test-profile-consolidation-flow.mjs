@@ -192,11 +192,16 @@ async function controlPage(app) {
         } catch {
           pathname = ''
         }
-        if (pathname !== '/control/chat' && pathname !== '/control/chat/new') continue
+        if (!candidate.url().startsWith('opensquilla-app://desktop/')) continue
+        if (pathname !== '/chat' && pathname !== '/chat/new') continue
+        const connection = await candidate.evaluate(
+          () => window.opensquillaDesktop?.getGatewayConnection?.(),
+        ).catch(() => null)
+        if (connection?.status !== 'ready') continue
         if (await candidate.locator('.chat-textarea').count().catch(() => 0)) return candidate
       }
       return null
-    }, 'consolidated primary Control UI')
+    }, 'consolidated primary Desktop renderer')
   } catch (error) {
     const windows = await Promise.all(app.windows().map(async (page) => ({
       url: page.url(),

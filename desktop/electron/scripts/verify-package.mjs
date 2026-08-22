@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
 import { lstat, readdir, readFile, stat } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
@@ -13,6 +13,7 @@ const sourceMainPath = join(packageRoot, 'src', 'main.ts')
 const compiledMainPath = join(packageRoot, 'dist', 'main.js')
 const packageJsonPath = join(packageRoot, 'package.json')
 const desktopOutputDir = join(repoRoot, 'dist', 'desktop-electron')
+const controlUiVerifierPath = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 
 const failures = []
 
@@ -229,6 +230,35 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
     return
   }
 
+  const sharedControlUiDir = join(root, 'control-ui-dist')
+  for (const entry of ['index.html', 'desktop.html', 'webui-artifact-manifest.json']) {
+    if (!files.includes(join(sharedControlUiDir, entry))) {
+      fail(`${label} runtime is missing shared Control UI ${entry}`)
+    }
+  }
+  const webuiManifests = files.filter((path) => path.endsWith('webui-artifact-manifest.json'))
+  if (
+    webuiManifests.length !== 1
+    || dirname(webuiManifests[0]) !== sharedControlUiDir
+  ) {
+    fail(`${label} runtime must contain exactly one shared Web UI artifact; found ${webuiManifests.join(', ')}`)
+  }
+  const embeddedControlUiMarker = `${join('opensquilla', 'gateway', 'static', 'dist')}${sep}`
+  const embeddedControlUiFiles = files.filter((path) => path.includes(embeddedControlUiMarker))
+  if (embeddedControlUiFiles.length > 0) {
+    fail(`${label} runtime still contains an embedded Control UI dist: ${embeddedControlUiFiles.join(', ')}`)
+  }
+  const controlUiVerification = spawnSync(
+    process.execPath,
+    [controlUiVerifierPath, sharedControlUiDir],
+    { encoding: 'utf8', windowsHide: true },
+  )
+  if (controlUiVerification.error || controlUiVerification.status !== 0) {
+    fail(
+      `${label} shared Control UI failed artifact verification: ${controlUiVerification.error?.message || controlUiVerification.stderr || controlUiVerification.stdout}`,
+    )
+  }
+
   const compatFile = files.find((path) => path.endsWith(join('opensquilla', 'compat', 'aiosqlite.py')))
   if (!compatFile) {
     fail(`${label} runtime is missing opensquilla/compat/aiosqlite.py`)
@@ -259,16 +289,27 @@ function verifyMainProcess(source, label) {
     'gatewayStartPromise',
     'openOrResumeDesktopApp',
     'ensureGatewayStarted',
-    'isCurrentWindowAtControlUi',
+    'DESKTOP_RENDERER_URL',
+    'isCurrentWindowAtDesktopRenderer',
+    'desktopGatewayConnectionSnapshot',
+    'readinessCheck',
   ]) {
     if (!source.includes(expected)) fail(`${label} main process is missing ${expected}`)
   }
 
   const helperIndex = source.indexOf('async function openOrResumeDesktopApp')
   const createIndex = source.indexOf('await createMainWindow()', helperIndex)
+  const localRendererIndex = source.indexOf('loadDesktopRendererIntoCurrentWindow()', helperIndex)
   const ensureIndex = source.indexOf('ensureGatewayStarted()', helperIndex)
-  if (helperIndex === -1 || createIndex === -1 || ensureIndex === -1 || createIndex > ensureIndex) {
-    fail(`${label} main process does not create the desktop window before gateway startup`)
+  if (
+    helperIndex === -1
+    || createIndex === -1
+    || localRendererIndex === -1
+    || ensureIndex === -1
+    || createIndex > localRendererIndex
+    || localRendererIndex > ensureIndex
+  ) {
+    fail(`${label} main process does not load the local Desktop renderer before gateway startup`)
   }
 
   const activateIndex = source.indexOf('async function activateMainWindow')
@@ -294,16 +335,20 @@ function verifyMainProcess(source, label) {
     fail(`${label} main process second-instance handler does not route through openOrResumeDesktopApp`)
   }
 
-  const loadCurrentIndex = source.indexOf('async function loadControlUiIntoCurrentWindow')
-  const controlGuardIndex = source.indexOf('isCurrentWindowAtControlUi(window, gatewayUrl)', loadCurrentIndex)
-  const controlLoadIndex = source.indexOf('loadControlUi(window, gatewayUrl)', loadCurrentIndex)
-  if (
-    loadCurrentIndex === -1
-    || controlGuardIndex === -1
-    || controlLoadIndex === -1
-    || controlGuardIndex > controlLoadIndex
-  ) {
-    fail(`${label} main process reloads the Control UI before checking whether it is already loaded`)
+  if (source.includes('/control/chat/new') || source.includes('waitForControlUi')) {
+    fail(`${label} main process still makes the Desktop document depend on Gateway Control UI`)
+  }
+  const createWindowIndex = source.indexOf('async function createMainWindow')
+  const createWindowSource = createWindowIndex === -1
+    ? ''
+    : source.slice(createWindowIndex, createWindowIndex + 8_000)
+  if (!createWindowSource.includes('loadURL(DESKTOP_RENDERER_URL)')) {
+    fail(`${label} main window does not load the local Desktop renderer`)
+  }
+  const waitIndex = source.indexOf('async function waitForGateway')
+  const waitSource = waitIndex === -1 ? '' : source.slice(waitIndex, waitIndex + 1_000)
+  if (!waitSource.includes('readinessCheck(url)') || waitSource.includes('healthCheck(url)')) {
+    fail(`${label} gateway startup does not use the readiness endpoint`)
   }
 
   const onboardingIndex = source.indexOf('async function runOnboarding')

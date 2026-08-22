@@ -297,7 +297,14 @@ workbenchResources.setProvider(props.workbenchResourcesEnabled ? workbenchResour
 const artifactImageLightbox = useArtifactImageLightbox()
 const nativeSurfaceOccluded = useNativeSurfaceOcclusionState()
 const surfaceBlocked = computed(() => props.modalBlocked || nativeSurfaceOccluded.value)
-const baseOrigin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
+const baseOrigin = (() => {
+  if (typeof window === 'undefined') return 'http://localhost'
+  if (
+    window.location.protocol === 'opensquilla-app:'
+    && window.location.hostname === 'desktop'
+  ) return 'opensquilla-app://desktop'
+  return window.location.origin
+})()
 const nativeApi = platform.workbench.native
 const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   nativeWorkbenchApi: nativeApi,

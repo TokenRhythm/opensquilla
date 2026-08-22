@@ -60,6 +60,33 @@ def test_static_asset_carries_long_cache_control(_app: Starlette) -> None:
     assert "public" in cache, cache
 
 
+def test_control_ui_can_serve_dist_from_desktop_shared_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static_dir = tmp_path / "embedded-static"
+    static_dir.mkdir()
+    shared_dist = _write_vite_static(tmp_path / "desktop-shared")
+    monkeypatch.setattr(control_ui, "_STATIC_DIR", static_dir)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", shared_dist)
+    app = Starlette(routes=create_control_ui_routes(GatewayConfig()))
+
+    response = TestClient(app).get("/control/static/dist/assets/index.js")
+
+    assert response.status_code == 200
+    assert response.text == "export {};\n"
+
+
+def test_control_ui_dist_resolver_prefers_explicit_desktop_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = tmp_path / "control-ui-dist"
+    monkeypatch.setenv("OPENSQUILLA_CONTROL_UI_DIST", str(configured))
+
+    assert control_ui._resolve_control_ui_dist_dir() == configured.resolve()
+
+
 def test_control_ui_bootstrap_includes_config_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

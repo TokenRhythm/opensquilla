@@ -102,14 +102,23 @@ try {
   })
 
   const page = await app.firstWindow({ timeout: 60_000 })
-  await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
+  await waitFor(
+    () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'candidate Desktop renderer',
+  )
+  await waitFor(
+    async () => (await page.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'candidate Desktop Gateway readiness',
+  )
   // The preceding release-upgrade launch can persist this exact chat URL. In
   // that case page.goto() below may not create a new socket, so explicitly
   // reload after installing the context-wide route.
   await page.reload({ waitUntil: 'domcontentloaded' })
 
   const sessionUrl = new URL(page.url())
-  sessionUrl.pathname = '/control/chat'
+  sessionUrl.pathname = '/chat'
   sessionUrl.search = new URLSearchParams({ session: sessionKey }).toString()
   sessionUrl.hash = ''
   await page.goto(sessionUrl.toString(), { waitUntil: 'domcontentloaded' })

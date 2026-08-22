@@ -54,6 +54,18 @@ function isLoopbackUrl(value) {
   }
 }
 
+function isDesktopMaterializedChatUrl(value) {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'opensquilla-app:'
+      && url.hostname === 'desktop'
+      && url.pathname === '/chat'
+      && url.searchParams.has('session')
+  } catch {
+    return false
+  }
+}
+
 async function startSyntheticOllama() {
   let requestCount = 0
   let chatRequestCount = 0
@@ -327,7 +339,10 @@ try {
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
-  await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
+  await waitFor(
+    () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'candidate Desktop renderer',
+  )
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
   // packaged Electron app, so the release gate instruments send() in the page
@@ -368,10 +383,10 @@ try {
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
     const draftUrl = new URL(page.url())
-    const alreadyOnEmptyDraft = draftUrl.pathname === '/control/chat/new'
+    const alreadyOnEmptyDraft = draftUrl.pathname === '/chat/new'
       && draftUrl.search === ''
       && draftUrl.hash === ''
-    draftUrl.pathname = '/control/chat/new'
+    draftUrl.pathname = '/chat/new'
     draftUrl.search = ''
     draftUrl.hash = ''
     // Packaged macOS Electron can report ERR_ABORTED for a redundant
@@ -412,7 +427,11 @@ try {
       `first chat.send ${iteration}`,
     )
     await syncObservedChatSends(page)
-    await waitFor(() => /\/control\/chat\?session=/.test(page.url()), `session materialization ${iteration}`, SEND_TIMEOUT_MS)
+    await waitFor(
+      () => isDesktopMaterializedChatUrl(page.url()),
+      `session materialization ${iteration}`,
+      SEND_TIMEOUT_MS,
+    )
     assert.equal(await page.locator('#app-route-header').count(), 1)
     assert.equal(await page.locator('.chat').count(), 1)
     assert.equal(await page.locator('.chat-textarea').count(), 1)

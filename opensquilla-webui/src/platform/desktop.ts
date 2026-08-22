@@ -1,6 +1,7 @@
 import { desktopCapabilities } from './capabilities'
 import type {
   CliInvocation,
+  DesktopGatewayConnection,
   DesktopUpdateErrorCode,
   DesktopUpdateInstallMode,
   DesktopUpdateSource,
@@ -12,6 +13,34 @@ import type {
   NativeWorkbenchSurfaceEventType,
   Platform,
 } from './types'
+
+const DESKTOP_GATEWAY_STATUSES = new Set(['starting', 'ready', 'stopped', 'error'])
+
+function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConnection {
+  const raw = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown>
+    : {}
+  if (
+    raw.schemaVersion !== 1
+    || !Number.isInteger(raw.revision)
+    || !DESKTOP_GATEWAY_STATUSES.has(String(raw.status))
+  ) {
+    throw new Error('The Desktop Gateway connection descriptor is invalid.')
+  }
+  return {
+    schemaVersion: 1,
+    revision: raw.revision as number,
+    status: raw.status as DesktopGatewayConnection['status'],
+    instanceId: typeof raw.instanceId === 'string' ? raw.instanceId : null,
+    profileFingerprint: typeof raw.profileFingerprint === 'string'
+      ? raw.profileFingerprint
+      : '',
+    httpUrl: typeof raw.httpUrl === 'string' ? raw.httpUrl : null,
+    wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
+    authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
+    error: typeof raw.error === 'string' ? raw.error : null,
+  }
+}
 
 function requireDesktopApi(): OpenSquillaDesktopApi {
   const api = window.opensquillaDesktop
@@ -467,6 +496,27 @@ export function createDesktopPlatform(): Platform {
     },
     gateway: {
       getStatus: () => requireDesktopApi().getGatewayStatus(),
+      ...(typeof desktopApi.getGatewayConnection === 'function'
+        ? {
+            getConnection: async () => normalizeDesktopGatewayConnection(
+              await requireDesktopApi().getGatewayConnection!(),
+            ),
+          }
+        : {}),
+      ...(typeof desktopApi.onGatewayConnectionChanged === 'function'
+        ? {
+            onConnection: (callback: (connection: DesktopGatewayConnection) => void) => (
+              requireDesktopApi().onGatewayConnectionChanged!((payload) => {
+                try {
+                  callback(normalizeDesktopGatewayConnection(payload))
+                } catch {
+                  // Ignore malformed main-process events; the next trusted
+                  // snapshot or event will restore the authoritative state.
+                }
+              })
+            ),
+          }
+        : {}),
       revealLog: () => requireDesktopApi().revealGatewayLog(),
       retryStartup: () => requireDesktopApi().retryStartup(),
       async getCliInvocation(): Promise<CliInvocation | null> {

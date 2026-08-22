@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, protocol, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -7,7 +7,7 @@ import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, w
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -23,6 +23,7 @@ import {
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   createDesktopGatewayInstanceNonce,
+  desktopGatewayAuthToken,
   desktopGatewayOwnershipMatchesLaunch,
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
@@ -142,17 +143,38 @@ import {
   normalizeRouterTiers,
   type RouterTier,
 } from './router-tier-normalization.js'
+import {
+  DESKTOP_RENDERER_ENTRY,
+  DESKTOP_RENDERER_SCHEME,
+  DESKTOP_RENDERER_URL,
+  isDesktopRendererDocumentUrl,
+  isDesktopRendererUrl,
+  resolveDesktopRendererFile,
+  routeDesktopRendererRequest,
+} from './desktop-renderer-protocol.js'
 
-protocol.registerSchemesAsPrivileged([{
-  scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
-  privileges: {
-    standard: true,
-    secure: true,
-    supportFetchAPI: true,
-    corsEnabled: true,
-    stream: true,
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: DESKTOP_RENDERER_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
   },
-}])
+  {
+    scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+])
 
 interface GatewayState {
   url: string
@@ -161,6 +183,18 @@ interface GatewayState {
   status: 'starting' | 'ready' | 'stopped' | 'error'
   logPath: string
   error?: string
+}
+
+interface DesktopGatewayConnection {
+  schemaVersion: 1
+  revision: number
+  status: GatewayState['status']
+  instanceId: string | null
+  profileFingerprint: string
+  httpUrl: string | null
+  wsUrl: string | null
+  authToken: string | null
+  error: string | null
 }
 
 type SecretEncryption = 'safeStorage' | 'plain'
@@ -534,6 +568,8 @@ const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
+let gatewayConnectionRevision = 0
+let gatewayConnectionInstanceId: string | null = null
 
 function invalidateDesktopOpenFlow(): number {
   desktopOpenFlowRevision += 1
@@ -560,6 +596,54 @@ const gatewayState: GatewayState = {
   owned: false,
   status: 'stopped',
   logPath: '',
+}
+
+function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
+  const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
+  const authToken = ready && gatewayState.owned && gatewayProcess
+    ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce ?? null
+    : null
+  return {
+    schemaVersion: 1,
+    revision: gatewayConnectionRevision,
+    status: gatewayState.status,
+    instanceId: gatewayConnectionInstanceId,
+    profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
+    httpUrl: gatewayState.url || null,
+    wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
+    authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
+    error: gatewayState.error || null,
+  }
+}
+
+function publishGatewayConnection(): void {
+  gatewayConnectionRevision += 1
+  const window = currentMainWindow()
+  if (!window || !isDesktopRendererDocumentUrl(window.webContents.getURL())) return
+  window.webContents.send('gateway:connection-changed', desktopGatewayConnectionSnapshot())
+}
+
+interface GatewayConnectionTransition {
+  url?: string
+  port?: number
+  owned?: boolean
+  status?: GatewayState['status']
+  error?: string | null
+  instanceId?: string | null
+}
+
+function transitionGatewayConnection(transition: GatewayConnectionTransition): void {
+  if (transition.url !== undefined) gatewayState.url = transition.url
+  if (transition.port !== undefined) gatewayState.port = transition.port
+  if (transition.owned !== undefined) gatewayState.owned = transition.owned
+  if (transition.status !== undefined) gatewayState.status = transition.status
+  if (transition.error !== undefined) {
+    gatewayState.error = transition.error === null ? undefined : transition.error
+  }
+  if (transition.instanceId !== undefined) {
+    gatewayConnectionInstanceId = transition.instanceId
+  }
+  publishGatewayConnection()
 }
 
 const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
@@ -590,8 +674,7 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
     if (
       !window
       || !gatewayState.owned
-      || !gatewayState.url
-      || !isCurrentWindowAtControlUi(window, gatewayState.url)
+      || !isCurrentWindowAtDesktopRenderer(window)
     ) return
     window.webContents.send('desktop:workbench:surface-event', event)
   },
@@ -1046,6 +1129,120 @@ function bootPagePath(): string {
   return app.isPackaged
     ? join(process.resourcesPath, 'boot.html')
     : join(packageRoot, 'src', 'boot.html')
+}
+
+function desktopRendererDistPath(): string {
+  return app.isPackaged
+    ? join(packagedRuntimeRoot(), 'gateway', 'control-ui-dist')
+    : join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
+}
+
+function desktopGatewayUnavailableResponse(): Response {
+  return new Response(JSON.stringify({
+    error: 'desktop_gateway_unavailable',
+    status: gatewayState.status,
+    message: gatewayState.error || 'The local runtime is not ready.',
+  }), {
+    status: 503,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  })
+}
+
+async function proxyDesktopRendererRequest(
+  request: Request,
+  pathAndQuery: string,
+): Promise<Response> {
+  if (gatewayState.status !== 'ready' || !gatewayState.url) {
+    return desktopGatewayUnavailableResponse()
+  }
+  const headers = new Headers(request.headers)
+  headers.delete('host')
+  headers.delete('origin')
+  headers.delete('referer')
+  const ownedGatewayNonce = gatewayProcess
+    ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+    : undefined
+  if (gatewayState.owned && ownedGatewayNonce) {
+    headers.delete('x-opensquilla-token')
+    headers.set(
+      'authorization',
+      `Bearer ${desktopGatewayAuthToken(ownedGatewayNonce)}`,
+    )
+  }
+  const method = request.method.toUpperCase()
+  const body = method === 'GET' || method === 'HEAD'
+    ? undefined
+    : new Uint8Array(await request.arrayBuffer())
+  const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
+    method,
+    headers,
+    body,
+    redirect: 'manual',
+    bypassCustomProtocolHandlers: true,
+  })
+  const responseHeaders = new Headers(response.headers)
+  // API bytes are fetch capabilities, not privileged Desktop documents. If a
+  // response is ever interpreted as HTML despite the navigation guards, the
+  // response-level sandbox prevents scripts, framing, and same-origin access.
+  responseHeaders.set(
+    'content-security-policy',
+    "sandbox; default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+  )
+  responseHeaders.set('x-content-type-options', 'nosniff')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders,
+  })
+}
+
+function secureDesktopRendererDocument(response: Response): Response {
+  const headers = new Headers(response.headers)
+  headers.set(
+    'content-security-policy',
+    [
+      "default-src 'self' opensquilla-app://desktop",
+      "base-uri opensquilla-app://desktop",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "script-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "style-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "img-src 'self' opensquilla-app://desktop blob: data: http: https:",
+      "font-src 'self' opensquilla-app://desktop data:",
+      "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
+      "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
+      "frame-src blob: http: https:",
+      "worker-src 'self' opensquilla-app://desktop blob:",
+    ].join('; '),
+  )
+  headers.set('x-content-type-options', 'nosniff')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+async function handleDesktopRendererRequest(request: Request): Promise<Response> {
+  const route = routeDesktopRendererRequest(request.url, request.method)
+  if (route.kind === 'reject') return new Response('Not found', { status: 404 })
+  if (route.kind === 'gateway') return proxyDesktopRendererRequest(request, route.pathAndQuery)
+
+  const assetPath = resolveDesktopRendererFile(desktopRendererDistPath(), route.relativePath)
+  if (!assetPath || !(await pathIsFile(assetPath))) {
+    const detail = route.kind === 'spa'
+      ? `Desktop renderer entry is missing: ${DESKTOP_RENDERER_ENTRY}`
+      : 'Desktop renderer asset was not found.'
+    return new Response(detail, { status: 404 })
+  }
+  const response = await electronNet.fetch(pathToFileURL(assetPath).href, {
+    bypassCustomProtocolHandlers: true,
+  })
+  return route.kind === 'spa' ? secureDesktopRendererDocument(response) : response
+}
+
+function installDesktopRendererProtocol(): void {
+  protocol.handle(DESKTOP_RENDERER_SCHEME, handleDesktopRendererRequest)
 }
 
 function appIconPath(): string {
@@ -2810,7 +3007,9 @@ function clearReusableGatewayState(): void {
   gatewayState.owned = false
   gatewayState.status = 'stopped'
   gatewayState.error = undefined
+  gatewayConnectionInstanceId = null
   gatewayProfileKey = null
+  publishGatewayConnection()
 }
 
 interface ArtifactOpenRequest {
@@ -7894,6 +8093,20 @@ async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   }
 }
 
+async function readinessCheck(url: string, timeoutMs = 1000): Promise<boolean> {
+  try {
+    const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
+    const response = await fetch(`${url}/readyz`, {
+      signal: AbortSignal.timeout(boundedTimeoutMs),
+    })
+    if (!response.ok) return false
+    const payload = await response.json().catch(() => null)
+    return Boolean(payload && payload.ready === true)
+  } catch {
+    return false
+  }
+}
+
 const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000
 const NEWER_CONFIG_DIAGNOSTIC_FIELDS = [
   'llm_ensemble',
@@ -7961,7 +8174,7 @@ async function waitForGateway(
 ): Promise<void> {
   const startedAt = Date.now()
   const result = await waitForGatewayReadiness({
-    probe: (remainingMs) => healthCheck(url, remainingMs),
+    probe: (remainingMs) => readinessCheck(url, remainingMs),
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
     lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
@@ -7979,25 +8192,7 @@ async function waitForGateway(
     return
   }
   if (result.status === 'exited') throw new Error(result.message)
-  throw new Error(`Gateway did not become healthy at ${url}`)
-}
-
-async function waitForControlUi(url: string, earlyExitMessage?: () => string | null): Promise<void> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < 45_000) {
-    const earlyExit = earlyExitMessage?.()
-    if (earlyExit) throw new Error(earlyExit)
-    try {
-      const response = await fetch(`${url}/control/`, { signal: AbortSignal.timeout(1500) })
-      if (response.ok) return
-    } catch {
-      // The ASGI socket can become healthy just before static routes are ready.
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 500))
-  }
-  const earlyExit = earlyExitMessage?.()
-  if (earlyExit) throw new Error(earlyExit)
-  throw new Error(`Control UI did not become reachable at ${url}/control/`)
+  throw new Error(`Gateway did not become ready at ${url}`)
 }
 
 function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null): boolean {
@@ -8030,18 +8225,20 @@ async function reuseHealthyGatewayState(
   // resumeOwnedGatewayStartup; a healthy port alone is not ownership proof.
   if (gatewayProcess && gatewayState.owned) return null
 
-  const healthy = await healthCheck(gatewayState.url)
+  const ready = await readinessCheck(gatewayState.url)
   if (!isCurrent()) return null
-  if (healthy) {
+  if (ready) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
     sendBootStatus('control')
+    publishGatewayConnection()
     return gatewayState
   }
 
   if (gatewayProcess && gatewayState.owned && hasGatewayProcessExited(gatewayProcess)) {
     gatewayProcess = null
     gatewayState.status = 'stopped'
+    publishGatewayConnection()
   }
   return null
 }
@@ -8103,11 +8300,10 @@ async function resumeOwnedGatewayStartup(
   sendBootStatus('gateway-health')
   await waitForGateway(url, childExitMessage)
   if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
-  await waitForControlUi(url, childExitMessage)
 
   // Health alone never grants ownership. The same exact child and profile that
-  // entered this resume path must still be current after both asynchronous
-  // probes, otherwise a concurrent restart or profile switch won the race.
+  // entered this resume path must still be current after the asynchronous
+  // readiness probe, otherwise a concurrent restart or profile switch won the race.
   if (
     gatewayProcess !== child
     || hasGatewayProcessExited(child)
@@ -8134,6 +8330,7 @@ async function resumeOwnedGatewayStartup(
   gatewayState.status = 'ready'
   gatewayState.error = undefined
   sendBootStatus('control')
+  publishGatewayConnection()
   return gatewayState
 }
 
@@ -8272,6 +8469,8 @@ async function startGateway(): Promise<GatewayState> {
     }
     gatewayState.status = 'stopped'
     gatewayState.error = undefined
+    gatewayConnectionInstanceId = null
+    publishGatewayConnection()
   }
 
   const activeProfile = activeDesktopProfile()
@@ -8283,12 +8482,19 @@ async function startGateway(): Promise<GatewayState> {
     gatewayState.port = Number(new URL(gatewayState.url).port || 0)
     gatewayState.owned = false
     gatewayProfileKey = desktopProfileKey(activeProfile)
-    const overrideReady = await healthCheck(gatewayState.url)
+    gatewayConnectionInstanceId = randomUUID()
+    gatewayState.status = 'starting'
+    gatewayState.error = undefined
+    publishGatewayConnection()
+    const overrideReady = await readinessCheck(gatewayState.url)
     if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
     gatewayState.status = overrideReady ? 'ready' : 'error'
     if (gatewayState.status !== 'ready') {
+      gatewayState.error = `Configured gateway is not ready: ${gatewayState.url}`
+      publishGatewayConnection()
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
+    publishGatewayConnection()
     return gatewayState
   }
 
@@ -8368,6 +8574,9 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.owned = true
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
+  gatewayState.error = undefined
+  gatewayConnectionInstanceId = randomUUID()
+  publishGatewayConnection()
 
   const childPath = desktopChildPath()
   const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
@@ -8381,6 +8590,7 @@ async function startGateway(): Promise<GatewayState> {
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     ...artifactBridgeEnvironment,
+    OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
@@ -8444,6 +8654,7 @@ async function startGateway(): Promise<GatewayState> {
     if (!isCurrentGateway) return
     if (isQuitting) {
       gatewayState.status = 'stopped'
+      publishGatewayConnection()
       return
     }
     gatewayState.status = 'error'
@@ -8452,13 +8663,11 @@ async function startGateway(): Promise<GatewayState> {
     if (portConflictExit && !hasExplicitGatewayPort()) {
       gatewayState.status = 'stopped'
       gatewayState.error = undefined
+      publishGatewayConnection()
       return
     }
     sendBootError(gatewayState.error)
-    // After boot the window is on the gateway-served Control UI, which never
-    // listens for boot:error. Restore the boot splash so the crash message and
-    // the Retry/Reset recovery affordances are visible instead of a dead origin.
-    void restoreMainWindowToBootPage()
+    publishGatewayConnection()
   })
 
   // A failed spawn (uv missing in dev, non-executable bundled binary) emits
@@ -8473,16 +8682,17 @@ async function startGateway(): Promise<GatewayState> {
     childExitMessage = message
     if (isQuitting) {
       gatewayState.status = 'stopped'
+      publishGatewayConnection()
       return
     }
     gatewayState.status = 'error'
     gatewayState.error = message
     sendBootError(message)
+    publishGatewayConnection()
   })
 
   sendBootStatus('gateway-health')
   await waitForGateway(url, () => childExitMessage)
-  await waitForControlUi(url, () => childExitMessage)
   // Guard against adopting a foreign gateway that won the probe→bind race: if our
   // spawned child has already exited, it lost the exclusive bind and the healthy
   // endpoint belongs to someone else (e.g. a CLI `opensquilla gateway run` on the
@@ -8507,6 +8717,8 @@ async function startGateway(): Promise<GatewayState> {
   }
   sendBootStatus('control')
   gatewayState.status = 'ready'
+  gatewayState.error = undefined
+  publishGatewayConnection()
   return gatewayState
 }
 
@@ -8532,58 +8744,15 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
   throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gateway port retry exhausted.'))
 }
 
-async function loadControlUi(window: BrowserWindow, gatewayUrl: string): Promise<void> {
-  const url = `${gatewayUrl}/control/chat/new`
-  let lastError: Error | null = null
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    try {
-      await window.loadURL(url)
-      desktopStartupLog('control_ui_ready', {
-        url: gatewayUrl,
-        attempt,
-      })
-      return
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error))
-      await new Promise((resolveWait) => setTimeout(resolveWait, 500))
-    }
-  }
-  throw lastError ?? new Error(`Failed to load ${url}`)
-}
-
-// The main window is only ever meant to sit on the gateway-served Control UI
-// origin (its /control paths). Anything else — a dropped file:// document, an
-// off-origin redirect — is a foreign navigation and must be blocked. The boot
-// splash is loaded programmatically (loadFile), which does not go through the
-// navigation guard, so it needs no allow-entry here.
+// The normal application renderer has a stable, local origin. Gateway HTTP and
+// WebSocket endpoints are capabilities it connects to after they become ready;
+// they are not the document that owns the Desktop window.
 function isAllowedMainWindowNavigation(targetUrl: string): boolean {
-  if (!gatewayState.url) return false
-  try {
-    const target = new URL(targetUrl)
-    const gateway = new URL(gatewayState.url)
-    return (
-      target.origin === gateway.origin
-      && (target.pathname === '/control' || target.pathname.startsWith('/control/'))
-    )
-  } catch {
-    return false
-  }
+  return isDesktopRendererDocumentUrl(targetUrl)
 }
 
-function isCurrentWindowAtControlUi(window: BrowserWindow, gatewayUrl: string): boolean {
-  const currentUrl = window.webContents.getURL()
-  if (!currentUrl) return false
-
-  try {
-    const current = new URL(currentUrl)
-    const gateway = new URL(gatewayUrl)
-    return (
-      current.origin === gateway.origin
-      && (current.pathname === '/control' || current.pathname.startsWith('/control/'))
-    )
-  } catch {
-    return false
-  }
+function isCurrentWindowAtDesktopRenderer(window: BrowserWindow): boolean {
+  return isDesktopRendererDocumentUrl(window.webContents.getURL())
 }
 
 async function createMainWindow(): Promise<BrowserWindow> {
@@ -8714,6 +8883,14 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
   window.webContents.on('will-navigate', guardMainWindowNavigation)
   window.webContents.on('will-redirect', guardMainWindowNavigation)
+  window.webContents.on('will-frame-navigate', (details) => {
+    // The renderer never embeds its own privileged origin. In particular, an
+    // API response must not become a same-origin child document that can reach
+    // the parent Desktop bridge.
+    if (!details.isMainFrame && isDesktopRendererUrl(details.url)) {
+      details.preventDefault()
+    }
+  })
   window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
     // Native child views sit above the renderer DOM. A full document change
     // must remove them before boot/recovery/another Control UI can become
@@ -8769,7 +8946,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     if (mainWindow === window) mainWindow = null
   })
 
-  await window.loadFile(bootPagePath())
+  await window.loadURL(DESKTOP_RENDERER_URL)
   return window
 }
 
@@ -8780,6 +8957,9 @@ function currentMainWindow(): BrowserWindow | null {
 function ensureGatewayStarted(): Promise<GatewayState> {
   if (!gatewayStartPromise) {
     sendBootStatus('profile')
+    gatewayState.status = 'starting'
+    gatewayState.error = undefined
+    publishGatewayConnection()
     gatewayStartPromise = startGatewayWithPortRecovery().finally(() => {
       gatewayStartPromise = null
     })
@@ -8787,41 +8967,21 @@ function ensureGatewayStarted(): Promise<GatewayState> {
   return gatewayStartPromise
 }
 
-async function loadControlUiIntoCurrentWindow(
-  gatewayUrl: string,
-  isCurrent: () => boolean,
-): Promise<boolean> {
-  if (!isCurrent()) return false
+async function loadDesktopRendererIntoCurrentWindow(): Promise<void> {
   const window = currentMainWindow()
-  if (!window) return false
-
-  sendBootStatus('control')
-  if (isCurrentWindowAtControlUi(window, gatewayUrl)) {
-    if (!isCurrent()) return false
-    sendBootStatus('ready')
-    return true
-  }
-
-  try {
-    await loadControlUi(window, gatewayUrl)
-  } catch (error) {
-    if (window.isDestroyed()) return false
-    throw error
-  }
-  if (!isCurrent()) return false
-  sendBootStatus('ready')
-  return true
+  if (!window) return
+  if (isCurrentWindowAtDesktopRenderer(window)) return
+  await window.loadURL(DESKTOP_RENDERER_URL)
 }
 
-// Bring the main window back to the boot splash when a gateway failure happens
-// while the window is showing the gateway-served Control UI. The splash owns the
-// boot:error listener plus the Retry/Reset recovery buttons, so this is what
-// turns an otherwise-dead Control UI origin back into a recoverable state.
+// The old boot document is now reserved for profile recovery that must complete
+// before the normal app can safely touch the user's data. Runtime failures stay
+// inside the local Desktop renderer and are shown as a recoverable capability
+// error instead of replacing the whole application.
 async function restoreMainWindowToBootPage(): Promise<void> {
   const window = currentMainWindow()
   if (!window) return
-  // Already on the boot splash (initial boot); its own onBootError handler will
-  // render the error. Only navigate back when the window left for the Control UI.
+  // Already on the recovery document.
   if (window.webContents.getURL().startsWith('file:')) return
   try {
     await window.loadFile(bootPagePath())
@@ -9022,6 +9182,10 @@ async function openOrResumeDesktopApp(): Promise<void> {
       try {
         if (await inspectActiveProfileBeforeStartup()) {
           if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
+            // Recovery may temporarily replace the renderer with boot.html. Put
+            // the local application back before any Gateway startup wait so the
+            // shell remains usable while the runtime comes online.
+            await loadDesktopRendererIntoCurrentWindow()
             const reusableGateway = forceOnboardingOnNextStartup
               ? null
               : await reuseHealthyGatewayState(
@@ -9048,10 +9212,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
               )
             )
             if (operationIsCurrent()) {
-              await loadControlUiIntoCurrentWindow(
-                gatewayUrl,
-                operationIsCurrent,
-              )
+              sendBootStatus('ready')
             }
           }
         }
@@ -9061,6 +9222,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (gatewayState.status !== 'ready') {
             gatewayState.status = 'error'
             gatewayState.error = error instanceof Error ? error.message : String(error)
+            publishGatewayConnection()
           }
           desktopLog('desktop_open_failed', {
             profileKind: 'primary',
@@ -9245,6 +9407,10 @@ function stopGateway(): void {
   const url = gatewayState.url
   trackStoppingGatewayProcess(child)
   gatewayProcess = null
+  gatewayState.status = 'stopped'
+  gatewayState.error = undefined
+  gatewayConnectionInstanceId = null
+  publishGatewayConnection()
 
   const hardTerminate = () => {
     hardTerminateGatewayProcess(child)
@@ -10848,6 +11014,12 @@ ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
 ipcMain.handle('gateway:status', () => ({ ...gatewayState }))
+ipcMain.handle('gateway:connection', (event) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    throw new Error('Untrusted Gateway connection request.')
+  }
+  return desktopGatewayConnectionSnapshot()
+})
 ipcMain.handle('gateway:cli-invocation', async () => {
   const runtime = await resolveGatewayRuntime()
   return buildCliInvocation({
@@ -12583,6 +12755,7 @@ ipcMain.handle('desktop:migration:run', async (
     // pattern): wait for the child to actually EXIT, bounded by the kill deadline.
     if (gatewayProcess && gatewayState.owned) {
       const child = gatewayProcess
+      const childInstanceId = gatewayConnectionInstanceId
       // We stay alive and await the exit, so let the gateway take its Windows
       // HTTP graceful drain instead of an immediate TerminateProcess.
       allowGracefulShutdownWhileQuitting = true
@@ -12596,19 +12769,26 @@ ipcMain.handle('desktop:migration:run', async (
         // Keep the still-live child visible to the rest of the lifecycle code and
         // refuse both the import and a replacement spawn against the same profile.
         gatewayProcess = child
-        gatewayState.owned = true
-        gatewayState.status = 'error'
-        gatewayState.error = 'The desktop gateway did not exit before the transfer deadline.'
+        transitionGatewayConnection({
+          owned: true,
+          status: 'error',
+          error: 'The desktop gateway did not exit before the transfer deadline.',
+          instanceId: childInstanceId ?? randomUUID(),
+        })
         restartAllowed = false
-        throw new Error(gatewayState.error)
+        throw new Error('The desktop gateway did not exit before the transfer deadline.')
       }
     }
 
     // Refuse while an unmanaged gateway still serves this profile — the import
     // must not race live sessions.db/scheduler.db writers.
     if (gatewayState.url && (await healthCheck(gatewayState.url))) {
-      gatewayState.owned = false
-      gatewayState.status = 'ready'
+      transitionGatewayConnection({
+        owned: false,
+        status: 'ready',
+        error: null,
+        instanceId: randomUUID(),
+      })
       shouldRestart = false
       throw new Error('A gateway is still serving this profile; stop it and retry.')
     }
@@ -12766,7 +12946,9 @@ ipcMain.handle('desktop:migration:dismiss-last-result', async (event) => (
 function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
   const window = currentMainWindow()
   if (!window || event.sender !== window.webContents) return false
-  const url = event.senderFrame?.url || event.sender.getURL()
+  const senderFrame = event.senderFrame
+  if (!senderFrame || senderFrame !== event.sender.mainFrame) return false
+  const url = senderFrame.url
   try {
     const sender = new URL(url)
     if (sender.protocol === 'file:') {
@@ -12780,11 +12962,14 @@ function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
 
 function trustedMainWindowControlIpc(event: Electron.IpcMainInvokeEvent): boolean {
   const window = currentMainWindow()
-  if (!window || event.sender !== window.webContents || !gatewayState.url) {
-    return false
-  }
+  if (!window || event.sender !== window.webContents) return false
+  const senderFrame = event.senderFrame
+  if (!senderFrame || senderFrame !== event.sender.mainFrame) return false
+  const rawUrl = senderFrame.url
+  if (isDesktopRendererDocumentUrl(rawUrl)) return true
+  if (!gatewayState.url) return false
   try {
-    const sender = new URL(event.senderFrame?.url || event.sender.getURL())
+    const sender = new URL(rawUrl)
     const gateway = new URL(gatewayState.url)
     return sender.origin === gateway.origin
       && (sender.pathname === '/control' || sender.pathname.startsWith('/control/'))
@@ -12804,7 +12989,12 @@ function trustedOnboardingIpc(
   const window = flow?.window
   if (!flow || !onboardingFlows.isCurrent(flow) || !window || window.isDestroyed()) return false
   if (event.sender !== window.webContents) return false
-  return (event.senderFrame?.url || event.sender.getURL()).startsWith('data:text/html')
+  const senderFrame = event.senderFrame
+  return Boolean(
+    senderFrame
+    && senderFrame === event.sender.mainFrame
+    && senderFrame.url.startsWith('data:text/html'),
+  )
 }
 
 function onboardingSaveFailure(
@@ -13234,10 +13424,9 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
     }
     const authority = pendingStart ? currentBootResumeAuthority() : initialAuthority
     if (!authority || !bootResumeAuthorityIsCurrent(authority)) return { ok: true }
-    await loadControlUiIntoCurrentWindow(
-      gateway.url,
-      () => bootResumeAuthorityIsCurrent(authority),
-    )
+    await loadDesktopRendererIntoCurrentWindow()
+    if (!bootResumeAuthorityIsCurrent(authority)) return { ok: true }
+    sendBootStatus('ready')
     return { ok: true }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -13296,12 +13485,11 @@ ipcMain.handle('desktop:boot:retry', async () => {
       pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
     })
     sendBootError(message)
-    await restoreMainWindowToBootPage()
+    publishGatewayConnection()
     return { ok: false, error: message }
   }
   clearReusableGatewayState()
   bootError = null
-  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
 
   void openOrResumeDesktopApp()
   return { ok: true }
@@ -13679,6 +13867,7 @@ if (!gotSingleInstanceLock) {
 
   void app.whenReady().then(async () => {
     app.name = 'OpenSquilla'
+    installDesktopRendererProtocol()
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
     createWindowsTray()

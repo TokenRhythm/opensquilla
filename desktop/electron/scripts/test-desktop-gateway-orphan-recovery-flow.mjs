@@ -22,13 +22,13 @@ const repoRoot = resolve(packageRoot, '../..')
 
 // Keep these phase budgets aligned with the product lifecycle in main.ts:
 // orphan recovery can legitimately spend up to 80s releasing the verified
-// predecessor, Gateway health owns a 120s cold-start budget, and Control UI
-// readiness has a final 45s route budget. A phase shares one deadline instead
+// predecessor, Gateway health owns a 120s cold-start budget, and the Desktop
+// renderer has a final 45s route budget. A phase shares one deadline instead
 // of accidentally receiving a fresh timeout for every individual assertion.
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
-const CONTROL_UI_ROUTE_TIMEOUT_MS = 45_000
+const DESKTOP_RENDERER_READY_TIMEOUT_MS = 45_000
 const INITIAL_DESKTOP_STARTUP_BUDGET_MS = (
-  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + CONTROL_UI_ROUTE_TIMEOUT_MS
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + DESKTOP_RENDERER_READY_TIMEOUT_MS
 )
 const ORPHAN_RECOVERY_STARTUP_BUDGET_MS = (
   VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS
@@ -207,7 +207,7 @@ function processAlive(pid) {
   }
 }
 
-async function waitForControlUi(app, userDataDir, phase) {
+async function waitForDesktopRenderer(app, userDataDir, phase) {
   let page
   try {
     page = await app.firstWindow({ timeout: phase.remainingMs('first-window') })
@@ -215,11 +215,22 @@ async function waitForControlUi(app, userDataDir, phase) {
     throw await phaseError('step=first-window', app, userDataDir, phase, error)
   }
   await waitFor(() => {
-    assertAppRunning(app, phase, 'control-ui-route')
-    return page.url().includes('/control/')
-  }, 'Desktop Control UI', phase.remainingMs('control-ui-route'), () => (
+    assertAppRunning(app, phase, 'desktop-renderer-route')
+    return page.url().startsWith('opensquilla-app://desktop/')
+  }, 'Desktop renderer', phase.remainingMs('desktop-renderer-route'), () => (
     phaseDiagnostics(app, userDataDir, phase)
   ))
+  await waitFor(
+    async () => {
+      assertAppRunning(app, phase, 'gateway-readiness')
+      return (await page.evaluate(
+        () => window.opensquillaDesktop?.getGatewayConnection?.(),
+      ))?.status === 'ready'
+    },
+    'Desktop Gateway readiness',
+    phase.remainingMs('gateway-readiness'),
+    () => phaseDiagnostics(app, userDataDir, phase),
+  )
   return page
 }
 
@@ -324,7 +335,7 @@ try {
     INITIAL_DESKTOP_STARTUP_BUDGET_MS,
   )
   firstApp = await launchDesktop(initialStartup, 'electron-launch')
-  await waitForControlUi(firstApp, userDataDir, initialStartup)
+  await waitForDesktopRenderer(firstApp, userDataDir, initialStartup)
   firstOwnershipDir = await ownershipDirectory(userDataDir, firstApp, initialStartup)
   const firstLoaded = loadDesktopGatewayOwnershipRecord(firstOwnershipDir)
   assert.equal(firstLoaded.status, 'valid')
@@ -383,7 +394,7 @@ try {
     ORPHAN_RECOVERY_STARTUP_BUDGET_MS,
   )
   secondApp = await launchDesktop(orphanRecoveryStartup, 'electron-relaunch')
-  await waitForControlUi(secondApp, userDataDir, orphanRecoveryStartup)
+  await waitForDesktopRenderer(secondApp, userDataDir, orphanRecoveryStartup)
   const secondOwnershipDir = await ownershipDirectory(
     userDataDir,
     secondApp,
