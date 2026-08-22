@@ -102,9 +102,17 @@ class _StopProvider:
                 encoding="utf-8",
             )
             parent_script.write_text(
+                "import pathlib\n"
                 "import subprocess\n"
                 "import sys\n"
-                f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n",
+                "import time\n"
+                f"child_pid = pathlib.Path({str(child_pid)!r})\n"
+                f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n"
+                "deadline = time.monotonic() + 10\n"
+                "while not child_pid.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.05)\n"
+                "if not child_pid.exists():\n"
+                "    raise RuntimeError('child did not publish its pid')\n",
                 encoding="utf-8",
             )
             yield ToolUseStartEvent(
@@ -460,10 +468,7 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
         assert not (evidence / "descendant-survived").exists()
 
         await _wait_for_health(port, process, gateway_log)
-        next_frames = [
-            frame
-            async for frame in client.send_message(session_key, "run after Stop")
-        ]
+        next_frames = [frame async for frame in client.send_message(session_key, "run after Stop")]
         assert any("NEXT_TASK_OK" in str(frame) for frame in next_frames)
         await _wait_for_health(port, process, gateway_log)
         assert process.poll() is None
