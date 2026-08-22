@@ -649,6 +649,8 @@ export interface UseChatHistoryOptions {
   lastHeaderDay: Ref<string>
   preserveLiveTail?: Ref<boolean>
   autoScroll?: Ref<boolean>
+  /** Invalidates deferred anchor work when the reused chat viewport changes session. */
+  scrollEpoch?: Ref<number>
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
 }
@@ -943,6 +945,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
+    const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
     cancelAnchorStabilization()
     const historyStateBeforeLoad = historyState.value
@@ -970,7 +973,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         recoveryError: params.prepend ? historyState.value.recoveryError : false,
       }
     }
-    const isCurrentRequest = () => key === options.sessionKey.value && requestSeq === historyRequestSeq
+    const isCurrentRequest = () => (
+      key === options.sessionKey.value
+      && requestSeq === historyRequestSeq
+      && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
+    )
     const restoreSilentBackgroundState = () => {
       failedHistoryRequest = failedHistoryRequestBeforeLoad
       historyState.value = historyStateBeforeLoad
@@ -1276,12 +1283,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       if (params.prepend) {
         await nextTick()
+        if (!isCurrentRequest()) return { ok: false, cancelled: true }
         if (prependAnchor) {
           restoreMessageAnchor(prependAnchor)
           stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
             isCurrent: () => options.sessionKey.value === key
               && historySessionKey.value === key
-              && historyRequestSeq === requestSeq,
+              && historyRequestSeq === requestSeq
+              && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
+              && options.threadRef?.value === prependContainer,
           })
         } else if (prependContainer) {
           applyProgrammaticScroll(prependContainer, () => {

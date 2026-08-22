@@ -908,6 +908,11 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function resetLiveTurnState() {
+    // Session switches can happen while a render frame or fallback timer is
+    // waiting to flush the previous live turn. Cancel it before clearing the
+    // stream state so the old session cannot request a scroll in the next
+    // session's reused transcript element.
+    clearRenderTimer()
     hideThinkingIndicator()
     clearStreamActivity()
     clearStreamIdleTimer()

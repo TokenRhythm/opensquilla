@@ -106,16 +106,25 @@
         <div
           ref="threadRef"
           class="chat-thread"
-          :class="{ 'chat-thread--reading-history': !autoScroll }"
+          :data-session-key="sessionKey"
+          :class="{
+            'chat-thread--reading-history': !autoScroll,
+            'chat-thread--nonvirtualized': messageListRef && !messageListRef.isVirtualized(),
+          }"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
           :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
           @wheel.passive="onThreadWheel"
+          @touchstart.passive="onThreadTouchStart"
           @touchmove.passive="onThreadTouchMove"
-          @pointerdown="markThreadScrollIntent('either')"
+          @touchend.passive="onThreadTouchEnd"
+          @touchcancel.passive="onThreadTouchEnd"
+          @pointerdown="onThreadPointerDown"
           @pointermove="onThreadPointerMove"
+          @pointerup="onThreadPointerEnd"
+          @pointercancel="onThreadPointerEnd"
           @keydown="onThreadScrollKeydown"
         >
         <template v-if="isNewChatLanding">
@@ -202,6 +211,7 @@
           :plan-actions-disabled="planActionsDisabled"
           :is-streaming="isStreaming"
           :follow-live-edge="autoScroll"
+          :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
@@ -615,6 +625,10 @@
       v-if="dockedPlanQuestionnaire"
       class="plan-questionnaire-dock"
       @wheel="handlePlanQuestionnaireWheel"
+      @touchstart.passive="onPlanQuestionnaireTouchStart"
+      @touchmove="onPlanQuestionnaireTouchMove"
+      @touchend.passive="onPlanQuestionnaireTouchEnd"
+      @touchcancel.passive="onPlanQuestionnaireTouchEnd"
     >
       <ClarifyCard
         :request="dockedPlanQuestionnaire"
@@ -1012,7 +1026,7 @@ import {
   artifactUsesWorkbenchPreview,
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
-import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
+import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
@@ -1023,6 +1037,7 @@ import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
   applyProgrammaticScroll,
+  clearProgrammaticScroll,
   consumeProgrammaticScroll,
 } from '@/utils/chat/scrollMutation'
 import {
@@ -1064,7 +1079,14 @@ import {
 import { createPendingInputWal } from '@/utils/chat/pendingInputWal'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
-import { handoffPlanQuestionnaireWheel } from '@/utils/chat/planQuestionnaireWheel'
+import {
+  handoffPlanQuestionnaireTouch,
+  handoffPlanQuestionnaireWheel,
+} from '@/utils/chat/planQuestionnaireWheel'
+import {
+  getChatWheelDirection,
+  resolveChatWheelOwnership,
+} from '@/utils/chat/chatScrollOwnership'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatHistoryRecoveryState,
@@ -1363,18 +1385,69 @@ const inputText = ref('')
 const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
+// Every session gets a monotonically increasing scroll epoch. Any queued
+// layout/render callback from an older epoch must become a no-op; the DOM node
+// for the thread is intentionally reused so focus and native scrolling remain
+// stable during route changes.
+const scrollEpoch = ref(0)
+let sessionScrollSwitching = false
+let sessionScrollInputEpoch: number | null = null
+let initialSessionPinFrame: number | null = null
+let sessionScrollBaseline: {
+  top: number
+  height: number
+  clientHeight: number
+} | null = null
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
 const LIVE_EDGE_EPSILON_PX = 2
 const SCROLL_DIRECTION_EPSILON_PX = 0.5
 let lastObservedThreadScrollTop: number | null = null
 let readerMovingAway = false
+let scrollDiagnosticFrame = 0
+
+let activeTouchIdentifier: number | null = null
+let touchStartX = 0
+let touchStartY = 0
+let questionnaireTouch: { identifier: number, x: number, y: number } | null = null
+let activePointerId: number | null = null
+let pointerStartX = 0
+let pointerStartY = 0
+// Native scrollbar drags and middle-button auto-scroll may emit scroll events
+// without a wheel/touch/keyboard event on the thread. Keep a short-lived
+// pointer marker so those source-less moves can interrupt explicit navigation
+// without mistaking smooth-scroll frames for reader input.
+let sourceLessScrollPointerId: number | null = null
+let activeHistoryNavigationEpoch: number | null = null
+let activeHistoryNavigationSessionKey = ''
+let activeThreadNavigationCancel: (() => void) | null = null
+let activeThreadNavigationTimer: number | null = null
 
 function resetReaderScrollTracking() {
   lastObservedThreadScrollTop = null
   readerMovingAway = false
 }
 
-watch(sessionKey, resetReaderScrollTracking, { flush: 'sync' })
+function recordChatScrollDiagnostic(
+  source: string,
+  writer: string,
+  container: HTMLElement,
+  beforeScrollTop: number | null,
+) {
+  if (!import.meta.env.DEV || typeof console === 'undefined') return
+  const afterScrollTop = container.scrollTop
+  if (beforeScrollTop === afterScrollTop && source !== 'programmatic') return
+  console.debug('[chat-scroll]', {
+    epoch: scrollEpoch.value,
+    sessionKey: sessionKey.value,
+    source,
+    writer,
+    beforeScrollTop,
+    afterScrollTop,
+    bottomGap: container.scrollHeight - afterScrollTop - container.clientHeight,
+    frame: ++scrollDiagnosticFrame,
+  })
+}
+
 watch(autoScroll, following => {
   if (following) readerMovingAway = false
 }, { flush: 'sync' })
@@ -2155,6 +2228,7 @@ const chatHistory = useChatHistory({
   lastHeaderDay,
   preserveLiveTail: preserveHistoryLiveTail,
   autoScroll,
+  scrollEpoch,
   stripTimePrefix,
   scrollToBottom,
 })
@@ -2169,6 +2243,99 @@ const {
   cancelActiveHistory,
   cleanup: cleanupHistory,
 } = chatHistory
+
+function cancelInitialSessionPin() {
+  if (initialSessionPinFrame !== null) {
+    cancelAnimationFrame(initialSessionPinFrame)
+    initialSessionPinFrame = null
+  }
+}
+
+function beginSessionScrollEpoch() {
+  cancelActiveThreadNavigation()
+  scrollEpoch.value += 1
+  sessionScrollSwitching = true
+  sessionScrollInputEpoch = null
+  sessionScrollBaseline = threadRef.value
+    ? {
+        top: threadRef.value.scrollTop,
+        height: threadRef.value.scrollHeight,
+        clientHeight: threadRef.value.clientHeight,
+      }
+    : null
+  cancelInitialSessionPin()
+  cancelTailLayoutPin()
+  activeTouchIdentifier = null
+  questionnaireTouch = null
+  activePointerId = null
+  sourceLessScrollPointerId = null
+  activeHistoryNavigationEpoch = null
+  activeHistoryNavigationSessionKey = ''
+  conversationMinimapRef.value?.cancelNavigation()
+  historyNavigationScrollLock.finish()
+  cancelAnchorStabilization()
+  resetReaderScrollTracking()
+  clearPendingComposerScrollIntent()
+  if (threadRef.value) clearProgrammaticScroll(threadRef.value)
+  if (composerDockPinFrame !== null) {
+    cancelAnimationFrame(composerDockPinFrame)
+    composerDockPinFrame = null
+  }
+  // The selected product policy is that every newly opened session starts at
+  // its live edge. A pre-pin reader gesture is recorded below and takes
+  // precedence over this one initial pin.
+  autoScroll.value = true
+}
+
+function scheduleInitialSessionPin(epoch: number) {
+  cancelInitialSessionPin()
+  void nextTick(() => {
+    if (
+      epoch !== scrollEpoch.value
+      || !sessionScrollSwitching
+      || sessionScrollInputEpoch === epoch
+    ) {
+      if (epoch === scrollEpoch.value) sessionScrollSwitching = false
+      return
+    }
+    initialSessionPinFrame = requestAnimationFrame(() => {
+      initialSessionPinFrame = null
+      if (
+        epoch !== scrollEpoch.value
+        || sessionScrollInputEpoch === epoch
+        || (!isNewChatLanding.value && sessionKey.value !== historySessionKey.value)
+      ) {
+        if (epoch === scrollEpoch.value) sessionScrollSwitching = false
+        return
+      }
+      const thread = threadRef.value
+      if (thread && bottomSentinelRef.value) {
+        const gap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+        if (gap > LIVE_EDGE_EPSILON_PX) {
+          applyProgrammaticScroll(thread, () => {
+            thread.scrollTop = thread.scrollHeight
+          })
+        }
+      }
+      sessionScrollSwitching = false
+    })
+  })
+}
+
+watch(sessionKey, beginSessionScrollEpoch, { flush: 'sync' })
+watch(
+  () => [sessionKey.value, historySessionKey.value, historyState.value.initialLoadStatus] as const,
+  ([activeKey, loadedKey, status]) => {
+    if (
+      !sessionScrollSwitching
+      || !activeKey
+      || activeKey !== loadedKey
+      || (status !== 'ready' && status !== 'error')
+    ) return
+    scheduleInitialSessionPin(scrollEpoch.value)
+  },
+  { flush: 'post' },
+)
 planMutationAccepted = () => scheduleHistorySync()
 
 const steerDelivery = useChatSteerDelivery({
@@ -3407,7 +3574,78 @@ const dockedPlanQuestionnaire = computed(() => (
 ))
 
 function handlePlanQuestionnaireWheel(event: WheelEvent) {
-  handoffPlanQuestionnaireWheel(event, threadRef.value)
+  const thread = threadRef.value
+  if (!thread) return
+  // The questionnaire may own the gesture until it reaches an edge. Treat a
+  // gesture that is handed off to the transcript as reader input before the
+  // helper writes scrollTop; some engines emit that scroll event synchronously.
+  const direction = getChatWheelDirection(
+    {
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      deltaMode: event.deltaMode,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      target: event.target,
+      composedPath: () => event.composedPath(),
+      defaultPrevented: false,
+    },
+    thread.clientHeight,
+  )
+  if (!direction) return
+  cancelTailLayoutPin()
+  noteSessionScrollInput()
+  interruptHistoryNavigationForReader()
+  markThreadScrollIntent(direction)
+  const forwarded = handoffPlanQuestionnaireWheel(event, thread)
+  if (!forwarded) {
+    clearPendingComposerScrollIntent()
+    return
+  }
+  if (direction === 'up') pauseFollowingForUpwardIntent()
+}
+
+function onPlanQuestionnaireTouchStart(event: TouchEvent) {
+  if (event.touches.length !== 1) {
+    questionnaireTouch = null
+    return
+  }
+  const touch = event.touches[0]
+  if (!touch) return
+  questionnaireTouch = {
+    identifier: touch.identifier,
+    x: touch.clientX,
+    y: touch.clientY,
+  }
+}
+
+function onPlanQuestionnaireTouchMove(event: TouchEvent) {
+  const start = questionnaireTouch
+  const thread = threadRef.value
+  if (!start || !thread || event.touches.length !== 1) return
+  const touch = Array.from(event.touches).find(item => item.identifier === start.identifier)
+  if (!touch) return
+  const deltaX = touch.clientX - start.x
+  const deltaY = start.y - touch.clientY
+  if (Math.abs(deltaY) <= 2 || Math.abs(deltaX) >= Math.abs(deltaY)) return
+  const direction = deltaY > 0 ? 'up' : 'down'
+  cancelTailLayoutPin()
+  noteSessionScrollInput()
+  interruptHistoryNavigationForReader()
+  // Mark before the helper writes scrollTop: the resulting scroll event is
+  // synchronous in some engines and must be classified as a user handoff.
+  markThreadScrollIntent(direction)
+  const forwarded = handoffPlanQuestionnaireTouch(event, thread, start)
+  if (!forwarded) {
+    clearPendingComposerScrollIntent()
+    return
+  }
+  if (direction === 'up') pauseFollowingForUpwardIntent()
+}
+
+function onPlanQuestionnaireTouchEnd() {
+  questionnaireTouch = null
 }
 
 const rpcEventHandlers = useChatRpcEventHandlers({
@@ -3606,18 +3844,23 @@ const visiblePendingInterruptKeys = computed(() => {
 async function focusPendingApprovalCard() {
   const request = appStore.approvalFocusRequest
   if (!request || request.sessionKey !== sessionKey.value) return
+  const requestScrollEpoch = scrollEpoch.value
 
   await nextTick()
   if (
     appStore.approvalFocusRequest?.requestId !== request.requestId
     || request.sessionKey !== sessionKey.value
+    || requestScrollEpoch !== scrollEpoch.value
   ) return
 
   const card = [...(threadRef.value?.querySelectorAll<HTMLElement>('[data-approval-id]') ?? [])]
     .find(element => element.dataset.approvalId === request.approvalId)
   if (!card) return
 
-  card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  const reduceMotion = typeof window !== 'undefined'
+    && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  beginActiveThreadNavigation(!reduceMotion)
+  card.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' })
   card.focus({ preventScroll: true })
   appStore.clearApprovalFocusRequest(request.requestId)
 }
@@ -3647,6 +3890,7 @@ function preserveTerminalAnswerAnchor() {
   if (!elementAnchor && !textAnchor) return
 
   const ownerSessionKey = sessionKey.value
+  const ownerScrollEpoch = scrollEpoch.value
   const guard = createScrollHandoffGuard(container)
   const previousRows = Array.from(
     container.querySelectorAll<HTMLElement>('.chat-message-list__row'),
@@ -3657,6 +3901,7 @@ function preserveTerminalAnswerAnchor() {
   const restore = () => {
     if (
       sessionKey.value !== ownerSessionKey
+      || scrollEpoch.value !== ownerScrollEpoch
       || isStreaming.value
       || autoScroll.value
       || threadRef.value !== container
@@ -3800,6 +4045,7 @@ function scrollToStepCard(toolUseId: string) {
   if (card && typeof (card as HTMLElement).scrollIntoView === 'function') {
     const reduceMotion = typeof window !== 'undefined'
       && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    beginActiveThreadNavigation(!reduceMotion)
     ;(card as HTMLElement).scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' })
   }
 }
@@ -3821,6 +4067,108 @@ let chatViewDisposed = false
 let composerDockResizeObserver: ResizeObserver | null = null
 let composerDockPinFrame: number | null = null
 let lastComposerDockHeight = -1
+let tailResizeObserver: ResizeObserver | null = null
+let tailMutationObserver: MutationObserver | null = null
+let tailLayoutPinFrame: number | null = null
+
+function cancelTailLayoutPin() {
+  if (tailLayoutPinFrame !== null) {
+    cancelAnimationFrame(tailLayoutPinFrame)
+    tailLayoutPinFrame = null
+  }
+}
+
+function queueTailLayoutPin() {
+  const thread = threadRef.value
+  if (!thread || tailLayoutPinFrame !== null) return
+  const epoch = scrollEpoch.value
+  const key = sessionKey.value
+  tailLayoutPinFrame = requestAnimationFrame(() => {
+    tailLayoutPinFrame = null
+    if (
+      epoch !== scrollEpoch.value
+      || key !== sessionKey.value
+      || threadRef.value !== thread
+      || !autoScroll.value
+    ) return
+    const gap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+    // Keep the established 2px live-edge contract and avoid another scroll
+    // event when a late image/font/layout change did not move the edge.
+    if (gap <= LIVE_EDGE_EPSILON_PX) return
+    applyProgrammaticScroll(thread, () => {
+      thread.scrollTop = thread.scrollHeight
+    })
+  })
+}
+
+function bindTailLayoutObservers() {
+  tailResizeObserver?.disconnect()
+  tailResizeObserver = null
+  tailMutationObserver?.disconnect()
+  tailMutationObserver = null
+  cancelTailLayoutPin()
+
+  const thread = threadRef.value
+  if (!thread) return
+  const epoch = scrollEpoch.value
+  const key = sessionKey.value
+
+  if (typeof ResizeObserver !== 'undefined') {
+    try {
+      const observer = new ResizeObserver(entries => {
+        if (
+          epoch !== scrollEpoch.value
+          || key !== sessionKey.value
+          || threadRef.value !== thread
+        ) return
+        // Observe only the thread's direct children. Their own components
+        // already coalesce internal changes; watching the entire subtree would
+        // turn every streamed token into an independent layout task.
+        if (entries.length > 0) {
+          queueTailLayoutPin()
+        }
+      })
+      for (const child of Array.from(thread.children)) {
+        if (!(child instanceof HTMLElement)) continue
+        try {
+          // `border-box` is intentionally omitted for older WebViews that do
+          // not implement ResizeObserver's box options; the default content
+          // box still provides the height-change signal we need.
+          observer.observe(child)
+        } catch {
+          // A single display:contents/legacy host must not disable observation
+          // for the remaining direct children.
+        }
+      }
+      tailResizeObserver = observer
+    } catch {
+      // Older WebViews may expose ResizeObserver but reject an observation;
+      // the existing ChatMessageList/Composer observers remain the fallback.
+      tailResizeObserver = null
+    }
+  }
+
+  if (typeof MutationObserver !== 'undefined') {
+    try {
+      const observer = new MutationObserver(records => {
+        if (
+          epoch !== scrollEpoch.value
+          || key !== sessionKey.value
+          || threadRef.value !== thread
+        ) return
+        if (records.some(record => record.type === 'childList' && record.target === thread)) {
+          // Rebind to newly mounted direct children, then let their ResizeObserver
+          // report any late image/font/fold growth in the next frame.
+          bindTailLayoutObservers()
+        }
+      })
+      observer.observe(thread, { childList: true })
+      tailMutationObserver = observer
+    } catch {
+      tailMutationObserver = null
+    }
+  }
+}
 
 /* ── Computed ──────────────────────────────────────────────────────── */
 
@@ -3837,6 +4185,11 @@ const isNewChatLanding = computed(() => {
 })
 
 watch(isNewChatLanding, resetComposerRetraction, { flush: 'sync' })
+watch(isNewChatLanding, landing => {
+  if (landing && sessionScrollSwitching) {
+    scheduleInitialSessionPin(scrollEpoch.value)
+  }
+}, { flush: 'post' })
 
 const historyRecoveryState = computed(() => {
   return resolveChatHistoryRecoveryState({
@@ -4609,6 +4962,9 @@ async function openDeliverables() {
 function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
   const reduceMotion = typeof window !== 'undefined'
     && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  const card = findArtifactCard(threadRef.value, artifact)
+  if (!card) return false
+  beginActiveThreadNavigation(!reduceMotion)
   return focusArtifactInTranscript(
     threadRef.value,
     artifact,
@@ -5204,28 +5560,81 @@ function shareTitle(): string {
 /* ── Streaming ─────────────────────────────────────────────────────── */
 
 function scrollToBottom() {
+  const epoch = scrollEpoch.value
+  const key = sessionKey.value
   nextTick(() => {
     // A stream/event may request a follow while the reader is at the live edge,
     // then the reader can scroll up before Vue applies this next-tick callback.
     // Re-check here so that queued automatic scrolls never override that choice.
-    if (threadRef.value && bottomSentinelRef.value && autoScroll.value) {
-      // The floating composer is represented by bottom padding after the
-      // sentinel. scrollIntoView() aligns the sentinel but leaves that padding
-      // below the viewport, so the live answer remains hidden under the dock
-      // and the geometric bottom gap equals the composer height. Scroll the
-      // container itself to its true maximum instead.
-      applyProgrammaticScroll(threadRef.value, () => {
-        threadRef.value!.scrollTop = threadRef.value!.scrollHeight
-      })
-    }
+    if (
+      epoch !== scrollEpoch.value
+      || key !== sessionKey.value
+      || !threadRef.value
+      || !bottomSentinelRef.value
+      || !autoScroll.value
+    ) return
+    // The floating composer is represented by bottom padding after the
+    // sentinel. scrollIntoView() aligns the sentinel but leaves that padding
+    // below the viewport, so the live answer remains hidden under the dock
+    // and the geometric bottom gap equals the composer height. Scroll the
+    // container itself to its true maximum instead.
+    const thread = threadRef.value
+    const gap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+    if (gap <= LIVE_EDGE_EPSILON_PX) return
+    applyProgrammaticScroll(thread, () => {
+      thread.scrollTop = thread.scrollHeight
+    })
   })
 }
 
 function onThreadScroll() {
   const el = threadRef.value
   if (!el) return
+  const observedBefore = lastObservedThreadScrollTop
   const currentScrollTop = el.scrollTop
   const scrollMutation = consumeProgrammaticScroll(el)
+  if (!scrollMutation?.matched) cancelTailLayoutPin()
+  if (sessionScrollSwitching) {
+    const baseline = sessionScrollBaseline
+    const metrics = {
+      top: currentScrollTop,
+      height: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }
+    lastObservedThreadScrollTop = currentScrollTop
+    // A native scrollbar drag/middle-button auto-scroll has no reliable input
+    // event on the thread. Treat it as user input only when the scroll range is
+    // otherwise unchanged; layout/hydration changes normally alter height and
+    // therefore remain eligible for the one initial live-edge pin.
+    if (
+      !scrollMutation?.matched
+      && baseline
+      && baseline.height === metrics.height
+      && baseline.clientHeight === metrics.clientHeight
+      && Math.abs(metrics.top - baseline.top) > SCROLL_DIRECTION_EPSILON_PX
+    ) {
+      noteSessionScrollInput()
+      const gap = metrics.height - metrics.top - metrics.clientHeight
+      if (gap > LIVE_EDGE_EPSILON_PX) {
+        // A native scrollbar drag or middle-button auto-scroll has no input
+        // event of its own. Once it moves the switched-in session away from
+        // the live edge, keep following paused just like a wheel/touch gesture.
+        readerMovingAway = true
+        autoScroll.value = false
+      } else {
+        readerMovingAway = false
+        autoScroll.value = true
+      }
+    }
+    sessionScrollBaseline = metrics
+    recordChatScrollDiagnostic(
+      scrollMutation?.matched ? 'programmatic' : 'session-switch',
+      scrollMutation?.matched ? 'applyProgrammaticScroll' : 'browser-or-user',
+      el,
+      observedBefore,
+    )
+    return
+  }
   const previousScrollTop = scrollMutation?.expectedScrollTop
     ?? lastObservedThreadScrollTop
   lastObservedThreadScrollTop = currentScrollTop
@@ -5235,8 +5644,12 @@ function onThreadScroll() {
   // write sites, so every other position change belongs to the reader.
   const programmatic = scrollMutation?.matched ?? false
   const intent = programmatic ? null : currentThreadScrollIntent()
-  if (!programmatic && historyNavigationScrollLock.locked && intent !== null) {
-    interruptHistoryNavigationForReader()
+  if (!programmatic && historyNavigationScrollLock.locked) {
+    const moved = previousScrollTop !== null
+      && Math.abs(currentScrollTop - previousScrollTop) > SCROLL_DIRECTION_EPSILON_PX
+    if (intent !== null || (sourceLessScrollPointerId !== null && moved)) {
+      interruptHistoryNavigationForReader()
+    }
   } else if (!programmatic && !historyNavigationScrollLock.locked) {
     const movedUp = previousScrollTop !== null
       && currentScrollTop < previousScrollTop - SCROLL_DIRECTION_EPSILON_PX
@@ -5271,6 +5684,12 @@ function onThreadScroll() {
     }
   }
   if (isNewChatLanding.value || !composerFxEnabled.value) {
+    recordChatScrollDiagnostic(
+      programmatic ? 'programmatic' : intent ? `user-${intent}` : 'browser-or-user',
+      programmatic ? 'applyProgrammaticScroll' : 'onThreadScroll',
+      el,
+      observedBefore,
+    )
     resetComposerRetraction()
     return
   }
@@ -5283,62 +5702,159 @@ function onThreadScroll() {
     navigationLocked: historyNavigationScrollLock.locked,
   })
   if (composerCollapsed.value !== wasCollapsed) clearPendingComposerScrollIntent()
+  recordChatScrollDiagnostic(
+    programmatic ? 'programmatic' : intent ? `user-${intent}` : 'browser-or-user',
+    programmatic ? 'applyProgrammaticScroll' : 'onThreadScroll',
+    el,
+    observedBefore,
+  )
 }
 
 function onThreadWheel(event: WheelEvent) {
-  // Browser zoom gestures surface as ctrl+wheel (including trackpad pinch in
-  // Chromium) but do not represent reader movement inside the transcript.
-  if (event.deltaY === 0 || event.ctrlKey) return
   const el = threadRef.value
   if (!el) return
+  // A nested scroller may already have called preventDefault(). It still is a
+  // real reader gesture and must interrupt an in-flight minimap navigation;
+  // ownership below continues to respect the consumed event.
+  const direction = getChatWheelDirection(
+    {
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      deltaMode: event.deltaMode,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      target: event.target,
+      composedPath: () => event.composedPath(),
+      defaultPrevented: false,
+    },
+    el.clientHeight,
+  )
+  if (!direction) return
+  cancelTailLayoutPin()
+  noteSessionScrollInput()
   // Any wheel gesture inside the transcript takes ownership away from an
   // in-flight minimap animation, including gestures consumed by a nested
   // reasoning/tool scroller. Outside navigation, only a wheel that reaches the
   // thread itself may pause live-edge following.
-  if (historyNavigationScrollLock.locked && !event.defaultPrevented) {
+  if (historyNavigationScrollLock.locked) {
     interruptHistoryNavigationForReader()
   }
   if (!threadConsumesWheel(event, el)) return
-  markThreadScrollIntent(event.deltaY < 0 ? 'up' : 'down')
-  if (event.deltaY < 0) pauseFollowingForUpwardIntent()
+  markThreadScrollIntent(direction)
+  if (direction === 'up') pauseFollowingForUpwardIntent()
 }
 
 function threadConsumesWheel(event: WheelEvent, thread: HTMLElement): boolean {
-  if (event.defaultPrevented) return false
-  const canScroll = (element: HTMLElement) => event.deltaY < 0
-    ? element.scrollTop > SCROLL_DIRECTION_EPSILON_PX
-    : element.scrollTop + element.clientHeight
-      < element.scrollHeight - SCROLL_DIRECTION_EPSILON_PX
-
-  for (const target of event.composedPath()) {
-    if (target === thread) return canScroll(thread)
-    if (!(target instanceof HTMLElement)) continue
-    const style = getComputedStyle(target)
-    const scrollable = ['auto', 'scroll', 'overlay'].includes(style.overflowY)
-      && target.scrollHeight > target.clientHeight + SCROLL_DIRECTION_EPSILON_PX
-    if (!scrollable) continue
-    if (canScroll(target)) return false
-    if (style.overscrollBehaviorY === 'contain' || style.overscrollBehaviorY === 'none') {
-      return false
-    }
-  }
-  return false
+  const ownership = resolveChatWheelOwnership(event, thread, {
+    pageHeight: thread.clientHeight,
+    epsilonPx: SCROLL_DIRECTION_EPSILON_PX,
+  })
+  return ownership?.owner === thread && ownership.canScroll
 }
 
-function onThreadTouchMove() {
-  markThreadScrollIntent('either')
+function noteSessionScrollInput() {
+  if (sessionScrollSwitching) {
+    sessionScrollInputEpoch = scrollEpoch.value
+    cancelInitialSessionPin()
+    sessionScrollSwitching = false
+  }
+}
+
+function onThreadTouchStart(event: TouchEvent) {
+  if (event.touches.length !== 1) {
+    activeTouchIdentifier = null
+    return
+  }
+  const touch = event.touches[0]
+  if (!touch) return
+  activeTouchIdentifier = touch.identifier
+  touchStartX = touch.clientX
+  touchStartY = touch.clientY
+}
+
+function onThreadTouchMove(event: TouchEvent) {
+  const thread = threadRef.value
+  if (!thread || activeTouchIdentifier === null || event.touches.length !== 1) return
+  const touch = Array.from(event.touches).find(item => item.identifier === activeTouchIdentifier)
+  if (!touch) return
+  const deltaX = touch.clientX - touchStartX
+  const deltaY = touchStartY - touch.clientY
+  if (Math.abs(deltaY) <= 2 || Math.abs(deltaX) >= Math.abs(deltaY)) return
+  const direction = deltaY > 0 ? 'up' : 'down'
+  // A single-finger vertical gesture is user input even when a nested
+  // scroller owns the movement. Cancel pending navigation/initial pin first;
+  // only the ownership result below is allowed to pause the outer follow.
+  cancelTailLayoutPin()
+  noteSessionScrollInput()
   interruptHistoryNavigationForReader()
+  const ownership = resolveChatWheelOwnership({
+    deltaX: 0,
+    deltaY: direction === 'up' ? -1 : 1,
+    defaultPrevented: event.defaultPrevented,
+    target: event.target,
+    composedPath: () => event.composedPath(),
+  }, thread, { epsilonPx: SCROLL_DIRECTION_EPSILON_PX })
+  if (ownership?.owner !== thread || !ownership.canScroll) return
+  markThreadScrollIntent(direction)
+  if (direction === 'up') pauseFollowingForUpwardIntent()
+}
+
+function onThreadTouchEnd() {
+  activeTouchIdentifier = null
+}
+
+function onThreadPointerDown(event: PointerEvent) {
+  if (event.pointerType === 'touch' || event.isPrimary === false) return
+  if (
+    event.button === 1
+    || (event.button === 0 && event.target === event.currentTarget)
+  ) {
+    sourceLessScrollPointerId = event.pointerId
+  }
+  if (event.button !== 0) return
+  activePointerId = event.pointerId
+  pointerStartX = event.clientX
+  pointerStartY = event.clientY
 }
 
 function onThreadPointerMove(event: PointerEvent) {
-  if (event.buttons !== 0 || event.pointerType === 'touch') {
-    markThreadScrollIntent('either')
-    interruptHistoryNavigationForReader()
-  }
+  if (
+    activePointerId === null
+    || event.pointerId !== activePointerId
+    || event.buttons === 0
+    || event.isPrimary === false
+  ) return
+  const deltaX = event.clientX - pointerStartX
+  const deltaY = pointerStartY - event.clientY
+  if (Math.abs(deltaY) <= 3 || Math.abs(deltaX) >= Math.abs(deltaY)) return
+  cancelTailLayoutPin()
+  noteSessionScrollInput()
+  const direction = deltaY > 0 ? 'up' : 'down'
+  interruptHistoryNavigationForReader()
+  const thread = threadRef.value
+  if (!thread) return
+  const ownership = resolveChatWheelOwnership({
+    deltaX: 0,
+    deltaY: direction === 'up' ? -1 : 1,
+    defaultPrevented: event.defaultPrevented,
+    target: event.target,
+    composedPath: () => event.composedPath(),
+  }, thread, { epsilonPx: SCROLL_DIRECTION_EPSILON_PX })
+  if (ownership?.owner !== thread || !ownership.canScroll) return
+  markThreadScrollIntent(direction)
+  if (direction === 'up') pauseFollowingForUpwardIntent()
+}
+
+function onThreadPointerEnd(event: PointerEvent) {
+  if (activePointerId === event.pointerId) activePointerId = null
+  if (sourceLessScrollPointerId === event.pointerId) sourceLessScrollPointerId = null
 }
 
 function onThreadScrollKeydown(event: KeyboardEvent) {
-  if (event.target !== event.currentTarget) return
+  // Leave browser/assistive-technology shortcuts and IME composition alone;
+  // only an unmodified navigation key should affect chat follow state.
+  if (event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return
   const up = event.key === 'ArrowUp'
     || event.key === 'PageUp'
     || event.key === 'Home'
@@ -5347,7 +5863,28 @@ function onThreadScrollKeydown(event: KeyboardEvent) {
     || event.key === 'PageDown'
     || event.key === 'End'
     || (event.key === ' ' && !event.shiftKey)
-  if (up || down) markThreadScrollIntent(up ? 'up' : 'down')
+  if (event.target !== event.currentTarget) {
+    // Independent reasoning/tool/questionnaire regions own their keyboard
+    // scroll. They still cancel a pending navigation or session pin, but must
+    // not pause the outer transcript when their own range can move.
+    const target = event.target instanceof HTMLElement ? event.target : null
+    const region = target?.closest('[role="region"][tabindex="0"]')
+    if (
+      !target
+      || region !== target
+      || (!up && !down)
+    ) return
+    cancelTailLayoutPin()
+    noteSessionScrollInput()
+    if (historyNavigationScrollLock.locked) interruptHistoryNavigationForReader()
+    return
+  }
+  if (up || down) {
+    cancelTailLayoutPin()
+    noteSessionScrollInput()
+    if (historyNavigationScrollLock.locked) interruptHistoryNavigationForReader()
+    markThreadScrollIntent(up ? 'up' : 'down')
+  }
   if (up) pauseFollowingForUpwardIntent()
 }
 
@@ -5359,12 +5896,69 @@ function pauseFollowingForUpwardIntent() {
   autoScroll.value = false
 }
 
+/**
+ * Mark a deliberate in-thread destination jump as application-owned. The
+ * lock prevents intermediate smooth-scroll frames from looking like reader
+ * input; wheel/touch/keyboard handlers can cancel it through the returned
+ * callback, and the session epoch makes a late `scrollend` harmless.
+ */
+function beginActiveThreadNavigation(smooth: boolean): () => void {
+  const thread = threadRef.value
+  const epoch = scrollEpoch.value
+  const key = sessionKey.value
+  if (activeHistoryNavigationEpoch !== null) {
+    conversationMinimapRef.value?.cancelNavigation()
+  }
+  cancelActiveThreadNavigation()
+  if (!thread) return () => {}
+
+  historyNavigationScrollLock.start()
+  let finished = false
+  const finish = () => {
+    if (finished) return
+    finished = true
+    thread.removeEventListener('scrollend', finish)
+    if (activeThreadNavigationTimer !== null) {
+      window.clearTimeout(activeThreadNavigationTimer)
+      activeThreadNavigationTimer = null
+    }
+    if (activeThreadNavigationCancel === finish) activeThreadNavigationCancel = null
+    if (epoch !== scrollEpoch.value || key !== sessionKey.value) return
+    historyNavigationScrollLock.finish()
+    syncComposerRetractionFromThread(false)
+  }
+  activeThreadNavigationCancel = finish
+  thread.addEventListener('scrollend', finish, { once: true })
+  activeThreadNavigationTimer = window.setTimeout(finish, smooth ? 1800 : 180)
+  return finish
+}
+
+function cancelActiveThreadNavigation() {
+  const thread = threadRef.value
+  if (thread && activeThreadNavigationCancel) {
+    try {
+      // Abort a native smooth scroll before releasing the lock; otherwise its
+      // late frames can continue into the next destination/session.
+      thread.scrollTo({ top: thread.scrollTop, behavior: 'auto' })
+    } catch {
+      // Older WebViews may not implement ScrollToOptions.
+    }
+  }
+  activeThreadNavigationCancel?.()
+  activeThreadNavigationCancel = null
+  if (activeThreadNavigationTimer !== null) {
+    window.clearTimeout(activeThreadNavigationTimer)
+    activeThreadNavigationTimer = null
+  }
+}
+
 function interruptHistoryNavigationForReader() {
   if (!historyNavigationScrollLock.locked) return
   const firstInterruption = historyNavigationScrollLock.interrupt()
   readerMovingAway = true
   autoScroll.value = false
   if (firstInterruption) conversationMinimapRef.value?.cancelNavigation()
+  if (firstInterruption) cancelActiveThreadNavigation()
 }
 
 function syncComposerRetractionFromThread(updateFollow = true) {
@@ -5383,12 +5977,22 @@ function syncComposerRetractionFromThread(updateFollow = true) {
 }
 
 function onHistoryNavigate() {
+  activeHistoryNavigationEpoch = scrollEpoch.value
+  activeHistoryNavigationSessionKey = sessionKey.value
   cancelAnchorStabilization()
   syncComposerRetractionFromThread()
   historyNavigationScrollLock.start()
 }
 
 function onHistoryNavigateEnd() {
+  const navigationEpoch = activeHistoryNavigationEpoch
+  const navigationSessionKey = activeHistoryNavigationSessionKey
+  activeHistoryNavigationEpoch = null
+  activeHistoryNavigationSessionKey = ''
+  if (
+    navigationEpoch !== scrollEpoch.value
+    || navigationSessionKey !== sessionKey.value
+  ) return
   const navigationInterrupted = historyNavigationScrollLock.finish()
   // Smooth-scroll frames and the final arrival are navigation, not transcript
   // browsing gestures. If the reader interrupted the motion, establish only a
@@ -5416,6 +6020,8 @@ watch(showJumpToLatest, showing => {
 
 function jumpToLatest() {
   cancelAnchorStabilization()
+  conversationMinimapRef.value?.cancelNavigation()
+  cancelActiveThreadNavigation()
   historyNavigationScrollLock.finish()
   expandComposer()
   autoScroll.value = true
@@ -5749,38 +6355,55 @@ function enterDraft() {
 
 let chatViewActive = false
 
+function bindBottomIntersectionObserver() {
+  bottomIntersectionObserver?.disconnect()
+  bottomIntersectionObserver = null
+  if (
+    typeof IntersectionObserver === 'undefined'
+    || !threadRef.value
+    || !bottomSentinelRef.value
+  ) return
+  const epoch = scrollEpoch.value
+  const key = sessionKey.value
+  const thread = threadRef.value
+  const sentinel = bottomSentinelRef.value
+  bottomIntersectionObserver = new IntersectionObserver((entries) => {
+    if (
+      epoch !== scrollEpoch.value
+      || key !== sessionKey.value
+      || threadRef.value !== thread
+      || bottomSentinelRef.value !== sentinel
+    ) return
+    const bottomGap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+    if (
+      entries.some(entry => entry.isIntersecting)
+      && bottomGap <= LIVE_EDGE_EPSILON_PX
+      && !readerMovingAway
+      && !historyNavigationScrollLock.locked
+    ) {
+      autoScroll.value = true
+    }
+  }, {
+    root: thread,
+    threshold: 1,
+  })
+  bottomIntersectionObserver.observe(sentinel)
+}
+
 onMounted(async () => {
   chatViewActive = true
   chatViewDisposed = false
-  if (
-    typeof IntersectionObserver !== 'undefined'
-    && threadRef.value
-    && bottomSentinelRef.value
-  ) {
-    bottomIntersectionObserver = new IntersectionObserver((entries) => {
-      const thread = threadRef.value
-      const bottomGap = thread
-        ? thread.scrollHeight - thread.scrollTop - thread.clientHeight
-        : Number.POSITIVE_INFINITY
-      if (
-        entries.some(entry => entry.isIntersecting)
-        && bottomGap <= LIVE_EDGE_EPSILON_PX
-        && !readerMovingAway
-        && !historyNavigationScrollLock.locked
-      ) {
-        autoScroll.value = true
-      }
-    }, {
-      root: threadRef.value,
-      threshold: 1,
-    })
-    bottomIntersectionObserver.observe(bottomSentinelRef.value)
-  }
+  // A native scrollbar drag can finish outside the thread element. Keep the
+  // source-less pointer marker from leaking into a later navigation gesture.
+  window.addEventListener('pointerup', onThreadPointerEnd)
+  window.addEventListener('pointercancel', onThreadPointerEnd)
+  bindBottomIntersectionObserver()
   const initialRouteFullPath = route.fullPath
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
   sessionKey.value = initialSession.sessionKey
+  bindTailLayoutObservers()
   let initialDraftProjectGeneration: number | null = null
   let initialAutoSendSnapshot: {
     text: string
@@ -5871,10 +6494,21 @@ onMounted(async () => {
       lastComposerDockHeight = height
       chatRootRef.value?.style.setProperty('--composer-dock-h', `${height + growth}px`)
       if (autoScroll.value && composerDockPinFrame === null) {
+        const epoch = scrollEpoch.value
+        const key = sessionKey.value
+        const scheduledThread = threadRef.value
         composerDockPinFrame = requestAnimationFrame(() => {
           composerDockPinFrame = null
           const thread = threadRef.value
-          if (thread && autoScroll.value) {
+          if (
+            thread
+            && thread === scheduledThread
+            && epoch === scrollEpoch.value
+            && key === sessionKey.value
+            && autoScroll.value
+          ) {
+            const gap = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+            if (gap <= LIVE_EDGE_EPSILON_PX) return
             applyProgrammaticScroll(thread, () => {
               thread.scrollTop = thread.scrollHeight
             })
@@ -5939,7 +6573,25 @@ onMounted(async () => {
   }
 })
 
+watch(
+  () => [sessionKey.value, bottomSentinelRef.value] as const,
+  () => {
+    void nextTick(bindBottomIntersectionObserver)
+  },
+  { flush: 'post' },
+)
+
+watch(
+  () => [sessionKey.value, threadRef.value] as const,
+  () => {
+    void nextTick(bindTailLayoutObservers)
+  },
+  { flush: 'post' },
+)
+
 onUnmounted(() => {
+  window.removeEventListener('pointerup', onThreadPointerEnd)
+  window.removeEventListener('pointercancel', onThreadPointerEnd)
   chatRouteHeaderRegistration.release()
   chatViewActive = false
   appStore.setChatLivePhase('idle')
@@ -5975,6 +6627,13 @@ onUnmounted(() => {
     cancelAnimationFrame(composerDockPinFrame)
     composerDockPinFrame = null
   }
+  cancelInitialSessionPin()
+  cancelTailLayoutPin()
+  tailResizeObserver?.disconnect()
+  tailResizeObserver = null
+  tailMutationObserver?.disconnect()
+  tailMutationObserver = null
+  if (threadRef.value) clearProgrammaticScroll(threadRef.value)
   clearPendingComposerScrollIntent()
   chatRootRef.value?.style.removeProperty('--composer-dock-h')
   // Drop any live share-preview object URL so the blob can be reclaimed.

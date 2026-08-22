@@ -12,6 +12,7 @@ function makeHistory(autoScroll = true, overrides: {
   messages?: ChatMessage[]
   preserveLiveTail?: boolean
   sessionKey?: Ref<string>
+  scrollEpoch?: Ref<number>
   threadRef?: Ref<HTMLElement | null>
   concurrentHistoryReads?: boolean
 } = {}) {
@@ -48,6 +49,7 @@ function makeHistory(autoScroll = true, overrides: {
     lastHeaderDay: ref(''),
     preserveLiveTail: ref(overrides.preserveLiveTail ?? false),
     autoScroll: ref(autoScroll),
+    scrollEpoch: overrides.scrollEpoch,
     stripTimePrefix: text => text,
     scrollToBottom,
   })
@@ -2020,6 +2022,51 @@ describe('useChatHistory scroll anchoring', () => {
     await nextTick()
 
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops a delayed prepend when the reused chat viewport enters a new epoch', async () => {
+    let resolveEarlier!: (value: ChatHistoryResponse) => void
+    const earlier = new Promise<ChatHistoryResponse>(resolve => { resolveEarlier = resolve })
+    const epoch = ref(1)
+    const thread = document.createElement('div')
+    Object.defineProperties(thread, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 900 },
+      scrollTop: { configurable: true, value: 120, writable: true },
+    })
+    const threadRef = ref<HTMLElement | null>(thread)
+    const { api, rpc } = makeHistory(false, {
+      scrollEpoch: epoch,
+      threadRef,
+      response: {
+        messages: [historyMessage('m2')],
+        has_more: true,
+        oldest_cursor: 'cursor-2',
+        newest_cursor: 'cursor-2',
+      },
+    })
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m2')],
+        has_more: true,
+        oldest_cursor: 'cursor-2',
+        newest_cursor: 'cursor-2',
+      })
+      .mockImplementationOnce(() => earlier)
+
+    await api.loadHistory()
+    const pending = api.loadEarlierHistory()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+    epoch.value = 2
+    resolveEarlier({
+      messages: [historyMessage('m1')],
+      has_more: false,
+      oldest_cursor: 'cursor-1',
+      newest_cursor: 'cursor-2',
+    })
+    await pending
+
+    expect(thread.scrollTop).toBe(120)
   })
 
   it('keeps protocol-shaped assistant documentation canonical', async () => {

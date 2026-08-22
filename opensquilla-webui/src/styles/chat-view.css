@@ -235,6 +235,13 @@
   overflow-anchor: auto;
 }
 
+/* Vue-owned fallback for WebViews without :has(): ChatView mirrors the
+   virtualizer state on the thread element so historical reflow keeps the
+   browser's native anchor in the same cases. */
+.chat-thread--reading-history.chat-thread--nonvirtualized {
+  overflow-anchor: auto;
+}
+
 /* Floating composer (existing conversation, toggle on): reserve the dock's
    measured height in the body itself. This shortens the scroll viewport so no
    visible transcript text can enter the glass panel, including while the
@@ -426,11 +433,13 @@
 .chat-jump-latest {
   position: absolute;
   bottom: calc(100% + 8px);
-  right: 12px;
+  inset-inline-end: 12px;
   z-index: 30;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-block-size: 44px;
+  min-inline-size: 44px;
   padding: 6px 12px;
   border-radius: var(--radius-full);
   border: 1px solid var(--border);
