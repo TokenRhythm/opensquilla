@@ -2984,6 +2984,15 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
         in script
     )
     assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
+    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000" in script
+    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
+    assert (
+        "createPhaseBudget(\n"
+        "    'windows-electron-child-cleanup',\n"
+        "    WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS,\n"
+        "  )"
+    ) in script
+    assert "timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS" in script
     assert "phase.remainingMs('first-window')" in script
     assert "phase.remainingMs('control-ui-route')" in script
     assert "DESKTOP_E2E_PHASE_TIMEOUT:" in script

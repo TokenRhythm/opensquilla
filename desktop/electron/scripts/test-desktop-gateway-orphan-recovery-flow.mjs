@@ -34,6 +34,8 @@ const ORPHAN_RECOVERY_STARTUP_BUDGET_MS = (
   VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS
 )
 const CRASH_EXIT_BUDGET_MS = 15_000
+const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000
+const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000
 
 function createPhaseBudget(name, timeoutMs) {
   const startedAt = Date.now()
@@ -234,7 +236,11 @@ async function stopExitedElectronChildrenOnWindows(parentPid) {
     execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', command],
-      { windowsHide: true, timeout: CRASH_EXIT_BUDGET_MS, killSignal: 'SIGKILL' },
+      {
+        windowsHide: true,
+        timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
+      },
       (error) => error ? rejectStop(error) : resolveStop(),
     )
   })
@@ -359,17 +365,21 @@ try {
   // Windows process termination does not reliably reap Chromium child
   // processes.  Target only Electron children; the detached Python Gateway is
   // intentionally left alive and verified below.
+  const electronChildCleanup = createPhaseBudget(
+    'windows-electron-child-cleanup',
+    WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS,
+  )
   await withPhaseDeadline(
     stopExitedElectronChildrenOnWindows(firstMainPid),
-    crashExit,
-    'windows-electron-child-cleanup',
+    electronChildCleanup,
+    'terminate-electron-children',
     firstApp,
     userDataDir,
   )
   assert.equal(
     await withPhaseDeadline(
       verifyDesktopGatewayOwnership(firstRecord),
-      crashExit,
+      electronChildCleanup,
       'verify-orphan-survived',
       firstApp,
       userDataDir,
