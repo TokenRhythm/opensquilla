@@ -2781,18 +2781,16 @@ async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
 
 def _gate_real_publish(
     stage: StreamConsumerStage,
-) -> tuple[threading.Event, threading.Event, threading.Event, list[threading.Thread]]:
+) -> tuple[threading.Event, threading.Event, threading.Event]:
     """Wrap the bound ``run_publish`` with an Event handshake: signal entry,
     block until released, then run the REAL publish (real ArtifactStore
     writes) and signal completion."""
     publish_started = threading.Event()
     release_publish = threading.Event()
     publish_finished = threading.Event()
-    worker_threads: list[threading.Thread] = []
     real_publish = stage._done_handler.run_publish
 
     def gated_publish(inner_inp: Any, accumulated_text: str) -> Any:
-        worker_threads.append(threading.current_thread())
         publish_started.set()
         assert release_publish.wait(timeout=5.0), "publish was never released"
         result = real_publish(inner_inp, accumulated_text)
@@ -2800,7 +2798,7 @@ def _gate_real_publish(
         return result
 
     stage._done_handler.run_publish = gated_publish  # type: ignore[method-assign]
-    return publish_started, release_publish, publish_finished, worker_threads
+    return publish_started, release_publish, publish_finished
 
 
 @pytest.mark.asyncio
@@ -2822,7 +2820,7 @@ async def test_single_cancel_records_completed_publish(tmp_path: Path) -> None:
         ]
     )
     stage, _ = _make_stage(agent_run=agent_run)
-    publish_started, release_publish, publish_finished, _ = _gate_real_publish(stage)
+    publish_started, release_publish, publish_finished = _gate_real_publish(stage)
     state = _make_state()
     inp = _make_input(state=state, tool_context=ctx)
 
@@ -2863,9 +2861,7 @@ async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> N
         ]
     )
     stage, _ = _make_stage(agent_run=agent_run)
-    publish_started, release_publish, publish_finished, worker_threads = (
-        _gate_real_publish(stage)
-    )
+    publish_started, release_publish, publish_finished = _gate_real_publish(stage)
     state = _make_state()
     inp = _make_input(state=state, tool_context=ctx)
 
@@ -2897,8 +2893,10 @@ async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> N
     # ctx.published_artifacts append happened strictly before the unwind.
     published_snapshot = list(ctx.published_artifacts)
     files_snapshot = sorted(str(p) for p in media_root.rglob("*") if p.is_file())
-    for thread in worker_threads:
-        await asyncio.to_thread(thread.join, 5.0)
+    # ``publish_task`` cannot complete until the worker callable returns. The
+    # callable runs on asyncio's long-lived default executor, so joining that
+    # worker here would either wait for executor shutdown or schedule a
+    # self-join on the same executor thread.
     for _ in range(10):
         await asyncio.sleep(0)
     assert list(ctx.published_artifacts) == published_snapshot
