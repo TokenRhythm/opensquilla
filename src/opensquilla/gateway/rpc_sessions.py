@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -231,6 +231,77 @@ async def _pending_input_enqueue_lock(
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
+
+
+def _prompt_annotation_source_only_context(context: Any) -> Any:
+    """Downgrade a PromptAnnotation turn when candidate preview is unavailable.
+
+    The autonomous ten-tool surface requires a live protocol-v4 Desktop
+    bridge: without it a writer could stage a DRAFT but could never obtain a
+    verification receipt or finish it.  Use the established source-only
+    compatibility surface instead of exposing a dead-end candidate loop.  The
+    source writer remains durable and the prompt explicitly tells the model
+    not to claim a preview verification it could not perform.
+    """
+
+    from opensquilla.gateway.artifact_contexts import (
+        PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+    )
+    from opensquilla.prompt_annotations import render_active_prompt_annotation_context
+
+    snapshots = getattr(context, "snapshots", ())
+    return replace(
+        context,
+        tool_names=PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+        request_context_prompt=(
+            render_active_prompt_annotation_context(
+                snapshots,
+                autonomous_loop=False,
+            )
+            or context.request_context_prompt
+        ),
+    )
+
+
+def _desktop_artifact_bridge_supports_candidate_loop(capabilities: Any) -> bool:
+    """Return whether the active Desktop surface can complete a candidate loop.
+
+    Protocol version alone is not enough: the v4 contract is also used for
+    non-HTML/office surfaces and for a shell whose active preview is still
+    loading.  Exposing the ten-tool contract in those states would create a
+    DRAFT that can be staged but can never obtain a verification receipt or
+    restore the canonical preview.  Require the capabilities that are stable
+    before the first candidate is bound; ``browserAct`` is intentionally not
+    required because the native surface enables it only after binding the
+    opaque candidate handle.
+    """
+
+    if capabilities is None:
+        return False
+    if isinstance(capabilities, Mapping):
+        version = capabilities.get("version")
+
+        def _flag(*names: str) -> bool:
+            return any(capabilities.get(name) is True for name in names)
+
+    else:
+        version = getattr(capabilities, "version", None)
+
+        def _flag(*names: str) -> bool:
+            return any(getattr(capabilities, name, None) is True for name in names)
+
+    values = (
+        _flag("available"),
+        _flag("browserInspect", "browser_inspect"),
+        _flag("bindCandidatePreview", "bind_candidate_preview"),
+        _flag("restoreCanonicalPreview", "restore_canonical_preview"),
+    )
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version >= 4
+        and all(values)
+    )
 
 
 def _emit_steer_metric(disposition: str, **labels: Any) -> None:
@@ -3297,6 +3368,43 @@ async def _accepted_turn_response(
         for item in accepted_prompt_annotation_ids
         if isinstance(item, str) and item.strip()
     ]
+    # A pending-input dispatch can be replayed after the staged row has been
+    # consumed.  That replay only has the ingress receipt, not the original
+    # RPC payload, so it cannot pass promptAnnotationIds directly.  Recover
+    # the immutable ids from the accepted user transcript envelope; otherwise
+    # the renderer keeps the local draft and sends it again on the next
+    # annotation turn, where preflight correctly rejects the already-SENT row.
+    if not normalized_annotation_ids and result.replayed:
+        try:
+            get_entry = getattr(storage, "get_canonical_transcript_entry", None)
+            if callable(get_entry):
+                accepted_entry = await get_entry(receipt.session_id, receipt.message_id)
+            else:
+                get_transcript = getattr(storage, "get_canonical_transcript", None)
+                if not callable(get_transcript):
+                    get_transcript = storage.get_transcript
+                entries = await get_transcript(receipt.session_id)
+                accepted_entry = next(
+                    (entry for entry in entries if entry.message_id == receipt.message_id),
+                    None,
+                )
+            content = getattr(accepted_entry, "content", None)
+            from opensquilla.prompt_annotations import (
+                prompt_annotations_from_transcript_envelope,
+            )
+
+            normalized_annotation_ids = [
+                str(snapshot["annotationId"])
+                for snapshot in prompt_annotations_from_transcript_envelope(content)
+                if isinstance(snapshot.get("annotationId"), str)
+                and snapshot["annotationId"].strip()
+            ]
+        except Exception:  # noqa: BLE001 - replay response must remain deliverable.
+            log.exception(
+                "sessions.send.accepted_annotation_recovery_failed",
+                session_id=receipt.session_id,
+                message_id=receipt.message_id,
+            )
     if normalized_annotation_ids:
         payload["acceptedPromptAnnotationIds"] = normalized_annotation_ids
 
@@ -4823,6 +4931,9 @@ async def _handle_sessions_send_impl(
         route_envelope.runtime_services["artifact_context"] = artifact_turn_context
         route_envelope.runtime_services["artifact_session"] = artifact_session_service
         route_envelope.runtime_services["artifact_event_emitter"] = artifact_event_emitter
+        preview_service = getattr(ctx, "artifact_preview_service", None)
+        if preview_service is not None:
+            route_envelope.runtime_services["artifact_preview_service"] = preview_service
         from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
 
         if (
@@ -4846,9 +4957,40 @@ async def _handle_sessions_send_impl(
                 log.warning("artifact.desktop_bridge_environment_rejected")
                 desktop_artifact_bridge = None
             if desktop_artifact_bridge is not None:
-                route_envelope.runtime_services["desktop_artifact_bridge"] = (
-                    desktop_artifact_bridge
+                # Negotiate before route construction so a legacy, unavailable,
+                # or non-HTML shell receives the source-only five-tool contract.
+                # Protocol version alone is insufficient: without an active
+                # v4 browser inspect surface plus candidate bind/restore, the
+                # ten-tool loop could stage a draft that can never be committed.
+                # Keep the useful durable source-writer compatibility path
+                # rather than exposing a candidate that can only be discarded.
+                try:
+                    bridge_capabilities = await desktop_artifact_bridge.capabilities()
+                except Exception:  # noqa: BLE001 - preserve unavailable bridge semantics
+                    bridge_capabilities = None
+                if not _desktop_artifact_bridge_supports_candidate_loop(
+                    bridge_capabilities
+                ):
+                    artifact_turn_context = _prompt_annotation_source_only_context(
+                        artifact_turn_context
+                    )
+                else:
+                    route_envelope.runtime_services["desktop_artifact_bridge"] = (
+                        desktop_artifact_bridge
+                    )
+            else:
+                # A browser-less web client must not receive the autonomous
+                # writer/finish contract.  It can still use the durable
+                # source-only editor, while the v4 Electron client gets the
+                # full candidate-preview loop above.
+                artifact_turn_context = _prompt_annotation_source_only_context(
+                    artifact_turn_context
                 )
+            # The initial runtime-service entry is made before bridge
+            # negotiation.  Replace it after any downgrade so routing creates
+            # the matching legacy mutation controller, not a dead candidate
+            # controller.
+            route_envelope.runtime_services["artifact_context"] = artifact_turn_context
     if (
         route_envelope.source_kind.value == "web"
         and route_envelope.interaction_mode.value == "interactive"
@@ -4949,6 +5091,11 @@ async def _handle_sessions_send_impl(
             "client_request_id": ingress_identity.client_request_id,
             "client_message_id": client_message_id,
             "surface_id": surface_id,
+            # The direct RPC execution path constructs ToolContext before a
+            # TaskRuntime record exists. Keep the durable turn identity in the
+            # envelope so PromptAnnotation candidate loops never fall back to
+            # the legacy one-shot writer merely because task metadata is late.
+            "task_id": turn_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
             **(
@@ -6783,6 +6930,11 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
         result["displayText"] = display_text
     if payload.get("confirmedPlainText") is True:
         result["confirmedPlainText"] = True
+    prompt_annotation_ids = payload.get("promptAnnotationIds")
+    if isinstance(prompt_annotation_ids, list) and prompt_annotation_ids:
+        result["promptAnnotationIds"] = [
+            item for item in prompt_annotation_ids if isinstance(item, str)
+        ][:16]
     initial_routing_mode = payload.get("initialRoutingMode")
     if isinstance(initial_routing_mode, str):
         result["initialRoutingMode"] = initial_routing_mode
@@ -6849,6 +7001,28 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     if not isinstance(attachments, list):
         raise ValueError("params.attachments must be an array")
 
+    raw_prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
+    )
+    if raw_prompt_annotation_ids is None:
+        prompt_annotation_ids: list[str] = []
+    else:
+        if not isinstance(raw_prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if len(raw_prompt_annotation_ids) > 16:
+            raise ValueError("params.promptAnnotationIds supports at most 16 items")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_prompt_annotation_ids
+        ):
+            raise ValueError(
+                "params.promptAnnotationIds must contain non-empty strings"
+            )
+        prompt_annotation_ids = [item.strip() for item in raw_prompt_annotation_ids]
+        if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain unique ids")
+
     payload: dict[str, Any] = {
         "key": key,
         "message": message,
@@ -6879,6 +7053,12 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         payload["displayText"] = display_text
     if confirmed_plain_text:
         payload["confirmedPlainText"] = True
+    if prompt_annotation_ids:
+        # Keep the immutable annotation batch in the staged payload.  A
+        # response-loss replay may no longer have the original chat.send
+        # params, and dropping these ids would leave the renderer's drafts
+        # unacknowledged after the first successful turn.
+        payload["promptAnnotationIds"] = prompt_annotation_ids
     return payload
 
 

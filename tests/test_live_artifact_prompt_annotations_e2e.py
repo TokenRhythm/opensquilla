@@ -95,6 +95,18 @@ class _DeterministicArtifactProvider:
 
     @staticmethod
     def _tool_chunk(model: str, *, call_id: str, name: str, arguments: object) -> list[dict]:
+        return _DeterministicArtifactProvider._tool_chunks(
+            model,
+            [(call_id, name, arguments)],
+        )
+
+    @staticmethod
+    def _tool_chunks(
+        model: str,
+        calls: list[tuple[str, str, object]],
+    ) -> list[dict]:
+        if not calls:
+            raise AssertionError("deterministic provider requires at least one tool call")
         return [
             {
                 "model": model,
@@ -105,14 +117,18 @@ class _DeterministicArtifactProvider:
                             "role": "assistant",
                             "tool_calls": [
                                 {
-                                    "index": 0,
+                                    "index": index,
                                     "id": call_id,
                                     "type": "function",
                                     "function": {
                                         "name": name,
-                                        "arguments": json.dumps(arguments, separators=(",", ":")),
+                                        "arguments": json.dumps(
+                                            arguments,
+                                            separators=(",", ":"),
+                                        ),
                                     },
                                 }
+                                for index, (call_id, name, arguments) in enumerate(calls)
                             ],
                         },
                         "finish_reason": None,
@@ -195,7 +211,108 @@ class _DeterministicArtifactProvider:
                 arguments={},
             )
 
-        annotation_payload = self._json_tool_content(tool_messages[-1].get("content"))
+        tool_payloads = [
+            self._json_tool_content(message.get("content"))
+            for message in tool_messages
+        ]
+        annotation_payload = next(
+            (item for item in tool_payloads if isinstance(item.get("annotations"), list)),
+            None,
+        )
+        assert annotation_payload is not None
+        latest_payload = tool_payloads[-1]
+        if latest_payload.get("status") == "candidate_staged":
+            return self._tool_chunk(
+                model,
+                call_id="call_document_browser_inspect",
+                name="document_browser_inspect",
+                arguments={"scope": "document", "maxNodes": 100},
+            )
+        source_patch_requested = any(
+            e2e._SOURCE_PATCH_INSERTION in str(annotation.get("instruction") or "")
+            for annotation in annotation_payload["annotations"]
+        )
+        if latest_payload.get("status") == "verification_passed":
+            if source_patch_requested and not any(
+                item.get("imageAttached") is True for item in tool_payloads
+            ):
+                return self._tool_chunk(
+                    model,
+                    call_id="call_document_browser_screenshot",
+                    name="document_browser_screenshot",
+                    arguments={},
+                )
+            return self._tool_chunk(
+                model,
+                call_id="call_document_finish",
+                name="document_finish",
+                arguments={
+                    "decision": "commit",
+                    "expectedCandidateSha256": latest_payload["candidateSha256"],
+                    "verificationToken": latest_payload["verificationToken"],
+                },
+            )
+        if latest_payload.get("status") in {"applied", "discarded"}:
+            return self._text_chunk(model, "The document update is complete.")
+        if source_patch_requested:
+            candidate_payloads = [
+                item for item in tool_payloads if item.get("status") == "candidate_staged"
+            ]
+            if candidate_payloads and any(item.get("status") == "ok" for item in tool_payloads):
+                repaired = (
+                    '<span id="reset-status" role="status" aria-live="polite">Ready</span>'
+                )
+                return self._tool_chunk(
+                    model,
+                    call_id="call_document_patch_repair",
+                    name="document_patch",
+                    arguments={
+                        "expectedSha256": candidate_payloads[-1]["candidateSha256"],
+                        "edits": [
+                            {
+                                "expectedText": e2e._SOURCE_PATCH_INSERTION,
+                                "replacement": repaired,
+                            }
+                        ],
+                    },
+                )
+            source_payload = next(
+                (item for item in reversed(tool_payloads) if item.get("view") == "source"),
+                None,
+            )
+            if source_payload is None:
+                source_sha = next(
+                    (
+                        item.get("revision", {}).get("sha256")
+                        for item in tool_payloads
+                        if isinstance(item.get("revision"), dict)
+                    ),
+                    None,
+                )
+                if not isinstance(source_sha, str):
+                    raise AssertionError("inspect response did not expose source SHA")
+                return self._tool_chunk(
+                    model,
+                    call_id="call_document_read",
+                    name="document_read",
+                    arguments={"view": "source"},
+                )
+            reset_button = '<button id="btn-reset" class="btn-outline">Reset</button>'
+            return self._tool_chunk(
+                model,
+                call_id="call_document_patch",
+                name="document_patch",
+                arguments={
+                    "expectedSha256": source_payload["sha256"],
+                    "edits": [
+                        {
+                            "expectedText": reset_button,
+                            "replacement": reset_button + e2e._SOURCE_PATCH_INSERTION,
+                        }
+                    ],
+                },
+            )
+
         mutations: list[dict[str, str]] = []
         for annotation in annotation_payload["annotations"]:
             target_kind = annotation["selection"]["kind"]
@@ -232,42 +349,58 @@ class _DeterministicArtifactProvider:
         )
 
 
-def test_scenario_matrix_has_approved_26_47_64_budget() -> None:
+def test_scenario_matrix_has_approved_42_63_64_budget() -> None:
     e2e._assert_scenario_plan()
 
-    assert sum(row.expected_physical_calls for row in e2e.SCENARIOS) == 26
-    assert e2e.WORST_CASE_PHYSICAL_CALLS == 47
+    assert sum(row.expected_physical_calls for row in e2e.SCENARIOS) == 42
+    assert e2e.WORST_CASE_PHYSICAL_CALLS == 63
     assert e2e.HARD_PHYSICAL_CALL_CAP == 64
     assert sum(row.zero_call_preflight for row in e2e.SCENARIOS) == 3
     mutation_cases = [row for row in e2e.SCENARIOS if not row.zero_call_preflight]
     assert mutation_cases
     assert all(
-        row.expected_tools
-        == (
-            "document_apply",
-            "document_inspect",
-            "document_locate",
-            "document_read",
-        )
+        row.expected_tools == e2e._ANNOTATION_TOOLS
         for row in mutation_cases
     )
 
 
 def test_physical_call_budget_refuses_overrun() -> None:
-    with pytest.raises(ValueError, match="between 47 and 64"):
-        e2e.PhysicalCallBudget(hard_cap=46)
+    with pytest.raises(ValueError, match="between 63 and 64"):
+        e2e.PhysicalCallBudget(hard_cap=62)
 
     budget = e2e.PhysicalCallBudget(hard_cap=64)
-    budget.reserve("baseline", 26)
+    budget.reserve("baseline", 42)
     budget.reserve("retry", 16)
     budget.reserve("ensemble_extra", 5)
-    budget.claim("baseline", 26)
+    budget.claim("baseline", 42)
     budget.claim("retry", 16)
     budget.claim("ensemble_extra", 5)
 
-    assert budget.observed == 47
+    assert budget.observed == 63
     with pytest.raises(RuntimeError, match="exceeded"):
         budget.claim("ensemble_extra")
+
+
+def test_direct_repair_loop_requires_one_decision_per_provider_request() -> None:
+    exact = (
+        ("document_inspect",),
+        ("document_read",),
+        ("document_patch",),
+        ("document_browser_inspect",),
+        ("document_browser_screenshot",),
+        ("document_patch",),
+        ("document_browser_inspect",),
+        ("document_finish",),
+        (),
+    )
+    assert e2e._direct_repair_loop_verified(exact) is True
+
+    grouped_read_and_patch = (
+        exact[0],
+        ("document_read", "document_patch"),
+        *exact[3:],
+    )
+    assert e2e._direct_repair_loop_verified(grouped_read_and_patch) is False
 
 
 def test_worker_environment_contains_only_tokenrhythm_provider_secret(
@@ -430,9 +563,11 @@ def _passing_evidence(scenario) -> object:
         accepted_annotations_verified=True,
         mode_verified=True,
         router_tier_verified=True,
-        observed_tools=tuple(sorted(scenario.expected_tools)),
-        writer_calls=1,
-        writer_attempts=1,
+        observed_tools=tuple(
+            sorted({"document_inspect", e2e._expected_writer_name(scenario)})
+        ),
+        writer_calls=e2e._expected_writer_calls(scenario),
+        writer_attempts=e2e._expected_writer_calls(scenario),
         proposer_tool_calls=0,
         aggregator_tools_verified=True,
         revert_verified=True,
@@ -486,7 +621,7 @@ def test_certification_reserves_each_case_and_completes_from_evidence_not_featur
     assert report["certification"] == "complete"
     assert report["featureDefaultEnabled"] is True
     assert report["reasonCodes"] == []
-    assert report["physicalCallBudget"]["observed"] == 26
+    assert report["physicalCallBudget"]["observed"] == 42
     assert all(row["status"] == "passed" for row in report["cases"])
 
 
@@ -752,8 +887,9 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
         assert closed["editSession"]["status"] == "closed"
 
         # Bind one source-proven visual annotation to the freshly saved head,
-        # then let the real restricted turn surface exact4 and atomically
-        # remove the selected void element through document_apply.
+        # then let the real restricted turn surface the ten-tool autonomous
+        # loop and atomically remove the selected void element through
+        # document_apply followed by preview verification and finish.
         saved_source = (
             await driver.client.call(
                 "artifacts.source.read",
@@ -812,14 +948,16 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
             "chat.send",
             {
                 "sessionKey": session_key,
-                "message": "Apply the attached artifact annotation exactly once, then stop.",
-                "clientRequestId": "offline-exact4-remove-node",
+                "message": (
+                    "Apply the attached artifact annotation, verify the preview, then commit."
+                ),
+                "clientRequestId": "offline-loop-remove-node",
                 "promptAnnotationIds": [annotation_id],
             },
         )
         assert accepted["acceptedPromptAnnotationIds"] == [annotation_id]
         task = await driver._wait_for_task(session_key, str(accepted["task_id"]))
-        assert task["status"] == "succeeded"
+        assert task["status"] == "succeeded", task
         agent_source = (
             await driver.client.call(
                 "artifacts.source.read",
@@ -831,9 +969,16 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
         assert "<p>Keep byte-for-byte</p>" in agent_source["text"]
         assert artifact_counts() == (1, 3, 2, 1)
         trace = e2e._trace_evidence(driver._session_trace(session_key), mode="direct")
-        assert trace.physical_calls == 3
+        assert trace.physical_calls == 5
+        assert trace.provider_calls == trace.physical_calls
+        assert trace.loop_continuation_calls == 2
         assert trace.surfaced_tools_exact is True
-        assert trace.observed_tools == ("document_apply", "document_inspect")
+        assert trace.observed_tools == (
+            "document_apply",
+            "document_browser_inspect",
+            "document_finish",
+            "document_inspect",
+        )
         assert trace.writer_calls == 1
         assert trace.writer_attempts == 1
         assert trace.writer_succeeded is True
@@ -928,7 +1073,9 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
             and record.get("session_key") != session_key
             for record in e2e._read_turn_call_records(driver.turn_log_dir)
         )
-        assert len(provider.requests) == 3
+        # inspect → apply(candidate) → browser_inspect → finish(commit) →
+        # tools=[] finalizer
+        assert len(provider.requests) == 5
     finally:
         if storage is not None:
             await storage.close()
@@ -956,16 +1103,36 @@ async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     try:
         await driver.start()
         scenarios = [row for row in e2e.SCENARIOS if not row.zero_call_preflight]
+        evidences = []
         for scenario in scenarios:
+            request_start = len(provider.requests)
             evidence = await driver.run_case(scenario)
+            case_requests = provider.requests[request_start:]
+            evidences.append(evidence)
             assert evidence.passed is True, scenario.case
             assert evidence.observed_physical_calls == scenario.expected_physical_calls
-            assert evidence.writer_calls == 1
-            assert evidence.writer_attempts == 1
+            assert evidence.writer_calls == e2e._expected_writer_calls(scenario)
+            assert evidence.writer_attempts == e2e._expected_writer_calls(scenario)
             assert evidence.single_revision_verified is True
             assert evidence.single_change_set_verified is True
             assert evidence.revert_verified is True
-        assert len(provider.requests) == sum(row.expected_physical_calls for row in scenarios)
+            if scenario.case == "direct_single_annotation":
+                assert len(case_requests) == 9
+                surfaced = [
+                    {
+                        item.get("function", {}).get("name")
+                        for item in request.get("tools") or []
+                    }
+                    for request in case_requests
+                ]
+                assert all(names == e2e._ALLOWED_TOOLS for names in surfaced[:-1])
+                assert surfaced[-1] == set()
+                assert {request.get("model") for request in case_requests} == {"glm-5.2"}
+        # The approved 42-call budget counts every raw provider request,
+        # including preview, finish, and tools=[] finalizer continuations.
+        assert len(provider.requests) == sum(item.provider_calls for item in evidences)
+        assert sum(item.observed_physical_calls for item in evidences) == 42
+        assert len(provider.requests) <= e2e.HARD_PHYSICAL_CALL_CAP
         prompt_reports = [
             record["payload"]
             for record in e2e._read_turn_call_records(driver.turn_log_dir)
@@ -1110,6 +1277,19 @@ def test_launch_worker_keeps_case_and_matrix_timeouts_separate(
     assert Path(worker_env["HOME"]) == worker_root / "user-state"
     assert Path(worker_env["USERPROFILE"]) == worker_root / "user-state"
     assert report["certification"] == "incomplete"
+
+
+def test_live_parser_defaults_to_glm_safe_case_timeout() -> None:
+    args = e2e._parser().parse_args(
+        [
+            "--output",
+            "/tmp/opensquilla-prompt-annotations.json",
+            "--confirm-live-cost",
+            "--confirm-rotated-key",
+        ]
+    )
+
+    assert args.timeout_seconds == e2e.DEFAULT_CASE_TIMEOUT_SECONDS == 120.0
 
 
 def test_launch_worker_rejects_unbounded_matrix_timeout() -> None:

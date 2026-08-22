@@ -32,6 +32,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -75,8 +77,9 @@ BASE_URL_ENV = "TOKENRHYTHM_BASE_URL"
 DESKTOP_BRIDGE_URL_ENV = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL"
 DESKTOP_BRIDGE_TOKEN_ENV = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN"
 DESKTOP_BRIDGE_VERSION = 3
+DESKTOP_BRIDGE_V4_VERSION = 4
 
-DIRECT_MODEL = "kimi-k2.7-code"
+DIRECT_MODEL = "glm-5.2"
 ROUTER_MODELS = {
     "c0": "deepseek-v4-flash",
     "c1": "deepseek-v4-pro",
@@ -98,11 +101,25 @@ _SINGLE_ANNOTATION_BODY = (
     "Set only this selected button's inline background-color to #ef4444. "
     "Preserve its id, class list, text, and every other element."
 )
+_SOURCE_PATCH_INSERTION = '<span id="reset-status" role="status">Ready</span>'
+_SOURCE_PATCH_ANNOTATION_BODY = (
+    "Exercise the autonomous candidate-repair loop using separate model iterations. First "
+    "inspect the bound Document, then read its source. Stage a provisional source patch that "
+    "inserts exactly "
+    f"{_SOURCE_PATCH_INSERTION!r} immediately after this selected button. Inspect the candidate "
+    "preview and capture a screenshot before repairing that provisional span to include "
+    "aria-live=\"polite\". Inspect the repaired candidate again, then commit it explicitly. "
+    "Preserve the selected button and every other existing byte. Call only one tool per model "
+    "response in this certification flow."
+)
 _TITLE_ANNOTATION_BODY = (
     f"Replace only this selected heading's text with {_TITLE_TEXT!r}. "
     "Preserve its tag and attributes."
 )
-_TURN_PROMPT = "Apply every attached artifact annotation exactly once, then stop."
+_TURN_PROMPT = (
+    "Apply every attached artifact annotation safely. Verify the bound preview, repair if needed, "
+    "then explicitly commit or discard the candidate."
+)
 _ELEMENT_PATHS = {
     "title": json.dumps(
         [["", "html", 1], ["", "body", 1], ["", "main", 1], ["", "h1", 1]],
@@ -114,18 +131,20 @@ _ELEMENT_PATHS = {
     ),
 }
 
-# The six annotation cases have 26 expected physical requests: Direct and
-# Router each need one inspect/locate round, one commit round, and one tools=[]
-# outcome-finalization round. Each full B5 Ensemble case needs one five-member
-# fusion round, then two stateful primary-aggregator continuations that reuse
-# the admitted proposer evidence. A single
+# The six annotation cases use raw provider-request accounting. Preview
+# inspection, screenshot/action, repair, explicit finish, and the tools=[]
+# finalizer are all physical requests and must never be deducted from the
+# matrix budget.
+# Each full B5 Ensemble case needs one five-member fusion round,
+# then four stateful primary-aggregator continuations that reuse the admitted
+# proposer evidence. A single
 # controlled scenario retry plus bounded in-place transient retries may consume
 # at most sixteen extra requests; one additional full Ensemble tool round is
 # five requests. Sixty-four remains an absolute guardrail, not a target.
-EXPECTED_PHYSICAL_CALLS = 26
+EXPECTED_PHYSICAL_CALLS = 42
 TRANSIENT_RETRY_ALLOWANCE = 16
 ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE = 5
-WORST_CASE_PHYSICAL_CALLS = 47
+WORST_CASE_PHYSICAL_CALLS = 63
 HARD_PHYSICAL_CALL_CAP = 64
 
 # A mutation case may legitimately consume its full request/turn deadline, and
@@ -135,11 +154,18 @@ HARD_PHYSICAL_CALL_CAP = 64
 DEFAULT_MATRIX_TIMEOUT_SECONDS = 600.0
 MIN_MATRIX_TIMEOUT_SECONDS = 300.0
 MAX_MATRIX_TIMEOUT_SECONDS = 900.0
+DEFAULT_CASE_TIMEOUT_SECONDS = 120.0
 
 _ANNOTATION_TOOLS = (
     "document_apply",
+    "document_browser_act",
+    "document_browser_inspect",
+    "document_browser_reload",
+    "document_browser_screenshot",
+    "document_finish",
     "document_inspect",
     "document_locate",
+    "document_patch",
     "document_read",
 )
 _REPORT_KEYS = frozenset(
@@ -177,6 +203,8 @@ _CASE_KEYS = frozenset(
         "expectedTools",
         "expectedPhysicalCalls",
         "observedPhysicalCalls",
+        "providerCalls",
+        "loopContinuationCalls",
         "providerCalled",
         "beforeHashVerified",
         "afterHashVerified",
@@ -253,13 +281,23 @@ SCENARIOS = (
     Scenario("discarded_annotation_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("cross_session_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("dom_mismatch_zero_call", "preflight", None, "none", (), 0, True),
-    Scenario("direct_single_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 3),
-    Scenario("direct_double_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 3),
-    Scenario("router_single_annotation", "router", "c2", "router_c2", _ANNOTATION_TOOLS, 3),
-    Scenario("router_double_annotation", "router", "c3", "router_c3", _ANNOTATION_TOOLS, 3),
-    Scenario("ensemble_single_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 7),
-    Scenario("ensemble_double_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 7),
+    Scenario("direct_single_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 9),
+    Scenario("direct_double_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 5),
+    Scenario("router_single_annotation", "router", "c2", "router_c2", _ANNOTATION_TOOLS, 5),
+    Scenario("router_double_annotation", "router", "c3", "router_c3", _ANNOTATION_TOOLS, 5),
+    Scenario("ensemble_single_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 9),
+    Scenario("ensemble_double_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 9),
 )
+
+
+def _expected_writer_name(scenario: Scenario) -> str:
+    return "document_patch" if scenario.case == "direct_single_annotation" else "document_apply"
+
+
+def _expected_writer_calls(scenario: Scenario) -> int:
+    """The source-fallback fixture deliberately stages one repair candidate."""
+
+    return 2 if scenario.case == "direct_single_annotation" else 1
 
 
 def _assert_scenario_plan() -> None:
@@ -283,11 +321,13 @@ def _assert_scenario_plan() -> None:
 
 @dataclass
 class PhysicalCallBudget:
-    """Case-level reservation plus observed physical-call accounting.
+    """Case-level reservation for every physical provider request.
 
     A live case is admitted only after its configured maximum has been
     reserved.  Gateway limits then make that reservation a real upper bound;
-    raw traces reconcile the number actually started after the turn.
+    raw traces reconcile the number actually started after the turn. Browser,
+    finish, and finalizer requests are included in this reservation;
+    ``loopContinuationCalls`` is diagnostic evidence only.
     """
 
     hard_cap: int = HARD_PHYSICAL_CALL_CAP
@@ -372,6 +412,8 @@ class PhysicalCallBudget:
 @dataclass(frozen=True, slots=True)
 class CaseEvidence:
     observed_physical_calls: int = 0
+    provider_calls: int = 0
+    loop_continuation_calls: int = 0
     provider_called: bool = False
     before_hash_verified: bool = False
     after_hash_verified: bool = False
@@ -510,6 +552,7 @@ def _wait_for_router_preload(
 
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
     observed = evidence if evidence is not None else CaseEvidence(status="not_run")
+    provider_calls = observed.provider_calls or observed.observed_physical_calls
     return {
         "case": scenario.case,
         "mode": scenario.mode,
@@ -518,6 +561,8 @@ def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> d
         "expectedTools": list(scenario.expected_tools),
         "expectedPhysicalCalls": scenario.expected_physical_calls,
         "observedPhysicalCalls": observed.observed_physical_calls,
+        "providerCalls": provider_calls,
+        "loopContinuationCalls": observed.loop_continuation_calls,
         "providerCalled": observed.provider_called,
         "beforeHashVerified": observed.before_hash_verified,
         "afterHashVerified": observed.after_hash_verified,
@@ -609,12 +654,16 @@ async def _run_certification(
     budget = PhysicalCallBudget(hard_cap=hard_cap)
     budget.ensure_full_matrix_fits()
     evidences: dict[str, CaseEvidence] = {}
+    provider_calls_observed = 0
     try:
         await driver.start()
         for scenario in SCENARIOS:
             if scenario.expected_physical_calls:
                 budget.reserve("baseline", scenario.expected_physical_calls)
             evidence = await driver.run_case(scenario)
+            provider_calls_observed += evidence.provider_calls or evidence.observed_physical_calls
+            if provider_calls_observed > hard_cap:
+                raise RuntimeError("live certification exceeded its raw provider-call hard cap")
             if evidence.observed_physical_calls > scenario.expected_physical_calls:
                 raise RuntimeError("live case exceeded its reserved physical-call budget")
             if evidence.observed_physical_calls:
@@ -625,6 +674,11 @@ async def _run_certification(
     report = _report(hard_cap=hard_cap, evidences=evidences)
     if report["physicalCallBudget"]["observed"] != budget.observed:
         raise RuntimeError("live certification call evidence did not reconcile")
+    reported_provider_calls = sum(
+        int(row.get("providerCalls") or 0) for row in report["cases"]
+    )
+    if reported_provider_calls > hard_cap:
+        raise RuntimeError("live certification raw provider-call evidence exceeded its cap")
     return report
 
 
@@ -680,6 +734,7 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
         raise RuntimeError("live certification report has an invalid case matrix")
     expected_cases = {scenario.case: scenario for scenario in SCENARIOS}
     observed_calls = 0
+    observed_provider_calls = 0
     for row in cases:
         if not isinstance(row, dict) or set(row) != _CASE_KEYS:
             raise RuntimeError("live certification case has an invalid schema")
@@ -698,6 +753,8 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
         if row.get("expectedPhysicalCalls") != scenario.expected_physical_calls:
             raise RuntimeError("live certification expected-call evidence is invalid")
         physical_calls = row.get("observedPhysicalCalls")
+        provider_calls = row.get("providerCalls")
+        loop_calls = row.get("loopContinuationCalls")
         if (
             isinstance(physical_calls, bool)
             or not isinstance(physical_calls, int)
@@ -705,9 +762,19 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
             or physical_calls > scenario.expected_physical_calls
         ):
             raise RuntimeError("live certification observed-call evidence is invalid")
+        if (
+            isinstance(provider_calls, bool)
+            or not isinstance(provider_calls, int)
+            or provider_calls != physical_calls
+            or isinstance(loop_calls, bool)
+            or not isinstance(loop_calls, int)
+            or not 0 <= loop_calls <= provider_calls
+        ):
+            raise RuntimeError("live certification provider-call evidence is invalid")
         if row.get("providerCalled") is not (physical_calls > 0):
             raise RuntimeError("live certification provider-call evidence is inconsistent")
         observed_calls += physical_calls
+        observed_provider_calls += provider_calls
         for field in (
             "providerCalled",
             "beforeHashVerified",
@@ -783,16 +850,18 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
                         "revertVerified",
                     )
                 )
-                or row.get("writerCalls") != 1
-                or row.get("writerAttempts") != 1
+                or row.get("writerCalls") != _expected_writer_calls(scenario)
+                or row.get("writerAttempts") != _expected_writer_calls(scenario)
                 or row.get("proposerToolCalls") != 0
-                or "document_apply" not in observed_tools
+                or _expected_writer_name(scenario) not in observed_tools
                 or row.get("reasonCode") != "none"
             ):
                 raise RuntimeError("passed mutation lacks required certification evidence")
 
     if observed_calls != budget["observed"]:
         raise RuntimeError("live certification physical-call accounting does not reconcile")
+    if observed_provider_calls > budget["hardCap"]:
+        raise RuntimeError("live certification raw provider-call evidence exceeds its cap")
     evidence_complete = all(row.get("passed") is True for row in cases)
     expected_certification = "complete" if evidence_complete else "incomplete"
     if report["certification"] != expected_certification:
@@ -840,7 +909,7 @@ class _BridgeSelection:
 
 
 class SyntheticDesktopBridge:
-    """Minimal authenticated v3 bridge used only inside the isolated worker."""
+    """Minimal authenticated v4 bridge used only inside the isolated worker."""
 
     def __init__(self) -> None:
         self._token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
@@ -848,12 +917,33 @@ class SyntheticDesktopBridge:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._selections: dict[str, _BridgeSelection] = {}
+        self._candidate_handle: str | None = None
+        self._candidate_bound = False
+        self._gateway_endpoint: str | None = None
+        self._active_preview_artifact_id: str | None = None
+        self._scope_id: str | None = None
+
+    def set_gateway_endpoint(self, endpoint: str) -> None:
+        """Set the owned Gateway origin used to resolve opaque preview handles.
+
+        The real Electron bridge receives only the opaque candidate handle and
+        asks its owned Gateway to resolve the candidate artifact identity. The
+        synthetic bridge follows the same boundary instead of manufacturing an
+        artifact id in the fixture.
+        """
+
+        if not re.fullmatch(r"http://127\.0\.0\.1:\d+", endpoint):
+            raise ValueError("synthetic bridge requires an IPv4 loopback Gateway endpoint")
+        with self._lock:
+            self._gateway_endpoint = endpoint
 
     def register(self, selection: _BridgeSelection) -> None:
         with self._lock:
             if selection.selection_id in self._selections:
                 raise RuntimeError("synthetic selection id already registered")
             self._selections[selection.selection_id] = selection
+            self._active_preview_artifact_id = selection.active_preview_artifact_id
+            self._scope_id = selection.scope_id
 
     def start(self) -> Mapping[str, str]:
         if self._server is not None:
@@ -900,6 +990,11 @@ class SyntheticDesktopBridge:
         self._thread = None
         with self._lock:
             self._selections.clear()
+            self._candidate_handle = None
+            self._candidate_bound = False
+            self._gateway_endpoint = None
+            self._active_preview_artifact_id = None
+            self._scope_id = None
         if server is not None:
             server.shutdown()
             server.server_close()
@@ -920,6 +1015,44 @@ class SyntheticDesktopBridge:
         handler.send_header("x-content-type-options", "nosniff")
         handler.end_headers()
         handler.wfile.write(body)
+
+    def _candidate_identity(self, handle: str) -> tuple[str, str]:
+        """Resolve candidate identity through the authenticated Gateway API."""
+
+        with self._lock:
+            endpoint = self._gateway_endpoint
+            token = self._token
+        if endpoint is None:
+            raise RuntimeError("synthetic bridge has no owned Gateway endpoint")
+        request = urllib.request.Request(
+            f"{endpoint}/api/v1/desktop-artifact-candidate-preview/resolve",
+            data=json.dumps({"version": 1, "candidateHandle": handle}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5.0) as response:  # noqa: S310 - owned loopback Gateway
+                if response.status != 200:
+                    raise RuntimeError("candidate preview resolution failed")
+                payload = json.loads(response.read(1024 * 1024))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError("candidate preview resolution failed") from exc
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("candidate preview resolution was malformed")
+        artifact_id = payload.get("candidate_artifact_id")
+        scope_id = payload.get("scope_id")
+        if (
+            payload.get("candidate_handle") != handle
+            or not isinstance(artifact_id, str)
+            or not artifact_id
+            or not isinstance(scope_id, str)
+            or not scope_id
+        ):
+            raise RuntimeError("candidate preview resolution was malformed")
+        return artifact_id, scope_id
 
     def _handle(self, handler: http.server.BaseHTTPRequestHandler) -> None:
         expected_auth = f"Bearer {self._token}"
@@ -959,23 +1092,29 @@ class SyntheticDesktopBridge:
                 {"ok": False, "code": "invalid-request", "message": "Invalid request."},
             )
             return
-        if handler.path == "/v1/capabilities" and body == {"version": 3}:
+        if (
+            handler.path == "/v1/capabilities"
+            and isinstance(body, dict)
+            and body.get("version") in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
+        ):
             self._json_response(
                 handler,
                 200,
                 {
                     "ok": True,
                     "value": {
-                        "version": 3,
+                        "version": DESKTOP_BRIDGE_V4_VERSION,
                         "available": True,
                         "captureSelection": False,
                         "resolveAnnotationSelection": True,
                         "focusAnnotation": False,
-                        "browserInspect": False,
-                        "browserAct": False,
-                        "screenshot": False,
+                        "browserInspect": True,
+                        "browserAct": True,
+                        "screenshot": True,
                         "officeFlush": False,
-                        "reloadSurface": False,
+                        "reloadSurface": True,
+                        "bindCandidatePreview": True,
+                        "restoreCanonicalPreview": True,
                     },
                 },
             )
@@ -983,8 +1122,7 @@ class SyntheticDesktopBridge:
         if (
             handler.path != "/v1/invoke"
             or not isinstance(body, dict)
-            or body.get("version") != 3
-            or body.get("method") != "resolveAnnotationSelection"
+            or body.get("version") not in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
             or not isinstance(body.get("request"), dict)
         ):
             self._json_response(
@@ -994,16 +1132,187 @@ class SyntheticDesktopBridge:
             )
             return
         request = body["request"]
+        method = body.get("method")
+        if method == "bindCandidatePreview":
+            handle = request.get("candidateHandle")
+            if (
+                request.get("version") != DESKTOP_BRIDGE_V4_VERSION
+                or not isinstance(handle, str)
+                or not handle.startswith("candidate_")
+            ):
+                self._json_response(
+                    handler,
+                    400,
+                    {
+                        "ok": False,
+                        "code": "invalid-request",
+                        "message": "Invalid candidate handle.",
+                    },
+                )
+                return
+            with self._lock:
+                self._candidate_handle = handle
+                self._candidate_bound = True
+            self._json_response(
+                handler,
+                200,
+                {"ok": True, "method": method, "value": {"bound": True, "candidateHandle": handle}},
+            )
+            return
+        if method == "restoreCanonicalPreview":
+            with self._lock:
+                self._candidate_handle = None
+                self._candidate_bound = False
+            self._json_response(
+                handler,
+                200,
+                {"ok": True, "method": method, "value": {"restored": True}},
+            )
+            return
+        if method == "browserInspect":
+            if request.get("version") != DESKTOP_BRIDGE_V4_VERSION:
+                self._json_response(
+                    handler,
+                    400,
+                    {
+                        "ok": False,
+                        "code": "unsupported-version",
+                        "message": "Browser preview requires v4.",
+                    },
+                )
+                return
+            scope = request.get("scope")
+            max_nodes = request.get("maxNodes")
+            with self._lock:
+                bound = self._candidate_bound
+                candidate_handle = self._candidate_handle
+                canonical_artifact_id = self._active_preview_artifact_id
+                canonical_scope_id = self._scope_id
+            if scope not in {"document", "selection", "viewport"} or not isinstance(max_nodes, int):
+                self._json_response(
+                    handler,
+                    400,
+                    {
+                        "ok": False,
+                        "code": "invalid-request",
+                        "message": "Invalid browser inspection.",
+                    },
+                )
+                return
+            active_artifact_id = canonical_artifact_id
+            active_scope_id = canonical_scope_id
+            if bound:
+                if not isinstance(candidate_handle, str):
+                    self._json_response(
+                        handler,
+                        409,
+                        {
+                            "ok": False,
+                            "code": "candidate-preview-unbound",
+                            "message": "Candidate preview is not bound.",
+                        },
+                    )
+                    return
+                try:
+                    active_artifact_id, active_scope_id = self._candidate_identity(candidate_handle)
+                except RuntimeError:
+                    self._json_response(
+                        handler,
+                        503,
+                        {
+                            "ok": False,
+                            "code": "candidate-preview-unavailable",
+                            "message": "Candidate preview identity is unavailable.",
+                        },
+                    )
+                    return
+            self._json_response(
+                handler,
+                200,
+                {
+                    "ok": True,
+                    "method": method,
+                    "value": {
+                        "scope": scope,
+                        "nodes": [
+                            {
+                                "anchor": "anchor_main",
+                                "role": "main",
+                                "name": "main",
+                                "text": "",
+                                "interactive": False,
+                                "disabled": False,
+                                "selected": False,
+                            }
+                        ] if bound else [],
+                        "truncated": False,
+                        "activePreviewArtifactId": active_artifact_id,
+                        "scopeId": active_scope_id,
+                        "candidateHandle": candidate_handle if bound else None,
+                    },
+                },
+            )
+            return
+        if method == "browserAct":
+            self._json_response(
+                handler,
+                200,
+                {"ok": True, "method": method, "value": {"performed": True, "changed": False}},
+            )
+            return
+        if method == "screenshot":
+            self._json_response(
+                handler,
+                200,
+                {
+                    "ok": True,
+                    "method": method,
+                    "value": {
+                        "mime": "image/png",
+                        "dataBase64": (
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+                            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                        ),
+                        "width": 1,
+                        "height": 1,
+                    },
+                },
+            )
+            return
+        if method == "reloadSurface":
+            self._json_response(
+                handler,
+                200,
+                {"ok": True, "method": method, "value": {"reloaded": True}},
+            )
+            return
+        if (
+            method != "resolveAnnotationSelection"
+            or request.get("version") not in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
+        ):
+            self._json_response(
+                handler,
+                400,
+                {"ok": False, "code": "invalid-request", "message": "Invalid bridge method."},
+            )
+            return
         selection_id = request.get("selectionId")
         with self._lock:
-            selection = self._selections.pop(str(selection_id), None)
-        if selection is None or request != selection.request():
+            selection = self._selections.get(str(selection_id))
+        expected_request = selection.request() if selection is not None else None
+        if expected_request is not None:
+            # v4 keeps the v3 annotation-selection payload for compatibility;
+            # only the envelope version changes during capability negotiation.
+            expected_request["version"] = request.get("version")
+        if selection is None or request != expected_request:
             self._json_response(
                 handler,
                 409,
                 {"ok": False, "code": "selection-changed", "message": "Selection changed."},
             )
             return
+        with self._lock:
+            self._selections.pop(str(selection_id), None)
         value = {
             **{key: value for key, value in selection.request().items() if key != "version"},
             "scopeId": selection.scope_id,
@@ -1031,6 +1340,8 @@ def _tool_name(raw: object) -> str | None:
 @dataclass(frozen=True, slots=True)
 class _TraceEvidence:
     physical_calls: int
+    provider_calls: int
+    loop_continuation_calls: int
     accounting_ambiguous: bool
     observed_tools: tuple[str, ...]
     surfaced_tools_exact: bool
@@ -1041,9 +1352,58 @@ class _TraceEvidence:
     aggregator_tools_verified: bool
     ensemble_fallback_used: bool
     restricted_prompt_verified: bool
+    request_tool_groups: tuple[tuple[str, ...], ...]
 
 
-def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _TraceEvidence:
+def _request_tool_groups(records: Sequence[Mapping[str, Any]]) -> list[tuple[str, ...]]:
+    """Associate each provider request with the tool calls it produced."""
+
+    groups: list[list[str]] = []
+    current: list[str] | None = None
+    for record in records:
+        kind = record.get("kind")
+        if kind == "llm_request":
+            current = []
+            groups.append(current)
+        elif kind == "tool_request" and current is not None:
+            payload = record.get("payload")
+            if isinstance(payload, Mapping) and isinstance(payload.get("name"), str):
+                current.append(str(payload["name"]))
+    return [tuple(group) for group in groups]
+
+
+def _direct_repair_loop_verified(groups: Sequence[tuple[str, ...]]) -> bool:
+    """Require the fixed GLM-5.2 acceptance case to exercise every loop phase.
+
+    Cardinality matters here: combining read+patch in one response would hide
+    an agent iteration and would no longer prove that candidate feedback is
+    returned to the model before its next decision.
+    """
+
+    if len(groups) != 9:
+        return False
+    return bool(
+        groups[0] == ("document_inspect",)
+        and groups[1] == ("document_read",)
+        and groups[2] == ("document_patch",)
+        and groups[3] == ("document_browser_inspect",)
+        and groups[4]
+        in {
+            ("document_browser_screenshot",),
+            ("document_browser_act",),
+        }
+        and groups[5] == ("document_patch",)
+        and groups[6] == ("document_browser_inspect",)
+        and groups[7] == ("document_finish",)
+        and groups[8] == ()
+    )
+
+
+def _trace_evidence(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    mode: str,
+) -> _TraceEvidence:
     requests = [record for record in records if record.get("kind") == "llm_request"]
     surfaced_sets: list[frozenset[str]] = []
     for record in requests:
@@ -1067,10 +1427,11 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
             }
         )
     )
+    writer_names = frozenset({"document_apply", "document_patch"})
     writer_requests = [
         record
         for record in tool_requests
-        if (record.get("payload") or {}).get("name") == "document_apply"
+        if (record.get("payload") or {}).get("name") in writer_names
     ]
     writer_ids = {
         str((record.get("payload") or {}).get("tool_use_id") or "")
@@ -1080,13 +1441,16 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
         record
         for record in records
         if record.get("kind") == "tool_response"
-        and (record.get("payload") or {}).get("name") == "document_apply"
+        and (record.get("payload") or {}).get("name") in writer_names
         and str((record.get("payload") or {}).get("tool_use_id") or "") in writer_ids
     ]
     writer_succeeded = bool(
-        len(writer_requests) == 1
-        and len(writer_responses) == 1
-        and (writer_responses[0].get("payload") or {}).get("is_error") is False
+        writer_requests
+        and len(writer_responses) == len(writer_requests)
+        and all(
+            (record.get("payload") or {}).get("is_error") is False
+            for record in writer_responses
+        )
     )
     attempt_records = [
         record
@@ -1098,6 +1462,18 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
             "artifact_mutation_intent_rejected",
         }
     ]
+    # Candidate-loop writers intentionally do not reserve a durable mutation
+    # attempt until document_finish(commit).  The live trace still needs to
+    # account for the single writer proposal, so use its tool request as the
+    # turn-local attempt evidence when the finish tool is present and no legacy
+    # intent journal event exists.
+    candidate_loop = any(
+        (record.get("payload") or {}).get("name") == "document_finish"
+        for record in tool_requests
+        if isinstance(record.get("payload"), Mapping)
+    )
+    if candidate_loop and not attempt_records:
+        attempt_records = list(writer_requests)
     prompt_reports: list[Mapping[str, Any]] = []
     for record in records:
         payload = record.get("payload")
@@ -1120,7 +1496,21 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
         and all(marker not in request_projection for marker in forbidden_prompt_markers)
     )
 
-    physical_calls = len(requests)
+    request_groups = _request_tool_groups(records)
+    loop_continuation_calls = sum(
+        bool(group)
+        and all(
+            name == "document_finish" or name.startswith("document_browser_")
+            for name in group
+        )
+        for group in request_groups
+    )
+    provider_calls = len(requests)
+    # Physical accounting is deliberately identical to the raw provider
+    # request count. Browser/finish continuations and the tools=[] finalizer
+    # are real paid requests and must not disappear from the certification
+    # budget.
+    physical_calls = provider_calls
     accounting_ambiguous = False
     proposer_tool_calls = 0
     aggregator_tools_verified = mode != "ensemble"
@@ -1134,8 +1524,10 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
             trace = payload.get("ensemble_trace") if isinstance(payload, Mapping) else None
             if isinstance(trace, Mapping):
                 traces.append(trace)
-        if len(traces) != len(requests):
-            accounting_ambiguous = True
+        # Ensemble traces are emitted once per aggregator continuation, while
+        # the ordinary llm_request stream records logical aggregator turns and
+        # omits proposer fan-out. The cumulative trace is therefore the only
+        # complete physical provider-request count for Ensemble.
         cumulative_request_counts = [
             int(trace.get("llm_request_count") or 0) for trace in traces
         ]
@@ -1152,7 +1544,8 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
             )
         ):
             accounting_ambiguous = True
-        physical_calls = cumulative_request_counts[-1] if cumulative_request_counts else 0
+        provider_calls = cumulative_request_counts[-1] if cumulative_request_counts else 0
+        physical_calls = provider_calls
         aggregator_tools_verified = bool(traces)
         for trace_index, trace in enumerate(traces):
             ensemble_fallback_used = ensemble_fallback_used or trace.get("fallback_used") is True
@@ -1199,6 +1592,8 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
     )
     return _TraceEvidence(
         physical_calls=physical_calls,
+        provider_calls=provider_calls,
+        loop_continuation_calls=loop_continuation_calls,
         accounting_ambiguous=accounting_ambiguous,
         observed_tools=observed_tools,
         surfaced_tools_exact=exact_tool_boundary,
@@ -1209,6 +1604,7 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
         aggregator_tools_verified=aggregator_tools_verified,
         ensemble_fallback_used=ensemble_fallback_used,
         restricted_prompt_verified=restricted_prompt_verified,
+        request_tool_groups=tuple(request_groups),
     )
 
 
@@ -1231,7 +1627,9 @@ def _write_gateway_config(
         "debug = false",
         "llm_request_timeout_seconds = 90",
         "agent_runtime_timeout_seconds = 120",
-        "agent_max_iterations = 2",
+        # Autonomous PromptAnnotation turns have no feature-specific iteration
+        # cap. Global runtime/time/cost budgets remain the safety fuse.
+        "agent_max_iterations = 0",
         "agent_max_provider_retries = 0",
         "",
         "[auth]",
@@ -1252,15 +1650,16 @@ def _write_gateway_config(
         "",
         "[tools]",
         # The live gate deliberately starts from the broad owner profile.  The
-        # PromptAnnotation exclusive ceiling must still surface exactly four
-        # typed semantic document tools in every request and at dispatch.
+        # PromptAnnotation exclusive ceiling must still surface the complete
+        # ten-tool document-agent surface in every tool-enabled request and at
+        # dispatch.
         'profile = "full"',
         "",
         "[memory]",
         'source = "state"',
         "",
         "[naming]",
-        # Auxiliary auto-title requests are outside the approved 26-call turn
+        # Auxiliary auto-title requests are outside the approved 42-call turn
         # matrix and must never consume the live credential.
         "enabled = false",
         "",
@@ -1413,6 +1812,7 @@ class GatewayCertificationDriver:
         env["OPENSQUILLA_TURN_CALL_LOG"] = "1"
         env["OPENSQUILLA_TURN_CALL_LOG_DIR"] = str(self.turn_log_dir)
         self.port = _free_port()
+        self.bridge.set_gateway_endpoint(f"http://127.0.0.1:{self.port}")
         self._stdout = self.stdout_path.open("w", encoding="utf-8")
         self._stderr = self.stderr_path.open("w", encoding="utf-8")
         os.chmod(self.stdout_path, 0o600)
@@ -1730,13 +2130,18 @@ class GatewayCertificationDriver:
             {"sessionKey": session_key, "documentId": document_id},
         )
         before_source = before["source"]
+        primary_body = (
+            _SOURCE_PATCH_ANNOTATION_BODY
+            if scenario.case == "direct_single_annotation"
+            else _SINGLE_ANNOTATION_BODY
+        )
         annotations = [
             await self._create_annotation(
                 session_key=session_key,
                 artifact_id=artifact_id,
                 document=document,
                 target="reset",
-                body=_SINGLE_ANNOTATION_BODY,
+                body=primary_body,
             )
         ]
         if "double" in scenario.case:
@@ -1773,14 +2178,28 @@ class GatewayCertificationDriver:
             "artifacts.changes.list",
             {"sessionKey": session_key, "documentId": document_id, "limit": 20},
         )
-        trace = _trace_evidence(self._session_trace(session_key), mode=scenario.mode)
-        source_text = str(after_source.get("text") or "")
-        reset_local = bool(
-            'id="btn-reset"' in source_text
-            and "btn-outline" in source_text
-            and "#ef4444" in source_text.lower()
-            and '<button id="btn-confirm" class="btn-primary">Confirm</button>' in source_text
+        trace = _trace_evidence(
+            self._session_trace(session_key),
+            mode=scenario.mode,
         )
+        source_text = str(after_source.get("text") or "")
+        if scenario.case == "direct_single_annotation":
+            repaired_status = (
+                '<span id="reset-status" role="status" aria-live="polite">Ready</span>'
+            )
+            reset_local = bool(
+                '<button id="btn-reset" class="btn-outline">Reset</button>' in source_text
+                and repaired_status in source_text
+                and "#ef4444" not in source_text.lower()
+                and '<button id="btn-confirm" class="btn-primary">Confirm</button>' in source_text
+            )
+        else:
+            reset_local = bool(
+                'id="btn-reset"' in source_text
+                and "btn-outline" in source_text
+                and "#ef4444" in source_text.lower()
+                and '<button id="btn-confirm" class="btn-primary">Confirm</button>' in source_text
+            )
         title_correct = _TITLE_TEXT in source_text if len(annotations) == 2 else (
             "Annotation live fixture" in source_text
         )
@@ -1856,13 +2275,20 @@ class GatewayCertificationDriver:
                 and restored.get("source", {}).get("sha256") == before_source.get("sha256")
             )
         physical_exact = trace.physical_calls == scenario.expected_physical_calls
-        tool_boundary = trace.surfaced_tools_exact and trace.writer_calls == 1
+        tool_boundary = (
+            trace.surfaced_tools_exact
+            and trace.writer_calls == _expected_writer_calls(scenario)
+            and (
+                scenario.case != "direct_single_annotation"
+                or _direct_repair_loop_verified(trace.request_tool_groups)
+            )
+        )
         mutation_invariants = bool(
             after_ok
             and single_revision
             and single_change
             and accepted_exact
-            and trace.writer_attempts == 1
+            and trace.writer_attempts == _expected_writer_calls(scenario)
             and trace.writer_succeeded
             and revert_verified
         )
@@ -1890,6 +2316,8 @@ class GatewayCertificationDriver:
             reason = "none"
         return CaseEvidence(
             observed_physical_calls=trace.physical_calls,
+            provider_calls=trace.provider_calls,
+            loop_continuation_calls=trace.loop_continuation_calls,
             provider_called=trace.physical_calls > 0,
             before_hash_verified=before_source.get("sha256")
             == hashlib.sha256(_FIXTURE_HTML.encode()).hexdigest(),
@@ -2023,7 +2451,11 @@ def _parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--output")
-    parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_CASE_TIMEOUT_SECONDS,
+    )
     parser.add_argument(
         "--matrix-timeout-seconds",
         type=float,

@@ -239,6 +239,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
+    "tests/test_artifact_session/test_candidate_loop.py",
+    "tests/test_tools/test_document_browser_identity.py",
 }
 
 

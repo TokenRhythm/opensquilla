@@ -20,6 +20,7 @@ from opensquilla.tools.builtin.artifact_editing import (
     _NO_ARGUMENTS_SCHEMA,
     _annotation_order,
     _bounded_anchor_text,
+    _candidate_epoch,
     _commit_prepared_document_mutation,
     _current_payload,
     _current_scope,
@@ -58,6 +59,41 @@ _INITIAL_OPERATIONS = ("replace_text", "set_style", "remove_node")
 
 def _adapter_error(exc: DocumentAdapterError) -> DocumentMutationError:
     return mutation_error_from_adapter(exc)
+
+
+async def _candidate_writer_replay(
+    controller: Any,
+    *,
+    tool_use_id: str | None,
+    proposal_sha256: str,
+) -> str | None:
+    """Return a stable staged result when a writer response was lost."""
+
+    replay_candidate = getattr(controller, "replay_candidate", None)
+    if (
+        not callable(replay_candidate)
+        or not isinstance(tool_use_id, str)
+        or not tool_use_id
+    ):
+        return None
+    replay = await replay_candidate(
+        tool_use_id=tool_use_id,
+        proposal_sha256=proposal_sha256,
+    )
+    if replay is None:
+        return None
+    state = getattr(controller, "state", None)
+    return _json(
+        {
+            "status": "candidate_staged",
+            "durable": False,
+            "replayed": True,
+            "candidateSha256": getattr(state, "candidate_sha256", None),
+            "candidateEpoch": getattr(state, "candidate_epoch", None),
+            "changeSetState": "draft",
+            "nextAction": "document_browser_inspect",
+        }
+    )
 
 
 async def _html_adapter_scope(tool_name: str, *, require_anchor: bool = False):
@@ -139,6 +175,7 @@ def _grant_payload(
         )
     return {
         "grantToken": token,
+        "candidateEpoch": _candidate_epoch(scope),
         "operation": target.operation,
         "current": current_preview,
         "currentTruncated": current_end < len(current),
@@ -192,10 +229,13 @@ def _locations_for_operation(
 @tool(
     name="document_inspect",
     description=(
-        "Inspect the annotated document once. Ready selections return reusable initialLocations "
-        "grants; do not locate those operations again and never pass candidateSource for a ready "
-        "selection. Contextual selections require document_read and one document_locate call. "
-        "No path, source offset, or internal identifier is returned."
+        "Inspect the current annotated-document candidate. Repeat after a new candidate or when "
+        "preview evidence is stale; identical inspections are safe and idempotent within the "
+        "turn-wide grant/resource budget. Ready selections return reusable initialLocations "
+        "grants; do not pass candidateSource for a ready selection. Contextual selections "
+        "require document_read before document_locate. Candidate changes invalidate earlier "
+        "grants and make a fresh inspection/read/locate sequence appropriate. No path, source "
+        "offset, or internal identifier is returned."
     ),
     params=_NO_ARGUMENTS_SCHEMA,
     owner_only=True,
@@ -214,12 +254,12 @@ async def document_inspect() -> str:
 
     if not isinstance(scope.context, BoundPromptAnnotationContext):
         raise SafeToolError("No prompt annotations are bound to this document turn.")
-    try:
-        document_grant_registry_for_context(scope.ctx).reserve_tool_attempt(
-            attempt_key="document_inspect"
-        )
-    except ArtifactRangeGrantError as exc:
-        raise _range_error(exc) from None
+    source_patch_available = "document_patch" in scope.context.tool_names
+    unsupported_operation_action = (
+        "document_read_then_document_patch"
+        if source_patch_available
+        else "leave_unchanged_and_explain"
+    )
     snapshots = normalize_prompt_annotation_snapshots(scope.context.snapshots)
     if len(snapshots) != len(scope.anchors):
         raise SafeToolError("The annotated document context is stale.")
@@ -270,7 +310,7 @@ async def document_inspect() -> str:
                     ),
                     "availableInitialOperations": available_initial_operations,
                     "unavailableInitialOperations": unavailable_initial_operations,
-                    "unsupportedOperationAction": "leave_unchanged_and_explain",
+                    "unsupportedOperationAction": unsupported_operation_action,
                 },
             }
         )
@@ -287,13 +327,15 @@ async def document_inspect() -> str:
                 "generation": scope.document.generation,
             },
             "revision": {"sha256": ref.sha256, "bytes": ref.size},
+            "candidateEpoch": _candidate_epoch(scope),
             "adapter": adapter.capabilities(),
             "structure": structure,
             "protocol": {
-                "inspectAgain": False,
+                "inspectAgain": True,
+                "repeatPolicy": "idempotent_with_turn_budget",
                 "readyTargets": "reuse_matching_initialLocations",
-                "contextualTargets": "document_read_then_document_locate_once",
-                "unsupportedOperations": "leave_unchanged_and_explain",
+                "contextualTargets": "document_read_then_document_locate",
+                "unsupportedOperations": unsupported_operation_action,
             },
             "annotations": annotations,
         }
@@ -372,6 +414,7 @@ async def document_read(
                 "status": "ok",
                 "view": "structure",
                 "format": adapter.format_id,
+                "candidateEpoch": _candidate_epoch(scope),
                 "structure": structure,
             }
         )
@@ -437,6 +480,7 @@ async def document_read(
             "view": "source",
             "format": adapter.format_id,
             "sha256": ref.sha256,
+            "candidateEpoch": _candidate_epoch(scope),
             "chunk": {"text": text, "characters": len(text), "bytes": len(text.encode("utf-8"))},
             "nextCursor": next_cursor,
             "hasMore": next_cursor is not None,
@@ -484,14 +528,15 @@ _DOCUMENT_LOCATE_SCHEMA: dict[str, Any] = {
 @tool(
     name="document_locate",
     description=(
-        "Locate one semantic mutation grant at most once. For a ready selection, first reuse a "
-        "matching document_inspect initialLocations grant; call this tool only for an "
-        "attribute-specific operation not prelocated there, and omit candidateSource. For a "
-        "contextual selection, first use document_read and then provide exactly one complete "
-        "opening tag as candidateSource. A not_found result is final for that selection and "
-        "operation: leave it unchanged and do not retry. Never submit source offsets. For "
-        "set_style, input is only a CSS declaration list without selectors, braces, or a "
-        "style= wrapper."
+        "Locate a semantic mutation grant for the current candidate. Identical lookups are "
+        "idempotent and deduplicated within the turn-wide query budget. For a ready selection, "
+        "reuse a matching document_inspect initialLocations grant when available; call this "
+        "tool for an attribute-specific operation not prelocated there and omit candidateSource. "
+        "For a contextual selection, first use document_read and provide a complete, unique, "
+        "source-backed opening tag as candidateSource. A not_found result applies only to the "
+        "current candidate; read/locate again after the candidate changes. Never submit source "
+        "offsets. For set_style, input is only a CSS declaration list without selectors, braces, "
+        "or a style= wrapper."
     ),
     params=_DOCUMENT_LOCATE_SCHEMA,
     owner_only=True,
@@ -528,33 +573,23 @@ async def document_locate(
 
     if not isinstance(scope.context, BoundPromptAnnotationContext):
         raise SafeToolError("No prompt annotations are bound to this document turn.")
+    source_patch_available = "document_patch" in scope.context.tool_names
     target = scope.context.targets[order]
     document_registry = document_grant_registry_for_context(scope.ctx)
-    attempt_key = json.dumps(
-        [
-            "document_locate",
-            scope.document.document_id,
-            scope.revision.revision_id,
-            order,
-            operation,
-            attribute_name,
-        ],
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
-    try:
-        document_registry.reserve_tool_attempt(attempt_key=attempt_key)
-    except ArtifactRangeGrantError as exc:
-        raise _range_error(exc) from None
     source = _decode_html(payload)
     contextual_locator: object | None = None
     contextual_fingerprint: str | None = None
     if target.status == "ready":
         if candidateSource is not None:
+            unavailable_action = (
+                "Read the bound source and use document_patch once for every requested change."
+                if source_patch_available
+                else "Leave the item unchanged and do not retry."
+            )
             raise SafeToolError(
                 "DOCUMENT_CANDIDATE_UNEXPECTED: Omit candidateSource for a ready target. "
-                "Reuse a matching document_inspect initialLocations grant; if the operation "
-                "is listed as unavailable, leave the item unchanged and do not retry."
+                "Reuse a matching document_inspect initialLocations grant. If the operation "
+                f"is listed as unavailable, {unavailable_action}"
             )
     else:
         if not isinstance(candidateSource, str):
@@ -637,13 +672,19 @@ async def document_locate(
             "attributeName": attribute_name,
             "locations": locations,
             "reasonCode": None if locations else "DOCUMENT_OPERATION_UNAVAILABLE",
-            "retryAllowed": False,
+            "retryAllowed": True,
+            "retryPolicy": "same_query_idempotent; reread_after_candidate_change",
             "nextAction": (
                 "apply_returned_grant"
                 if locations
-                else "leave_unchanged_and_explain_without_retry"
+                else (
+                    "document_read_then_document_patch"
+                    if source_patch_available
+                    else "leave_unchanged_and_explain_without_retry"
+                )
             ),
             "remainingUniqueLocateQueries": remaining_queries,
+            "candidateEpoch": _candidate_epoch(scope),
         }
     )
 
@@ -723,27 +764,91 @@ async def document_apply(
         ) from None
     proposal_sha256 = hashlib.sha256(proposal_payload).hexdigest()
     tool_context = current_tool_context.get()
+    candidate_controller = (
+        getattr(tool_context, "artifact_candidate_loop_controller", None)
+        if tool_context is not None
+        else None
+    )
+    # In an autonomous PromptAnnotation turn a writer only stages a draft.
+    # Do not reserve the legacy one-shot mutation receipt: the durable boundary
+    # is document_finish(commit), after the model has verified the preview.
+    if candidate_controller is not None:
+        replay_result = await _candidate_writer_replay(
+            candidate_controller,
+            tool_use_id=_tool_use_id,
+            proposal_sha256=proposal_sha256,
+        )
+        if replay_result is not None:
+            return replay_result
+        _scope, _ref, _source, _adapter = await _html_adapter_scope(
+            "document_apply",
+            require_anchor=True,
+        )
+        prepared = None
+        try:
+            prepared = await _prepare_document_mutation(
+                _ref.sha256,
+                [],
+                f"Applied {len(canonical_mutations)} document mutations",
+                _tool_name="document_apply",
+                _semantic_operations=canonical_mutations,
+                _proposal_sha256=proposal_sha256,
+            )
+            from opensquilla.tools.builtin.artifact_editing import (
+                _stage_prepared_document_mutation,
+            )
+
+            staged = await _stage_prepared_document_mutation(
+                prepared,
+                tool_use_id=_tool_use_id,
+                proposal_sha256=(
+                    proposal_sha256
+                    if isinstance(_tool_use_id, str) and _tool_use_id
+                    else None
+                ),
+            )
+            if staged is not None:
+                return staged
+            raise DocumentMutationError(
+                "DOCUMENT_CANDIDATE_STAGE_UNAVAILABLE",
+                "The document candidate writer is unavailable; no revision was created.",
+                retry_policy="refresh",
+            )
+        except BaseException:
+            if prepared is not None:
+                prepared.release_grants()
+            raise
     controller = (
         tool_context.artifact_mutation_attempt_controller
         if tool_context is not None
         else None
     )
-    if controller is None or not isinstance(_tool_use_id, str) or not _tool_use_id:
+    candidate_controller = (
+        getattr(tool_context, "artifact_candidate_loop_controller", None)
+        if tool_context is not None
+        else None
+    )
+    if (
+        candidate_controller is None
+        and (controller is None or not isinstance(_tool_use_id, str) or not _tool_use_id)
+    ):
         raise DocumentMutationError(
             "DOCUMENT_MUTATION_AUTHORITY_UNAVAILABLE",
             "Commit authority is unavailable.",
             retry_policy="forbidden",
         )
-    try:
-        replay = await controller.replay_commit(_tool_use_id, proposal_sha256)
-    except ArtifactConflictError:
-        raise DocumentMutationError(
-            "DOCUMENT_MUTATION_REPLAY_CONFLICT",
-            "The mutation replay does not match the original proposal.",
-            retry_policy="forbidden",
-        ) from None
-    if replay is not None:
-        return _json({"status": "replayed"})
+    if candidate_controller is None:
+        assert controller is not None
+        try:
+            replay = await controller.replay_commit(_tool_use_id, proposal_sha256)
+        except ArtifactConflictError:
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_REPLAY_CONFLICT",
+                "The mutation replay does not match the original proposal.",
+                retry_policy="forbidden",
+            ) from None
+        if replay is not None:
+            return _json({"status": "replayed"})
     _scope, ref, _source, _adapter = await _html_adapter_scope(
         "document_apply",
         require_anchor=True,
@@ -759,16 +864,18 @@ async def document_apply(
             _semantic_operations=canonical_mutations,
             _proposal_sha256=proposal_sha256,
         )
-        reservation = await controller.reserve_commit(
-            _tool_use_id,
-            prepared.proposal_sha256,
-        )
-        if not reservation.created:
-            raise DocumentMutationError(
-                "DOCUMENT_MUTATION_REPLAY",
-                "The mutation attempt is already reserved.",
-                retry_policy="refresh",
+        if candidate_controller is None:
+            assert controller is not None
+            reservation = await controller.reserve_commit(
+                _tool_use_id,
+                prepared.proposal_sha256,
             )
+            if not reservation.created:
+                raise DocumentMutationError(
+                    "DOCUMENT_MUTATION_REPLAY",
+                    "The mutation attempt is already reserved.",
+                    retry_policy="refresh",
+                )
     except BaseException:
         if prepared is not None:
             prepared.release_grants()
@@ -823,11 +930,13 @@ _DOCUMENT_PATCH_SCHEMA: dict[str, Any] = {
 @tool(
     name="document_patch",
     description=(
-        "The only tool that updates the current bound HTML Document. First call document_read "
-        "with view=source and no cursor, then pass its returned sha256 and exact non-empty source "
-        "fragments. Every expectedText must occur exactly once; all edits apply together or none "
-        "do. write_file, edit_file, and apply_patch change workspace files and cannot replace "
-        "this operation."
+        "Exact-source writer for the current bound HTML Document. Use it when semantic grants "
+        "cannot express an insertion, deletion, structural, global CSS, or script change. First "
+        "call document_read with view=source and no cursor, then pass its returned sha256 and "
+        "exact non-empty source fragments. Every expectedText must occur exactly once; all edits "
+        "apply "
+        "together or none do. write_file, edit_file, and apply_patch change workspace files and "
+        "cannot update the bound Document."
     ),
     params=_DOCUMENT_PATCH_SCHEMA,
     owner_only=True,
@@ -868,27 +977,81 @@ async def document_patch(
         ) from None
     proposal_sha256 = hashlib.sha256(proposal_payload).hexdigest()
     tool_context = current_tool_context.get()
+    candidate_controller = (
+        getattr(tool_context, "artifact_candidate_loop_controller", None)
+        if tool_context is not None
+        else None
+    )
+    if candidate_controller is not None:
+        replay_result = await _candidate_writer_replay(
+            candidate_controller,
+            tool_use_id=_tool_use_id,
+            proposal_sha256=proposal_sha256,
+        )
+        if replay_result is not None:
+            return replay_result
+        prepared = None
+        try:
+            prepared = await _prepare_document_text_patch(
+                expectedSha256,
+                canonical_edits,  # type: ignore[arg-type]
+                proposal_sha256=proposal_sha256,
+            )
+            from opensquilla.tools.builtin.artifact_editing import (
+                _stage_prepared_document_mutation,
+            )
+
+            staged = await _stage_prepared_document_mutation(
+                prepared,
+                tool_use_id=_tool_use_id,
+                proposal_sha256=(
+                    proposal_sha256
+                    if isinstance(_tool_use_id, str) and _tool_use_id
+                    else None
+                ),
+            )
+            if staged is not None:
+                return staged
+            raise DocumentMutationError(
+                "DOCUMENT_CANDIDATE_STAGE_UNAVAILABLE",
+                "The document candidate writer is unavailable; no revision was created.",
+                retry_policy="refresh",
+            )
+        except BaseException:
+            if prepared is not None:
+                prepared.release_grants()
+            raise
     controller = (
         tool_context.artifact_mutation_attempt_controller
         if tool_context is not None
         else None
     )
-    if controller is None or not isinstance(_tool_use_id, str) or not _tool_use_id:
+    candidate_controller = (
+        getattr(tool_context, "artifact_candidate_loop_controller", None)
+        if tool_context is not None
+        else None
+    )
+    if (
+        candidate_controller is None
+        and (controller is None or not isinstance(_tool_use_id, str) or not _tool_use_id)
+    ):
         raise DocumentMutationError(
             "DOCUMENT_MUTATION_AUTHORITY_UNAVAILABLE",
             "Commit authority is unavailable.",
             retry_policy="forbidden",
         )
-    try:
-        replay = await controller.replay_commit(_tool_use_id, proposal_sha256)
-    except ArtifactConflictError:
-        raise DocumentMutationError(
-            "DOCUMENT_MUTATION_REPLAY_CONFLICT",
-            "The mutation replay does not match the original proposal.",
-            retry_policy="forbidden",
-        ) from None
-    if replay is not None:
-        return _json({"status": "replayed"})
+    if candidate_controller is None:
+        assert controller is not None
+        try:
+            replay = await controller.replay_commit(_tool_use_id, proposal_sha256)
+        except ArtifactConflictError:
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_REPLAY_CONFLICT",
+                "The mutation replay does not match the original proposal.",
+                retry_policy="forbidden",
+            ) from None
+        if replay is not None:
+            return _json({"status": "replayed"})
 
     prepared = None
     try:
@@ -897,16 +1060,18 @@ async def document_patch(
             canonical_edits,  # type: ignore[arg-type]
             proposal_sha256=proposal_sha256,
         )
-        reservation = await controller.reserve_commit(
-            _tool_use_id,
-            prepared.proposal_sha256,
-        )
-        if not reservation.created:
-            raise DocumentMutationError(
-                "DOCUMENT_MUTATION_REPLAY",
-                "The mutation attempt is already reserved.",
-                retry_policy="refresh",
+        if candidate_controller is None:
+            assert controller is not None
+            reservation = await controller.reserve_commit(
+                _tool_use_id,
+                prepared.proposal_sha256,
             )
+            if not reservation.created:
+                raise DocumentMutationError(
+                    "DOCUMENT_MUTATION_REPLAY",
+                    "The mutation attempt is already reserved.",
+                    retry_policy="refresh",
+                )
     except BaseException:
         if prepared is not None:
             prepared.release_grants()

@@ -29,6 +29,11 @@ from opensquilla.contracts.gateway_transport import (
 from opensquilla.engine.types import AnswerGenerationResetEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.artifact_contexts import (
+    PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+    PROMPT_ANNOTATION_TOOL_NAMES,
+    BoundPromptAnnotationContext,
+)
 from opensquilla.gateway.attachment_ingest import (
     MAX_STAGED_PDF_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
@@ -92,6 +97,94 @@ def test_sessions_steer_v2_scope_contract() -> None:
 
 def test_sessions_pending_inputs_steer_scope_contract() -> None:
     assert METHOD_SCOPES["sessions.pending_inputs.steer"] == WRITE_SCOPE
+
+
+def test_prompt_annotation_bridge_fallback_uses_source_only_contract() -> None:
+    context = BoundPromptAnnotationContext(
+        session_key="agent:main:web",
+        session_id="session-1",
+        document_id="document-1",
+        revision_id="revision-1",
+        targets=(),
+        snapshots=(
+            {
+                "version": 1,
+                "annotationId": "annotation-1",
+                "order": 0,
+                "body": "Remove the label.",
+                "targetStatus": "ready",
+                "targetReason": None,
+                "targetKind": "region",
+                "targetText": "label",
+                "document": {"id": "document-1", "name": "page.html", "kind": "html"},
+                "revision": {
+                    "id": "revision-1",
+                    "generation": 1,
+                    "sha256": "a" * 64,
+                },
+                "anchor": {
+                    "id": "anchor-1",
+                    "kind": "html_element",
+                    "tagName": "p",
+                    "locator": {},
+                    "quote": "label",
+                },
+            },
+        ),
+        artifact_format="html",
+        tool_names=PROMPT_ANNOTATION_TOOL_NAMES,
+        operation_class="selection_edit",
+        request_context_prompt="old prompt",
+    )
+
+    downgraded = rpc_sessions._prompt_annotation_source_only_context(context)
+
+    assert downgraded.tool_names == PROMPT_ANNOTATION_SOURCE_TOOL_NAMES
+    assert "document_finish" not in downgraded.tool_names
+    assert "document_browser_inspect" not in downgraded.tool_names
+    assert "source-only compatibility path" in downgraded.request_context_prompt
+
+
+def test_candidate_loop_requires_v4_active_preview_capabilities() -> None:
+    assert rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        SimpleNamespace(
+            version=4,
+            available=True,
+            browser_inspect=True,
+            bind_candidate_preview=True,
+            restore_canonical_preview=True,
+        )
+    )
+    assert not rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        SimpleNamespace(
+            version=4,
+            available=False,
+            browser_inspect=False,
+            bind_candidate_preview=False,
+            restore_canonical_preview=False,
+        )
+    )
+
+
+def test_candidate_loop_capability_check_accepts_wire_camel_case() -> None:
+    assert rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        {
+            "version": 4,
+            "available": True,
+            "browserInspect": True,
+            "bindCandidatePreview": True,
+            "restoreCanonicalPreview": True,
+        }
+    )
+    assert not rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        {
+            "version": 4,
+            "available": True,
+            "browserInspect": True,
+            "bindCandidatePreview": True,
+            "restoreCanonicalPreview": False,
+        }
+    )
 
 
 @dataclass

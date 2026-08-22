@@ -159,8 +159,9 @@ def _capability_snapshot(
             else None
         ),
         supports_tools=(
-            bool(capabilities.supports_tools)
+            capabilities.supports_tools
             if capabilities is not None
+            and isinstance(capabilities.supports_tools, bool)
             else None
         ),
         supports_streaming=(

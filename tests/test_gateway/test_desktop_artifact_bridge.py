@@ -13,6 +13,7 @@ from opensquilla.gateway.desktop_artifact_bridge import (
     DesktopArtifactBridgeClient,
     DesktopArtifactBridgeError,
     desktop_artifact_bridge_client_from_environment,
+    desktop_artifact_bridge_token_valid,
 )
 
 
@@ -93,6 +94,26 @@ def _install_response(
     return calls
 
 
+def _install_response_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    payloads: list[dict[str, object]],
+) -> list[dict[str, Any]]:
+    """Return one deterministic response per loopback connection."""
+
+    calls: list[dict[str, Any]] = []
+    responses = [_Response(payload) for payload in payloads]
+    next_response = 0
+
+    def connection_factory(*args: object, **kwargs: object) -> _Connection:
+        nonlocal next_response
+        response = responses[min(next_response, len(responses) - 1)]
+        next_response += 1
+        return _Connection(response, calls, *args, **kwargs)
+
+    monkeypatch.setattr(bridge_module.http.client, "HTTPConnection", connection_factory)
+    return calls
+
+
 def test_environment_requires_desktop_and_exact_ipv4_loopback() -> None:
     token = _token()
     assert desktop_artifact_bridge_client_from_environment({}) is None
@@ -149,6 +170,25 @@ def test_runtime_initialization_scrubs_credentials_before_child_tools(
     assert DESKTOP_ARTIFACT_BRIDGE_URL_ENV not in bridge_module.os.environ
     assert DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV not in bridge_module.os.environ
     assert bridge_module.get_desktop_artifact_bridge_client() is client
+
+
+def test_process_local_token_verifier_survives_environment_scrub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidate preview auth must continue after startup consumes env creds."""
+
+    token = _token()
+    monkeypatch.setattr(bridge_module, "_runtime_client_initialized", False)
+    monkeypatch.setattr(bridge_module, "_runtime_client", None)
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
+    monkeypatch.setenv(DESKTOP_ARTIFACT_BRIDGE_URL_ENV, "http://127.0.0.1:1234")
+    monkeypatch.setenv(DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV, token)
+
+    client = bridge_module.initialize_desktop_artifact_bridge_client()
+    assert client is not None
+    assert DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV not in bridge_module.os.environ
+    assert desktop_artifact_bridge_token_valid(token) is True
+    assert desktop_artifact_bridge_token_valid("wrong-token") is False
 
 
 @pytest.mark.asyncio
@@ -513,6 +553,287 @@ async def test_reload_surface_has_no_raw_transport_or_surface_arguments(
 
 
 @pytest.mark.asyncio
+async def test_candidate_handle_is_carried_on_browser_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_handle = "candidate_0123456789abcdef"
+    calls = _install_response_sequence(
+        monkeypatch,
+        [
+            {
+                "ok": True,
+                "method": "browserAct",
+                "value": {"performed": True, "changed": True},
+            },
+            {
+                "ok": True,
+                "method": "browserAct",
+                "value": {"performed": True, "changed": True},
+            },
+            {
+                "ok": True,
+                "method": "browserAct",
+                "value": {"performed": True, "changed": True},
+            },
+            {
+                "ok": True,
+                "method": "browserAct",
+                "value": {"performed": True, "changed": True},
+            },
+            {
+                "ok": True,
+                "method": "screenshot",
+                "value": {
+                    "mime": "image/png",
+                    "dataBase64": base64.b64encode(b"png").decode(),
+                    "width": 1,
+                    "height": 1,
+                },
+            },
+            {
+                "ok": True,
+                "method": "reloadSurface",
+                "value": {"reloaded": True},
+            },
+        ],
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    await client.browser_click(anchor="a1", candidate_handle=candidate_handle)
+    await client.browser_type(anchor="a1", text="x", candidate_handle=candidate_handle)
+    await client.browser_press(key="Enter", candidate_handle=candidate_handle)
+    await client.browser_scroll(
+        direction="down",
+        amount="line",
+        candidate_handle=candidate_handle,
+    )
+    await client.screenshot(candidate_handle=candidate_handle)
+    await client.reload_surface(candidate_handle=candidate_handle)
+
+    requests = [json.loads(call["body"]) for call in calls if call.get("method") == "POST"]
+    assert len(requests) == 6
+    assert all(request["request"]["candidateHandle"] == candidate_handle for request in requests)
+    assert [request["method"] for request in requests] == [
+        "browserAct",
+        "browserAct",
+        "browserAct",
+        "browserAct",
+        "screenshot",
+        "reloadSurface",
+    ]
+
+    calls.clear()
+    with pytest.raises(ValueError, match="candidate handle"):
+        await client.browser_press(key="Enter", candidate_handle="https://example.invalid")
+    with pytest.raises(ValueError, match="candidate handle"):
+        await client.screenshot(candidate_handle="not-a-handle")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_preview_lifecycle_is_opaque_and_protocol_v4_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_handle = "candidate_0123456789abcdef"
+    _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "value": {
+                "version": 4,
+                "available": True,
+                "captureSelection": False,
+                "resolveAnnotationSelection": False,
+                "focusAnnotation": False,
+                "browserInspect": True,
+                "browserAct": True,
+                "screenshot": True,
+                "officeFlush": False,
+                "reloadSurface": True,
+                "bindCandidatePreview": True,
+                "restoreCanonicalPreview": True,
+            },
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+    capabilities = await client.capabilities()
+    assert capabilities.version == 4
+    assert capabilities.bind_candidate_preview is True
+    assert capabilities.restore_canonical_preview is True
+
+    bind_calls = _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "method": "bindCandidatePreview",
+            "value": {"bound": True, "candidateHandle": candidate_handle},
+        },
+    )
+    assert await client.bind_candidate_preview(candidate_handle) is True
+    bind_request = json.loads(bind_calls[1]["body"])
+    assert bind_request["version"] == 4
+    assert bind_request["method"] == "bindCandidatePreview"
+    assert bind_request["request"] == {
+        "version": 4,
+        "candidateHandle": candidate_handle,
+    }
+    serialized = json.dumps(bind_request).lower()
+    assert "artifactid" not in serialized
+    assert "path" not in serialized
+    assert "url" not in serialized
+    assert "javascript" not in serialized
+    assert "cdp" not in serialized
+
+    restore_calls = _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "method": "restoreCanonicalPreview",
+            "value": {"restored": True},
+        },
+    )
+    assert await client.restore_canonical_preview(candidate_handle) is True
+    restore_request = json.loads(restore_calls[1]["body"])
+    assert restore_request["method"] == "restoreCanonicalPreview"
+    assert restore_request["request"] == {
+        "version": 4,
+        "candidateHandle": candidate_handle,
+    }
+
+    bind_calls.clear()
+    with pytest.raises(ValueError, match="candidate handle"):
+        await client.bind_candidate_preview("https://example.invalid/candidate")
+    assert bind_calls == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_preview_first_call_negotiates_protocol_v4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_handle = "candidate_0123456789abcdef"
+    calls = _install_response_sequence(
+        monkeypatch,
+        [
+            {
+                "ok": True,
+                "value": {
+                    "version": 4,
+                    "available": True,
+                    "captureSelection": False,
+                    "resolveAnnotationSelection": False,
+                    "focusAnnotation": False,
+                    "browserInspect": True,
+                    "browserAct": True,
+                    "screenshot": True,
+                    "officeFlush": False,
+                    "reloadSurface": True,
+                    "bindCandidatePreview": True,
+                    "restoreCanonicalPreview": True,
+                },
+            },
+            {
+                "ok": True,
+                "method": "bindCandidatePreview",
+                "value": {"bound": True, "candidateHandle": candidate_handle},
+            },
+        ],
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    assert await client.bind_candidate_preview(candidate_handle) is True
+    requests = [
+        json.loads(call["body"])
+        for call in calls
+        if call.get("method") == "POST"
+    ]
+    assert requests[0] == {"version": 3}
+    assert requests[1]["version"] == 4
+    assert requests[1]["method"] == "bindCandidatePreview"
+    assert requests[1]["request"] == {
+        "version": 4,
+        "candidateHandle": candidate_handle,
+    }
+
+    restore_calls = _install_response_sequence(
+        monkeypatch,
+        [
+            {
+                "ok": True,
+                "value": {
+                    "version": 4,
+                    "available": True,
+                    "captureSelection": False,
+                    "resolveAnnotationSelection": False,
+                    "focusAnnotation": False,
+                    "browserInspect": True,
+                    "browserAct": True,
+                    "screenshot": True,
+                    "officeFlush": False,
+                    "reloadSurface": True,
+                    "bindCandidatePreview": True,
+                    "restoreCanonicalPreview": True,
+                },
+            },
+            {
+                "ok": True,
+                "method": "restoreCanonicalPreview",
+                "value": {"restored": True},
+            },
+        ],
+    )
+    fresh_client = DesktopArtifactBridgeClient(
+        endpoint="http://127.0.0.1:4321",
+        token=_token(),
+    )
+    assert await fresh_client.restore_canonical_preview(candidate_handle) is True
+    restore_requests = [
+        json.loads(call["body"])
+        for call in restore_calls
+        if call.get("method") == "POST"
+    ]
+    assert restore_requests[0] == {"version": 3}
+    assert restore_requests[1] == {
+        "version": 4,
+        "method": "restoreCanonicalPreview",
+        "request": {
+            "version": 4,
+            "candidateHandle": candidate_handle,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_candidate_preview_lifecycle_fails_closed_for_v3_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "value": {
+                "version": 3,
+                "available": True,
+                "captureSelection": False,
+                "resolveAnnotationSelection": False,
+                "focusAnnotation": False,
+                "browserInspect": False,
+                "browserAct": False,
+                "screenshot": True,
+                "officeFlush": False,
+                "reloadSurface": True,
+            },
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+    await client.capabilities()
+    with pytest.raises(DesktopArtifactBridgeError, match="protocol-v4"):
+        await client.bind_candidate_preview("candidate_0123456789abcdef")
+    with pytest.raises(DesktopArtifactBridgeError, match="protocol-v4"):
+        await client.restore_canonical_preview("candidate_0123456789abcdef")
+    assert sum(item.get("method") == "POST" for item in calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_typed_screenshot_decodes_bounded_png(monkeypatch: pytest.MonkeyPatch) -> None:
     png = b"\x89PNG\r\n\x1a\n"
     _install_response(
@@ -578,3 +899,64 @@ async def test_invalid_typed_arguments_never_reach_transport(
     with pytest.raises(ValueError, match="deadline"):
         await client.reload_surface(deadline_ms=60_001)
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_browser_snapshot_preserves_v4_active_surface_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "method": "browserInspect",
+            "value": {
+                "scope": "document",
+                "nodes": [],
+                "truncated": False,
+                "activePreviewArtifactId": "art-candidate",
+                "scopeId": "agent:main:webchat:preview",
+                "candidateHandle": "candidate_0123456789abcdef",
+            },
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    snapshot = await client.browser_inspect(scope="document", max_nodes=20)
+
+    assert snapshot.active_preview_artifact_id == "art-candidate"
+    assert snapshot.scope_id == "agent:main:webchat:preview"
+    assert snapshot.candidate_handle == "candidate_0123456789abcdef"
+
+
+@pytest.mark.asyncio
+async def test_browser_inspect_carries_candidate_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_handle = "candidate_0123456789abcdef"
+    calls = _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "method": "browserInspect",
+            "value": {
+                "scope": "document",
+                "nodes": [],
+                "truncated": False,
+                "activePreviewArtifactId": "art-candidate",
+                "scopeId": "agent:main:webchat:preview",
+                "candidateHandle": candidate_handle,
+            },
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    await client.browser_inspect(
+        scope="document",
+        max_nodes=1,
+        candidate_handle=candidate_handle,
+    )
+
+    request = next(call for call in calls if call.get("method") == "POST")
+    payload = json.loads(request["body"])
+    assert payload["request"]["candidateHandle"] == candidate_handle

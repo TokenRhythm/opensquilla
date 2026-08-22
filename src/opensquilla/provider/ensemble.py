@@ -828,6 +828,42 @@ def _openrouter_static_capabilities(model: str) -> ModelCapabilities | None:
     return None
 
 
+def _member_catalog_capabilities(
+    member: EnsembleMemberConfig,
+    *,
+    model_catalog: Any | None = None,
+) -> ModelCapabilities | None:
+    """Resolve one member's catalog facts without applying static fallbacks."""
+
+    cfg = member.provider_config
+    provider = cfg.provider.strip().lower()
+    try:
+        catalog = model_catalog if model_catalog is not None else shared_catalog()
+        deployment_capabilities = getattr(
+            catalog,
+            "resolve_deployment_capabilities",
+            None,
+        )
+        if callable(deployment_capabilities):
+            resolved = deployment_capabilities(
+                cfg.model,
+                provider=provider,
+                api_key=cfg.api_key,
+                base_url=cfg.base_url,
+            )
+        else:
+            resolved = catalog.get_capabilities(
+                cfg.model,
+                provider_name=provider,
+                base_url=cfg.base_url,
+            )
+        # Keep the existing duck-typed catalog seam: embedders may return a
+        # capability-shaped object instead of the concrete dataclass.
+        return cast(ModelCapabilities, resolved) if resolved is not None else None
+    except Exception:
+        return None
+
+
 def _member_model_capabilities(
     member: EnsembleMemberConfig,
     *,
@@ -835,32 +871,24 @@ def _member_model_capabilities(
 ) -> ModelCapabilities:
     cfg = member.provider_config
     provider = cfg.provider.strip().lower()
+    catalog_caps = _member_catalog_capabilities(
+        member,
+        model_catalog=model_catalog,
+    )
     if provider == "openrouter":
         static_caps = _openrouter_static_capabilities(cfg.model)
+        # Static OpenRouter prefixes are a compatibility fallback for models
+        # whose catalog is incomplete. An explicit catalog denial is stronger
+        # and must reach artifact admission unchanged.
+        if (
+            static_caps is not None
+            and catalog_caps is not None
+            and getattr(catalog_caps, "supports_tools", None) is False
+        ):
+            return catalog_caps
         if static_caps is not None:
             return static_caps
-    try:
-        catalog = model_catalog or shared_catalog()
-        deployment_capabilities = getattr(
-            catalog,
-            "resolve_deployment_capabilities",
-            None,
-        )
-        if callable(deployment_capabilities):
-            return cast(
-                ModelCapabilities,
-                deployment_capabilities(
-                    cfg.model,
-                    provider=provider,
-                    api_key=cfg.api_key,
-                    base_url=cfg.base_url,
-                ),
-            )
-        return catalog.get_capabilities(
-            cfg.model, provider_name=provider, base_url=cfg.base_url
-        )
-    except Exception:
-        return ModelCapabilities()
+    return catalog_caps or ModelCapabilities()
 
 
 def _member_tools_capability_is_verified(
@@ -872,12 +900,23 @@ def _member_tools_capability_is_verified(
 
     cfg = member.provider_config
     provider = cfg.provider.strip().lower()
+    catalog_caps = _member_catalog_capabilities(
+        member,
+        model_catalog=model_catalog,
+    )
+    # A catalog's explicit false is authoritative even when a static
+    # OpenRouter prefix would otherwise imply tool support.
+    if (
+        catalog_caps is not None
+        and getattr(catalog_caps, "supports_tools", None) is False
+    ):
+        return False
     if provider == "openrouter":
         static_caps = _openrouter_static_capabilities(cfg.model)
         if static_caps is not None:
             return bool(static_caps.supports_tools)
     try:
-        catalog = model_catalog or shared_catalog()
+        catalog = model_catalog if model_catalog is not None else shared_catalog()
         verifier = getattr(
             catalog,
             "deployment_tool_capability_is_verified",
@@ -1364,6 +1403,7 @@ class EnsembleProvider:
         _fallback_request_budget_member: EnsembleMemberConfig | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
         _artifact_tool_executor_capabilities: ModelCapabilities | None = None,
+        _artifact_tool_executor_capability_verified: bool = False,
         _provider_state_replay_activation_targets: Sequence[Any] | None = None,
     ) -> None:
         self.profile_name = profile_name
@@ -1424,7 +1464,7 @@ class EnsembleProvider:
         )
         self.artifact_tools_capability_verified = bool(
             _artifact_tool_executor_capabilities is not None
-            and _artifact_tool_executor_capabilities.supports_tools
+            and _artifact_tool_executor_capability_verified
         )
         self._provider_state_replay_activation_targets = list(
             _provider_state_replay_activation_targets or []
@@ -6884,19 +6924,21 @@ def build_ensemble_provider_from_config(
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
     artifact_tool_executor_capabilities: ModelCapabilities | None = None
+    artifact_tool_executor_capability_verified = False
     if _artifact_mutation:
         if not aggregator.ready:
             raise ValueError(
                 "artifact_ensemble_unavailable:aggregator_not_ready"
             )
-        if not _member_tools_capability_is_verified(
+        artifact_tool_executor_capabilities = _member_model_capabilities(
             aggregator,
             model_catalog=_model_catalog,
-        ):
+        )
+        if artifact_tool_executor_capabilities.supports_tools is False:
             raise ValueError(
-                "artifact_ensemble_unavailable:aggregator_tools_unverified"
+                "artifact_ensemble_unavailable:aggregator_tools_unsupported"
             )
-        artifact_tool_executor_capabilities = _member_model_capabilities(
+        artifact_tool_executor_capability_verified = _member_tools_capability_is_verified(
             aggregator,
             model_catalog=_model_catalog,
         )
@@ -7097,6 +7139,9 @@ def build_ensemble_provider_from_config(
         _fallback_request_budget_member=fallback_request_budget_member,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
         _artifact_tool_executor_capabilities=artifact_tool_executor_capabilities,
+        _artifact_tool_executor_capability_verified=(
+            artifact_tool_executor_capability_verified
+        ),
         _provider_state_replay_activation_targets=(
             deferred_replay_activation_targets
         ),

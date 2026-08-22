@@ -592,6 +592,7 @@ def tool_context_from_envelope(
     artifact_context = envelope.runtime_services.get("artifact_context")
     artifact_session = envelope.runtime_services.get("artifact_session")
     desktop_artifact_bridge = envelope.runtime_services.get("desktop_artifact_bridge")
+    artifact_preview_service = envelope.runtime_services.get("artifact_preview_service")
     artifact_event_emitter = envelope.runtime_services.get("artifact_event_emitter")
     generated_artifact_adopter = envelope.runtime_services.get(
         "generated_artifact_adopter"
@@ -600,6 +601,7 @@ def tool_context_from_envelope(
     surfaced_tools: set[str] | None = None
     exclusive_tools: frozenset[str] | None = None
     artifact_mutation_attempt_controller: Any | None = None
+    artifact_candidate_loop_controller: Any | None = None
     from opensquilla.gateway.artifact_contexts import (
         DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY,
         BoundDocumentContext,
@@ -634,17 +636,29 @@ def tool_context_from_envelope(
             revision_id = str(getattr(artifact_context, "revision_id", "") or "").strip()
             if task_id and document_id and revision_id:
                 from opensquilla.artifact_session import (
+                    ArtifactCandidateLoopController,
                     ArtifactMutationAttemptController,
                     ArtifactSessionService,
                 )
 
                 if isinstance(artifact_session, ArtifactSessionService):
-                    artifact_mutation_attempt_controller = ArtifactMutationAttemptController(
-                        artifact_session,
-                        document_id=document_id,
-                        base_revision_id=revision_id,
-                        turn_id=task_id,
-                    )
+                    if (
+                        isinstance(artifact_context, BoundPromptAnnotationContext)
+                        and "document_finish" in artifact_tool_names
+                    ):
+                        artifact_candidate_loop_controller = ArtifactCandidateLoopController(
+                            artifact_session,
+                            document_id=document_id,
+                            base_revision_id=revision_id,
+                            turn_id=task_id,
+                        )
+                    else:
+                        artifact_mutation_attempt_controller = ArtifactMutationAttemptController(
+                            artifact_session,
+                            document_id=document_id,
+                            base_revision_id=revision_id,
+                            turn_id=task_id,
+                        )
     else:
         artifact_event_emitter = None
         desktop_artifact_bridge = None
@@ -737,6 +751,8 @@ def tool_context_from_envelope(
         artifact_mutation_attempt_controller=(
             artifact_mutation_attempt_controller
         ),
+        artifact_candidate_loop_controller=artifact_candidate_loop_controller,
+        artifact_preview_service=artifact_preview_service,
     )
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,

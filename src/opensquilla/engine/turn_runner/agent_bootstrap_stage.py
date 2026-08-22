@@ -396,9 +396,9 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
-    # True only when the tools flag came from an authoritative catalog/host
-    # layer. Unknown models retain the general-chat optimistic capability but
-    # cannot receive persistent Artifact writer tools.
+    # True only when the active deployment's tools flag came from an
+    # authoritative catalog/host layer. Unknown capability provenance remains
+    # diagnostic and does not remove the runtime-authorized tool surface.
     tools_capability_verified: bool = False
     vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Raw positive global ``llm.context_window_tokens`` value, or zero when
@@ -826,16 +826,20 @@ class AgentBootstrapStage:
             "artifact_tool_executor_capabilities",
             None,
         )
-        if bool(
-            getattr(inp.provider, "artifact_tools_capability_verified", False)
-        ) and artifact_executor_capabilities is not None:
-            # A strict Artifact Ensemble grants tools only to its verified
-            # Aggregator. The configured single-model selector is merely the
-            # inherited deployment context and must not decide this gate.
+        if artifact_executor_capabilities is not None:
+            # A strict Artifact Ensemble grants tools only to its Aggregator.
+            # The configured single-model selector is merely the inherited
+            # deployment context and must not supply its capabilities.
             catalog = replace(
                 catalog,
                 capabilities=artifact_executor_capabilities,
-                tools_capability_verified=True,
+                tools_capability_verified=bool(
+                    getattr(
+                        inp.provider,
+                        "artifact_tools_capability_verified",
+                        False,
+                    )
+                ),
             )
 
         # Capacity diagnostics contain resolved numeric limits only. They are
@@ -858,7 +862,7 @@ class AgentBootstrapStage:
             tuple[str, str],
             tuple[int, int, ModelCapabilities | None],
         ] = {}
-        artifact_tool_chain_verified = bool(
+        active_artifact_tools_verified = bool(
             catalog.tools_capability_verified
             and catalog.capabilities is not None
             and getattr(catalog.capabilities, "supports_tools", False)
@@ -919,16 +923,6 @@ class AgentBootstrapStage:
                         fallback_catalog.capabilities,
                     ),
                 )
-                artifact_tool_chain_verified = bool(
-                    artifact_tool_chain_verified
-                    and fallback_catalog.tools_capability_verified
-                    and fallback_catalog.capabilities is not None
-                    and getattr(
-                        fallback_catalog.capabilities,
-                        "supports_tools",
-                        False,
-                    )
-                )
         route_provider = str(
             agent_metadata.get("routed_provider")
             or inp.active_provider_id
@@ -964,16 +958,6 @@ class AgentBootstrapStage:
                         else 0
                     ),
                     fallback_catalog.capabilities,
-                )
-                artifact_tool_chain_verified = bool(
-                    artifact_tool_chain_verified
-                    and fallback_catalog.tools_capability_verified
-                    and fallback_catalog.capabilities is not None
-                    and getattr(
-                        fallback_catalog.capabilities,
-                        "supports_tools",
-                        False,
-                    )
                 )
         configure_private_fallback_limits = getattr(
             inp.provider,
@@ -1093,7 +1077,7 @@ class AgentBootstrapStage:
             ),
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
-            model_tools_capability_verified=artifact_tool_chain_verified,
+            model_tools_capability_verified=active_artifact_tools_verified,
             model_vision_support=catalog.vision_support,
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(aux.tool_result_projection_max_inline_chars),

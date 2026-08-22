@@ -11,6 +11,7 @@ from typing import Any
 from .errors import ArtifactValidationError
 from .models import (
     Actor,
+    ActorKind,
     Anchor,
     AnchorKind,
     AnchorState,
@@ -614,6 +615,50 @@ class ArtifactSessionService:
             limit=_bounded_limit(limit),
         )
 
+    async def list_rejected_candidate_artifacts(
+        self,
+        *,
+        limit: int = 500,
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        """List physical candidate blobs still journaled by rejected drafts."""
+
+        return await self.repository.list_rejected_candidate_artifacts(
+            limit=_bounded_limit(limit),
+        )
+
+    async def list_applied_candidate_artifacts(
+        self,
+        *,
+        limit: int = 500,
+    ) -> tuple[tuple[str, str, str, str, str], ...]:
+        """List superseded candidate blobs still journaled by applied turns."""
+
+        return await self.repository.list_applied_candidate_artifacts(
+            limit=_bounded_limit(limit),
+        )
+
+    async def mark_candidate_artifact_cleaned(
+        self,
+        *,
+        document_id: str,
+        artifact_id: str,
+        sha256: str,
+        actor: Actor,
+    ) -> None:
+        """Persist the idempotent completion marker for physical cleanup."""
+
+        digest = _required(sha256, "sha256")
+        if not _SHA256_RE.fullmatch(digest):
+            raise ArtifactValidationError(
+                "sha256 must contain exactly 64 hexadecimal characters"
+            )
+        await self.repository.mark_candidate_artifact_cleaned(
+            document_id=_required(document_id, "document_id"),
+            artifact_id=_required(artifact_id, "artifact_id"),
+            sha256=digest.lower(),
+            actor=_actor(actor),
+        )
+
     async def snapshot_session_heads(self, *, session_id: str) -> tuple[CommitResult, ...]:
         return await self.repository.snapshot_session_heads(
             session_id=_required(session_id, "session_id"),
@@ -782,6 +827,7 @@ class ArtifactSessionService:
         turn_id: str | None = None,
         summary: str = "",
         change_set_id: str | None = None,
+        candidate_loop: bool = False,
     ) -> ChangeSet:
         if not operations:
             raise ArtifactValidationError("operations must not be empty")
@@ -791,6 +837,8 @@ class ArtifactSessionService:
             raise ArtifactValidationError("summary must be a string")
         if len(summary) > 4_000:
             raise ArtifactValidationError("summary is too long")
+        if not isinstance(candidate_loop, bool):
+            raise ArtifactValidationError("candidate_loop must be a boolean")
         return await self.repository.create_change_set(
             document_id=_required(document_id, "document_id"),
             base_revision_id=_required(base_revision_id, "base_revision_id"),
@@ -801,10 +849,18 @@ class ArtifactSessionService:
             change_set_id=(
                 None if change_set_id is None else _required(change_set_id, "change_set_id")
             ),
+            candidate_loop=candidate_loop,
         )
 
     async def get_change_set(self, change_set_id: str) -> ChangeSet:
         return await self.repository.get_change_set(_required(change_set_id, "change_set_id"))
+
+    async def is_candidate_loop_change_set(self, change_set_id: str) -> bool:
+        """Check the immutable candidate-loop creation marker."""
+
+        return await self.repository.is_candidate_loop_change_set(
+            _required(change_set_id, "change_set_id")
+        )
 
     async def get_change_set_by_turn(
         self,
@@ -849,6 +905,32 @@ class ArtifactSessionService:
             actor=_actor(actor),
         )
 
+    async def update_draft_change_set_candidate(
+        self,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        candidate_artifact: ArtifactBlobRef,
+        operations: Sequence[dict[str, Any]],
+        actor: Actor,
+        validation: dict[str, Any] | None = None,
+    ) -> ChangeSet:
+        """Stage a replacement candidate while keeping the change set draft."""
+
+        if not operations:
+            raise ArtifactValidationError("operations must not be empty")
+        _json_value(list(operations), "operations")
+        if validation is not None:
+            _json_value(validation, "validation")
+        return await self.repository.update_draft_change_set_candidate(
+            change_set_id=_required(change_set_id, "change_set_id"),
+            expected_state_revision=_positive(expected_state_revision, "expected_state_revision"),
+            candidate_artifact=_blob(candidate_artifact),
+            operations=operations,
+            validation=validation,
+            actor=_actor(actor),
+        )
+
     async def reject_change_set(
         self,
         *,
@@ -862,6 +944,96 @@ class ArtifactSessionService:
             expected_state_revision=_positive(expected_state_revision, "expected_state_revision"),
             actor=_actor(actor),
             reason=reason,
+        )
+
+    async def reject_draft_change_set_and_cleanup(
+        self,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        actor: Actor,
+        reason: str | None = None,
+        require_no_active_mutation_attempt: bool = False,
+    ) -> ChangeSet:
+        """Reject a draft and detach its transient candidate reference."""
+
+        if not isinstance(require_no_active_mutation_attempt, bool):
+            raise ArtifactValidationError(
+                "require_no_active_mutation_attempt must be a boolean"
+            )
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise ArtifactValidationError("reason must be a string")
+            if len(reason) > 4_000:
+                raise ArtifactValidationError("reason is too long")
+        return await self.repository.reject_draft_change_set_and_cleanup(
+            change_set_id=_required(change_set_id, "change_set_id"),
+            expected_state_revision=_positive(expected_state_revision, "expected_state_revision"),
+            actor=_actor(actor),
+            reason=reason,
+            require_no_active_mutation_attempt=require_no_active_mutation_attempt,
+        )
+
+    async def reject_candidate_draft_and_fail_attempt_for_recovery(
+        self,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        actor: Actor,
+        reason: str,
+        failure_code: str,
+    ) -> tuple[ChangeSet, MutationAttempt | None]:
+        """Atomically close a restart-orphaned candidate and mutation receipt."""
+
+        normalized_reason = _required(reason, "reason")
+        if len(normalized_reason) > 4_000:
+            raise ArtifactValidationError("reason is too long")
+        normalized_failure_code = _required(failure_code, "failure_code")
+        if not _FAILURE_CODE_RE.fullmatch(normalized_failure_code):
+            raise ArtifactValidationError("failure_code has an invalid format")
+        normalized_actor = _actor(actor)
+        if (
+            normalized_actor.kind is not ActorKind.SYSTEM
+            or normalized_actor.actor_id != "restart-recovery"
+        ):
+            raise ArtifactValidationError(
+                "candidate recovery rejection requires the restart-recovery actor"
+            )
+        return await self.repository.reject_candidate_draft_and_fail_attempt_for_recovery(
+            change_set_id=_required(change_set_id, "change_set_id"),
+            expected_state_revision=_positive(
+                expected_state_revision,
+                "expected_state_revision",
+            ),
+            actor=normalized_actor,
+            reason=normalized_reason,
+            failure_code=normalized_failure_code,
+        )
+
+    async def list_draft_change_sets(
+        self,
+        *,
+        limit: int = 100,
+        candidate_only: bool = False,
+    ) -> tuple[ChangeSet, ...]:
+        """List drafts, optionally limiting results to agent turn candidates."""
+
+        if not isinstance(candidate_only, bool):
+            raise ArtifactValidationError("candidate_only must be a boolean")
+        return await self.repository.list_draft_change_sets(
+            limit=_bounded_limit(limit),
+            candidate_only=candidate_only,
+        )
+
+    async def list_applied_candidate_change_sets(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        """List applied agent turns whose superseded candidate blobs may remain."""
+
+        return await self.repository.list_applied_candidate_change_sets(
+            limit=_bounded_limit(limit),
         )
 
     async def apply_change_set(
@@ -893,6 +1065,70 @@ class ArtifactSessionService:
             lease_id=lease_id,
             fencing_token=fencing_token,
             require_lease=require_lease,
+        )
+
+    async def commit_draft_change_set_atomically(
+        self,
+        *,
+        change_set_id: str,
+        expected_change_set_state_revision: int,
+        expected_head_revision_id: str,
+        expected_document_state_revision: int,
+        actor: Actor,
+        expected_candidate_sha256: str | None = None,
+        source: RevisionSource = RevisionSource.AGENT,
+        revision_event_type: str = "revision.change_set_applied",
+        lease: WriterLease | None = None,
+        require_lease: bool = False,
+        mutation_attempt_id: str | None = None,
+        mutation_attempt_tool_use_id: str | None = None,
+    ) -> tuple[CommitResult, ChangeSet]:
+        """Atomically publish a previously staged draft candidate."""
+
+        candidate_sha = None
+        if expected_candidate_sha256 is not None:
+            candidate_sha = _required(expected_candidate_sha256, "expected_candidate_sha256")
+            if not _SHA256_RE.fullmatch(candidate_sha):
+                raise ArtifactValidationError(
+                    "expected_candidate_sha256 must contain exactly 64 hexadecimal characters"
+                )
+        lease_id, fencing_token = _lease_fields(lease)
+        return await self.repository.commit_draft_change_set_atomically(
+            change_set_id=_required(change_set_id, "change_set_id"),
+            expected_change_set_state_revision=_positive(
+                expected_change_set_state_revision,
+                "expected_change_set_state_revision",
+            ),
+            expected_head_revision_id=_required(
+                expected_head_revision_id,
+                "expected_head_revision_id",
+            ),
+            expected_document_state_revision=_positive(
+                expected_document_state_revision,
+                "expected_document_state_revision",
+            ),
+            actor=_actor(actor),
+            expected_candidate_sha256=(
+                None if candidate_sha is None else candidate_sha.lower()
+            ),
+            source=source,
+            revision_event_type=_required(revision_event_type, "revision_event_type"),
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+            require_lease=require_lease,
+            mutation_attempt_id=(
+                None
+                if mutation_attempt_id is None
+                else _required(mutation_attempt_id, "mutation_attempt_id")
+            ),
+            mutation_attempt_tool_use_id=(
+                None
+                if mutation_attempt_tool_use_id is None
+                else _required(
+                    mutation_attempt_tool_use_id,
+                    "mutation_attempt_tool_use_id",
+                )
+            ),
         )
 
     async def commit_change_set_atomically(
@@ -985,6 +1221,8 @@ class ArtifactSessionService:
         base_revision_id: str,
         proposal_sha256: str | None,
         mutation_attempt_id: str | None = None,
+        candidate_change_set_id: str | None = None,
+        expected_candidate_state_revision: int | None = None,
     ) -> MutationAttempt:
         attempt, _created = await self.reserve_mutation_attempt_with_status(
             document_id=document_id,
@@ -993,6 +1231,8 @@ class ArtifactSessionService:
             base_revision_id=base_revision_id,
             proposal_sha256=proposal_sha256,
             mutation_attempt_id=mutation_attempt_id,
+            candidate_change_set_id=candidate_change_set_id,
+            expected_candidate_state_revision=expected_candidate_state_revision,
         )
         return attempt
 
@@ -1005,6 +1245,8 @@ class ArtifactSessionService:
         base_revision_id: str,
         proposal_sha256: str | None,
         mutation_attempt_id: str | None = None,
+        candidate_change_set_id: str | None = None,
+        expected_candidate_state_revision: int | None = None,
     ) -> tuple[MutationAttempt, bool]:
         proposal_sha = None if proposal_sha256 is None else proposal_sha256.strip()
         if proposal_sha is not None and not _SHA256_RE.fullmatch(proposal_sha):
@@ -1021,6 +1263,19 @@ class ArtifactSessionService:
                 None
                 if mutation_attempt_id is None
                 else _required(mutation_attempt_id, "mutation_attempt_id")
+            ),
+            candidate_change_set_id=(
+                None
+                if candidate_change_set_id is None
+                else _required(candidate_change_set_id, "candidate_change_set_id")
+            ),
+            expected_candidate_state_revision=(
+                None
+                if expected_candidate_state_revision is None
+                else _positive(
+                    expected_candidate_state_revision,
+                    "expected_candidate_state_revision",
+                )
             ),
         )
 
@@ -1430,3 +1685,31 @@ class ArtifactSessionService:
 
     async def latest_audit_event(self, document_id: str) -> AuditEvent | None:
         return await self.repository.latest_audit_event(_required(document_id, "document_id"))
+
+    async def audit_event_for_mutation(
+        self,
+        document_id: str,
+        *,
+        revision_id: str | None = None,
+        change_set_id: str | None = None,
+    ) -> AuditEvent | None:
+        """Find the durable audit sequence for one exact mutation.
+
+        This is intentionally narrower than :meth:`latest_audit_event`: a
+        transient ``source.patched`` notification may be replayed after a
+        crash, and using the document's newest unrelated row would make the
+        UI sequence fence ambiguous.
+        """
+
+        document = _required(document_id, "document_id")
+        if revision_id is None and change_set_id is None:
+            raise ArtifactValidationError(
+                "revision_id or change_set_id is required for an exact audit lookup"
+            )
+        return await self.repository.audit_event_for_mutation(
+            document,
+            revision_id=(None if revision_id is None else _required(revision_id, "revision_id")),
+            change_set_id=(
+                None if change_set_id is None else _required(change_set_id, "change_set_id")
+            ),
+        )

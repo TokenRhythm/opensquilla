@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session import ArtifactBlobRef
+from opensquilla.artifacts import ArtifactStore
 from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.engine.agent import _normalize_uncommitted_candidate_outcome
 from opensquilla.engine.types import ToolEffectOutcome
 from opensquilla.provider import ModelCapabilities, ToolDefinition, ToolInputSchema
 from opensquilla.provider.types import (
@@ -142,6 +146,299 @@ class _CloseAwareMutationProvider:
         return stream
 
 
+class _OpenCandidateController:
+    """Small turn-local candidate double for engine terminal-outcome tests."""
+
+    is_candidate_loop = True
+
+    def __init__(self) -> None:
+        self._state = SimpleNamespace(status="open", candidate_sha256=None)
+        self.discard_calls = 0
+
+    @property
+    def state(self) -> SimpleNamespace:
+        return self._state
+
+    @property
+    def candidate_artifact(self) -> None:
+        return None
+
+    async def discard(self, *, actor: Any, reason: str) -> None:
+        del actor, reason
+        self.discard_calls += 1
+        self._state.status = "discarded"
+        self._state.candidate_sha256 = None
+
+
+@pytest.mark.asyncio
+async def test_outer_candidate_cleanup_keeps_blob_when_discard_stays_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Cleanup must not delete a blob while the draft outcome is unknown."""
+
+    store = ArtifactStore(tmp_path / "media")
+    ref = store.publish_bytes(
+        b"<h1>still staged</h1>",
+        session_id="candidate-session",
+        session_key="agent:main:webchat:cleanup",
+        name="page.html",
+        mime="text/html",
+        source="document_html_agent_candidate",
+        visibility="internal",
+    )
+    candidate = ArtifactBlobRef(
+        artifact_id=ref.id,
+        sha256=ref.sha256,
+        filename=ref.name,
+        media_type=ref.mime,
+        byte_size=ref.size,
+    )
+
+    class _UnresolvedController:
+        is_candidate_loop = True
+        candidate_artifact = candidate
+        change_set = SimpleNamespace(status="draft")
+        preview_handle = "candidate_cleanup_unresolved"
+
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(
+                status="candidate_staged",
+                candidate_sha256=candidate.sha256,
+            )
+            self.discard_calls = 0
+
+        async def reconcile(self) -> None:
+            return None
+
+        async def discard(self, **_kwargs: object) -> None:
+            self.discard_calls += 1
+            raise RuntimeError("database unavailable")
+
+    controller = _UnresolvedController()
+    context = SimpleNamespace(
+        agent_id="agent-main",
+        artifact_session_id="candidate-session",
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_candidate_loop_controller=controller,
+    )
+    agent = Agent.__new__(Agent)
+    agent._tool_context = context  # noqa: SLF001
+    agent._session_key = "agent:main:webchat:cleanup"  # noqa: SLF001
+    agent.config = SimpleNamespace(  # noqa: SLF001
+        tool_result_store_agent_id="",
+        metadata={},
+    )
+
+    await agent._discard_uncommitted_candidate("database-outage")  # noqa: SLF001
+
+    assert controller.discard_calls == 2
+    assert store.resolve_for_download(ref.id, session_id="candidate-session")[0].id == ref.id
+
+
+@pytest.mark.asyncio
+async def test_outer_candidate_cleanup_defers_to_other_finish_owner(
+    tmp_path: Path,
+) -> None:
+    """A losing finish must not reject or restore the winner's candidate."""
+
+    store = ArtifactStore(tmp_path / "media")
+    ref = store.publish_bytes(
+        b"<h1>winning candidate</h1>",
+        session_id="candidate-session",
+        session_key="agent:main:webchat:cleanup-owner",
+        name="page.html",
+        mime="text/html",
+        source="document_html_agent_candidate",
+        visibility="internal",
+    )
+    candidate = ArtifactBlobRef(
+        artifact_id=ref.id,
+        sha256=ref.sha256,
+        filename=ref.name,
+        media_type=ref.mime,
+        byte_size=ref.size,
+    )
+
+    class _OwnerController:
+        is_candidate_loop = True
+        candidate_artifact = candidate
+        change_set = SimpleNamespace(status="draft")
+        preview_handle = "candidate_cleanup_owner"
+        discard_blocked_by_other_finish = True
+
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(
+                status="candidate_staged",
+                candidate_sha256=candidate.sha256,
+            )
+            self.discard_calls = 0
+
+        async def reconcile(self) -> None:
+            return None
+
+        async def discard(self, **_kwargs: object) -> None:
+            self.discard_calls += 1
+            raise AssertionError("losing cleanup must not call discard")
+
+    class _Bridge:
+        def __init__(self) -> None:
+            self.restore_calls = 0
+
+        async def restore_canonical_preview(self, _candidate_handle: str) -> bool:
+            self.restore_calls += 1
+            raise AssertionError("losing cleanup must not restore winner preview")
+
+    bridge = _Bridge()
+    context = SimpleNamespace(
+        agent_id="agent-main",
+        artifact_session_id="candidate-session",
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_candidate_loop_controller=_OwnerController(),
+        desktop_artifact_bridge=bridge,
+    )
+    agent = Agent.__new__(Agent)
+    agent._tool_context = context  # noqa: SLF001
+    agent._session_key = "agent:main:webchat:cleanup-owner"  # noqa: SLF001
+    agent.config = SimpleNamespace(  # noqa: SLF001
+        tool_result_store_agent_id="",
+        metadata={},
+    )
+
+    await agent._discard_uncommitted_candidate("losing-finish")  # noqa: SLF001
+
+    assert context.artifact_candidate_loop_controller.discard_calls == 0
+    assert bridge.restore_calls == 0
+    assert store.resolve_for_download(ref.id, session_id="candidate-session")[0].id == ref.id
+
+
+@pytest.mark.parametrize("candidate_status", [
+    "candidate_staged",
+    "verification_passed",
+    "verification_failed",
+])
+def test_uncommitted_candidate_done_outcome_is_not_reported_as_applied(
+    candidate_status: str,
+) -> None:
+    controller = SimpleNamespace(
+        state=SimpleNamespace(status=candidate_status, candidate_sha256="a" * 64)
+    )
+
+    outcome = _normalize_uncommitted_candidate_outcome(
+        {
+            "version": 1,
+            "status": candidate_status,
+            "phase": "candidate",
+            "retryPolicy": "same_turn",
+            "code": "document_candidate_staged",
+        },
+        controller,
+    )
+
+    assert outcome is not None
+    assert outcome["status"] == "not_applied"
+    assert outcome["phase"] == "commit"
+    assert outcome["retryPolicy"] == "new_turn"
+    assert outcome["code"] == "document_candidate_discarded_on_turn_close"
+
+
+def test_unresolved_durable_finish_done_outcome_is_ambiguous() -> None:
+    """Timeout/cancel after reservation must not claim candidate discard."""
+
+    controller = SimpleNamespace(
+        state=SimpleNamespace(status="candidate_staged", candidate_sha256="d" * 64),
+        discard_blocked_by_other_finish=True,
+        _mutation_attempt_id="mutation-durable",
+        _mutation_attempt_tool_use_id="finish-durable",
+    )
+
+    outcome = _normalize_uncommitted_candidate_outcome(
+        {
+            "version": 1,
+            "status": "candidate_staged",
+            "phase": "candidate",
+            "retryPolicy": "same_turn",
+            "code": "document_candidate_staged",
+        },
+        controller,
+    )
+
+    assert outcome is not None
+    assert outcome["status"] == "ambiguous"
+    assert outcome["phase"] == "commit"
+    assert outcome["retryPolicy"] == "reconcile"
+    assert outcome["code"] == "document_finish_commit_ambiguous"
+
+
+@pytest.mark.parametrize("terminal_status", ["applied", "discarded", "ambiguous"])
+def test_candidate_done_outcome_preserves_terminal_receipt_status(terminal_status: str) -> None:
+    controller = SimpleNamespace(
+        state=SimpleNamespace(status="candidate_staged", candidate_sha256="b" * 64)
+    )
+    original = {
+        "version": 1,
+        "status": terminal_status,
+        "phase": "commit",
+        "retryPolicy": "never",
+        "code": f"document_{terminal_status}",
+    }
+
+    outcome = _normalize_uncommitted_candidate_outcome(original, controller)
+
+    assert outcome == original
+
+
+@pytest.mark.asyncio
+async def test_done_event_normalizes_staged_candidate_before_outer_discard() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            [
+                ProviderTextDeltaEvent(text="The page was updated."),
+                *_tool_call_events("candidate-stage", {}),
+            ]
+        ]
+    )
+    legacy_controller = _MutationController()
+    candidate_controller = _OpenCandidateController()
+
+    async def handler(call: Any) -> ToolResult:
+        del call
+        candidate_controller._state.status = "candidate_staged"  # noqa: SLF001
+        candidate_controller._state.candidate_sha256 = "c" * 64  # noqa: SLF001
+        return _effect_result(
+            "candidate-stage",
+            status="candidate_staged",
+            effect_state="started",
+            retry_policy="same_turn",
+            loop_action="continue",
+            code="document_candidate_staged",
+            is_error=False,
+        )
+
+    agent = _agent(
+        provider,
+        legacy_controller,
+        handler,
+        max_turn_llm_calls=1,
+    )
+    agent._tool_context.artifact_candidate_loop_controller = candidate_controller  # noqa: SLF001
+    events = [event async for event in agent.run_turn("edit")]
+    done = next(event for event in events if event.kind == "done")
+
+    assert done.document_mutation_outcome is not None
+    assert done.document_mutation_outcome["status"] == "not_applied"
+    assert done.document_mutation_outcome["code"] == (
+        "document_candidate_discarded_on_turn_close"
+    )
+    assert done.text == "The document changes were not applied."
+    assert "page was updated" not in done.text.lower()
+    assert any(
+        event.kind == "warning"
+        and getattr(event, "code", "") == "document_candidate_final_text_normalized"
+        for event in events
+    )
+    assert candidate_controller.discard_calls == 1
+
+
 def _tool_call_events(tool_use_id: str, arguments: dict[str, Any]) -> list[object]:
     return [
         ProviderToolUseStartEvent(
@@ -224,7 +521,34 @@ def _agent(
     max_turn_llm_calls: int = 8,
     max_turn_input_tokens: int = 0,
     max_turn_billed_cost_usd: float = 0.0,
+    include_document_patch: bool = False,
 ) -> Agent:
+    tool_definitions = [
+        ToolDefinition(
+            name="document_apply",
+            description="Apply a prepared semantic document mutation.",
+            input_schema=ToolInputSchema(
+                properties={"mutations": {"type": "array"}},
+                required=["mutations"],
+            ),
+        )
+    ]
+    tool_names = {"document_apply"}
+    if include_document_patch:
+        tool_definitions.append(
+            ToolDefinition(
+                name="document_patch",
+                description="Patch the current bound document source.",
+                input_schema=ToolInputSchema(
+                    properties={
+                        "expectedSha256": {"type": "string"},
+                        "edits": {"type": "array"},
+                    },
+                    required=["expectedSha256", "edits"],
+                ),
+            )
+        )
+        tool_names.add("document_patch")
     return Agent(
         provider=provider,
         config=AgentConfig(
@@ -239,23 +563,14 @@ def _agent(
             iteration_timeout=iteration_timeout,
             timeout=timeout,
         ),
-        tool_definitions=[
-            ToolDefinition(
-                name="document_apply",
-                description="Apply a prepared semantic document mutation.",
-                input_schema=ToolInputSchema(
-                    properties={"mutations": {"type": "array"}},
-                    required=["mutations"],
-                ),
-            )
-        ],
+        tool_definitions=tool_definitions,
         tool_handler=handler,
         tool_context=ToolContext(
             is_owner=True,
             session_key="agent:main:webchat:document-loop-test",
-            exclusive_tools={"document_apply"},
-            allowed_tools={"document_apply"},
-            surfaced_tools={"document_apply"},
+            exclusive_tools=set(tool_names),
+            allowed_tools=set(tool_names),
+            surfaced_tools=set(tool_names),
             artifact_mutation_attempt_controller=controller,
         ),
     )
@@ -702,14 +1017,29 @@ async def test_iteration_cap_uses_outcome_only_finalization_without_grant_histor
 
 
 @pytest.mark.asyncio
-async def test_unverified_tool_model_answers_without_starting_mutation_lifecycle() -> None:
+async def test_unverified_tool_model_keeps_document_mutation_tools_available() -> None:
     provider = _ScriptedMutationProvider(
-        [[ProviderTextDeltaEvent(text="No change."), ProviderDoneEvent(stop_reason="end_turn")]]
+        [
+            _tool_call_events("apply-unverified", {"mutations": []}),
+            [
+                ProviderTextDeltaEvent(text="Done."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
     )
     controller = _MutationController()
 
-    async def handler(_call: Any) -> ToolResult:
-        raise AssertionError("an unverified model must never dispatch a document tool")
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
 
     events = [
         event
@@ -722,11 +1052,11 @@ async def test_unverified_tool_model_answers_without_starting_mutation_lifecycle
     ]
     done = next(event for event in events if event.kind == "done")
 
-    assert len(provider.calls) == 1
-    assert provider.calls[0]["tools"] is None
-    assert done.text == "No change."
-    assert done.document_mutation_outcome is None
-    assert controller.observed == []
+    assert len(provider.calls) == 2
+    assert [tool.name for tool in provider.calls[0]["tools"]] == ["document_apply"]
+    assert provider.calls[1]["tools"] is None
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert controller.observed == ["apply-unverified"]
 
 
 @pytest.mark.asyncio
@@ -886,6 +1216,115 @@ async def test_two_document_apply_calls_in_one_response_are_rejected_before_disp
     assert handler_calls == 0
     assert done.document_mutation_outcome["code"] == "document_parallel_writers"
     assert done.document_mutation_outcome["status"] == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_apply_and_patch_in_one_response_are_rejected_before_dispatch() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            [
+                *_tool_call_events("apply-a", {"mutations": []})[:-1],
+                *_document_patch_call_events(
+                    "patch-b",
+                    {
+                        "expectedSha256": "a" * 64,
+                        "edits": [{"expectedText": "old", "replacement": "new"}],
+                    },
+                ),
+            ],
+            [
+                ProviderTextDeltaEvent(text="No mutation."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+    handler_calls = 0
+
+    async def handler(_call: Any) -> ToolResult:
+        nonlocal handler_calls
+        handler_calls += 1
+        raise AssertionError("parallel document writers must be rejected before dispatch")
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            include_document_patch=True,
+        ).run_turn("edit")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert len(provider.calls) == 2
+    assert handler_calls == 0
+    assert done.document_mutation_outcome["code"] == "document_parallel_writers"
+    assert done.document_mutation_outcome["status"] == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_correctable_apply_failure_can_retry_with_patch_and_commit_once() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            _tool_call_events("apply-bad", {"mutations": []}),
+            _document_patch_call_events(
+                "patch-good",
+                {
+                    "expectedSha256": "a" * 64,
+                    "edits": [{"expectedText": "old", "replacement": "new"}],
+                },
+            ),
+            [
+                ProviderTextDeltaEvent(text="Updated."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        if call.tool_name == "document_apply":
+            await controller.reject_proposal(call.tool_use_id)
+            return _effect_result(
+                call.tool_use_id,
+                status="not_attempted",
+                effect_state="none",
+                retry_policy="same_turn",
+                loop_action="continue",
+                code="DOCUMENT_OPERATION_UNAVAILABLE",
+                is_error=True,
+            )
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+            corrected=True,
+            tool_name="document_patch",
+        )
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            include_document_patch=True,
+        ).run_turn("edit")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert controller.observed == ["apply-bad", "patch-good"]
+    assert controller.rejected == ["apply-bad"]
+    assert controller.committed_ids == {"patch-good"}
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert done.document_mutation_outcome["proposalAttempts"] == 2
+    assert done.document_mutation_outcome["corrected"] is True
 
 
 @pytest.mark.asyncio

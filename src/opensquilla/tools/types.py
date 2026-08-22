@@ -237,6 +237,30 @@ class ToolContext:
     # ownership. Raw values are never written to the owner registry.
     parent_session_key: str | None = field(default=None, repr=False)
     parent_task_id: str | None = field(default=None, repr=False)
+    # Process-local candidate-loop authority for PromptAnnotation turns.  It
+    # stages repeated edits in one draft ChangeSet and crosses the durable
+    # revision boundary only when the model invokes document_finish(commit).
+    # This field is intentionally at the end to preserve every historical
+    # positional ToolContext constructor contract.
+    artifact_candidate_loop_controller: Any | None = field(
+        default=None,
+        repr=False,
+    )
+    # Process-local preview materialization service used by the protocol-v4
+    # Electron candidate bridge.  It is never serialized or exposed to the
+    # model; the bridge receives only the controller's opaque handle.
+    artifact_preview_service: Any | None = field(
+        default=None,
+        repr=False,
+    )
+    # Ephemeral binary evidence produced by a tool for the current provider
+    # request. The map is keyed by tool_use_id and consumed by the Agent
+    # before the next provider call; it is never persisted or exposed as a
+    # filesystem path.
+    tool_result_media: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy
@@ -340,6 +364,11 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "message",
         "publish_artifact",
         "document_apply",
+        "document_browser_act",
+        "document_browser_inspect",
+        "document_browser_reload",
+        "document_browser_screenshot",
+        "document_finish",
         "document_patch",
         "document_inspect",
         "document_locate",

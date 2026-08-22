@@ -59,6 +59,7 @@ def test_prompt_annotation_context_escapes_instruction_and_wraps_source_quote() 
         "document_read",
         "document_locate",
         "document_apply",
+        "document_patch",
     ):
         assert tool_name in rendered
     assert "summarize only the visible result" in rendered
@@ -68,12 +69,16 @@ def test_prompt_annotation_context_escapes_instruction_and_wraps_source_quote() 
     assert "answering does not require a document tool call" in rendered
     assert "An instruction may be answered without being included" in rendered
     assert "Cover every ordered annotation" not in rendered
-    assert "call document_inspect once" in rendered
+    assert "begin with document_inspect" in rendered
     assert "initialLocations already contains every prelocated opaque grant" in rendered
     assert "never pass candidateSource" in rendered
     assert "document_locate only for an attribute-specific operation" in rendered
-    assert "leave that item unchanged and do not retry or guess" in rendered
-    assert "re-inspecting" in rendered
+    assert "at most one document writer" in rendered
+    assert "do not apply only a subset" in rendered
+    assert "leave that item unchanged and do not guess" in rendered
+    assert "repeat inspect/read/locate" in rendered
+    assert "Never call document_apply and document_patch in the same response" in rendered
+    assert "re-inspect" in rendered
     assert "CSS declaration list" in rendered
     assert "must not contain selectors" in rendered
     assert "html_edit_source" not in rendered

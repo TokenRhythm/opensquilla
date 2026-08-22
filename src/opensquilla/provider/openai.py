@@ -3014,8 +3014,10 @@ def _build_openai_messages(
     per tool result, while opensquilla packs multiple tool results into a single
     Message.
 
-    Invariant: tool_result blocks never coexist with text/image blocks in the
-    same Message (agent.py always packs tool results into a dedicated message).
+    Tool results normally arrive in a dedicated message.  The autonomous
+    document loop may additionally place a screenshot image in that message;
+    it is emitted as a trailing user image message because OpenAI-compatible
+    APIs accept only text in a ``role=tool`` payload.
     """
     if isinstance(msg.content, str):
         return [
@@ -3068,8 +3070,14 @@ def _build_openai_messages(
                 }
             )
 
-    # Tool results → one message per result (OpenAI requirement)
+    # Tool results → one message per result (OpenAI requirement).  A browser
+    # screenshot is carried as a separate user image message because the
+    # Chat Completions API accepts only text in a ``role=tool`` payload; doing
+    # this here preserves the tool-call/result pairing while still giving a
+    # vision-capable model the pixels.
     if tool_results:
+        if parts:
+            tool_results.append({"role": "user", "content": parts})
         return tool_results
 
     # Assistant message with tool_calls (preserve text alongside calls)
