@@ -15,6 +15,7 @@ const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
 const HEADER_IDENTITY_ATTRIBUTE = 'data-opensquilla-first-send-identity'
 const HEADER_IDENTITY_SETTLE_MS = 250
+const MAX_PRE_SEND_AUTHORITY_BINDS = 2
 const FORBIDDEN_RENDERER_ERROR = /(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])/i
 const WIDE_VIEWPORT = { width: 1440, height: 900 }
 const TIGHT_VIEWPORT = { width: 900, height: 780 }
@@ -203,9 +204,38 @@ async function browserRpcSnapshot(page) {
   return await page.evaluate(() => {
     const probe = globalThis.__opensquillaP15RpcProbe
     return {
+      documentGeneration: probe?.documentGeneration || '',
       methods: probe?.methods || {},
       sends: probe?.sends || [],
     }
+  })
+}
+
+async function firstSendAuthoritySnapshot(page, {
+  documentGeneration,
+  headerIdentity,
+  message,
+}) {
+  return await page.evaluate((expected) => {
+    const probe = globalThis.__opensquillaP15RpcProbe
+    const header = document.querySelector('#app-route-header [data-testid="chat-header-actions"]')
+    const composer = document.querySelector('.chat-textarea')
+    const sendButton = document.querySelector('.chat-send-btn.btn--primary')
+    return {
+      documentGeneration: probe?.documentGeneration || '',
+      generationMatches: probe?.documentGeneration === expected.documentGeneration,
+      headerIdentityMatches: header?.getAttribute(expected.headerIdentityAttribute) === expected.headerIdentity,
+      composerMatches: composer instanceof HTMLTextAreaElement && composer.value === expected.message,
+      sendReady: sendButton instanceof HTMLButtonElement
+        && !sendButton.disabled
+        && sendButton.classList.contains('is-ready'),
+      connected: Boolean(document.querySelector('.conn-pill.connected')),
+    }
+  }, {
+    documentGeneration,
+    headerIdentity,
+    headerIdentityAttribute: HEADER_IDENTITY_ATTRIBUTE,
+    message,
   })
 }
 
@@ -297,6 +327,49 @@ async function establishStableHeaderIdentity(header, iteration) {
   return marker
 }
 
+async function prepareStableFirstSendAuthority(page, {
+  composer,
+  header,
+  message,
+  iteration,
+}) {
+  let lastSnapshot = null
+  for (let bindAttempt = 1; bindAttempt <= MAX_PRE_SEND_AUTHORITY_BINDS; bindAttempt += 1) {
+    // Bind to the active document before filling the composer. Windows can
+    // finish one last startup navigation after the first visible frame; text
+    // entered before that navigation belongs to the discarded renderer.
+    const headerIdentity = await establishStableHeaderIdentity(header, iteration)
+    const { documentGeneration } = await browserRpcSnapshot(page)
+    assert.ok(documentGeneration, 'the active renderer must expose a document generation')
+    await composer.fill(message)
+
+    const outcome = await waitFor(async () => {
+      const snapshot = await firstSendAuthoritySnapshot(page, {
+        documentGeneration,
+        headerIdentity,
+        message,
+      })
+      lastSnapshot = snapshot
+      if (!snapshot.generationMatches || !snapshot.headerIdentityMatches) {
+        return { status: 'authority-changed', snapshot }
+      }
+      if (snapshot.composerMatches && snapshot.sendReady && snapshot.connected) {
+        return { status: 'ready', snapshot }
+      }
+      return false
+    }, `stable first-send authority ${iteration}`, SEND_TIMEOUT_MS)
+
+    if (outcome.status === 'ready') {
+      return { documentGeneration, headerIdentity }
+    }
+    // No send action has run yet, so rebinding once is safe and cannot create
+    // a duplicate turn. A second authority loss is terminal and diagnostic.
+  }
+  throw new Error(
+    `First-send authority changed repeatedly before iteration ${iteration}: ${JSON.stringify(lastSnapshot)}`,
+  )
+}
+
 try {
   await assertIsolatedUserData(userDataDir)
   provider = await startSyntheticOllama()
@@ -333,7 +406,11 @@ try {
   // packaged Electron app, so the release gate instruments send() in the page
   // before a clean reload and leaves the real Gateway connection untouched.
   await page.addInitScript(() => {
-    const probe = { methods: {}, sends: [] }
+    const probe = {
+      documentGeneration: globalThis.crypto.randomUUID(),
+      methods: {},
+      sends: [],
+    }
     Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
       configurable: false,
       enumerable: false,
@@ -400,15 +477,29 @@ try {
     )
     assert.equal(await header.isHidden(), true, 'landing route header must be hidden with its node mounted')
 
-    const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
-    await composer.fill(firstMessage)
     const sendButton = page.locator('.chat-send-btn.btn--primary')
-    await waitFor(async () => await sendButton.count() === 1 && !await sendButton.isDisabled(), 'enabled first send')
-    const landingHeaderIdentity = await establishStableHeaderIdentity(header, iteration)
+    const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
+    const {
+      documentGeneration: firstSendDocumentGeneration,
+      headerIdentity: landingHeaderIdentity,
+    } = await prepareStableFirstSendAuthority(page, {
+      composer,
+      header,
+      message: firstMessage,
+      iteration,
+    })
     await sendButton.click()
 
     await waitFor(
-      () => observedChatSendCount(page, firstMessage).then(count => count === 1),
+      async () => {
+        const snapshot = await browserRpcSnapshot(page)
+        assert.equal(
+          snapshot.documentGeneration,
+          firstSendDocumentGeneration,
+          'renderer generation changed after the first-send action began',
+        )
+        return snapshot.sends.filter(entry => entry.message === firstMessage).length === 1
+      },
       `first chat.send ${iteration}`,
     )
     await syncObservedChatSends(page)
