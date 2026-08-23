@@ -396,6 +396,30 @@ describe('SidebarConversations project workspaces', () => {
     expect(row?.querySelector('.sidebar-history-item')?.getAttribute('title')).toBeNull()
   })
 
+  it('keeps a long mixed-language title and tooltip relationship intact', async () => {
+    const title = '请执行一项 Deep Research 任务：分析 Fortinet 的长期经营表现与竞争格局'
+    const { host } = await mountSidebar([projectRow(), taskRow({ title })])
+    const row = host.querySelector<HTMLElement>(
+      '[data-session-key="agent:main:webchat:task-a"]',
+    )
+    Object.defineProperty(row, 'getBoundingClientRect', {
+      value: () => ({ left: 12, right: 280, top: 40 }),
+    })
+
+    row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+
+    const trigger = row?.querySelector('.sidebar-history-item')
+    const preview = document.body.querySelector('.sidebar-session-preview')
+    expect(row?.querySelector('.sidebar-history-title')?.textContent).toBe(title)
+    expect(preview?.querySelector('.sidebar-session-preview__title')?.textContent).toBe(title)
+    expect(preview?.querySelector('.sidebar-session-preview__time')?.textContent).not.toBe('')
+    expect(preview?.querySelector('[data-testid="sidebar-session-project"]')?.textContent)
+      .toContain('Project A')
+    expect(trigger?.getAttribute('aria-describedby')).toBe('sidebar-session-preview')
+    expect(preview?.getAttribute('role')).toBe('tooltip')
+  })
+
   it('keeps the hover card but omits the project row for an unbound session', async () => {
     const { host } = await mountSidebar([
       taskRow({
