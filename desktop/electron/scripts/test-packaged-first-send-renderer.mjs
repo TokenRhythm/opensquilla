@@ -589,14 +589,31 @@ if (runError) {
   throw runError
 }
 
-assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
-assert.equal(desktopLogSummary.eventCounts.renderer_console || 0, 0, 'desktop.log contains renderer console errors')
-assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
-assert.equal(
-  provider?.counts().chatRequestCount,
-  iterations * 2,
-  'each accepted chat.send must complete exactly one synthetic provider request',
-)
+try {
+  assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
+  assert.equal(desktopLogSummary.eventCounts.renderer_console || 0, 0, 'desktop.log contains renderer console errors')
+  assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
+  assert.equal(
+    provider?.counts().chatRequestCount,
+    iterations * 2,
+    'each accepted chat.send must complete exactly one synthetic provider request',
+  )
+} catch (error) {
+  console.error(JSON.stringify({
+    ok: false,
+    iterations,
+    completedChatSends: rpcSendCounts.size,
+    provider: provider?.counts(),
+    renderer: {
+      pageErrors: pageErrors.length,
+      consoleErrors: consoleErrors.length,
+      consoleErrorMessages: consoleErrors.slice(0, 10),
+    },
+    externalRendererRequests: outboundNetwork.length,
+    desktopLog: desktopLogSummary,
+  }, null, 2))
+  throw error
+}
 
 console.log(JSON.stringify({
   ok: true,
