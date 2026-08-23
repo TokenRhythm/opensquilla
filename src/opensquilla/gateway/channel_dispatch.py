@@ -2250,6 +2250,21 @@ _STREAM_RELAY_DEFAULT_COALESCE_MS = 0.0
 _STREAM_RELAY_DEFAULT_COALESCE_CHARS = 0
 
 
+def _channel_tool_progress_enabled(channel: Any, config: Any) -> bool:
+    """Hermes-style per-tool-call status bubbles (opt-out via channel config).
+
+    Enabled by default for adapters that can send messages; disable with
+    ``[channels] tool_progress = false`` in config.toml.
+    """
+
+    if not callable(getattr(channel, "send", None)):
+        return False
+    channels_cfg = getattr(config, "channels", None) if config is not None else None
+    if isinstance(channels_cfg, dict):
+        return bool(channels_cfg.get("tool_progress", True))
+    return bool(getattr(channels_cfg, "tool_progress", True))
+
+
 def _resolve_stream_relay_coalesce(config: Any) -> tuple[float, int]:
     """Return ``(window_seconds, char_threshold)`` for stream relay batching.
 
@@ -2306,6 +2321,97 @@ class _RuntimeChannelStreamRelay:
         coalesce_window_s, coalesce_chars = _resolve_stream_relay_coalesce(config)
         self._coalesce_window_s = coalesce_window_s
         self._coalesce_chars = coalesce_chars
+        # Hermes-style tool progress: one silent status message per tool call,
+        # edited in place per tool_use_id so a long turn shows live activity
+        # instead of one silent bubble (see _maybe_notify_tool_progress).
+        self._tool_status_ids: dict[str, str] = {}
+        self._tool_notify_enabled = _channel_tool_progress_enabled(channel, config)
+
+    def _tool_progress_text(
+        self, *, tool_name: str, tool_use_id: str, arguments: Any, done: bool, is_error: bool
+    ) -> str:
+        args_preview = ""
+        if isinstance(arguments, dict):
+            for key in ("command", "path", "pattern", "query", "url", "file_path", "name"):
+                val = arguments.get(key)
+                if isinstance(val, str) and val.strip():
+                    args_preview = val.strip().splitlines()[0][:80]
+                    break
+        suffix = f" `{args_preview}`" if args_preview else ""
+        if done:
+            return f"{'✗' if is_error else '✓'} {tool_name}{suffix}"
+        return f"⚙ {tool_name}{suffix}"
+
+    async def _send_tool_status(
+        self, *, tool_use_id: str, text: str, reply_to: str | None
+    ) -> str | None:
+        """Send (or edit) one silent status bubble; returns its message ref."""
+
+        send = getattr(self._channel, "send", None)
+        if not callable(send):
+            return None
+        existing = self._tool_status_ids.get(tool_use_id)
+        if existing is not None:
+            edit = getattr(self._channel, "edit", None)
+            if callable(edit):
+                try:
+                    await edit(existing, text, chat_id=reply_to)
+                    return existing
+                except Exception:
+                    self._tool_status_ids.pop(tool_use_id, None)
+        outgoing = OutgoingMessage(
+            content=text,
+            reply_to=reply_to,
+            metadata={"disable_notification": True},
+        )
+        try:
+            result = await send(outgoing)
+        except Exception:
+            return None
+        ref: str | None = None
+        if isinstance(result, str) and result:
+            ref = result
+        elif isinstance(result, dict):
+            inner = result.get("result") if isinstance(result.get("result"), dict) else {}
+            chat_raw = result.get("chat") or inner.get("chat") or {}
+            chat = chat_raw.get("id") if isinstance(chat_raw, dict) else chat_raw
+            msg_id = result.get("message_id") or inner.get("message_id")
+            if msg_id is not None:
+                ref = f"{chat or reply_to}|{msg_id}"
+        if ref:
+            self._tool_status_ids[tool_use_id] = ref
+            return ref
+        return None
+
+    async def _maybe_notify_tool_progress(self, event: Any) -> None:
+        if not self._tool_notify_enabled:
+            return
+        meta = getattr(self._inbound, "metadata", None) or {}
+        thread = meta.get("thread_id") or meta.get("message_thread_id")
+        reply_to = thread or getattr(self._inbound, "channel_id", None)
+        if isinstance(event, ToolUseEndEvent):
+            text = self._tool_progress_text(
+                tool_name=event.tool_name,
+                tool_use_id=event.tool_use_id,
+                arguments=event.arguments,
+                done=True,
+                is_error=False,
+            )
+            await self._send_tool_status(
+                tool_use_id=event.tool_use_id, text=text, reply_to=reply_to
+            )
+        elif isinstance(event, ToolResultEvent):
+            if getattr(event, "is_error", False):
+                text = self._tool_progress_text(
+                    tool_name=event.tool_name,
+                    tool_use_id=event.tool_use_id,
+                    arguments=getattr(event, "arguments", None),
+                    done=True,
+                    is_error=True,
+                )
+                await self._send_tool_status(
+                    tool_use_id=event.tool_use_id, text=text, reply_to=reply_to
+                )
 
     @classmethod
     def maybe_create(
@@ -2315,7 +2421,20 @@ class _RuntimeChannelStreamRelay:
         task_runtime: Any,
         config: Any = None,
     ) -> _RuntimeChannelStreamRelay | None:
-        if not resolve_channel_stream_policy(channel).relay_stream:
+        policy = resolve_channel_stream_policy(channel)
+        log.warning(
+            "channel_dispatch.relay_diag",
+            channel_type=type(channel).__name__,
+            policy_mode=policy.mode,
+            relay_stream=policy.relay_stream,
+            has_send_streaming=callable(getattr(channel, "send_streaming", None)),
+            has_enqueue=callable(getattr(task_runtime, "enqueue", None)),
+            enqueue_accepts_sink=(
+                callable(getattr(task_runtime, "enqueue", None))
+                and _accepts_keyword_arg(task_runtime.enqueue, "stream_event_sink")
+            ),
+        )
+        if not policy.relay_stream:
             return None
         enqueue = getattr(task_runtime, "enqueue", None)
         if not callable(enqueue) or not _accepts_keyword_arg(enqueue, "stream_event_sink"):
@@ -2428,6 +2547,7 @@ class _RuntimeChannelStreamRelay:
                 return
 
     async def emit(self, event: Any) -> None:
+        await self._maybe_notify_tool_progress(event)
         artifact = _artifact_event_payload(event)
         if artifact is not None:
             self._artifacts.append(artifact)
