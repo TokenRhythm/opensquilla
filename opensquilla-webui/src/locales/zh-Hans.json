@@ -4435,5 +4435,28 @@
       "copyFailed": "无法复制命令",
       "copyLabel": "复制网关重启命令"
     }
+  },
+  "remoteControl": {
+    "title": "手机遥控",
+    "sidebar": "遥控",
+    "enable": "启用远程控制",
+    "enableDesc": "从其他设备通过本地代理控制。",
+    "deviceName": "设备名称",
+    "scanHint": "扫描二维码以在远程控制中打开此设备，或",
+    "copyLink": "复制链接",
+    "desc": "用手机扫码打开本网关的移动控制面板。链接 10 分钟后过期且只能使用一次。",
+    "create": "生成二维码",
+    "tunnelHint": "无法建立公网隧道。若本机开启了代理（Clash/V2Ray 等 TUN 模式），它可能劫持了 cloudflared 的出站连接，请为 cloudflared 设置直连规则后重试。",
+    "safeModeUnavailable": "本机安全模式当前不可用，未勾选「允许执行主机命令」的手机将无法执行任何任务（发送会被拒绝）。请勾选该选项后重新配对，或先修复安全模式。",
+    "creating": "生成中…",
+    "expiresIn": "有效期剩余",
+    "hostExecute": "允许执行主机命令",
+    "hostExecuteWarn": "警告：开启后手机将获得在本机执行命令的权限。仅在可信网络下启用。",
+    "hostExecuteAppliesNext": "该设置在下次生成二维码时生效；要改变已配对设备的权限，请先断开再重新配对。",
+    "devices": "已配对设备",
+    "connected": "已连接",
+    "pending": "等待扫码",
+    "revoke": "断开",
+    "revokeAll": "全部断开"
   }
 }

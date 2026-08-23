@@ -215,6 +215,21 @@ function toggleSection(family: SidebarFamilyId) {
   writeSidebarCollapsedState(next)
 }
 
+function zoneCollapseKey(zone: SidebarDisplayZone): string {
+  return `zone:${zone}`
+}
+
+function isZoneCollapsed(zone: SidebarDisplayZone): boolean {
+  return collapsed.value[zoneCollapseKey(zone)] === true
+}
+
+function toggleZone(zone: SidebarDisplayZone) {
+  const key = zoneCollapseKey(zone)
+  const next = { ...collapsed.value, [key]: !isZoneCollapsed(zone) }
+  collapsed.value = next
+  writeSidebarCollapsedState(next)
+}
+
 function projectCollapseKey(workspaceId: string): string {
   return `project:${workspaceId}`
 }
@@ -978,8 +993,17 @@ function onSelectRow(row: SidebarConversationItem) {
           class="sidebar-zone-heading"
           :data-sidebar-zone-heading="block.zone"
         >
-          <span class="sidebar-zone-heading__label">{{ block.label }}</span>
-          <span class="sidebar-zone-heading__count">{{ block.count }}</span>
+          <button
+            type="button"
+            class="sidebar-zone-heading__disclosure"
+            :aria-expanded="!isZoneCollapsed(block.zone)"
+            :aria-controls="`sidebar-zone-${block.zone}`"
+            @click="toggleZone(block.zone)"
+          >
+            <Icon class="sidebar-zone-heading__chevron" name="chevronRight" :size="12" />
+            <span class="sidebar-zone-heading__label">{{ block.label }}</span>
+            <span class="sidebar-zone-heading__count">{{ block.count }}</span>
+          </button>
           <button
             v-if="
               block.zone === 'projects'
@@ -1034,8 +1058,11 @@ function onSelectRow(row: SidebarConversationItem) {
 
         <Transition name="sidebar-group">
           <div
-            v-show="!block.showFamilyHeader || !block.family || !isCollapsed(block.family)"
-            :id="`sidebar-group-${block.key}`"
+            v-show="
+              !isZoneCollapsed(block.zone)
+              && (!block.showFamilyHeader || !block.family || !isCollapsed(block.family))
+            "
+            :id="block.showHeading ? `sidebar-zone-${block.zone}` : `sidebar-group-${block.key}`"
             class="sidebar-group__body"
           >
             <div class="sidebar-group__content">

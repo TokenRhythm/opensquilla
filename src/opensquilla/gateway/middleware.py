@@ -176,7 +176,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if auth_mode == "token":
             token = self._extract_token(request)
-            from opensquilla.gateway.auth import resolve_auth
+            from opensquilla.gateway.auth import normalize_forwarded_for, resolve_auth
 
             peer_ip = request.client.host if request.client is not None else None
             principal = resolve_auth(
@@ -184,6 +184,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 auth_params={"token": token} if token else {},
                 role_claim="operator",
                 peer_ip=peer_ip,
+                forwarded_for=normalize_forwarded_for(request.headers),
             )
             if principal is None:
                 return JSONResponse(

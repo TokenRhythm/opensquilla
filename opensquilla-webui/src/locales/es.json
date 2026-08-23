@@ -4345,5 +4345,28 @@
       "copyFailed": "No se pudo copiar el comando",
       "copyLabel": "Copiar el comando de reinicio del gateway"
     }
+  },
+  "remoteControl": {
+    "title": "Control remoto móvil",
+    "sidebar": "Remoto",
+    "enable": "Activar control remoto",
+    "enableDesc": "Controlar desde otros dispositivos mediante un proxy local.",
+    "deviceName": "Nombre del dispositivo",
+    "scanHint": "Escanee el código QR para abrir este dispositivo, o",
+    "copyLink": "copiar enlace",
+    "desc": "Escanea el código QR con tu teléfono para abrir un panel de control móvil de esta pasarela. El enlace caduca en 10 minutos y solo puede usarse una vez.",
+    "create": "Generar código QR",
+    "tunnelHint": "No se pudo establecer un túnel público. Un proxy local en modo TUN (Clash/V2Ray u similar) puede secuestrar la conexión de salida de cloudflared; añade una regla directa para cloudflared y reinténtalo.",
+    "safeModeUnavailable": "El modo seguro no esta disponible en este equipo, por lo que un telefono emparejado sin permiso de comandos del host no puede ejecutar nada y sus envios se rechazan. Activa esa opcion y vuelve a emparejar, o repara el modo seguro.",
+    "creating": "Creando…",
+    "expiresIn": "Caduca en",
+    "hostExecute": "Permitir ejecución de comandos en el host",
+    "hostExecuteWarn": "Advertencia: esto concede al teléfono permiso para ejecutar comandos en esta máquina. Actívalo solo en redes de confianza.",
+    "hostExecuteAppliesNext": "Esto se aplica al proximo codigo QR. Para cambiar un dispositivo ya emparejado, revocalo y vuelve a emparejarlo.",
+    "devices": "Dispositivos vinculados",
+    "connected": "Conectado",
+    "pending": "Esperando escaneo",
+    "revoke": "Revocar",
+    "revokeAll": "Revocar todo"
   }
 }

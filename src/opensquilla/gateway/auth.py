@@ -26,12 +26,18 @@ import ipaddress
 import re
 import secrets
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import structlog
 
+from opensquilla.gateway.pairing import (
+    PAIRING_DEVICE_SOURCE_KIND,
+    PAIRING_DEVICE_TTL_SECONDS,
+    pairing_device_name,
+)
 from opensquilla.gateway.scopes import (
     CLI_DEFAULT_OPERATOR_SCOPES,
     GUEST_SAFE_CAPABILITIES,
@@ -86,6 +92,10 @@ class Principal:
     token_public_id: str | None = None
     guest_owner_id: str | None = None
     guest_session_key: str | None = field(default=None, repr=False)
+    # Long-lived reconnect credential minted when a pairing token is claimed
+    # (web remote control). Returned to the phone in the hello payload; never
+    # logged.
+    device_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.auth_state is None:
@@ -114,6 +124,7 @@ class ScopeResolver(Protocol):
         config: GatewayConfig,
         *,
         peer_ip: str | None = None,
+        forwarded_for: str | None = None,
     ) -> Principal: ...
 
 
@@ -127,6 +138,7 @@ class TokenScopeResolver:
         config: GatewayConfig,
         *,
         peer_ip: str | None = None,
+        forwarded_for: str | None = None,
     ) -> Principal:
         allowed_roles = config.auth.allowed_roles
         if role_claim not in allowed_roles:
@@ -136,6 +148,11 @@ class TokenScopeResolver:
             allowed_cidrs=config.auth.allowed_client_cidrs,
         ):
             raise ValueError("Public peers are not accepted")
+
+        # Token-record bookkeeping wants the real client address when the
+        # request came through the tunnel relay; trust decisions below use
+        # the raw transport peer only.
+        record_ip = forwarded_for or peer_ip
 
         provided = str((auth_params or {}).get("token") or "")
         if provided and role_claim == "operator":
@@ -163,7 +180,7 @@ class TokenScopeResolver:
                 guest_session_key=_resolve_guest_session_key(auth_params),
             )
 
-        named_record = _verify_named_token(config, provided, peer_ip=peer_ip)
+        named_record = _verify_named_token(config, provided, peer_ip=record_ip)
         if named_record is not None:
             if role_claim not in named_record.roles:
                 return _guest_principal(
@@ -171,6 +188,20 @@ class TokenScopeResolver:
                     public_id=named_record.public_id,
                     guest_session_key=_resolve_guest_session_key(auth_params),
                 )
+            if named_record.source_kind == "pairing":
+                pairing_principal = _resolve_pairing_principal(
+                    config,
+                    named_record,
+                    role_claim,
+                    auth_params,
+                )
+                if pairing_principal is None:
+                    return _guest_principal(
+                        auth_state="invalid",
+                        public_id=named_record.public_id,
+                        guest_session_key=_resolve_guest_session_key(auth_params),
+                    )
+                return pairing_principal
             scopes = (
                 NODE_DEFAULT_SCOPES
                 if role_claim == "node"
@@ -203,8 +234,13 @@ class TokenScopeResolver:
             scopes = normalize_operator_scopes(config.auth.token_scopes)
             capabilities = HUMAN_TOKEN_CAPABILITIES
             # Owner flag follows proximity, not the token — a shared token
-            # used from a LAN peer should not claim ownership.
-            is_owner = is_loopback_bind(config.host) and is_loopback_address(peer_ip)
+            # used from a LAN peer or through the tunnel relay should not
+            # claim ownership.
+            is_owner = (
+                is_loopback_bind(config.host)
+                and is_loopback_address(peer_ip)
+                and not forwarded_for
+            )
 
         return Principal(
             role=role_claim,
@@ -243,6 +279,7 @@ class OpenScopeResolver:
         config: GatewayConfig,
         *,
         peer_ip: str | None = None,
+        forwarded_for: str | None = None,
     ) -> Principal:
         allowed_roles = config.auth.allowed_roles
         if role_claim not in allowed_roles:
@@ -263,7 +300,49 @@ class OpenScopeResolver:
                 auth_state="guest",
             )
 
-        local_owner = is_loopback_bind(config.host) and is_loopback_address(peer_ip)
+        record_ip = forwarded_for or peer_ip
+        provided = str((auth_params or {}).get("token") or "")
+        if provided:
+            named_record = _verify_named_token(config, provided, peer_ip=record_ip)
+            if named_record is not None and named_record.source_kind == "pairing":
+                pairing_principal = _resolve_pairing_principal(
+                    config,
+                    named_record,
+                    role_claim,
+                    auth_params,
+                )
+                if pairing_principal is not None:
+                    return pairing_principal
+                return _guest_principal(
+                    auth_state="invalid",
+                    public_id=named_record.public_id,
+                    guest_session_key=_resolve_guest_session_key(auth_params),
+                )
+            if (
+                named_record is not None
+                and named_record.source_kind == PAIRING_DEVICE_SOURCE_KIND
+                and role_claim in named_record.roles
+            ):
+                # Reconnect credential minted by a pairing claim: it is a
+                # plain operator token and must not fall through to guest.
+                return Principal(
+                    role=role_claim,
+                    scopes=normalize_operator_scopes(named_record.scopes),
+                    is_owner=False,
+                    authenticated=True,
+                    capabilities=named_record.capabilities,
+                    auth_state="authenticated",
+                    token_public_id=named_record.public_id,
+                )
+
+        # Loopback proximity proves a true local owner. The tunnel relay also
+        # dials from loopback, but it always carries X-Forwarded-For — such a
+        # connection is a remote phone, never the owner.
+        local_owner = (
+            is_loopback_bind(config.host)
+            and is_loopback_address(peer_ip)
+            and not forwarded_for
+        )
 
         if local_owner:
             scopes = CLI_DEFAULT_OPERATOR_SCOPES
@@ -362,17 +441,94 @@ def _verify_named_token(
 ) -> TokenRecord | None:
     if not token.startswith("osq_"):
         return None
+    store = _named_token_store(config)
+    if store is None:
+        return None
+    try:
+        return store.verify(token, peer_ip=peer_ip)
+    except (OSError, sqlite3.Error):
+        log.exception("auth.named_token_store_unavailable")
+        return None
+
+
+def _named_token_store(config: GatewayConfig) -> TokenStore | None:
     state_dir = getattr(config, "state_dir", None)
     if not state_dir:
         return None
     try:
-        return TokenStore(Path(str(state_dir)) / "sessions.db").verify(
-            token,
-            peer_ip=peer_ip,
-        )
+        return TokenStore(Path(str(state_dir)) / "sessions.db")
     except (OSError, sqlite3.Error):
         log.exception("auth.named_token_store_unavailable")
         return None
+
+
+def _resolve_pairing_principal(
+    config: GatewayConfig,
+    named_record: TokenRecord,
+    role_claim: str,
+    auth_params: dict,
+) -> Principal | None:
+    """Authenticate a one-shot pairing token, or return None to reject.
+
+    Pairing tokens (web remote control) can be claimed exactly once: the
+    first WebSocket handshake that presents the token wins. Every later
+    handshake with the same token is rejected, so a scanned QR credential
+    cannot be replayed after the phone session ends.
+    """
+
+    if role_claim not in named_record.roles:
+        return None
+    store = _named_token_store(config)
+    if store is None:
+        return None
+    current = store.get(named_record.public_id)
+    if current is None or current.claimed_at is not None:
+        return None
+    if not store.claim(named_record.public_id):
+        return None
+    scopes = normalize_operator_scopes(named_record.scopes)
+    return Principal(
+        role=role_claim,
+        scopes=scopes,
+        is_owner=False,
+        authenticated=True,
+        capabilities=named_record.capabilities,
+        auth_state="authenticated",
+        token_public_id=named_record.public_id,
+        device_token=_mint_pairing_device_token(
+            store,
+            named_record.public_id,
+            scopes,
+            named_record.capabilities,
+        ),
+    )
+
+
+def _mint_pairing_device_token(
+    store: TokenStore,
+    pairing_public_id: str,
+    scopes: frozenset[str],
+    capabilities: frozenset[str],
+) -> str | None:
+    """Mint the long-lived credential the phone uses to reconnect.
+
+    Failure here must not reject an otherwise valid pairing: the connection
+    proceeds one-shot exactly as before, without a reconnect credential.
+    """
+
+    try:
+        issued = store.create(
+            name=pairing_device_name(pairing_public_id),
+            roles={"operator"},
+            scopes=scopes,
+            capabilities=capabilities,
+            source_kind=PAIRING_DEVICE_SOURCE_KIND,
+            expires_at=int(time.time()) + PAIRING_DEVICE_TTL_SECONDS,
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        log.warning("auth.pairing_device_token_mint_failed")
+        return None
+    return issued.token
 
 
 _RESOLVERS: dict[str, ScopeResolver] = {
@@ -381,12 +537,32 @@ _RESOLVERS: dict[str, ScopeResolver] = {
 }
 
 
+def normalize_forwarded_for(headers: object) -> str | None:
+    """First hop of an X-Forwarded-For header, or None.
+
+    The tunnel relay (cloudflared) dials from loopback and stamps the
+    phone's address here; the header's presence marks the connection as
+    "relayed remote". It never grants trust - callers use it only to
+    deny loopback-proximity owner upgrades and to record the real client
+    address on token rows.
+    """
+
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    value = getter("x-forwarded-for") if callable(getter) else None
+    if not value:
+        return None
+    return str(value).split(",")[0].strip() or None
+
+
 def resolve_auth(
     config: GatewayConfig,
     auth_params: dict,
     role_claim: str,
     *,
     peer_ip: str | None = None,
+    forwarded_for: str | None = None,
 ) -> Principal | None:
     """Pick resolver by auth mode, return Principal or None on failure.
 
@@ -395,13 +571,19 @@ def resolve_auth(
     proximity checks in :class:`OpenScopeResolver` and to set the
     ``is_owner`` flag in :class:`TokenScopeResolver`. ``None`` is treated
     as "unknown" — non-loopback for the purposes of any upgrade.
+    ``forwarded_for`` is the client address claimed by a trusted local
+    relay (the remote-control tunnel); it never grants proximity-based
+    trust, it only marks the connection as "not the local owner" and is
+    used for token-record bookkeeping.
     """
     resolver = _RESOLVERS.get(config.auth.mode)
     if resolver is None:
         log.warning("auth.unsupported_mode", mode=config.auth.mode)
         return None
     try:
-        return resolver.resolve(auth_params, role_claim, config, peer_ip=peer_ip)
+        return resolver.resolve(
+            auth_params, role_claim, config, peer_ip=peer_ip, forwarded_for=forwarded_for
+        )
     except ValueError as exc:
         log.warning("auth.failed", mode=config.auth.mode, error=str(exc))
         return None

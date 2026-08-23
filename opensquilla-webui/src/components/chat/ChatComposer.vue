@@ -1925,6 +1925,13 @@ defineExpose<ChatComposerExpose>({
   .chat-composer--floating.chat-composer--collapsed {
     padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
   }
+
+  /* Touch-first Stop/Send targets on phones: the streaming Stop button must
+     stay reachable one-handed mid-turn. */
+  .chat-input-actions .btn--icon {
+    height: 44px;
+    width: 44px;
+  }
 }
 
 @media (hover: none) {

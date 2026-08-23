@@ -53,7 +53,7 @@ async def workspace_ctx(tmp_path):
         await storage.close()
 
 
-def _remote_ctx(owner_ctx: RpcContext) -> RpcContext:
+def _remote_ctx(owner_ctx: RpcContext, *, host_execute: bool = False) -> RpcContext:
     return RpcContext(
         conn_id="remote",
         principal=Principal(
@@ -61,6 +61,11 @@ def _remote_ctx(owner_ctx: RpcContext) -> RpcContext:
             scopes=frozenset({"operator.read", "operator.write"}),
             is_owner=False,
             authenticated=True,
+            capabilities=(
+                frozenset({"host.execute", "task.submit"})
+                if host_execute
+                else frozenset({"task.submit"})
+            ),
         ),
         session_manager=owner_ctx.session_manager,
         config=owner_ctx.config,
@@ -1663,7 +1668,28 @@ async def test_failed_legacy_adoption_is_retried(
 
 
 @pytest.mark.asyncio
-async def test_all_workspace_handlers_require_local_owner(
+async def test_remote_host_execute_can_list_and_open_workspaces(
+    workspace_ctx, tmp_path
+) -> None:
+    owner_ctx, _storage = workspace_ctx
+    ctx = _remote_ctx(owner_ctx, host_execute=True)
+    project = tmp_path / "remote-project"
+    project.mkdir()
+
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+    listed = await _handle_workspaces_list(None, ctx)
+
+    assert opened["workspace"]["path"] == str(project.resolve())
+    assert [row["id"] for row in listed["workspaces"]] == [
+        opened["workspace"]["id"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_handlers_reject_remote_without_host_execute(
     workspace_ctx, tmp_path
 ) -> None:
     from opensquilla.gateway import rpc_workspaces
@@ -1697,4 +1723,4 @@ async def test_all_workspace_handlers_require_local_owner(
     for handler, params in calls:
         with pytest.raises(RpcHandlerError) as excinfo:
             await handler(params, ctx)
-        assert excinfo.value.code == "OWNER_REQUIRED"
+        assert excinfo.value.code == "HOST_CAPABILITY_REQUIRED"

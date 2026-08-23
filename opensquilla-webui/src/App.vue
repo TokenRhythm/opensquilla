@@ -114,6 +114,17 @@
       <button
         type="button"
         class="sidebar-fn-item"
+        data-icon="remote"
+        data-testid="sidebar-remote-control"
+        :title="t('remoteControl.title')"
+        @click="remoteControlOpen = true"
+      >
+        <Icon name="qr" :size="16" />
+        <span class="sidebar-fn-label">{{ t('remoteControl.sidebar') }}</span>
+      </button>
+      <button
+        type="button"
+        class="sidebar-fn-item"
         data-icon="settings"
         @click="openSettings"
       >
@@ -405,6 +416,11 @@
 
   <ConfirmModal />
 
+  <RemoteControlDialog
+    :open="remoteControlOpen"
+    @close="remoteControlOpen = false"
+  />
+
   <ProjectWorkspaceCreateDialog
     v-if="rpcStore.canChooseProject"
     :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
@@ -476,6 +492,7 @@ import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
+import RemoteControlDialog from './components/RemoteControlDialog.vue'
 import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
@@ -731,6 +748,7 @@ installSessionNavigationDiagConsole()
 const { agents, loadAgents } = useAgentOptions(optionalSessionRpcCallOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
+const remoteControlOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
 // Pending optimistic renames, keyed by session key; cleared after the next list
 // reload returns the backend's canonical title.

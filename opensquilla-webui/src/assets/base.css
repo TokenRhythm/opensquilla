@@ -738,6 +738,30 @@ pre {
   flex-shrink: 0;
 }
 
+.sidebar-zone-heading__disclosure {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.sidebar-zone-heading__chevron {
+  flex: 0 0 auto;
+  transform: rotate(0deg);
+  transition: transform var(--transition);
+}
+
+.sidebar-zone-heading__disclosure[aria-expanded='true'] .sidebar-zone-heading__chevron {
+  transform: rotate(90deg);
+}
+
 .sidebar-zone-heading__label {
   min-width: 0;
   overflow: hidden;

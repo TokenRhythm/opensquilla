@@ -9,6 +9,7 @@ const clients: Array<{
   emit: (event: string, ...args: unknown[]) => void
   disconnect: ReturnType<typeof vi.fn>
   waitForConnection: ReturnType<typeof vi.fn>
+  updateToken: ReturnType<typeof vi.fn>
 }> = []
 
 vi.mock('@/lib/rpc', () => ({
@@ -45,6 +46,7 @@ vi.mock('@/lib/rpc', () => ({
     })
     waitForConnection = vi.fn()
     call = vi.fn()
+    updateToken = vi.fn()
   },
 }))
 
@@ -56,7 +58,7 @@ describe('rpc link-token bootstrap', () => {
     localStorage.clear()
     sessionStorage.clear()
     delete window.opensquillaDesktop
-    window.history.replaceState(null, '', '/control/sessions')
+    window.history.replaceState(null, '', 'http://localhost:3000/control/sessions')
   })
 
   it('uses a URL token over stale browser storage before initial connect', () => {
@@ -68,7 +70,7 @@ describe('rpc link-token bootstrap', () => {
     localStorage.setItem('unrelated.preference', 'keep')
     sessionStorage.setItem('opensquilla.wsToken', 'old-token')
     sessionStorage.setItem('opensquilla.cachedAuth', 'stale-auth')
-    window.history.replaceState(null, '', '/control/?token=new-token')
+    window.history.replaceState(null, '', '/control/#token=new-token')
 
     const store = useRpcStore()
     store.init()
@@ -83,6 +85,31 @@ describe('rpc link-token bootstrap', () => {
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('new-token')
     expect(sessionStorage.getItem('opensquilla.cachedAuth')).toBeNull()
     expect(window.location.href).toBe('http://localhost:3000/control/')
+  })
+
+  it('refuses a query-string token and strips it without connecting', () => {
+    // A token in the query has already been transmitted to the server by the
+    // time any script runs, so it must never be honoured or persisted.
+    window.history.replaceState(null, '', '/control/?token=leaked-token')
+
+    const store = useRpcStore()
+    store.init()
+
+    expect(connectCalls).toEqual([{ url: 'ws://localhost:3000/ws', token: undefined }])
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+    expect(window.location.href).toBe('http://localhost:3000/control/')
+  })
+
+  it('consumes a fragment token and leaves no secret in the address bar', () => {
+    window.history.replaceState(null, '', '/control/?session=agent%3Amain#token=frag-token')
+
+    const store = useRpcStore()
+    store.init()
+
+    expect(connectCalls).toEqual([{ url: 'ws://localhost:3000/ws', token: 'frag-token' }])
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('frag-token')
+    // The session hint survives; the spent secret does not.
+    expect(window.location.href).toBe('http://localhost:3000/control/?session=agent%3Amain')
   })
 
   it('delegates an aborted wait even when the reactive store is connected', async () => {
@@ -113,7 +140,7 @@ describe('rpc link-token bootstrap', () => {
     store.init()
     expect(connectCalls).toEqual([{ url: 'ws://localhost:3000/ws', token: 'old-token' }])
 
-    window.history.replaceState(null, '', '/control/sessions?token=new-token')
+    window.history.replaceState(null, '', '/control/sessions#token=new-token')
     expect(store.applyLinkTokenFromUrl()).toBe(true)
 
     expect(connectCalls).toEqual([
@@ -145,7 +172,7 @@ describe('rpc link-token bootstrap', () => {
     store.markMethodUnavailable('usage.query')
     expect(store.supportsMethod('usage.query')).toBe(false)
 
-    window.history.replaceState(null, '', '/control/?token=new-token')
+    window.history.replaceState(null, '', '/control/#token=new-token')
 
     expect(store.applyLinkTokenFromUrl()).toBe(true)
     expect(store.policy).toBeNull()
@@ -201,6 +228,14 @@ describe('rpc link-token bootstrap', () => {
     expect(store.canManageProjectWorkspaces).toBe(false)
 
     clients[0].emit('_state', 'connected')
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: false, capabilities: ['host.execute'] } },
+      features: { methods: ['workspaces.list', 'workspaces.open'] },
+    })
+    expect(store.isLocalOwner).toBe(false)
+    expect(store.canManageProjectWorkspaces).toBe(true)
+    expect(store.canChooseProject).toBe(true)
+
     clients[0].emit('_hello', {
       auth: { principal: { isOwner: false } },
       features: { methods: ['workspaces.list', 'workspaces.open'] },
@@ -267,5 +302,96 @@ describe('rpc link-token bootstrap', () => {
     expect(clients[0].disconnect).toHaveBeenCalledOnce()
     expect(store.error).toBe('runtime stopped')
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+  })
+})
+
+describe('rpc store device credentials', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    connectCalls.length = 0
+    clients.length = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    // The Desktop supervisor case in the previous suite installs this global;
+    // leaving it set routes init() down the Desktop branch, which returns
+    // before the browser link-token bootstrap ever connects.
+    delete window.opensquillaDesktop
+    // Reset the fragment too: a leftover #token from an earlier test would be
+    // consumed here and silently replace the credential under test.
+    window.history.replaceState(null, '', 'http://localhost:3000/control/')
+  })
+
+  it('persists the hello deviceToken and drops the spent pairing token', () => {
+    sessionStorage.setItem('opensquilla.wsToken', 'osq_pair')
+    const store = useRpcStore()
+    store.init()
+
+    // Shape mirrors the gateway: the credential rides inside the auth payload
+    // (see _websocket_hello_auth_payload), not at the frame's top level.
+    clients[0].emit('_hello', {
+      auth: { principal: { authenticated: true }, deviceToken: 'osq_dev' },
+    })
+
+    expect(localStorage.getItem('opensquilla.deviceToken')).toBe('osq_dev')
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+    // Reconnects must replay the device credential, not the spent pairing token.
+    expect(clients[0].updateToken).toHaveBeenCalledWith('osq_dev')
+  })
+
+  it('reconnects with the stored deviceToken in a fresh browser session', () => {
+    localStorage.setItem('opensquilla.deviceToken', 'osq_dev')
+
+    const store = useRpcStore()
+    store.init()
+
+    expect(connectCalls.length).toBeGreaterThan(0)
+    expect(connectCalls[0].token).toBe('osq_dev')
+  })
+
+  it('clears a stale deviceToken when the gateway rejects it', () => {
+    localStorage.setItem('opensquilla.deviceToken', 'osq_stale')
+    const store = useRpcStore()
+    store.init()
+
+    clients[0].emit('_hello', { auth: { principal: { authenticated: false } } })
+
+    expect(localStorage.getItem('opensquilla.deviceToken')).toBeNull()
+    expect(clients[0].updateToken).toHaveBeenCalledWith(null)
+  })
+
+  it('ignores a top-level deviceToken, which the gateway never sends', () => {
+    const store = useRpcStore()
+    store.init()
+
+    clients[0].emit('_hello', {
+      auth: { principal: { authenticated: true } },
+      deviceToken: 'osq_wrong_shape',
+    })
+
+    expect(localStorage.getItem('opensquilla.deviceToken')).toBeNull()
+  })
+
+  it('preserves the deviceToken across a plain reload without a link token', () => {
+    // The phone reloads the bare control URL after a network switch; wiping
+    // the credential here is what stranded it with no way back in.
+    localStorage.setItem('opensquilla.deviceToken', 'osq_dev')
+    window.history.replaceState(null, '', '/control/')
+
+    const store = useRpcStore()
+    store.init()
+
+    expect(localStorage.getItem('opensquilla.deviceToken')).toBe('osq_dev')
+    expect(connectCalls[0].token).toBe('osq_dev')
+  })
+
+  it('discards the previous deviceToken when a fresh pairing link arrives', () => {
+    localStorage.setItem('opensquilla.deviceToken', 'osq_old')
+    window.history.replaceState(null, '', '/control/#token=osq_fresh')
+
+    const store = useRpcStore()
+    store.init()
+
+    expect(connectCalls[0].token).toBe('osq_fresh')
+    expect(localStorage.getItem('opensquilla.deviceToken')).toBeNull()
   })
 })

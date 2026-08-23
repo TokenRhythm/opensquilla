@@ -436,7 +436,7 @@ def create_gateway_app(
         return JSONResponse(payload, status_code=status)
 
     def _make_ctx(request: Request | None = None, role_claim: str = "operator") -> RpcContext:
-        from opensquilla.gateway.auth import Principal, resolve_auth
+        from opensquilla.gateway.auth import Principal, normalize_forwarded_for, resolve_auth
 
         principal = (
             getattr(request.state, "principal", None)
@@ -458,6 +458,9 @@ def create_gateway_app(
                 auth_params=auth_params,
                 role_claim=role_claim,
                 peer_ip=peer_ip,
+                forwarded_for=normalize_forwarded_for(
+                    request.headers if request is not None else None
+                ),
             )
         if principal is None:
             principal = Principal(

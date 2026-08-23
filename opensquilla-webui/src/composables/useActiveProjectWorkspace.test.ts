@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   createDraftProjectHydrationGuard,
+  projectSendBlockedReason,
   useActiveProjectWorkspace,
   type ActiveProjectWorkspaceSnapshot,
 } from './useActiveProjectWorkspace'
@@ -85,6 +86,18 @@ describe('useActiveProjectWorkspace', () => {
     })
     expect(unknown.status.value).toBe('unknown')
     expect(unknown.sendBlockedReason.value).toBe('unknown')
+  })
+
+  it('allows a paired remote to continue an existing bound project session', () => {
+    expect(projectSendBlockedReason('unknown', 'bound-project', false)).toBeNull()
+
+    // Local owners still resolve the project catalog before sending, and a
+    // remote session never bypasses authoritative negative states.
+    expect(projectSendBlockedReason('unknown', 'bound-project', true)).toBe('unknown')
+    expect(projectSendBlockedReason('unknown', null, false)).toBe('unknown')
+    expect(projectSendBlockedReason('unavailable', 'bound-project', false)).toBe('unavailable')
+    expect(projectSendBlockedReason('removed', 'bound-project', false)).toBe('removed')
+    expect(projectSendBlockedReason('error', 'bound-project', false)).toBe('error')
   })
 
   it('rejects a stale session snapshot after switching sessions', () => {

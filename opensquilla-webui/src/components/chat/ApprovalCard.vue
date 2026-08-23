@@ -702,6 +702,7 @@ function emitDeny() {
 
   .approval-card__actions .btn {
     justify-content: center;
+    min-height: 44px;
   }
 }
 

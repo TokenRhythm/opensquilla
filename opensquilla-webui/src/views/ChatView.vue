@@ -935,6 +935,7 @@ import {
 } from '@/composables/useProjectWorkspaces'
 import {
   createDraftProjectHydrationGuard,
+  projectSendBlockedReason,
   useActiveProjectWorkspace,
   type ActiveProjectWorkspaceSnapshot,
 } from '@/composables/useActiveProjectWorkspace'
@@ -6252,7 +6253,11 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     }
     if (!workspaceId) return activeWorkspaceSendBlockedReason.value
     if (!rpc.canManageProjectWorkspaces) {
-      return activeWorkspaceSendBlockedReason.value
+      return projectSendBlockedReason(
+        activeWorkspaceStatus.value,
+        workspaceId,
+        false,
+      )
     }
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),

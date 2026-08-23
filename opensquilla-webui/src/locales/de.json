@@ -4345,5 +4345,28 @@
       "copyFailed": "Befehl konnte nicht kopiert werden",
       "copyLabel": "Gateway-Neustart-Befehl kopieren"
     }
+  },
+  "remoteControl": {
+    "title": "Mobile Fernsteuerung",
+    "sidebar": "Fernsteuerung",
+    "enable": "Fernsteuerung aktivieren",
+    "enableDesc": "Von anderen Geräten über einen lokalen Proxy steuern.",
+    "deviceName": "Gerätename",
+    "scanHint": "QR-Code scannen, um dieses Gerät zu öffnen, oder",
+    "copyLink": "Link kopieren",
+    "desc": "Scannen Sie den QR-Code mit Ihrem Telefon, um ein mobiles Bedienfeld für dieses Gateway zu öffnen. Der Link läuft in 10 Minuten ab und kann nur einmal verwendet werden.",
+    "create": "QR-Code erstellen",
+    "tunnelHint": "Es konnte kein öffentlicher Tunnel aufgebaut werden. Ein lokaler Proxy im TUN-Modus (Clash/V2Ray o. Ä.) kann die ausgehende Verbindung von cloudflared abfangen; ergänze eine Direktregel für cloudflared und versuche es erneut.",
+    "safeModeUnavailable": "Der Safe-Modus ist auf diesem Host nicht verfuegbar. Ein Telefon ohne Host-Befehlsrechte kann daher nichts ausfuehren und seine Sendevorgaenge werden abgelehnt. Aktivieren Sie die Option und koppeln Sie erneut, oder reparieren Sie den Safe-Modus.",
+    "creating": "Erstelle…",
+    "expiresIn": "Läuft ab in",
+    "hostExecute": "Host-Befehle erlauben",
+    "hostExecuteWarn": "Warnung: Dadurch erhält das Telefon die Berechtigung, Befehle auf diesem Computer auszuführen. Nur in vertrauenswürdigen Netzwerken aktivieren.",
+    "hostExecuteAppliesNext": "Dies gilt für den naechsten QR-Code. Um ein bereits gekoppeltes Geraet zu aendern, trennen Sie es und koppeln Sie erneut.",
+    "devices": "Gekoppelte Geräte",
+    "connected": "Verbunden",
+    "pending": "Warte auf Scan",
+    "revoke": "Widerrufen",
+    "revokeAll": "Alle widerrufen"
   }
 }

@@ -4435,5 +4435,28 @@
       "copyFailed": "Could not copy the command",
       "copyLabel": "Copy the gateway restart command"
     }
+  },
+  "remoteControl": {
+    "title": "Mobile remote control",
+    "sidebar": "Remote",
+    "enable": "Enable remote control",
+    "enableDesc": "Control from other devices using a local proxy.",
+    "deviceName": "Device name",
+    "scanHint": "Scan the QR code to open this device in remote control, or",
+    "copyLink": "copy link",
+    "desc": "Scan the QR code with your phone to open a mobile control panel for this gateway. The link expires in 10 minutes and can be used once.",
+    "create": "Generate QR code",
+    "tunnelHint": "Could not establish a public tunnel. A local proxy in TUN mode (Clash/V2Ray and similar) can hijack cloudflared's outbound connection; add a direct rule for cloudflared and retry.",
+    "safeModeUnavailable": "Safe mode is unavailable on this host, so a phone paired without host command permission cannot run anything and its sends will be rejected. Enable that option and pair again, or repair Safe mode first.",
+    "creating": "Creating…",
+    "expiresIn": "Expires in",
+    "hostExecute": "Allow host command execution",
+    "hostExecuteWarn": "Warning: this grants the phone permission to run host commands on this machine. Only enable it when you trust the network.",
+    "hostExecuteAppliesNext": "This applies to the next QR code. To change an already paired device, revoke it and pair again.",
+    "devices": "Paired devices",
+    "connected": "Connected",
+    "pending": "Waiting for scan",
+    "revoke": "Revoke",
+    "revokeAll": "Revoke all"
   }
 }
