@@ -181,6 +181,80 @@ def test_tool_compaction_reserves_provider_tool_followup_and_summary_legs(
         driver.load_case(path)
 
 
+def test_send_and_observe_waits_for_assistant_history_after_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_key = "agent:main:webchat:synthetic"
+    marker = "synthetic complete"
+    events = [
+        {
+            "event": "session.event.text_delta",
+            "payload": {"session_key": session_key, "text": marker},
+        },
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": session_key, "reason": "completed"},
+        },
+    ]
+    calls: list[str] = []
+    history_calls = 0
+
+    class Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def connect(self, _url: str) -> None:
+            calls.append("connect")
+
+        async def call(
+            self,
+            method: str,
+            _params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal history_calls
+            calls.append(method)
+            if method == "chat.history":
+                history_calls += 1
+                if history_calls == 1:
+                    return {"messages": []}
+                return {"messages": [{"role": "assistant", "text": marker}]}
+            return {}
+
+        async def recv_event(self, *, timeout: float) -> dict[str, object]:
+            assert timeout > 0
+            if events:
+                return events.pop(0)
+            raise TimeoutError
+
+        async def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(driver, "GatewayRPCClient", Client)
+
+    observation, assistant_bytes, assistant_markers = asyncio.run(
+        driver._send_and_observe(
+            SimpleNamespace(ws_url="ws://synthetic"),
+            prompt="synthetic prompt",
+            marker=marker,
+            session_key=session_key,
+            timeout_seconds=5,
+        )
+    )
+
+    assert observation.completed is True
+    assert assistant_bytes == len(marker.encode("utf-8"))
+    assert assistant_markers == 1
+    assert history_calls == 2
+    assert calls == [
+        "connect",
+        "sessions.messages.subscribe",
+        "sessions.send",
+        "chat.history",
+        "chat.history",
+        "close",
+    ]
+
+
 def test_gateway_config_contains_env_names_but_not_credential_values(
     tmp_path: Path,
 ) -> None:
