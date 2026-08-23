@@ -379,6 +379,7 @@ METHOD_SCOPES: dict[str, str] = {
     # authenticated admin in addition to the handlers' local-owner proof.
     "sandbox.runtime.install": ADMIN_SCOPE,
     "sandbox.runtime.cancel": ADMIN_SCOPE,
+    "sandbox.runtime.discard_download": ADMIN_SCOPE,
     "sandbox.runtime.remove": ADMIN_SCOPE,
     "meta.setup.install": ADMIN_SCOPE,
     "meta.runs.show": ADMIN_SCOPE,

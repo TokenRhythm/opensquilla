@@ -98,6 +98,7 @@ async function createSandboxSettings(options: {
     if (
       method === 'sandbox.runtime.install'
       || method === 'sandbox.runtime.cancel'
+      || method === 'sandbox.runtime.discard_download'
       || method === 'sandbox.runtime.remove'
     ) {
       return options.runtimeAction?.(method, params) ?? { status: readyRuntimeStatus }
@@ -510,6 +511,7 @@ describe('useSandboxSettings runtime packs', () => {
     expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
       .toBe('operation-1')
     await expect(settings.cancelRuntime('python', 'operation-1')).resolves.toBe(true)
+    await expect(settings.discardRuntimeDownload('python')).resolves.toBe(true)
     await expect(settings.removeRuntime('python')).resolves.toBe(true)
 
     expect(call).toHaveBeenCalledWith('sandbox.runtime.install', { componentId: 'python' })
@@ -517,8 +519,58 @@ describe('useSandboxSettings runtime packs', () => {
       componentId: 'python',
       operationId: 'operation-1',
     })
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.discard_download', {
+      componentId: 'python',
+    })
     expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
     expect(settings.runtimeStatus.value?.catalogVersion).toBe('2026-08-21.2')
+    scope.stop()
+  })
+
+  it('refreshes the row after a discard failure without blocking other runtime use', async () => {
+    const paused = structuredClone(readyRuntimeStatus)
+    paused.components[0] = {
+      ...paused.components[0],
+      resumeAvailable: true,
+      resumeBytes: 40,
+      operation: {
+        operationId: 'cancelled-update',
+        componentId: 'python',
+        kind: 'install',
+        state: 'cancelled',
+        source: 'github',
+        downloadedBytes: 40,
+        totalBytes: 100,
+        progressPercent: 40,
+        startedAtMs: 1,
+        updatedAtMs: 2,
+        error: null,
+      },
+    }
+    let statusCalls = 0
+    const { call, scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => {
+        statusCalls += 1
+        return statusCalls === 1 ? paused : readyRuntimeStatus
+      },
+      runtimeAction: method => {
+        if (method === 'sandbox.runtime.discard_download') throw new Error('cache is busy')
+        return { status: readyRuntimeStatus }
+      },
+    })
+    await settings.load()
+    await settle()
+
+    await expect(settings.discardRuntimeDownload('python')).resolves.toBe(false)
+    await settle()
+
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.status')
+    expect(statusCalls).toBe(2)
+    expect(settings.runtimeStatus.value?.components[0]?.resumeBytes).toBe(0)
+    expect(settings.runtimeActionError.python).toBe('cache is busy')
+    expect(settings.runtimeActionPending.python).toBe(false)
+    await expect(settings.removeRuntime('python')).resolves.toBe(true)
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
     scope.stop()
   })
 
