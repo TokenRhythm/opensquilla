@@ -936,6 +936,11 @@ export function createRpcArtifactDocumentProvider(
       // Downloads must dereference the mutable document head at request time,
       // even between a successful save and the asynchronous metadata refresh.
       download_url: resolved.latestDownloadUrl,
+      // Keep the stable mutable-document identity on the derived head payload.
+      // The immutable artifact id changes on every commit and must not become
+      // the workspace/cache key during the release-triggered preview rebuild.
+      documentId: resolved.documentId,
+      document_id: resolved.documentId,
     }
     return {
       document: resolved,

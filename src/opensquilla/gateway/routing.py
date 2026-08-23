@@ -753,6 +753,9 @@ def tool_context_from_envelope(
         ),
         artifact_candidate_loop_controller=artifact_candidate_loop_controller,
         artifact_preview_service=artifact_preview_service,
+        turn_cleanup_callbacks=list(
+            envelope.runtime_services.get("turn_cleanup_callbacks") or ()
+        ),
     )
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,

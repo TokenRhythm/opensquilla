@@ -350,6 +350,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private component: ArtifactPreviewPanelHandle | null = null
   private blockedHeadRevisionId = ''
   private createdSurface = false
+  private agentEditReleaseObserved = false
+  private agentEditResumeInFlight: Promise<void> | null = null
   private generation = 0
   private item: WorkbenchItem
   private lease: ArtifactPreviewLease | null = null
@@ -404,6 +406,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       annotationAvailable: false,
       annotationMode: false,
       annotationModeStopping: false,
+      agentEditInProgress: false,
     })
   }
 
@@ -1077,6 +1080,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     item: WorkbenchItem,
   ) {
     this.item = item
+    if (event.type === 'agent-edit-released') {
+      this.agentEditReleaseObserved = true
+      await this.resumeAfterAgentEditReleased()
+      return
+    }
     if (!this.createdSurface) return
     if (event.type === 'annotation-selected') {
       await this.handleAnnotationSelected(event.detail?.selection)
@@ -1728,6 +1736,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async dispose() {
     this.component = null
+    this.agentEditReleaseObserved = false
     await this.releaseNativeSurface(true)
     await this.releaseLease()
     this.rect = null
@@ -2051,7 +2060,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     const generation = ++this.generation
     this.createdSurface = true
-    this.context.updateRenderState({ nativeSurfaceState: 'loading' })
+    this.agentEditReleaseObserved = false
+    this.context.updateRenderState({
+      agentEditInProgress: false,
+      nativeSurfaceState: 'loading',
+    })
     let expectedOrigin = ''
     try {
       expectedOrigin = new URL(lease.launch_url).origin
@@ -2074,6 +2087,19 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (generation !== this.generation) return
     if (!result.ok) {
       this.createdSurface = false
+      if (result.code === 'AGENT_EDIT_IN_PROGRESS') {
+        await this.releaseLease()
+        this.context.updateRenderState({
+          agentEditInProgress: true,
+          nativeSurfaceState: 'loading',
+          previewBlocked: true,
+          previewLeaseError: '',
+          previewReadiness: 'loading',
+          previewState: 'loading',
+        })
+        if (this.agentEditReleaseObserved) await this.resumeAfterAgentEditReleased()
+        return
+      }
       throw surfaceError('Failed to create the native Workbench surface', result.message)
     }
     if (!await this.syncSurfaceRect()) return
@@ -2091,6 +2117,90 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     await this.refreshAnnotationCapability(generation)
     if (generation !== this.generation || !this.createdSurface) return
     await this.restoreAnnotationModeAfterSurfaceRefresh()
+  }
+
+  private async resumeAfterAgentEditReleased() {
+    if (this.agentEditResumeInFlight) {
+      await this.agentEditResumeInFlight
+      return
+    }
+    if (!this.context.isItemOpen()) return
+    const resume = this.resumeAfterAgentEditReleasedNow()
+    this.agentEditResumeInFlight = resume
+    try {
+      await resume
+    } finally {
+      this.agentEditResumeInFlight = null
+    }
+  }
+
+  private async resumeAfterAgentEditReleasedNow() {
+    const artifact = artifactFromWorkbenchItem(this.item)
+    if (!artifact || !this.context.isItemOpen()) return
+    this.context.updateRenderState({
+      agentEditInProgress: false,
+      nativeSurfaceState: 'loading',
+      previewBlocked: true,
+      previewLeaseError: '',
+      previewReadiness: 'loading',
+      previewState: 'loading',
+    })
+    try {
+      if (!await this.loadFreshCanonicalDocumentHead()) {
+        throw surfaceError('Failed to load the latest document head')
+      }
+      if (!this.context.isItemOpen()) return
+      if (!await this.releaseNativeSurface(true)) {
+        throw surfaceError('Failed to replace the native Workbench surface')
+      }
+      await this.releaseLease()
+      await this.prepareLeasePreview()
+      this.agentEditReleaseObserved = false
+    } catch (error) {
+      await this.handleLeaseFailure(error)
+    }
+  }
+
+  private async loadFreshCanonicalDocumentHead(): Promise<boolean> {
+    const artifact = artifactFromWorkbenchItem(this.item)
+    const documents = this.options.artifactDocuments
+    if (!artifact || !documents) return false
+    const sessionKey = artifactSessionKey(this.item, this.options)
+    // A failed refresh deliberately preserves the previous workspace with
+    // snapshot.stale=true.  Never mint a replacement lease from that cached
+    // head after an agent edit.  One immediate second read covers the narrow
+    // release-vs-document-state propagation race without adding a generic
+    // retry loop or extending any timeout.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await documents.load(artifact, sessionKey, { force: true })
+      } catch {
+        continue
+      }
+      if (this.canonicalDocumentSnapshotFresh(
+        documents.snapshot(artifact, sessionKey),
+      )) return true
+    }
+    return false
+  }
+
+  private canonicalDocumentSnapshotFresh(
+    snapshot: ArtifactDocumentWorkspaceSnapshot,
+  ): boolean {
+    const workspace = snapshot.workspace
+    if (
+      snapshot.loading
+      || !snapshot.loaded
+      || snapshot.stale
+      || workspace?.source !== 'document-api'
+    ) return false
+    const head = workspace.revisions.find(
+      revision => revision.revisionId === workspace.document.headRevisionId,
+    )
+    return Boolean(
+      head
+      && String(workspace.headArtifact.id || '') === String(head.artifactId || ''),
+    )
   }
 
   private async replaceLeasePreview() {
@@ -2971,6 +3081,7 @@ export function createArtifactWorkbenchDefinitions(
         authToken: options.authToken(),
         baseOrigin: options.baseOrigin,
         nativeHtml: state.nativeSurface,
+        agentEditInProgress: runtimeStateValue(state, 'agentEditInProgress', false),
         nativeSurfaceState: runtimeStateValue(
           state,
           'nativeSurfaceState',

@@ -28,6 +28,7 @@ from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import task_runtime
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.desktop_artifact_bridge import TurnAuthorityCleanup
 from opensquilla.gateway.routing import (
     RouteEnvelope,
     SourceKind,
@@ -107,6 +108,101 @@ def _make_storage() -> Any:
     storage.update_transcript_turn_context = update_turn_context
     storage.turn_context_updates = turn_context_updates
     return storage
+
+
+def _authority_envelope(
+    authority: TurnAuthorityCleanup,
+    session_key: str,
+) -> RouteEnvelope:
+    return replace(
+        _make_envelope(session_key),
+        runtime_services={
+            "desktop_artifact_bridge": object(),
+            "turn_authority_cleanup": authority,
+            "turn_cleanup_callbacks": [authority.aclose],
+            "durable_service": "kept",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_authority_cleanup_runs_once_on_success_and_reservation_abort() -> None:
+    success_calls = 0
+    abort_calls = 0
+
+    async def release_success() -> None:
+        nonlocal success_calls
+        success_calls += 1
+
+    async def release_abort() -> None:
+        nonlocal abort_calls
+        abort_calls += 1
+
+    success_authority = TurnAuthorityCleanup(release_success)
+    runtime = _make_runtime()
+    success = await runtime.enqueue(
+        _authority_envelope(success_authority, "agent:main:webchat:authority-success"),
+        "success",
+    )
+    await runtime.wait(success.task_id, timeout=2.0)
+
+    abort_authority = TurnAuthorityCleanup(release_abort)
+    reservation = await runtime.reserve(
+        _authority_envelope(abort_authority, "agent:main:webchat:authority-abort"),
+        "abort",
+    )
+    await runtime.abort_reservation(reservation)
+    await runtime.abort_reservation(reservation)
+    await runtime.shutdown()
+
+    assert success_calls == 1
+    assert abort_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_turn_authority_cleanup_runs_once_when_activation_fails_before_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_calls = 0
+
+    async def release() -> None:
+        nonlocal release_calls
+        release_calls += 1
+
+    runtime = _make_runtime()
+    authority = TurnAuthorityCleanup(release)
+
+    async def fail_activation(_reservation: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("synthetic pre-boundary activation failure")
+
+    monkeypatch.setattr(runtime, "activate", fail_activation)
+
+    with pytest.raises(RuntimeError, match="pre-boundary activation failure"):
+        await runtime.enqueue(
+            _authority_envelope(
+                authority,
+                "agent:main:webchat:authority-activation-failure",
+            ),
+            "activation failure",
+        )
+
+    await authority.aclose()
+    await runtime.shutdown()
+
+    assert release_calls == 1
+    assert runtime._reservations_by_session == {}
+
+
+def test_reusable_route_envelope_strips_all_turn_authority() -> None:
+    async def release() -> None:
+        return None
+
+    authority = TurnAuthorityCleanup(release)
+    reusable = task_runtime._reusable_route_envelope(
+        _authority_envelope(authority, "agent:main:webchat:authority-cache")
+    )
+
+    assert reusable.runtime_services == {"durable_service": "kept"}
 
 
 def _make_runtime(

@@ -2504,7 +2504,10 @@ async def test_rejected_drifted_reinstall_does_not_reload_or_advance_catalog(
     assert result.lifecycle.install_state.value == "drifted"
     assert loader.snapshot() is snapshot
     assert loader.snapshot().generation == snapshot.generation
-    current = loader.get_by_name("example-skill")
+    # get_by_name() may run its compatibility filesystem probe after 250 ms.
+    # Inspect the already-pinned live snapshot so scheduler delay cannot turn
+    # this transaction assertion into a separate external-drift refresh.
+    current = next(skill for skill in snapshot.skills if skill.name == "example-skill")
     assert current is published
     assert "Local drift." not in current.content
 

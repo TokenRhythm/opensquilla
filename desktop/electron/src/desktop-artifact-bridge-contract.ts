@@ -5,14 +5,17 @@
  * remains accepted on the wire so an older Gateway can be upgraded
  * independently of the Electron shell.
  */
-export const DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION = 4 as const
+export const DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION = 5 as const
+export const DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4 = 4 as const
 export const DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3 = 3 as const
 export const DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS = [
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
 ] as const
 export type DesktopArtifactBridgeProtocolVersion =
   typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+  | typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4
   | typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
 
 export const DESKTOP_ARTIFACT_BRIDGE_METHODS = [
@@ -57,7 +60,7 @@ export interface DesktopArtifactBridgeCapabilities {
  */
 export const DESKTOP_ARTIFACT_BRIDGE_CONTRACT = {
   version: DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
-  surfaceBinding: 'active' as const,
+  surfaceBinding: 'turn' as const,
   methods: DESKTOP_ARTIFACT_BRIDGE_METHODS,
   acceptsSurfaceId: false as const,
   acceptsUrl: false as const,
@@ -271,6 +274,8 @@ export interface DesktopArtifactBrowserSnapshot {
   scopeId?: string
   /** Opaque candidate handle while a candidate preview is bound. */
   candidateHandle?: string | null
+  /** v5 process-local binding generation; never projected to the model. */
+  bindingGeneration?: number
 }
 
 export interface DesktopArtifactBrowserActResult {
@@ -405,8 +410,8 @@ function parseV4OnlyRequest(
   label: string,
 ): Record<string, unknown> {
   const request = parseRequest(value, allowedKeys, label)
-  if (requestVersion(value) !== DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION) {
-    throw new Error(`The Desktop artifact ${label} requires protocol-v4.`)
+  if (requestVersion(value) < DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4) {
+    throw new Error(`The Desktop artifact ${label} requires protocol-v4 or newer.`)
   }
   return request
 }
@@ -671,7 +676,7 @@ export function parseDesktopArtifactBindCandidatePreviewRequest(
     'candidate preview binding',
   )
   return {
-    version: DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+    version: request.version as DesktopArtifactBridgeProtocolVersion,
     candidateHandle: parseCandidateHandle(request.candidateHandle),
   }
 }
@@ -685,7 +690,7 @@ export function parseDesktopArtifactRestoreCanonicalPreviewRequest(
     'canonical preview restore',
   )
   return {
-    version: DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+    version: request.version as DesktopArtifactBridgeProtocolVersion,
     candidateHandle: parseCandidateHandle(request.candidateHandle),
   }
 }

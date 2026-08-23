@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
@@ -12,6 +13,7 @@ from opensquilla.gateway.desktop_artifact_bridge import (
     DESKTOP_ARTIFACT_BRIDGE_URL_ENV,
     DesktopArtifactBridgeClient,
     DesktopArtifactBridgeError,
+    TurnAuthorityCleanup,
     desktop_artifact_bridge_client_from_environment,
     desktop_artifact_bridge_token_valid,
 )
@@ -112,6 +114,184 @@ def _install_response_sequence(
 
     monkeypatch.setattr(bridge_module.http.client, "HTTPConnection", connection_factory)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_v5_binding_is_opaque_bound_and_released_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding_token = base64.urlsafe_b64encode(bytes(reversed(range(32)))).rstrip(b"=").decode()
+    capabilities = {
+        "version": 5,
+        "available": True,
+        "captureSelection": False,
+        "resolveAnnotationSelection": True,
+        "focusAnnotation": True,
+        "browserInspect": True,
+        "browserAct": True,
+        "screenshot": True,
+        "officeFlush": False,
+        "reloadSurface": True,
+        "bindCandidatePreview": True,
+        "restoreCanonicalPreview": True,
+    }
+    advertised_capabilities = {**capabilities, "browserAct": False}
+    calls = _install_response_sequence(monkeypatch, [
+        {"ok": True, "value": advertised_capabilities},
+        {
+            "ok": True,
+            "value": {
+                "version": 5,
+                "bindingToken": binding_token,
+                "capabilities": capabilities,
+            },
+        },
+        {"ok": True, "method": "reloadSurface", "value": {"reloaded": True}},
+        {"ok": True, "value": {"released": True}},
+    ])
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    bound = await client.acquire_binding()
+    assert bound is not None
+    assert (await bound.capabilities()).browser_act is True
+    assert await bound.reload_surface() is True
+    await bound.aclose()
+    await bound.aclose()
+
+    requests = [json.loads(call["body"]) for call in calls if call.get("method") == "POST"]
+    assert requests[0] == {"version": 5}
+    assert requests[1] == {"version": 5}
+    assert requests[2]["bindingToken"] == binding_token
+    assert requests[2]["version"] == 5
+    assert requests[3] == {"version": 5, "bindingToken": binding_token}
+    assert len(requests) == 4
+    assert binding_token not in repr(bound)
+
+
+@pytest.mark.asyncio
+async def test_process_scoped_client_keeps_unbound_invocations_on_v4_after_v5_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding_token = base64.urlsafe_b64encode(bytes(reversed(range(32)))).rstrip(b"=").decode()
+    capabilities = {
+        "version": 5,
+        "available": True,
+        "captureSelection": False,
+        "resolveAnnotationSelection": True,
+        "focusAnnotation": True,
+        "browserInspect": True,
+        "browserAct": True,
+        "screenshot": True,
+        "officeFlush": False,
+        "reloadSurface": True,
+        "bindCandidatePreview": True,
+        "restoreCanonicalPreview": True,
+    }
+    calls = _install_response_sequence(
+        monkeypatch,
+        [
+            {"ok": True, "value": capabilities},
+            {
+                "ok": True,
+                "value": {
+                    "version": 5,
+                    "bindingToken": binding_token,
+                    "capabilities": capabilities,
+                },
+            },
+            {"ok": True, "method": "reloadSurface", "value": {"reloaded": True}},
+            {"ok": True, "value": {"released": True}},
+        ],
+    )
+    client = DesktopArtifactBridgeClient(
+        endpoint="http://127.0.0.1:4321",
+        token=_token(),
+    )
+
+    bound = await client.acquire_binding()
+    assert bound is not None
+    assert await client.reload_surface() is True
+    await bound.aclose()
+
+    requests = [json.loads(call["body"]) for call in calls if call.get("method") == "POST"]
+    assert requests[2] == {
+        "version": 4,
+        "method": "reloadSurface",
+        "request": {"version": 4},
+    }
+    assert "bindingToken" not in requests[2]
+
+
+@pytest.mark.asyncio
+async def test_v5_acquire_validation_failure_releases_new_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding_token = base64.urlsafe_b64encode(bytes(reversed(range(32)))).rstrip(b"=").decode()
+    capabilities = {
+        "version": 5,
+        "available": True,
+        "captureSelection": False,
+        "resolveAnnotationSelection": True,
+        "focusAnnotation": True,
+        "browserInspect": True,
+        "browserAct": True,
+        "screenshot": True,
+        "officeFlush": False,
+        "reloadSurface": True,
+        "bindCandidatePreview": True,
+        "restoreCanonicalPreview": True,
+    }
+    calls = _install_response_sequence(
+        monkeypatch,
+        [
+            {"ok": True, "value": capabilities},
+            {
+                "ok": True,
+                "value": {
+                    "version": 5,
+                    "bindingToken": binding_token,
+                    "capabilities": {**capabilities, "browserInspect": "invalid"},
+                },
+            },
+            {"ok": True, "value": {"released": True}},
+        ],
+    )
+    client = DesktopArtifactBridgeClient(
+        endpoint="http://127.0.0.1:4321",
+        token=_token(),
+    )
+
+    with pytest.raises(DesktopArtifactBridgeError, match="inspection capability"):
+        await client.acquire_binding()
+
+    requests = [json.loads(call["body"]) for call in calls if call.get("method") == "POST"]
+    assert requests[-1] == {"version": 5, "bindingToken": binding_token}
+
+
+@pytest.mark.asyncio
+async def test_turn_authority_cleanup_is_cancellation_safe_and_exactly_once() -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    calls = 0
+
+    async def release() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await finish.wait()
+
+    cleanup = TurnAuthorityCleanup(release)
+    first = asyncio.create_task(cleanup.aclose())
+    second = asyncio.create_task(cleanup.aclose())
+    await started.wait()
+    first.cancel()
+    finish.set()
+
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert results[1] is None
+    await cleanup.aclose()
+    assert calls == 1
 
 
 def test_environment_requires_desktop_and_exact_ipv4_loopback() -> None:

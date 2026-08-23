@@ -65,7 +65,17 @@
 
     <div class="artifact-preview__viewport">
       <div
-        v-if="preview.state.value === 'loading'"
+        v-if="agentEditInProgress"
+        class="artifact-preview__status"
+        data-testid="artifact-preview-agent-edit-in-progress"
+        role="status"
+      >
+        <Icon name="info" :size="18" />
+        <strong>{{ t('workbench.artifactPreview.agentEditInProgress') }}</strong>
+      </div>
+
+      <div
+        v-else-if="preview.state.value === 'loading'"
         class="artifact-preview__status"
         role="status"
         :aria-label="t('chat.loadingPreview')"
@@ -202,6 +212,7 @@ import {
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 
 const props = withDefaults(defineProps<{
+  agentEditInProgress?: boolean
   artifact: ArtifactPayload
   authToken?: string
   baseOrigin?: string
@@ -218,6 +229,7 @@ const props = withDefaults(defineProps<{
   showHeader?: boolean
   suspended?: boolean
 }>(), {
+  agentEditInProgress: false,
   authToken: '',
   baseOrigin: '',
   nativeHtml: false,

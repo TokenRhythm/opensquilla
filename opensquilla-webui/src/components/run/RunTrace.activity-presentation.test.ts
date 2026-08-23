@@ -400,6 +400,115 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.activity-tool-details')).toBeNull()
   })
 
+  it.each([undefined, 'activity' as const])(
+    'removes successful document disclosure in %s presentation',
+    async (presentation) => {
+      const sensitive = JSON.stringify({
+        source: '<html>private source</html>',
+        expectedSha256: 'a'.repeat(64),
+        cursor: 'private-cursor',
+        grant: 'private-grant',
+        bindingToken: 'private-binding-token',
+      })
+      const el = await mountTimeline([
+        group('document.update', [
+          call('document-success-one', {
+            name: 'document_apply',
+            inputRaw: sensitive,
+            inputPreview: sensitive,
+            result: sensitive,
+            resultPreview: sensitive,
+          }),
+          call('document-success-two', {
+            name: 'document_patch',
+            inputRaw: sensitive,
+            inputPreview: sensitive,
+            result: sensitive,
+            resultPreview: sensitive,
+          }),
+        ]),
+      ], presentation ? { presentation } : {})
+
+      const row = el.querySelector('.tool-row--group')
+      expect(row?.hasAttribute('aria-expanded')).toBe(false)
+      expect(el.querySelector('.step-chevron')).toBeNull()
+      expect(el.querySelector('.tool-row-body')).toBeNull()
+      expect(el.textContent).not.toMatch(/private|sha256|cursor|grant|binding/i)
+    },
+  )
+
+  it.each([undefined, 'activity' as const])(
+    'shows only safe document failure guidance in %s presentation',
+    async (presentation) => {
+      const sensitive = JSON.stringify({
+        category: 'DOCUMENT_PREVIEW_UNAVAILABLE',
+        message_key: 'document.previewUnavailable',
+        user_message: '<html>private source</html>',
+        retry_policy: 'new_turn',
+        next_action: 'finalize_without_tools',
+        expectedSha256: 'a'.repeat(64),
+        cursor: 'private-cursor',
+        grant: 'private-grant',
+        bindingToken: 'private-binding-token',
+      })
+      const onShowResult = vi.fn()
+      const el = await mountTimeline([
+        group('document.update', [call('document-failure', {
+          name: 'document_apply',
+          status: 'error',
+          isError: true,
+          inputRaw: sensitive,
+          inputPreview: sensitive,
+          result: sensitive,
+          resultPreview: sensitive,
+        })]),
+      ], {
+        ...(presentation ? { presentation } : {}),
+        onShowResult,
+      })
+
+      expect(el.querySelector('.step-chevron')).not.toBeNull()
+      expect(el.textContent).toContain('Preview unavailable')
+      expect(el.textContent).toContain('Retry policy: start a new task')
+      expect(el.textContent).not.toMatch(/private|sha256|cursor|grant|binding|<html>/i)
+      expect(el.querySelector('.activity-tool-details__view')).toBeNull()
+      expect(el.querySelector('.tool-row-section')).toBeNull()
+      expect(onShowResult).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([undefined, 'activity' as const])(
+    'restores a safe document failure disclosure from structured history in %s presentation',
+    async (presentation) => {
+      const persistedFailure = JSON.stringify({
+        ok: false,
+        status: 'error',
+        category: 'DOCUMENT_PREVIEW_UNAVAILABLE',
+        message_key: 'document.previewUnavailable',
+        retry_policy: 'new_turn',
+        next_action: 'finalize_without_tools',
+        source: '<html>private source</html>',
+        bindingToken: 'private-binding-token',
+      })
+      const el = await mountTimeline([
+        group('document.read', [call('restored-document-failure', {
+          name: 'document_browser_inspect',
+          status: 'success',
+          isError: false,
+          result: persistedFailure,
+          resultPreview: persistedFailure,
+        })]),
+      ], presentation ? { presentation, itemOpen: true } : {})
+
+      expect(el.querySelector('.step-chevron')).not.toBeNull()
+      expect(el.textContent).toContain('Preview unavailable')
+      expect(el.textContent).toContain('Retry policy: start a new task')
+      expect(el.textContent).not.toMatch(/private|binding|<html>/i)
+      expect(el.querySelector('.activity-tool-details__view')).toBeNull()
+      expect(el.querySelector('.tool-row-section')).toBeNull()
+    },
+  )
+
   it('shows long activity details in one bounded preview and preserves raw forwarding', async () => {
     const result = 'file contents\n'.repeat(30)
     const onShowResult = vi.fn()

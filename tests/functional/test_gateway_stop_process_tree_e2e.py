@@ -101,13 +101,21 @@ class _StopProvider:
                 "time.sleep(30)\n",
                 encoding="utf-8",
             )
+            # Keep the long-lived descendant in the same process tree without
+            # retaining the leader's asyncio pipes. On Windows, Process.wait()
+            # does not finish its transport until inherited pipes disconnect.
             parent_script.write_text(
                 "import pathlib\n"
                 "import subprocess\n"
                 "import sys\n"
                 "import time\n"
                 f"child_pid = pathlib.Path({str(child_pid)!r})\n"
-                f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n"
+                "subprocess.Popen(\n"
+                f"    [sys.executable, {str(child_script)!r}],\n"
+                "    stdin=subprocess.DEVNULL,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                ")\n"
                 "deadline = time.monotonic() + 10\n"
                 "while not child_pid.exists() and time.monotonic() < deadline:\n"
                 "    time.sleep(0.05)\n"
@@ -176,8 +184,6 @@ class _StopProvider:
                     break
             if wait_result is None or wait_result.get("exited") is not True:
                 raise AssertionError("process wait did not confirm direct leader exit")
-            (self.evidence_dir / "leader-terminal").write_text("confirmed")
-            (self.evidence_dir / "provider-blocked").write_text("ready")
             while True:
                 await asyncio.sleep(1)
         yield TextDeltaEvent(text="NEXT_TASK_OK")
@@ -435,6 +441,9 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
     )
     client = GatewayClient()
     first_frames: list[dict[str, Any]] = []
+    leader_wait_result: asyncio.Future[dict[str, Any]] = (
+        asyncio.get_running_loop().create_future()
+    )
     descendant_identity: tuple[str, int] | None = None
     try:
         await _wait_for_health(port, process, gateway_log)
@@ -444,14 +453,26 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
         async def consume_first() -> None:
             async for frame in client.send_message(session_key, "start owned process"):
                 first_frames.append(frame)
+                if (
+                    frame.get("event") == "session.event.tool_result"
+                    and frame.get("tool_use_id") == "wait-background-leader-1"
+                    and not leader_wait_result.done()
+                ):
+                    leader_wait_result.set_result(frame)
 
         first_turn = asyncio.create_task(consume_first())
         await _wait_for_file(evidence / "child.pid")
         descendant_identity = _open_process_liveness(
             int((evidence / "child.pid").read_text(encoding="utf-8"))
         )
-        await _wait_for_file(evidence / "leader-terminal")
-        await _wait_for_file(evidence / "provider-blocked")
+        wait_frame = await asyncio.wait_for(
+            asyncio.shield(leader_wait_result),
+            timeout=10.0,
+        )
+        wait_payload = json.loads(str(wait_frame.get("result", "")))
+        assert wait_frame.get("is_error") is False
+        assert wait_payload.get("action") == "wait"
+        assert wait_payload.get("exited") is True
         task_id = client._active_turn_ids[session_key]
         stopped = await client.call(
             "chat.abort",

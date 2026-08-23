@@ -583,6 +583,8 @@ try {
       })
       await owner.loadURL('data:text/html,<title>Trusted Control UI fixture</title>')
       let reentrantReplacementPromise = null
+      const candidateReleaseHandles = []
+      const previewPinReleases = []
       let manager
       manager = new Manager({
         getPrivilegedGatewayUrl: () => fixture.privilegedGatewayUrl,
@@ -603,6 +605,39 @@ try {
                 scopeId: 'synthetic:terminal-replacement',
               },
             })
+          }
+        },
+        resolveCandidatePreview: async candidateHandle => ({
+          candidateHandle,
+          candidateArtifactId: `art-${candidateHandle}`,
+          leaseId: `apl-${candidateHandle}`,
+          launchUrl: `${fixture.previewOrigin}/binding-candidate`,
+          expectedOrigin: fixture.previewOrigin,
+          scopeId: candidateHandle.includes('binding_a')
+            ? 'synthetic:v4-binding-a'
+            : 'synthetic:v4-binding-b',
+          mode: 'offline',
+        }),
+        releaseCandidatePreview: async candidateHandle => {
+          candidateReleaseHandles.push(candidateHandle)
+        },
+        pinArtifactPreview: grant => {
+          let released = false
+          const currentGrant = { ...grant }
+          return {
+            currentGrant: () => ({ ...currentGrant }),
+            ensureCurrent: async () => released ? null : { ...currentGrant },
+            release: async () => {
+              if (released) return
+              released = true
+              const surfaceId = currentGrant.scopeId.endsWith('-a')
+                ? 'artifact:v4-binding-a'
+                : 'artifact:v4-binding-b'
+              previewPinReleases.push({
+                scopeId: currentGrant.scopeId,
+                surfacePresent: manager.surfaces.has(surfaceId),
+              })
+            },
           }
         },
       })
@@ -1958,6 +1993,188 @@ try {
         enabled: true,
       })
 
+      const v4BindingA = await manager.createSurface({
+        version: 4,
+        surfaceId: 'artifact:v4-binding-a',
+        kind: 'artifact-preview',
+        payload: {
+          launchUrl: `${fixture.previewOrigin}/binding-a`,
+          expectedOrigin: fixture.previewOrigin,
+          scopeId: 'synthetic:v4-binding-a',
+          mode: 'full',
+        },
+      }, 'art-v4-binding-a')
+      if (!v4BindingA.ok) throw new Error(v4BindingA.message || 'v4 binding A failed.')
+      const v4BindingAView = view('artifact:v4-binding-a')
+      manager.setSurfaceRect({
+        surfaceId: 'artifact:v4-binding-a',
+        x: 400,
+        y: 80,
+        width: 400,
+        height: 500,
+        visible: true,
+      })
+      await waitFor(() => v4BindingAView.getVisible(), 'visible v4 binding A')
+      const turnBindingA = await manager.acquireArtifactBridgeTargetBinding()
+      if (!turnBindingA) throw new Error('v4 turn binding A was unavailable.')
+      const sameSurfaceSecondBinding = await manager.acquireArtifactBridgeTargetBinding()
+      const bindingAInitial = await turnBindingA.target.browserInspect(
+        { version: 5, scope: 'document', maxNodes: 8 },
+        new AbortController().signal,
+      )
+
+      const v4BindingB = await manager.createSurface({
+        version: 4,
+        surfaceId: 'artifact:v4-binding-b',
+        kind: 'artifact-preview',
+        payload: {
+          launchUrl: `${fixture.previewOrigin}/binding-b`,
+          expectedOrigin: fixture.previewOrigin,
+          scopeId: 'synthetic:v4-binding-b',
+          mode: 'full',
+        },
+      }, 'art-v4-binding-b')
+      if (!v4BindingB.ok) throw new Error(v4BindingB.message || 'v4 binding B failed.')
+      const v4BindingBView = view('artifact:v4-binding-b')
+      manager.setSurfaceRect({
+        surfaceId: 'artifact:v4-binding-b',
+        x: 400,
+        y: 80,
+        width: 400,
+        height: 500,
+        visible: true,
+      })
+      await waitFor(() => v4BindingBView.getVisible(), 'visible v4 binding B')
+      const turnBindingB = await manager.acquireArtifactBridgeTargetBinding()
+      if (!turnBindingB) throw new Error('v4 turn binding B was unavailable.')
+      const bindingSwitchStress = []
+      for (let iteration = 0; iteration < 20; iteration += 1) {
+        const activeSurfaceId = iteration % 2 === 0
+          ? 'artifact:v4-binding-a'
+          : 'artifact:v4-binding-b'
+        const activation = manager.activateSurface(activeSurfaceId)
+        if (!activation.ok) throw new Error(activation.message || 'v4 binding switch failed.')
+        const [bindingAStress, bindingBStress] = await Promise.all([
+          turnBindingA.target.browserInspect(
+            { version: 5, scope: 'document', maxNodes: 8 },
+            new AbortController().signal,
+          ),
+          turnBindingB.target.browserInspect(
+            { version: 5, scope: 'document', maxNodes: 8 },
+            new AbortController().signal,
+          ),
+        ])
+        bindingSwitchStress.push({
+          activeSurfaceId,
+          bindingAScopeId: bindingAStress.scopeId,
+          bindingAGeneration: bindingAStress.bindingGeneration,
+          bindingBScopeId: bindingBStress.scopeId,
+          bindingBGeneration: bindingBStress.bindingGeneration,
+        })
+      }
+      manager.activateSurface('artifact:v4-binding-b')
+      const detachedBindingA = await manager.destroySurface('artifact:v4-binding-a')
+      const bindingAStayedPinned = manager.surfaces.has('artifact:v4-binding-a')
+        && !v4BindingAView.getVisible()
+      const [bindingAAfterSwitch, bindingBAfterSwitch] = await Promise.all([
+        turnBindingA.target.browserInspect(
+          { version: 5, scope: 'document', maxNodes: 8 },
+          new AbortController().signal,
+        ),
+        turnBindingB.target.browserInspect(
+          { version: 5, scope: 'document', maxNodes: 8 },
+          new AbortController().signal,
+        ),
+      ])
+      const candidateHandleA = 'candidate_v4_binding_a_1234'
+      const bindingACandidate = await turnBindingA.target.bindCandidatePreview(
+        { version: 5, candidateHandle: candidateHandleA },
+        new AbortController().signal,
+      )
+      const candidateSnapshotBeforeCrash = await turnBindingA.target.browserInspect(
+        {
+          version: 5,
+          scope: 'document',
+          maxNodes: 8,
+          candidateHandle: candidateHandleA,
+        },
+        new AbortController().signal,
+      )
+      const originalCdpCommand = manager.cdpCommand.bind(manager)
+      let droppedActionReply = false
+      manager.cdpCommand = async (record, method, params) => {
+        const value = await originalCdpCommand(record, method, params)
+        if (method === 'Runtime.callFunctionOn' && !droppedActionReply) {
+          droppedActionReply = true
+          throw new Error('synthetic action reply loss')
+        }
+        return value
+      }
+      let actionResultUnknownCode = ''
+      try {
+        await turnBindingA.target.browserAct(
+          {
+            version: 5,
+            action: 'press',
+            key: 'Enter',
+            candidateHandle: candidateHandleA,
+          },
+          new AbortController().signal,
+        )
+      } catch (error) {
+        actionResultUnknownCode = error?.code || ''
+      } finally {
+        manager.cdpCommand = originalCdpCommand
+      }
+      const candidateSnapshotAfterUnknownAction = await turnBindingA.target.browserInspect(
+        {
+          version: 5,
+          scope: 'document',
+          maxNodes: 8,
+          candidateHandle: candidateHandleA,
+        },
+        new AbortController().signal,
+      )
+      const bindingAContentsBeforeCrash = view('artifact:v4-binding-a').webContents
+      emitRendererGone(bindingAContentsBeforeCrash)
+      const candidateSnapshotAfterRecovery = await turnBindingA.target.browserInspect(
+        {
+          version: 5,
+          scope: 'document',
+          maxNodes: 8,
+          candidateHandle: candidateHandleA,
+        },
+        new AbortController().signal,
+      )
+      const bindingAContentsAfterRecovery = view('artifact:v4-binding-a').webContents
+      const candidateReboundAfterRecovery = manager.surfaces
+        .get('artifact:v4-binding-a')?.candidatePreview?.handle === candidateHandleA
+      emitRendererGone(bindingAContentsAfterRecovery)
+      let secondBindingFailureCode = ''
+      try {
+        await turnBindingA.target.browserInspect(
+          {
+            version: 5,
+            scope: 'document',
+            maxNodes: 8,
+            candidateHandle: candidateHandleA,
+          },
+          new AbortController().signal,
+        )
+      } catch (error) {
+        secondBindingFailureCode = error?.code || ''
+      }
+      await turnBindingA.release()
+      const bindingADestroyedBeforePinRelease = previewPinReleases.some(entry =>
+        entry.scopeId === 'synthetic:v4-binding-a'
+        && entry.surfacePresent === false)
+      const bindingAReleasedEventCount = events.filter(event =>
+        event.surfaceId === 'artifact:v4-binding-a'
+        && event.type === 'agent-edit-released').length
+      await turnBindingB.release()
+      const bindingBSurfaceRetained = manager.surfaces.has('artifact:v4-binding-b')
+      await manager.destroySurface('artifact:v4-binding-b')
+
       const isolated = await manager.createSurface({
         version: 2,
         surfaceId: 'artifact:v2-isolated',
@@ -2558,6 +2775,47 @@ try {
           width: v3Screenshot.width,
           height: v3Screenshot.height,
         },
+        v4BindingA,
+        sameSurfaceSecondBindingWasRejected: sameSurfaceSecondBinding === null,
+        bindingAInitial: {
+          scopeId: bindingAInitial.scopeId,
+          generation: bindingAInitial.bindingGeneration,
+        },
+        detachedBindingA,
+        bindingAStayedPinned,
+        bindingAAfterSwitch: {
+          scopeId: bindingAAfterSwitch.scopeId,
+          generation: bindingAAfterSwitch.bindingGeneration,
+        },
+        bindingBAfterSwitch: {
+          scopeId: bindingBAfterSwitch.scopeId,
+          generation: bindingBAfterSwitch.bindingGeneration,
+        },
+        bindingSwitchStress,
+        bindingACandidate,
+        candidateSnapshotBeforeCrash: {
+          scopeId: candidateSnapshotBeforeCrash.scopeId,
+          candidateHandle: candidateSnapshotBeforeCrash.candidateHandle,
+          generation: candidateSnapshotBeforeCrash.bindingGeneration,
+        },
+        actionResultUnknownCode,
+        candidateSnapshotAfterUnknownAction: {
+          candidateHandle: candidateSnapshotAfterUnknownAction.candidateHandle,
+          generation: candidateSnapshotAfterUnknownAction.bindingGeneration,
+        },
+        candidateSnapshotAfterRecovery: {
+          scopeId: candidateSnapshotAfterRecovery.scopeId,
+          candidateHandle: candidateSnapshotAfterRecovery.candidateHandle,
+          generation: candidateSnapshotAfterRecovery.bindingGeneration,
+        },
+        bindingAContentsReplaced:
+          bindingAContentsAfterRecovery.id !== bindingAContentsBeforeCrash.id,
+        candidateReboundAfterRecovery,
+        secondBindingFailureCode,
+        bindingADestroyedBeforePinRelease,
+        bindingAReleasedEventCount,
+        bindingBSurfaceRetained,
+        candidateReleaseHandles,
         isolationState,
         offlineLocal,
         offlineNetworkWarning,
@@ -2828,7 +3086,11 @@ try {
     webSecurity: true,
     webviewTag: false,
   })
-  assert.deepEqual(result.annotationOverlayVisualStructure, {
+  const {
+    textareaHeight: annotationTextareaHeight,
+    ...annotationOverlayVisualStructure
+  } = result.annotationOverlayVisualStructure
+  assert.deepEqual(annotationOverlayVisualStructure, {
     role: 'dialog',
     ariaModal: 'false',
     labelledBy: 'annotation-title',
@@ -2838,10 +3100,14 @@ try {
     initialBody: 'Initial annotation',
     submitDisabled: false,
     cardRadius: '12px',
-    textareaHeight: '73px',
     submitHeight: '32px',
     tabOrder: ['annotation-body', 'annotation-cancel', 'annotation-submit'],
   })
+  assert.ok(
+    Number.parseFloat(annotationTextareaHeight) >= 73
+      && Number.parseFloat(annotationTextareaHeight) < 74,
+    'annotation textarea height must remain within one fractional Windows DPI pixel',
+  )
   assert.equal(result.annotationOverlayDevToolsBlocked, true)
   assert.ok(result.annotationOverlayBounds.width <= 304)
   assert.ok(result.annotationOverlayBounds.height <= 160)
@@ -3009,6 +3275,89 @@ try {
   assert.ok(result.v3Screenshot.width > 0 && result.v3Screenshot.height > 0)
   assert.equal(result.v3Reload.reloaded, true, 'v3 reload must stay on the active surface')
   assert.ok(result.v3NavigationEventCount > 0, 'v3 surfaces must preserve v2 navigation events')
+  assert.equal(result.v4BindingA.ok, true)
+  assert.equal(
+    result.sameSurfaceSecondBindingWasRejected,
+    true,
+    'one native surface must admit only one editing turn binding',
+  )
+  assert.deepEqual(result.bindingAInitial, {
+    scopeId: 'synthetic:v4-binding-a',
+    generation: 1,
+  })
+  assert.equal(result.detachedBindingA.ok, true)
+  assert.equal(result.detachedBindingA.code, 'AGENT_EDIT_IN_PROGRESS')
+  assert.equal(
+    result.bindingAStayedPinned,
+    true,
+    'UI detach must hide rather than destroy a turn-bound surface',
+  )
+  assert.equal(result.bindingAAfterSwitch.scopeId, 'synthetic:v4-binding-a')
+  assert.equal(result.bindingBAfterSwitch.scopeId, 'synthetic:v4-binding-b')
+  assert.equal(result.bindingSwitchStress.length, 20)
+  for (const [iteration, snapshot] of result.bindingSwitchStress.entries()) {
+    assert.equal(
+      snapshot.activeSurfaceId,
+      iteration % 2 === 0 ? 'artifact:v4-binding-a' : 'artifact:v4-binding-b',
+    )
+    assert.equal(snapshot.bindingAScopeId, 'synthetic:v4-binding-a')
+    assert.equal(snapshot.bindingAGeneration, result.bindingAInitial.generation)
+    assert.equal(snapshot.bindingBScopeId, 'synthetic:v4-binding-b')
+    assert.equal(snapshot.bindingBGeneration, result.bindingBAfterSwitch.generation)
+  }
+  assert.equal(
+    result.bindingAAfterSwitch.generation,
+    result.bindingAInitial.generation,
+    'switching the active UI surface must not mutate the old binding generation',
+  )
+  assert.equal(result.bindingACandidate.bound, true)
+  assert.equal(
+    result.candidateSnapshotBeforeCrash.candidateHandle,
+    'candidate_v4_binding_a_1234',
+  )
+  assert.equal(
+    result.actionResultUnknownCode,
+    'action-result-unknown',
+    'a lost browser action reply must require inspection rather than replay',
+  )
+  assert.equal(
+    result.candidateSnapshotAfterUnknownAction.candidateHandle,
+    'candidate_v4_binding_a_1234',
+    'the binding must accept a fresh inspection after an uncertain action',
+  )
+  assert.equal(result.candidateSnapshotAfterRecovery.scopeId, 'synthetic:v4-binding-a')
+  assert.equal(
+    result.candidateSnapshotAfterRecovery.candidateHandle,
+    'candidate_v4_binding_a_1234',
+  )
+  assert.ok(
+    result.candidateSnapshotAfterRecovery.generation
+      > result.candidateSnapshotBeforeCrash.generation,
+    'surface recovery must invalidate the old binding generation',
+  )
+  assert.equal(result.bindingAContentsReplaced, true)
+  assert.equal(result.candidateReboundAfterRecovery, true)
+  assert.equal(
+    result.secondBindingFailureCode,
+    'binding-terminal-unavailable',
+    'a second surface failure must terminate the binding without another rebuild',
+  )
+  assert.equal(
+    result.bindingADestroyedBeforePinRelease,
+    true,
+    'a UI-detached surface must be destroyed before its canonical preview pin is released',
+  )
+  assert.equal(result.bindingAReleasedEventCount, 1)
+  assert.equal(
+    result.bindingBSurfaceRetained,
+    true,
+    'releasing a still-UI-owned binding must leave its canonical surface available',
+  )
+  assert.deepEqual(
+    result.candidateReleaseHandles,
+    ['candidate_v4_binding_a_1234'],
+    'candidate cleanup must remain exactly once across recovery and terminal release',
+  )
   assert.equal(
     result.isolationState.storageWasCleared,
     true,

@@ -22,7 +22,7 @@ class _Bridge:
 
     async def capabilities(self) -> SimpleNamespace:
         return SimpleNamespace(
-            version=4,
+            version=5,
             browser_inspect=True,
             reload_surface=True,
             screenshot=True,
@@ -36,6 +36,7 @@ class _Bridge:
             active_preview_artifact_id=self._artifact_id,
             scope_id=self._scope_id,
             candidate_handle=self._candidate_handle,
+            binding_generation=1,
         )
 
     async def reload_surface(self, **_kwargs: object) -> bool:
@@ -76,7 +77,7 @@ class _ActionBridge(_Bridge):
 class _WireCapabilityBridge(_Bridge):
     async def capabilities(self) -> dict[str, object]:
         return {
-            "version": 4,
+            "version": 5,
             "available": True,
             "browserInspect": True,
             "browserAct": True,
@@ -172,6 +173,7 @@ async def test_candidate_inspect_requires_matching_active_surface_identity(
 
     assert result["status"] == "verification_passed"
     assert controller.verifications
+    assert "bindingGeneration" not in result
 
 
 @pytest.mark.asyncio
@@ -428,7 +430,7 @@ async def test_non_retryable_browser_control_result_closes_candidate_loop() -> N
 
 
 @pytest.mark.asyncio
-async def test_unavailable_candidate_preview_requires_explicit_discard() -> None:
+async def test_unavailable_candidate_preview_terminates_without_more_tools() -> None:
     call = ToolCall(
         tool_use_id="writer-preview-unavailable",
         tool_name="document_apply",
@@ -450,10 +452,13 @@ async def test_unavailable_candidate_preview_requires_explicit_discard() -> None
     projected = await dispatch_module._candidate_loop_effect_result(result, tool_call=call)
 
     assert projected.effect_outcome is not None
-    assert projected.effect_outcome.loop_action == "continue"
-    assert projected.effect_outcome.retry_policy == "same_turn"
+    assert projected.effect_outcome.loop_action == "finalize_without_tools"
+    assert projected.effect_outcome.retry_policy == "new_turn"
     assert projected.effect_outcome.outcome_code == "document_preview_unavailable"
-    assert json.loads(projected.content)["retry_allowed"] is True
+    payload = json.loads(projected.content)
+    assert payload["retry_allowed"] is False
+    assert payload["category"] == "DOCUMENT_PREVIEW_UNAVAILABLE"
+    assert projected.terminates_turn is True
 
 
 @pytest.mark.asyncio

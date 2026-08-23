@@ -58,6 +58,7 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'annotation-submit',
   'annotation-cancel',
   'annotation-overlay-fallback',
+  'agent-edit-released',
 ])
 
 function normalizeArtifactAnnotationSelection(

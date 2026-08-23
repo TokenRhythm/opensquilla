@@ -180,6 +180,7 @@
       "readyWithWarnings": "プレビューは警告付きで実行されています。",
       "warningsShort": "警告あり",
       "suspended": "プレビューを一時停止しました",
+      "agentEditInProgress": "編集はバックグラウンドで続行中です。",
       "nativePreview": "インタラクティブプレビュー",
       "allowRemoteResources": "オンラインの画像、スタイル、メディアを許可",
       "blockRemoteResources": "オンラインの画像、スタイル、メディアをブロック",
@@ -4316,7 +4317,22 @@
       "activityContentSize": "{lines} 行 · {characters} 文字",
       "activityExitCode": "終了コード {code}",
       "activityNotCompleted": "完了できませんでした",
-      "activityPublished": "公開済み"
+      "activityPublished": "公開済み",
+      "documentErrorCategory": "カテゴリ: {category} ({code})",
+      "documentPreviewUnavailableCategory": "プレビューを利用できません",
+      "documentActionUnknownCategory": "操作結果が不明です",
+      "documentEditFailedCategory": "ドキュメントの編集に失敗しました",
+      "documentPreviewUnavailableMessage": "編集プレビューを利用できません。未確定の変更は適用されていません。",
+      "documentActionUnknownMessage": "操作が実行された可能性があります。続行前に現在のプレビューを確認してください。",
+      "documentEditFailedMessage": "ドキュメント操作は完了しませんでした。",
+      "documentRetrySameTurn": "再試行方針: このタスクで続行",
+      "documentRetryNewTurn": "再試行方針: 新しいタスクを開始",
+      "documentRetryNever": "再試行方針: 再試行しない",
+      "documentNextRetry": "次の操作: 再試行",
+      "documentNextReinspect": "次の操作: 再確認",
+      "documentNextFinalize": "次の操作: ツールを使わずに終了",
+      "documentNextNewTurn": "次の操作: 新しいタスクを開始",
+      "documentNextStop": "次の操作: 停止"
     }
   },
   "channelStatus": {

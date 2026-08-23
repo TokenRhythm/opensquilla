@@ -6755,7 +6755,18 @@ class Agent:
                 self._tool_context.turn_cleanup_callbacks.clear()
                 for callback in callbacks:
                     try:
-                        callback()
+                        result = callback()
+                        if inspect.isawaitable(result):
+                            cleanup_task = asyncio.ensure_future(result)
+                            cleanup_cancelled = False
+                            while not cleanup_task.done():
+                                try:
+                                    await asyncio.shield(cleanup_task)
+                                except asyncio.CancelledError:
+                                    cleanup_cancelled = True
+                            cleanup_task.result()
+                            if cleanup_cancelled:
+                                logger.debug("agent.turn_authority_cleanup_completed_after_cancel")
                     except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
                         logger.warning(
                             "agent.turn_authority_cleanup_failed",

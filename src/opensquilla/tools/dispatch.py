@@ -1791,6 +1791,7 @@ async def _candidate_loop_effect_result(
         if context is not None:
             setattr(context, "_artifact_browser_verification_token", None)
             setattr(context, "_artifact_browser_verification_sha256", None)
+            setattr(context, "_artifact_browser_binding_generation", None)
         if callable(invalidate):
             try:
                 await invalidate(reason="candidate_loop_operation")
@@ -1834,32 +1835,42 @@ async def _candidate_loop_effect_result(
         )
     if candidate_preview_unavailable:
         # Without a bindable preview the candidate can never produce the
-        # verification receipt required by document_finish(commit).  Keep the
-        # lifecycle tool available so the model remains responsible for the
-        # explicit discard decision; a plain-text stop is nudged back into the
-        # loop, while the global deadline/cost/call fuses still reject an
-        # abandoned draft during turn cleanup.
+        # verification receipt required by document_finish(commit). End the
+        # tool loop immediately; the turn finalizer rejects the staged draft.
+        result.content = json.dumps(
+            {
+                "status": "error",
+                "category": "DOCUMENT_PREVIEW_UNAVAILABLE",
+                "message_key": "document.previewUnavailable",
+                "retry_policy": "new_turn",
+                "next_action": "finalize_without_tools",
+                "retry_allowed": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        result.is_error = True
         result.effect_outcome = ToolEffectOutcome(
-            effect_state="started",
-            retry_policy="same_turn",
-            loop_action="continue",
+            effect_state="none",
+            retry_policy="new_turn",
+            loop_action="finalize_without_tools",
             outcome_code="document_preview_unavailable",
             safe_details={
                 "documentMutationOutcome": {
                     "version": 1,
                     "status": "not_applied",
                     "phase": "candidate",
-                    "retryPolicy": "same_turn",
+                    "retryPolicy": "new_turn",
                     "code": "document_preview_unavailable",
                 }
             },
         )
         _set_mutation_payload_control(
             result,
-            retry_policy="same_turn",
+            retry_policy="new_turn",
             outcome_code="document_preview_unavailable",
         )
-        result.terminates_turn = False
+        result.terminates_turn = True
         result.terminal_response_text = None
         return result
     # The ordinary tool-run budget is a global circuit breaker, not a model
@@ -1910,38 +1921,58 @@ async def _candidate_loop_effect_result(
     payload_retry_disallowed = (
         isinstance(payload, dict) and payload.get("retry_allowed") is False
     )
+    bridge_category = str(getattr(exception, "category", "") or "")
+    bridge_retry_policy = str(getattr(exception, "retry_policy", "") or "")
+    bridge_next_action = str(getattr(exception, "next_action", "") or "")
+    if bridge_category:
+        result.content = json.dumps(
+            {
+                "status": "error",
+                "category": bridge_category,
+                "message_key": (
+                    "document.previewUnavailable"
+                    if getattr(exception, "terminal_binding_loss", False) is True
+                    else "document.actionResultUnknown"
+                    if bridge_category == "DOCUMENT_ACTION_RESULT_UNKNOWN"
+                    else "document.editFailed"
+                ),
+                "retry_policy": bridge_retry_policy or "same_turn",
+                "next_action": bridge_next_action or "retry",
+                "retry_allowed": bridge_retry_policy != "new_turn",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        result.is_error = True
     browser_preview_unavailable = (
         tool_call.tool_name.startswith("document_browser_")
-        and (
-            "DOCUMENT_BROWSER_UNAVAILABLE" in result.content
-            or "DOCUMENT_BROWSER_PREVIEW_UNAVAILABLE" in result.content
-        )
+        and getattr(exception, "terminal_binding_loss", False) is True
     )
     if browser_preview_unavailable:
-        # A missing/v3 bridge cannot be repaired by another browser iteration,
-        # but it is still the model's decision to abandon the candidate.  Feed
-        # the failure back with document_finish(discard) still available.
+        # A terminal binding loss cannot be repaired by another browser
+        # iteration. Close the tool loop after the first failure; turn cleanup
+        # safely discards any uncommitted candidate.
         result.effect_outcome = ToolEffectOutcome(
             effect_state="none",
-            retry_policy="same_turn",
-            loop_action="continue",
+            retry_policy="new_turn",
+            loop_action="finalize_without_tools",
             outcome_code="document_preview_unavailable",
             safe_details={
                 "documentMutationOutcome": {
                     "version": 1,
                     "status": "not_applied",
                     "phase": "verification",
-                    "retryPolicy": "same_turn",
+                    "retryPolicy": "new_turn",
                     "code": "document_preview_unavailable",
                 }
             },
         )
         _set_mutation_payload_control(
             result,
-            retry_policy="same_turn",
+            retry_policy="new_turn",
             outcome_code="document_preview_unavailable",
         )
-        result.terminates_turn = False
+        result.terminates_turn = True
         result.terminal_response_text = None
         return result
     durable_ambiguous = _candidate_finish_is_ambiguous(

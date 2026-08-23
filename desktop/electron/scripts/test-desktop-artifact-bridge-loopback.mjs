@@ -12,6 +12,7 @@ let slowReload = false
 let releaseSlowReload
 let slowReloadAbortObserved = false
 let lateReloadCount = 0
+let bindingReleaseCount = 0
 const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve })
 const annotationDigest = 'b'.repeat(64)
 const annotationElementProof = 'c'.repeat(64)
@@ -71,7 +72,13 @@ const target = {
 }
 
 const audit = []
-const bridge = new DesktopArtifactBridge({ getActiveTarget: () => target })
+const bridge = new DesktopArtifactBridge({
+  getActiveTarget: () => target,
+  acquireActiveTargetBinding: async () => ({
+    target,
+    release: () => { bindingReleaseCount += 1 },
+  }),
+})
 const transport = new DesktopArtifactBridgeLoopbackTransport(bridge, {
   audit: entry => audit.push(entry),
 })
@@ -120,6 +127,35 @@ assert.deepEqual(capabilities, {
     reloadSurface: true,
   },
 })
+
+const bindingResponse = await post('/v1/bindings/acquire', { version: 5 })
+assert.equal(bindingResponse.status, 201)
+const bindingBody = await bindingResponse.json()
+assert.match(bindingBody.value.bindingToken, /^[A-Za-z0-9_-]{43}$/)
+assert.equal(bindingBody.value.capabilities.version, 5)
+const boundReloadResponse = await post('/v1/invoke', {
+  version: 5,
+  bindingToken: bindingBody.value.bindingToken,
+  method: 'screenshot',
+  request: { version: 5 },
+})
+assert.equal(boundReloadResponse.status, 200)
+assert.equal((await boundReloadResponse.json()).ok, true)
+for (let index = 0; index < 2; index += 1) {
+  const releaseResponse = await post('/v1/bindings/release', {
+    version: 5,
+    bindingToken: bindingBody.value.bindingToken,
+  })
+  assert.equal(releaseResponse.status, 200)
+}
+assert.equal(bindingReleaseCount, 1, 'binding release must be idempotent')
+const expiredBindingResponse = await post('/v1/invoke', {
+  version: 5,
+  bindingToken: bindingBody.value.bindingToken,
+  method: 'reloadSurface',
+  request: { version: 5 },
+})
+assert.equal((await expiredBindingResponse.json()).code, 'unavailable')
 
 const resolvedAnnotationResponse = await post('/v1/invoke', {
   version: 3,
@@ -318,6 +354,34 @@ assert.equal(oversizedResponse.status, 413)
 assert.ok(audit.length >= 9)
 assert.ok(audit.every(entry => !JSON.stringify(entry).includes(token)))
 assert.ok(audit.every(entry => !('payload' in entry)))
+
+let actionAbortObserved = false
+const actionTimeoutBridge = new DesktopArtifactBridge({
+  getActiveTarget: () => ({
+    capabilities: { browserAct: true },
+    isCurrent: () => true,
+    browserAct: async (_request, signal) => {
+      await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+      actionAbortObserved = true
+      throw new Error('synthetic lost action reply')
+    },
+  }),
+  operationTimeoutMs: 100,
+})
+const actionTestKeepalive = setTimeout(() => undefined, 1_000)
+const unknownAction = await actionTimeoutBridge.browserAct({
+  version: 5,
+  action: 'press',
+  key: 'Enter',
+  candidateHandle: 'candidate_timeout_12345678',
+}).finally(() => clearTimeout(actionTestKeepalive))
+assert.deepEqual(unknownAction, {
+  ok: false,
+  method: 'browserAct',
+  code: 'action-result-unknown',
+  message: 'The Desktop artifact action result is unknown; inspect again.',
+})
+assert.equal(actionAbortObserved, true)
 
 await transport.close()
 await assert.rejects(() => fetch(`${endpoint}/v1/capabilities`, {

@@ -842,6 +842,7 @@ import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
+import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverableUpdateIndicator'
 import { useChatRouteHeaderBridge } from '@/composables/chat/useChatRouteHeaderBridge'
 import {
   goalHasRenderedTerminalAnchor,
@@ -2196,6 +2197,14 @@ const chatRenderedMessages = useChatRenderedMessages({
   timeTranslator: t,
 })
 const { renderedMessages } = chatRenderedMessages
+const {
+  hasNewDeliverable,
+  acknowledge: acknowledgeDeliverableUpdate,
+} = useDeliverableUpdateIndicator({
+  sessionKey,
+  messages: renderedMessages,
+  isStreaming,
+})
 const sessionCreationRouterPresentation = computed(() => (
   projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
 ))
@@ -4907,6 +4916,7 @@ function focusHeaderAction(
 
 async function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
+  acknowledgeDeliverableUpdate()
   if (
     workbenchEnabled.value
     && workbenchResourcesEnabled.value
@@ -5410,6 +5420,7 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   copyIcon: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
   deliverableCount: headerDeliverableCount,
+  hasNewDeliverable,
   shareMode,
   shareableMessageCount,
 }, {

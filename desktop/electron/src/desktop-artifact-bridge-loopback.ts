@@ -26,7 +26,7 @@ type AuditOutcome = 'allowed' | 'rejected' | 'failed'
 
 export interface DesktopArtifactBridgeLoopbackAudit {
   event: 'desktop_artifact_bridge_transport'
-  operation: 'capabilities' | DesktopArtifactBridgeMethod | 'unknown'
+  operation: 'capabilities' | 'bindingAcquire' | 'bindingRelease' | DesktopArtifactBridgeMethod | 'unknown'
   outcome: AuditOutcome
   code: string
   durationMs: number
@@ -117,6 +117,42 @@ function writeJson(response: ServerResponse, status: number, payload: unknown): 
     'x-content-type-options': 'nosniff',
   })
   response.end(body)
+}
+
+async function writeJsonSettled(
+  response: ServerResponse,
+  status: number,
+  payload: unknown,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      response.off('finish', onFinish)
+      response.off('close', onClose)
+      response.off('error', onError)
+    }
+    const onFinish = () => {
+      cleanup()
+      resolve()
+    }
+    const onClose = () => {
+      cleanup()
+      if (response.writableFinished) resolve()
+      else reject(new Error('The Desktop binding response closed before delivery.'))
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    response.once('finish', onFinish)
+    response.once('close', onClose)
+    response.once('error', onError)
+    try {
+      writeJson(response, status, payload)
+    } catch (error) {
+      cleanup()
+      reject(error)
+    }
+  })
 }
 
 class TransportRequestError extends Error {
@@ -216,6 +252,7 @@ export class DesktopArtifactBridgeLoopbackTransport {
     this.endpoint = null
     this.tokenText = null
     this.startPromise = null
+    await this.bridge.releaseAllBindings()
     if (!server) return
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
@@ -305,14 +342,57 @@ export class DesktopArtifactBridgeLoopbackTransport {
         this.assertBeforeDeadline(deadlineAt)
         outcome = 'allowed'
         code = 'ok'
-        writeJson(response, 200, { ok: true, value: this.bridge.getCapabilities() })
+        writeJson(response, 200, {
+          ok: true,
+          value: this.bridge.getCapabilities(
+            body.version as (typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS)[number],
+          ),
+        })
+        return
+      }
+
+      if (request.url === '/v1/bindings/acquire') {
+        operation = 'bindingAcquire'
+        if (!isObjectRecord(body) || !exactKeys(body, ['version']) || body.version !== DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION) {
+          throw new TransportRequestError(400, 'invalid-request', 'The binding request is invalid.')
+        }
+        const binding = await this.bridge.acquireBinding()
+        if (!binding) throw new TransportRequestError(409, 'unavailable', 'No editable Desktop artifact surface is available.')
+        try {
+          this.assertBeforeDeadline(deadlineAt)
+          await writeJsonSettled(response, 201, {
+            ok: true,
+            value: {
+              version: DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+              ...binding,
+            },
+          })
+          outcome = 'allowed'
+          code = 'ok'
+        } catch (error) {
+          await this.bridge.releaseBinding(binding.bindingToken)
+          throw error
+        }
+        return
+      }
+
+      if (request.url === '/v1/bindings/release') {
+        operation = 'bindingRelease'
+        if (!isObjectRecord(body) || !exactKeys(body, ['version', 'bindingToken']) || body.version !== DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION || typeof body.bindingToken !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.bindingToken)) {
+          throw new TransportRequestError(400, 'invalid-request', 'The binding release request is invalid.')
+        }
+        await this.bridge.releaseBinding(body.bindingToken)
+        outcome = 'allowed'
+        code = 'ok'
+        writeJson(response, 200, { ok: true, value: { released: true } })
         return
       }
 
       if (request.url !== '/v1/invoke') {
         throw new TransportRequestError(404, 'not-found', 'The Desktop bridge endpoint was not found.')
       }
-      if (!isObjectRecord(body) || !exactKeys(body, ['version', 'method', 'request'])) {
+      const isV5 = isObjectRecord(body) && body.version === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+      if (!isObjectRecord(body) || !exactKeys(body, isV5 ? ['version', 'method', 'request', 'bindingToken'] : ['version', 'method', 'request'])) {
         throw new TransportRequestError(400, 'invalid-request', 'The bridge invocation is invalid.')
       }
       // The envelope and typed request must negotiate the same protocol.  A
@@ -334,7 +414,9 @@ export class DesktopArtifactBridgeLoopbackTransport {
       this.assertBeforeDeadline(deadlineAt)
       const invocationController = new AbortController()
       const result = await this.beforeDeadline(
-        this.invokeBridge(method, body.request, invocationController.signal),
+        isV5
+          ? this.invokeBoundBridge(method, body.request, body.bindingToken, invocationController.signal)
+          : this.invokeBridge(method, body.request, invocationController.signal),
         deadlineAt,
         invocationController,
       )
@@ -416,6 +498,18 @@ export class DesktopArtifactBridgeLoopbackTransport {
     signal: AbortSignal,
   ): Promise<DesktopArtifactBridgeResult<M>> {
     return this.bridge[method](request, signal) as Promise<DesktopArtifactBridgeResult<M>>
+  }
+
+  private invokeBoundBridge<M extends DesktopArtifactBridgeMethod>(
+    method: M,
+    request: unknown,
+    bindingToken: unknown,
+    signal: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<M>> {
+    if (typeof bindingToken !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(bindingToken)) {
+      return Promise.resolve({ ok: false, method, code: 'invalid-request', message: 'The Desktop artifact binding token is invalid.' })
+    }
+    return this.bridge.invokeBound(method, request, bindingToken, signal)
   }
 
   private now(): number {

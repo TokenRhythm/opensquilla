@@ -319,6 +319,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
+  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version: NativeWorkbenchProtocolVersion

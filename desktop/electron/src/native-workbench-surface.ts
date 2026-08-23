@@ -56,7 +56,10 @@ import type {
   DesktopArtifactBrowserSnapshot,
   DesktopArtifactFocusAnnotationRequest,
 } from './desktop-artifact-bridge-contract.js'
-import type { DesktopArtifactBridgeTarget } from './desktop-artifact-bridge.js'
+import type {
+  DesktopArtifactBridgeTarget,
+  DesktopArtifactBridgeTargetBinding,
+} from './desktop-artifact-bridge.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
@@ -108,6 +111,8 @@ interface NativeWorkbenchSurfaceRecord {
   disposed: boolean
   crashed: boolean
   cleanupPromise: Promise<void> | null
+  artifactBridgePins: number
+  uiReleaseRequested: boolean
   missingResourceReported: boolean
   blockedNetworkReported: boolean
   privilegedOriginReported: boolean
@@ -145,6 +150,30 @@ interface NativeWorkbenchSurfaceRecord {
   cdpQueue: Promise<void>
   cdpReady: boolean
   debuggerExpectedDetach: boolean
+}
+
+interface NativeWorkbenchArtifactBridgeBindingState {
+  record: NativeWorkbenchSurfaceRecord
+  target: DesktopArtifactBridgeTarget
+  previewPin: NativeWorkbenchArtifactPreviewPin
+  generation: number
+  recoveryAttempted: boolean
+  terminal: boolean
+  released: boolean
+  candidateHandle: string | null
+}
+
+interface NativeWorkbenchArtifactPreviewGrant {
+  launchUrl: string
+  expectedOrigin: string
+  scopeId: string
+  mode: NativeWorkbenchPreviewMode
+}
+
+interface NativeWorkbenchArtifactPreviewPin {
+  currentGrant(): NativeWorkbenchArtifactPreviewGrant
+  ensureCurrent(): Promise<NativeWorkbenchArtifactPreviewGrant | null>
+  release(): Promise<void>
 }
 
 interface NativeWorkbenchBrowserAnchor {
@@ -915,6 +944,9 @@ export interface NativeWorkbenchSurfaceManagerOptions {
     candidateHandle: string,
     signal: AbortSignal,
   ) => Promise<void>
+  pinArtifactPreview?: (
+    grant: NativeWorkbenchArtifactPreviewGrant,
+  ) => NativeWorkbenchArtifactPreviewPin | null
 }
 
 export interface NativeWorkbenchCandidatePreviewBinding {
@@ -1079,6 +1111,10 @@ export class NativeWorkbenchSurfaceManager {
   private readonly annotationOverlays = new Map<BrowserWindow, NativeWorkbenchAnnotationOverlayRecord>()
   private readonly hookedWindows = new WeakSet<BrowserWindow>()
   private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
+  private readonly artifactBridgeBindings = new Map<
+    string,
+    NativeWorkbenchArtifactBridgeBindingState
+  >()
   private activeSurfaceId: string | null = null
 
   constructor(private readonly options: NativeWorkbenchSurfaceManagerOptions) {}
@@ -1100,6 +1136,14 @@ export class NativeWorkbenchSurfaceManager {
     activePreviewArtifactId: string | null,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const previous = this.surfaces.get(request.surfaceId)
+    if (previous?.artifactBridgePins) {
+      return {
+        ok: false,
+        retryable: true,
+        code: 'AGENT_EDIT_IN_PROGRESS',
+        message: 'Agent editing is continuing in the background.',
+      }
+    }
     if (previous) await this.destroyRecord(previous)
     if (this.surfaces.size >= NATIVE_WORKBENCH_MAX_SURFACES) {
       return {
@@ -1185,6 +1229,8 @@ export class NativeWorkbenchSurfaceManager {
       disposed: false,
       crashed: false,
       cleanupPromise: null,
+      artifactBridgePins: 0,
+      uiReleaseRequested: false,
       missingResourceReported: false,
       blockedNetworkReported: false,
       privilegedOriginReported: false,
@@ -1596,6 +1642,12 @@ export class NativeWorkbenchSurfaceManager {
       || !record.view.getVisible()
       || record.view.webContents.isDestroyed()
     ) return null
+    return this.artifactBridgeTargetForRecord(record)
+  }
+
+  private artifactBridgeTargetForRecord(
+    record: NativeWorkbenchSurfaceRecord,
+  ): DesktopArtifactBridgeTarget {
     return {
       protocolVersion: record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
         ? NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
@@ -2030,6 +2082,334 @@ export class NativeWorkbenchSurfaceManager {
     return { restored: true }
   }
 
+  private artifactBridgeBindingError(code: string, message: string): Error {
+    const error = new Error(message) as Error & { code?: string }
+    error.code = code
+    return error
+  }
+
+  private bindingRecordNeedsRecovery(
+    state: NativeWorkbenchArtifactBridgeBindingState,
+  ): boolean {
+    const record = state.record
+    try {
+      return record.disposed
+        || record.crashed
+        || record.view.webContents.isDestroyed()
+        || !record.cdpReady
+        || !record.view.webContents.debugger.isAttached()
+        || this.surfaces.get(record.id) !== record
+    } catch {
+      return true
+    }
+  }
+
+  private async refreshArtifactBridgeCanonicalGrant(
+    state: NativeWorkbenchArtifactBridgeBindingState,
+  ): Promise<boolean> {
+    const grant = await state.previewPin.ensureCurrent()
+    if (!grant || grant.scopeId !== state.record.scopeId) {
+      state.terminal = true
+      throw this.artifactBridgeBindingError(
+        'binding-terminal-unavailable',
+        'The bound Desktop artifact preview lease is unavailable.',
+      )
+    }
+    const record = state.record
+    const changed = record.canonicalDocumentUrl !== grant.launchUrl
+      || record.canonicalExpectedOrigin !== grant.expectedOrigin
+      || record.canonicalMode !== grant.mode
+    if (!changed) return false
+    record.canonicalDocumentUrl = grant.launchUrl
+    record.canonicalExpectedOrigin = grant.expectedOrigin
+    record.canonicalMode = grant.mode
+    state.generation += 1
+    return true
+  }
+
+  private async recoverArtifactBridgeBinding(
+    state: NativeWorkbenchArtifactBridgeBindingState,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (state.released || state.terminal || state.recoveryAttempted || signal.aborted) {
+      state.terminal = true
+      throw this.artifactBridgeBindingError(
+        'binding-terminal-unavailable',
+        'The bound Desktop artifact surface is unavailable.',
+      )
+    }
+    state.recoveryAttempted = true
+    const failed = state.record
+    await this.refreshArtifactBridgeCanonicalGrant(state)
+    const candidateHandle = state.candidateHandle ?? failed.candidatePreview?.handle ?? null
+    const canonicalArtifactId = failed.canonicalPreviewArtifactId
+    const uiReleaseRequested = failed.uiReleaseRequested
+    const request: NativeWorkbenchCreateRequest = {
+      version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
+      surfaceId: failed.id,
+      kind: 'artifact-preview',
+      payload: {
+        launchUrl: failed.canonicalDocumentUrl,
+        expectedOrigin: failed.canonicalExpectedOrigin || '',
+        scopeId: failed.scopeId,
+        mode: failed.canonicalMode,
+      },
+    }
+    failed.artifactBridgePins = 0
+    try {
+      await this.destroyRecord(failed, { preserveCandidatePreview: true })
+      const created = await this.createSurfaceNow(request, canonicalArtifactId)
+      if (!created.ok) throw new Error(created.message || 'Surface recovery failed.')
+      const replacement = this.surfaces.get(failed.id)
+      if (!replacement || replacement.disposed || replacement.crashed) {
+        throw new Error('The replacement surface is unavailable.')
+      }
+      replacement.artifactBridgePins = 1
+      replacement.uiReleaseRequested = uiReleaseRequested
+      replacement.visibleRequested = false
+      this.setPhysicalVisibility(replacement, false)
+      state.record = replacement
+      state.target = this.artifactBridgeTargetForRecord(replacement)
+      state.generation += 1
+      if (candidateHandle) {
+        await this.bindCandidatePreview(replacement, candidateHandle, signal)
+        state.candidateHandle = candidateHandle
+      }
+    } catch (error) {
+      state.terminal = true
+      const replacement = this.surfaces.get(failed.id)
+      if (replacement && replacement !== failed) {
+        replacement.artifactBridgePins = 0
+        await this.destroyRecord(replacement).catch(() => undefined)
+      }
+      if (candidateHandle && this.options.releaseCandidatePreview) {
+        await this.options.releaseCandidatePreview(
+          candidateHandle,
+          new AbortController().signal,
+        ).catch(() => undefined)
+      }
+      throw this.artifactBridgeBindingError(
+        'binding-terminal-unavailable',
+        'The bound Desktop artifact surface could not be recovered.',
+      )
+    }
+  }
+
+  private async invokeArtifactBridgeBinding<T>(
+    state: NativeWorkbenchArtifactBridgeBindingState,
+    method: keyof DesktopArtifactBridgeTarget,
+    request: unknown,
+    signal: AbortSignal,
+    recoverable: boolean,
+  ): Promise<T> {
+    if (state.released || state.terminal) {
+      throw this.artifactBridgeBindingError(
+        'binding-terminal-unavailable',
+        'The bound Desktop artifact surface is unavailable.',
+      )
+    }
+    const canonicalGrantChanged = await this.refreshArtifactBridgeCanonicalGrant(state)
+    if (canonicalGrantChanged || this.bindingRecordNeedsRecovery(state)) {
+      await this.recoverArtifactBridgeBinding(state, signal)
+    }
+
+    const run = async (): Promise<T> => {
+      const handler = state.target[method]
+      if (typeof handler !== 'function') {
+        throw new Error(`The Desktop artifact surface does not support ${String(method)}.`)
+      }
+      return await (handler as (
+        value: unknown,
+        operationSignal: AbortSignal,
+      ) => T | Promise<T>)(request, signal)
+    }
+
+    const recordSuccess = (value: T): T => {
+      if (method === 'bindCandidatePreview') {
+        state.candidateHandle = (request as { candidateHandle?: string }).candidateHandle || null
+      } else if (method === 'restoreCanonicalPreview') {
+        state.candidateHandle = null
+      }
+      return value
+    }
+
+    try {
+      return recordSuccess(await run())
+    } catch (error) {
+      const needsRecovery = this.bindingRecordNeedsRecovery(state)
+      if (method === 'browserAct' && needsRecovery) {
+        throw this.artifactBridgeBindingError(
+          'action-result-unknown',
+          'The Desktop artifact action result is unknown; inspect again.',
+        )
+      }
+      if (!recoverable || !needsRecovery) throw error
+      await this.recoverArtifactBridgeBinding(state, signal)
+      try {
+        return recordSuccess(await run())
+      } catch {
+        state.terminal = true
+        throw this.artifactBridgeBindingError(
+          'binding-terminal-unavailable',
+          'The bound Desktop artifact surface is unavailable after recovery.',
+        )
+      }
+    }
+  }
+
+  private artifactBridgeBindingTarget(
+    state: NativeWorkbenchArtifactBridgeBindingState,
+  ): DesktopArtifactBridgeTarget {
+    const initial = state.target
+    return {
+      ...initial,
+      isCurrent: () => !state.released && !state.terminal,
+      capabilities: {
+        ...initial.capabilities,
+        browserAct: initial.capabilities.bindCandidatePreview === true,
+      },
+      resolveAnnotationSelection: initial.resolveAnnotationSelection
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'resolveAnnotationSelection', request, signal, true,
+          )
+        : undefined,
+      focusAnnotation: initial.focusAnnotation
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'focusAnnotation', request, signal, true,
+          )
+        : undefined,
+      browserInspect: initial.browserInspect
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'browserInspect', request, signal, true,
+          )
+        : undefined,
+      browserAct: initial.browserAct
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'browserAct', request, signal, false,
+          )
+        : undefined,
+      bindCandidatePreview: initial.bindCandidatePreview
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'bindCandidatePreview', request, signal, true,
+          )
+        : undefined,
+      restoreCanonicalPreview: initial.restoreCanonicalPreview
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'restoreCanonicalPreview', request, signal, true,
+          )
+        : undefined,
+      screenshot: initial.screenshot
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'screenshot', request, signal, true,
+          )
+        : undefined,
+      reloadSurface: initial.reloadSurface
+        ? (request, signal) => this.invokeArtifactBridgeBinding(
+            state, 'reloadSurface', request, signal, true,
+          )
+        : undefined,
+    }
+  }
+
+  async acquireArtifactBridgeTargetBinding(): Promise<DesktopArtifactBridgeTargetBinding | null> {
+    if (!this.activeSurfaceId) return null
+    const record = this.surfaces.get(this.activeSurfaceId)
+    if (
+      !record
+      || record.artifactBridgePins > 0
+      || this.artifactBridgeBindings.has(record.id)
+    ) return null
+    const target = this.getActiveArtifactBridgeTarget()
+    if (!target || record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) return null
+    const previewPin = record.kind === 'artifact-preview'
+      && record.canonicalExpectedOrigin
+      && this.options.pinArtifactPreview
+      ? this.options.pinArtifactPreview({
+          launchUrl: record.canonicalDocumentUrl,
+          expectedOrigin: record.canonicalExpectedOrigin,
+          scopeId: record.scopeId,
+          mode: record.canonicalMode,
+        })
+      : null
+    if (record.kind === 'artifact-preview' && !previewPin) return null
+    if (!previewPin) return null
+    record.artifactBridgePins += 1
+    let state: NativeWorkbenchArtifactBridgeBindingState | null = null
+    try {
+      state = {
+        record,
+        target,
+        previewPin,
+        generation: 1,
+        recoveryAttempted: false,
+        terminal: false,
+        released: false,
+        candidateHandle: record.candidatePreview?.handle ?? null,
+      }
+      this.artifactBridgeBindings.set(record.id, state)
+      const bindingState = state
+      const bindingTarget = this.artifactBridgeBindingTarget(bindingState)
+      let released = false
+      return {
+        target: bindingTarget,
+        release: async () => {
+          if (released) return
+          released = true
+          bindingState.released = true
+          if (this.artifactBridgeBindings.get(record.id) === bindingState) {
+            this.artifactBridgeBindings.delete(record.id)
+          }
+          const current = bindingState.record
+          if (
+            bindingState.candidateHandle
+            && current.candidatePreview?.handle === bindingState.candidateHandle
+            && !current.disposed
+            && !current.crashed
+          ) {
+            try {
+              await this.restoreCanonicalPreview(
+                current,
+                bindingState.candidateHandle,
+                new AbortController().signal,
+              )
+              bindingState.candidateHandle = null
+            } catch {
+              bindingState.terminal = true
+            }
+          }
+          current.artifactBridgePins = Math.max(0, current.artifactBridgePins - 1)
+          if (
+            current.artifactBridgePins === 0
+            && (current.uiReleaseRequested || current.crashed || bindingState.terminal)
+          ) {
+            await this.destroyRecord(current)
+          } else if (
+            bindingState.candidateHandle
+            && this.options.releaseCandidatePreview
+          ) {
+            await this.options.releaseCandidatePreview(
+              bindingState.candidateHandle,
+              new AbortController().signal,
+            ).catch(() => undefined)
+          }
+          await previewPin.release()
+          this.options.emit({
+            version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
+            surfaceId: record.id,
+            type: 'agent-edit-released',
+          })
+        },
+      }
+    } catch (error) {
+      if (state && this.artifactBridgeBindings.get(record.id) === state) {
+        this.artifactBridgeBindings.delete(record.id)
+      }
+      record.artifactBridgePins = Math.max(0, record.artifactBridgePins - 1)
+      await previewPin.release()
+      throw error
+    }
+  }
+
   private trustedCandidatePreviewUrl(launchUrl: string, expectedOrigin: string): boolean {
     try {
       const parsed = new URL(launchUrl)
@@ -2081,14 +2461,19 @@ export class NativeWorkbenchSurfaceManager {
 
   private isActiveArtifactBridgeRecord(record: NativeWorkbenchSurfaceRecord): boolean {
     try {
-      return this.activeSurfaceId === record.id
-        && this.surfaces.get(record.id) === record
+      const live = this.surfaces.get(record.id) === record
         && isArtifactBridgeProtocolVersion(record.version)
         && !record.disposed
         && !record.crashed
-        && record.visibleRequested
-        && record.view.getVisible()
         && !record.view.webContents.isDestroyed()
+      return live && (
+        record.artifactBridgePins > 0
+        || (
+          this.activeSurfaceId === record.id
+          && record.visibleRequested
+          && record.view.getVisible()
+        )
+      )
     } catch {
       return false
     }
@@ -2354,6 +2739,23 @@ export class NativeWorkbenchSurfaceManager {
     record.browserAnchorGeneration += 1
   }
 
+  private artifactBridgeBindingGeneration(
+    record: NativeWorkbenchSurfaceRecord,
+  ): number | undefined {
+    const state = this.artifactBridgeBindings.get(record.id)
+    return state?.record === record && !state.released
+      ? state.generation
+      : undefined
+  }
+
+  private bumpArtifactBridgeBindingGeneration(
+    record: NativeWorkbenchSurfaceRecord,
+  ): void {
+    const state = this.artifactBridgeBindings.get(record.id)
+    if (state?.record !== record || state.released) return
+    state.generation += 1
+  }
+
   private async browserRoot(
     record: NativeWorkbenchSurfaceRecord,
     objectGroup: string,
@@ -2418,6 +2820,7 @@ export class NativeWorkbenchSurfaceManager {
         activePreviewArtifactId: record.activePreviewArtifactId,
         scopeId: record.scopeId,
         candidateHandle: record.candidatePreview?.handle ?? null,
+        bindingGeneration: this.artifactBridgeBindingGeneration(record),
       }
     }
     const objectGroup = `opensquilla-browser-${randomUUID()}`
@@ -2502,6 +2905,7 @@ export class NativeWorkbenchSurfaceManager {
         activePreviewArtifactId: record.activePreviewArtifactId,
         scopeId: record.scopeId,
         candidateHandle: record.candidatePreview?.handle ?? null,
+        bindingGeneration: this.artifactBridgeBindingGeneration(record),
       }
     } finally {
       await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })
@@ -2581,31 +2985,42 @@ export class NativeWorkbenchSurfaceManager {
       } else {
         throw new Error('The browser action is unsupported.')
       }
-      const acted = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-        objectId: foundObjectId,
-        objectGroup,
-        functionDeclaration,
-        arguments: argumentsList,
-        awaitPromise: true,
-        returnByValue: true,
-        silent: true,
-      }) as { exceptionDetails?: unknown; result?: { value?: unknown } }
-      if (acted.exceptionDetails) throw new Error('The browser action failed.')
-      const raw = acted.result?.value
-      if (!raw || typeof raw !== 'object' || (raw as Record<string, unknown>).ok !== true) {
-        const reason = raw && typeof raw === 'object'
-          ? (raw as Record<string, unknown>).reason
-          : null
-        throw new Error(typeof reason === 'string' ? reason : 'The browser action failed.')
-      }
-      this.assertBrowserRecord(record, signal)
-      this.assertCandidateRequestBinding(record, request.candidateHandle)
-      // Actions can change the DOM without navigation. Never let an anchor
-      // survive an action; the model must inspect again before acting again.
-      this.invalidateBrowserAnchors(record)
-      return {
-        performed: true,
-        changed: (raw as Record<string, unknown>).changed === true,
+      try {
+        const acted = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
+          objectId: foundObjectId,
+          objectGroup,
+          functionDeclaration,
+          arguments: argumentsList,
+          awaitPromise: true,
+          returnByValue: true,
+          silent: true,
+        }) as { exceptionDetails?: unknown; result?: { value?: unknown } }
+        if (acted.exceptionDetails) throw new Error('The browser action failed.')
+        const raw = acted.result?.value
+        if (!raw || typeof raw !== 'object' || (raw as Record<string, unknown>).ok !== true) {
+          const reason = raw && typeof raw === 'object'
+            ? (raw as Record<string, unknown>).reason
+            : null
+          throw new Error(typeof reason === 'string' ? reason : 'The browser action failed.')
+        }
+        this.assertBrowserRecord(record, signal)
+        this.assertCandidateRequestBinding(record, request.candidateHandle)
+        // Actions can change the DOM without navigation. Never let an anchor
+        // survive an action; the model must inspect again before acting again.
+        this.invalidateBrowserAnchors(record)
+        return {
+          performed: true,
+          changed: (raw as Record<string, unknown>).changed === true,
+        }
+      } catch {
+        // Runtime.callFunctionOn may have reached the page even when CDP lost
+        // the reply. Clear every anchor and force a fresh inspection instead
+        // of allowing a blind replay of a potentially completed side effect.
+        this.invalidateBrowserAnchors(record)
+        throw this.artifactBridgeBindingError(
+          'action-result-unknown',
+          'The Desktop artifact action result is unknown; inspect again.',
+        )
       }
     } finally {
       await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })
@@ -3456,11 +3871,25 @@ export class NativeWorkbenchSurfaceManager {
   private async destroySurfaceNow(surfaceId: string): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(surfaceId)
     if (!record) return { ok: true }
+    if (record.artifactBridgePins > 0) {
+      record.uiReleaseRequested = true
+      record.visibleRequested = false
+      this.setPhysicalVisibility(record, false)
+      void this.cancelAnnotationInteraction(record, 'surface-hidden', true)
+      return {
+        ok: true,
+        code: 'AGENT_EDIT_IN_PROGRESS',
+        message: 'Agent editing is continuing in the background.',
+      }
+    }
     await this.destroyRecord(record)
     return { ok: true }
   }
 
-  private destroyRecord(record: NativeWorkbenchSurfaceRecord): Promise<void> {
+  private destroyRecord(
+    record: NativeWorkbenchSurfaceRecord,
+    options: { preserveCandidatePreview?: boolean } = {},
+  ): Promise<void> {
     if (record.cleanupPromise) return record.cleanupPromise
     const isCurrent = this.surfaces.get(record.id) === record
     if (isCurrent) this.surfaces.delete(record.id)
@@ -3488,7 +3917,10 @@ export class NativeWorkbenchSurfaceManager {
       }
     } catch {}
 
-    const cleanupPromise = this.cleanupDisposedRecord(record)
+    const cleanupPromise = this.cleanupDisposedRecord(
+      record,
+      options.preserveCandidatePreview === true,
+    )
     record.cleanupPromise = cleanupPromise
     this.recordCleanups.add(cleanupPromise)
     void cleanupPromise.then(
@@ -3498,8 +3930,15 @@ export class NativeWorkbenchSurfaceManager {
     return cleanupPromise
   }
 
-  private async cleanupDisposedRecord(record: NativeWorkbenchSurfaceRecord): Promise<void> {
-    if (record.candidatePreview && this.options.releaseCandidatePreview) {
+  private async cleanupDisposedRecord(
+    record: NativeWorkbenchSurfaceRecord,
+    preserveCandidatePreview: boolean,
+  ): Promise<void> {
+    if (
+      !preserveCandidatePreview
+      && record.candidatePreview
+      && this.options.releaseCandidatePreview
+    ) {
       await this.options.releaseCandidatePreview(
         record.candidatePreview.handle,
         new AbortController().signal,
@@ -4403,6 +4842,7 @@ export class NativeWorkbenchSurfaceManager {
           record.privilegedOriginReported = false
         }
         record.annotationDocumentGeneration += 1
+        this.bumpArtifactBridgeBindingGeneration(record)
         this.invalidateBrowserAnchors(record)
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
       },
@@ -4482,6 +4922,7 @@ export class NativeWorkbenchSurfaceManager {
     contents.on('did-navigate-in-page', () => {
       if (isArtifactBridgeProtocolVersion(record.version)) {
         record.annotationDocumentGeneration += 1
+        this.bumpArtifactBridgeBindingGeneration(record)
         this.invalidateBrowserAnchors(record)
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
       }
@@ -4803,6 +5244,16 @@ export class NativeWorkbenchSurfaceManager {
     if (record.disposed || record.crashed) return false
     record.crashed = true
     record.visibleRequested = false
+    this.setPhysicalVisibility(record, false)
+    this.invalidateBrowserAnchors(record)
+    if (record.artifactBridgePins > 0) {
+      // A turn binding owns one deterministic recovery attempt. Preserve the
+      // exact record and candidate mapping until its next operation decides
+      // whether recovery is safe; UI lifecycle events must not pre-empt it.
+      void this.cancelAnnotationInteraction(record, 'surface-failed', true)
+      this.dispatchEvent(record, type, detail)
+      return true
+    }
     // Begin the complete teardown before calling renderer-owned event code.
     // destroyRecord removes the slot and marks the record disposed
     // synchronously, so callback re-entry cannot revive or replace a surface

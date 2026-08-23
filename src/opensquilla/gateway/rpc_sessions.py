@@ -14,6 +14,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -3566,8 +3567,49 @@ async def _accepted_turn_response(
     return payload
 
 
+class _IngressTurnAuthorityScope:
+    """Own newly acquired turn authorities until runtime admission succeeds."""
+
+    def __init__(self) -> None:
+        self.authorities: list[Any] = []
+
+    def register(self, authority: Any) -> None:
+        self.authorities.append(authority)
+
+    async def close_untransferred(self) -> None:
+        for authority in tuple(self.authorities):
+            if getattr(authority, "ingress_owned", False) is not True:
+                continue
+            try:
+                await authority.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - preserve the ingress outcome
+                log.warning("sessions.send.turn_authority_cleanup_failed", exc_info=True)
+
+
+_INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = ContextVar(
+    "opensquilla_ingress_turn_authority_scope",
+    default=None,
+)
+
+
 @_d.method("sessions.send", scope="operator.write")
 async def _handle_sessions_send_impl(
+    params: dict | None,
+    ctx: RpcContext,
+    **kwargs: Any,
+) -> dict:
+    scope = _IngressTurnAuthorityScope()
+    token = _INGRESS_TURN_AUTHORITY_SCOPE.set(scope)
+    try:
+        return await _handle_sessions_send_impl_inner(params, ctx, **kwargs)
+    finally:
+        _INGRESS_TURN_AUTHORITY_SCOPE.reset(token)
+        await scope.close_untransferred()
+
+
+async def _handle_sessions_send_impl_inner(
     params: dict | None,
     ctx: RpcContext,
     *,
@@ -5018,6 +5060,7 @@ async def _handle_sessions_send_impl(
             and not guest_safe
         ):
             from opensquilla.gateway.desktop_artifact_bridge import (
+                TurnAuthorityCleanup,
                 get_desktop_artifact_bridge_client,
             )
 
@@ -5037,20 +5080,46 @@ async def _handle_sessions_send_impl(
                 # ten-tool loop could stage a draft that can never be committed.
                 # Keep the useful durable source-writer compatibility path
                 # rather than exposing a candidate that can only be discarded.
+                turn_authority_cleanup = None
                 try:
-                    bridge_capabilities = await desktop_artifact_bridge.capabilities()
+                    bound_desktop_artifact_bridge = await desktop_artifact_bridge.acquire_binding()
+                    turn_authority_cleanup = (
+                        TurnAuthorityCleanup(bound_desktop_artifact_bridge.aclose)
+                        if bound_desktop_artifact_bridge is not None
+                        else None
+                    )
+                    authority_scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
+                    if turn_authority_cleanup is not None and authority_scope is not None:
+                        authority_scope.register(turn_authority_cleanup)
+                    bridge_capabilities = (
+                        await bound_desktop_artifact_bridge.capabilities()
+                        if bound_desktop_artifact_bridge is not None
+                        else None
+                    )
                 except Exception:  # noqa: BLE001 - preserve unavailable bridge semantics
+                    bound_desktop_artifact_bridge = None
                     bridge_capabilities = None
-                if not _desktop_artifact_bridge_supports_candidate_loop(
-                    bridge_capabilities
+                if (
+                    not _desktop_artifact_bridge_supports_candidate_loop(
+                        bridge_capabilities
+                    )
+                    or turn_authority_cleanup is None
                 ):
+                    if turn_authority_cleanup is not None:
+                        await turn_authority_cleanup.aclose()
                     artifact_turn_context = _prompt_annotation_source_only_context(
                         artifact_turn_context
                     )
                 else:
                     route_envelope.runtime_services["desktop_artifact_bridge"] = (
-                        desktop_artifact_bridge
+                        bound_desktop_artifact_bridge
                     )
+                    route_envelope.runtime_services["turn_authority_cleanup"] = (
+                        turn_authority_cleanup
+                    )
+                    route_envelope.runtime_services.setdefault(
+                        "turn_cleanup_callbacks", []
+                    ).append(turn_authority_cleanup.aclose)
             else:
                 # A browser-less web client must not receive the autonomous
                 # writer/finish contract.  It can still use the durable
@@ -5936,6 +6005,10 @@ async def _handle_sessions_send_impl(
                     session_key=key,
                     attempts_remaining=_prompt_annotation_acceptance_retries,
                 )
+                authority_scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
+                if authority_scope is not None:
+                    await authority_scope.close_untransferred()
+                    authority_scope.authorities.clear()
                 return cast(
                     dict[Any, Any],
                     await _handle_sessions_send_impl(
@@ -6357,7 +6430,23 @@ async def _handle_sessions_send_impl(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
+            turn_authority = route_envelope.runtime_services.get(
+                "turn_authority_cleanup"
+            )
+            try:
+                direct_registry.register(
+                    key,
+                    task,
+                    terminal_cleanup=(
+                        turn_authority.aclose if turn_authority is not None else None
+                    ),
+                )
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            if turn_authority is not None:
+                turn_authority.handoff()
             return acceptance
 
         try:
@@ -6592,7 +6681,23 @@ async def _handle_sessions_send_impl(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
+            turn_authority = route_envelope.runtime_services.get(
+                "turn_authority_cleanup"
+            )
+            try:
+                direct_registry.register(
+                    key,
+                    task,
+                    terminal_cleanup=(
+                        turn_authority.aclose if turn_authority is not None else None
+                    ),
+                )
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            if turn_authority is not None:
+                turn_authority.handoff()
 
         await _emit_to_subscribers(
             ctx,

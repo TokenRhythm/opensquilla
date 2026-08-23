@@ -225,7 +225,7 @@ class ToolContext:
     # Process-local authority cleanup registered by ingress/runtime adapters.
     # The shared Agent turn boundary invokes these callbacks on every terminal
     # path without importing feature-specific tool implementations.
-    turn_cleanup_callbacks: list[Callable[[], None]] = field(
+    turn_cleanup_callbacks: list[Callable[[], Any]] = field(
         default_factory=list,
         repr=False,
     )

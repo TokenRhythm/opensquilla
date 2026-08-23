@@ -180,6 +180,7 @@
       "readyWithWarnings": "L’aperçu fonctionne avec des avertissements.",
       "warningsShort": "Avertissements",
       "suspended": "Aperçu en pause",
+      "agentEditInProgress": "La modification se poursuit en arrière-plan.",
       "nativePreview": "Aperçu interactif",
       "allowRemoteResources": "Autoriser les images, styles et médias en ligne",
       "blockRemoteResources": "Bloquer les images, styles et médias en ligne",
@@ -4316,7 +4317,22 @@
       "activityContentSize": "{lines} lignes · {characters} caractères",
       "activityExitCode": "Code de sortie {code}",
       "activityNotCompleted": "Non terminé",
-      "activityPublished": "Publié"
+      "activityPublished": "Publié",
+      "documentErrorCategory": "Catégorie : {category} ({code})",
+      "documentPreviewUnavailableCategory": "Aperçu indisponible",
+      "documentActionUnknownCategory": "Résultat de l’action inconnu",
+      "documentEditFailedCategory": "Échec de la modification du document",
+      "documentPreviewUnavailableMessage": "L’aperçu d’édition est indisponible. Aucune modification non validée n’a été appliquée.",
+      "documentActionUnknownMessage": "L’action a peut-être été exécutée. Inspectez l’aperçu avant de continuer.",
+      "documentEditFailedMessage": "L’opération sur le document n’a pas abouti.",
+      "documentRetrySameTurn": "Nouvelle tentative : poursuivre dans cette tâche",
+      "documentRetryNewTurn": "Nouvelle tentative : démarrer une nouvelle tâche",
+      "documentRetryNever": "Nouvelle tentative : ne pas réessayer",
+      "documentNextRetry": "Étape suivante : réessayer",
+      "documentNextReinspect": "Étape suivante : inspecter à nouveau",
+      "documentNextFinalize": "Étape suivante : terminer sans autre outil",
+      "documentNextNewTurn": "Étape suivante : démarrer une nouvelle tâche",
+      "documentNextStop": "Étape suivante : arrêter"
     }
   },
   "channelStatus": {

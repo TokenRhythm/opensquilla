@@ -180,6 +180,7 @@
       "readyWithWarnings": "Die Vorschau wird mit Warnungen ausgeführt.",
       "warningsShort": "Warnungen",
       "suspended": "Vorschau pausiert",
+      "agentEditInProgress": "Die Bearbeitung wird im Hintergrund fortgesetzt.",
       "nativePreview": "Interaktive Vorschau",
       "allowRemoteResources": "Online-Bilder, -Stile und -Medien zulassen",
       "blockRemoteResources": "Online-Bilder, -Stile und -Medien blockieren",
@@ -4316,7 +4317,22 @@
       "activityContentSize": "{lines} Zeilen · {characters} Zeichen",
       "activityExitCode": "Exit-Code {code}",
       "activityNotCompleted": "Nicht abgeschlossen",
-      "activityPublished": "Veröffentlicht"
+      "activityPublished": "Veröffentlicht",
+      "documentErrorCategory": "Kategorie: {category} ({code})",
+      "documentPreviewUnavailableCategory": "Vorschau nicht verfügbar",
+      "documentActionUnknownCategory": "Aktionsergebnis unbekannt",
+      "documentEditFailedCategory": "Dokumentbearbeitung fehlgeschlagen",
+      "documentPreviewUnavailableMessage": "Die Bearbeitungsvorschau ist nicht verfügbar. Nicht übernommene Änderungen wurden verworfen.",
+      "documentActionUnknownMessage": "Die Aktion wurde möglicherweise ausgeführt. Prüfen Sie die Vorschau, bevor Sie fortfahren.",
+      "documentEditFailedMessage": "Der Dokumentvorgang wurde nicht abgeschlossen.",
+      "documentRetrySameTurn": "Wiederholung: in dieser Aufgabe fortfahren",
+      "documentRetryNewTurn": "Wiederholung: neue Aufgabe starten",
+      "documentRetryNever": "Wiederholung: nicht erneut versuchen",
+      "documentNextRetry": "Nächster Schritt: erneut versuchen",
+      "documentNextReinspect": "Nächster Schritt: erneut prüfen",
+      "documentNextFinalize": "Nächster Schritt: ohne weitere Werkzeuge beenden",
+      "documentNextNewTurn": "Nächster Schritt: neue Aufgabe starten",
+      "documentNextStop": "Nächster Schritt: stoppen"
     }
   },
   "channelStatus": {

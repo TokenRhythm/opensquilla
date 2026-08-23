@@ -1804,6 +1804,205 @@ describe('artifact Workbench provider', () => {
     await runtime.dispose?.('closed')
   })
 
+  it('shows a non-error agent-edit placeholder and rebuilds from the latest head after release', async () => {
+    const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
+    const revision1 = {
+      ...legacy.revisions[0],
+      revisionId: 'revision-1',
+      documentId: 'document-1',
+      artifactId: 'artifact-head-1',
+      generation: 1,
+    }
+    const revision2 = {
+      ...revision1,
+      revisionId: 'revision-2',
+      parentRevisionId: 'revision-1',
+      artifactId: 'artifact-head-2',
+      artifactSha256: 'b'.repeat(64),
+      generation: 2,
+    }
+    const workspace = {
+      ...legacy,
+      source: 'document-api' as const,
+      document: {
+        ...legacy.document,
+        documentId: 'document-1',
+        headRevisionId: 'revision-1',
+        capabilities: {
+          ...legacy.document.capabilities,
+          preview: true,
+          edit: true,
+          source: true,
+          agentEdit: true,
+        },
+      },
+      revisions: [revision1],
+      headArtifact: {
+        ...artifact,
+        id: revision1.artifactId,
+        documentId: 'document-1',
+      },
+    }
+    let leaseSequence = 0
+    const createLease = vi.fn(async () => {
+      leaseSequence += 1
+      const token = String(leaseSequence).padStart(32, '0')
+      return {
+        ok: true as const,
+        status: 201,
+        payload: {
+          version: 1 as const,
+          lease_id: `apl-agent-edit-${leaseSequence}`,
+          effective_mode: 'full' as const,
+          launch_url: `http://p-${token}.localhost:48721/index.html`,
+          entrypoint: 'index.html',
+          expires_at: '2099-01-01T00:00:00Z',
+          preview_origin: `http://p-${token}.localhost:48721`,
+          idle_timeout_seconds: 28_800,
+          source: {
+            kind: 'single_file' as const,
+            collection_status: 'not_applicable' as const,
+            file_count: 1,
+            total_bytes: 128,
+            warning_codes: [],
+          },
+        },
+      }
+    })
+    const createSurface = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false as const,
+        code: 'AGENT_EDIT_IN_PROGRESS',
+        message: 'agent edit owns this surface',
+        retryable: true,
+      })
+      .mockResolvedValue({ ok: true as const })
+    const revokeLease = vi.fn(async () => ({
+      ok: true as const,
+      status: 204,
+      payload: undefined,
+    }))
+    const nativeApi: NativeWorkbenchApi = {
+      getCapabilities: vi.fn(async () => ({
+        protocolVersions: [4] as Array<4>,
+        modes: ['full', 'offline'] as Array<'full' | 'offline'>,
+        maxSurfaces: 8,
+      })),
+      getArtifactAnnotationCapabilities: vi.fn(async () => ({
+        version: 4 as const,
+        available: false,
+        picker: false,
+        trustedOverlay: false,
+        overlayCopyVersion: 1 as const,
+      })),
+      createArtifactPreviewLease: createLease,
+      renewArtifactPreviewLease: vi.fn(async () => ({
+        ok: true as const,
+        status: 200,
+        payload: {
+          version: 1 as const,
+          lease_id: `apl-agent-edit-${leaseSequence}`,
+          expires_at: '2099-01-01T00:00:00Z',
+        },
+      })),
+      revokeArtifactPreviewLease: revokeLease,
+      createSurface,
+      setSurfaceRect: vi.fn(async () => ({ ok: true as const })),
+      activateSurface: vi.fn(async () => ({ ok: true as const })),
+      destroySurface: vi.fn(async () => ({ ok: true as const })),
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    let refreshAttempt = 0
+    let staleSnapshot = false
+    const loadDocument = vi.fn(async () => {
+      refreshAttempt += 1
+      if (refreshAttempt === 1) {
+        // The document store preserves the previous head when its first
+        // release-triggered refresh races state propagation.
+        staleSnapshot = true
+        return
+      }
+      staleSnapshot = false
+      workspace.document.headRevisionId = revision2.revisionId
+      workspace.revisions = [revision1, revision2]
+      workspace.headArtifact = {
+        ...workspace.headArtifact,
+        id: revision2.artifactId,
+      }
+    })
+    const renderState: Record<string, unknown> = {}
+    const reportError = vi.fn()
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: true,
+      sessionKey: 'session-a',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      artifactDocuments: {
+        load: loadDocument,
+        snapshot: vi.fn(() => ({
+          key: 'fixture',
+          loading: false,
+          loaded: true,
+          stale: staleSnapshot,
+          error: null,
+          workspace,
+        })),
+        headArtifact: vi.fn(() => workspace.headArtifact),
+      },
+      authToken: () => 'synthetic-token',
+      baseOrigin: 'http://127.0.0.1:18791',
+      confirmRemoteResources: vi.fn(async () => true),
+      currentSessionId: () => 'session-a',
+      openArtifact: vi.fn(),
+      platform: {
+        id: 'desktop',
+        capabilities: { canOpenArtifactsNatively: true },
+        files: {},
+      } as unknown as Platform,
+      previewLeasesEnabled: true,
+      pushToast: vi.fn(),
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-preview')!
+    const runtime = await definition.createRuntime!(item, {
+      nativeWorkbenchApi: nativeApi,
+      getRenderState: () => renderState,
+      updateRenderState: patch => Object.assign(renderState, patch),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError,
+    })
+
+    expect(renderState).toMatchObject({
+      agentEditInProgress: true,
+      previewBlocked: true,
+      previewLeaseError: '',
+    })
+    expect(reportError).not.toHaveBeenCalled()
+    expect(revokeLease).toHaveBeenCalledWith(expect.objectContaining({
+      leaseId: 'apl-agent-edit-1',
+      scopeId: 'session-a',
+    }))
+
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 4,
+      surfaceId: item.id,
+      type: 'agent-edit-released',
+    }, item)
+
+    expect(loadDocument).toHaveBeenCalledTimes(2)
+    expect(loadDocument).toHaveBeenLastCalledWith(
+      artifact,
+      'session-a',
+      { force: true },
+    )
+    expect(createLease).toHaveBeenCalledTimes(2)
+    expect(createSurface).toHaveBeenCalledTimes(2)
+    expect(renderState.agentEditInProgress).toBe(false)
+    expect(reportError).not.toHaveBeenCalled()
+    await runtime.dispose?.('closed')
+  })
+
   it('refreshes annotation capability after reactivating a replacement surface', async () => {
     const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
     const workspace = {

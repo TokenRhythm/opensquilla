@@ -78,6 +78,7 @@ DESKTOP_BRIDGE_URL_ENV = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL"
 DESKTOP_BRIDGE_TOKEN_ENV = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN"
 DESKTOP_BRIDGE_VERSION = 3
 DESKTOP_BRIDGE_V4_VERSION = 4
+DESKTOP_BRIDGE_V5_VERSION = 5
 
 DIRECT_MODEL = "glm-5.2"
 ROUTER_MODELS = {
@@ -909,7 +910,7 @@ class _BridgeSelection:
 
 
 class SyntheticDesktopBridge:
-    """Minimal authenticated v4 bridge used only inside the isolated worker."""
+    """Minimal authenticated v5 bridge used only inside the isolated worker."""
 
     def __init__(self) -> None:
         self._token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
@@ -917,8 +918,9 @@ class SyntheticDesktopBridge:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._selections: dict[str, _BridgeSelection] = {}
-        self._candidate_handle: str | None = None
-        self._candidate_bound = False
+        self._bindings: dict[str, dict[str, Any]] = {
+            "legacy": {"candidateHandle": None, "candidateBound": False, "generation": 1}
+        }
         self._gateway_endpoint: str | None = None
         self._active_preview_artifact_id: str | None = None
         self._scope_id: str | None = None
@@ -951,7 +953,7 @@ class SyntheticDesktopBridge:
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            server_version = "OpenSquillaSyntheticBridge/3"
+            server_version = "OpenSquillaSyntheticBridge/5"
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -990,8 +992,7 @@ class SyntheticDesktopBridge:
         self._thread = None
         with self._lock:
             self._selections.clear()
-            self._candidate_handle = None
-            self._candidate_bound = False
+            self._bindings.clear()
             self._gateway_endpoint = None
             self._active_preview_artifact_id = None
             self._scope_id = None
@@ -1000,6 +1001,23 @@ class SyntheticDesktopBridge:
             server.server_close()
         if thread is not None:
             thread.join(timeout=2.0)
+
+    @staticmethod
+    def _capabilities() -> dict[str, Any]:
+        return {
+            "version": DESKTOP_BRIDGE_V5_VERSION,
+            "available": True,
+            "captureSelection": False,
+            "resolveAnnotationSelection": True,
+            "focusAnnotation": False,
+            "browserInspect": True,
+            "browserAct": True,
+            "screenshot": True,
+            "officeFlush": False,
+            "reloadSurface": True,
+            "bindCandidatePreview": True,
+            "restoreCanonicalPreview": True,
+        }
 
     def _json_response(
         self,
@@ -1095,35 +1113,79 @@ class SyntheticDesktopBridge:
         if (
             handler.path == "/v1/capabilities"
             and isinstance(body, dict)
-            and body.get("version") in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
+            and body.get("version")
+            in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION, DESKTOP_BRIDGE_V5_VERSION}
         ):
+            self._json_response(
+                handler,
+                200,
+                {"ok": True, "value": self._capabilities()},
+            )
+            return
+        if (
+            handler.path == "/v1/bindings/acquire"
+            and isinstance(body, dict)
+            and body.get("version") == DESKTOP_BRIDGE_V5_VERSION
+        ):
+            binding_token = (
+                base64.urlsafe_b64encode(secrets.token_bytes(32))
+                .decode("ascii")
+                .rstrip("=")
+            )
+            with self._lock:
+                self._bindings[binding_token] = {
+                    "candidateHandle": None,
+                    "candidateBound": False,
+                    "generation": 1,
+                }
             self._json_response(
                 handler,
                 200,
                 {
                     "ok": True,
                     "value": {
-                        "version": DESKTOP_BRIDGE_V4_VERSION,
-                        "available": True,
-                        "captureSelection": False,
-                        "resolveAnnotationSelection": True,
-                        "focusAnnotation": False,
-                        "browserInspect": True,
-                        "browserAct": True,
-                        "screenshot": True,
-                        "officeFlush": False,
-                        "reloadSurface": True,
-                        "bindCandidatePreview": True,
-                        "restoreCanonicalPreview": True,
+                        "version": DESKTOP_BRIDGE_V5_VERSION,
+                        "bindingToken": binding_token,
+                        "capabilities": self._capabilities(),
                     },
                 },
             )
             return
         if (
+            handler.path == "/v1/bindings/release"
+            and isinstance(body, dict)
+            and body.get("version") == DESKTOP_BRIDGE_V5_VERSION
+            and isinstance(body.get("bindingToken"), str)
+        ):
+            with self._lock:
+                self._bindings.pop(str(body["bindingToken"]), None)
+            self._json_response(handler, 200, {"ok": True, "value": {"released": True}})
+            return
+        binding_token = body.get("bindingToken") if isinstance(body, dict) else None
+        protocol_version = body.get("version") if isinstance(body, dict) else None
+        binding_key = (
+            str(binding_token)
+            if protocol_version == DESKTOP_BRIDGE_V5_VERSION
+            else "legacy"
+        )
+        with self._lock:
+            binding = self._bindings.get(binding_key)
+        is_bound_v5 = (
+            protocol_version == DESKTOP_BRIDGE_V5_VERSION
+            and isinstance(binding_token, str)
+            and binding is not None
+        )
+        is_legacy = (
+            protocol_version in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
+            and binding_token is None
+            and binding is not None
+        )
+        if (
             handler.path != "/v1/invoke"
             or not isinstance(body, dict)
-            or body.get("version") not in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
+            or not (is_bound_v5 or is_legacy)
             or not isinstance(body.get("request"), dict)
+            or body["request"].get("version") != protocol_version
         ):
             self._json_response(
                 handler,
@@ -1136,7 +1198,8 @@ class SyntheticDesktopBridge:
         if method == "bindCandidatePreview":
             handle = request.get("candidateHandle")
             if (
-                request.get("version") != DESKTOP_BRIDGE_V4_VERSION
+                request.get("version")
+                not in {DESKTOP_BRIDGE_V4_VERSION, DESKTOP_BRIDGE_V5_VERSION}
                 or not isinstance(handle, str)
                 or not handle.startswith("candidate_")
             ):
@@ -1151,8 +1214,21 @@ class SyntheticDesktopBridge:
                 )
                 return
             with self._lock:
-                self._candidate_handle = handle
-                self._candidate_bound = True
+                current = self._bindings.get(binding_key)
+                if current is None:
+                    self._json_response(
+                        handler,
+                        409,
+                        {
+                            "ok": False,
+                            "code": "binding-unavailable",
+                            "message": "Binding is unavailable.",
+                        },
+                    )
+                    return
+                current["candidateHandle"] = handle
+                current["candidateBound"] = True
+                current["generation"] = int(current["generation"]) + 1
             self._json_response(
                 handler,
                 200,
@@ -1161,8 +1237,11 @@ class SyntheticDesktopBridge:
             return
         if method == "restoreCanonicalPreview":
             with self._lock:
-                self._candidate_handle = None
-                self._candidate_bound = False
+                current = self._bindings.get(binding_key)
+                if current is not None:
+                    current["candidateHandle"] = None
+                    current["candidateBound"] = False
+                    current["generation"] = int(current["generation"]) + 1
             self._json_response(
                 handler,
                 200,
@@ -1170,7 +1249,10 @@ class SyntheticDesktopBridge:
             )
             return
         if method == "browserInspect":
-            if request.get("version") != DESKTOP_BRIDGE_V4_VERSION:
+            if request.get("version") not in {
+                DESKTOP_BRIDGE_V4_VERSION,
+                DESKTOP_BRIDGE_V5_VERSION,
+            }:
                 self._json_response(
                     handler,
                     400,
@@ -1184,8 +1266,10 @@ class SyntheticDesktopBridge:
             scope = request.get("scope")
             max_nodes = request.get("maxNodes")
             with self._lock:
-                bound = self._candidate_bound
-                candidate_handle = self._candidate_handle
+                current = self._bindings.get(binding_key)
+                bound = bool(current and current["candidateBound"])
+                candidate_handle = current["candidateHandle"] if current else None
+                binding_generation = int(current["generation"]) if current else 0
                 canonical_artifact_id = self._active_preview_artifact_id
                 canonical_scope_id = self._scope_id
             if scope not in {"document", "selection", "viewport"} or not isinstance(max_nodes, int):
@@ -1249,6 +1333,11 @@ class SyntheticDesktopBridge:
                         "activePreviewArtifactId": active_artifact_id,
                         "scopeId": active_scope_id,
                         "candidateHandle": candidate_handle if bound else None,
+                        **(
+                            {"bindingGeneration": binding_generation}
+                            if protocol_version == DESKTOP_BRIDGE_V5_VERSION
+                            else {}
+                        ),
                     },
                 },
             )
@@ -1280,6 +1369,10 @@ class SyntheticDesktopBridge:
             )
             return
         if method == "reloadSurface":
+            with self._lock:
+                current = self._bindings.get(binding_key)
+                if current is not None:
+                    current["generation"] = int(current["generation"]) + 1
             self._json_response(
                 handler,
                 200,
@@ -1288,7 +1381,8 @@ class SyntheticDesktopBridge:
             return
         if (
             method != "resolveAnnotationSelection"
-            or request.get("version") not in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION}
+            or request.get("version")
+            not in {DESKTOP_BRIDGE_VERSION, DESKTOP_BRIDGE_V4_VERSION, DESKTOP_BRIDGE_V5_VERSION}
         ):
             self._json_response(
                 handler,
@@ -1301,7 +1395,7 @@ class SyntheticDesktopBridge:
             selection = self._selections.get(str(selection_id))
         expected_request = selection.request() if selection is not None else None
         if expected_request is not None:
-            # v4 keeps the v3 annotation-selection payload for compatibility;
+            # v4/v5 keep the v3 annotation-selection payload for compatibility;
             # only the envelope version changes during capability negotiation.
             expected_request["version"] = request.get("version")
         if selection is None or request != expected_request:

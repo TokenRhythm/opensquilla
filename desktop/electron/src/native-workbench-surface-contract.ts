@@ -2,6 +2,7 @@ import {
   DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
 } from './desktop-artifact-bridge-contract.js'
 
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION = 1 as const
@@ -9,7 +10,7 @@ export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V2 = 2 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V3 =
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V4 =
-  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4
 export const NATIVE_WORKBENCH_MAX_SURFACES = 8
 export const NATIVE_WORKBENCH_MAX_HTML_BYTES = 5 * 1024 * 1024
 export const NATIVE_WORKBENCH_ARTIFACT_SCHEME = 'opensquilla-artifact'
@@ -200,6 +201,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
+  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version:

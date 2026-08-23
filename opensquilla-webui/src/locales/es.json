@@ -180,6 +180,7 @@
       "readyWithWarnings": "La vista previa se está ejecutando con advertencias.",
       "warningsShort": "Advertencias",
       "suspended": "Vista previa en pausa",
+      "agentEditInProgress": "La edición continúa en segundo plano.",
       "nativePreview": "Vista previa interactiva",
       "allowRemoteResources": "Permitir imágenes, estilos y contenido multimedia en línea",
       "blockRemoteResources": "Bloquear imágenes, estilos y contenido multimedia en línea",
@@ -4316,7 +4317,22 @@
       "activityContentSize": "{lines} líneas · {characters} caracteres",
       "activityExitCode": "Código de salida {code}",
       "activityNotCompleted": "No se completó",
-      "activityPublished": "Publicado"
+      "activityPublished": "Publicado",
+      "documentErrorCategory": "Categoría: {category} ({code})",
+      "documentPreviewUnavailableCategory": "Vista previa no disponible",
+      "documentActionUnknownCategory": "Resultado de la acción desconocido",
+      "documentEditFailedCategory": "Error al editar el documento",
+      "documentPreviewUnavailableMessage": "La vista previa de edición no está disponible. No se aplicaron cambios sin confirmar.",
+      "documentActionUnknownMessage": "Es posible que la acción se haya ejecutado. Inspecciona la vista previa antes de continuar.",
+      "documentEditFailedMessage": "La operación del documento no se completó.",
+      "documentRetrySameTurn": "Política de reintento: continuar en esta tarea",
+      "documentRetryNewTurn": "Política de reintento: iniciar una tarea nueva",
+      "documentRetryNever": "Política de reintento: no reintentar",
+      "documentNextRetry": "Siguiente paso: reintentar",
+      "documentNextReinspect": "Siguiente paso: inspeccionar de nuevo",
+      "documentNextFinalize": "Siguiente paso: finalizar sin más herramientas",
+      "documentNextNewTurn": "Siguiente paso: iniciar una tarea nueva",
+      "documentNextStop": "Siguiente paso: detener"
     }
   },
   "channelStatus": {

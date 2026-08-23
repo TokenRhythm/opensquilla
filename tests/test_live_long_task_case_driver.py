@@ -780,6 +780,106 @@ def test_stop_count_requires_durable_webui_stop_outcomes() -> None:
     assert count == 1
 
 
+def test_terminal_history_evidence_waits_for_durable_assistant_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter(
+        [
+            (0, 0, 0, 0),
+            (18, 1, 0, 0),
+        ]
+    )
+    calls = 0
+
+    async def history_evidence(
+        _client: object,
+        *,
+        session_key: str,
+        assistant_marker: str,
+        user_marker: str = "",
+    ) -> tuple[int, int, int, int]:
+        nonlocal calls
+        calls += 1
+        assert session_key == "agent:main:webchat:synthetic"
+        assert assistant_marker == "synthetic complete"
+        assert user_marker == ""
+        return next(observations)
+
+    monkeypatch.setattr(driver, "_history_evidence", history_evidence)
+
+    class Client:
+        recv_calls = 0
+
+        async def recv_event(self, *, timeout: float) -> dict[str, object]:
+            self.recv_calls += 1
+            assert timeout > 0
+            return {"event": "history-settle"}
+
+    class Observation:
+        frames: list[dict[str, object]] = []
+
+        def consume(self, frame: dict[str, object]) -> None:
+            self.frames.append(frame)
+
+    client = Client()
+    observation = Observation()
+
+    result = asyncio.run(
+        driver._wait_for_assistant_history_evidence(
+            client,
+            observation,
+            session_key="agent:main:webchat:synthetic",
+            assistant_marker="synthetic complete",
+            deadline=driver.time.monotonic() + 1.0,
+        )
+    )
+
+    assert result == (18, 1, 0, 0)
+    assert calls == 2
+    assert client.recv_calls == 1
+    assert observation.frames == [{"event": "history-settle"}]
+
+
+def test_terminal_history_evidence_does_not_extend_case_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def history_evidence(
+        _client: object,
+        *,
+        session_key: str,
+        assistant_marker: str,
+        user_marker: str = "",
+    ) -> tuple[int, int, int, int]:
+        nonlocal calls
+        calls += 1
+        return (0, 0, 0, 0)
+
+    monkeypatch.setattr(driver, "_history_evidence", history_evidence)
+
+    class Client:
+        async def recv_event(self, *, timeout: float) -> dict[str, object]:
+            raise AssertionError(f"expired deadline waited for {timeout}")
+
+    class Observation:
+        def consume(self, frame: dict[str, object]) -> None:
+            raise AssertionError(f"expired deadline consumed {frame}")
+
+    result = asyncio.run(
+        driver._wait_for_assistant_history_evidence(
+            Client(),
+            Observation(),
+            session_key="agent:main:webchat:synthetic",
+            assistant_marker="synthetic complete",
+            deadline=driver.time.monotonic(),
+        )
+    )
+
+    assert result == (0, 0, 0, 0)
+    assert calls == 1
+
+
 def test_runtime_failure_preserves_physical_usage_and_cost_budget_evidence(
     tmp_path: Path,
 ) -> None:

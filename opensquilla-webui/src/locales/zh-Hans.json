@@ -180,6 +180,7 @@
       "readyWithWarnings": "预览已运行，但存在警告。",
       "warningsShort": "存在警告",
       "suspended": "预览已暂停",
+      "agentEditInProgress": "编辑正在后台继续。",
       "nativePreview": "互动预览",
       "allowRemoteResources": "允许加载在线图片、样式和媒体",
       "blockRemoteResources": "禁止加载在线图片、样式和媒体",
@@ -4404,7 +4405,22 @@
       "activityContentSize": "{lines} 行 · {characters} 个字符",
       "activityExitCode": "退出码 {code}",
       "activityNotCompleted": "未通过",
-      "activityPublished": "已发布"
+      "activityPublished": "已发布",
+      "documentErrorCategory": "类别：{category}（{code}）",
+      "documentPreviewUnavailableCategory": "编辑预览不可用",
+      "documentActionUnknownCategory": "操作结果未知",
+      "documentEditFailedCategory": "文档编辑失败",
+      "documentPreviewUnavailableMessage": "编辑预览不可用，未提交的修改均未应用。",
+      "documentActionUnknownMessage": "操作可能已执行，请先重新检查当前预览再继续。",
+      "documentEditFailedMessage": "文档操作未完成。",
+      "documentRetrySameTurn": "重试策略：在当前任务中继续",
+      "documentRetryNewTurn": "重试策略：开始新任务",
+      "documentRetryNever": "重试策略：不要重试",
+      "documentNextRetry": "下一步：重试",
+      "documentNextReinspect": "下一步：重新检查",
+      "documentNextFinalize": "下一步：不再调用工具并结束",
+      "documentNextNewTurn": "下一步：开始新任务",
+      "documentNextStop": "下一步：停止"
     }
   },
   "channelStatus": {

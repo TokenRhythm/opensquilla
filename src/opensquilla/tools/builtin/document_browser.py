@@ -32,6 +32,35 @@ _V4_BROWSER_CAPABILITIES = frozenset(
 )
 
 
+class DocumentBridgeToolError(SafeToolError):
+    """Sanitized bridge failure with loop-control metadata for dispatch."""
+
+    def __init__(
+        self,
+        user_message: str,
+        *,
+        category: str,
+        retry_policy: str,
+        next_action: str,
+        terminal_binding_loss: bool = False,
+    ) -> None:
+        super().__init__(user_message)
+        self.category = category
+        self.retry_policy = retry_policy
+        self.next_action = next_action
+        self.terminal_binding_loss = terminal_binding_loss
+
+
+def _terminal_preview_error(message: str) -> DocumentBridgeToolError:
+    return DocumentBridgeToolError(
+        message,
+        category="DOCUMENT_PREVIEW_UNAVAILABLE",
+        retry_policy="new_turn",
+        next_action="finalize_without_tools",
+        terminal_binding_loss=True,
+    )
+
+
 def _json(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -39,7 +68,7 @@ def _json(payload: object) -> str:
 def _ctx() -> Any:
     context = current_tool_context.get()
     if context is None:
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_UNAVAILABLE: No bound document preview is available."
         )
     surfaced = getattr(context, "surfaced_tools", None)
@@ -53,7 +82,7 @@ def _ctx() -> Any:
             "document_browser_reload",
         )
     ):
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_UNAVAILABLE: Browser tools are not authorized for this turn."
         )
     if surfaced is not None and not any(
@@ -65,12 +94,12 @@ def _ctx() -> Any:
             "document_browser_reload",
         )
     ):
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_UNAVAILABLE: Browser tools are not authorized for this turn."
         )
     bridge = getattr(context, "desktop_artifact_bridge", None)
     if bridge is None:
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_UNAVAILABLE: The bound desktop preview is unavailable."
         )
     return context
@@ -90,7 +119,7 @@ async def _capability(context: Any, name: str) -> None:
     try:
         value = await capabilities()
     except Exception as exc:  # noqa: BLE001 - never expose transport details
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_UNAVAILABLE: The bound desktop preview is unavailable."
         ) from exc
     # Browser inspection/action is intentionally a protocol-v4 capability.
@@ -103,7 +132,7 @@ async def _capability(context: Any, name: str) -> None:
         if raw_version is None and isinstance(value, Mapping):
             raw_version = value.get("version")
         if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 4:
-            raise SafeToolError(
+            raise _terminal_preview_error(
                 "DOCUMENT_BROWSER_UNAVAILABLE: Protocol-v4 bound preview is required."
             )
     # The in-process bridge client exposes snake_case dataclass fields, while
@@ -125,7 +154,7 @@ async def _capability(context: Any, name: str) -> None:
         else any(getattr(value, alias, False) is True for alias in names)
     )
     if not bool(advertised):
-        raise SafeToolError(
+        raise _terminal_preview_error(
             f"DOCUMENT_BROWSER_UNAVAILABLE: The preview does not support {name}."
         )
 
@@ -136,9 +165,33 @@ def _bridge_error(exc: BaseException, operation: str) -> SafeToolError:
     # source-only repair or finish(discard).
     code = str(getattr(exc, "code", "failed") or "failed")
     safe_code = "".join(ch for ch in code.upper() if ch.isalnum() or ch == "_")[:48]
-    return SafeToolError(
-        f"DOCUMENT_BROWSER_{operation.upper()}_{safe_code or 'FAILED'}: "
-        "The bound preview operation did not complete."
+    normalized_code = code.strip().lower().replace("_", "-")
+    terminal_binding_loss = normalized_code in {
+        "binding-terminal-unavailable",
+        "binding-unavailable",
+        "transport-unavailable",
+        "unavailable",
+    }
+    action_result_unknown = normalized_code == "action-result-unknown"
+    category = (
+        "DOCUMENT_PREVIEW_UNAVAILABLE"
+        if terminal_binding_loss
+        else "DOCUMENT_ACTION_RESULT_UNKNOWN"
+        if action_result_unknown
+        else f"DOCUMENT_BROWSER_{operation.upper()}_{safe_code or 'FAILED'}"
+    )
+    return DocumentBridgeToolError(
+        f"{category}: The bound preview operation did not complete.",
+        category=category,
+        retry_policy="new_turn" if terminal_binding_loss else "same_turn",
+        next_action=(
+            "finalize_without_tools"
+            if terminal_binding_loss
+            else "reinspect"
+            if action_result_unknown
+            else "retry"
+        ),
+        terminal_binding_loss=terminal_binding_loss,
     )
 
 
@@ -181,7 +234,7 @@ async def _assert_candidate_preview_identity(context: Any, *, operation: str) ->
         return None
     expected_candidate_handle = getattr(controller, "preview_handle", None)
     if not isinstance(expected_candidate_handle, str):
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_PREVIEW_UNAVAILABLE: The candidate preview handle is unavailable."
         )
     await _capability(context, "browser_inspect")
@@ -297,6 +350,7 @@ async def _invalidate_candidate_verification(context: Any, *, reason: str) -> No
 
     setattr(context, "_artifact_browser_verification_token", None)
     setattr(context, "_artifact_browser_verification_sha256", None)
+    setattr(context, "_artifact_browser_binding_generation", None)
     controller = getattr(context, "artifact_candidate_loop_controller", None)
     invalidate = getattr(controller, "invalidate_verification", None)
     if callable(invalidate):
@@ -381,7 +435,7 @@ async def document_browser_inspect(
         else None
     )
     if candidate_is_staged and not isinstance(candidate_handle, str):
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_BROWSER_PREVIEW_UNAVAILABLE: The candidate preview handle is unavailable."
         )
     try:
@@ -401,7 +455,7 @@ async def document_browser_inspect(
     )
     if candidate_is_staged:
         if not bool(getattr(context, "_artifact_candidate_preview_bound", False)):
-            raise SafeToolError(
+            raise _terminal_preview_error(
                 "DOCUMENT_BROWSER_PREVIEW_UNAVAILABLE: The current Electron client "
                 "cannot bind this candidate preview."
             )
@@ -425,6 +479,19 @@ async def document_browser_inspect(
                 "the current candidate; inspect the current candidate again."
             )
         sha256 = candidate_sha256
+    binding_generation = getattr(snapshot, "binding_generation", None)
+    if candidate_is_staged and (
+        isinstance(binding_generation, bool)
+        or not isinstance(binding_generation, int)
+        or binding_generation < 1
+    ):
+        await _invalidate_candidate_verification(
+            context,
+            reason="browser_binding_generation_unavailable",
+        )
+        raise SafeToolError(
+            "DOCUMENT_BROWSER_VERIFICATION_STALE: The preview binding changed; inspect again."
+        )
     nodes = [
         {
             "anchor": node.anchor,
@@ -444,6 +511,7 @@ async def document_browser_inspect(
         "generation": generation,
         "revisionId": revision_id,
         "candidateEpoch": candidate_epoch,
+        "bindingGeneration": binding_generation,
     }
     token = _new_verification_token(sha256=sha256, payload=receipt_payload)
     # ToolContext is intentionally process-local and not serialized.  Keeping
@@ -451,6 +519,7 @@ async def document_browser_inspect(
     # adding a public token store or a database migration.
     setattr(context, "_artifact_browser_verification_token", token)
     setattr(context, "_artifact_browser_verification_sha256", sha256)
+    setattr(context, "_artifact_browser_binding_generation", binding_generation)
     if candidate_controller is not None and candidate_is_staged and sha256 is not None:
         try:
             await candidate_controller.record_verification(
@@ -487,6 +556,11 @@ async def _final_browser_health_check(context: Any, expected_sha256: str) -> str
     model's immediately preceding inspect result.
     """
 
+    expected_binding_generation = getattr(
+        context,
+        "_artifact_browser_binding_generation",
+        None,
+    )
     try:
         raw = await document_browser_inspect(scope="document", maxNodes=1)
         payload = json.loads(raw)
@@ -502,13 +576,23 @@ async def _final_browser_health_check(context: Any, expected_sha256: str) -> str
         )
     candidate_sha = payload.get("candidateSha256")
     token = payload.get("verificationToken")
+    fresh_binding_generation = getattr(
+        context,
+        "_artifact_browser_binding_generation",
+        None,
+    )
     if (
         payload.get("status") != "verification_passed"
         or not isinstance(candidate_sha, str)
         or candidate_sha.lower() != expected_sha256.lower()
         or not isinstance(token, str)
         or not re.fullmatch(_TOKEN_RE, token)
+        or expected_binding_generation != fresh_binding_generation
     ):
+        await _invalidate_candidate_verification(
+            context,
+            reason="finish_binding_generation_stale",
+        )
         raise SafeToolError(
             "DOCUMENT_FINISH_VERIFICATION_STALE: The candidate changed; inspect again."
         )
@@ -988,6 +1072,7 @@ async def document_finish(
         setattr(context, "_artifact_candidate_preview_cleanup_pending", restore_pending)
         setattr(context, "_artifact_browser_verification_token", None)
         setattr(context, "_artifact_browser_verification_sha256", None)
+        setattr(context, "_artifact_browser_binding_generation", None)
         # Native restore deliberately retains its opaque handle when the
         # Gateway release fails, so a later cleanup pass can retry.  Retiring
         # the Gateway mapping here would make that retry impossible (the
@@ -1016,7 +1101,7 @@ async def document_finish(
             "DOCUMENT_FINISH_VERIFICATION_REQUIRED: Commit requires a fresh verification token."
         )
     if not bool(getattr(context, "_artifact_candidate_preview_bound", False)):
-        raise SafeToolError(
+        raise _terminal_preview_error(
             "DOCUMENT_FINISH_PREVIEW_UNAVAILABLE: The candidate preview is not bound "
             "to the active Electron surface."
         )
@@ -1078,6 +1163,7 @@ async def document_finish(
         setattr(context, "_artifact_candidate_preview_cleanup_pending", not restored)
         setattr(context, "_artifact_browser_verification_token", None)
         setattr(context, "_artifact_browser_verification_sha256", None)
+        setattr(context, "_artifact_browser_binding_generation", None)
         if restored:
             _retire_candidate_preview(context, controller)
         else:

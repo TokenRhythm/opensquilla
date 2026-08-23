@@ -969,14 +969,16 @@ assert.deepEqual(controlledBridge.getCapabilities(), {
   captureSelection: true,
   resolveAnnotationSelection: true,
   focusAnnotation: true,
-  browserInspect: true,
-  browserAct: true,
+  browserInspect: false,
+  browserAct: false,
   bindCandidatePreview: false,
   restoreCanonicalPreview: false,
   screenshot: true,
   officeFlush: false,
   reloadSurface: true,
 })
+assert.equal(controlledBridge.getCapabilities(5).browserInspect, true)
+assert.equal(controlledBridge.getCapabilities(5).browserAct, true)
 assert.equal((await controlledBridge.captureSelection({ version: 3 })).ok, true)
 assert.equal((await controlledBridge.resolveAnnotationSelection({
   version: 3,

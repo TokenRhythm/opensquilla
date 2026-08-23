@@ -387,9 +387,17 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
             "sandbox_run_context",
         ):
             metadata.pop(key, None)
+    runtime_services = dict(envelope.runtime_services)
+    for key in (
+        "desktop_artifact_bridge",
+        "turn_authority_cleanup",
+        "turn_cleanup_callbacks",
+    ):
+        runtime_services.pop(key, None)
     return replace(
         envelope,
         metadata=metadata,
+        runtime_services=runtime_services,
         sandbox_run_context_fresh=False,
     )
 
@@ -650,6 +658,7 @@ class _RuntimeTask:
     terminal_assistant_message_id: str | None = None
     terminal_assistant_message_content: str | None = None
     document_mutation_outcome: dict[str, Any] | None = None
+    turn_authority_cleanup: Any | None = field(default=None, repr=False)
     stream_event_sink: TaskStreamEventSink | None = None
     finalizer_completed: bool = False
     accepted_config: Any | None = None
@@ -789,6 +798,25 @@ def _cleanup_guest_profile(task: _RuntimeTask) -> None:
         guest_profile_root,
         managed_root=guest_managed_root,
     )
+
+
+async def _cleanup_turn_authority(task: _RuntimeTask) -> None:
+    """Release one task's process-local turn authority exactly once."""
+
+    authority = task.turn_authority_cleanup
+    if authority is None:
+        return
+    try:
+        await authority.aclose()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - terminal cleanup must continue
+        log.warning(
+            "task_runtime.turn_authority_cleanup_failed",
+            task_id=task.task_id,
+            session_key=task.envelope.session_key,
+            exc_info=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -1936,26 +1964,38 @@ class TaskRuntime:
     ) -> TaskHandle:
         """Persist and activate one direct enqueue without cancellation drift."""
 
-        reservation = await self.reserve(
-            envelope,
-            message,
-            attachments=attachments,
-            mode=mode,
-            run_kind=run_kind,
-            no_memory_capture=no_memory_capture,
-            ingress_pipeline_steps=ingress_pipeline_steps,
-            semantic_message=semantic_message,
-            persisted_user_message_id=persisted_user_message_id,
-            persisted_user_message_ids=persisted_user_message_ids,
-            message_count=message_count,
-            fresh_user_session=fresh_user_session,
-            stream_event_sink=stream_event_sink,
-            accepted_run_mode_override=accepted_run_mode_override,
-            task_id=task_id,
-            provider_request_correlation=provider_request_correlation,
-            update_envelope_cache=update_envelope_cache,
-            overflow_policy=overflow_policy,
+        turn_authority_cleanup = envelope.runtime_services.get(
+            "turn_authority_cleanup"
         )
+        try:
+            reservation = await self.reserve(
+                envelope,
+                message,
+                attachments=attachments,
+                mode=mode,
+                run_kind=run_kind,
+                no_memory_capture=no_memory_capture,
+                ingress_pipeline_steps=ingress_pipeline_steps,
+                semantic_message=semantic_message,
+                persisted_user_message_id=persisted_user_message_id,
+                persisted_user_message_ids=persisted_user_message_ids,
+                message_count=message_count,
+                fresh_user_session=fresh_user_session,
+                stream_event_sink=stream_event_sink,
+                accepted_run_mode_override=accepted_run_mode_override,
+                task_id=task_id,
+                provider_request_correlation=provider_request_correlation,
+                turn_authority_cleanup=turn_authority_cleanup,
+                update_envelope_cache=update_envelope_cache,
+                overflow_policy=overflow_policy,
+            )
+        except BaseException:
+            # Queue rejection and shutdown can happen before a reservation
+            # exists. Runtime admission still owns releasing any one-turn
+            # Desktop authority supplied to this enqueue operation.
+            if turn_authority_cleanup is not None:
+                await turn_authority_cleanup.aclose()
+            raise
         try:
             if self._accepted_config_provider is not None:
                 await self.freeze_acceptance(reservation)
@@ -1988,9 +2028,23 @@ class TaskRuntime:
             # activation in a fresh child; otherwise the reservation already owns
             # the live task and only the caller cancellation remains to propagate.
             if not reservation.activated:
-                await self._wait_for_task_settlement(
-                    asyncio.create_task(self.activate(reservation))
-                )
+                try:
+                    await self._wait_for_task_settlement(
+                        asyncio.create_task(self.activate(reservation))
+                    )
+                except BaseException:
+                    if not reservation.activated:
+                        await self._wait_for_task_settlement(
+                            asyncio.create_task(self.abort_reservation(reservation))
+                        )
+            raise
+        except BaseException:
+            # Activation may fail while capturing accepted configuration or
+            # before it registers the runtime task. The durable row does not
+            # retain one-turn Desktop authority, so release the inert
+            # reservation here; a post-boundary failure is owned by _execute.
+            if not reservation.activated:
+                await self.abort_reservation(reservation)
             raise
 
     @staticmethod
@@ -2028,6 +2082,7 @@ class TaskRuntime:
         *,
         task_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        turn_authority_cleanup: Any | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
         bypass_pending_limit: bool = False,
@@ -2127,6 +2182,11 @@ class TaskRuntime:
             persisted_user_message_ids=normalized_message_ids,
             message_count=message_count,
             fresh_user_session=fresh_user_session,
+            turn_authority_cleanup=(
+                turn_authority_cleanup
+                if turn_authority_cleanup is not None
+                else envelope.runtime_services.get("turn_authority_cleanup")
+            ),
             stream_event_sink=stream_event_sink,
             accepted_run_mode_override=accepted_run_mode_override,
             provider_request_correlation=provider_request_correlation,
@@ -2247,6 +2307,9 @@ class TaskRuntime:
                 reservation
             )
             self._signal_driver_state_changed()
+        authority = runtime_task.turn_authority_cleanup
+        if authority is not None:
+            authority.handoff()
         try:
             runtime_task.envelope = _materialize_guest_task_envelope(
                 runtime_task.envelope,
@@ -2278,6 +2341,7 @@ class TaskRuntime:
                 )
             reservation.aborted = True
             self._signal_driver_state_changed()
+        await _cleanup_turn_authority(reservation.runtime_task)
         _cleanup_guest_profile(reservation.runtime_task)
 
     async def _emit_queued_activation(
@@ -4351,6 +4415,7 @@ class TaskRuntime:
         finally:
             self._user_input_broker.cancel_task(task.task_id)
             await self._settle_attached_plan_run(task)
+            await _cleanup_turn_authority(task)
             _cleanup_guest_profile(task)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
@@ -4486,7 +4551,9 @@ class TaskRuntime:
                 self._last_envelope_by_session.get(task.envelope.session_key)
                 is previous_envelope
             ):
-                self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+                self._last_envelope_by_session[task.envelope.session_key] = (
+                    _reusable_route_envelope(task.envelope)
+                )
         if metadata["collaboration_mode"] == "plan":
             task.no_memory_capture = True
         plan_run = await self._start_attached_plan_run(task)
@@ -4504,7 +4571,9 @@ class TaskRuntime:
                     self._last_envelope_by_session.get(task.envelope.session_key)
                     is previous_envelope
                 ):
-                    self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+                    self._last_envelope_by_session[task.envelope.session_key] = (
+                        _reusable_route_envelope(task.envelope)
+                    )
 
     async def _start_attached_plan_run(self, task: _RuntimeTask) -> Any | None:
         run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
@@ -5902,6 +5971,7 @@ class TaskRuntime:
             # A driver cancelled before its first event-loop step never enters
             # ``_execute`` and therefore has no execution ``finally`` block.
             if not task.execution_started:
+                await _cleanup_turn_authority(task)
                 _cleanup_guest_profile(task)
         if not claimed:
             return

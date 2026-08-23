@@ -180,6 +180,7 @@
       "readyWithWarnings": "The preview is running with warnings.",
       "warningsShort": "Warnings",
       "suspended": "Preview paused",
+      "agentEditInProgress": "Editing is continuing in the background.",
       "nativePreview": "Interactive preview",
       "allowRemoteResources": "Allow online images, styles, and media",
       "blockRemoteResources": "Block online images, styles, and media",
@@ -4404,7 +4405,22 @@
       "activityContentSize": "{lines} lines · {characters} characters",
       "activityExitCode": "Exit code {code}",
       "activityNotCompleted": "Didn't complete",
-      "activityPublished": "Published"
+      "activityPublished": "Published",
+      "documentErrorCategory": "Category: {category} ({code})",
+      "documentPreviewUnavailableCategory": "Preview unavailable",
+      "documentActionUnknownCategory": "Action result unknown",
+      "documentEditFailedCategory": "Document edit failed",
+      "documentPreviewUnavailableMessage": "The editing preview is unavailable. No uncommitted changes were applied.",
+      "documentActionUnknownMessage": "The action may have run. Inspect the current preview before continuing.",
+      "documentEditFailedMessage": "The document operation did not complete.",
+      "documentRetrySameTurn": "Retry policy: continue in this task",
+      "documentRetryNewTurn": "Retry policy: start a new task",
+      "documentRetryNever": "Retry policy: do not retry",
+      "documentNextRetry": "Next action: retry",
+      "documentNextReinspect": "Next action: inspect again",
+      "documentNextFinalize": "Next action: finish without more tools",
+      "documentNextNewTurn": "Next action: start a new task",
+      "documentNextStop": "Next action: stop"
     }
   },
   "channelStatus": {

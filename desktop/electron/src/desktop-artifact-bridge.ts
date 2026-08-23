@@ -1,6 +1,8 @@
+import { randomBytes } from 'node:crypto'
 import {
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
   DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
   DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES,
   parseDesktopArtifactBrowserActRequest,
   parseDesktopArtifactBrowserInspectRequest,
@@ -25,6 +27,8 @@ export type DesktopArtifactBridgeErrorCode =
   | 'unsupported'
   | 'timed-out'
   | 'operation-failed'
+  | 'binding-terminal-unavailable'
+  | 'action-result-unknown'
 
 export interface DesktopArtifactBridgeSuccess<M extends DesktopArtifactBridgeMethod> {
   ok: true
@@ -72,7 +76,22 @@ export interface DesktopArtifactBridgeTarget {
 
 export interface DesktopArtifactBridgeOptions {
   getActiveTarget(): DesktopArtifactBridgeTarget | null
+  acquireActiveTargetBinding?():
+    | DesktopArtifactBridgeTargetBinding
+    | null
+    | Promise<DesktopArtifactBridgeTargetBinding | null>
   operationTimeoutMs?: number
+}
+
+export interface DesktopArtifactBridgeTargetBinding {
+  target: DesktopArtifactBridgeTarget
+  release(): void | Promise<void>
+}
+
+interface DesktopArtifactBridgeBindingRecord {
+  target: DesktopArtifactBridgeTarget
+  release: () => void | Promise<void>
+  queue: Promise<void>
 }
 
 const REQUEST_PARSERS = {
@@ -106,6 +125,7 @@ function handlerFor<M extends DesktopArtifactBridgeMethod>(
  */
 export class DesktopArtifactBridge {
   private operationQueue: Promise<void> = Promise.resolve()
+  private readonly bindings = new Map<string, DesktopArtifactBridgeBindingRecord>()
   private readonly operationTimeoutMs: number
 
   constructor(private readonly options: DesktopArtifactBridgeOptions) {
@@ -115,7 +135,9 @@ export class DesktopArtifactBridge {
       : 15_000
   }
 
-  getCapabilities(): DesktopArtifactBridgeCapabilities {
+  getCapabilities(
+    requestedVersion: DesktopArtifactBridgeProtocolVersion = DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
+  ): DesktopArtifactBridgeCapabilities {
     const target = this.activeTarget()
     if (!target || !this.targetIsCurrent(target)) {
       return { ...DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES }
@@ -125,20 +147,111 @@ export class DesktopArtifactBridge {
       // surface's negotiated version.  This prevents a v3 legacy preview
       // from being mistaken for an autonomous v4 browser surface by the
       // Gateway, without removing its old screenshot/reload operations.
-      version: target.protocolVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
-        ? DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
-        : DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+      version: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+        ? DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+        : target.protocolVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+          ? DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+          : DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
       available: true,
       captureSelection: this.methodAvailable(target, 'captureSelection'),
       resolveAnnotationSelection: this.methodAvailable(target, 'resolveAnnotationSelection'),
       focusAnnotation: this.methodAvailable(target, 'focusAnnotation'),
-      browserInspect: this.methodAvailable(target, 'browserInspect'),
-      browserAct: this.methodAvailable(target, 'browserAct'),
-      bindCandidatePreview: this.methodAvailable(target, 'bindCandidatePreview'),
-      restoreCanonicalPreview: this.methodAvailable(target, 'restoreCanonicalPreview'),
+      browserInspect: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'browserInspect'),
+      browserAct: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'browserAct'),
+      bindCandidatePreview: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'bindCandidatePreview'),
+      restoreCanonicalPreview: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'restoreCanonicalPreview'),
       screenshot: this.methodAvailable(target, 'screenshot'),
       officeFlush: this.methodAvailable(target, 'officeFlush'),
       reloadSurface: this.methodAvailable(target, 'reloadSurface'),
+    }
+  }
+
+  async acquireBinding(): Promise<{
+    bindingToken: string
+    capabilities: DesktopArtifactBridgeCapabilities
+  } | null> {
+    const acquired = await this.options.acquireActiveTargetBinding?.()
+    if (!acquired) return null
+    try {
+      if (!this.targetIsCurrent(acquired.target)) {
+        await acquired.release()
+        return null
+      }
+      const bindingToken = randomBytes(32).toString('base64url')
+      const capabilities = this.capabilitiesFor(acquired.target)
+      this.bindings.set(bindingToken, {
+        target: acquired.target,
+        release: acquired.release,
+        queue: Promise.resolve(),
+      })
+      return { bindingToken, capabilities }
+    } catch (error) {
+      await acquired.release()
+      throw error
+    }
+  }
+
+  async releaseBinding(bindingToken: string): Promise<void> {
+    const record = this.bindings.get(bindingToken)
+    if (!record) return
+    this.bindings.delete(bindingToken)
+    await record.queue.catch(() => undefined)
+    await record.release()
+  }
+
+  async releaseAllBindings(): Promise<void> {
+    await Promise.allSettled([...this.bindings.keys()].map(token => this.releaseBinding(token)))
+  }
+
+  invokeBound<M extends DesktopArtifactBridgeMethod>(
+    method: M,
+    value: unknown,
+    bindingToken: string,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<M>> {
+    const record = this.bindings.get(bindingToken)
+    if (!record) {
+      return Promise.resolve({
+        ok: false,
+        method,
+        code: 'unavailable',
+        message: 'The Desktop artifact binding is unavailable.',
+      })
+    }
+    let request: DesktopArtifactBridgeRequestByMethod[M]
+    try {
+      request = REQUEST_PARSERS[method](value) as DesktopArtifactBridgeRequestByMethod[M]
+    } catch (error) {
+      return Promise.resolve({
+        ok: false,
+        method,
+        code: 'invalid-request',
+        message: error instanceof Error ? error.message : 'The Desktop artifact request is invalid.',
+      })
+    }
+    const operation = record.queue.then(
+      () => this.perform(method, request, record.target, signal),
+      () => this.perform(method, request, record.target, signal),
+    )
+    record.queue = operation.then(() => undefined, () => undefined)
+    return operation
+  }
+
+  private capabilitiesFor(target: DesktopArtifactBridgeTarget): DesktopArtifactBridgeCapabilities {
+    const available = (method: DesktopArtifactBridgeMethod) => this.methodAvailable(target, method)
+    return {
+      version: DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+      available: true,
+      captureSelection: available('captureSelection'),
+      resolveAnnotationSelection: available('resolveAnnotationSelection'),
+      focusAnnotation: available('focusAnnotation'),
+      browserInspect: available('browserInspect'),
+      browserAct: available('browserAct'),
+      screenshot: available('screenshot'),
+      officeFlush: available('officeFlush'),
+      reloadSurface: available('reloadSurface'),
+      bindCandidatePreview: available('bindCandidatePreview'),
+      restoreCanonicalPreview: available('restoreCanonicalPreview'),
     }
   }
 
@@ -313,13 +426,35 @@ export class DesktopArtifactBridge {
       return { ok: true, method, value }
     } catch (error) {
       const timedOut = controller.signal.aborted
+      // Once browserAct has entered its handler, a timeout or cancellation
+      // cannot prove whether the page observed the input. Never classify that
+      // boundary as safely retryable: the caller must inspect again.
+      const actionResultUnknown = method === 'browserAct' && timedOut
+      const operationCode: DesktopArtifactBridgeErrorCode | null = (
+        !timedOut
+        && error
+        && typeof error === 'object'
+        && 'code' in error
+        && (
+          (error as { code?: unknown }).code === 'binding-terminal-unavailable'
+          || (error as { code?: unknown }).code === 'action-result-unknown'
+        )
+      ) ? (error as { code: DesktopArtifactBridgeErrorCode }).code : null
       return {
         ok: false,
         method,
-        code: timedOut ? 'timed-out' : 'operation-failed',
-        message: timedOut
-          ? 'The Desktop artifact operation timed out.'
-          : 'The Desktop artifact operation failed.',
+        code: actionResultUnknown
+          ? 'action-result-unknown'
+          : timedOut ? 'timed-out' : operationCode || 'operation-failed',
+        message: actionResultUnknown
+          ? 'The Desktop artifact action result is unknown; inspect again.'
+          : timedOut
+            ? 'The Desktop artifact operation timed out.'
+          : operationCode === 'action-result-unknown'
+            ? 'The Desktop artifact action result is unknown; inspect again.'
+            : operationCode === 'binding-terminal-unavailable'
+              ? 'The bound Desktop artifact surface is unavailable.'
+              : 'The Desktop artifact operation failed.',
       }
     } finally {
       if (timeout) clearTimeout(timeout)

@@ -8,6 +8,7 @@ import pytest
 
 from opensquilla.engine.types import ToolCall
 from opensquilla.tool_boundary import ToolResult
+from opensquilla.tools.builtin.document_browser import DocumentBridgeToolError
 from opensquilla.tools.builtin.document_format_adapters import DocumentMutationError
 from opensquilla.tools.dispatch import (
     _candidate_loop_effect_result,
@@ -201,6 +202,98 @@ async def test_candidate_finish_validation_error_returns_to_loop() -> None:
     assert projected.effect_outcome.retry_policy == "same_turn"
     assert projected.effect_outcome.loop_action == "continue"
     assert json.loads(projected.content)["retry_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_typed_terminal_browser_loss_ends_after_one_failure() -> None:
+    candidate = _CandidateController("verification_failed")
+    context = _candidate_context(candidate)
+    call = ToolCall(
+        tool_use_id="inspect-terminal-loss",
+        tool_name="document_browser_inspect",
+        arguments={"scope": "document"},
+    )
+    result = ToolResult(
+        tool_use_id=call.tool_use_id,
+        tool_name=call.tool_name,
+        content="DOCUMENT_BROWSER_INSPECT_UNAVAILABLE: unavailable",
+        is_error=True,
+    )
+    exception = DocumentBridgeToolError(
+        "DOCUMENT_BROWSER_INSPECT_UNAVAILABLE: unavailable",
+        category="DOCUMENT_PREVIEW_UNAVAILABLE",
+        retry_policy="new_turn",
+        next_action="finalize_without_tools",
+        terminal_binding_loss=True,
+    )
+    token = current_tool_context.set(context)
+    try:
+        projected = await _candidate_loop_effect_result(
+            result,
+            tool_call=call,
+            exception=exception,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert projected.effect_outcome is not None
+    assert projected.effect_outcome.retry_policy == "new_turn"
+    assert projected.effect_outcome.loop_action == "finalize_without_tools"
+    assert projected.terminates_turn is True
+    payload = json.loads(projected.content)
+    assert payload == {
+        "category": "DOCUMENT_PREVIEW_UNAVAILABLE",
+        "message_key": "document.previewUnavailable",
+        "next_action": "finalize_without_tools",
+        "outcome_code": "document_preview_unavailable",
+        "retry_allowed": False,
+        "retry_policy": "new_turn",
+        "status": "error",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unknown_browser_action_requires_fresh_inspection() -> None:
+    candidate = _CandidateController("verification_failed")
+    context = _candidate_context(candidate)
+    context._artifact_browser_verification_token = "receipt-private"  # type: ignore[attr-defined]
+    context._artifact_browser_binding_generation = 7  # type: ignore[attr-defined]
+    call = ToolCall(
+        tool_use_id="action-result-unknown",
+        tool_name="document_browser_act",
+        arguments={"action": "click", "anchor": "opaque-anchor"},
+    )
+    result = ToolResult(
+        tool_use_id=call.tool_use_id,
+        tool_name=call.tool_name,
+        content="unknown",
+        is_error=True,
+    )
+    exception = DocumentBridgeToolError(
+        "DOCUMENT_ACTION_RESULT_UNKNOWN: inspect again",
+        category="DOCUMENT_ACTION_RESULT_UNKNOWN",
+        retry_policy="same_turn",
+        next_action="reinspect",
+        terminal_binding_loss=False,
+    )
+    token = current_tool_context.set(context)
+    try:
+        projected = await _candidate_loop_effect_result(
+            result,
+            tool_call=call,
+            exception=exception,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert projected.effect_outcome is not None
+    assert projected.effect_outcome.retry_policy == "same_turn"
+    assert projected.effect_outcome.loop_action == "continue"
+    assert context._artifact_browser_verification_token is None  # type: ignore[attr-defined]
+    assert context._artifact_browser_binding_generation is None  # type: ignore[attr-defined]
+    payload = json.loads(projected.content)
+    assert payload["category"] == "DOCUMENT_ACTION_RESULT_UNKNOWN"
+    assert payload["next_action"] == "reinspect"
 
 
 @pytest.mark.asyncio

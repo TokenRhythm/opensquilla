@@ -2932,9 +2932,13 @@ class TestSessionsSend:
             append_called.set()
             return await original_append(*args, **kwargs)
 
-        def observed_register(session_key: str, task: asyncio.Task) -> None:
+        def observed_register(
+            session_key: str,
+            task: asyncio.Task,
+            **kwargs: Any,
+        ) -> None:
             assert admission_active is True
-            original_register(session_key, task)
+            original_register(session_key, task, **kwargs)
 
         monkeypatch.setattr(registry, "admission", observed_admission)
         monkeypatch.setattr(registry, "register", observed_register)

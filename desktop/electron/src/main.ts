@@ -594,6 +594,7 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
   getWindow: () => currentMainWindow(),
   resolveCandidatePreview: resolveCandidatePreviewFromGateway,
   releaseCandidatePreview: releaseCandidatePreviewFromGateway,
+  pinArtifactPreview: grant => artifactPreviewLeaseBroker.pinSurface(grant),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
@@ -614,6 +615,7 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
 })
 const desktopArtifactBridge = new DesktopArtifactBridge({
   getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
+  acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
 })
 const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
   desktopArtifactBridge,

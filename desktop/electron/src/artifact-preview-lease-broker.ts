@@ -64,7 +64,14 @@ export interface ArtifactPreviewSurfaceGrant {
   mode: ArtifactPreviewLeaseMode
 }
 
+export interface ArtifactPreviewSurfacePin {
+  currentGrant(): ArtifactPreviewSurfaceGrant
+  ensureCurrent(): Promise<ArtifactPreviewSurfaceGrant | null>
+  release(): Promise<void>
+}
+
 interface IssuedArtifactPreview {
+  leaseId: string
   artifactId: string
   gatewayOrigin: string
   launchUrl: string
@@ -73,6 +80,13 @@ interface IssuedArtifactPreview {
   authToken?: string
   mode: ArtifactPreviewLeaseMode
   expiresAtMs: number
+  bindingPins: number
+  revokePending: boolean
+  renewTimer: ReturnType<typeof setInterval> | null
+  renewInFlight: boolean
+  replacementAttempted: boolean
+  replacementInFlight: Promise<boolean> | null
+  retiredLeaseIds: Set<string>
 }
 
 interface ArtifactPreviewLeaseBrokerOptions {
@@ -88,6 +102,7 @@ const PREVIEW_HOST_PATTERN = /^p-[a-f0-9]{32}\.localhost$/i
 const MAX_RESPONSE_BYTES = 1024 * 1024
 const MAX_CREDENTIAL_BYTES = 16 * 1024
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+const PINNED_LEASE_RENEW_INTERVAL_MS = 15 * 60 * 1000
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -355,6 +370,7 @@ export class ArtifactPreviewLeaseBroker {
 
   clear(): void {
     this.generation += 1
+    for (const lease of this.issued.values()) this.stopPinnedRenewal(lease)
     this.issued.clear()
   }
 
@@ -368,8 +384,16 @@ export class ArtifactPreviewLeaseBroker {
   async revokeAll(): Promise<void> {
     this.generation += 1
     const issued = [...this.issued.entries()]
-    this.issued.clear()
+    for (const [leaseId, lease] of issued) {
+      if (lease.bindingPins > 0) {
+        lease.revokePending = true
+      } else {
+        this.stopPinnedRenewal(lease)
+        this.issued.delete(leaseId)
+      }
+    }
     await Promise.allSettled(issued.map(([leaseId, lease]) => {
+      if (lease.bindingPins > 0) return Promise.resolve()
       if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== lease.gatewayOrigin) {
         return Promise.resolve()
       }
@@ -449,6 +473,7 @@ export class ArtifactPreviewLeaseBroker {
         return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an expired preview lease.')
       }
       this.issued.set(parsed.payload.lease_id, {
+        leaseId: parsed.payload.lease_id,
         artifactId: request.artifactId,
         gatewayOrigin,
         launchUrl: parsed.payload.launch_url,
@@ -457,6 +482,13 @@ export class ArtifactPreviewLeaseBroker {
         authToken: request.authToken,
         mode: parsed.payload.effective_mode,
         expiresAtMs: parsed.expiresAtMs,
+        bindingPins: 0,
+        revokePending: false,
+        renewTimer: null,
+        renewInFlight: false,
+        replacementAttempted: false,
+        replacementInFlight: null,
+        retiredLeaseIds: new Set(),
       })
       return { ok: true, status: response.status, payload: parsed.payload }
     } catch {
@@ -492,7 +524,8 @@ export class ArtifactPreviewLeaseBroker {
     )
     if (!response.ok) {
       if (response.status === 404 || response.status === 410) {
-        this.issued.delete(request.leaseId)
+        this.stopPinnedRenewal(issued)
+        if (issued.bindingPins === 0) this.issued.delete(request.leaseId)
       }
       return response
     }
@@ -526,11 +559,17 @@ export class ArtifactPreviewLeaseBroker {
       )
     }
     const issued = this.currentIssuedLease(request.leaseId, request.scopeId)
+      ?? this.retiredIssuedLease(request.leaseId, request.scopeId)
     if (!issued) {
       return failure(404, 'BROKER_LEASE_NOT_FOUND', 'The Desktop preview lease is unavailable.')
     }
+    if (issued.bindingPins > 0) {
+      issued.revokePending = true
+      return { ok: true, status: 202, payload: undefined }
+    }
     // Revoke local authority before the network request. A failed Gateway call
     // must never leave a renderer-revoked launch URL eligible for a new surface.
+    this.stopPinnedRenewal(issued)
     this.issued.delete(request.leaseId)
     const response = await this.request(
       new URL(
@@ -546,6 +585,174 @@ export class ArtifactPreviewLeaseBroker {
       return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
     }
     return { ok: true, status: response.status, payload: undefined }
+  }
+
+  pinSurface(grant: ArtifactPreviewSurfaceGrant): ArtifactPreviewSurfacePin | null {
+    const lease = this.issuedLeaseForSurface(grant)
+    if (!lease) return null
+    const [, issued] = lease
+    issued.bindingPins += 1
+    this.startPinnedRenewal(issued)
+    let released = false
+    return {
+      currentGrant: () => this.surfaceGrant(issued),
+      ensureCurrent: async () => {
+        if (released || issued.bindingPins < 1) return null
+        if (issued.replacementInFlight) await issued.replacementInFlight
+        if (
+          this.issued.get(issued.leaseId) !== issued
+          || issued.expiresAtMs <= this.now()
+        ) {
+          if (!await this.replacePinnedLease(issued)) return null
+        }
+        return this.issued.get(issued.leaseId) === issued
+          && issued.expiresAtMs > this.now()
+          ? this.surfaceGrant(issued)
+          : null
+      },
+      release: async () => {
+        if (released) return
+        released = true
+        issued.bindingPins = Math.max(0, issued.bindingPins - 1)
+        if (issued.bindingPins === 0) this.stopPinnedRenewal(issued)
+        if (issued.bindingPins !== 0 || !issued.revokePending) return
+        this.issued.delete(issued.leaseId)
+        if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== issued.gatewayOrigin) return
+        await this.request(
+          new URL(
+            `/api/v1/artifact-preview-leases/${encodeURIComponent(issued.leaseId)}`,
+            issued.gatewayOrigin,
+          ),
+          'DELETE',
+          issued.scopeId,
+          issued.authToken,
+        )
+      },
+    }
+  }
+
+  private startPinnedRenewal(issued: IssuedArtifactPreview): void {
+    if (issued.renewTimer) return
+    issued.renewTimer = setInterval(() => {
+      if (
+        issued.bindingPins < 1
+        || issued.renewInFlight
+        || this.issued.get(issued.leaseId) !== issued
+      ) return
+      issued.renewInFlight = true
+      void this.renew({
+        version: 1,
+        leaseId: issued.leaseId,
+        scopeId: issued.scopeId,
+        ...(issued.authToken ? { authToken: issued.authToken } : {}),
+      }).then(async result => {
+        if (!result.ok && (result.status === 404 || result.status === 410)) {
+          await this.replacePinnedLease(issued)
+        }
+      }).finally(() => {
+        issued.renewInFlight = false
+      })
+    }, PINNED_LEASE_RENEW_INTERVAL_MS)
+    issued.renewTimer.unref?.()
+  }
+
+  private surfaceGrant(issued: IssuedArtifactPreview): ArtifactPreviewSurfaceGrant {
+    return {
+      launchUrl: issued.launchUrl,
+      expectedOrigin: issued.expectedOrigin,
+      scopeId: issued.scopeId,
+      mode: issued.mode,
+    }
+  }
+
+  private async replacePinnedLease(issued: IssuedArtifactPreview): Promise<boolean> {
+    if (issued.replacementInFlight) return await issued.replacementInFlight
+    if (issued.replacementAttempted || issued.bindingPins < 1) return false
+    issued.replacementAttempted = true
+    const replacement = this.replacePinnedLeaseNow(issued)
+    issued.replacementInFlight = replacement
+    try {
+      return await replacement
+    } finally {
+      issued.replacementInFlight = null
+    }
+  }
+
+  private async replacePinnedLeaseNow(issued: IssuedArtifactPreview): Promise<boolean> {
+    const gatewayOrigin = parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())
+    if (!gatewayOrigin || gatewayOrigin !== issued.gatewayOrigin) return false
+    const response = await this.requestJson(
+      new URL(
+        `/api/v1/artifacts/${encodeURIComponent(issued.artifactId)}/preview-leases`,
+        issued.gatewayOrigin,
+      ),
+      'POST',
+      issued.scopeId,
+      issued.authToken,
+      JSON.stringify({ version: 1, mode: issued.mode, client: 'desktop' }),
+    )
+    if (!response.ok || response.status !== 201) return false
+    let parsed: ReturnType<typeof parseLeasePayload>
+    try {
+      parsed = parseLeasePayload(response.payload, issued.mode)
+    } catch {
+      return false
+    }
+    const replacementId = parsed.payload.lease_id
+    const replacementCurrent = (
+      issued.bindingPins > 0
+      && parsed.expiresAtMs > this.now()
+      && parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) === issued.gatewayOrigin
+      && (!this.issued.has(replacementId) || this.issued.get(replacementId) === issued)
+    )
+    if (!replacementCurrent) {
+      await this.request(
+        new URL(
+          `/api/v1/artifact-preview-leases/${encodeURIComponent(replacementId)}`,
+          issued.gatewayOrigin,
+        ),
+        'DELETE',
+        issued.scopeId,
+        issued.authToken,
+      )
+      return false
+    }
+    const retiredLeaseId = issued.leaseId
+    if (this.issued.get(retiredLeaseId) === issued) this.issued.delete(retiredLeaseId)
+    issued.retiredLeaseIds.add(retiredLeaseId)
+    issued.leaseId = replacementId
+    issued.launchUrl = parsed.payload.launch_url
+    issued.expectedOrigin = parsed.payload.preview_origin
+    issued.mode = parsed.payload.effective_mode
+    issued.expiresAtMs = parsed.expiresAtMs
+    this.issued.set(replacementId, issued)
+    this.startPinnedRenewal(issued)
+    return true
+  }
+
+  private stopPinnedRenewal(issued: IssuedArtifactPreview): void {
+    if (!issued.renewTimer) return
+    clearInterval(issued.renewTimer)
+    issued.renewTimer = null
+  }
+
+  private issuedLeaseForSurface(
+    grant: ArtifactPreviewSurfaceGrant,
+  ): [string, IssuedArtifactPreview] | null {
+    const gatewayOrigin = parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())
+    if (!gatewayOrigin) return null
+    for (const entry of this.issued) {
+      const issued = entry[1]
+      if (
+        issued.gatewayOrigin === gatewayOrigin
+        && issued.launchUrl === grant.launchUrl
+        && issued.expectedOrigin === grant.expectedOrigin
+        && issued.scopeId === grant.scopeId
+        && issued.mode === grant.mode
+        && issued.expiresAtMs > this.now()
+      ) return entry
+    }
+    return null
   }
 
   authorizesSurface(grant: ArtifactPreviewSurfaceGrant): boolean {
@@ -565,6 +772,7 @@ export class ArtifactPreviewLeaseBroker {
         issued.expiresAtMs <= this.now()
         || issued.gatewayOrigin !== gatewayOrigin
       ) {
+        this.stopPinnedRenewal(issued)
         this.issued.delete(leaseId)
         continue
       }
@@ -591,10 +799,28 @@ export class ArtifactPreviewLeaseBroker {
       || issued.scopeId !== scopeId
       || issued.expiresAtMs <= this.now()
     ) {
+      this.stopPinnedRenewal(issued)
       this.issued.delete(leaseId)
       return null
     }
     return issued
+  }
+
+  private retiredIssuedLease(
+    leaseId: string,
+    scopeId: string,
+  ): IssuedArtifactPreview | null {
+    const gatewayOrigin = parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())
+    if (!gatewayOrigin) return null
+    for (const issued of new Set(this.issued.values())) {
+      if (
+        issued.gatewayOrigin === gatewayOrigin
+        && issued.scopeId === scopeId
+        && issued.retiredLeaseIds.has(leaseId)
+        && issued.bindingPins > 0
+      ) return issued
+    }
+    return null
   }
 
   private async requestJson(
