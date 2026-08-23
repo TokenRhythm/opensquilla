@@ -199,6 +199,7 @@ const outboundNetwork = []
 const rpcSendCounts = new Map()
 const rpcSessions = new Map()
 let desktopLogBaseline
+let desktopLogRuntimeSummary
 let desktopLogSummary
 
 async function browserRpcSnapshot(page) {
@@ -584,6 +585,22 @@ try {
     iterations,
     'each new-task iteration must materialize one distinct session',
   )
+  desktopLogRuntimeSummary = await readDesktopLogSummary(userDataDir)
+  assert.equal(
+    desktopLogRuntimeSummary.forbiddenErrorCount,
+    0,
+    'desktop.log contains a forbidden renderer failure during the measured runtime',
+  )
+  assert.equal(
+    desktopLogRuntimeSummary.eventCounts.renderer_console || 0,
+    desktopLogBaseline?.eventCounts.renderer_console || 0,
+    'desktop.log contains renderer console errors after renderer readiness',
+  )
+  assert.equal(
+    desktopLogRuntimeSummary.eventCounts.renderer_unresponsive || 0,
+    0,
+    'renderer became unresponsive during the measured runtime',
+  )
 } catch (error) {
   runError = error
 } finally {
@@ -605,6 +622,7 @@ if (runError) {
     },
     externalRendererRequests: outboundNetwork.length,
     desktopLogBaseline,
+    desktopLogRuntimeSummary,
     desktopLog: desktopLogSummary,
   }, null, 2))
   throw runError
@@ -612,11 +630,6 @@ if (runError) {
 
 try {
   assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
-  assert.equal(
-    desktopLogSummary.eventCounts.renderer_console || 0,
-    desktopLogBaseline?.eventCounts.renderer_console || 0,
-    'desktop.log contains renderer console errors after renderer readiness',
-  )
   assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
   assert.equal(
     provider?.counts().chatRequestCount,
@@ -636,6 +649,7 @@ try {
     },
     externalRendererRequests: outboundNetwork.length,
     desktopLogBaseline,
+    desktopLogRuntimeSummary,
     desktopLog: desktopLogSummary,
   }, null, 2))
   throw error
@@ -651,5 +665,6 @@ console.log(JSON.stringify({
   renderer: { pageErrors: pageErrors.length, consoleErrors: consoleErrors.length },
   externalRendererRequests: outboundNetwork.length,
   desktopLogBaseline,
+  desktopLogRuntimeSummary,
   desktopLog: desktopLogSummary,
 }, null, 2))
