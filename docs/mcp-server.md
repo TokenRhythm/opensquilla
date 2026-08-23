@@ -77,3 +77,33 @@ Read next:
 ---
 
 [Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+
+
+## Build Remote Agent (phone pairing)
+
+OpenSquilla's MCP bridge exposes this agent to MCP clients. A phone can spectate the same desktop session with [Build Remote Agent](https://grokbuildremote.com/) through the free MIT `gbr-agent`. Protocol `gbr/1`. Phone is spectator + veto, not orchestrator.
+
+Independent product by Linespotting AB. Not affiliated with xAI or SpaceX.
+
+This is **not** a second OpenSquilla gateway. Pair on the machine that already runs `opensquilla`:
+
+```bash
+curl -fsSL https://grokbuildremote.com/install.sh | bash
+gbr-agent version          # v0.6.0+
+gbr-agent pair && gbr-agent run
+git clone https://github.com/LinespottingOrg/GrokBuildRemote-Agents.git
+cd GrokBuildRemote-Agents/mcp/gbr-mcp && npm install
+node bin/gbr-mcp.js --diagnose
+```
+
+Attach only:
+
+- Bot API `http://127.0.0.1:8788`
+- MCP stdio `gbr-mcp` (configure your MCP client to spawn `node …/gbr-mcp/bin/gbr-mcp.js`)
+
+```sh
+curl -sS http://127.0.0.1:8788/health
+curl -sS http://127.0.0.1:8788/v1/sessions
+```
+
+Do not put mailbox keys, provider keys, or channel secrets in MCP client config. Phone **Settings → Bot API** is the only place the relay key is copied.
