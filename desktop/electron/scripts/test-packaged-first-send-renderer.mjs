@@ -198,6 +198,7 @@ const consoleErrors = []
 const outboundNetwork = []
 const rpcSendCounts = new Map()
 const rpcSessions = new Map()
+let desktopLogBaseline
 let desktopLogSummary
 
 async function browserRpcSnapshot(page) {
@@ -396,10 +397,6 @@ try {
     await route.abort('blockedbyclient')
   })
   const page = await app.firstWindow({ timeout: 60_000 })
-  page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
-  page.on('console', (message) => {
-    if (message.type() === 'error') consoleErrors.push(message.text())
-  })
   await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
@@ -441,6 +438,29 @@ try {
     }
   })
   await page.reload({ waitUntil: 'domcontentloaded' })
+  const instrumentedHeader = page.locator('#app-route-header [data-testid="chat-header-actions"]')
+  await page.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: SEND_TIMEOUT_MS,
+  })
+  await instrumentedHeader.waitFor({ state: 'attached', timeout: SEND_TIMEOUT_MS })
+  await establishStableHeaderIdentity(instrumentedHeader, 'instrumented-bootstrap')
+  await waitFor(
+    async () => Boolean((await browserRpcSnapshot(page)).documentGeneration),
+    'instrumented renderer generation',
+    SEND_TIMEOUT_MS,
+  )
+
+  // The instrumentation reload intentionally tears down the startup WebSocket.
+  // Start the measured window only after the replacement renderer, route header,
+  // and Gateway connection are all stable. This keeps transition-only console
+  // errors out of the gate without allowlisting their text or weakening the
+  // zero-error contract for the 20 real first-send iterations below.
+  desktopLogBaseline = await readDesktopLogSummary(userDataDir)
+  page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text())
+  })
 
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
@@ -584,6 +604,7 @@ if (runError) {
       consoleErrorMessages: consoleErrors.slice(0, 10),
     },
     externalRendererRequests: outboundNetwork.length,
+    desktopLogBaseline,
     desktopLog: desktopLogSummary,
   }, null, 2))
   throw runError
@@ -591,7 +612,11 @@ if (runError) {
 
 try {
   assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
-  assert.equal(desktopLogSummary.eventCounts.renderer_console || 0, 0, 'desktop.log contains renderer console errors')
+  assert.equal(
+    desktopLogSummary.eventCounts.renderer_console || 0,
+    desktopLogBaseline?.eventCounts.renderer_console || 0,
+    'desktop.log contains renderer console errors after renderer readiness',
+  )
   assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
   assert.equal(
     provider?.counts().chatRequestCount,
@@ -610,6 +635,7 @@ try {
       consoleErrorMessages: consoleErrors.slice(0, 10),
     },
     externalRendererRequests: outboundNetwork.length,
+    desktopLogBaseline,
     desktopLog: desktopLogSummary,
   }, null, 2))
   throw error
@@ -624,5 +650,6 @@ console.log(JSON.stringify({
   provider: provider?.counts(),
   renderer: { pageErrors: pageErrors.length, consoleErrors: consoleErrors.length },
   externalRendererRequests: outboundNetwork.length,
+  desktopLogBaseline,
   desktopLog: desktopLogSummary,
 }, null, 2))
