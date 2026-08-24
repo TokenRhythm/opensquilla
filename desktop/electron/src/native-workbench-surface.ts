@@ -129,6 +129,7 @@ interface NativeWorkbenchSurfaceRecord {
   annotationFallbackActive: boolean
   annotationFocusTimer: NodeJS.Timeout | null
   annotationPickerActive: boolean
+  annotationPickerEpoch: number
   /** True only after the current v4 preview navigation reaches did-finish-load. */
   browserDocumentReady: boolean
   /** Set by CDP Runtime.exceptionThrown until the next successful navigation. */
@@ -1009,7 +1010,70 @@ export interface NativeWorkbenchSurfaceResult {
   message?: string
 }
 
+export interface NativeWorkbenchAnnotationLifecycleDiagnostic {
+  phase: 'close-start' | 'arm-start' | 'armed' | 'cancelled' | 'failed' | 'selection-emitted'
+  outcome: 'started' | 'succeeded' | 'cancelled' | 'failed'
+  reason: NativeWorkbenchAnnotationLifecycleReason
+  elapsedMs: number
+  pickerEpoch: number
+  generation: number
+  webContentsId: number
+  current: boolean
+  visible: boolean
+  cdpReady: boolean
+}
+
+type NativeWorkbenchAnnotationLifecycleReason =
+  | 'requested'
+  | 'completed'
+  | 'superseded'
+  | 'reset-failed'
+  | 'activate-failed'
+  | 'preview-hide-failed'
+  | 'picker-cancelled'
+  | 'candidate-preview-bound'
+  | 'candidate-preview-restored'
+  | 'selection-stale'
+  | 'debugger-detached'
+  | 'surface-reloaded'
+  | 'surface-navigation'
+  | 'surface-redirect'
+  | 'surface-hidden'
+  | 'surface-closed'
+  | 'surface-failed'
+  | 'lifecycle-cancelled'
+
+const NATIVE_WORKBENCH_ANNOTATION_LIFECYCLE_REASONS = new Set<string>([
+  'requested',
+  'completed',
+  'superseded',
+  'reset-failed',
+  'activate-failed',
+  'preview-hide-failed',
+  'picker-cancelled',
+  'candidate-preview-bound',
+  'candidate-preview-restored',
+  'selection-stale',
+  'debugger-detached',
+  'surface-reloaded',
+  'surface-navigation',
+  'surface-redirect',
+  'surface-hidden',
+  'surface-closed',
+  'surface-failed',
+  'lifecycle-cancelled',
+])
+
+function nativeWorkbenchAnnotationLifecycleReason(
+  reason: string,
+): NativeWorkbenchAnnotationLifecycleReason {
+  return NATIVE_WORKBENCH_ANNOTATION_LIFECYCLE_REASONS.has(reason)
+    ? reason as NativeWorkbenchAnnotationLifecycleReason
+    : 'lifecycle-cancelled'
+}
+
 export interface NativeWorkbenchSurfaceManagerOptions {
+  annotationAudit?(entry: NativeWorkbenchAnnotationLifecycleDiagnostic): void
   authenticationTimeoutMs?: number
   getPrivilegedGatewayUrl?(): string | null
   getWindow(): BrowserWindow | null
@@ -1204,7 +1268,14 @@ export class NativeWorkbenchSurfaceManager {
     activePreviewArtifactId: string | null = null,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(request.surfaceId)
-    if (pending) this.cancelPendingAuthentication(pending)
+    if (pending) {
+      // Fence an in-flight atomic picker arm before waiting behind any queued
+      // surface work. The eventual destroy still performs authoritative CDP
+      // cleanup; this synchronous epoch bump only prevents a late arm result
+      // from becoming current during replacement.
+      pending.annotationPickerEpoch += 1
+      this.cancelPendingAuthentication(pending)
+    }
     return await this.queueSurfaceOperation(
       request.surfaceId,
       () => this.createSurfaceNow(request, activePreviewArtifactId),
@@ -1326,6 +1397,7 @@ export class NativeWorkbenchSurfaceManager {
       annotationFallbackActive: false,
       annotationFocusTimer: null,
       annotationPickerActive: false,
+      annotationPickerEpoch: 0,
       browserDocumentReady: false,
       browserRuntimeException: false,
       offlineRealmGuardInstalled: false,
@@ -1445,6 +1517,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        atomicCloseRearm: true,
         reason: 'No active protocol-v4 HTML artifact preview is available.',
       }
     }
@@ -1455,6 +1528,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        atomicCloseRearm: true,
         reason: 'The isolated DOM inspector is unavailable.',
       }
     }
@@ -1473,6 +1547,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: true,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        atomicCloseRearm: true,
         reason: 'The trusted annotation editor is unavailable.',
       }
     }
@@ -1482,6 +1557,143 @@ export class NativeWorkbenchSurfaceManager {
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1,
+      atomicCloseRearm: true,
+    }
+  }
+
+  private annotationPickerTransitionIsCurrent(
+    record: NativeWorkbenchSurfaceRecord,
+    pickerEpoch: number,
+    documentGeneration: number,
+    binding: NativeWorkbenchAnnotationOverlayBinding | null,
+  ): boolean {
+    if (
+      record.annotationPickerEpoch !== pickerEpoch
+      || record.annotationDocumentGeneration !== documentGeneration
+      || this.surfaces.get(record.id) !== record
+      || this.activeSurfaceId !== record.id
+      || record.kind !== 'artifact-preview'
+      || record.activePreviewArtifactId === null
+      || record.disposed
+      || record.crashed
+      || !record.visibleRequested
+      || !record.rect
+      || record.owner.isDestroyed()
+      || !this.ownerCanShowSurfaces(record.owner)
+      || record.view.webContents.isDestroyed()
+      || !record.cdpReady
+      || !record.view.webContents.debugger.isAttached()
+    ) return false
+    return binding === null || this.activeAnnotationOverlayBinding(record) === binding
+  }
+
+  private auditAnnotationPicker(
+    record: NativeWorkbenchSurfaceRecord,
+    phase: NativeWorkbenchAnnotationLifecycleDiagnostic['phase'],
+    outcome: NativeWorkbenchAnnotationLifecycleDiagnostic['outcome'],
+    reason: string,
+    startedAt = Date.now(),
+  ): void {
+    try {
+      this.options.annotationAudit?.({
+        phase,
+        outcome,
+        reason: nativeWorkbenchAnnotationLifecycleReason(reason),
+        elapsedMs: Math.max(0, Date.now() - startedAt),
+        pickerEpoch: record.annotationPickerEpoch,
+        generation: record.annotationDocumentGeneration,
+        webContentsId: record.view.webContents.id,
+        current: this.surfaces.get(record.id) === record && !record.disposed && !record.crashed,
+        visible: record.view.getVisible(),
+        cdpReady: record.cdpReady && record.view.webContents.debugger.isAttached(),
+      })
+    } catch {
+      // Diagnostics must never change picker lifecycle semantics.
+    }
+  }
+
+  private async armAnnotationPicker(
+    record: NativeWorkbenchSurfaceRecord,
+    pickerEpoch: number,
+    documentGeneration: number,
+    binding: NativeWorkbenchAnnotationOverlayBinding | null,
+  ): Promise<NativeWorkbenchSurfaceResult> {
+    const startedAt = Date.now()
+    this.auditAnnotationPicker(record, 'arm-start', 'started', 'requested', startedAt)
+    record.annotationPickerActive = false
+    const resetFailure = await this.clearAnnotationInspectState(record, true)
+    if (!this.annotationPickerTransitionIsCurrent(
+      record,
+      pickerEpoch,
+      documentGeneration,
+      binding,
+    )) {
+      this.auditAnnotationPicker(record, 'cancelled', 'cancelled', 'superseded', startedAt)
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: 'The annotation picker was cancelled before it became active.',
+      }
+    }
+    if (resetFailure) {
+      this.auditAnnotationPicker(record, 'failed', 'failed', 'reset-failed', startedAt)
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: resetFailure,
+      }
+    }
+    record.annotationPickerActive = true
+    try {
+      await this.cdpCommand(record, 'Overlay.setInspectMode', {
+        mode: 'searchForNode',
+        highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
+      })
+      const transitionCurrent = this.annotationPickerTransitionIsCurrent(
+        record,
+        pickerEpoch,
+        documentGeneration,
+        binding,
+      )
+      if (
+        !record.annotationPickerActive
+        || !transitionCurrent
+      ) {
+        // A postcondition failure on this exact epoch means Chromium may have
+        // accepted searchForNode while the manager cannot advertise it as
+        // armed. Roll that inspect mode back. A superseded epoch must not run
+        // this cleanup because it could disable the replacement picker.
+        if (transitionCurrent && record.annotationPickerEpoch === pickerEpoch) {
+          await this.clearAnnotationInspectState(record, true)
+        }
+        this.auditAnnotationPicker(record, 'cancelled', 'cancelled', 'superseded', startedAt)
+        return {
+          ok: false,
+          code: 'ANNOTATION_UNAVAILABLE',
+          retryable: true,
+          message: 'The annotation picker was cancelled before it became active.',
+        }
+      }
+      this.auditAnnotationPicker(record, 'armed', 'succeeded', 'completed', startedAt)
+      return { ok: true }
+    } catch (error) {
+      if (record.annotationPickerEpoch === pickerEpoch) {
+        record.annotationPickerActive = false
+      }
+      const cleanupFailure = record.annotationPickerEpoch === pickerEpoch
+        ? await this.clearAnnotationInspectState(record, true)
+        : null
+      this.auditAnnotationPicker(record, 'failed', 'failed', 'activate-failed', startedAt)
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: cleanupFailure
+          ? `${errorMessage(error)} ${cleanupFailure}`
+          : errorMessage(error),
+      }
     }
   }
 
@@ -1546,38 +1758,13 @@ export class NativeWorkbenchSurfaceManager {
     // successfully while ordinary page clicks still pass through to the
     // document. Make every enable an idempotent clean-arm transaction so the
     // UI never advertises an active picker that Chromium did not install.
-    record.annotationPickerActive = false
-    const resetFailure = await this.clearAnnotationInspectState(record, true)
-    if (resetFailure) {
-      return {
-        ok: false,
-        code: 'ANNOTATION_UNAVAILABLE',
-        retryable: true,
-        message: resetFailure,
-      }
-    }
-    record.annotationPickerActive = true
-    try {
-      await this.cdpCommand(record, 'Overlay.setInspectMode', {
-        mode: 'searchForNode',
-        highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
-      })
-      if (!this.isActiveAnnotationRecord(record) || !record.annotationPickerActive) {
-        throw new Error('The annotation picker was cancelled before it became active.')
-      }
-      return { ok: true }
-    } catch (error) {
-      record.annotationPickerActive = false
-      const cleanupFailure = await this.clearAnnotationInspectState(record, true)
-      return {
-        ok: false,
-        code: 'ANNOTATION_UNAVAILABLE',
-        retryable: true,
-        message: cleanupFailure
-          ? `${errorMessage(error)} ${cleanupFailure}`
-          : errorMessage(error),
-      }
-    }
+    const pickerEpoch = ++record.annotationPickerEpoch
+    return await this.armAnnotationPicker(
+      record,
+      pickerEpoch,
+      record.annotationDocumentGeneration,
+      null,
+    )
   }
 
   async showArtifactAnnotationOverlay(
@@ -1678,9 +1865,9 @@ export class NativeWorkbenchSurfaceManager {
     }
   }
 
-  closeArtifactAnnotationOverlay(
+  async closeArtifactAnnotationOverlay(
     request: NativeWorkbenchAnnotationOverlayCloseRequest,
-  ): NativeWorkbenchSurfaceResult {
+  ): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(request.surfaceId)
     if (!record || record.disposed) {
       return {
@@ -1703,6 +1890,85 @@ export class NativeWorkbenchSurfaceManager {
         retryable: true,
         message: 'The trusted annotation editor changed.',
       }
+    }
+    if (request.rearm === true) {
+      const candidate = record.annotationCandidate
+      if (
+        !overlay
+        || !binding
+        || !candidate
+        || binding.record !== record
+        || candidate.documentGeneration !== record.annotationDocumentGeneration
+        || !record.cdpReady
+        || !record.view.webContents.debugger.isAttached()
+        || this.activeSurfaceId !== record.id
+        || !record.visibleRequested
+        || !record.rect
+      ) {
+        return {
+          ok: false,
+          code: 'ANNOTATION_UNAVAILABLE',
+          retryable: true,
+          message: 'The trusted annotation editor cannot rearm the picker.',
+        }
+      }
+      const startedAt = Date.now()
+      const documentGeneration = record.annotationDocumentGeneration
+      const pickerEpoch = ++record.annotationPickerEpoch
+      this.auditAnnotationPicker(record, 'close-start', 'started', 'requested', startedAt)
+      this.stopAnnotationGeometryWatcher(candidate)
+      try {
+        record.view.webContents.setAudioMuted(true)
+        record.view.setVisible(false)
+        overlay.view.setVisible(this.ownerCanShowSurfaces(record.owner))
+      } catch {
+        this.startAnnotationGeometryWatcher(record, candidate)
+        this.auditAnnotationPicker(record, 'failed', 'failed', 'preview-hide-failed', startedAt)
+        return {
+          ok: false,
+          code: 'ANNOTATION_UNAVAILABLE',
+          retryable: true,
+          message: 'The preview could not enter the annotation handoff state.',
+        }
+      }
+      const armed = await this.armAnnotationPicker(
+        record,
+        pickerEpoch,
+        documentGeneration,
+        binding,
+      )
+      if (!armed.ok) {
+        if (
+          this.surfaces.get(record.id) === record
+          && !record.disposed
+          && !record.crashed
+          && this.activeAnnotationOverlayBinding(record) === binding
+          && record.annotationCandidate === candidate
+        ) {
+          this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
+          this.startAnnotationGeometryWatcher(record, candidate)
+        }
+        return armed
+      }
+      if (!this.annotationPickerTransitionIsCurrent(
+        record,
+        pickerEpoch,
+        documentGeneration,
+        binding,
+      )) {
+        this.auditAnnotationPicker(record, 'cancelled', 'cancelled', 'superseded', startedAt)
+        return {
+          ok: false,
+          code: 'ANNOTATION_UNAVAILABLE',
+          retryable: true,
+          message: 'The annotation picker handoff was superseded.',
+        }
+      }
+      this.closeAnnotationOverlayBinding(overlay, false)
+      record.annotationFallbackActive = false
+      this.clearAnnotationCandidate(record)
+      this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
+      return { ok: true }
     }
     if (overlay) this.closeAnnotationOverlayBinding(overlay, false)
     record.annotationFallbackActive = false
@@ -3399,6 +3665,7 @@ export class NativeWorkbenchSurfaceManager {
     backendNodeId: number,
   ): Promise<void> {
     if (!record.annotationPickerActive || !this.isActiveAnnotationRecord(record)) return
+    record.annotationPickerEpoch += 1
     record.annotationPickerActive = false
     const generation = record.annotationDocumentGeneration
     // Chromium exits inspect mode as part of dispatching inspectNodeRequested.
@@ -3482,6 +3749,12 @@ export class NativeWorkbenchSurfaceManager {
         geometryRefreshPending: false,
       }
       retainedObjectGroup = true
+      this.auditAnnotationPicker(
+        record,
+        'selection-emitted',
+        'succeeded',
+        'completed',
+      )
       this.emit(record, 'annotation-selected', { selection })
     } catch (error) {
       this.clearAnnotationCandidate(record)
@@ -3505,6 +3778,8 @@ export class NativeWorkbenchSurfaceManager {
     // Fence delayed focus cleanup synchronously. Navigation and destruction
     // intentionally do not wait for this async routine before tearing down the
     // child renderer, so a prior timer must not outlive the surface generation.
+    const startedAt = Date.now()
+    record.annotationPickerEpoch += 1
     const inspectModeMayBeActive = record.annotationPickerActive
     if (record.annotationFocusTimer) clearTimeout(record.annotationFocusTimer)
     record.annotationFocusTimer = null
@@ -3533,6 +3808,13 @@ export class NativeWorkbenchSurfaceManager {
       && !record.view.webContents.isDestroyed()
       && record.view.webContents.debugger.isAttached()
     ) record.annotationPickerActive = true
+    this.auditAnnotationPicker(
+      record,
+      cleanupFailure ? 'failed' : 'cancelled',
+      cleanupFailure ? 'failed' : 'cancelled',
+      cleanupFailure ? 'reset-failed' : reason,
+      startedAt,
+    )
     return cleanupFailure
   }
 
@@ -3998,7 +4280,13 @@ export class NativeWorkbenchSurfaceManager {
 
   async destroySurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(surfaceId)
-    if (pending) this.cancelPendingAuthentication(pending)
+    if (pending) {
+      // destroyAll and ordinary close share this queue-external fence so a
+      // blocked searchForNode cannot complete successfully while disposal is
+      // waiting for earlier work on the same surface.
+      pending.annotationPickerEpoch += 1
+      this.cancelPendingAuthentication(pending)
+    }
     return await this.queueSurfaceOperation(
       surfaceId,
       () => this.destroySurfaceNow(surfaceId),

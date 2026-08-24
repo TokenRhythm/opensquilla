@@ -174,6 +174,7 @@ describe('native Workbench platform bridge', () => {
         picker: true,
         trustedOverlay: true,
         overlayCopyVersion: 1,
+        atomicCloseRearm: true,
       }),
       setArtifactAnnotationMode: setMode,
       showArtifactAnnotationOverlay: showOverlay,
@@ -188,6 +189,7 @@ describe('native Workbench platform bridge', () => {
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1,
+      atomicCloseRearm: true,
     })
     await expect(native.screenshot?.({ version: 3 })).resolves.toEqual({
       ok: true,

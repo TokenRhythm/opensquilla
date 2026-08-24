@@ -673,6 +673,34 @@ assert.deepEqual(
   { version: 3, surfaceId: 'artifact:v3', annotationId: 'annotation_42' },
 )
 assert.deepEqual(
+  parseNativeWorkbenchAnnotationOverlayCloseRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    annotationId: 'annotation_42',
+    rearm: true,
+  }),
+  { version: 3, surfaceId: 'artifact:v3', annotationId: 'annotation_42', rearm: true },
+)
+assert.throws(
+  () => parseNativeWorkbenchAnnotationOverlayCloseRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    annotationId: 'annotation_42',
+    rearm: false,
+  }),
+  /overlay close request is invalid/,
+)
+assert.throws(
+  () => parseNativeWorkbenchAnnotationOverlayCloseRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    annotationId: 'annotation_42',
+    rearm: true,
+    unexpected: true,
+  }),
+  /overlay close request is invalid/,
+)
+assert.deepEqual(
   parseNativeWorkbenchAnnotationOverlayMessage({
     version: 1,
     type: 'draft-changed',

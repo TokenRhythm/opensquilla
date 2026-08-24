@@ -26,6 +26,7 @@ export interface NativeWorkbenchAnnotationCapabilities {
   picker: boolean
   trustedOverlay: boolean
   overlayCopyVersion?: 1
+  atomicCloseRearm?: true
   reason?: string
 }
 
@@ -60,6 +61,7 @@ export interface NativeWorkbenchAnnotationOverlayCloseRequest {
   version: NativeWorkbenchAnnotationProtocolVersion
   surfaceId: string
   annotationId?: string
+  rearm?: true
 }
 
 export interface NativeWorkbenchAnnotationRect {
@@ -246,9 +248,12 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
 ): NativeWorkbenchAnnotationOverlayCloseRequest {
   const request = parseExactRequest(
     value,
-    ['version', 'surfaceId', 'annotationId'],
+    ['version', 'surfaceId', 'annotationId', 'rearm'],
     'overlay close',
   )
+  if (request.rearm !== undefined && request.rearm !== true) {
+    throw new Error('The native Workbench annotation overlay close request is invalid.')
+  }
   return {
     version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
@@ -260,6 +265,7 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
             'annotation',
           ),
         }),
+    ...(request.rearm === true ? { rearm: true as const } : {}),
   }
 }
 

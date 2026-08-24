@@ -2572,7 +2572,10 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'" in native
     assert "const annotationGeometryDeltas = fixture.stressMode" in native
     assert "? [96, -24, 24, -32, 32]" in native
-    assert "const annotationRearmCycleCount = fixture.stressMode ? 3 : 1" in native
+    assert "const annotationRearmCycleCount = fixture.stressMode ? 50 : 8" in native
+    assert "rearm: true" in native
+    assert "annotationAtomicHandoffPendingState" in native
+    assert "annotationAtomicFailureRetained" in native
     assert "restoreTrustedAnnotationInputFocus" in native
     assert "state.ownerFocused" in native
     assert "&& state.nativeFocused" in native

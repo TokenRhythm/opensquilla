@@ -238,6 +238,7 @@ export interface NativeArtifactAnnotationCapabilities {
   picker?: boolean
   trustedOverlay?: boolean
   overlayCopyVersion?: 1
+  atomicCloseRearm?: true
   reason?: string
 }
 
@@ -270,6 +271,7 @@ export interface NativeArtifactAnnotationOverlayCloseRequest {
   version: 3 | 4
   surfaceId: string
   annotationId?: string
+  rearm?: true
 }
 
 export interface NativeArtifactScreenshotRequest {

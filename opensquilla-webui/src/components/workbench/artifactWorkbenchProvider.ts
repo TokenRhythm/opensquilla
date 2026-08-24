@@ -328,6 +328,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private annotationMode = false
   private annotationModeRestorePending = false
   private annotationOverlayCopyVersion: 0 | 1 = 0
+  private annotationAtomicCloseRearm = false
   private annotationPickerArmed = false
   private annotationModeOperation = 0
   private annotationSelectionAttempt = 0
@@ -1487,7 +1488,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     generation: number
     surfaceId: string
     annotationId: string
-  }): Promise<{ ok: boolean; code?: string; retryable?: boolean }> {
+  }, rearm = false): Promise<{ ok: boolean; code?: string; retryable?: boolean }> {
     const close = this.context.nativeWorkbenchApi?.closeArtifactAnnotationOverlay
     if (!close) return { ok: false }
     try {
@@ -1495,12 +1496,13 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         version: this.nativeArtifactProtocolVersion(),
         surfaceId: fence.surfaceId,
         annotationId: fence.annotationId,
+        ...(rearm && this.annotationAtomicCloseRearm ? { rearm: true as const } : {}),
       })
       if (
         !result.ok
         && result.retryable === true
         && (result.code === 'PREVIEW_CAPABILITY_EXPIRED'
-          || result.code === 'ANNOTATION_UNAVAILABLE')
+          || (!rearm && result.code === 'ANNOTATION_UNAVAILABLE'))
       ) {
         // The scoped surface is already gone, so its trusted overlay is gone
         // too. Treat close as acknowledged; after local cleanup the normal
@@ -1529,6 +1531,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (!fence || !body.trim() || this.annotationOverlayOperation) return
     const operation = Symbol('annotation-submit')
     this.annotationOverlayOperation = operation
+    const atomicRearm = this.annotationAtomicCloseRearm && this.annotationMode
+    const modeOperation = this.annotationModeOperation
     try {
       // A prior cancel may already have durably discarded this draft while a
       // native close failed. It cannot be resurrected; only retry that close.
@@ -1539,14 +1543,31 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         if (!await this.flushAnnotationBody(annotationId, body)) return
         if (!this.annotationOverlayFenceCurrent(fence)) return
       }
-      const closed = await this.closeAnnotationOverlay(fence)
+      const closed = await this.closeAnnotationOverlay(fence, atomicRearm)
       if (!this.annotationOverlayFenceCurrent(fence)) return
       if (!closed.ok) {
+        if (atomicRearm && (
+          modeOperation !== this.annotationModeOperation
+          || !this.annotationMode
+        )) return
         this.showAnnotationCloseFailure()
         return
       }
       this.options.promptAnnotations?.completeOverlayEdit?.(annotationId)
       if (!this.clearAnnotationOverlayState(fence)) return
+      if (atomicRearm) {
+        if (
+          modeOperation === this.annotationModeOperation
+          && this.annotationMode
+        ) {
+          this.annotationPickerArmed = true
+          this.context.updateRenderState({
+            annotationMode: true,
+            annotationModeStopping: false,
+          })
+        }
+        return
+      }
       await this.syncSurfaceRect()
       // Adding one draft only completes that element's editor. Keep the
       // explicit annotation session active so the user can select more page
@@ -1586,6 +1607,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     const operation = Symbol('annotation-cancel')
     this.annotationOverlayOperation = operation
+    const atomicRearm = this.annotationAtomicCloseRearm && this.annotationMode
+    const modeOperation = this.annotationModeOperation
     try {
       if (this.annotationUpdateTimer) {
         clearTimeout(this.annotationUpdateTimer)
@@ -1611,13 +1634,30 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       // Explicit close is the native acknowledgement. Until it succeeds the
       // trusted editor remains visible and owns the opaque selection.
-      const closed = await this.closeAnnotationOverlay(fence)
+      const closed = await this.closeAnnotationOverlay(fence, atomicRearm)
       if (!this.annotationOverlayFenceCurrent(fence)) return
       if (!closed.ok) {
+        if (atomicRearm && (
+          modeOperation !== this.annotationModeOperation
+          || !this.annotationMode
+        )) return
         this.showAnnotationCloseFailure()
         return
       }
       if (!this.clearAnnotationOverlayState(fence)) return
+      if (atomicRearm) {
+        if (
+          modeOperation === this.annotationModeOperation
+          && this.annotationMode
+        ) {
+          this.annotationPickerArmed = true
+          this.context.updateRenderState({
+            annotationMode: true,
+            annotationModeStopping: false,
+          })
+        }
+        return
+      }
       await this.syncSurfaceRect()
       await this.rearmAnnotationPickerIfNeeded()
     } finally {
@@ -1871,6 +1911,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       || !nativeApi.closeArtifactAnnotationOverlay
     ) {
       this.annotationOverlayCopyVersion = 0
+      this.annotationAtomicCloseRearm = false
       const preserveRestoreIntent = this.annotationModeRestorePending
       this.annotationModeOperation += 1
       this.annotationSelectionAttempt += 1
@@ -1889,6 +1930,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       const capability = await nativeApi.getArtifactAnnotationCapabilities()
       if (expectedGeneration !== this.generation || !this.createdSurface) return false
       this.annotationOverlayCopyVersion = capability.overlayCopyVersion === 1 ? 1 : 0
+      this.annotationAtomicCloseRearm = capability.atomicCloseRearm === true
       const available = (capability.version === 3 || capability.version === 4)
         && capability.available
         && capability.picker !== false
@@ -1930,6 +1972,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     } catch {
       if (expectedGeneration !== this.generation || !this.createdSurface) return false
       this.annotationOverlayCopyVersion = 0
+      this.annotationAtomicCloseRearm = false
       const preserveRestoreIntent = this.annotationModeRestorePending
       this.annotationModeOperation += 1
       this.annotationSelectionAttempt += 1

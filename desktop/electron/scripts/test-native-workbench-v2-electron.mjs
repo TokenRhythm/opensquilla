@@ -570,6 +570,7 @@ try {
       const Manager = globalThis.__opensquillaNativeWorkbenchSurfaceManager
       if (!Manager) throw new Error('The native Workbench manager fixture was not installed.')
       const events = []
+      const annotationLifecycleDiagnostics = []
       const owner = new BrowserWindow({
         show: true,
         width: 900,
@@ -587,6 +588,7 @@ try {
       const previewPinReleases = []
       let manager
       manager = new Manager({
+        annotationAudit: entry => annotationLifecycleDiagnostics.push(entry),
         getPrivilegedGatewayUrl: () => fixture.privilegedGatewayUrl,
         getWindow: () => owner,
         emit: event => {
@@ -1478,7 +1480,7 @@ try {
         && annotationOverlay.binding?.annotationId === 'annotation_electron_fixture'
         && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate?.selection.selectionId
           === selected.selectionId
-      const annotationWrongAcknowledgement = manager.closeArtifactAnnotationOverlay({
+      const annotationWrongAcknowledgement = await manager.closeArtifactAnnotationOverlay({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_wrong_fixture',
@@ -1492,21 +1494,44 @@ try {
         const textarea = document.getElementById('annotation-body')
         textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
       })()`)
-      const annotationOverlayAcknowledgement = await closeAnnotationOverlayImmediately({
+      const atomicHandoffCdpCommand = manager.cdpCommand.bind(manager)
+      let releaseAtomicHandoff = null
+      manager.cdpCommand = async (record, method, params) => {
+        if (
+          releaseAtomicHandoff === null
+          && method === 'Overlay.setInspectMode'
+          && params?.mode === 'searchForNode'
+        ) {
+          await new Promise(resolve => {
+            releaseAtomicHandoff = resolve
+          })
+        }
+        return await atomicHandoffCdpCommand(record, method, params)
+      }
+      const annotationOverlayAcknowledgementPromise = closeAnnotationOverlayImmediately({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_electron_fixture',
+        rearm: true,
       })
+      await waitFor(
+        () => typeof releaseAtomicHandoff === 'function',
+        'blocked atomic annotation handoff',
+      )
+      const annotationAtomicHandoffPendingState = {
+        editorVisible: annotationOverlay.view.getVisible(),
+        editorBound: annotationOverlay.binding?.annotationId === 'annotation_electron_fixture',
+        previewHidden: !manager.surfaces.get('artifact:v3-bridge')?.view.getVisible(),
+      }
+      releaseAtomicHandoff()
+      const annotationOverlayAcknowledgement = await annotationOverlayAcknowledgementPromise
+      manager.cdpCommand = atomicHandoffCdpCommand
       const annotationOverlayClosedAfterAcknowledgement =
         !annotationOverlay.view.getVisible()
         && annotationOverlay.binding === null
         && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate === null
       const annotationRearmEventsBefore = events.length
-      const annotationPickerRearm = await manager.setArtifactAnnotationMode({
-        version: 3,
-        surfaceId: 'artifact:v3-bridge',
-        enabled: true,
-      })
+      const annotationPickerRearm = annotationOverlayAcknowledgement
       const annotationPageClicksBeforeRearm = await v3Contents.executeJavaScript(
         'Number(window.__annotationPageClicks || 0)',
       )
@@ -1702,7 +1727,7 @@ try {
         annotationRearmAfterRetiredGeometry.ok
         && manager.surfaces.get('artifact:v3-bridge')?.annotationPickerActive === true
       const annotationRearmFocusCycles = []
-      const annotationRearmCycleCount = fixture.stressMode ? 8 : 4
+      const annotationRearmCycleCount = fixture.stressMode ? 50 : 8
       let cyclePicker = annotationRearmAfterRetiredGeometry
       for (let cycle = 0; cycle < annotationRearmCycleCount; cycle += 1) {
         const cycleEventsBefore = events.length
@@ -1768,27 +1793,116 @@ try {
           value: cycleInputState.value,
         })
         const cycleFocusState = cycleInputState
+        const cycleSubmitEventsBefore = events.length
+        await annotationOverlay.view.webContents.executeJavaScript(
+          "document.querySelector('button[type=submit]').click()",
+        )
+        const cycleSubmit = await waitFor(
+          () => events.slice(cycleSubmitEventsBefore).find(event =>
+            event.type === 'annotation-submit'
+            && event.detail?.annotationId === cycleAnnotationId
+            && event.detail?.body === cycleBody),
+          `annotation rearm submit cycle ${cycle + 1}`,
+        )
         const cycleClose = await closeAnnotationOverlayImmediately({
           version: 3,
           surfaceId: 'artifact:v3-bridge',
           annotationId: cycleAnnotationId,
+          rearm: true,
         })
-        const cycleNextPicker = cycle + 1 < annotationRearmCycleCount
-          ? await manager.setArtifactAnnotationMode({
-              version: 3,
-              surfaceId: 'artifact:v3-bridge',
-              enabled: true,
-            })
-          : null
+        const cycleNextPicker = cycleClose
         annotationRearmFocusCycles.push({
           picker: cyclePicker.ok,
           overlay: cycleOverlayResult.ok,
           ...cycleFocusState,
           typedValue: cycleInputState.value,
+          submitted: Boolean(cycleSubmit),
           closed: cycleClose.ok,
         })
         cyclePicker = cycleNextPicker
       }
+      const atomicFailureEventsBefore = events.length
+      v3Contents.focus()
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: annotationX,
+        y: annotationY,
+        button: 'none',
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: annotationX,
+        y: annotationY,
+        button: 'left',
+        clickCount: 1,
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: annotationX,
+        y: annotationY,
+        button: 'left',
+        clickCount: 1,
+      })
+      const atomicFailureSelectionEvent = await waitFor(
+        () => events.slice(atomicFailureEventsBefore).find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'annotation-selected'),
+        'atomic annotation failure selection',
+      )
+      const annotationAtomicFailureId = 'annotation_atomic_failure_fixture'
+      const annotationAtomicFailureOverlay = await manager.showArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        selectionId: atomicFailureSelectionEvent.detail.selection.selectionId,
+        annotationId: annotationAtomicFailureId,
+        initialBody: 'Retain this body after a failed handoff.',
+      })
+      await restoreTrustedAnnotationInputFocus(
+        annotationOverlay,
+        'atomic annotation failure editor focus',
+      )
+      const atomicFailureCdpCommand = manager.cdpCommand.bind(manager)
+      let rejectAtomicArm = true
+      manager.cdpCommand = async (record, method, params) => {
+        if (
+          rejectAtomicArm
+          && method === 'Overlay.setInspectMode'
+          && params?.mode === 'searchForNode'
+        ) {
+          rejectAtomicArm = false
+          throw new Error('Synthetic atomic picker activation failure')
+        }
+        return await atomicFailureCdpCommand(record, method, params)
+      }
+      const annotationAtomicFailureResult = await manager.closeArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        annotationId: annotationAtomicFailureId,
+        rearm: true,
+      })
+      manager.cdpCommand = atomicFailureCdpCommand
+      const annotationAtomicFailureRetained = {
+        editorVisible: annotationOverlay.view.getVisible(),
+        editorBound: annotationOverlay.binding?.annotationId === annotationAtomicFailureId,
+        previewVisible: Boolean(manager.surfaces.get('artifact:v3-bridge')?.view.getVisible()),
+        candidateRetained: manager.surfaces
+          .get('artifact:v3-bridge')?.annotationCandidate?.selection.selectionId
+          === atomicFailureSelectionEvent.detail.selection.selectionId,
+        body: await annotationOverlay.view.webContents.executeJavaScript(
+          "document.getElementById('annotation-body').value",
+        ),
+      }
+      const annotationAtomicFailureRetry = await manager.closeArtifactAnnotationOverlay({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        annotationId: annotationAtomicFailureId,
+        rearm: true,
+      })
+      const annotationAtomicStopAfterCycles = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: false,
+      })
       const v3Record = manager.surfaces.get('artifact:v3-bridge')
       const annotationScrollBeforeFocus = await v3Contents.executeJavaScript('window.scrollY')
       const annotationFocus = await v3BridgeTarget.focusAnnotation(
@@ -1964,7 +2078,7 @@ try {
         'trusted annotation overlay fallback event',
       )
       const annotationPreviewHiddenForFallback = !v3View.getVisible()
-      const annotationFallbackClose = manager.closeArtifactAnnotationOverlay({
+      const annotationFallbackClose = await manager.closeArtifactAnnotationOverlay({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_fallback_fixture',
@@ -2896,6 +3010,7 @@ try {
         annotationOverlayRetainedAfterWrongAcknowledgement,
         annotationOverlayAcknowledgement,
         annotationOverlayClosedAfterAcknowledgement,
+        annotationAtomicHandoffPendingState,
         annotationPickerRearm,
         annotationRearmOverlayResult,
         annotationRearmCopy,
@@ -2908,6 +3023,12 @@ try {
         annotationRearmOverlayClose,
         annotationRetiredGeometryDidNotCancelRearm,
         annotationRearmFocusCycles,
+        annotationAtomicFailureOverlay,
+        annotationAtomicFailureResult,
+        annotationAtomicFailureRetained,
+        annotationAtomicFailureRetry,
+        annotationAtomicStopAfterCycles,
+        annotationLifecycleDiagnostics,
         annotationFocus,
         annotationScrollBeforeFocus,
         annotationScrollAfterFocus,
@@ -3236,6 +3357,7 @@ try {
     picker: true,
     trustedOverlay: true,
     overlayCopyVersion: 1,
+    atomicCloseRearm: true,
   })
   assert.equal(result.annotationPicker.ok, true)
   assert.equal(
@@ -3343,6 +3465,11 @@ try {
   assert.equal(result.annotationOverlayRetainedAfterWrongAcknowledgement, true)
   assert.equal(result.annotationOverlayAcknowledgement.ok, true)
   assert.equal(result.annotationOverlayClosedAfterAcknowledgement, true)
+  assert.deepEqual(result.annotationAtomicHandoffPendingState, {
+    editorVisible: true,
+    editorBound: true,
+    previewHidden: true,
+  })
   assert.equal(result.annotationPickerRearm.ok, true)
   assert.equal(result.annotationRearmOverlayResult.ok, true)
   assert.deepEqual(result.annotationRearmCopy, {
@@ -3377,7 +3504,7 @@ try {
   assert.equal(result.annotationRearmSubmitAfterInterruptedComposition, true)
   assert.equal(result.annotationRearmOverlayClose.ok, true)
   assert.equal(result.annotationRetiredGeometryDidNotCancelRearm, true)
-  assert.equal(result.annotationRearmFocusCycles.length, result.stressMode ? 8 : 4)
+  assert.equal(result.annotationRearmFocusCycles.length, result.stressMode ? 50 : 8)
   assert.equal(
     result.annotationRearmFocusCycles.every(cycle =>
       cycle.picker
@@ -3385,10 +3512,34 @@ try {
       && cycle.editorFocused
       && cycle.ownerFocused
       && cycle.nativeFocused
+      && cycle.submitted
       && cycle.closed
       && cycle.typedValue.includes('中文输入')),
     true,
     'trusted annotation editor must survive repeated close/rearm/IME cycles',
+  )
+  assert.equal(result.annotationAtomicStopAfterCycles.ok, true)
+  assert.equal(result.annotationAtomicFailureOverlay.ok, true)
+  assert.equal(result.annotationAtomicFailureResult.ok, false)
+  assert.deepEqual(result.annotationAtomicFailureRetained, {
+    editorVisible: true,
+    editorBound: true,
+    previewVisible: true,
+    candidateRetained: true,
+    body: 'Retain this body after a failed handoff.',
+  })
+  assert.equal(result.annotationAtomicFailureRetry.ok, true)
+  assert.equal(
+    result.annotationLifecycleDiagnostics.some(entry => entry.phase === 'close-start'),
+    true,
+  )
+  assert.equal(
+    result.annotationLifecycleDiagnostics.some(entry => entry.phase === 'armed'),
+    true,
+  )
+  assert.equal(
+    result.annotationLifecycleDiagnostics.some(entry => entry.phase === 'selection-emitted'),
+    true,
   )
   assert.deepEqual(result.annotationFocus, {
     focused: true,
