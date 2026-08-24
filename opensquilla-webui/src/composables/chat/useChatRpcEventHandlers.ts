@@ -149,7 +149,7 @@ export interface UseChatRpcEventHandlersOptions {
   normalizeRunStatus: (status: string) => string
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
-  queueRouterDecision: (payload: RouterDecisionPayload) => void
+  queueRouterDecision: (payload: RouterDecisionPayload, identityStreamSeq?: number) => void
   bindRouterDecisionToModelCall?: (
     modelCallId: string,
     iteration?: number,
@@ -1027,10 +1027,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       // Let the terminal own a shared cursor. A tracked compaction terminal may
       // still close its existing UI after task completion, but it must not move
       // the task cursor past the terminal that closed the stream.
-      const payload = entry.replayWithoutSeq || sharesTerminalSequence || maintenanceAfterTerminal
-        ? withoutBufferedStreamSeq(entry.payload)
-        : entry.payload
-      replayPendingStreamEvent({ event: entry.event, payload })
+      const replayWithoutSeq = Boolean(
+        entry.replayWithoutSeq || sharesTerminalSequence || maintenanceAfterTerminal,
+      )
+      replayPendingStreamEvent({
+        event: entry.event,
+        payload: entry.payload,
+        ...(replayWithoutSeq ? { replayWithoutSeq: true } : {}),
+      })
     }
   }
 
@@ -2128,7 +2132,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
     recordActivityPhase('Selecting model', 'router:decided')
-    options.queueRouterDecision(payload)
+    options.queueRouterDecision(payload, replayActivityOrder)
   }
 
   function handleRpcEnsembleProgress(payload: EnsembleProgressPayload) {

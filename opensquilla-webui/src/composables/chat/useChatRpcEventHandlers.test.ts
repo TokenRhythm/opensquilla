@@ -72,6 +72,7 @@ function createHarness(options: {
   }
   const markEnsembleHandoff = vi.fn()
   const bindRouterDecisionToModelCall = vi.fn()
+  const queueRouterDecision = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -109,7 +110,7 @@ function createHarness(options: {
     normalizeRunStatus: (status: string) => status,
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
-    queueRouterDecision: vi.fn(),
+    queueRouterDecision,
     bindRouterDecisionToModelCall,
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
@@ -144,6 +145,7 @@ function createHarness(options: {
     applySessionRunState,
     markEnsembleHandoff,
     bindRouterDecisionToModelCall,
+    queueRouterDecision,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showCompactionToast,
@@ -534,6 +536,43 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(3, 12)
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('keeps a snapshot router sequence as identity without replaying it through the cursor', () => {
+    const {
+      api,
+      lastStreamSeq,
+      queueRouterDecision,
+      stop,
+    } = createHarness()
+    try {
+      lastStreamSeq.value = 900
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2_400,
+        events: [{
+          event: 'session.event.router_decision',
+          payload: {
+            session_key: 'agent:main:test',
+            task_id: 'task-live',
+            turn_id: 'turn-live',
+            stream_seq: 17,
+            tier: 'c1',
+            model: 'provider/first',
+            source: 'squilla_router',
+          },
+        }],
+      })
+
+      expect(queueRouterDecision).toHaveBeenCalledOnce()
+      const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
+      expect(payload).not.toHaveProperty('stream_seq')
+      expect(identityStreamSeq).toBe(17)
+      expect(lastStreamSeq.value).toBe(2_400)
     } finally {
       stop()
     }

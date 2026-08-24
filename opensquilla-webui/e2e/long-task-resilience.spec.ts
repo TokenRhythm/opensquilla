@@ -11,6 +11,9 @@ import {
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-task-resilience'
 const TASK_ID = 'task-e2e-long-running'
+const ROUTER_SESSION_KEY = 'agent:main:webchat:e2e-router-reconnect'
+const ROUTER_TASK_ID = 'task-e2e-router-reconnect'
+const ROUTER_TURN_ID = 'turn-e2e-router-reconnect'
 
 type RpcRequest = {
   id?: string | number
@@ -86,7 +89,7 @@ function eventFrame(event: string, payload: Record<string, unknown>) {
   return JSON.stringify({ type: 'event', event, payload })
 }
 
-function hello(methods: string[] = []) {
+function hello(methods: string[] = [], events: string[] = []) {
   return JSON.stringify({
     protocol: 3,
     policy: {
@@ -109,6 +112,7 @@ function hello(methods: string[] = []) {
         'session.event.provider_activity',
         'session.event.run_heartbeat',
         'session.event.done',
+        ...events,
       ],
     },
     auth: {
@@ -319,6 +323,193 @@ test.describe('0.5.0 long-task resilience', () => {
       page.getByText('First incremental token after restart.', { exact: true }),
     ).toBeVisible({ timeout: 2_000 })
     expect(performance.now() - firstTokenAt).toBeLessThanOrEqual(2_000)
+  })
+
+  test('keeps one router card across reconnect snapshot, done, and history refresh', async ({
+    page,
+  }) => {
+    test.setTimeout(30_000)
+    await preparePage(page)
+    await page.addInitScript(() => {
+      window.localStorage.setItem('opensquilla.routerVisualEffects', '1')
+    })
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+
+    const generation = 'generation-router-reconnect'
+    const sockets: WebSocketRoute[] = []
+    let initialSnapshotComplete = false
+    let settledHistory = false
+    const routerPayload = {
+      session_key: ROUTER_SESSION_KEY,
+      task_id: ROUTER_TASK_ID,
+      turn_id: ROUTER_TURN_ID,
+      stream_generation: generation,
+      stream_seq: 10,
+      tier: 'c1',
+      tier_index: 1,
+      model: 'deepseek/deepseek-v4-pro',
+      baseline_model: 'deepseek/deepseek-v4-pro',
+      source: 'squilla_router',
+      confidence: 0.8,
+      routing_applied: true,
+    }
+    const history = () => {
+      const messages: Array<Record<string, unknown>> = [{
+        role: 'user',
+        text: 'Build a long HTML document.',
+        id: 'router-reconnect-user',
+        message_id: 'router-reconnect-user',
+        timestamp: Math.floor(Date.now() / 1_000) - 10,
+        turn_context: { turn_id: ROUTER_TURN_ID },
+      }]
+      if (settledHistory) {
+        messages.push({
+          role: 'assistant',
+          text: 'The document is ready.',
+          id: 'router-reconnect-assistant',
+          message_id: 'router-reconnect-assistant',
+          timestamp: Math.floor(Date.now() / 1_000),
+          turn_context: { turn_id: ROUTER_TURN_ID },
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'deepseek/deepseek-v4-pro',
+            routing_source: 'squilla_router',
+            router_model_call_id: '1.0',
+            router_iteration: 1,
+          },
+        })
+      }
+      return { messages, has_more: false, canonical_complete: true }
+    }
+
+    await page.routeWebSocket(/\/ws$/, ws => {
+      const socketIndex = sockets.length
+      sockets.push(ws)
+      ws.send(eventFrame('connect.challenge', {}))
+      ws.onMessage(message => {
+        let frame: RpcRequest
+        try {
+          frame = JSON.parse(String(message)) as RpcRequest
+        } catch {
+          return
+        }
+        if (frame.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
+        if (frame.type !== 'req') return
+        const method = String(frame.method || '')
+        if (method === 'connect') {
+          ws.send(hello([], [
+            'session.event.router_decision',
+            'session.event.turn_committed',
+          ]))
+          return
+        }
+        if (method === 'chat.history') {
+          ws.send(successResponse(frame.id, history()))
+          return
+        }
+        if (method === 'sessions.messages.snapshot') {
+          const replayRouter = socketIndex > 0 && !settledHistory
+          ws.send(successResponse(frame.id, {
+            key: ROUTER_SESSION_KEY,
+            task_id: settledHistory ? null : ROUTER_TASK_ID,
+            stream_generation: generation,
+            current_stream_seq: settledHistory ? 11 : replayRouter ? 10 : 9,
+            events: replayRouter
+              ? [{ event: 'session.event.router_decision', payload: routerPayload }]
+              : [],
+          }))
+          if (socketIndex === 0) initialSnapshotComplete = true
+          return
+        }
+        if (method === 'sessions.messages.subscribe') {
+          ws.send(successResponse(frame.id, {
+            subscribed: true,
+            replay_complete: true,
+            stream_generation: generation,
+            current_stream_seq: settledHistory ? 11 : socketIndex > 0 ? 10 : 9,
+            run_status: settledHistory ? 'idle' : 'running',
+            active_task: settledHistory
+              ? null
+              : { task_id: ROUTER_TASK_ID, status: 'running' },
+          }))
+          return
+        }
+        if (method === 'sessions.messages.hydrate') {
+          ws.send(successResponse(frame.id, {
+            hydration_complete: true,
+            stream_generation: generation,
+            current_stream_seq: settledHistory ? 11 : socketIndex > 0 ? 10 : 9,
+            run_status: settledHistory ? 'idle' : 'running',
+            active_task: settledHistory
+              ? null
+              : { task_id: ROUTER_TASK_ID, status: 'running' },
+          }))
+          return
+        }
+        if (method === 'config.get') {
+          ws.send(successResponse(frame.id, {
+            squilla_router: {
+              enabled: true,
+              rollout_phase: 'full',
+              tiers: {
+                c0: { model: 'openai/gpt-5.4-mini' },
+                c1: { model: 'deepseek/deepseek-v4-pro' },
+                c2: { model: 'z-ai/glm-5.2' },
+              },
+            },
+            permissions: {},
+            skills: {},
+          }))
+          return
+        }
+        if (method === 'models.routing.get') {
+          ws.send(successResponse(frame.id, { mode: 'router' }))
+          return
+        }
+        ws.send(successResponse(frame.id, basePayload(method)))
+      })
+    })
+
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(ROUTER_SESSION_KEY))
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => initialSnapshotComplete).toBe(true)
+    sockets[0]!.send(eventFrame('session.event.router_decision', routerPayload))
+    await expect(page.locator('.router-fx')).toHaveCount(1)
+
+    await sockets[0]!.close({ code: 1012, reason: 'deterministic reconnect' })
+    await expect.poll(() => sockets.length, { timeout: 4_000 }).toBe(2)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 4_000 })
+    await expect(page.locator('.router-fx')).toHaveCount(1)
+
+    sockets[1]!.send(eventFrame('session.event.done', {
+      session_key: ROUTER_SESSION_KEY,
+      task_id: ROUTER_TASK_ID,
+      turn_id: ROUTER_TURN_ID,
+      stream_generation: generation,
+      stream_seq: 11,
+      reason: 'completed',
+      text: 'The document is ready.',
+      usage: {
+        model: 'deepseek/deepseek-v4-pro',
+        routed_tier: 'c1',
+        routed_model: 'deepseek/deepseek-v4-pro',
+        routing_source: 'squilla_router',
+        router_model_call_id: '1.0',
+        router_iteration: 1,
+      },
+    }))
+    await expect(page.locator('.router-fx')).toHaveCount(1)
+    await expect(page.locator('.router-fx[data-settled="true"]')).toHaveCount(1)
+    await expect(page.getByText('The document is ready.', { exact: true })).toBeVisible()
+
+    settledHistory = true
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.router-fx')).toHaveCount(1)
+    await expect(page.getByText('The document is ready.', { exact: true })).toHaveCount(1)
   })
 
   test('projects reasoning, Retry-After, retry, fallback, and stale progress without leaking errors', async ({
