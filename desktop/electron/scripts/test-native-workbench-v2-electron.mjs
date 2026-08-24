@@ -118,7 +118,7 @@ const server = createServer((request, response) => {
         #gsap-probe { width: 20px; height: 20px; background: rgb(20, 80, 200); }
         #lottie-probe { width: 100px; height: 100px; }
       </style>
-      <div id="font-probe">Synthetic font preview</div>
+      <div id="font-probe" class="fixture-source-target">Synthetic font preview</div>
       <div id="gsap-probe"></div>
       <div id="lottie-probe"></div>
       <canvas id="canvas-probe" width="8" height="8"></canvas>
@@ -2059,11 +2059,25 @@ try {
       await v3Contents.executeJavaScript(
         "document.getElementById('font-probe').classList.add('fixture-selected-runtime')",
       )
-      const annotationSelectedClassMismatchRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
+      const annotationSelectedClassAdditionAccepted = await focusWithSourceProof()
+        .then(result => result.focused === true, () => false)
       await v3Contents.executeJavaScript(
-        "document.getElementById('font-probe').removeAttribute('class')",
+        "document.getElementById('font-probe').classList.remove('fixture-source-target')",
       )
+      const annotationSelectedClassRemovalRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript(`(() => {
+        const target = document.getElementById('font-probe')
+        target.classList.remove('fixture-selected-runtime')
+        target.classList.add('fixture-runtime-replacement')
+      })()`)
+      const annotationSelectedClassReplacementRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript(`(() => {
+        const target = document.getElementById('font-probe')
+        target.classList.remove('fixture-runtime-replacement')
+        target.classList.add('fixture-source-target')
+      })()`)
       const mismatchedElementPath = JSON.stringify(
         JSON.parse(selected.elementPath).map((segment, index, segments) => (
           index === segments.length - 1
@@ -3070,7 +3084,9 @@ try {
         annotationAncestorClassReplacementRejected,
         annotationAncestorIdMismatchRejected,
         annotationAncestorStyleMismatchRejected,
-        annotationSelectedClassMismatchRejected,
+        annotationSelectedClassAdditionAccepted,
+        annotationSelectedClassRemovalRejected,
+        annotationSelectedClassReplacementRejected,
         annotationPathMismatchRejected,
         annotationTagMismatchRejected,
         annotationRefocus,
@@ -3603,7 +3619,13 @@ try {
   assert.equal(result.annotationAncestorClassReplacementRejected, true)
   assert.equal(result.annotationAncestorIdMismatchRejected, true)
   assert.equal(result.annotationAncestorStyleMismatchRejected, true)
-  assert.equal(result.annotationSelectedClassMismatchRejected, true)
+  assert.equal(
+    result.annotationSelectedClassAdditionAccepted,
+    true,
+    'adding a selected-element class must preserve the source proof',
+  )
+  assert.equal(result.annotationSelectedClassRemovalRejected, true)
+  assert.equal(result.annotationSelectedClassReplacementRejected, true)
   assert.equal(result.annotationPathMismatchRejected, true)
   assert.equal(result.annotationTagMismatchRejected, true)
   assert.deepEqual(result.annotationRefocus, {

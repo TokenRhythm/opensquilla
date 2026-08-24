@@ -205,7 +205,7 @@ class HtmlAnchorChangedError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ElementProofV2:
-    """Bounded proof that tolerates additive ancestor class tokens only."""
+    """Bounded proof that tolerates additive class tokens on the element path."""
 
     stable_element_proof_sha256: str
     ancestor_class_commitments: tuple[str, ...]
@@ -548,11 +548,12 @@ def canonical_element_proof_v2(
     """Return the bounded v2 element proof, or ``None`` when it is too large.
 
     The stable digest keeps the v1 path and attribute serialization, except
-    that an unnamespaced ``class`` attribute is omitted from non-selected
-    ancestors.  Each ancestor class token is committed separately so a source
-    token may be reordered, duplicated, or joined by additive runtime tokens,
-    while removal/replacement and moving a token to another depth still fail
-    closed.  No token or partial commitment set is returned on overflow.
+    that an unnamespaced ``class`` attribute is omitted from every element on
+    the path, including the selected element.  Each class token is committed
+    separately so a source token may be reordered, duplicated, or joined by
+    additive runtime tokens, while removal/replacement and moving a token to
+    another depth still fail closed.  No token or partial commitment set is
+    returned on overflow.
     """
 
     ancestors: list[etree._Element] = []
@@ -569,30 +570,28 @@ def canonical_element_proof_v2(
     stable_tokens: list[str] = []
     ancestor_class_tokens: set[tuple[int, str]] = set()
     class_token_bytes = 0
-    selected_depth = len(ancestors) - 1
     for depth, element in enumerate(ancestors):
         namespace, tag_name = _element_name(element)
         attributes = _normalized_element_attributes(element)
-        if depth != selected_depth:
-            stable_attributes: list[list[str]] = []
-            for attribute in attributes:
-                if attribute[0] == "" and attribute[1] == "class":
-                    for token in _ASCII_CLASS_WHITESPACE_RE.split(attribute[2]):
-                        if not token:
-                            continue
-                        depth_token = (depth, token)
-                        if depth_token in ancestor_class_tokens:
-                            continue
-                        class_token_bytes += len(token.encode("utf-8"))
-                        ancestor_class_tokens.add(depth_token)
-                        if (
-                            len(ancestor_class_tokens) > MAX_ANCESTOR_CLASS_COMMITMENTS
-                            or class_token_bytes > MAX_ANCESTOR_CLASS_TOKEN_BYTES
-                        ):
-                            return None
-                    continue
-                stable_attributes.append(attribute)
-            attributes = stable_attributes
+        stable_attributes: list[list[str]] = []
+        for attribute in attributes:
+            if attribute[0] == "" and attribute[1] == "class":
+                for token in _ASCII_CLASS_WHITESPACE_RE.split(attribute[2]):
+                    if not token:
+                        continue
+                    depth_token = (depth, token)
+                    if depth_token in ancestor_class_tokens:
+                        continue
+                    class_token_bytes += len(token.encode("utf-8"))
+                    ancestor_class_tokens.add(depth_token)
+                    if (
+                        len(ancestor_class_tokens) > MAX_ANCESTOR_CLASS_COMMITMENTS
+                        or class_token_bytes > MAX_ANCESTOR_CLASS_TOKEN_BYTES
+                    ):
+                        return None
+                continue
+            stable_attributes.append(attribute)
+        attributes = stable_attributes
         stable_tokens.append(
             json.dumps(
                 [

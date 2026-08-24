@@ -400,20 +400,16 @@ const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
       attribute.value,
     ]).sort(compareJsonKeysByCodePoint)
     proofTokens.unshift([namespace, tagName, index, attributes])
-    if (current === selected) {
-      stableProofTokens.unshift([namespace, tagName, index, attributes])
-    } else {
-      stableProofTokens.unshift([
-        namespace,
-        tagName,
-        index,
-        attributes.filter(attribute => !(attribute[0] === '' && attribute[1] === 'class')),
-      ])
-      const tokens = attributes
-        .filter(attribute => attribute[0] === '' && attribute[1] === 'class')
-        .flatMap(attribute => attribute[2].split(/[\\t\\n\\f\\r ]+/).filter(Boolean))
-      ancestorClassTokens.unshift(Array.from(new Set(tokens)))
-    }
+    stableProofTokens.unshift([
+      namespace,
+      tagName,
+      index,
+      attributes.filter(attribute => !(attribute[0] === '' && attribute[1] === 'class')),
+    ])
+    const tokens = attributes
+      .filter(attribute => attribute[0] === '' && attribute[1] === 'class')
+      .flatMap(attribute => attribute[2].split(/[\\t\\n\\f\\r ]+/).filter(Boolean))
+    ancestorClassTokens.unshift(Array.from(new Set(tokens)))
     current = current.parentElement
   }
   const elementPath = JSON.stringify(segments)

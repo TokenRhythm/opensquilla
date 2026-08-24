@@ -129,14 +129,14 @@ def test_canonical_selection_proofs_safely_parse_source_and_path() -> None:
     assert len(proof) == 64
 
 
-def test_element_proof_v2_accepts_only_additive_reordered_ancestor_classes() -> None:
+def test_element_proof_v2_accepts_only_additive_reordered_path_classes() -> None:
     source = (
         '<main class="shell base" id="app"><section class="card reveal">'
         '<span class="leaf" id="target">Leaf</span></section></main>'
     )
     runtime = (
         '<main class="ready base shell shell" id="app">'
-        '<section class="visible reveal card"><span class="leaf" id="target">'
+        '<section class="visible reveal card"><span class="active leaf leaf" id="target">'
         "Leaf</span></section></main>"
     )
     element_path = json.dumps(
@@ -174,27 +174,29 @@ def test_element_proof_v2_accepts_only_additive_reordered_ancestor_classes() -> 
     [
         # Removing/replacing a source class token is not additive.
         '<main class="shell" id="app" data-state="source" style="color:red">'
-        '<span id="target">Leaf</span></main>',
+        '<span id="target" class="selected base">Leaf</span></main>',
         '<main class="shell other" id="app" data-state="source" style="color:red">'
-        '<span id="target">Leaf</span></main>',
+        '<span id="target" class="selected base">Leaf</span></main>',
         # All non-class ancestor attributes remain strict, including style.
         '<main class="shell base" id="changed" data-state="source" style="color:red">'
-        '<span id="target">Leaf</span></main>',
+        '<span id="target" class="selected base">Leaf</span></main>',
         '<main class="shell base" id="app" data-state="changed" style="color:red">'
-        '<span id="target">Leaf</span></main>',
+        '<span id="target" class="selected base">Leaf</span></main>',
         '<main class="shell base" id="app" data-state="source" style="color:blue">'
+        '<span id="target" class="selected base">Leaf</span></main>',
+        # Removing/replacing a selected-element source class is not additive.
+        '<main class="shell base" id="app" data-state="source" style="color:red">'
         '<span id="target">Leaf</span></main>',
-        # The selected element keeps its complete attribute identity.
         '<main class="shell base" id="app" data-state="source" style="color:red">'
-        '<span id="target" class="selected">Leaf</span></main>',
+        '<span id="target" class="changed">Leaf</span></main>',
         '<main class="shell base" id="app" data-state="source" style="color:red">'
-        '<span id="target" style="opacity:.5">Leaf</span></main>',
+        '<span id="target" class="selected base" style="opacity:.5">Leaf</span></main>',
     ],
 )
 def test_element_proof_v2_rejects_non_additive_or_non_class_changes(runtime: str) -> None:
     source = (
         '<main class="shell base" id="app" data-state="source" style="color:red">'
-        '<span id="target">Leaf</span></main>'
+        '<span id="target" class="selected base">Leaf</span></main>'
     )
     element_path = json.dumps(
         [["", "html", 1], ["", "body", 1], ["", "main", 1], ["", "span", 1]],

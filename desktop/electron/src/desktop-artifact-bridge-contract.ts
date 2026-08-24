@@ -41,7 +41,7 @@ export interface DesktopArtifactBridgeCapabilities {
   captureSelection: boolean
   resolveAnnotationSelection: boolean
   focusAnnotation: boolean
-  /** Additive proof for runtime-only class additions on non-selected ancestors. */
+  /** Additive proof for runtime-only class additions along the selected element path. */
   annotationProofV2?: true
   browserInspect: boolean
   /** True only while a v4 offline candidate preview is bound to the surface. */

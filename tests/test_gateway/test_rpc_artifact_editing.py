@@ -591,10 +591,15 @@ async def test_prompt_annotation_accepts_unrelated_runtime_dom_mutation(
             'style="color:red"><section class="card reveal reveal" data-zone="hero">'
             '<span class="leaf" style="opacity:1">Leaf</span></section></main>'
         ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero">'
+            '<span class="visible leaf leaf" style="opacity:1">Leaf</span></section></main>'
+        ),
     ],
-    ids=("add", "reorder", "duplicates"),
+    ids=("ancestor-add", "reorder", "duplicates", "selected-add"),
 )
-async def test_prompt_annotation_v2_accepts_additive_ancestor_class_mutations(
+async def test_prompt_annotation_v2_accepts_additive_path_class_mutations(
     artifact_editing_env,
     monkeypatch: pytest.MonkeyPatch,
     runtime_html: str,
@@ -699,7 +704,12 @@ async def test_prompt_annotation_v2_accepts_additive_ancestor_class_mutations(
         ),
         (
             '<main class="shell base" id="app" data-state="source" style="color:red">'
-            '<section class="card reveal" data-zone="hero"><span class="leaf changed" '
+            '<section class="card reveal" data-zone="hero"><span '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="changed" '
             'style="opacity:1">Leaf</span></section></main>'
         ),
         (
@@ -714,7 +724,8 @@ async def test_prompt_annotation_v2_accepts_additive_ancestor_class_mutations(
         "ancestor-id",
         "ancestor-data",
         "ancestor-style",
-        "selected-class",
+        "selected-class-remove",
+        "selected-class-replace",
         "selected-style",
     ),
 )
