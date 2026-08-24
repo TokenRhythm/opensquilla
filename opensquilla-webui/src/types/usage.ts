@@ -1,6 +1,8 @@
 export interface SessionRow {
   session?: string
   sessionKey?: string
+  sessionId?: string
+  session_id?: string
   key?: string
   taskName?: string
   task_name?: string
