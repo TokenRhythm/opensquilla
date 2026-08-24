@@ -2186,14 +2186,6 @@ def _active_user_message_index_for_request(
     return None
 
 
-def _is_mid_budget_nudge_message(message: Message) -> bool:
-    return (
-        message.role == "user"
-        and isinstance(message.content, str)
-        and message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
-    )
-
-
 def _is_runtime_nudge_message(message: Message) -> bool:
     """Whether a message is a runtime-injected nudge, not conversation history.
 
@@ -18459,11 +18451,6 @@ class Agent:
         return Agent._filter_ignored_porcelain_status(status, gitlink_paths)
 
     @staticmethod
-    def _workspace_gitlink_paths(workspace_dir: Path) -> set[str]:
-        _state, paths = Agent._workspace_gitlink_paths_observed(workspace_dir)
-        return paths
-
-    @staticmethod
     def _workspace_gitlink_paths_observed(
         workspace_dir: Path,
     ) -> tuple[GitRunState, set[str]]:
@@ -18480,10 +18467,6 @@ class Agent:
             if len(parts) == 4 and parts[0] == "160000":
                 paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
-
-    def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
-        _state, ignored = self._workspace_ignored_diff_paths_observed(workspace_dir)
-        return ignored
 
     def _workspace_ignored_diff_paths_observed(
         self,
@@ -19029,11 +19012,6 @@ class Agent:
         )
         return suspicious_name or suspicious_content
 
-    def _tool_call_targets_workspace_path(self, tc: ToolCall) -> bool:
-        if tc.tool_name not in _WORKSPACE_EDIT_TOOL_NAMES:
-            return False
-        return self._workspace_edit_gate_edit_block_detail(tc) is None
-
     def _workspace_edit_gate_allows_recovery_read(
         self,
         tc: ToolCall,
@@ -19046,9 +19024,6 @@ class Agent:
             return False
         resolved = self._resolve_workspace_path_candidate(raw_path)
         return resolved is not None and str(resolved) in recovery_read_paths
-
-    def _workspace_edit_gate_apply_patch_error_allows_read(self, result: ToolResult) -> bool:
-        return self._workspace_edit_gate_edit_error_allows_read(result)
 
     def _workspace_edit_gate_edit_error_allows_read(self, result: ToolResult) -> bool:
         if not result.is_error:
