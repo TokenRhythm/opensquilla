@@ -1532,6 +1532,33 @@ try {
         && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate === null
       const annotationRearmEventsBefore = events.length
       const annotationPickerRearm = annotationOverlayAcknowledgement
+      const annotationRejectedSelectionDiagnosticsBefore = annotationLifecycleDiagnostics.length
+      const annotationRejectedSelectionRecord = manager.surfaces.get('artifact:v3-bridge')
+      if (!annotationRejectedSelectionRecord) {
+        throw new Error('The annotation surface disappeared before rejected-selection recovery.')
+      }
+      // A CSS pseudo-element can produce an inspectNodeRequested backend id
+      // which cannot be resolved to a supported Element in the isolated
+      // world. Exercise the same rejection path deterministically, then prove
+      // the next real click is still captured by the picker below.
+      await manager.handleAnnotationNodeSelected(
+        annotationRejectedSelectionRecord,
+        Number.MAX_SAFE_INTEGER,
+      )
+      const annotationRejectedSelectionDiagnostics = annotationLifecycleDiagnostics.slice(
+        annotationRejectedSelectionDiagnosticsBefore,
+      )
+      const annotationRejectedSelectionRecovery = {
+        blocked: events.slice(annotationRearmEventsBefore).some(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'blocked-action'
+          && event.detail?.action === 'annotation-picker'),
+        rejected: annotationRejectedSelectionDiagnostics.some(entry =>
+          entry.phase === 'selection-rejected'),
+        rearmed: annotationRejectedSelectionDiagnostics.some(entry => entry.phase === 'armed')
+          && annotationRejectedSelectionRecord.annotationPickerActive === true,
+        candidateCleared: annotationRejectedSelectionRecord.annotationCandidate === null,
+      }
       const annotationPageClicksBeforeRearm = await v3Contents.executeJavaScript(
         'Number(window.__annotationPageClicks || 0)',
       )
@@ -3012,6 +3039,7 @@ try {
         annotationOverlayClosedAfterAcknowledgement,
         annotationAtomicHandoffPendingState,
         annotationPickerRearm,
+        annotationRejectedSelectionRecovery,
         annotationRearmOverlayResult,
         annotationRearmCopy,
         annotationRearmLayout,
@@ -3529,6 +3557,12 @@ try {
     body: 'Retain this body after a failed handoff.',
   })
   assert.equal(result.annotationAtomicFailureRetry.ok, true)
+  assert.deepEqual(result.annotationRejectedSelectionRecovery, {
+    blocked: true,
+    rejected: true,
+    rearmed: true,
+    candidateCleared: true,
+  })
   assert.equal(
     result.annotationLifecycleDiagnostics.some(entry => entry.phase === 'close-start'),
     true,

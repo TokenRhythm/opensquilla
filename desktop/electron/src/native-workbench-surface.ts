@@ -1011,7 +1011,7 @@ export interface NativeWorkbenchSurfaceResult {
 }
 
 export interface NativeWorkbenchAnnotationLifecycleDiagnostic {
-  phase: 'close-start' | 'arm-start' | 'armed' | 'cancelled' | 'failed' | 'selection-emitted'
+  phase: 'close-start' | 'arm-start' | 'armed' | 'cancelled' | 'failed' | 'selection-emitted' | 'selection-rejected'
   outcome: 'started' | 'succeeded' | 'cancelled' | 'failed'
   reason: NativeWorkbenchAnnotationLifecycleReason
   elapsedMs: number
@@ -1034,6 +1034,7 @@ type NativeWorkbenchAnnotationLifecycleReason =
   | 'candidate-preview-bound'
   | 'candidate-preview-restored'
   | 'selection-stale'
+  | 'selection-rejected'
   | 'debugger-detached'
   | 'surface-reloaded'
   | 'surface-navigation'
@@ -1054,6 +1055,7 @@ const NATIVE_WORKBENCH_ANNOTATION_LIFECYCLE_REASONS = new Set<string>([
   'candidate-preview-bound',
   'candidate-preview-restored',
   'selection-stale',
+  'selection-rejected',
   'debugger-detached',
   'surface-reloaded',
   'surface-navigation',
@@ -3665,7 +3667,7 @@ export class NativeWorkbenchSurfaceManager {
     backendNodeId: number,
   ): Promise<void> {
     if (!record.annotationPickerActive || !this.isActiveAnnotationRecord(record)) return
-    record.annotationPickerEpoch += 1
+    const pickerEpoch = ++record.annotationPickerEpoch
     record.annotationPickerActive = false
     const generation = record.annotationDocumentGeneration
     // Chromium exits inspect mode as part of dispatching inspectNodeRequested.
@@ -3757,11 +3759,32 @@ export class NativeWorkbenchSurfaceManager {
       )
       this.emit(record, 'annotation-selected', { selection })
     } catch (error) {
+      const selectionIsCurrent = this.annotationPickerTransitionIsCurrent(
+        record,
+        pickerEpoch,
+        generation,
+        null,
+      )
+      if (!selectionIsCurrent) return
       this.clearAnnotationCandidate(record)
+      this.auditAnnotationPicker(
+        record,
+        'selection-rejected',
+        'failed',
+        'selection-rejected',
+      )
       this.emit(record, 'blocked-action', {
         action: 'annotation-picker',
         reason: errorMessage(error).slice(0, 200),
       })
+      // Chromium inspect mode is one-shot: even an unsupported node (for
+      // example a page-wide CSS pseudo-element) consumes searchForNode before
+      // the isolated inspector can reject it. Keep the user's annotation
+      // intent alive by installing a fresh picker, fenced to this exact
+      // surface generation. A concurrent Stop, navigation, hide, or replace
+      // advances the epoch and prevents this recovery from reactivating it.
+      const rearmEpoch = ++record.annotationPickerEpoch
+      await this.armAnnotationPicker(record, rearmEpoch, generation, null)
     } finally {
       if (!retainedObjectGroup) {
         await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })
