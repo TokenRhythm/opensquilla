@@ -376,7 +376,7 @@ export class WorkbenchRuntimeManager {
       ...(nativeApi.setArtifactAnnotationMode
         ? {
             setArtifactAnnotationMode: request => (
-              mayShow()
+              (request.enabled ? mayShow() : isCurrent())
                 ? nativeApi.setArtifactAnnotationMode!(request)
                 : Promise.resolve(ignored())
             ),

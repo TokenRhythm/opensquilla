@@ -205,6 +205,8 @@ const props = defineProps<{
   goalElapsed?: string
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
+  /** Session/render epoch used to invalidate deferred scroll corrections. */
+  scrollEpoch?: number
   /** Preview/export paths can force a complete, canonical DOM. */
   virtualizationDisabled?: boolean
   /** Current search match or another externally owned focus target. */
@@ -282,6 +284,18 @@ let viewportFrame = 0
 let pendingAnchorAdjustment = 0
 let anchorAdjustmentScheduled = false
 let liveEdgePinScheduled = false
+let deferredScrollGeneration = 0
+
+function currentScrollEpoch(): number {
+  return props.scrollEpoch ?? 0
+}
+
+function resetDeferredScrollWork() {
+  deferredScrollGeneration += 1
+  pendingAnchorAdjustment = 0
+  anchorAdjustmentScheduled = false
+  liveEdgePinScheduled = false
+}
 
 function readVirtualizationPreference(): boolean {
   if (typeof window === 'undefined') return true
@@ -413,14 +427,19 @@ function scheduleViewportMeasure() {
 function queueAnchorAdjustment(delta: number) {
   const container = props.scrollContainer
   if (!container || Math.abs(delta) < 0.5) return
+  const epoch = currentScrollEpoch()
+  const sessionKey = props.sessionKey
+  const generation = deferredScrollGeneration
   pendingAnchorAdjustment += delta
   if (anchorAdjustmentScheduled) return
   anchorAdjustmentScheduled = true
   void nextTick(() => {
+    if (deferredScrollGeneration !== generation) return
     anchorAdjustmentScheduled = false
     const adjustment = pendingAnchorAdjustment
     pendingAnchorAdjustment = 0
     if (!props.scrollContainer || props.scrollContainer !== container) return
+    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
     applyProgrammaticScroll(container, () => {
       container.scrollTop += adjustment
     })
@@ -431,10 +450,15 @@ function queueAnchorAdjustment(delta: number) {
 function queueLiveEdgePin() {
   const container = props.scrollContainer
   if (!container || liveEdgePinScheduled) return
+  const epoch = currentScrollEpoch()
+  const sessionKey = props.sessionKey
+  const generation = deferredScrollGeneration
   liveEdgePinScheduled = true
   void nextTick(() => {
+    if (deferredScrollGeneration !== generation) return
     liveEdgePinScheduled = false
     if (!props.followLiveEdge || props.scrollContainer !== container) return
+    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
     applyProgrammaticScroll(container, () => {
       container.scrollTop = container.scrollHeight
     })
@@ -638,13 +662,18 @@ watch(virtualizationEnabled, () => {
     scheduleViewportMeasure()
   })
 })
-watch(() => props.sessionKey, () => {
-  measuredSizes.clear()
-  ensuredMessageKeys.value = new Set()
-  focusedMessageKey.value = null
-  measurementVersion.value += 1
-  void nextTick(scheduleViewportMeasure)
-})
+watch(
+  [() => props.sessionKey, () => props.scrollEpoch],
+  () => {
+    resetDeferredScrollWork()
+    measuredSizes.clear()
+    ensuredMessageKeys.value = new Set()
+    focusedMessageKey.value = null
+    measurementVersion.value += 1
+    void nextTick(scheduleViewportMeasure)
+  },
+  { flush: 'sync' },
+)
 watch(() => windowRows.value.map(row => row.key), nextKeys => {
   const retained = new Set(nextKeys)
   for (const key of measuredSizes.keys()) {

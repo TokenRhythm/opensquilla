@@ -389,17 +389,17 @@ def test_registry_reuses_budget_for_an_identical_query_without_broadening_author
         registry.consume_query_budget(query_key="annotation-3:remove_node")
 
 
-def test_document_registry_allows_one_identical_tool_replay_then_stops() -> None:
+def test_document_registry_bounds_malformed_tool_recovery_replays() -> None:
     registry = DocumentMutationGrantRegistry()
 
-    assert registry.reserve_tool_attempt(attempt_key="document_inspect") == 1
-    assert registry.reserve_tool_attempt(attempt_key="document_inspect") == 0
+    assert registry.reserve_tool_attempt(attempt_key="document_read:invalid_cursor") == 1
+    assert registry.reserve_tool_attempt(attempt_key="document_read:invalid_cursor") == 0
     with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_QUERY_LIMIT") as exc_info:
-        registry.reserve_tool_attempt(attempt_key="document_inspect")
-    assert "Reuse the earlier result" in exc_info.value.user_message
+        registry.reserve_tool_attempt(attempt_key="document_read:invalid_cursor")
+    assert "malformed document-tool recovery" in exc_info.value.user_message
 
     registry.clear()
-    assert registry.reserve_tool_attempt(attempt_key="document_inspect") == 1
+    assert registry.reserve_tool_attempt(attempt_key="document_read:invalid_cursor") == 1
 
 
 @pytest.mark.asyncio

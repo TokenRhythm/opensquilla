@@ -500,6 +500,11 @@ def create_gateway_app(
             memory_managers=memory_managers or {},
             memory_stores=memory_stores or {},
             memory_retrievers=memory_retrievers or {},
+            artifact_preview_service=getattr(
+                app.state,
+                "artifact_preview_service",
+                None,
+            ),
         )
 
     async def api_channels_status(request: Request) -> JSONResponse:
@@ -767,6 +772,11 @@ def create_gateway_app(
             memory_retrievers=memory_retrievers,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
             skill_management_service=skill_management_service,
+            artifact_preview_service=getattr(
+                app.state,
+                "artifact_preview_service",
+                None,
+            ),
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────

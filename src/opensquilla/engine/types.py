@@ -760,10 +760,9 @@ class AgentConfig:
     repair_max_items_per_tick: int = 5
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
-    # Provenance gate for persistent Artifact writer tools. General chat keeps
-    # the historical optimistic capability fallback for unknown model ids,
-    # while Artifact mutations require an authoritative tools declaration for
-    # every physical selector leg.
+    # Active-deployment tool capability provenance for diagnostics and routing.
+    # Tool authorization remains owned by the projected registry surface and
+    # dispatch/side-effect boundaries; unknown provenance does not remove tools.
     model_tools_capability_verified: bool = False
     # Runtime-only tri-state evidence; synthesized capability defaults remain
     # ``unknown`` instead of becoming an authoritative vision denial.

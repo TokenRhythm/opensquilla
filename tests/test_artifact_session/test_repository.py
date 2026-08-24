@@ -16,6 +16,7 @@ from opensquilla.artifact_session import (
     ArtifactConflictError,
     ArtifactKind,
     ArtifactSessionService,
+    ArtifactValidationError,
     RevisionSource,
     WriterLeaseConflictError,
     WriterLeaseExpiredError,
@@ -129,6 +130,53 @@ async def test_revision_commit_uses_head_and_state_compare_and_swap(tmp_path: Pa
             revision.generation
             for revision in await service.list_revisions(initial.document.document_id)
         ] == [2, 1]
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_event_for_mutation_ignores_later_unrelated_events(
+    tmp_path: Path,
+) -> None:
+    """Replay uses the committed revision sequence, not document latest."""
+
+    service = await open_service(tmp_path / "audit-replay.db", FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:audit-replay",
+            name="Replay",
+            kind=ArtifactKind.DOCUMENT,
+            initial_artifact=blob("audit-base"),
+            actor=USER,
+        )
+        committed = await service.commit_revision(
+            document_id=initial.document.document_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            artifact=blob("audit-next"),
+            actor=AGENT,
+            source=RevisionSource.AGENT,
+        )
+        await service.rename_document(
+            document_id=initial.document.document_id,
+            expected_state_revision=committed.document.state_revision,
+            name="Replay renamed",
+            actor=USER,
+        )
+
+        exact = await service.audit_event_for_mutation(
+            initial.document.document_id,
+            revision_id=committed.revision.revision_id,
+        )
+        assert exact is not None
+        assert exact.revision_id == committed.revision.revision_id
+        assert exact.event_type == "revision.committed"
+        latest = await service.latest_audit_event(initial.document.document_id)
+        assert latest is not None
+        assert exact.sequence < latest.sequence
+
+        with pytest.raises(ArtifactValidationError, match="revision_id or change_set_id"):
+            await service.audit_event_for_mutation(initial.document.document_id)
     finally:
         await service.close()
 

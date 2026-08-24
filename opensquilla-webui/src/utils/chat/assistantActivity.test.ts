@@ -1113,6 +1113,31 @@ describe('projectAssistantActivityTimeline', () => {
     expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([3, 5, 3])
   })
 
+  it('uses authoritative v2 phase endings without sorting by timestamps', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 99_000,
+      statusHistory: [
+        {
+          action: 'provider:requesting',
+          label: 'Waiting',
+          at: 9_000,
+          endedAt: 9_000,
+          activityOrder: 1,
+        },
+        {
+          action: 'provider:fallback',
+          label: 'Fallback',
+          at: 1_000,
+          endedAt: 12_000,
+          activityOrder: 2,
+        },
+      ],
+    })
+    expect(projection.statusSteps.map(step => step.activityOrder)).toEqual([1, 2])
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([0, 11])
+  })
+
   it('counts down provider retry waits locally without changing other phases', () => {
     const statusStep = (
       overrides: Partial<AssistantActivityStatusStep>,

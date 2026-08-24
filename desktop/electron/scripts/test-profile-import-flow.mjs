@@ -17,6 +17,7 @@ const importScreenshotDir = String(
     || (process.env.CI_REPORT_DIR ? join(process.env.CI_REPORT_DIR, 'profile-import-screenshots') : ''),
 ).trim()
 const SOURCE_CHAT = 'synthetic imported chat survives whole-profile transfer'
+const PROFILE_FIXTURE_TIMEOUT_MS = 120_000
 async function waitFor(check, label, timeoutMs = 90_000) {
   const startedAt = Date.now()
   let lastError
@@ -37,9 +38,17 @@ function runPython(source, args) {
     cwd: repoRoot,
     encoding: 'utf8',
     env: { ...process.env, UV_CACHE_DIR: join(tmpdir(), 'opensquilla-profile-import-uv-cache') },
+    timeout: PROFILE_FIXTURE_TIMEOUT_MS,
+    killSignal: 'SIGTERM',
+    maxBuffer: 4 * 1024 * 1024,
   })
-  if (result.status !== 0) {
-    throw new Error(`Python fixture command failed: ${result.stderr || result.stdout}`)
+  if (result.error || result.signal || result.status !== 0) {
+    const outcome = result.error?.code === 'ETIMEDOUT'
+      ? `timed out after ${PROFILE_FIXTURE_TIMEOUT_MS}ms`
+      : `status=${result.status ?? 'null'} signal=${result.signal ?? 'null'}`
+    throw new Error(
+      `Python fixture command failed (${outcome}): ${result.stderr || result.stdout}`,
+    )
   }
   return result.stdout.trim()
 }

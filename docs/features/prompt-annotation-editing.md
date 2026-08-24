@@ -25,9 +25,11 @@ unchanged in history.
 
 Versioned HTML resources are enabled by default. Source-backed DOM annotations
 default on only in Electron builds that synchronously expose the complete
-native protocol-v3 annotation bridge; browser-hosted Web UI and older or
-partial Desktop shells fail closed. This is not a general comment system, a
-browser automation surface, or an Office editor.
+native protocol-v4 annotation bridge, including the candidate-preview
+lifecycle; browser-hosted Web UI and older or partial Desktop shells fail
+closed. A protocol-v3 shell may retain source-only editing compatibility, but
+cannot claim autonomous visual verification. This is not a general comment
+system, a browser automation surface, or an Office editor.
 
 ## Architecture and invariants
 
@@ -44,11 +46,15 @@ The request path is deliberately narrow:
    revision, and anchor.
 5. `chat.send` accepts the user message and ordered annotation snapshots in the
    same SQLite transaction. A failed compare-and-swap accepts neither.
-6. Annotated turns expose exactly four context-bound tools:
-   `document_inspect`, `document_read`, `document_locate`, and `document_apply`.
-7. Inspection, reading, locating, and proposal preparation remain free of
-   durable mutation writes. The service admits at most one commit for the turn;
-   a successful commit produces one revision and one change set.
+6. Annotated turns expose a ten-tool context-bound surface: the five source
+   tools (`document_inspect`, `document_read`, `document_locate`,
+   `document_apply`, and `document_patch`), four bound-preview tools
+   (`document_browser_inspect`, `document_browser_act`,
+   `document_browser_screenshot`, and `document_browser_reload`), and the
+   lifecycle tool `document_finish`.
+7. Inspection, reading, locating, and source writers remain free of durable
+   revision writes. Writers stage one draft candidate; only
+   `document_finish(commit)` publishes one revision and one change set.
 
 `document_inspect` returns the ordered instructions, a bounded document
 summary, adapter capabilities, and safe initial mutation grants.
@@ -56,17 +62,36 @@ summary, adapter capabilities, and safe initial mutation grants.
 grants edit authority. `document_locate` asks the active format adapter to
 locate one selected semantic target and returns an opaque, turn-scoped grant.
 `document_apply` submits the grants chosen for mutation as one atomic proposal.
-An instruction may be answered without a mutation; every mutation that is
-submitted must still use a grant bound to its own selected context.
+`document_patch` is the exact-source writer for instructions that cannot be
+expressed by grants, including insertion, outer-structure changes, global CSS,
+and scripts. It edits only the current bound Document and accepts no filesystem
+path. An instruction may be answered without a mutation.
 The HTML adapter supports the semantic operations `replace_text`,
 `set_attribute`, `remove_attribute`, `set_style`, and `remove_node`.
 
+The model chooses at most one source writer for each response. If every
+requested change has a suitable grant, it uses one `document_apply`; otherwise
+it reads the required source pages and submits all changes together in one
+`document_patch`. It must not call both writers in one response. Each writer
+stages a candidate and keeps the loop alive. The model may inspect the bound
+preview, repair the candidate, and inspect again across iterations. A fresh
+verification receipt and matching candidate SHA are required before
+`document_finish(commit)`; `document_finish(discard)` explicitly abandons the
+candidate without changing the canonical head.
+
+`document_browser_screenshot` keeps the PNG out of the JSON tool text. When the
+selected model explicitly supports vision, the bounded image is delivered as
+an ephemeral user image block after the tool result; text-only or ensemble
+legs receive only the dimensions/status and can continue with DOM, console,
+and bounded browser actions. The image is not written to the workspace or
+persisted in the transcript.
+
 The model never calculates or submits source offsets and never receives a
-workspace path, anchor ID, DOM proof, internal document ID, or raw editable
-range. It asks `document_locate` for a semantic operation, then supplies only
-the opaque grant and the operation-specific `input` requested by that grant;
-the server-side `DocumentFormatAdapter` derives and validates the exact source
-replacement.
+workspace path, anchor ID, DOM proof, or internal document ID. Semantic edits
+use only opaque grants. Source fallback uses the current source SHA plus exact,
+uniquely matching `expectedText`/`replacement` edits. The server rejects stale
+SHA values, missing or repeated matches, overlaps, no-ops, invalid HTML, and
+partial proposals before publication.
 `replace_text` is escaped as HTML text, opening-tag changes preserve unaffected
 source, and `remove_node` removes either a proven balanced element range or one
 proven HTML void element such as `img`. Unsupported or ambiguous structures
@@ -84,8 +109,8 @@ source fragments.
 
 There is one prompt-annotation tool contract and no client-selectable protocol
 version. Accepted and replayed responses report the accepted annotation IDs,
-not a tool-protocol version. Restricted annotated turns cannot widen the exact
-four-tool ceiling.
+not a tool-protocol version. Restricted annotated turns cannot widen the
+ten-tool ceiling or access workspace mutators.
 
 The following contracts must remain true:
 
@@ -109,10 +134,12 @@ The following contracts must remain true:
   silently run again.
 - A context-only answer does not arm the mutation ledger, create a mutation
   outcome, reserve a summary round, or require a second provider request.
-- The mutation outcome and one `tools=[]` authoritative summary round are armed
-  only after the first valid `document_apply` intent is observed.
+- A candidate draft is not a durable mutation outcome. The model may claim the
+  page was updated only after `document_finish(commit)` returns an applied
+  result; timeout, cancellation, or discard rejects an uncommitted draft.
 - One agent turn can advance the document head once. A failed edit or validation
-  leaves the head unchanged.
+  leaves the head unchanged, while additional candidate repairs replace the
+  same draft without advancing generation.
 - The HTML adapter validates the selected semantic operation, attribute or
   inline-style value, source-range proof, source-preserving candidate, and a
   bounded HTML structure scan before publication. It does not certify visual
@@ -131,8 +158,10 @@ The renderer resolves two independent feature defaults in
   discovery, HTML preview, silent legacy materialization, and versioned editing;
 - `artifactPromptAnnotations` defaults to `true` only when the client is
   Electron Desktop and every native surface, preview-lease, screenshot, and
-  protocol-v3 annotation bridge method required by the flow is present at app
-  startup. Web and incomplete Desktop bridges default to `false`.
+  protocol-v4 annotation bridge method required by the flow is present at app
+  startup. Web and incomplete Desktop bridges default to `false`; a v3 bridge
+  can use the source-only compatibility path but is not eligible for the
+  autonomous visual loop.
 
 The V1 UI does not expose a Publish action. Users edit the document head and
 can inspect Versions and Changes; immutable publication remains a separate
@@ -144,7 +173,8 @@ The annotation UI also requires all of the following runtime capabilities:
 - the current document independently advertises `selectionContext = true`,
   `agentEdit = true`, and `promptAnnotations = true`;
 - the artifact is a supported single-file UTF-8 HTML document;
-- an Electron native workbench surface and the v3 artifact bridge are active;
+- an Electron native workbench surface and the v4 artifact bridge are active;
+  v3 remains a source-only compatibility path;
 - selection resolution, focus, and trusted-overlay capabilities are available.
 
 Browser-hosted Web UI retains the HTML Workbench but does not offer DOM
@@ -207,9 +237,9 @@ same context-bound tool implementations.
 
 | Mode | Model policy | Mutation policy |
 | --- | --- | --- |
-| Direct | Uses the user's fixed model. | A verified tool-capable model may answer or mutate. For an unverified model, document tools are hidden and the model may only answer from the selected context; no mutation lifecycle starts. |
+| Direct | Uses the user's fixed model. | A model with unknown or unverified capability provenance receives the same authorized document tools. Only an explicit `supports_tools = false` declaration rejects the mutation before provider execution. |
 | Router | Applies deterministic artifact floors after classification. | A selection edit has a minimum of `c2`; a multi-element/structural edit has a minimum of `c3`. Budget and fallback policy may move upward but cannot cross below the effective floor. Missing capable tiers fail closed. |
-| Ensemble | Runs the configured B5 lineup. | Proposers receive the annotation context but no executable tools. Only the Aggregator receives and may call artifact tools. For mutation turns, proposer tools are forced off, single-model fallback is removed, and an unverified Aggregator fails before provider execution. |
+| Ensemble | Runs the configured B5 lineup. | Proposers receive the annotation context but no executable tools. Only the Aggregator receives and may call artifact tools. For mutation turns, proposer tools are forced off and single-model fallback is removed. An unknown or unverified Aggregator is allowed; an unready Aggregator or one explicitly declaring `supports_tools = false` fails before provider execution. |
 
 Proposer output is advisory text. It never advances the document head. The
 Aggregator must independently submit the mutation proposal through the normal
@@ -336,13 +366,15 @@ changed ancestor, wrong active artifact, or runtime-only path still fails
 closed before draft persistence.
 
 The offline document Workbench gate additionally composes an owned-Gateway
-WebSocket lifecycle (preview, materialization, EditSession save, exact-four agent edit,
-backend publication-journal and immutable-source checks) with the real Electron
+WebSocket lifecycle (preview, materialization, EditSession save, autonomous
+document-agent edit loop, backend publication-journal and immutable-source checks) with the real Electron
 native surface suite. Its user-journey fixture starts the current Vue UI and
 owned Gateway, generates synthetic HTML as one editable file, selects through the
-native picker and trusted overlay, applies exactly one Agent change, observes
-Preview plus Versions/Changes refresh, and proves an answer-only follow-up adds
-no durable write. It is credential-free and requires Electron foreground focus;
+native picker and trusted overlay, stages and verifies one candidate (repairing
+it when needed) before one final Agent commit, observes Preview plus
+Versions/Changes refresh, and proves an answer-only follow-up adds no durable
+write. A discarded or interrupted candidate creates no revision. It is
+credential-free and requires Electron foreground focus;
 a locked or background-only macOS session fails the gate.
 
 ### Live provider certification
@@ -373,23 +405,33 @@ uv run python scripts/live_artifact_prompt_annotations_e2e.py \
 
 Without `--execute-live-matrix`, the command is an intentional zero-call dry
 run that writes `certification=incomplete`. With the flag, the isolated worker
-runs the owned Gateway/provider path and requires the exact-four tool surface.
+runs the owned Gateway/provider path and requires the ten-tool document-agent surface.
 It does not replace the separate real-Electron selection gate.
-Each successful mutation case in Direct or Router uses three physical
-requests: bounded inspection/location, the admitted commit proposal, and a
-final `tools=[]` outcome response. A B5 Ensemble case uses the corresponding
-three five-member rounds. The outcome-finalization round is required Agent work; it must not be
-removed or treated as a free call. The approved matrix therefore expects 42
-physical provider calls, allows a bounded worst-case budget of 63, and
-hard-stops at 64. A build is not release-ready until the following matrix is
+The fixed Direct `glm-5.2` source-fallback case must exercise a repair loop:
+`document_inspect → document_read → document_patch →
+document_browser_inspect → document_browser_screenshot` (or a bounded browser
+action) `→ document_patch → document_browser_inspect → document_finish(commit)
+→ tools=[]` finalization. The model chooses whether to take each observation,
+repair, or discard step; the harness checks this representative sequence but
+does not impose a PromptAnnotation-specific iteration count. The live harness
+therefore uses a 120-second per-case deadline; this is a task deadline, not a
+provider retry. A B5 Ensemble case uses the configured proposer/Aggregator
+rounds while keeping proposer and finalizer tools empty. The outcome-finalization
+round is required Agent work; it must not be removed or treated as a free call.
+The approved autonomous-loop matrix therefore reserves 42 baseline physical
+provider calls, allows a bounded worst-case reservation of 63, and hard-stops
+raw provider traffic at 64. Preview, browser action, `document_finish`, and
+tools-disabled finalizer requests are all included in that physical count;
+none is deducted or treated as free work.
+A build is not release-ready until the following matrix is
 verified end to end:
 
-- Direct: one annotation and a two-annotation batch using a verified
-  tool-capable fixed model;
+- Direct: one source-fallback insertion and a two-annotation semantic batch
+  using fixed model `glm-5.2`;
 - Router: a single selection at `c2`, a structural batch at `c3`, and no
   fallback below the effective floor;
 - Ensemble: the full configured lineup, zero executable proposer tool calls,
-  and one Aggregator-owned admitted `document_apply` commit;
+  an Aggregator-owned candidate loop, and one final `document_finish(commit)`;
 - rejection cases for stale head, cross-session draft, DOM mismatch, and visual
   selection, each with zero provider calls;
 - exactly one revision and one change set for every successful batch, plus a
@@ -424,13 +466,17 @@ Ongoing maintenance should include:
 
 - rerunning the DOM-path/parse5 golden corpus after Electron, Chromium, parse5,
   or Monaco upgrades;
-- requiring authoritative tool-capability metadata before any Direct model or
-  Ensemble Aggregator may mutate a document; unverified models remain
-  answer-only with document tools hidden;
+- treating tool-capability provenance as routing and diagnostic metadata:
+  unknown or unverified Direct models and Ensemble Aggregators retain their
+  authorized tools, while explicit `supports_tools = false` declarations are
+  rejected before provider execution;
+- preserving the actual mutation safety boundary in registry visibility,
+  dispatch authorization, argument validation, writer leases, and atomic
+  compare-and-swap commit;
 - keeping every new test in the Windows shard assignments and duration data;
 - exercising migrations from released wheels and old profiles;
-- preserving opaque bridge handles and typed protocol methods when protocol v3
-  evolves;
+- preserving opaque bridge handles and typed protocol methods as protocol v4
+  evolves, with v3 retained only for source-only compatibility;
 - running a real Electron corpus on every supported platform before release;
 - reviewing limits and garbage collection without weakening immutable
   revisions, CAS, fencing, or transcript replay safety.

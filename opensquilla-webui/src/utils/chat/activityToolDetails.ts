@@ -6,6 +6,23 @@ export type ActivityToolDetailLine =
   | { kind: 'content-size'; lines: number; characters: number }
   | { kind: 'exit-code'; code: number }
   | { kind: 'published' }
+  | {
+      kind: 'document-category'
+      category: 'DOCUMENT_PREVIEW_UNAVAILABLE'
+        | 'DOCUMENT_ACTION_RESULT_UNKNOWN'
+        | 'DOCUMENT_EDIT_FAILED'
+    }
+  | {
+      kind: 'document-message'
+      messageKey: 'document.previewUnavailable'
+        | 'document.actionResultUnknown'
+        | 'document.editFailed'
+    }
+  | { kind: 'document-retry'; policy: 'same_turn' | 'new_turn' | 'never' }
+  | {
+      kind: 'document-next-action'
+      action: 'retry' | 'reinspect' | 'finalize_without_tools' | 'start_new_turn' | 'stop'
+    }
 
 export interface ActivityToolDetailProjection {
   lines: ActivityToolDetailLine[]
@@ -293,13 +310,9 @@ function pushUnique(
   line: ActivityToolDetailLine | null,
 ) {
   if (!line) return
-  const key = 'text' in line
-    ? `${line.kind}:${line.text}`
-    : JSON.stringify(line)
+  const key = JSON.stringify(line)
   const duplicate = lines.some(item => (
-    'text' in item
-      ? `${item.kind}:${item.text}`
-      : JSON.stringify(item)
+    JSON.stringify(item)
   ) === key)
   if (!duplicate) lines.push(line)
 }
@@ -312,7 +325,69 @@ export function projectActivityToolDetail(
   // one-time grants. Those belong in diagnostics, not in the ordinary chat
   // activity disclosure.
   if (operationKey === 'document.read' || operationKey === 'document.update') {
-    return { lines: [], rawContent: '' }
+    const resultRecord = parseRecord(call.result || call.resultPreview)
+    const nestedError = asRecord(resultRecord?.error)
+    const category = recordString(resultRecord, ['category', 'error_category', 'errorCategory', 'code'])
+      || recordString(nestedError, ['category', 'code'])
+    const recordedStatus = recordString(resultRecord, ['status', 'state']).toLowerCase()
+    const recordedFailure = Boolean(
+      call.isError
+      || call.status === 'error'
+      || resultRecord?.ok === false
+      || nestedError
+      || ['error', 'failed', 'failure'].includes(recordedStatus)
+      || category,
+    )
+    // Compatibility history can lose the transient call error flags while
+    // retaining the structured bridge result.  Derive failure only from
+    // stable structured fields; successful document calls remain completely
+    // non-disclosable and never enter a raw/result/copy path.
+    if (!recordedFailure) return { lines: [], rawContent: '' }
+    const messageKey = recordString(resultRecord, ['message_key', 'messageKey'])
+      || recordString(nestedError, ['message_key', 'messageKey'])
+    const retryPolicy = recordString(resultRecord, ['retry_policy', 'retryPolicy'])
+      || recordString(nestedError, ['retry_policy', 'retryPolicy'])
+    const nextAction = recordString(resultRecord, ['next_action', 'nextAction'])
+      || recordString(nestedError, ['next_action', 'nextAction'])
+    const allowedCategory = new Set([
+      'DOCUMENT_PREVIEW_UNAVAILABLE',
+      'DOCUMENT_ACTION_RESULT_UNKNOWN',
+      'DOCUMENT_EDIT_FAILED',
+    ]).has(category)
+      ? category as 'DOCUMENT_PREVIEW_UNAVAILABLE'
+        | 'DOCUMENT_ACTION_RESULT_UNKNOWN'
+        | 'DOCUMENT_EDIT_FAILED'
+      : 'DOCUMENT_EDIT_FAILED'
+    const allowedMessageKey = new Set([
+      'document.previewUnavailable',
+      'document.actionResultUnknown',
+      'document.editFailed',
+    ]).has(messageKey)
+      ? messageKey as 'document.previewUnavailable'
+        | 'document.actionResultUnknown'
+        | 'document.editFailed'
+      : 'document.editFailed'
+    const allowedRetry = new Set(['same_turn', 'new_turn', 'never']).has(retryPolicy)
+      ? retryPolicy as 'same_turn' | 'new_turn' | 'never'
+      : 'never'
+    const allowedAction = new Set([
+      'retry', 'reinspect', 'finalize_without_tools', 'start_new_turn', 'stop',
+    ]).has(nextAction)
+      ? nextAction as 'retry'
+        | 'reinspect'
+        | 'finalize_without_tools'
+        | 'start_new_turn'
+        | 'stop'
+      : 'stop'
+    const lines: ActivityToolDetailLine[] = [
+      { kind: 'document-category', category: allowedCategory },
+      { kind: 'document-message', messageKey: allowedMessageKey },
+    ]
+    lines.push({ kind: 'document-retry', policy: allowedRetry })
+    lines.push({ kind: 'document-next-action', action: allowedAction })
+    // Document details never enter raw/full-result/copy paths. Only the
+    // stable allowlisted projection above can reach the DOM.
+    return { lines, rawContent: '' }
   }
   const inputRecord = parseRecord(call.inputRaw || call.inputPreview)
   const resultRecord = parseRecord(call.result || call.resultPreview)
@@ -394,4 +469,12 @@ export function projectActivityToolDetail(
     lines: lines.slice(0, 3),
     ...rawDetails(call),
   }
+}
+
+export function hasActivityToolDetail(
+  call: ChatToolCallRenderItem,
+  operationKey: string,
+): boolean {
+  const projection = projectActivityToolDetail(call, operationKey)
+  return projection.lines.length > 0 || Boolean(projection.rawContent)
 }

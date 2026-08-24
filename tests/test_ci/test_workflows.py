@@ -470,6 +470,16 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
         for step in workflow["jobs"]["frontend-check"]["steps"]
         if step.get("name") == "Run frontend type checks"
     )
+    setup_node = next(
+        step
+        for step in workflow["jobs"]["frontend-check"]["steps"]
+        if step.get("name") == "Set up Node.js"
+    )
+    install_node = next(
+        step
+        for step in workflow["jobs"]["frontend-check"]["steps"]
+        if step.get("name") == "Install frontend dependencies"
+    )
     unit_tests = next(
         step
         for step in workflow["jobs"]["frontend-check"]["steps"]
@@ -480,6 +490,8 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     assert typecheck["run"] == "npm run typecheck"
     assert "frontend_changed == 'true'" in typecheck["if"]
     assert "planner_full_fallback == 'true'" in typecheck["if"]
+    assert setup_node["if"] == typecheck["if"]
+    assert install_node["if"] == typecheck["if"]
     assert "planner_full_fallback == 'true'" in unit_tests["if"]
     assert upload["with"]["retention-days"] >= 31
     assert upload["with"]["overwrite"] is True
@@ -1599,6 +1611,14 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     playwright_cache = next(
         step for step in steps if step.get("name") == "Restore Playwright browser"
     )
+    electron_cache = next(
+        step for step in steps if step.get("name") == "Restore Electron binary cache"
+    )
+    electron_cache_seed = next(
+        step
+        for step in steps
+        if step.get("name") == "Seed Electron binary cache from nightly main"
+    )
     run = next(
         step for step in steps if step.get("name") == "Run compiled Desktop recovery flows"
     )
@@ -1632,6 +1652,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
         "${{ github.workspace }}/.cache/ms-playwright"
     )
+    assert job["env"]["ELECTRON_CACHE"] == "${{ github.workspace }}/.cache/electron"
+    assert job["env"]["OPENSQUILLA_DESKTOP_CASE_TIMEOUT_MS"] == "900000"
+    assert electron_cache["uses"] == "actions/cache/restore@v4"
+    assert electron_cache["with"]["path"] == "${{ env.ELECTRON_CACHE }}"
+    assert "hashFiles('desktop/electron/package-lock.json')" in electron_cache["with"]["key"]
+    assert electron_cache_seed["uses"] == "actions/cache/save@v4"
     assert job["env"]["OPENSQUILLA_WORKBENCH_E2E_MODE"] == (
         "${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') "
         "&& 'smoke' || 'stress' }}"
@@ -2212,7 +2238,10 @@ def test_ubuntu_quality_keeps_targeted_pr_tests_and_full_ci_uses_balanced_matrix
     }
     assert ubuntu_full["timeout-minutes"] == 20
     assert ".github/scripts/windows_test_shards.py run" in full_test_step["run"]
-    assert "--maxfail" not in full_test_step["run"]
+    assert '"${{ matrix.shard }}" == "gateway-sqlite"' in full_test_step["run"]
+    assert "worker_args+=(--workers=2)" in full_test_step["run"]
+    assert "maxfail_args+=(--maxfail=3)" in full_test_step["run"]
+    assert '"${maxfail_args[@]}"' in full_test_step["run"]
     assert "--reruns" not in json.dumps(ubuntu_full, sort_keys=True)
     assert all("continue-on-error" not in step for step in ubuntu_full["steps"])
 

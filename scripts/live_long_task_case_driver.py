@@ -94,6 +94,8 @@ _BROWSER_HELPER: Final = WEBUI_ROOT / "scripts" / "live-long-task-browser.mjs"
 _TERMINAL_EVENTS: Final = frozenset({"session.event.done", "session.event.error"})
 _MAX_CASE_FILE_BYTES: Final = 64 * 1024
 _MAX_BROWSER_RESULT_BYTES: Final = 64 * 1024
+_HISTORY_SETTLE_TIMEOUT_SECONDS: Final = 5.0
+_HISTORY_SETTLE_EVENT_WAIT_SECONDS: Final = 0.05
 _PERFORMANCE_FIXTURE: Final = {
     "historyMessages": 200,
     "reasoningDeltas": 20_000,
@@ -863,6 +865,42 @@ async def _history_evidence(
     )
 
 
+async def _wait_for_assistant_history_evidence(
+    client: GatewayRPCClient,
+    observation: TurnObservation,
+    *,
+    session_key: str,
+    assistant_marker: str,
+    deadline: float,
+) -> tuple[int, int, int, int]:
+    # The terminal stream event can win a narrow race with the assistant
+    # transcript commit. Keep the durable marker assertion, but let history
+    # converge within its own bounded phase. Waiting on the event queue avoids
+    # a blind sleep and keeps the client responsive to late stream frames.
+    settle_deadline = min(
+        deadline,
+        time.monotonic() + _HISTORY_SETTLE_TIMEOUT_SECONDS,
+    )
+    while True:
+        evidence = await _history_evidence(
+            client,
+            session_key=session_key,
+            assistant_marker=assistant_marker,
+        )
+        if evidence[1] > 0:
+            return evidence
+        remaining = settle_deadline - time.monotonic()
+        if remaining <= 0:
+            return evidence
+        try:
+            frame = await client.recv_event(
+                timeout=min(remaining, _HISTORY_SETTLE_EVENT_WAIT_SECONDS)
+            )
+        except TimeoutError:
+            continue
+        observation.consume(frame)
+
+
 async def _cancelled_webui_stop_count(
     client: GatewayRPCClient,
     *,
@@ -935,11 +973,22 @@ async def _send_and_observe(
                 raise TimeoutError("live turn exceeded its case timeout")
             frame = await client.recv_event(timeout=min(remaining, 30.0))
             observation.consume(frame)
-        assistant_bytes, assistant_markers, _, _ = await _history_evidence(
-            client,
-            session_key=session_key,
-            assistant_marker=marker,
-        )
+        if observation.completed and observation.marker_seen_in_stream:
+            assistant_bytes, assistant_markers, _, _ = (
+                await _wait_for_assistant_history_evidence(
+                    client,
+                    observation,
+                    session_key=session_key,
+                    assistant_marker=marker,
+                    deadline=deadline,
+                )
+            )
+        else:
+            assistant_bytes, assistant_markers, _, _ = await _history_evidence(
+                client,
+                session_key=session_key,
+                assistant_marker=marker,
+            )
         return observation, assistant_bytes, assistant_markers
     finally:
         await client.close()

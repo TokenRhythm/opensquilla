@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from opensquilla.artifact_session import (
+    ArtifactCandidateLoopController,
     ArtifactMutationAttemptController,
     ArtifactSessionService,
 )
@@ -77,7 +78,7 @@ def test_prompt_annotation_turn_gets_exclusive_tool_ceiling() -> None:
     assert result.artifact_mutation_attempt_controller is None
 
 
-def test_accepted_prompt_annotation_turn_gets_single_writer_controller() -> None:
+def test_accepted_prompt_annotation_turn_gets_candidate_loop_controller() -> None:
     envelope = build_web_route_envelope(session_key="agent:main:web")
     context = _prompt_annotation_context()
     service = ArtifactSessionService(repository=object())  # type: ignore[arg-type]
@@ -91,10 +92,8 @@ def test_accepted_prompt_annotation_turn_gets_single_writer_controller() -> None
 
     result = tool_context_from_envelope(envelope, is_owner=True)
 
-    assert isinstance(
-        result.artifact_mutation_attempt_controller,
-        ArtifactMutationAttemptController,
-    )
+    assert isinstance(result.artifact_candidate_loop_controller, ArtifactCandidateLoopController)
+    assert result.artifact_mutation_attempt_controller is None
     assert result.turn_cleanup_callbacks == []
     registry_for_context(result)
     assert len(result.turn_cleanup_callbacks) == 1

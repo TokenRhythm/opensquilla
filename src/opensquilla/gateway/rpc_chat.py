@@ -283,6 +283,18 @@ async def _chat_history_turn_outcomes(
         )
         if projection is None:
             continue
+        projection = dict(projection)
+        projected_snapshot = projection.get("activity_snapshot")
+        if projected_snapshot is not None:
+            validated_snapshot = terminal_activity_snapshot(
+                projected_snapshot,
+                task_id=str(projection.get("task_id") or turn_id),
+                turn_id=turn_id,
+            )
+            if validated_snapshot is None:
+                projection.pop("activity_snapshot", None)
+            else:
+                projection["activity_snapshot"] = validated_snapshot
         previous = outcomes_by_turn.get(turn_id)
         if previous is not None and previous != projection:
             outcomes_by_turn.pop(turn_id, None)
@@ -423,6 +435,13 @@ async def _chat_history_turn_outcomes(
             accepted_mode = str(accepted_routing.get("effective_mode") or "").strip().lower()
             if accepted_mode in {"direct", "router", "ensemble"}:
                 projected["accepted_routing_mode"] = accepted_mode
+        snapshot = terminal_activity_snapshot(
+            details.get("activity_snapshot"),
+            task_id=str(task_id or turn_id),
+            turn_id=turn_id,
+        )
+        if snapshot is not None:
+            projected["activity_snapshot"] = snapshot
         error_class = getattr(row, "error_class", None)
         if is_usage_accounting_barrier(error_class):
             if outcome is None:
@@ -460,13 +479,6 @@ async def _chat_history_turn_outcomes(
             retry_after_ms = safe_retry_after_ms(details.get("retry_after_ms"))
             if retry_after_ms is not None:
                 projected["retry_after_ms"] = retry_after_ms
-            snapshot = terminal_activity_snapshot(
-                details.get("activity_snapshot"),
-                task_id=str(task_id or turn_id),
-                turn_id=turn_id,
-            )
-            if snapshot is not None:
-                projected["activity_snapshot"] = snapshot
     for turn_id, attempt in attempts_by_turn_id.items():
         existing = outcomes_by_turn.get(turn_id)
         if existing is not None:

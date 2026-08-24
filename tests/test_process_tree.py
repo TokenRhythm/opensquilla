@@ -48,6 +48,105 @@ def _synthetic_owner_reference(
     )
 
 
+@pytest.mark.parametrize(
+    ("frozen", "expected_prefix"),
+    [
+        (False, ("/synthetic/python", "-m", "opensquilla.process_tree")),
+        (True, ("/synthetic/gateway", "--internal-child", "process-tree")),
+    ],
+)
+def test_process_tree_child_argv_is_fixed_for_source_and_frozen_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    frozen: bool,
+    expected_prefix: tuple[str, ...],
+) -> None:
+    executable = "/synthetic/gateway" if frozen else "/synthetic/python"
+    monkeypatch.setattr(process_tree.sys, "executable", executable)
+    monkeypatch.setattr(process_tree.sys, "frozen", frozen, raising=False)
+
+    argv = process_tree._process_tree_child_argv(
+        "--windows-owned-launch",
+        "gate",
+        "ready",
+        "--",
+        "cmd",
+    )
+
+    assert argv == (
+        *expected_prefix,
+        "--windows-owned-launch",
+        "gate",
+        "ready",
+        "--",
+        "cmd",
+    )
+
+
+def test_windows_frozen_helper_ready_wait_is_extended_and_retried_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    delays: list[float] = []
+
+    class Gate:
+        def wait_ready(self, timeout: float) -> None:
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise TimeoutError("synthetic cold start")
+
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    process_tree._wait_for_windows_helper_ready(Gate())
+
+    assert waits == [5.0, 5.0]
+    assert delays == [0.25]
+
+
+def test_windows_frozen_helper_ready_wait_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    delays: list[float] = []
+
+    class Gate:
+        def wait_ready(self, timeout: float) -> None:
+            waits.append(timeout)
+            raise TimeoutError("synthetic frozen timeout")
+
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    with pytest.raises(TimeoutError, match="frozen timeout"):
+        process_tree._wait_for_windows_helper_ready(Gate())
+
+    assert waits == [5.0, 5.0]
+    assert delays == [0.25]
+
+
+def test_windows_source_helper_ready_timeout_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+
+    class Gate:
+        def wait_ready(self, timeout: float) -> None:
+            waits.append(timeout)
+            raise TimeoutError("synthetic source timeout")
+
+    monkeypatch.delattr(process_tree.sys, "frozen", raising=False)
+    monkeypatch.setattr(
+        process_tree.time,
+        "sleep",
+        lambda _delay: pytest.fail("source helper readiness must not retry"),
+    )
+
+    with pytest.raises(TimeoutError, match="source timeout"):
+        process_tree._wait_for_windows_helper_ready(Gate())
+
+    assert waits == [2.0]
+
+
 @pytest.mark.asyncio
 async def test_posix_anchor_creation_waits_for_ready(
     monkeypatch: pytest.MonkeyPatch,
@@ -1274,6 +1373,42 @@ async def test_windows_owned_launch_boots_helper_with_restricted_target_env() ->
 
     assert process.returncode == 0, stderr.decode(errors="replace")
     assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native packaged Windows Gateway")
+@pytest.mark.asyncio
+async def test_windows_packaged_gateway_first_exec_command(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = os.environ.get("OPENSQUILLA_PACKAGED_GATEWAY_BINARY", "")
+    if not gateway or not os.path.isfile(gateway):
+        pytest.skip("requires OPENSQUILLA_PACKAGED_GATEWAY_BINARY")
+
+    from opensquilla.tools.builtin import shell
+    from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+
+    monkeypatch.setattr(process_tree.sys, "executable", gateway)
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            session_key="packaged-first-exec-command",
+            run_mode="full",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    try:
+        result = await shell.exec_command(
+            "Write-Output opensquilla-packaged-first-exec-ok",
+            workdir=str(tmp_path),
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "exit_code=0" in result
+    assert "opensquilla-packaged-first-exec-ok" in result
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job crash semantics")

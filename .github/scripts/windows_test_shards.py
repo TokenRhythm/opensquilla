@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator
@@ -669,6 +670,44 @@ def _combined_pytest_exit_code(
     return 0
 
 
+def _run_pytest_subprocess(root: Path, pytest_args: list[str], *, phase: str) -> int:
+    """Run a pytest phase in a fresh interpreter and report its duration.
+
+    The shard deliberately has a parallel and a serial phase.  Calling
+    ``pytest.main`` twice in this controller process lets process-wide state
+    (notably structlog lazy logger bindings and plugin registries) leak from
+    one phase into the other.  A fresh interpreter keeps the phase boundary
+    real while preserving the same working tree and environment.
+    """
+
+    environment = os.environ.copy()
+    root_text = str(root)
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (root_text, existing_pythonpath) if value
+    )
+    started_at = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", *pytest_args],
+        cwd=root,
+        env=environment,
+        check=False,
+    )
+    elapsed = time.monotonic() - started_at
+    print(f"{phase} pytest phase finished with exit={result.returncode} in {elapsed:.2f}s")
+    return int(result.returncode)
+
+
+@contextmanager
+def _pytest_file_selection_arg(files: tuple[str, ...]) -> Iterator[str]:
+    """Keep the selected test files out of Windows' bounded command line."""
+
+    with tempfile.TemporaryDirectory(prefix="opensquilla-pytest-args-") as temp_dir:
+        argfile = Path(temp_dir) / "test-files.txt"
+        argfile.write_text("\n".join(files) + "\n", encoding="utf-8")
+        yield f"@{argfile}"
+
+
 def _pytest_phase_inputs(
     raw_args: list[str],
 ) -> tuple[list[str], str | None]:
@@ -852,7 +891,6 @@ def _run(args: argparse.Namespace) -> int:
         )
 
     pytest_args, marker_expression = _pytest_phase_inputs(args.pytest_args)
-    file_args = [str(root / path) for path in files]
     parallel_junit = _phase_junit_path(args.junit, "parallel")
     serial_junit = _phase_junit_path(args.junit, "serial")
     runner_error_junit = _phase_junit_path(args.junit, "runner-error")
@@ -869,7 +907,10 @@ def _run(args: argparse.Namespace) -> int:
     parallel_exit_code: int | None = None
     raw_serial_exit_code: int | None = None
     try:
-        with _prebuilt_core_wheel_environment(root, files):
+        with (
+            _prebuilt_core_wheel_environment(root, files),
+            _pytest_file_selection_arg(files) as file_selection_arg,
+        ):
             parallel_args = [
                 *pytest_args,
                 "-m",
@@ -878,24 +919,35 @@ def _run(args: argparse.Namespace) -> int:
                 str(args.workers),
                 "--dist",
                 "loadfile",
-                *file_args,
+                file_selection_arg,
                 f"--junitxml={parallel_junit}",
             ]
             print(
                 f"Running parallel bulk phase with {args.workers} workers "
                 "(--dist loadfile; excludes ci_serial)"
             )
-            parallel_exit_code = int(pytest.main(parallel_args))
+            parallel_exit_code = _run_pytest_subprocess(
+                root,
+                parallel_args,
+                phase="parallel",
+            )
 
             serial_args = [
                 *pytest_args,
                 "-m",
                 _phase_marker(marker_expression, "ci_serial"),
-                *file_args,
+                file_selection_arg,
                 f"--junitxml={serial_junit}",
             ]
-            print("Running serial phase in the controller process (ci_serial only)")
-            raw_serial_exit_code = int(pytest.main(serial_args))
+            print(
+                "Running serial phase in the controller process "
+                "(fresh subprocess; ci_serial only)"
+            )
+            raw_serial_exit_code = _run_pytest_subprocess(
+                root,
+                serial_args,
+                phase="serial",
+            )
     except (
         ImportError,
         OSError,

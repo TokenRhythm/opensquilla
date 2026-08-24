@@ -490,6 +490,21 @@ class ModelSelector:
         self._index = next_index
         return provider
 
+    def next_fallback_matching(
+        self,
+        *,
+        predicate: Callable[[ProviderConfig], bool],
+    ) -> LLMProvider:
+        """Atomically advance to the first matching static fallback."""
+
+        current = self._chain[self._index]
+        matching_chain = [
+            candidate
+            for candidate in self._chain[self._index + 1 :]
+            if predicate(candidate)
+        ]
+        return self._activate_fallback_chain(current, matching_chain)
+
     def _fallback_chain_after_failure(
         self,
         primary_failure: Exception,

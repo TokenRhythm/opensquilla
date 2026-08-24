@@ -38,6 +38,10 @@ import {
 } from '@/composables/chat/sessionBootstrapContract'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import {
+  activityReasoningBlocks,
+  activitySnapshotMatchesMessage,
+} from '@/utils/chat/activitySnapshot'
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
@@ -380,6 +384,22 @@ function attachHistoryTurnOutcomes(
   const enriched = messages.map(message => {
     const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
     if (!outcome) return message
+    const activitySnapshot = message.role === 'assistant'
+      ? outcome.activitySnapshot
+      : undefined
+    const snapshotReasoningBlocks = activitySnapshot?.complete
+      ? activityReasoningBlocks(activitySnapshot, message.reasoning?.text ?? '')
+      : undefined
+    const activitySnapshotComplete = Boolean(
+      activitySnapshot?.complete
+      && snapshotReasoningBlocks !== undefined
+      && activitySnapshotMatchesMessage(activitySnapshot, message),
+    )
+    const acceptedActivitySnapshot = activitySnapshot
+      ? activitySnapshotComplete
+        ? activitySnapshot
+        : { ...activitySnapshot, complete: false }
+      : undefined
     const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
     const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass))
       && message.role === 'system'
@@ -398,7 +418,18 @@ function attachHistoryTurnOutcomes(
             terminalNotice: true,
           }
         : {}),
-      ...(message.role === 'assistant' && outcome.statusHistory?.length
+      ...(message.role === 'assistant' && acceptedActivitySnapshot
+        ? {
+            activitySnapshot: acceptedActivitySnapshot,
+            activitySnapshotIncomplete: !activitySnapshotComplete,
+            ...(activitySnapshotComplete
+              ? {
+                  statusHistory: (outcome.statusHistory || []).map(entry => ({ ...entry })),
+                  reasoningBlocks: snapshotReasoningBlocks?.map(block => ({ ...block })),
+                }
+              : {}),
+          }
+        : message.role === 'assistant' && outcome.statusHistory?.length
         ? {
             statusHistory: [
               ...(message.statusHistory || []),
@@ -618,6 +649,8 @@ export interface UseChatHistoryOptions {
   lastHeaderDay: Ref<string>
   preserveLiveTail?: Ref<boolean>
   autoScroll?: Ref<boolean>
+  /** Invalidates deferred anchor work when the reused chat viewport changes session. */
+  scrollEpoch?: Ref<number>
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
 }
@@ -743,7 +776,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): ChatMessage {
     // History rows carry the turn's reasoning text but not the measured
     // thinking duration; live turn records re-fill seconds after sync.
-    const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
+    const rawReasoningText = typeof msg.reasoning_content === 'string'
+      ? msg.reasoning_content
+      : ''
+    // v2 reasoning entries address the canonical transcript in UTF-16 units.
+    // Use trim only to decide whether the field is empty; never shift a valid
+    // snapshot's offsets by rewriting its leading or trailing whitespace.
+    const reasoningText = rawReasoningText.trim() ? rawReasoningText : ''
     const messageId = msg.message_id || msg.id || ''
     const steerContext = historyHasSteerEvidence(msg.turn_context)
     const turnProvenance = historyTurnPresentationProvenance(msg.turn_context)
@@ -906,6 +945,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
+    const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
     cancelAnchorStabilization()
     const historyStateBeforeLoad = historyState.value
@@ -933,7 +973,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         recoveryError: params.prepend ? historyState.value.recoveryError : false,
       }
     }
-    const isCurrentRequest = () => key === options.sessionKey.value && requestSeq === historyRequestSeq
+    const isCurrentRequest = () => (
+      key === options.sessionKey.value
+      && requestSeq === historyRequestSeq
+      && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
+    )
     const restoreSilentBackgroundState = () => {
       failedHistoryRequest = failedHistoryRequestBeforeLoad
       historyState.value = historyStateBeforeLoad
@@ -1239,12 +1283,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       if (params.prepend) {
         await nextTick()
+        if (!isCurrentRequest()) return { ok: false, cancelled: true }
         if (prependAnchor) {
           restoreMessageAnchor(prependAnchor)
           stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
             isCurrent: () => options.sessionKey.value === key
               && historySessionKey.value === key
-              && historyRequestSeq === requestSeq,
+              && historyRequestSeq === requestSeq
+              && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
+              && options.threadRef?.value === prependContainer,
           })
         } else if (prependContainer) {
           applyProgrammaticScroll(prependContainer, () => {

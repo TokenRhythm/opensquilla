@@ -152,6 +152,20 @@ async function bootElapsedSeconds(page) {
   return Number(match[1])
 }
 
+async function waitForBootProgress(page, expected) {
+  return await waitFor(async () => {
+    const progress = page.locator('#startupProgress')
+    const value = Number(await progress.getAttribute('aria-valuenow'))
+    const count = (await page.locator('#progressCount').innerText()).trim()
+    const width = await progress.evaluate((element) => (
+      element.style.getPropertyValue('--boot-progress').trim()
+    ))
+    return value === expected && count === `${expected}/4`
+      ? { value, count, width }
+      : null
+  }, `boot progress to reach ${expected}/4`)
+}
+
 function boxesOverlap(left, right) {
   return left.x < right.x + right.width
     && left.x + left.width > right.x
@@ -185,11 +199,34 @@ async function verifyBootPhaseTimer(app) {
   const page = await bootWindow(app)
   const phase = page.locator('#phase')
   const timer = page.locator('#timer')
+  const progress = page.locator('#startupProgress')
   assert.equal(await phase.getAttribute('role'), 'status')
   assert.equal(await phase.getAttribute('aria-live'), 'polite')
   assert.equal(await phase.getAttribute('aria-atomic'), 'true')
   assert.equal(await timer.getAttribute('aria-hidden'), 'true')
   assert.equal(await page.locator('section.status').getAttribute('aria-live'), null)
+  assert.equal(await progress.getAttribute('role'), 'progressbar')
+  assert.equal(await progress.getAttribute('aria-labelledby'), 'phase')
+  assert.equal(await progress.getAttribute('aria-valuemin'), '0')
+  assert.equal(await progress.getAttribute('aria-valuemax'), '4')
+
+  const stateBeforeReload = await page.evaluate(async () => (
+    await window.opensquillaDesktop.getBootState()
+  ))
+  const persistedProgress = {
+    profile: 0,
+    'gateway-start': 1,
+    'gateway-health': 2,
+    control: 3,
+    ready: 4,
+  }[stateBeforeReload?.status?.phaseId] ?? 0
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await waitForBootProgress(page, persistedProgress)
+  await waitFor(async () => (
+    (await phase.innerText()).trim() === String(stateBeforeReload?.status?.label || '').trim()
+      ? true
+      : null
+  ), 'boot progress snapshot to restore after a splash reload')
 
   const staleStatus = {
     phaseId: 'gateway-start',
@@ -197,6 +234,7 @@ async function verifyBootPhaseTimer(app) {
     at: new Date(Date.now() - 3_000).toISOString(),
   }
   await sendBootEvent(app, 'desktop:boot:status', staleStatus)
+  assert.equal((await waitForBootProgress(page, 1)).width, '25%')
   const anchoredElapsed = await waitFor(async () => {
     const value = await bootElapsedSeconds(page)
     return value >= 2 ? value : null
@@ -208,6 +246,7 @@ async function verifyBootPhaseTimer(app) {
     at: new Date().toISOString(),
   }
   await sendBootEvent(app, 'desktop:boot:status', activeStatus)
+  assert.equal((await waitForBootProgress(page, 2)).width, '50%')
   const resetElapsed = await waitFor(async () => {
     const value = await bootElapsedSeconds(page)
     return value < anchoredElapsed - 1 ? value : null
@@ -237,6 +276,7 @@ async function verifyBootPhaseTimer(app) {
     label: invalidTimestampLabel,
     at: 'not-a-date',
   })
+  await waitForBootProgress(page, 2)
   const invalidTimestampValue = await waitFor(async () => {
     if ((await phase.innerText()).trim() !== invalidTimestampLabel) return null
     const value = await bootElapsedSeconds(page)
@@ -250,6 +290,7 @@ async function verifyBootPhaseTimer(app) {
     label: futureTimestampLabel,
     at: new Date(Date.now() + 60_000).toISOString(),
   })
+  assert.equal((await waitForBootProgress(page, 3)).width, '75%')
   const futureTimestampValue = await waitFor(async () => {
     if ((await phase.innerText()).trim() !== futureTimestampLabel) return null
     const value = await bootElapsedSeconds(page)
@@ -257,22 +298,47 @@ async function verifyBootPhaseTimer(app) {
   }, 'future boot timestamp to clamp near zero')
   assert.ok(futureTimestampValue.value >= 0 && futureTimestampValue.value < 2)
 
+  const activeStepBeforeUnknown = await page.locator('.step.active').getAttribute('data-step')
+  await sendBootEvent(app, 'desktop:boot:status', {
+    phaseId: 'future-phase',
+    label: 'Synthetic future phase',
+    at: new Date().toISOString(),
+  })
+  await waitFor(async () => (
+    (await phase.innerText()).trim() === 'Synthetic future phase' ? true : null
+  ), 'unknown boot phase label to render')
+  await waitForBootProgress(page, 3)
+  assert.equal(
+    await page.locator('.step.active').getAttribute('data-step'),
+    activeStepBeforeUnknown,
+    'an unknown phase must not move the visible milestone state',
+  )
+
+  await sendBootEvent(app, 'desktop:boot:status', {
+    phaseId: 'ready',
+    label: 'Synthetic ready',
+    at: new Date().toISOString(),
+  })
+  assert.equal((await waitForBootProgress(page, 4)).width, '100%')
+
   await sendBootEvent(app, 'desktop:boot:error', { message: 'Synthetic boot pause.' })
   await delay(150)
   const frozenText = await timer.innerText()
   await delay(350)
   assert.equal(await timer.innerText(), frozenText, 'boot errors must freeze the elapsed timer')
+  await waitForBootProgress(page, 4)
 
   await sendBootEvent(app, 'desktop:boot:status', {
     phaseId: 'profile',
     label: 'Synthetic retry',
     at: new Date().toISOString(),
   })
+  await waitForBootProgress(page, 0)
   await delay(350)
   assert.notEqual(await timer.innerText(), frozenText, 'a new retry status must resume phase timing')
 }
 
-async function launchIsolatedOnboarding(prefix, gatewayPort) {
+async function launchIsolatedOnboarding(prefix) {
   const userDataRoot = await mkdtemp(join(tmpdir(), prefix))
   const userDataDir = join(userDataRoot, 'chromium-user-data')
   const isolatedHome = join(userDataRoot, 'home')
@@ -289,7 +355,6 @@ async function launchIsolatedOnboarding(prefix, gatewayPort) {
       USERPROFILE: isolatedHome,
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
-      OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(gatewayPort),
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION: '',
       LANG: 'en_US.UTF-8',
@@ -419,7 +484,6 @@ async function assertSubmitRestored(
 async function verifySubmitFeedbackAndSingleFlight() {
   const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
     'opensquilla-electron-onboarding-submit-test-',
-    18896,
   )
   try {
     const page = await setupWindow(app)
@@ -549,7 +613,6 @@ await verifySubmitFeedbackAndSingleFlight()
 
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
   'opensquilla-electron-onboarding-test-',
-  18897,
 )
 const rendererDiagnostics = []
 const observeRenderer = (candidate) => {

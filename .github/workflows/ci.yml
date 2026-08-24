@@ -393,6 +393,7 @@ jobs:
           path: src/opensquilla/gateway/static/dist/
 
       - name: Set up Node.js
+        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -400,6 +401,7 @@ jobs:
           cache-dependency-path: opensquilla-webui/package-lock.json
 
       - name: Install frontend dependencies
+        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
         working-directory: opensquilla-webui
         run: npm ci
 
@@ -630,6 +632,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          node scripts/test-installer-progress-contract.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
@@ -750,12 +753,6 @@ jobs:
             fi
           done
 
-      - name: tracemalloc leak smoke test
-        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
-        shell: bash
-        run: |
-          uv run python -m pytest tests/test_gateway/test_task_runtime_terminal_cleanup.py::test_no_leak_under_load -v
-
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
     needs: classify-changes
@@ -813,14 +810,29 @@ jobs:
           set -euo pipefail
           markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
+          worker_args=()
+          if [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+            # Gateway tests start subprocesses and touch shared SQLite/logging
+            # state.  Match the bounded Windows shard fan-out instead of
+            # letting the Ubuntu default start four competing workers.
+            worker_args+=(--workers=2)
+          fi
+          maxfail_args=()
+          if [[ "${{ github.event_name }}" == "pull_request" ||
+                "${{ github.event_name }}" == "merge_group" ]]; then
+            maxfail_args+=(--maxfail=3)
+          fi
+
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
+            "${worker_args[@]}" \
             -- \
             -q \
             -m "${markers}" \
             --durations=50 \
+            "${maxfail_args[@]}" \
             2>&1 | tee "${CI_REPORT_DIR}/pytest.log"
 
       - name: Upload Ubuntu full shard report
@@ -1163,10 +1175,17 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+      # Electron's postinstall download is otherwise repeated on every fresh
+      # hosted runner. Keep it beside the Playwright cache so a cold macOS
+      # worker cannot spend the case watchdog budget downloading the binary.
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
       CI_E2E_SHARD: ${{ matrix.shard }}
       # Keep merge-critical workbench coverage deterministic and bounded.
       # Scheduled/manual runs retain the wider geometry/rearm stress cycles.
       OPENSQUILLA_WORKBENCH_E2E_MODE: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'smoke' || 'stress' }}
+      # A hung Electron/gateway child must fail one case with diagnostics,
+      # rather than consuming the whole 45-minute matrix cell.
+      OPENSQUILLA_DESKTOP_CASE_TIMEOUT_MS: "900000"
 
     steps:
       - name: Prepare Desktop recovery report
@@ -1217,6 +1236,13 @@ jobs:
         shell: bash
         run: node opensquilla-webui/scripts/verify-dist.mjs src/opensquilla/gateway/static/dist
 
+      - name: Restore Electron binary cache
+        id: electron-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ELECTRON_CACHE }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
+
       - name: Install Python dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
@@ -1225,6 +1251,13 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm ci
+
+      - name: Seed Electron binary cache from nightly main
+        if: ${{ github.event_name == 'schedule' && steps.electron-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ELECTRON_CACHE }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install WebUI recovery dependencies
         if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}

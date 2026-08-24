@@ -220,6 +220,8 @@ try {
   assert.equal(renewed.ok, true)
   assert.equal(renewed.ok && renewed.payload.lease_id, leaseId)
 
+  const releaseSurfacePin = broker.pinSurface(exactGrant)
+  assert.equal(typeof releaseSurfacePin?.release, 'function')
   const revoked = await broker.revoke({
     version: 1,
     leaseId,
@@ -227,8 +229,80 @@ try {
     authToken: 'synthetic-bearer',
   })
   assert.equal(revoked.ok, true)
+  assert.equal(revoked.status, 202)
+  assert.equal(broker.authorizesSurface(exactGrant), true)
+  await releaseSurfacePin.release()
   assert.equal(broker.authorizesSurface(exactGrant), false)
   assert.equal(broker.resolveSurfaceArtifactId(exactGrant), null)
+
+  let replacementNow = Date.now()
+  let replacementSequence = 0
+  const replacementDeletes = []
+  const replacementBroker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => gatewayUrl,
+    now: () => replacementNow,
+    fetchImpl: async (input, init) => {
+      const url = new URL(String(input))
+      if (init?.method === 'DELETE') {
+        replacementDeletes.push(url.pathname)
+        return new Response(null, { status: 204 })
+      }
+      replacementSequence += 1
+      const token = String(replacementSequence).padStart(32, 'e')
+      const origin = `http://p-${token}.localhost:48721`
+      return new Response(JSON.stringify({
+        version: 1,
+        lease_id: `apl-replacement_${replacementSequence}`,
+        effective_mode: 'offline',
+        launch_url: `${origin}/index.html`,
+        entrypoint: 'index.html',
+        expires_at: new Date(
+          replacementNow + (replacementSequence === 1 ? 1_000 : 60 * 60 * 1_000),
+        ).toISOString(),
+        preview_origin: origin,
+        idle_timeout_seconds: 28_800,
+        source: {
+          kind: 'single_file',
+          collection_status: 'not_applicable',
+          file_count: 1,
+          total_bytes: 42,
+          warning_codes: [],
+        },
+      }), {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  const replacementCreated = await replacementBroker.create({
+    version: 1,
+    artifactId: 'art-replacement',
+    scopeId: `${scopeId}:replacement`,
+    mode: 'offline',
+  })
+  assert.equal(replacementCreated.ok, true)
+  const replacementOriginalGrant = {
+    launchUrl: replacementCreated.payload.launch_url,
+    expectedOrigin: replacementCreated.payload.preview_origin,
+    scopeId: `${scopeId}:replacement`,
+    mode: 'offline',
+  }
+  const replacementPin = replacementBroker.pinSurface(replacementOriginalGrant)
+  assert.ok(replacementPin)
+  replacementNow += 2_000
+  const recoveredGrant = await replacementPin.ensureCurrent()
+  assert.ok(recoveredGrant)
+  assert.notEqual(recoveredGrant.launchUrl, replacementOriginalGrant.launchUrl)
+  assert.equal(replacementSequence, 2)
+  const retiredRevoke = await replacementBroker.revoke({
+    version: 1,
+    leaseId: replacementCreated.payload.lease_id,
+    scopeId: `${scopeId}:replacement`,
+  })
+  assert.equal(retiredRevoke.ok, true)
+  assert.equal(retiredRevoke.status, 202)
+  await replacementPin.release()
+  assert.deepEqual(replacementDeletes, ['/api/v1/artifact-preview-leases/apl-replacement_2'])
 
   const denied = await broker.create({
     version: 1,

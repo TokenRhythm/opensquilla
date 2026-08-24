@@ -86,8 +86,23 @@
         />
       </button>
     </div>
-    <div v-else-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
-    <div v-else-if="item.type === 'interrupt'" class="run-trace__interrupt">
+    <div
+      v-else-if="item.type === 'text'"
+      class="msg-ai-text"
+      :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+      :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+      :data-activity-id="presentation === 'activity' ? item.key : undefined"
+      :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
+      v-html="item.html"
+    />
+    <div
+      v-else-if="item.type === 'interrupt'"
+      class="run-trace__interrupt"
+      :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+      :data-activity-type="presentation === 'activity' ? 'interrupt' : undefined"
+      :data-activity-id="presentation === 'activity' ? item.key : undefined"
+      :data-activity-order="presentation === 'activity' ? item.activityOrder : undefined"
+    >
       <slot name="interrupt" :part="item.part" />
     </div>
     <button
@@ -114,11 +129,11 @@
             type="button"
             class="tool-row tool-row--group"
             :data-op="item.group.operationKey"
-            :aria-expanded="groupOpen(item.group)"
+            :aria-expanded="groupHasDetails(item.group) ? groupOpen(item.group) : undefined"
             @click="toggleGroupDisclosure(item.group)"
           >
             <Icon
-              v-if="presentation === 'activity'"
+              v-if="presentation === 'activity' && groupHasDetails(item.group)"
               class="tool-row__activity-icon"
               :class="activityGroupIconClass(item.group)"
               :name="item.group.iconName"
@@ -131,9 +146,9 @@
                  secondary ("2 web actions"), so the raw call-count pill would
                  repeat it. -->
             <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
-            <span v-if="item.group.secondary" class="tool-row__arg">{{ item.group.secondary }}</span>
+            <span v-if="item.group.secondary && (!item.group.isRunning || groupOpen(item.group))" class="tool-row__arg">{{ item.group.secondary }}</span>
             <Icon
-              v-if="presentation === 'activity'"
+              v-if="presentation === 'activity' && groupHasDetails(item.group)"
               class="step-chevron tool-row__activity-arrow"
               name="chevronRight"
               :size="13"
@@ -142,7 +157,7 @@
             />
             <span class="tool-row__trailing">
               <span v-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
-              <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
+              <Icon v-if="presentation !== 'activity' && groupHasDetails(item.group)" class="step-chevron" name="chevronRight" :size="14" />
             </span>
           </button>
           <TransitionGroup
@@ -151,13 +166,21 @@
             tag="div"
             class="step-group-members"
           >
-            <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
+            <div
+              v-for="call in item.group.calls"
+              :key="call.renderKey"
+              class="tool-row-wrap"
+              :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+              :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+              :data-activity-id="presentation === 'activity' ? `tool:${call.toolId}` : undefined"
+              :data-activity-order="presentation === 'activity' ? call.activityOrder : undefined"
+            >
               <button
                 type="button"
                 class="tool-row tool-row--member"
                 :class="rowClass(call)"
                 :data-op="operationKey(call)"
-                :aria-expanded="callOpen(call)"
+                :aria-expanded="callHasDetails(call) ? callOpen(call) : undefined"
                 @click="toggleItemDisclosure(call)"
               >
                 <Icon
@@ -170,7 +193,7 @@
                 />
                 <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
                 <span class="tool-row__label tool-row__label--member">{{ call.displayName }}</span>
-                <span v-if="resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
+                <span v-if="(!call.isRunning || callOpen(call)) && resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
                 <Icon
                   v-if="presentation === 'activity' && callHasDetails(call)"
                   class="step-chevron tool-row__activity-arrow"
@@ -189,13 +212,13 @@
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                   <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
                   <Icon v-else-if="presentation !== 'activity' && iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
-                  <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
+                  <Icon v-if="presentation !== 'activity' && callHasDetails(call)" class="step-chevron" name="chevronRight" :size="14" />
                 </span>
               </button>
               <Transition name="activity-tool-detail" :css="presentation === 'activity'">
                 <div v-if="callOpen(call)" class="tool-row-body">
                   <ActivityToolDetails
-                    v-if="presentation === 'activity'"
+                    v-if="presentation === 'activity' || isDocumentCall(call)"
                     :call="call"
                     :label="call.displayName"
                     :operation-key="operationKey(call)"
@@ -213,13 +236,21 @@
           </TransitionGroup>
         </template>
         <template v-else>
-          <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
+          <div
+            v-for="call in item.group.calls"
+            :key="call.renderKey"
+            class="tool-row-wrap"
+            :data-activity-entry="presentation === 'activity' ? 'true' : undefined"
+            :data-activity-type="presentation === 'activity' ? 'segment' : undefined"
+            :data-activity-id="presentation === 'activity' ? `tool:${call.toolId}` : undefined"
+            :data-activity-order="presentation === 'activity' ? call.activityOrder : undefined"
+          >
             <button
               type="button"
               class="tool-row"
               :class="rowClass(call)"
               :data-op="operationKey(call)"
-              :aria-expanded="callOpen(call)"
+              :aria-expanded="callHasDetails(call) ? callOpen(call) : undefined"
               @click="toggleItemDisclosure(call)"
             >
               <Icon
@@ -232,7 +263,7 @@
               />
               <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
               <span class="tool-row__label">{{ item.group.label }}</span>
-              <span v-if="singleCallSecondary(item.group, call)" class="tool-row__arg">
+              <span v-if="(!call.isRunning || callOpen(call)) && singleCallSecondary(item.group, call)" class="tool-row__arg">
                 {{ singleCallSecondary(item.group, call) }}
               </span>
               <Icon
@@ -249,13 +280,13 @@
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                 <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
                 <Icon v-else-if="presentation !== 'activity' && iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
-                <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
+                <Icon v-if="presentation !== 'activity' && callHasDetails(call)" class="step-chevron" name="chevronRight" :size="14" />
               </span>
             </button>
             <Transition name="activity-tool-detail" :css="presentation === 'activity'">
               <div v-if="callOpen(call)" class="tool-row-body">
                 <ActivityToolDetails
-                  v-if="presentation === 'activity'"
+                  v-if="presentation === 'activity' || isDocumentCall(call)"
                   :call="call"
                   :label="item.group.label"
                   :operation-key="operationKey(call)"
@@ -579,6 +610,7 @@ import type {
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import {
   toolGroupStatusText as defaultToolGroupStatusText,
+  isDocumentAgentToolName,
   toolSecondaryText as defaultToolSecondaryText,
   toolStatusText as defaultToolStatusText,
   toolIconName,
@@ -589,6 +621,7 @@ import { toolState } from '@/utils/chat/toParts'
 import { composeTree, statusVisual, type StatusVisual } from '@/components/run/runTrace'
 import { copyTextWithFallback } from '@/utils/browser'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
+import { hasActivityToolDetail } from '@/utils/chat/activityToolDetails'
 
 const { t } = useI18n()
 const { mode: toolDetailDisplayMode } = useToolDetailPreference()
@@ -759,7 +792,8 @@ function withoutFailedActivityRows(
 
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
+    const documentAgentGroup = item.group.operationKey.startsWith('document.')
+      || isDocumentAgentToolName(item.group.operationKey)
 
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
@@ -769,22 +803,27 @@ function withoutFailedActivityRows(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
-      && !documentApplyGroup
+      && !documentAgentGroup
     ) {
       return []
     }
 
+    const groupLevelWriterError = documentAgentGroup
+      && (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
     const calls = item.group.calls.filter(
       call => (
         (!call.isError && call.status !== 'error')
-        || isDocumentApplyToolName(call.name)
+        || isDocumentAgentToolName(call.name)
       ),
-    )
+    ).map(call => groupLevelWriterError
+      ? { ...call, isError: true, status: 'error' as const }
+      : call)
     if (calls.length === 0) return []
 
     const isRunning = calls.some(call => call.isRunning)
     const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
+      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
@@ -802,13 +841,6 @@ function withoutFailedActivityRows(
       },
     }]
   })
-}
-
-function isDocumentApplyToolName(value: string | undefined): boolean {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (!normalized) return false
-  const segments = normalized.split(/[.:/]/)
-  return segments[segments.length - 1] === 'document_apply'
 }
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
@@ -1049,6 +1081,11 @@ function operationKey(call: ChatToolCallRenderItem): string {
   return toolOperationKey(call.name)
 }
 
+function isDocumentCall(call: ChatToolCallRenderItem): boolean {
+  const key = operationKey(call)
+  return key === 'document.read' || key === 'document.update'
+}
+
 function callDefaultOpen(call: ChatToolCallRenderItem): boolean {
   if (call.isError || call.status === 'error') return true
   if (props.presentation === 'activity') return false
@@ -1058,6 +1095,7 @@ function callDefaultOpen(call: ChatToolCallRenderItem): boolean {
 }
 
 function callOpen(call: ChatToolCallRenderItem): boolean {
+  if (!callHasDetails(call)) return false
   // A recorded toggle inverts the default, so error auto-expand still honors
   // an explicit user collapse.
   return callDefaultOpen(call) !== isItemOpen(itemStateId(call.renderKey))
@@ -1076,6 +1114,7 @@ function itemStateId(renderKey: string): string {
 }
 
 function groupOpen(group: ChatToolCallGroup): boolean {
+  if (!groupHasDetails(group)) return false
   return groupDefaultOpen(group) !== isGroupOpen(groupStateId(group.groupId))
 }
 
@@ -1097,10 +1136,12 @@ function toggleTargetOverride(target: DefaultOpenTarget) {
 }
 
 function toggleGroupDisclosure(group: ChatToolCallGroup) {
+  if (!groupHasDetails(group)) return
   emit('toggleGroup', groupStateId(group.groupId))
 }
 
 function toggleItemDisclosure(call: ChatToolCallRenderItem) {
+  if (!callHasDetails(call)) return
   emit('toggleItem', itemStateId(call.renderKey))
 }
 
@@ -1157,12 +1198,19 @@ function activityGroupIconClass(group: ChatToolCallGroup) {
 }
 
 function callHasDetails(call: ChatToolCallRenderItem): boolean {
+  if (props.presentation === 'activity' || isDocumentCall(call)) {
+    return hasActivityToolDetail(call, operationKey(call))
+  }
   return Boolean(
     call.inputRaw
     || call.inputPreview
     || call.result
     || call.resultPreview,
   )
+}
+
+function groupHasDetails(group: ChatToolCallGroup): boolean {
+  return group.calls.some(callHasDetails)
 }
 
 function showGroupStatus(group: ChatToolCallGroup): boolean {
@@ -1220,6 +1268,8 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
 }
 
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
+  const key = toolOperationKey(context?.toolName || '')
+  if (key === 'document.read' || key === 'document.update') return
   emit('showResult', content, title, context)
 }
 

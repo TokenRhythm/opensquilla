@@ -33,6 +33,7 @@ validate_assignment_payload = SHARD_MODULE["validate_assignment_payload"]
 validated_files_for_shard = SHARD_MODULE["validated_files_for_shard"]
 requires_isolated_core_wheel = SHARD_MODULE["_requires_isolated_core_wheel"]
 combined_pytest_exit_code = SHARD_MODULE["_combined_pytest_exit_code"]
+pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
 OFFLINE_MARKER_EXCLUSIONS = {
     "tests/functional/test_agent_synthetic_golden.py",
@@ -68,6 +69,9 @@ OFFLINE_MARKER_EXCLUSIONS = {
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_ci/test_plan_ci.py",
+    "tests/test_git_runtime.py",
+    "tests/test_tools/test_gitless_write_tracking.py",
     "tests/test_gateway/test_artifact_product_errors.py",
     "tests/test_scripts/test_bench_skill_integrity.py",
     "tests/test_skills_hash_consumers.py",
@@ -235,6 +239,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
+    "tests/test_artifact_session/test_candidate_loop.py",
+    "tests/test_tools/test_document_browser_identity.py",
 }
 
 
@@ -812,6 +818,20 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert "serial_pytest_exit_code=5" in text
     assert "junit_status=failed" in text
     assert "synthetic shard failure" in text
+
+
+def test_windows_shard_runner_uses_argfile_for_large_file_selection() -> None:
+    files = tuple(
+        f"tests/test_gateway/test_long_windows_selection_{index:04d}.py"
+        for index in range(600)
+    )
+
+    with pytest_file_selection_arg(files) as selection_arg:
+        argfile = Path(selection_arg.removeprefix("@"))
+        assert len(selection_arg) < 260
+        assert argfile.read_text(encoding="utf-8").splitlines() == list(files)
+
+    assert not argfile.exists()
 
 
 def test_windows_shard_runner_accepts_parallel_no_tests_when_serial_passes(

@@ -14,7 +14,7 @@ import type {
  * by `appendFrame` as a monotonic append index (seq-less frames are ordered
  * by arrival), used only for ordering/dedup — never for gating.
  */
-export type Frame =
+type FrameBody =
   | {
       kind: 'text'
       seq: number
@@ -87,6 +87,11 @@ export type Frame =
       reason?: string
     }
 
+export type Frame = FrameBody & {
+  /** Authoritative Gateway stream position for cross-refresh chronology. */
+  activityOrder?: number
+}
+
 /** A frame as emitted by a mutator; `appendFrame` stamps the `seq` index. */
 export type FrameInput =
   | Omit<Extract<Frame, { kind: 'text' }>, 'seq'>
@@ -112,4 +117,6 @@ export interface ReasoningBlock {
   startedAt: number
   endedAt?: number
   contentKind: 'summary' | 'reasoning'
+  /** First accepted event position for interleaving with phases and tools. */
+  activityOrder?: number
 }

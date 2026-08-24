@@ -116,6 +116,7 @@ import {
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
+  type NativeWorkbenchCandidatePreviewBinding,
 } from './native-workbench-surface.js'
 import {
   parseNativeWorkbenchAnnotationModeRequest,
@@ -418,6 +419,19 @@ interface BootStatus {
 interface BootError {
   message: string
   at: string
+  code?: BootErrorCode
+}
+
+type BootErrorCode = 'keychain_unavailable'
+
+class DesktopStartupError extends Error {
+  constructor(
+    readonly code: BootErrorCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'DesktopStartupError'
+  }
 }
 
 interface MacInstallContext {
@@ -662,6 +676,9 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
       : null
   ),
   getWindow: () => currentMainWindow(),
+  resolveCandidatePreview: resolveCandidatePreviewFromGateway,
+  releaseCandidatePreview: releaseCandidatePreviewFromGateway,
+  pinArtifactPreview: grant => artifactPreviewLeaseBroker.pinSurface(grant),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
@@ -681,6 +698,7 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
 })
 const desktopArtifactBridge = new DesktopArtifactBridge({
   getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
+  acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
 })
 const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
   desktopArtifactBridge,
@@ -693,6 +711,124 @@ const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport
     }),
   },
 )
+
+async function resolveCandidatePreviewFromGateway(
+  candidateHandle: string,
+  signal: AbortSignal,
+): Promise<NativeWorkbenchCandidatePreviewBinding> {
+  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
+    ? gatewayState.url
+    : null
+  const token = desktopArtifactBridgeLoopback.token()
+  if (!gatewayOrigin || !token) {
+    throw new Error('The Desktop candidate preview service is unavailable.')
+  }
+  const response = await fetch(
+    new URL('/api/v1/desktop-artifact-candidate-preview/resolve', gatewayOrigin),
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ version: 1, candidateHandle }),
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal,
+    },
+  )
+  const contentType = response.headers.get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase()
+  const declaredLength = response.headers.get('content-length')
+  if (
+    contentType !== 'application/json'
+    || (declaredLength !== null && (
+      !/^\d+$/.test(declaredLength)
+      || Number(declaredLength) > 1024 * 1024
+    ))
+  ) throw new Error('The Desktop candidate preview response is invalid.')
+  const text = await response.text()
+  if (!response.ok || text.length > 1024 * 1024) {
+    throw new Error('The Desktop candidate preview service rejected the request.')
+  }
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    throw new Error('The Desktop candidate preview response is invalid.')
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('The Desktop candidate preview response is invalid.')
+  }
+  const value = raw as Record<string, unknown>
+  const launchUrl = value.launch_url
+  const expectedOrigin = value.preview_origin
+  const candidateArtifactId = value.candidate_artifact_id
+  const leaseId = value.lease_id
+  const scopeId = value.scope_id
+  const effectiveMode = value.effective_mode
+  if (
+    typeof launchUrl !== 'string'
+    || typeof expectedOrigin !== 'string'
+    || typeof candidateArtifactId !== 'string'
+    || typeof leaseId !== 'string'
+    || typeof scopeId !== 'string'
+    || scopeId.length === 0
+    || scopeId.length > 512
+    || /[\u0000-\u001f\u007f]/.test(scopeId)
+    // Candidate previews are always rendered in the offline realm. Keep this
+    // check at the Gateway→Electron boundary as well as in the native surface
+    // so a compromised/stale response cannot widen browser-action authority.
+    || effectiveMode !== 'offline'
+    || value.candidate_handle !== candidateHandle
+  ) throw new Error('The Desktop candidate preview response is invalid.')
+  return {
+    candidateHandle,
+    candidateArtifactId,
+    leaseId,
+    launchUrl,
+    expectedOrigin,
+    scopeId,
+    mode: effectiveMode,
+  }
+}
+
+async function releaseCandidatePreviewFromGateway(
+  candidateHandle: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
+    ? gatewayState.url
+    : null
+  const token = desktopArtifactBridgeLoopback.token()
+  // A missing Gateway/bridge identity is not a successful restore.  Native
+  // cleanup callers may intentionally swallow this error during shutdown,
+  // while the interactive discard path must retain the candidate handle and
+  // retry instead of claiming that the canonical preview was restored.
+  if (!gatewayOrigin || !token) {
+    throw new Error('The Desktop candidate preview cleanup service is unavailable.')
+  }
+  const response = await fetch(
+    new URL(
+      `/api/v1/desktop-artifact-candidate-preview/${encodeURIComponent(candidateHandle)}`,
+      gatewayOrigin,
+    ),
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal,
+    },
+  )
+  if (!response.ok) {
+    throw new Error('The Desktop candidate preview cleanup was rejected.')
+  }
+}
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -1315,6 +1451,21 @@ function assertSupportedMacInstallLocation(): void {
   if (message) throw new Error(message)
 }
 
+const MAC_KEYCHAIN_ACCESS_PATHS = [
+  '/System/Library/CoreServices/Applications/Keychain Access.app',
+  '/Applications/Utilities/Keychain Access.app',
+] as const
+
+async function openMacKeychainAccess(): Promise<boolean> {
+  if (process.platform !== 'darwin') return false
+  for (const applicationPath of MAC_KEYCHAIN_ACCESS_PATHS) {
+    if (!existsSync(applicationPath)) continue
+    const error = await shell.openPath(applicationPath)
+    if (!error) return true
+  }
+  return false
+}
+
 function sendBootStatus(phaseId: BootPhaseId): void {
   bootStatus = { phaseId, label: desktopT('boot.' + phaseId), at: new Date().toISOString() }
   bootError = null
@@ -1326,6 +1477,7 @@ function sendBootError(error: unknown): void {
   bootError = {
     message: error instanceof Error ? error.message : String(error),
     at: new Date().toISOString(),
+    ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
   }
   mainWindow?.webContents.send('desktop:boot:error', bootError)
 }
@@ -2095,13 +2247,17 @@ function desktopSecretStorageBackend(): SecretEncryption {
   return secretStorageBackendCache
 }
 
+function invalidateSecretStorageBackendCache(): void {
+  secretStorageBackendCache = null
+}
+
 function encryptSecret(secret: string): { value: string; encryption: SecretEncryption } {
   const policyBackend = desktopSecretStoragePolicyBackend()
   const availableBackend = desktopSecretStorageBackend()
   if (policyBackend === 'safeStorage') {
     if (availableBackend !== 'safeStorage') {
       throw new Error(
-        'The OS keychain is unavailable. Unlock it and reopen OpenSquilla before saving credentials.'
+        'The OS keychain is unavailable. Unlock it and try saving credentials again.'
       )
     }
     try {
@@ -6604,7 +6760,8 @@ async function runOnboarding(): Promise<DesktopConnection> {
       || Boolean(existing?.encryptedApiKey && existing.encryption === 'safeStorage')
     )
   ) {
-    throw new Error(
+    throw new DesktopStartupError(
+      'keychain_unavailable',
       'OpenSquilla needs the OS keychain to read or safely adopt this credential, '
       + 'but the keychain is currently unavailable. Unlock it and reopen '
       + 'OpenSquilla, or use "Reset setup" to start over.'
@@ -8498,7 +8655,7 @@ async function startGateway(): Promise<GatewayState> {
     return gatewayState
   }
 
-  sendBootStatus('gateway-health')
+  sendBootStatus('profile')
   await recoverVerifiedOrphanGatewayBeforeSpawn()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 
@@ -13078,6 +13235,10 @@ async function performOnboardingSave(
         () => readPendingMigrationProviderSetup(),
       )
       credential = await telemetry.stage('settings_persist', async () => {
+        // Keychain availability may have changed while the onboarding window
+        // remained open. Re-check it on every save attempt instead of carrying
+        // a transient locked-keychain result across a user unlock.
+        invalidateSecretStorageBackendCache()
         if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
           return await saveImportedDesktopCredential(
             pendingMigration,
@@ -13372,6 +13533,11 @@ ipcMain.handle('desktop:boot:state', () => ({
   recovery: recoveryStateSnapshot(),
 }))
 
+ipcMain.handle('desktop:boot:open-keychain', async (event) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Keychain access request.')
+  return await openMacKeychainAccess()
+})
+
 interface BootResumeAuthority {
   child: ChildProcessWithoutNullStreams
   profileKey: string
@@ -13402,7 +13568,8 @@ function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
     && desktopOpenFlowRevision === authority.openFlowRevision
 }
 
-async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
+async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?: BootErrorCode }> {
+  invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
   bootError = null
@@ -13434,7 +13601,11 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
     // direct resume, an exit handler or a newer quit/reset/restart owns any
     // state after this exact child/profile/revision loses authority.
     if (pendingStart || !initialAuthority || !bootResumeAuthorityIsCurrent(initialAuthority)) {
-      return { ok: false, error: message }
+      return {
+        ok: false,
+        error: message,
+        ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
+      }
     }
     if (gatewayState.status !== 'ready') {
       gatewayState.status = 'error'
@@ -13461,6 +13632,7 @@ ipcMain.handle('desktop:boot:resume', async () => {
   }
 })
 ipcMain.handle('desktop:boot:retry', async () => {
+  invalidateSecretStorageBackendCache()
   // The Control UI "Restart runtime" action intentionally forces a new child.
   // The boot page uses desktop:boot:resume instead so a slow owned child can be
   // accepted after it becomes healthy instead of being torn down first.

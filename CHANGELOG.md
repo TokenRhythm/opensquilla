@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unset.
 ### Fixed
 
+- Desktop startup now shows monotonic, milestone-based progress without
+  estimating remaining time or changing recovery and Gateway startup behavior.
 - Stop now acknowledges immediately for provider and ordinary tool work while
   safely settling in-flight filesystem mutations before publishing a terminal
   turn. Late provider or tool results are discarded, timed-out writes retain

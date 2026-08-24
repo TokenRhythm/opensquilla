@@ -62,6 +62,8 @@ function createHarness(options: {
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
+    setAcceptedActivityOrder: vi.fn(),
+    setAcceptedActivityStartedAt: vi.fn(),
     recordCompactionActivity: vi.fn(),
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
@@ -527,8 +529,50 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
         id: 'tool-1',
       }))
       expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
+      expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(1, 10)
+      expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(2, 11)
+      expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(3, 12)
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('opens the reducer before accepting the first snapshot activity order', () => {
+    const { api, stream, stop } = createHarness()
+    let acceptedOrder: number | undefined
+    try {
+      stream.isStreaming.value = false
+      vi.mocked(stream.setAcceptedActivityOrder!).mockImplementation((order) => {
+        acceptedOrder = order
+      })
+      vi.mocked(stream.startStreaming).mockImplementation(() => {
+        // Mirror the real startStreaming reset: an order accepted before this
+        // point would be cleared with the previous turn log.
+        acceptedOrder = undefined
+        stream.isStreaming.value = true
+      })
+
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 4,
+        events: [{
+          event: 'session.event.provider_activity',
+          payload: {
+            session_key: 'agent:main:test',
+            task_id: 'task-live',
+            phase: 'requesting',
+            reason: 'initial',
+            stream_seq: 4,
+          },
+        }],
+      })
+
+      expect(stream.startStreaming).toHaveBeenCalledOnce()
+      expect(stream.setAcceptedActivityOrder).toHaveBeenCalledWith(4)
+      expect(acceptedOrder).toBe(4)
     } finally {
       stop()
     }
@@ -2247,6 +2291,59 @@ describe('useChatRpcEventHandlers terminal activity retention', () => {
       api.attachTurnReasoning()
 
       expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not reattach local phases over a complete terminal v2 snapshot', () => {
+    const liveHistory = [
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000, activityOrder: 2 },
+      { action: 'write:1', label: 'Writing', at: 4_000, activityOrder: 4 },
+      { action: 'write:2', label: 'Writing', at: 4_001, activityOrder: 4 },
+    ]
+    const durableHistory = [
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000, activityOrder: 2 },
+      { action: 'write:1', label: 'Writing', at: 4_000, activityOrder: 4 },
+    ]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: '2026-01-01T00:00:07.000Z',
+          statusHistory: liveHistory,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-terminal-v2',
+        text: 'answer',
+      })
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: '2026-01-01T00:00:07.000Z',
+        turnId: 'turn-terminal-v2',
+        restoredFromHistory: true,
+        statusHistory: durableHistory,
+        activitySnapshot: {
+          version: 2,
+          taskId: 'task-terminal-v2',
+          turnId: 'turn-terminal-v2',
+          complete: true,
+          entries: [],
+        },
+        activitySnapshotIncomplete: false,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.statusHistory).toEqual(durableHistory)
     } finally {
       stop()
     }

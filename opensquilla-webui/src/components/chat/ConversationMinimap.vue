@@ -385,6 +385,11 @@ function cancelFrame(frame: number) {
 
 function elementNeedsAnchorRemeasure(element: Element): boolean {
   if (!lastAnchorElement || element === lastAnchorElement) return true
+  // The minimap observes direct thread children. When the list root contains
+  // the current last prompt, its own late height change must invalidate the
+  // cached anchor even though document position reports the anchor as a
+  // descendant rather than a following sibling.
+  if (element.contains(lastAnchorElement)) return true
   return Boolean(element.compareDocumentPosition(lastAnchorElement) & Node.DOCUMENT_POSITION_FOLLOWING)
 }
 

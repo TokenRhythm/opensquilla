@@ -7,7 +7,8 @@ from copy import deepcopy
 from typing import Any
 
 FORK_TERMINAL_OUTCOME_CONTEXT_KEY = "_opensquilla_fork_terminal_outcome_v1"
-FORK_TERMINAL_OUTCOME_VERSION = 1
+FORK_TERMINAL_OUTCOME_VERSION = 2
+_ACCEPTED_FORK_TERMINAL_OUTCOME_VERSIONS = frozenset({1, 2})
 
 TERMINAL_AGENT_TASK_STATUSES = frozenset(
     {
@@ -73,6 +74,7 @@ def build_fork_terminal_outcome_projection(
     finished_at: int | None,
     outcome: Mapping[str, Any],
     accepted_routing_mode: str | None = None,
+    activity_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a projection bound to one fork child identity."""
 
@@ -97,6 +99,13 @@ def build_fork_terminal_outcome_projection(
     }
     if accepted_routing_mode is not None:
         projection["accepted_routing_mode"] = accepted_routing_mode
+    if (
+        activity_snapshot is not None
+        and activity_snapshot.get("version") in {1, 2}
+        and activity_snapshot.get("task_id") == task_id
+        and activity_snapshot.get("turn_id") == turn_id
+    ):
+        projection["activity_snapshot"] = deepcopy(dict(activity_snapshot))
     return projection
 
 
@@ -114,7 +123,7 @@ def extract_fork_terminal_outcome_projection(
     raw = turn_context.get(FORK_TERMINAL_OUTCOME_CONTEXT_KEY)
     if not isinstance(raw, Mapping):
         return None
-    if raw.get("version") != FORK_TERMINAL_OUTCOME_VERSION:
+    if raw.get("version") not in _ACCEPTED_FORK_TERMINAL_OUTCOME_VERSIONS:
         return None
     if raw.get("session_id") != session_id or raw.get("session_key") != session_key:
         return None
@@ -156,6 +165,12 @@ def extract_fork_terminal_outcome_projection(
     }
     if accepted_routing_mode is not _MISSING:
         projection["accepted_routing_mode"] = accepted_routing_mode
+    activity_snapshot = raw.get("activity_snapshot")
+    if raw.get("version") == 2 and isinstance(activity_snapshot, Mapping):
+        snapshot_task_id = activity_snapshot.get("task_id")
+        snapshot_turn_id = activity_snapshot.get("turn_id")
+        if snapshot_task_id == task_id and snapshot_turn_id == turn_id:
+            projection["activity_snapshot"] = deepcopy(dict(activity_snapshot))
     return projection
 
 

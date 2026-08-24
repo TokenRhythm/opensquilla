@@ -49,6 +49,10 @@ import {
   sanitizeAssistantPresentationText,
 } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
+import {
+  applyActivityOrdersToTimeline,
+  restoreActivityInterruptTimeline,
+} from '@/utils/chat/activitySnapshot'
 
 export interface NormalizedRouterDecision extends Record<string, unknown> {
   tier: string
@@ -539,9 +543,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         createdSessionLinks: createdSessionLinksFromCalls(normalizedToolCalls),
         // submit_plan is a transport/control detail. Once a typed immutable
         // plan part exists, the plan card is the authoritative visible item;
-        // do not also render the same payload as an expandable tool timeline.
-        toolCalls: isPlanMessage ? [] : normalizedToolCalls,
-        timelineItems: isPlanMessage ? [] : normalizeMessageTimeline(msg, ownerKey),
+        // keep real process tools in the Activity timeline.
+        toolCalls: normalizedToolCalls.filter(call => !isPlanMessage || call.name !== 'submit_plan'),
+        timelineItems: applyActivityOrdersToTimeline(
+          stripPlanControlToolItems(normalizeMessageTimeline(msg, ownerKey), isPlanMessage),
+          msg.activitySnapshot,
+        ),
         planRevisions,
         artifacts: msg.artifacts,
         meta: messageMeta(msg),
@@ -551,6 +558,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           : undefined,
         reasoningPresentationPending: msg.role === 'assistant'
           ? msg.reasoningPresentationPending
+          : undefined,
+        activitySnapshot: msg.role === 'assistant' ? msg.activitySnapshot : undefined,
+        activitySnapshotIncomplete: msg.role === 'assistant'
+          ? msg.activitySnapshotIncomplete
           : undefined,
         interrupted: msg.interrupted,
         provenanceKind: msg.provenanceKind,
@@ -573,6 +584,16 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
             options.interruptState?.value,
           )
         : []
+      if (rendered.displayRole === 'assistant') {
+        const restoredActivity = restoreActivityInterruptTimeline(
+          rendered.timelineItems ?? [],
+          rendered.parts,
+          rendered.activitySnapshot,
+          ownerKey,
+        )
+        rendered.timelineItems = restoredActivity.items
+        rendered.parts = restoredActivity.parts
+      }
       rendered.sources = rendered.displayRole === 'assistant' ? toSources(rendered) : []
       // statusHistory is a stored snapshot (not re-derivable from tool_calls), so
       // read it straight off the message for assistant turns. A reloaded thread
@@ -1187,6 +1208,37 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ...item,
         rawText,
         html: options.renderMarkdown(rawText),
+      }]
+    })
+  }
+
+  function stripPlanControlToolItems(
+    items: ChatStreamTimelineItem[],
+    isPlanMessage: boolean,
+  ): ChatStreamTimelineItem[] {
+    if (!isPlanMessage) return items
+    return items.flatMap((item): ChatStreamTimelineItem[] => {
+      if (item.type !== 'tool-group') return [item]
+      const calls = item.group.calls.filter(call => call.name !== 'submit_plan')
+      if (calls.length === 0) return []
+      if (calls.length === item.group.calls.length) return [item]
+      const hasError = calls.some(call => call.isError || call.status === 'error')
+      return [{
+        ...item,
+        group: {
+          ...item.group,
+          calls,
+          isRunning: calls.some(call => call.isRunning),
+          isError: hasError,
+          status: hasError
+            ? 'error'
+            : calls.every(call => call.status === 'success')
+              ? 'success'
+              : '',
+          secondary: calls.length === 1
+            ? toolSecondaryText(calls[0]!)
+            : summarizeToolGroup(calls),
+        },
       }]
     })
   }

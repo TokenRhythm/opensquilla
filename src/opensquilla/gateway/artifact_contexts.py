@@ -6,7 +6,30 @@ from dataclasses import dataclass
 from typing import Literal
 
 PROMPT_ANNOTATION_TOOL_NAMES = frozenset(
-    {"document_apply", "document_inspect", "document_locate", "document_read"}
+    {
+        "document_browser_act",
+        "document_browser_inspect",
+        "document_browser_reload",
+        "document_browser_screenshot",
+        "document_apply",
+        "document_finish",
+        "document_inspect",
+        "document_locate",
+        "document_patch",
+        "document_read",
+    }
+)
+# Rolling-compatibility surface for protocol-v3 Electron shells.  It retains
+# the original source-only writer path; candidate preview/browser lifecycle
+# tools are deliberately withheld because v3 cannot bind or verify a draft.
+PROMPT_ANNOTATION_SOURCE_TOOL_NAMES = frozenset(
+    {
+        "document_apply",
+        "document_inspect",
+        "document_locate",
+        "document_patch",
+        "document_read",
+    }
 )
 DOCUMENT_CONTEXT_TOOL_NAMES = frozenset({"document_patch", "document_read"})
 DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY = frozenset(
@@ -134,4 +157,5 @@ __all__ = [
     "DOCUMENT_CONTEXT_TOOL_NAMES",
     "DOCUMENT_CONTEXT_WORKSPACE_MUTATOR_DENY",
     "PROMPT_ANNOTATION_TOOL_NAMES",
+    "PROMPT_ANNOTATION_SOURCE_TOOL_NAMES",
 ]

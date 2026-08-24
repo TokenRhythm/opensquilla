@@ -430,6 +430,7 @@ export interface UseChatSendOptions {
     requestedIds: readonly string[],
     acceptedIds: readonly string[],
     sessionKey: string,
+    requestSessionKey?: string,
   ) => void
   /** Synchronous, session-scoped identity used to avoid replaying against another document/head. */
   currentDocumentContext?: (sessionKey: string) => ChatDocumentContext | null
@@ -488,11 +489,15 @@ export interface UseChatSendOptions {
   enqueuePendingInput: (
     text: string,
     owner?: PendingQueueOwner,
-    enqueueOptions?: { confirmedPlainText?: boolean },
+    enqueueOptions?: {
+      confirmedPlainText?: boolean
+      promptAnnotationIds?: readonly string[]
+    },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
+      promptAnnotationIds?: readonly string[]
       attachments?: Attachment[]
       intent?: string | null
       confirmedPlainText?: boolean
@@ -609,24 +614,49 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.promptAnnotationIds.length === 0
       || attempt.promptAnnotationsAcknowledged === true
     ) return
+    const requested = new Set(attempt.promptAnnotationIds)
+    const accepted = acceptedPromptAnnotationIds(response)
+      .filter(id => requested.has(id))
+    // A mixed-version/pending-dispatch replay may prove ingress acceptance
+    // without carrying the annotation ids. Do not burn the one-shot local
+    // acknowledgement in that case: a later receipt recovery can still carry
+    // the canonical ids and must be allowed to close the draft/picker.
+    if (accepted.length === 0) return
     // A direct response and the bounded receipt-recovery worker can race to
     // observe the same accepted request. Consume the Gateway acknowledgement
     // exactly once so drafts and the native annotation picker transition as
     // one idempotent UI operation.
     attempt.promptAnnotationsAcknowledged = true
-    const requested = new Set(attempt.promptAnnotationIds)
-    const accepted = acceptedPromptAnnotationIds(response)
-      .filter(id => requested.has(id))
     const acceptedSet = new Set(accepted)
     const acceptedSnapshots = attempt.promptAnnotations.filter(snapshot => (
       acceptedSet.has(snapshot.annotationId)
     ))
     setAttemptPromptAnnotations(attempt, acceptedSnapshots)
-    options.acknowledgePromptAnnotations?.(
-      attempt.promptAnnotationIds,
-      accepted,
-      attempt.requestSessionKey,
-    )
+    // A first send from a provisional draft can be accepted under a different
+    // canonical session key. Publish both identities so Workbench can finish
+    // the native annotation lifecycle regardless of which descriptor wins the
+    // render race. Keep the legacy three-argument call when they are equal.
+    const acceptedSessionKey = String(
+      response.sessionKey
+        || response.session_key
+        || attempt.acceptedSessionKey
+        || attempt.requestSessionKey,
+    ).trim() || attempt.requestSessionKey
+    attempt.acceptedSessionKey = acceptedSessionKey
+    if (acceptedSessionKey === attempt.requestSessionKey) {
+      options.acknowledgePromptAnnotations?.(
+        attempt.promptAnnotationIds,
+        accepted,
+        acceptedSessionKey,
+      )
+    } else {
+      options.acknowledgePromptAnnotations?.(
+        attempt.promptAnnotationIds,
+        accepted,
+        acceptedSessionKey,
+        attempt.requestSessionKey,
+      )
+    }
   }
 
   function setAttemptPromptAnnotations(
@@ -2332,12 +2362,22 @@ export function useChatSend(options: UseChatSendOptions) {
         // preserved (enqueue returns false before clearing the composer).
         const composerChanged = !composerMatchesSnapshot(composerSnapshot)
         if (invocation.cancelIfComposerChanged && composerChanged) return
+        const queuedPromptAnnotationIds = composerSnapshot.promptAnnotationIds
+        const queuedEnqueueOptions = {
+          ...(slashClassification === 'unknown' ? { confirmedPlainText: true } : {}),
+          ...(queuedPromptAnnotationIds.length
+            ? { promptAnnotationIds: queuedPromptAnnotationIds }
+            : {}),
+        }
         const queued = await Promise.resolve(
           composerChanged || invocation.textOverride !== undefined
             ? options.enqueuePendingPayload?.({
               text: durableText,
               attachments: composerSnapshot.payloadAttachments,
               intent: composerSnapshot.intent,
+              ...(queuedPromptAnnotationIds.length
+                ? { promptAnnotationIds: queuedPromptAnnotationIds }
+                : {}),
               ...(slashClassification === 'unknown'
                 ? { confirmedPlainText: true }
                 : {}),
@@ -2346,12 +2386,18 @@ export function useChatSend(options: UseChatSendOptions) {
               ? options.enqueuePendingInput(
                 durableText,
                 queueOwnerFromSnapshot(composerSnapshot),
-                { confirmedPlainText: true },
+                queuedEnqueueOptions,
               )
-              : options.enqueuePendingInput(
-                durableText,
-                queueOwnerFromSnapshot(composerSnapshot),
-              ),
+              : queuedPromptAnnotationIds.length
+                ? options.enqueuePendingInput(
+                  durableText,
+                  queueOwnerFromSnapshot(composerSnapshot),
+                  queuedEnqueueOptions,
+                )
+                : options.enqueuePendingInput(
+                  durableText,
+                  queueOwnerFromSnapshot(composerSnapshot),
+                ),
         )
         if (!queued) {
           pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
@@ -2530,7 +2576,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
-      promptAnnotationIds: [],
+      promptAnnotationIds: item.promptAnnotationIds || [],
       payload: {
         attachments: item.attachments,
         intent: item.intent,

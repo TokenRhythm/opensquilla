@@ -202,6 +202,13 @@ def _collect_executed_lines() -> set[int]:
                 self.status = "reserved"
                 self.proposal_rejection_count = 0
 
+            @property
+            def state(self) -> SimpleNamespace:
+                return SimpleNamespace(status=self.status)
+
+            async def invalidate_verification(self, *, reason: str) -> None:
+                del reason
+
             def owns_commit(self, _tool_use_id: str) -> bool:
                 return False
 
@@ -255,6 +262,9 @@ def _collect_executed_lines() -> set[int]:
                 allowed_tools={"document_apply"},
                 surfaced_tools={"document_apply"},
                 artifact_mutation_attempt_controller=controller,
+                artifact_candidate_loop_controller=(
+                    controller if outcome == "candidate_success" else None
+                ),
             )
             handler = build_tool_handler(registry, ctx)
             token = current_tool_context.set(None)
@@ -268,6 +278,59 @@ def _collect_executed_lines() -> set[int]:
                 )
             finally:
                 current_tool_context.reset(token)
+
+        async def _run_candidate_finalize_recovery_coverage() -> None:
+            """Drive the lost-finalizer-response recovery branch.
+
+            A candidate commit may become durable before result accounting
+            finishes.  Dispatch must project the controller's terminal
+            receipt if the shared finalizer then raises.
+            """
+
+            controller = SimpleNamespace(
+                state=SimpleNamespace(status="committed"),
+            )
+            registry = ToolRegistry()
+
+            async def _finish() -> str:
+                return '{"status":"applied"}'
+
+            registry.register(
+                ToolSpec(
+                    name="document_finish",
+                    description="coverage candidate finish",
+                    parameters={},
+                    exposed_by_default=False,
+                ),
+                _finish,
+            )
+            ctx = ToolContext(
+                is_owner=True,
+                session_key="agent:main:coverage:candidate-finalizer",
+                allowed_tools={"document_finish"},
+                surfaced_tools={"document_finish"},
+                exclusive_tools={"document_finish"},
+                artifact_candidate_loop_controller=controller,
+            )
+            handler = build_tool_handler(registry, ctx)
+            original_finalize = _dispatch_module.finalize
+
+            async def _raise_finalize(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+                raise RuntimeError("synthetic lost finalizer response")
+
+            _dispatch_module.finalize = _raise_finalize
+            token = current_tool_context.set(None)
+            try:
+                await handler(
+                    ToolCall(
+                        tool_use_id="tc-candidate-finalizer",
+                        tool_name="document_finish",
+                        arguments={},
+                    )
+                )
+            finally:
+                current_tool_context.reset(token)
+                _dispatch_module.finalize = original_finalize
 
         for hooks in hook_variants:
             await _run_coverage_only(
@@ -317,11 +380,14 @@ def _collect_executed_lines() -> set[int]:
 
         for outcome in (
             "success",
+            "candidate_success",
             "handler_error",
             "exclusive_denial",
             "plan_denial",
         ):
             await _run_artifact_writer_coverage(outcome=outcome)
+
+        await _run_candidate_finalize_recovery_coverage()
 
     tracer.runfunc(asyncio.run, _run_all())
 

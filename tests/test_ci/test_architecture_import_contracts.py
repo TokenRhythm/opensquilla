@@ -75,6 +75,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("diagnostics_sources.py", "gateway"),
     ("diagnostics_sources.py", "onboarding"),
     ("engine", "agents"),
+    # Candidate-loop cancellation uses the canonical Actor value object when
+    # rejecting a staged draft during turn cleanup.  The import is lazy and
+    # one-way; ArtifactSession does not depend on engine.
+    ("engine", "artifact_session"),
     ("engine", "channels"),
     ("engine", "contracts"),
     ("engine", "gateway"),

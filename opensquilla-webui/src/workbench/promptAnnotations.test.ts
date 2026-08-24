@@ -85,4 +85,23 @@ describe('prompt annotation Workbench activation', () => {
       sessionKey: 'session-a',
     })
   })
+
+  it('carries the provisional request key when acceptance materializes a session', () => {
+    let detail: ArtifactPromptAnnotationsAcceptedDetail | null = null
+    window.addEventListener(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, (event) => {
+      detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
+    }, { once: true })
+
+    notifyArtifactPromptAnnotationsAccepted({
+      acceptedIds: ['annotation-1'],
+      sessionKey: 'session-canonical',
+      requestSessionKey: 'session-draft',
+    })
+
+    expect(detail).toEqual({
+      acceptedIds: ['annotation-1'],
+      sessionKey: 'session-canonical',
+      requestSessionKey: 'session-draft',
+    })
+  })
 })

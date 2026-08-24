@@ -321,6 +321,40 @@ def test_matching_fallback_build_failure_does_not_advance_selector(monkeypatch) 
     assert selector.remaining_chain() == original_chain
 
 
+def test_static_matching_fallback_build_failure_is_atomic(monkeypatch) -> None:
+    primary = ProviderConfig("openrouter", "primary", api_key="primary-test-key")
+    incompatible = ProviderConfig(
+        "openrouter",
+        "incompatible",
+        api_key="incompatible-test-key",
+    )
+    target = ProviderConfig("openrouter", "target", api_key="target-test-key")
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=primary,
+            fallbacks=[incompatible, target],
+        )
+    )
+    original_chain = selector.remaining_chain()
+
+    def failing_build_provider(cfg: ProviderConfig):
+        assert cfg is target
+        raise ProviderBuildError("synthetic target build failure")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        failing_build_provider,
+    )
+
+    with pytest.raises(ProviderBuildError, match="synthetic target build failure"):
+        selector.next_fallback_matching(
+            predicate=lambda cfg: cfg.model == "target",
+        )
+
+    assert selector.current_config is primary
+    assert selector.remaining_chain() == original_chain
+
+
 def test_next_fallback_build_failure_keeps_active_matching_candidate(monkeypatch) -> None:
     primary = ProviderConfig("openrouter", "primary", api_key="primary-test-key")
     first_vision = ProviderConfig(

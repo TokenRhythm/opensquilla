@@ -1429,6 +1429,7 @@ class SessionManager:
                         finished_at=snapshot.get("finished_at"),
                         outcome=snapshot["outcome"],
                         accepted_routing_mode=snapshot.get("accepted_routing_mode"),
+                        activity_snapshot=snapshot.get("activity_snapshot"),
                     )
                     continue
 
@@ -1459,6 +1460,9 @@ class SessionManager:
                 accepted_routing_mode = _accepted_routing_mode_from_task_details(details)
                 if accepted_routing_mode is not None:
                     snapshot["accepted_routing_mode"] = accepted_routing_mode
+                activity_snapshot = details.get("activity_snapshot")
+                if isinstance(activity_snapshot, dict):
+                    snapshot["activity_snapshot"] = activity_snapshot
             elif turn_id not in invalid_turn_ids:
                 snapshot = source_projections.get(turn_id)
 
@@ -1474,6 +1478,7 @@ class SessionManager:
                 finished_at=snapshot.get("finished_at"),
                 outcome=snapshot["outcome"],
                 accepted_routing_mode=snapshot.get("accepted_routing_mode"),
+                activity_snapshot=snapshot.get("activity_snapshot"),
             )
 
         return _ForkTerminalOutcomeResolution(

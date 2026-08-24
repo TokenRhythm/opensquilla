@@ -13,7 +13,8 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -231,6 +232,77 @@ async def _pending_input_enqueue_lock(
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
+
+
+def _prompt_annotation_source_only_context(context: Any) -> Any:
+    """Downgrade a PromptAnnotation turn when candidate preview is unavailable.
+
+    The autonomous ten-tool surface requires a live protocol-v4 Desktop
+    bridge: without it a writer could stage a DRAFT but could never obtain a
+    verification receipt or finish it.  Use the established source-only
+    compatibility surface instead of exposing a dead-end candidate loop.  The
+    source writer remains durable and the prompt explicitly tells the model
+    not to claim a preview verification it could not perform.
+    """
+
+    from opensquilla.gateway.artifact_contexts import (
+        PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+    )
+    from opensquilla.prompt_annotations import render_active_prompt_annotation_context
+
+    snapshots = getattr(context, "snapshots", ())
+    return replace(
+        context,
+        tool_names=PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+        request_context_prompt=(
+            render_active_prompt_annotation_context(
+                snapshots,
+                autonomous_loop=False,
+            )
+            or context.request_context_prompt
+        ),
+    )
+
+
+def _desktop_artifact_bridge_supports_candidate_loop(capabilities: Any) -> bool:
+    """Return whether the active Desktop surface can complete a candidate loop.
+
+    Protocol version alone is not enough: the v4 contract is also used for
+    non-HTML/office surfaces and for a shell whose active preview is still
+    loading.  Exposing the ten-tool contract in those states would create a
+    DRAFT that can be staged but can never obtain a verification receipt or
+    restore the canonical preview.  Require the capabilities that are stable
+    before the first candidate is bound; ``browserAct`` is intentionally not
+    required because the native surface enables it only after binding the
+    opaque candidate handle.
+    """
+
+    if capabilities is None:
+        return False
+    if isinstance(capabilities, Mapping):
+        version = capabilities.get("version")
+
+        def _flag(*names: str) -> bool:
+            return any(capabilities.get(name) is True for name in names)
+
+    else:
+        version = getattr(capabilities, "version", None)
+
+        def _flag(*names: str) -> bool:
+            return any(getattr(capabilities, name, None) is True for name in names)
+
+    values = (
+        _flag("available"),
+        _flag("browserInspect", "browser_inspect"),
+        _flag("bindCandidatePreview", "bind_candidate_preview"),
+        _flag("restoreCanonicalPreview", "restore_canonical_preview"),
+    )
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version >= 4
+        and all(values)
+    )
 
 
 def _emit_steer_metric(disposition: str, **labels: Any) -> None:
@@ -3278,6 +3350,69 @@ def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
     return f"{caller_kind}:{channel_kind}:{principal_role}"[:256]
 
 
+async def _load_followup_annotation_focus(
+    storage: SessionStorage,
+    *,
+    session_id: str,
+    document_id: str,
+) -> str | None:
+    """Return a short read-only focus for the current document follow-up.
+
+    This is intentionally derived from the accepted transcript envelope rather
+    than reusing an annotation authority.  The current document context still
+    performs the normal owner, session, head, and CAS checks below.
+    """
+
+    try:
+        get_transcript = getattr(storage, "get_canonical_transcript", None)
+        if not callable(get_transcript):
+            get_transcript = storage.get_transcript
+        entries = await get_transcript(session_id)
+        from opensquilla.prompt_annotations import (
+            prompt_annotations_from_transcript_envelope,
+            render_followup_prompt_annotation_focus,
+        )
+
+        user_entries: list[tuple[int, Any, tuple[dict[str, Any], ...]]] = []
+        for index, entry in enumerate(entries):
+            if getattr(entry, "role", None) != "user":
+                continue
+            snapshots = prompt_annotations_from_transcript_envelope(
+                getattr(entry, "content", None)
+            )
+            if snapshots:
+                user_entries.append((index, entry, snapshots))
+        if not user_entries:
+            return None
+
+        annotation_index, _entry, snapshots = user_entries[-1]
+        matching = tuple(
+            snapshot
+            for snapshot in snapshots
+            if isinstance(snapshot.get("document"), Mapping)
+            and snapshot["document"].get("id") == document_id
+        )
+        if not matching:
+            return None
+
+        later_user_turns = sum(
+            1
+            for entry in entries[annotation_index + 1 :]
+            if getattr(entry, "role", None) == "user"
+        )
+        if later_user_turns > 1:
+            return None
+        return render_followup_prompt_annotation_focus(matching)
+    except Exception:  # noqa: BLE001 - context continuity must fail open.
+        log.debug(
+            "sessions.followup_annotation_focus_unavailable",
+            session_id=session_id,
+            document_id=document_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _accepted_turn_response(
     result: TurnAcceptanceResult,
     *,
@@ -3297,6 +3432,43 @@ async def _accepted_turn_response(
         for item in accepted_prompt_annotation_ids
         if isinstance(item, str) and item.strip()
     ]
+    # A pending-input dispatch can be replayed after the staged row has been
+    # consumed.  That replay only has the ingress receipt, not the original
+    # RPC payload, so it cannot pass promptAnnotationIds directly.  Recover
+    # the immutable ids from the accepted user transcript envelope; otherwise
+    # the renderer keeps the local draft and sends it again on the next
+    # annotation turn, where preflight correctly rejects the already-SENT row.
+    if not normalized_annotation_ids and result.replayed:
+        try:
+            get_entry = getattr(storage, "get_canonical_transcript_entry", None)
+            if callable(get_entry):
+                accepted_entry = await get_entry(receipt.session_id, receipt.message_id)
+            else:
+                get_transcript = getattr(storage, "get_canonical_transcript", None)
+                if not callable(get_transcript):
+                    get_transcript = storage.get_transcript
+                entries = await get_transcript(receipt.session_id)
+                accepted_entry = next(
+                    (entry for entry in entries if entry.message_id == receipt.message_id),
+                    None,
+                )
+            content = getattr(accepted_entry, "content", None)
+            from opensquilla.prompt_annotations import (
+                prompt_annotations_from_transcript_envelope,
+            )
+
+            normalized_annotation_ids = [
+                str(snapshot["annotationId"])
+                for snapshot in prompt_annotations_from_transcript_envelope(content)
+                if isinstance(snapshot.get("annotationId"), str)
+                and snapshot["annotationId"].strip()
+            ]
+        except Exception:  # noqa: BLE001 - replay response must remain deliverable.
+            log.exception(
+                "sessions.send.accepted_annotation_recovery_failed",
+                session_id=receipt.session_id,
+                message_id=receipt.message_id,
+            )
     if normalized_annotation_ids:
         payload["acceptedPromptAnnotationIds"] = normalized_annotation_ids
 
@@ -3395,8 +3567,49 @@ async def _accepted_turn_response(
     return payload
 
 
+class _IngressTurnAuthorityScope:
+    """Own newly acquired turn authorities until runtime admission succeeds."""
+
+    def __init__(self) -> None:
+        self.authorities: list[Any] = []
+
+    def register(self, authority: Any) -> None:
+        self.authorities.append(authority)
+
+    async def close_untransferred(self) -> None:
+        for authority in tuple(self.authorities):
+            if getattr(authority, "ingress_owned", False) is not True:
+                continue
+            try:
+                await authority.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - preserve the ingress outcome
+                log.warning("sessions.send.turn_authority_cleanup_failed", exc_info=True)
+
+
+_INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = ContextVar(
+    "opensquilla_ingress_turn_authority_scope",
+    default=None,
+)
+
+
 @_d.method("sessions.send", scope="operator.write")
 async def _handle_sessions_send_impl(
+    params: dict | None,
+    ctx: RpcContext,
+    **kwargs: Any,
+) -> dict:
+    scope = _IngressTurnAuthorityScope()
+    token = _INGRESS_TURN_AUTHORITY_SCOPE.set(scope)
+    try:
+        return await _handle_sessions_send_impl_inner(params, ctx, **kwargs)
+    finally:
+        _INGRESS_TURN_AUTHORITY_SCOPE.reset(token)
+        await scope.close_untransferred()
+
+
+async def _handle_sessions_send_impl_inner(
     params: dict | None,
     ctx: RpcContext,
     *,
@@ -4312,6 +4525,27 @@ async def _handle_sessions_send_impl(
                     retryable=False,
                     accepted=False,
                 )
+            followup_focus = await _load_followup_annotation_focus(
+                storage,
+                session_id=session_id,
+                document_id=document.document_id,
+            )
+            base_document_context_prompt = (
+                "<active_document_context>\n"
+                "The currently opened HTML document is bound to this turn. If the user asks "
+                "to inspect or modify the open page, use the bound document tools, not "
+                "workspace file tools. The first source read MUST be document_read with "
+                "view=source and no cursor, or cursor=\"\" only when the provider adapter "
+                "requires that field. Never invent a non-empty cursor: only pass the exact "
+                "nextCursor returned by the preceding document_read response when hasMore "
+                "is true. To modify the open page, call document_patch with the sha256 "
+                "returned by document_read and exact, unique expectedText from the returned "
+                "source. write_file, edit_file, and apply_patch operate on workspace files; "
+                "they do not update this Document and MUST NOT substitute for document_patch. "
+                "Those workspace mutators are unavailable while this Document is bound; do "
+                "not attempt to call them.\n"
+                "</active_document_context>"
+            )
             artifact_turn_context = BoundDocumentContext(
                 session_key=key,
                 session_id=session_id,
@@ -4320,21 +4554,10 @@ async def _handle_sessions_send_impl(
                 artifact_format="html",
                 tool_names=DOCUMENT_CONTEXT_TOOL_NAMES,
                 operation_class="document_edit",
-                request_context_prompt=(
-                    "<active_document_context>\n"
-                    "The currently opened HTML document is bound to this turn. If the user asks "
-                    "to inspect or modify the open page, use the bound document tools, not "
-                    "workspace file tools. The first source read MUST be document_read with "
-                    "view=source and no cursor, or cursor=\"\" only when the provider adapter "
-                    "requires that field. Never invent a non-empty cursor: only pass the exact "
-                    "nextCursor returned by the preceding document_read response when hasMore "
-                    "is true. To modify the open page, call document_patch with the sha256 "
-                    "returned by document_read and exact, unique expectedText from the returned "
-                    "source. write_file, edit_file, and apply_patch operate on workspace files; "
-                    "they do not update this Document and MUST NOT substitute for document_patch. "
-                    "Those workspace mutators are unavailable while this Document is bound; do "
-                    "not attempt to call them.\n"
-                    "</active_document_context>"
+                request_context_prompt="\n\n".join(
+                    part
+                    for part in (base_document_context_prompt, followup_focus)
+                    if part
                 ),
             )
             artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
@@ -4823,6 +5046,9 @@ async def _handle_sessions_send_impl(
         route_envelope.runtime_services["artifact_context"] = artifact_turn_context
         route_envelope.runtime_services["artifact_session"] = artifact_session_service
         route_envelope.runtime_services["artifact_event_emitter"] = artifact_event_emitter
+        preview_service = getattr(ctx, "artifact_preview_service", None)
+        if preview_service is not None:
+            route_envelope.runtime_services["artifact_preview_service"] = preview_service
         from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
 
         if (
@@ -4834,6 +5060,7 @@ async def _handle_sessions_send_impl(
             and not guest_safe
         ):
             from opensquilla.gateway.desktop_artifact_bridge import (
+                TurnAuthorityCleanup,
                 get_desktop_artifact_bridge_client,
             )
 
@@ -4846,9 +5073,66 @@ async def _handle_sessions_send_impl(
                 log.warning("artifact.desktop_bridge_environment_rejected")
                 desktop_artifact_bridge = None
             if desktop_artifact_bridge is not None:
-                route_envelope.runtime_services["desktop_artifact_bridge"] = (
-                    desktop_artifact_bridge
+                # Negotiate before route construction so a legacy, unavailable,
+                # or non-HTML shell receives the source-only five-tool contract.
+                # Protocol version alone is insufficient: without an active
+                # v4 browser inspect surface plus candidate bind/restore, the
+                # ten-tool loop could stage a draft that can never be committed.
+                # Keep the useful durable source-writer compatibility path
+                # rather than exposing a candidate that can only be discarded.
+                turn_authority_cleanup = None
+                try:
+                    bound_desktop_artifact_bridge = await desktop_artifact_bridge.acquire_binding()
+                    turn_authority_cleanup = (
+                        TurnAuthorityCleanup(bound_desktop_artifact_bridge.aclose)
+                        if bound_desktop_artifact_bridge is not None
+                        else None
+                    )
+                    authority_scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
+                    if turn_authority_cleanup is not None and authority_scope is not None:
+                        authority_scope.register(turn_authority_cleanup)
+                    bridge_capabilities = (
+                        await bound_desktop_artifact_bridge.capabilities()
+                        if bound_desktop_artifact_bridge is not None
+                        else None
+                    )
+                except Exception:  # noqa: BLE001 - preserve unavailable bridge semantics
+                    bound_desktop_artifact_bridge = None
+                    bridge_capabilities = None
+                if (
+                    not _desktop_artifact_bridge_supports_candidate_loop(
+                        bridge_capabilities
+                    )
+                    or turn_authority_cleanup is None
+                ):
+                    if turn_authority_cleanup is not None:
+                        await turn_authority_cleanup.aclose()
+                    artifact_turn_context = _prompt_annotation_source_only_context(
+                        artifact_turn_context
+                    )
+                else:
+                    route_envelope.runtime_services["desktop_artifact_bridge"] = (
+                        bound_desktop_artifact_bridge
+                    )
+                    route_envelope.runtime_services["turn_authority_cleanup"] = (
+                        turn_authority_cleanup
+                    )
+                    route_envelope.runtime_services.setdefault(
+                        "turn_cleanup_callbacks", []
+                    ).append(turn_authority_cleanup.aclose)
+            else:
+                # A browser-less web client must not receive the autonomous
+                # writer/finish contract.  It can still use the durable
+                # source-only editor, while the v4 Electron client gets the
+                # full candidate-preview loop above.
+                artifact_turn_context = _prompt_annotation_source_only_context(
+                    artifact_turn_context
                 )
+            # The initial runtime-service entry is made before bridge
+            # negotiation.  Replace it after any downgrade so routing creates
+            # the matching legacy mutation controller, not a dead candidate
+            # controller.
+            route_envelope.runtime_services["artifact_context"] = artifact_turn_context
     if (
         route_envelope.source_kind.value == "web"
         and route_envelope.interaction_mode.value == "interactive"
@@ -4949,6 +5233,11 @@ async def _handle_sessions_send_impl(
             "client_request_id": ingress_identity.client_request_id,
             "client_message_id": client_message_id,
             "surface_id": surface_id,
+            # The direct RPC execution path constructs ToolContext before a
+            # TaskRuntime record exists. Keep the durable turn identity in the
+            # envelope so PromptAnnotation candidate loops never fall back to
+            # the legacy one-shot writer merely because task metadata is late.
+            "task_id": turn_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
             **(
@@ -5716,6 +6005,10 @@ async def _handle_sessions_send_impl(
                     session_key=key,
                     attempts_remaining=_prompt_annotation_acceptance_retries,
                 )
+                authority_scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
+                if authority_scope is not None:
+                    await authority_scope.close_untransferred()
+                    authority_scope.authorities.clear()
                 return cast(
                     dict[Any, Any],
                     await _handle_sessions_send_impl(
@@ -6137,7 +6430,23 @@ async def _handle_sessions_send_impl(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
+            turn_authority = route_envelope.runtime_services.get(
+                "turn_authority_cleanup"
+            )
+            try:
+                direct_registry.register(
+                    key,
+                    task,
+                    terminal_cleanup=(
+                        turn_authority.aclose if turn_authority is not None else None
+                    ),
+                )
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            if turn_authority is not None:
+                turn_authority.handoff()
             return acceptance
 
         try:
@@ -6372,7 +6681,23 @@ async def _handle_sessions_send_impl(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
+            turn_authority = route_envelope.runtime_services.get(
+                "turn_authority_cleanup"
+            )
+            try:
+                direct_registry.register(
+                    key,
+                    task,
+                    terminal_cleanup=(
+                        turn_authority.aclose if turn_authority is not None else None
+                    ),
+                )
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            if turn_authority is not None:
+                turn_authority.handoff()
 
         await _emit_to_subscribers(
             ctx,
@@ -6783,6 +7108,11 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
         result["displayText"] = display_text
     if payload.get("confirmedPlainText") is True:
         result["confirmedPlainText"] = True
+    prompt_annotation_ids = payload.get("promptAnnotationIds")
+    if isinstance(prompt_annotation_ids, list) and prompt_annotation_ids:
+        result["promptAnnotationIds"] = [
+            item for item in prompt_annotation_ids if isinstance(item, str)
+        ][:16]
     initial_routing_mode = payload.get("initialRoutingMode")
     if isinstance(initial_routing_mode, str):
         result["initialRoutingMode"] = initial_routing_mode
@@ -6849,6 +7179,28 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     if not isinstance(attachments, list):
         raise ValueError("params.attachments must be an array")
 
+    raw_prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
+    )
+    if raw_prompt_annotation_ids is None:
+        prompt_annotation_ids: list[str] = []
+    else:
+        if not isinstance(raw_prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if len(raw_prompt_annotation_ids) > 16:
+            raise ValueError("params.promptAnnotationIds supports at most 16 items")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_prompt_annotation_ids
+        ):
+            raise ValueError(
+                "params.promptAnnotationIds must contain non-empty strings"
+            )
+        prompt_annotation_ids = [item.strip() for item in raw_prompt_annotation_ids]
+        if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain unique ids")
+
     payload: dict[str, Any] = {
         "key": key,
         "message": message,
@@ -6879,6 +7231,12 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         payload["displayText"] = display_text
     if confirmed_plain_text:
         payload["confirmedPlainText"] = True
+    if prompt_annotation_ids:
+        # Keep the immutable annotation batch in the staged payload.  A
+        # response-loss replay may no longer have the original chat.send
+        # params, and dropping these ids would leave the renderer's drafts
+        # unacknowledged after the first successful turn.
+        payload["promptAnnotationIds"] = prompt_annotation_ids
     return payload
 
 

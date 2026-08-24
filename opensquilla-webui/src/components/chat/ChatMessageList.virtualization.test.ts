@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App } from 'vue'
+import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
 
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
@@ -40,6 +40,8 @@ async function mountList(options: {
   forceMountMessageKeys?: ReadonlySet<string>
   followLiveEdge?: boolean
   messages?: ChatRenderedMessage[]
+  sessionKey?: string
+  scrollEpoch?: number
 } = {}) {
   const container = document.createElement('div')
   const host = document.createElement('div')
@@ -51,12 +53,14 @@ async function mountList(options: {
   })
   container.getBoundingClientRect = () => ({ top: 0 } as DOMRect)
 
-  const app = createApp(ChatMessageList, {
+  const componentProps = reactive({
     messages: options.messages ?? Array.from({ length: 200 }, (_, index) => message(index)),
     scrollContainer: container,
     shareMode: options.shareMode ?? false,
     forceMountMessageKeys: options.forceMountMessageKeys,
     followLiveEdge: options.followLiveEdge,
+    sessionKey: options.sessionKey,
+    scrollEpoch: options.scrollEpoch ?? 0,
     selectedMessageIds: new Set<string>(),
     stripTimePrefix: (value: string) => value,
     renderMarkdown: (value: string) => value,
@@ -72,13 +76,18 @@ async function mountList(options: {
     copyMessage: async () => true,
     downloadAttachment: async () => true,
   })
+  const listRef = ref<ChatMessageListVirtualizer | null>(null)
+  const app = createApp({
+    setup: () => () => h(ChatMessageList, { ...componentProps, ref: listRef }),
+  })
   app.use(i18n)
-  const api = app.mount(host) as unknown as ChatMessageListVirtualizer
+  app.mount(host)
+  const api = listRef.value as ChatMessageListVirtualizer
   apps.push(app)
   await nextTick()
   await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
   await nextTick()
-  return { api, container, host }
+  return { api, container, host, props: componentProps }
 }
 
 beforeEach(() => {
@@ -195,6 +204,55 @@ describe('ChatMessageList long-history virtualization', () => {
     await nextTick()
 
     expect(container.scrollTop).toBe(120)
+  })
+
+  it('drops a queued anchor correction when the scroll epoch changes', async () => {
+    const { container, host, props } = await mountList({ scrollEpoch: 1 })
+    const row = host.querySelector<HTMLElement>('[data-testid="chat-message-row"]')
+    expect(row).toBeTruthy()
+    row!.getBoundingClientRect = () => ({ height: 214, bottom: 120 } as DOMRect)
+
+    const entry = { target: row } as unknown as ResizeObserverEntry
+    for (const callback of resizeObserverCallbacks) callback([entry], {} as ResizeObserver)
+    props.scrollEpoch = 2
+    await nextTick()
+    await nextTick()
+
+    expect(container.scrollTop).toBe(0)
+
+    row!.getBoundingClientRect = () => ({ height: 214, bottom: 120 } as DOMRect)
+    for (const callback of resizeObserverCallbacks) callback([entry], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+
+    expect(container.scrollTop).toBe(120)
+  })
+
+  it('drops a queued live-edge pin on a session change and accepts the next one', async () => {
+    const { container, host, props } = await mountList({
+      followLiveEdge: true,
+      sessionKey: 'session-a',
+      scrollEpoch: 1,
+    })
+    Object.defineProperty(container, 'scrollHeight', { configurable: true, value: 12_000 })
+    const row = host.querySelector<HTMLElement>('[data-testid="chat-message-row"]')
+    expect(row).toBeTruthy()
+    row!.getBoundingClientRect = () => ({ height: 40 } as DOMRect)
+
+    const entry = { target: row } as unknown as ResizeObserverEntry
+    for (const callback of resizeObserverCallbacks) callback([entry], {} as ResizeObserver)
+    props.sessionKey = 'session-b'
+    await nextTick()
+    await nextTick()
+
+    expect(container.scrollTop).toBe(0)
+
+    row!.getBoundingClientRect = () => ({ height: 80 } as DOMRect)
+    for (const callback of resizeObserverCallbacks) callback([entry], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+
+    expect(container.scrollTop).toBe(12_000)
   })
 
   it('renders the complete canonical history for share mode and the rollback flag', async () => {

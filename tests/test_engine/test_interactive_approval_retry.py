@@ -815,6 +815,8 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
     reset_approval_queue()
     approval_prompt_seen = asyncio.Event()
     tool_calls: list[dict[str, Any]] = []
+    execution_timeout = 1.0
+    approval_hold_seconds = execution_timeout + 0.1
 
     async def _handler(call: ToolCall) -> ToolResult:
         tool_calls.append(dict(call.arguments))
@@ -855,7 +857,6 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
                     }
                 ),
             )
-        await asyncio.sleep(0.01)
         return ToolResult(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
@@ -867,8 +868,8 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
         provider=provider,
         config=AgentConfig(
             max_iterations=2,
-            timeout=0.05,
-            iteration_timeout=0.05,
+            timeout=execution_timeout,
+            iteration_timeout=execution_timeout,
         ),
         tool_definitions=[_exec_definition()],
         tool_handler=_handler,
@@ -885,7 +886,13 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
     try:
         task = asyncio.create_task(_drive())
         await asyncio.wait_for(approval_prompt_seen.wait(), timeout=2.0)
-        await asyncio.sleep(0.08)
+        # Keep the turn pending beyond its execution deadlines without
+        # cancelling it.  The contract under test is that human approval time
+        # is suspended, not that platform scheduling and approval persistence
+        # fit inside a sub-second timing margin.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=approval_hold_seconds)
+        assert task.done() is False
 
         assert len(provider.calls) == 1
         assert len(tool_calls) == 1

@@ -116,7 +116,7 @@ describe('native Workbench platform bridge', () => {
 
     const listener = vi.fn()
     expect(native!.onSurfaceEvent(listener)).toBe(unsubscribe)
-    emit?.({ version: 4, surfaceId: 'artifact:fixture', type: 'ready' })
+    emit?.({ version: 99, surfaceId: 'artifact:fixture', type: 'ready' })
     emit?.({
       version: 1,
       surfaceId: 'artifact:fixture',

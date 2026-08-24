@@ -2216,6 +2216,7 @@ class _SelectorFallbackProvider:
         self._used_fallback = False
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
+        self._last_request_had_tools = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[
             _FallbackDeploymentIdentity, tuple[int, int]
@@ -2391,6 +2392,71 @@ class _SelectorFallbackProvider:
         )
         model = str(getattr(current_config, "model", "") or "")
         return provider_id, model
+
+    def _fallback_candidate_accepts_tools(self, deployment: Any) -> bool:
+        """Allow unknown candidates and reject only explicit tool denials."""
+
+        capabilities = self._fallback_deployment_capabilities.get(
+            _fallback_deployment_identity(deployment)
+        )
+        return bool(
+            capabilities is None
+            or getattr(capabilities, "supports_tools", None) is not False
+        )
+
+    def _advance_past_explicit_tool_denials(
+        self,
+        *,
+        candidate_predicate: Callable[[Any], bool] | None = None,
+    ) -> bool:
+        """Advance until tools, health, and any caller constraint all pass."""
+
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        current_config = getattr(self._selector, "current_config", None)
+        while current_config is not None:
+            candidate_compatible = bool(
+                self._fallback_candidate_accepts_tools(current_config)
+                and (
+                    candidate_predicate is None
+                    or candidate_predicate(current_config)
+                )
+            )
+            health_eligible = True
+            if (
+                candidate_compatible
+                and self._health_ledger is not None
+                and callable(remaining_chain)
+            ):
+                candidates = [
+                    (
+                        str(getattr(candidate, "provider", "")),
+                        str(getattr(candidate, "model", "")),
+                    )
+                    for candidate in remaining_chain()
+                    if self._fallback_candidate_accepts_tools(candidate)
+                    and (
+                        candidate_predicate is None
+                        or candidate_predicate(candidate)
+                    )
+                ]
+                if candidates:
+                    health_eligible = self._health_ledger.eligible(
+                        candidates[0][0],
+                        candidates[0][1],
+                        candidates,
+                    )
+            if candidate_compatible and health_eligible:
+                return True
+            next_fallback = getattr(self._selector, "next_fallback", None)
+            if not callable(next_fallback):
+                return False
+            try:
+                self._provider = next_fallback()
+            except Exception:  # noqa: BLE001 - optional legacy selector seam
+                return False
+            self._note_fallback_hop()
+            current_config = getattr(self._selector, "current_config", None)
+        return False
 
     def fallback_deployment_configs(self) -> tuple[Any, ...]:
         """Return private physical fallback configs without metadata projection."""
@@ -2738,22 +2804,18 @@ class _SelectorFallbackProvider:
             return
         ledger.record_success(provider_id, model)
 
-    def _can_escalate_local_admission_failure(self, config: Any = None) -> bool:
-        """Return whether the next authorized leg has a larger context window.
+    def _local_admission_candidate_is_compatible(
+        self,
+        current: Any,
+        candidate: Any,
+        config: Any = None,
+        *,
+        requires_tools: bool = False,
+    ) -> bool:
+        """Prove one local-admission candidate is larger and tool-compatible."""
 
-        ``provider_request_budget_exhausted`` is emitted before network I/O by
-        adapters. A small routed leg must not force durable session
-        compaction, but the selector may advance once to an already-authorized
-        larger fallback and let that leg repeat final admission.
-        """
-
-        remaining_chain = getattr(self._selector, "remaining_chain", None)
-        if not callable(remaining_chain):
+        if requires_tools and not self._fallback_candidate_accepts_tools(candidate):
             return False
-        chain = list(remaining_chain())
-        if len(chain) < 2:
-            return False
-        current, fallback = chain[0], chain[1]
         try:
             catalog = shared_catalog()
             global_override = _non_negative_int(
@@ -2769,10 +2831,10 @@ class _SelectorFallbackProvider:
                 provider=str(getattr(current, "provider", "") or ""),
                 global_override=global_override,
             )
-            fallback_window, fallback_source = resolve_effective_context_window(
+            candidate_window, candidate_source = resolve_effective_context_window(
                 catalog,
-                str(getattr(fallback, "model", "") or ""),
-                provider=str(getattr(fallback, "provider", "") or ""),
+                str(getattr(candidate, "model", "") or ""),
+                provider=str(getattr(candidate, "provider", "") or ""),
                 global_override=global_override,
             )
         except Exception:  # noqa: BLE001 - unknown capacity is not an escalation proof
@@ -2780,9 +2842,45 @@ class _SelectorFallbackProvider:
         reliable_sources = {"override", "config", "catalog"}
         return bool(
             str(current_source or "") in reliable_sources
-            and str(fallback_source or "") in reliable_sources
-            and int(fallback_window or 0) > int(current_window or 0)
+            and str(candidate_source or "") in reliable_sources
+            and int(candidate_window or 0) > int(current_window or 0)
         )
+
+    def _local_admission_fallback_index(
+        self,
+        config: Any = None,
+        *,
+        requires_tools: bool = False,
+    ) -> int:
+        """Return the first larger compatible fallback's one-based chain index.
+
+        ``provider_request_budget_exhausted`` is emitted before network I/O by
+        adapters. A small routed leg must not force durable session
+        compaction, but the selector may advance to an already-authorized
+        larger compatible fallback and let that leg repeat final admission.
+        """
+
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        if not callable(remaining_chain):
+            return 0
+        chain = list(remaining_chain())
+        if len(chain) < 2:
+            return 0
+        current = chain[0]
+        for index, fallback in enumerate(chain[1:], start=1):
+            if self._local_admission_candidate_is_compatible(
+                current,
+                fallback,
+                config,
+                requires_tools=requires_tools,
+            ):
+                return index
+        return 0
+
+    def _can_escalate_local_admission_failure(self, config: Any = None) -> bool:
+        """Return whether any authorized leg has a larger context window."""
+
+        return self._local_admission_fallback_index(config) > 0
 
     def _skip_benched_fallbacks(self) -> None:
         """Advance past benched fallback deployments (opt-in ledger only).
@@ -2819,19 +2917,18 @@ class _SelectorFallbackProvider:
             self._note_fallback_hop()
 
     def fallback_after_invalid_response(self, reason: str) -> bool:
-        try:
-            self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
-        except Exception:
-            return False
-        self._note_fallback_hop()
-        self._skip_benched_fallbacks()
-        return True
+        return self.fallback_after_invalid_response_with_capabilities(
+            reason,
+            requires_vision=False,
+            requires_tools=self._last_request_had_tools,
+        )
 
     def fallback_after_invalid_response_with_capabilities(
         self,
         reason: str,
         *,
         requires_vision: bool,
+        requires_tools: bool = False,
     ) -> bool:
         """Select an invalid-response fallback with exact capability evidence.
 
@@ -2841,32 +2938,61 @@ class _SelectorFallbackProvider:
         installs only the matching chain.
         """
 
-        if not requires_vision:
-            return self.fallback_after_invalid_response(reason)
-
         matching_fallback = getattr(
             self._selector,
             "next_fallback_after_failure_matching",
             None,
         )
-        if not callable(matching_fallback):
-            return False
         try:
-            self._provider = matching_fallback(
-                RuntimeError(reason),
-                predicate=lambda candidate: (
-                    self._fallback_deployment_vision_support.get(
-                        _fallback_deployment_identity(candidate),
-                        "unknown",
+            if requires_vision or requires_tools:
+                if not callable(matching_fallback):
+                    # Legacy selector seams cannot prove vision support, but
+                    # tool capability defaults to allowed-until-denied. The
+                    # active-leg admission guard below still blocks a fallback
+                    # that resolves to an explicit tools denial before I/O.
+                    if requires_vision:
+                        return False
+                    self._provider = self._selector.next_fallback_after_failure(
+                        RuntimeError(reason)
                     )
-                    == "supported"
-                ),
-            )
+                    if requires_tools and not self._advance_past_explicit_tool_denials():
+                        # The legacy selector already mutated its active leg.
+                        # Keep configuration rebinding enabled so any caller
+                        # that retries after ``False`` still hits the explicit
+                        # capability guard before provider I/O.
+                        self._note_fallback_hop()
+                        return False
+                else:
+                    self._provider = matching_fallback(
+                        RuntimeError(reason),
+                        predicate=lambda candidate: bool(
+                            (
+                                not requires_vision
+                                or self._fallback_deployment_vision_support.get(
+                                    _fallback_deployment_identity(candidate),
+                                    "unknown",
+                                )
+                                == "supported"
+                            )
+                            and (
+                                not requires_tools
+                                or self._fallback_candidate_accepts_tools(candidate)
+                            )
+                        ),
+                    )
+            else:
+                self._provider = self._selector.next_fallback_after_failure(
+                    RuntimeError(reason)
+                )
         except Exception:  # noqa: BLE001 - fallback support is optional
             return False
 
         self._note_fallback_hop()
-        self._skip_benched_fallbacks()
+        if requires_tools:
+            if not self._advance_past_explicit_tool_denials():
+                return False
+        else:
+            self._skip_benched_fallbacks()
         return True
 
     def _reject_unsupported_image_input(
@@ -2983,6 +3109,7 @@ class _SelectorFallbackProvider:
         *,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
+        self._last_request_had_tools = bool(tools)
         emitted_user_visible_content = False
         pre_text_buffer = _SelectorPreTextBuffer()
         primary_activity_id = uuid.uuid4().hex
@@ -2992,6 +3119,20 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
+        if (
+            tools
+            and getattr(
+                getattr(active_config, "model_capabilities", None),
+                "supports_tools",
+                None,
+            )
+            is False
+        ):
+            yield ProviderErrorEvent(
+                message="The selected model does not support tool calling.",
+                code="model_tools_unsupported",
+            )
+            return
         validation_error = self.validate_chat_admission(messages, config)
         if validation_error is not None:
             yield validation_error
@@ -3139,11 +3280,16 @@ class _SelectorFallbackProvider:
                         code="incomplete_tool_stream",
                     )
 
-                local_admission_escalation = bool(
-                    isinstance(event, ProviderErrorEvent)
+                local_admission_fallback_index = (
+                    self._local_admission_fallback_index(
+                        active_config,
+                        requires_tools=bool(tools),
+                    )
+                    if isinstance(event, ProviderErrorEvent)
                     and event.code == "provider_request_budget_exhausted"
-                    and self._can_escalate_local_admission_failure(active_config)
+                    else 0
                 )
+                local_admission_escalation = local_admission_fallback_index > 0
                 if isinstance(event, ProviderErrorEvent) and (
                     _should_use_selector_fallback(self.provider_name, event)
                     or event.code == "invalid_stream_order"
@@ -3161,9 +3307,68 @@ class _SelectorFallbackProvider:
                         "current_config",
                         None,
                     )
+                    local_candidate_predicate: Callable[[Any], bool] | None = None
+                    legacy_selection_mutated = False
                     try:
                         if local_admission_escalation:
-                            self._provider = self._selector.next_fallback()
+                            def _local_candidate_predicate(candidate: Any) -> bool:
+                                return self._local_admission_candidate_is_compatible(
+                                    failed_authority_config,
+                                    candidate,
+                                    active_config,
+                                    requires_tools=bool(tools),
+                                )
+
+                            local_candidate_predicate = _local_candidate_predicate
+                            matching_fallback = getattr(
+                                self._selector,
+                                "next_fallback_matching",
+                                None,
+                            )
+                            if callable(matching_fallback):
+                                self._provider = matching_fallback(
+                                    predicate=local_candidate_predicate,
+                                )
+                            else:
+                                next_fallback = getattr(
+                                    self._selector,
+                                    "next_fallback",
+                                    None,
+                                )
+                                if not callable(next_fallback):
+                                    raise IndexError(
+                                        "local admission fallback selection unavailable"
+                                    )
+                                for _ in range(local_admission_fallback_index):
+                                    self._provider = next_fallback()
+                                    legacy_selection_mutated = True
+                                    # Legacy selectors cannot advance
+                                    # atomically. Rebind capabilities after
+                                    # every successful step so a later build
+                                    # failure cannot expose this leg using the
+                                    # primary model's config.
+                                    self._used_fallback = True
+                        elif tools:
+                            matching_fallback = getattr(
+                                self._selector,
+                                "next_fallback_after_failure_matching",
+                                None,
+                            )
+                            selector_failure = _selector_failure_for_hook(
+                                active_provider_id or self.provider_name,
+                                event,
+                            )
+                            if callable(matching_fallback):
+                                self._provider = matching_fallback(
+                                    selector_failure,
+                                    predicate=self._fallback_candidate_accepts_tools,
+                                )
+                            else:
+                                self._provider = (
+                                    self._selector.next_fallback_after_failure(
+                                        selector_failure
+                                    )
+                                )
                         else:
                             self._provider = self._selector.next_fallback_after_failure(
                                 _selector_failure_for_hook(
@@ -3172,12 +3377,25 @@ class _SelectorFallbackProvider:
                                 )
                             )
                     except Exception:
+                        if legacy_selection_mutated:
+                            self._note_fallback_hop()
                         for buffered_event in pre_text_buffer.drain(successful_leg=False):
                             yield buffered_event
                         yield event
                         return
                     self._note_fallback_hop()
-                    self._skip_benched_fallbacks()
+                    if tools:
+                        if not self._advance_past_explicit_tool_denials(
+                            candidate_predicate=local_candidate_predicate
+                        ):
+                            for buffered_event in pre_text_buffer.drain(
+                                successful_leg=False
+                            ):
+                                yield buffered_event
+                            yield event
+                            return
+                    else:
+                        self._skip_benched_fallbacks()
                     # Close the failed physical leg before reserving the next
                     # one; otherwise an early-consumer break can defer unknown
                     # coverage until async-generator GC.
@@ -3185,6 +3403,22 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
+                    if (
+                        tools
+                        and getattr(
+                            getattr(fallback_config, "model_capabilities", None),
+                            "supports_tools",
+                            None,
+                        )
+                        is False
+                    ):
+                        yield ProviderErrorEvent(
+                            message=(
+                                "The selected fallback model does not support tool calling."
+                            ),
+                            code="model_tools_unsupported",
+                        )
+                        return
                     fallback_admission_error = self._reject_unsupported_image_input(
                         messages,
                         fallback_config,

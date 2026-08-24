@@ -180,6 +180,16 @@ def _wait_for_file(path: Path, process: subprocess.Popen[bytes]) -> None:
         time.sleep(0.01)
 
 
+def _release_lease_holder(process: subprocess.Popen[bytes]) -> None:
+    assert process.stdin is not None
+    process.stdin.close()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def test_gateway_profile_lease_blocks_offline_process_then_allows_install(
     tmp_path: Path,
 ) -> None:
@@ -189,7 +199,6 @@ def test_gateway_profile_lease_blocks_offline_process_then_allows_install(
     lockfile = profile_home / "skills-lock.json"
     journal = profile_home / "state" / "skill-transaction.json"
     ready = tmp_path / "lease-ready"
-    release = tmp_path / "lease-release"
     installed = tmp_path / "installed"
     environment = _worker_environment(state_root)
     holder = subprocess.Popen(
@@ -199,9 +208,9 @@ def test_gateway_profile_lease_blocks_offline_process_then_allows_install(
             "hold",
             str(profile_home),
             str(ready),
-            str(release),
         ],
         env=environment,
+        stdin=subprocess.PIPE,
     )
     try:
         _wait_for_file(ready, holder)
@@ -226,12 +235,7 @@ def test_gateway_profile_lease_blocks_offline_process_then_allows_install(
         assert not journal.exists()
         assert not (managed / "process-skill").exists()
     finally:
-        release.write_text("release", encoding="utf-8")
-        try:
-            holder.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            holder.kill()
-            holder.wait(timeout=5)
+        _release_lease_holder(holder)
     assert holder.returncode == 0
 
     succeeded = subprocess.run(
@@ -274,7 +278,6 @@ def test_unleased_build_services_does_not_sweep_another_process_reservation(
     rollback_reservation.mkdir(parents=True)
 
     ready = tmp_path / "lease-ready"
-    release = tmp_path / "lease-release"
     probe = tmp_path / "boot-probe.json"
     environment = _worker_environment(state_root)
     holder = subprocess.Popen(
@@ -284,9 +287,9 @@ def test_unleased_build_services_does_not_sweep_another_process_reservation(
             "hold",
             str(profile_home),
             str(ready),
-            str(release),
         ],
         env=environment,
+        stdin=subprocess.PIPE,
     )
     try:
         _wait_for_file(ready, holder)
@@ -309,12 +312,7 @@ def test_unleased_build_services_does_not_sweep_another_process_reservation(
         assert rollback_reservation.is_dir()
         assert "PROFILE_LEASE_REQUIRED" in probe.read_text(encoding="utf-8")
     finally:
-        release.write_text("release", encoding="utf-8")
-        try:
-            holder.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            holder.kill()
-            holder.wait(timeout=5)
+        _release_lease_holder(holder)
     assert holder.returncode == 0
 
 

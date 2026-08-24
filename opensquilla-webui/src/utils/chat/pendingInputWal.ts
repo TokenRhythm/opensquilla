@@ -20,6 +20,8 @@ export interface PendingInputWalRecord {
   clientRequestId: string
   clientMessageId: string
   text: string
+  /** Annotation batch retained across IndexedDB/WAL queue recovery. */
+  promptAnnotationIds?: string[]
   attachments: Attachment[]
   intent: string | null
   confirmedPlainText?: boolean
@@ -116,6 +118,16 @@ const WAL_STATES = new Set<PendingInputWalState>([
   'cancelling',
 ])
 
+function validPromptAnnotationIds(value: unknown): boolean {
+  if (value === undefined) return true
+  if (!Array.isArray(value) || value.length > 16) return false
+  return value.every((item, index) => (
+    typeof item === 'string'
+    && item.trim().length > 0
+    && value.indexOf(item) === index
+  ))
+}
+
 function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord {
   if (!value || typeof value !== 'object') return false
   const record = value as Partial<PendingInputWalRecord>
@@ -129,6 +141,7 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
+    && validPromptAnnotationIds(record.promptAnnotationIds)
     && Array.isArray(record.attachments)
     && record.attachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
@@ -222,6 +235,9 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
 function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
   return {
     ...record,
+    ...(record.promptAnnotationIds
+      ? { promptAnnotationIds: [...record.promptAnnotationIds] }
+      : {}),
     attachments: record.attachments.map(attachment => ({ ...attachment })),
   }
 }

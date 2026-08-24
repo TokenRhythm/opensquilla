@@ -16,6 +16,7 @@ from opensquilla.sandbox.runtime_launcher import (
 @pytest.mark.parametrize(
     ("role", "module"),
     [
+        (ChildRole.PROCESS_TREE, "opensquilla.process_tree"),
         (ChildRole.FILESYSTEM_WORKER, "opensquilla.sandbox.filesystem_worker"),
         (ChildRole.LINUX_HELPER, "opensquilla.sandbox.backend.linux_helper"),
         (
@@ -48,6 +49,7 @@ def test_source_child_uses_python_module(
     "role",
     [
         ChildRole.FILESYSTEM_WORKER,
+        ChildRole.PROCESS_TREE,
         ChildRole.LINUX_HELPER,
         ChildRole.WINDOWS_DEFAULT_RUNNER,
         ChildRole.DIRECTORY_PICKER,
@@ -78,6 +80,14 @@ def test_dispatch_rejects_missing_or_unknown_role() -> None:
         dispatch_internal_child([])
     with pytest.raises(InternalChildDispatchError, match="unknown"):
         dispatch_internal_child(["shell"])
+
+
+def test_dispatch_process_tree_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    from opensquilla import process_tree
+
+    monkeypatch.setattr(process_tree, "main", lambda args: 7 if tuple(args) == ("--probe",) else 2)
+
+    assert dispatch_internal_child(["process-tree", "--probe"]) == 7
 
 
 def test_strict_runtime_path_does_not_inherit_host_when_no_pack_exists(

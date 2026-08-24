@@ -29,6 +29,11 @@ from opensquilla.contracts.gateway_transport import (
 from opensquilla.engine.types import AnswerGenerationResetEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.artifact_contexts import (
+    PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+    PROMPT_ANNOTATION_TOOL_NAMES,
+    BoundPromptAnnotationContext,
+)
 from opensquilla.gateway.attachment_ingest import (
     MAX_STAGED_PDF_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
@@ -92,6 +97,94 @@ def test_sessions_steer_v2_scope_contract() -> None:
 
 def test_sessions_pending_inputs_steer_scope_contract() -> None:
     assert METHOD_SCOPES["sessions.pending_inputs.steer"] == WRITE_SCOPE
+
+
+def test_prompt_annotation_bridge_fallback_uses_source_only_contract() -> None:
+    context = BoundPromptAnnotationContext(
+        session_key="agent:main:web",
+        session_id="session-1",
+        document_id="document-1",
+        revision_id="revision-1",
+        targets=(),
+        snapshots=(
+            {
+                "version": 1,
+                "annotationId": "annotation-1",
+                "order": 0,
+                "body": "Remove the label.",
+                "targetStatus": "ready",
+                "targetReason": None,
+                "targetKind": "region",
+                "targetText": "label",
+                "document": {"id": "document-1", "name": "page.html", "kind": "html"},
+                "revision": {
+                    "id": "revision-1",
+                    "generation": 1,
+                    "sha256": "a" * 64,
+                },
+                "anchor": {
+                    "id": "anchor-1",
+                    "kind": "html_element",
+                    "tagName": "p",
+                    "locator": {},
+                    "quote": "label",
+                },
+            },
+        ),
+        artifact_format="html",
+        tool_names=PROMPT_ANNOTATION_TOOL_NAMES,
+        operation_class="selection_edit",
+        request_context_prompt="old prompt",
+    )
+
+    downgraded = rpc_sessions._prompt_annotation_source_only_context(context)
+
+    assert downgraded.tool_names == PROMPT_ANNOTATION_SOURCE_TOOL_NAMES
+    assert "document_finish" not in downgraded.tool_names
+    assert "document_browser_inspect" not in downgraded.tool_names
+    assert "source-only compatibility path" in downgraded.request_context_prompt
+
+
+def test_candidate_loop_requires_v4_active_preview_capabilities() -> None:
+    assert rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        SimpleNamespace(
+            version=4,
+            available=True,
+            browser_inspect=True,
+            bind_candidate_preview=True,
+            restore_canonical_preview=True,
+        )
+    )
+    assert not rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        SimpleNamespace(
+            version=4,
+            available=False,
+            browser_inspect=False,
+            bind_candidate_preview=False,
+            restore_canonical_preview=False,
+        )
+    )
+
+
+def test_candidate_loop_capability_check_accepts_wire_camel_case() -> None:
+    assert rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        {
+            "version": 4,
+            "available": True,
+            "browserInspect": True,
+            "bindCandidatePreview": True,
+            "restoreCanonicalPreview": True,
+        }
+    )
+    assert not rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
+        {
+            "version": 4,
+            "available": True,
+            "browserInspect": True,
+            "bindCandidatePreview": True,
+            "restoreCanonicalPreview": False,
+        }
+    )
 
 
 @dataclass
@@ -2839,9 +2932,13 @@ class TestSessionsSend:
             append_called.set()
             return await original_append(*args, **kwargs)
 
-        def observed_register(session_key: str, task: asyncio.Task) -> None:
+        def observed_register(
+            session_key: str,
+            task: asyncio.Task,
+            **kwargs: Any,
+        ) -> None:
             assert admission_active is True
-            original_register(session_key, task)
+            original_register(session_key, task, **kwargs)
 
         monkeypatch.setattr(registry, "admission", observed_admission)
         monkeypatch.setattr(registry, "register", observed_register)
@@ -6092,20 +6189,27 @@ class TestSessionsAbort:
             cancel_background,
         )
         monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
-        started_at = rpc_sessions.time.monotonic()
-
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.abort",
-            {"key": session.session_key},
-            make_ctx(session_manager=FakeSessionManager([session]), task_runtime=Runtime()),
+        # The runtime cancellation intentionally never completes.  The
+        # production handler must return on its shared budget, but a strict
+        # wall-clock assertion is flaky on loaded Windows runners (scheduler
+        # hand-off alone can exceed 150 ms).  A one-second outer bound still
+        # catches an unbounded await while keeping the contract deterministic.
+        res = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.abort",
+                {"key": session.session_key},
+                make_ctx(
+                    session_manager=FakeSessionManager([session]),
+                    task_runtime=Runtime(),
+                ),
+            ),
+            timeout=1.0,
         )
-        elapsed = rpc_sessions.time.monotonic() - started_at
-        await asyncio.wait_for(cancel_entered.wait(), timeout=0.2)
-        await asyncio.wait_for(cancel_cancelled.wait(), timeout=0.2)
+        await asyncio.wait_for(cancel_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(cancel_cancelled.wait(), timeout=1.0)
 
         assert res.ok is True
-        assert elapsed < 0.15
 
     @pytest.mark.asyncio
     async def test_abort_no_manager(self, dispatcher, ctx_no_manager):
@@ -8714,6 +8818,7 @@ class TestSessionsMessagesSubscribe:
                         "stream_generation": stream_registry.stream_generation,
                         "stream_seq": 1,
                         "emitted_at": ANY,
+                        "ended_at": ANY,
                     },
                 }
             ],

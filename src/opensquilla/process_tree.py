@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -42,6 +42,9 @@ log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 0.01
 _CONTROL_READY_TIMEOUT_SECONDS = 2.0
+_WINDOWS_FROZEN_READY_TIMEOUT_SECONDS = 5.0
+_WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS = 0.25
+_WINDOWS_FROZEN_READY_ATTEMPTS = 2
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
@@ -71,6 +74,44 @@ _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 _POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
 _DARWIN_PROC_PIDTBSDINFO = 3
+
+
+def _process_tree_child_argv(*args: str) -> tuple[str, ...]:
+    """Build the source or frozen argv for one process-tree helper."""
+
+    prefix = (
+        (sys.executable, "--internal-child", "process-tree")
+        if getattr(sys, "frozen", False)
+        else (sys.executable, "-m", "opensquilla.process_tree")
+    )
+    return (*prefix, *args)
+
+
+def _wait_for_windows_helper_ready(gate: Any) -> None:
+    """Wait longer, once more, for a cold frozen helper to become ready."""
+
+    frozen = bool(getattr(sys, "frozen", False))
+    timeout = (
+        _WINDOWS_FROZEN_READY_TIMEOUT_SECONDS
+        if frozen
+        else _CONTROL_READY_TIMEOUT_SECONDS
+    )
+    attempts = _WINDOWS_FROZEN_READY_ATTEMPTS if frozen else 1
+    for attempt in range(attempts):
+        try:
+            gate.wait_ready(timeout)
+            return
+        except TimeoutError:
+            if attempt + 1 >= attempts:
+                raise
+            log.warning(
+                "windows_process_tree_helper_ready_retry",
+                extra={
+                    "attempt": attempt + 1,
+                    "timeout_seconds": timeout,
+                },
+            )
+            time.sleep(_WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -1862,12 +1903,11 @@ async def _create_posix_anchor(
     if control_path is not None:
         _prepare_private_directory(control_path.parent)
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "opensquilla.process_tree",
-        "--posix-group-anchor",
-        owner_id,
-        *(str(control_path) if control_path is not None else "-",),
+        *_process_tree_child_argv(
+            "--posix-group-anchor",
+            owner_id,
+            *(str(control_path) if control_path is not None else "-",),
+        ),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -2015,14 +2055,13 @@ async def _create_owned_posix_subprocess(
             status_write_fd,
         )
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "opensquilla.process_tree",
-            "--posix-owned-launch",
-            str(gate.read_fd),
-            str(status_write_fd),
-            "--",
-            *argv,
+            *_process_tree_child_argv(
+                "--posix-owned-launch",
+                str(gate.read_fd),
+                str(status_write_fd),
+                "--",
+                *argv,
+            ),
             **child_kwargs,
         )
         gate.close_child_end()
@@ -2102,10 +2141,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
         )
         child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-        helper_argv = (
-            sys.executable,
-            "-m",
-            "opensquilla.process_tree",
+        helper_argv = _process_tree_child_argv(
             "--windows-owned-launch",
             gate.gate_name,
             gate.ready_name,
@@ -2121,8 +2157,8 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             )
             job.assign_pid(int(windows_process.pid))
             await asyncio.to_thread(
-                gate.wait_ready,
-                _CONTROL_READY_TIMEOUT_SECONDS,
+                _wait_for_windows_helper_ready,
+                gate,
             )
             if task_scope is not None:
                 persisted_owner = _insert_owner_record(
@@ -2196,22 +2232,19 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
     )
     child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-    helper_argv = [
-        sys.executable,
-        "-m",
-        "opensquilla.process_tree",
+    helper_argv = _process_tree_child_argv(
         "--windows-owned-launch",
         gate.gate_name,
         gate.ready_name,
         "--",
         *argv,
-    ]
+    )
     process: Any | None = None
     persisted_owner: _PersistedOwnerRef | None = None
     try:
         process = subprocess.Popen(helper_argv, **child_kwargs)
         job.assign_pid(int(process.pid))
-        gate.wait_ready(_CONTROL_READY_TIMEOUT_SECONDS)
+        _wait_for_windows_helper_ready(gate)
         if task_scope is not None:
             persisted_owner = _insert_owner_record(
                 task_scope,
@@ -2838,8 +2871,10 @@ async def reconcile_persisted_processes(state_dir: str | Path | None) -> int:
     return await _terminate_owner_records(records)
 
 
-def _main() -> int:
-    args = sys.argv[1:]
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one fixed process-tree helper mode."""
+
+    args = list(sys.argv[1:] if argv is None else argv)
     if (
         len(args) == 3
         and args[0] == "--posix-group-anchor"
@@ -2877,10 +2912,11 @@ __all__ = [
     "create_owned_popen",
     "create_owned_subprocess_exec",
     "create_owned_subprocess_shell",
+    "main",
     "reconcile_persisted_processes",
     "task_process_scope",
 ]
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    raise SystemExit(main())

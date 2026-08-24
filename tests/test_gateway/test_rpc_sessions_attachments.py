@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.rpc_sessions import (
     _ALLOWED_MEDIA_TYPES,
     _MAX_ATTACHMENT_BYTES,
@@ -180,14 +181,21 @@ def test_mime_sniff_logs_warning_on_mismatch(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch on the module-level logger rather than caplog — testing
     the contract, not the framework plumbing.
     """
-    from opensquilla.gateway import rpc_sessions
-
     captured: list[tuple[str, dict[str, Any]]] = []
 
     def _record_warning(event: str, **kwargs: Any) -> None:
         captured.append((event, kwargs))
 
-    monkeypatch.setattr(rpc_sessions.log, "warning", _record_warning)
+    real_log = rpc_sessions.log
+
+    class _WarningLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            _record_warning(event, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(rpc_sessions, "log", _WarningLog())
 
     pdf_bytes = b"%PDF-1.4\nbody\n"
     _validate_attachments([_attach("text/plain", pdf_bytes, name="weird.txt")])

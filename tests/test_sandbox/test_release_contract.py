@@ -112,13 +112,16 @@ def test_ci_owns_a_package_contract_verifier() -> None:
     assert "asset.sizeBytes" in verifier
     assert "asset.unpackedSizeBytes" in verifier
     assert r"\.tar\.xz" in verifier
-    assert "managed upgrade cleanup without a custom recursive delete" in verifier
-    assert "build', 'installer.nsh'" in verifier
+    assert "verifyInstallerProgressPolicy" in verifier
     assert "verify-sandbox-package.mjs" in workflow
 
     package_verifier = _text("desktop/electron/scripts/verify-package.mjs")
-    assert "managed upgrade cleanup without a custom recursive delete" in package_verifier
-    assert "unsafeInstallerInclude" in package_verifier
+    assert "verifyInstallerProgressPolicy" in package_verifier
+
+    installer_policy = _text("desktop/electron/scripts/installer-progress-policy.mjs")
+    assert "NSIS include must be exactly" in installer_policy
+    assert "NSIS must not define a custom full installer script" in installer_policy
+    assert "NSIS default build/installer.nsh override must not be present" in installer_policy
 
 
 def test_finalized_catalog_allows_development_and_release() -> None:

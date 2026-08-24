@@ -63,6 +63,22 @@ try {
   assert.equal(failed.record.status, 'failed')
   assert.deepEqual(failed.record.details, { exit_code: 7, signal: null })
 
+  const timedOut = await runCommandWithTelemetry({
+    caseName: 'command-timeout',
+    os: 'TestOS',
+    shard: 'unit',
+    attempt: 1,
+    outputPath,
+    emit: line => emitted.push(line),
+    timeoutMs: 100,
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 30_000)'],
+  })
+  assert.notEqual(timedOut.exitCode, 0)
+  assert.equal(timedOut.record.status, 'failed')
+  assert.equal(timedOut.record.details.timed_out, true)
+  assert.equal(timedOut.record.details.timeout_ms, 100)
+
   const cliPassed = spawnSync(process.execPath, [
     helperPath,
     'run',
@@ -113,6 +129,7 @@ try {
     'direct-case',
     'command-pass',
     'command-fail',
+    'command-timeout',
     'cli-pass',
     'cli-fail',
   ])
