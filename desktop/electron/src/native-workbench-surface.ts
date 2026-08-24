@@ -2771,7 +2771,12 @@ export class NativeWorkbenchSurfaceManager {
       ) return
       candidate.geometryRefreshPending = true
       void this.refreshAnnotationGeometry(record, candidate).catch(() => {
-        void this.cancelAnnotationInteraction(record, 'selection-stale', true)
+        // Closing an editor can release its candidate while this CDP read is
+        // still in flight. Never let that retired read cancel a picker that a
+        // newer close/rearm transaction has already installed.
+        if (record.annotationCandidate === candidate) {
+          void this.cancelAnnotationInteraction(record, 'selection-stale', true)
+        }
       }).finally(() => {
         candidate.geometryRefreshPending = false
       })

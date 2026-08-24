@@ -841,21 +841,11 @@ try {
         return await waitForTrustedAnnotationInput(overlay, probe, expectedValue, label)
       }
 
-      async function closeAnnotationOverlayAndDrain(request, label) {
-        const record = manager.surfaces.get(request.surfaceId)
-        const candidate = record?.annotationCandidate ?? null
-        const result = manager.closeArtifactAnnotationOverlay(request)
-        if (record && candidate) {
-          // Closing stops the interval synchronously, but a geometry CDP call
-          // that already started may still finish through its stale-selection
-          // cleanup. Do not let that cleanup cancel the next picker rearm.
-          await waitFor(async () => {
-            if (candidate.geometryRefreshPending) return false
-            await record.cdpQueue
-            return !candidate.geometryRefreshPending && record.annotationCandidate === null
-          }, `${label} geometry cleanup`)
-        }
-        return result
+      function closeAnnotationOverlayImmediately(request) {
+        // Do not drain a retired geometry read before continuing. The product
+        // contract must fence that stale continuation from the newly armed
+        // picker, including when the next click arrives immediately.
+        return manager.closeArtifactAnnotationOverlay(request)
       }
 
       // WebContents.isFocused() is only meaningful while the Electron app owns
@@ -1502,11 +1492,11 @@ try {
         const textarea = document.getElementById('annotation-body')
         textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
       })()`)
-      const annotationOverlayAcknowledgement = await closeAnnotationOverlayAndDrain({
+      const annotationOverlayAcknowledgement = await closeAnnotationOverlayImmediately({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_electron_fixture',
-      }, 'trusted annotation acknowledgement')
+      })
       const annotationOverlayClosedAfterAcknowledgement =
         !annotationOverlay.view.getVisible()
         && annotationOverlay.binding === null
@@ -1669,20 +1659,53 @@ try {
           && event.detail?.body === 'Rearmed input\n'),
         'reused trusted overlay IME state reset',
       )
-      const annotationRearmOverlayClose = await closeAnnotationOverlayAndDrain({
+      const retiredGeometryCandidate = manager.surfaces
+        .get('artifact:v3-bridge')?.annotationCandidate
+      const rearmCdpCommand = manager.cdpCommand.bind(manager)
+      let releaseRetiredGeometry = null
+      manager.cdpCommand = async (record, method, params) => {
+        const result = await rearmCdpCommand(record, method, params)
+        if (
+          releaseRetiredGeometry === null
+          && method === 'Runtime.callFunctionOn'
+          && params?.returnByValue === true
+          && params?.awaitPromise !== true
+        ) {
+          await new Promise(resolve => {
+            releaseRetiredGeometry = resolve
+          })
+        }
+        return result
+      }
+      await waitFor(
+        () => typeof releaseRetiredGeometry === 'function',
+        'in-flight retired annotation geometry read',
+      )
+      const annotationRearmOverlayClose = await closeAnnotationOverlayImmediately({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_rearmed_fixture',
-      }, 'rearmed annotation acknowledgement')
-      const annotationRearmFocusCycles = []
-      const annotationRearmCycleCount = fixture.stressMode ? 8 : 4
-      for (let cycle = 0; cycle < annotationRearmCycleCount; cycle += 1) {
-        const cycleEventsBefore = events.length
-        const cyclePicker = await manager.setArtifactAnnotationMode({
+      })
+      const annotationRearmAfterRetiredGeometry =
+        await manager.setArtifactAnnotationMode({
           version: 3,
           surfaceId: 'artifact:v3-bridge',
           enabled: true,
         })
+      manager.cdpCommand = rearmCdpCommand
+      releaseRetiredGeometry()
+      await waitFor(
+        () => retiredGeometryCandidate?.geometryRefreshPending === false,
+        'retired annotation geometry completion',
+      )
+      const annotationRetiredGeometryDidNotCancelRearm =
+        annotationRearmAfterRetiredGeometry.ok
+        && manager.surfaces.get('artifact:v3-bridge')?.annotationPickerActive === true
+      const annotationRearmFocusCycles = []
+      const annotationRearmCycleCount = fixture.stressMode ? 8 : 4
+      let cyclePicker = annotationRearmAfterRetiredGeometry
+      for (let cycle = 0; cycle < annotationRearmCycleCount; cycle += 1) {
+        const cycleEventsBefore = events.length
         const cyclePageClicksBefore = await v3Contents.executeJavaScript(
           'Number(window.__annotationPageClicks || 0)',
         )
@@ -1745,11 +1768,18 @@ try {
           value: cycleInputState.value,
         })
         const cycleFocusState = cycleInputState
-        const cycleClose = await closeAnnotationOverlayAndDrain({
+        const cycleClose = await closeAnnotationOverlayImmediately({
           version: 3,
           surfaceId: 'artifact:v3-bridge',
           annotationId: cycleAnnotationId,
-        }, `annotation rearm close cycle ${cycle + 1}`)
+        })
+        const cycleNextPicker = cycle + 1 < annotationRearmCycleCount
+          ? await manager.setArtifactAnnotationMode({
+              version: 3,
+              surfaceId: 'artifact:v3-bridge',
+              enabled: true,
+            })
+          : null
         annotationRearmFocusCycles.push({
           picker: cyclePicker.ok,
           overlay: cycleOverlayResult.ok,
@@ -1757,6 +1787,7 @@ try {
           typedValue: cycleInputState.value,
           closed: cycleClose.ok,
         })
+        cyclePicker = cycleNextPicker
       }
       const v3Record = manager.surfaces.get('artifact:v3-bridge')
       const annotationScrollBeforeFocus = await v3Contents.executeJavaScript('window.scrollY')
@@ -2875,6 +2906,7 @@ try {
         annotationRearmShiftEnterDidNotSubmit,
         annotationRearmSubmitAfterInterruptedComposition,
         annotationRearmOverlayClose,
+        annotationRetiredGeometryDidNotCancelRearm,
         annotationRearmFocusCycles,
         annotationFocus,
         annotationScrollBeforeFocus,
@@ -3344,6 +3376,7 @@ try {
   assert.equal(result.annotationRearmShiftEnterDidNotSubmit, true)
   assert.equal(result.annotationRearmSubmitAfterInterruptedComposition, true)
   assert.equal(result.annotationRearmOverlayClose.ok, true)
+  assert.equal(result.annotationRetiredGeometryDidNotCancelRearm, true)
   assert.equal(result.annotationRearmFocusCycles.length, result.stressMode ? 8 : 4)
   assert.equal(
     result.annotationRearmFocusCycles.every(cycle =>
