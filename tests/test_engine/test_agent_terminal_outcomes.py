@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.engine.outcome import outcome_from_error
-from opensquilla.engine.turn_control import TurnStateSnapshot, decide_turn_control
 
 STOP_SURFACE_INVENTORY = {
     "max_iterations": {
@@ -73,20 +72,3 @@ def test_stop_surface_inventory_tracks_recovery_first_contract() -> None:
         item["interactive_terminal_by_default"]
         for item in STOP_SURFACE_INVENTORY.values()
     )
-
-
-def test_turn_control_recoverable_stops_are_not_terminal_before_recovery() -> None:
-
-    snapshot = TurnStateSnapshot(
-        iteration=1,
-        max_iterations=1,
-        provider_call_count=1,
-        run_mode="interactive",
-        recovery_attempted=False,
-        finalization_attempted=False,
-    )
-
-    decision = decide_turn_control(snapshot, stop_code="max_iterations")
-
-    assert decision.action == "finalize_partial"
-    assert decision.presentation != "terminal"

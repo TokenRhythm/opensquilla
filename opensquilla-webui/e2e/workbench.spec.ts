@@ -592,7 +592,6 @@ test.describe('Application Workbench', () => {
     await (await deliverablesHeaderAction(page)).click()
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
-    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(0)
     expect(requests.get('/api/v1/artifacts/workbench-guide')).toBeGreaterThan(guideRequestCount)
   })
 

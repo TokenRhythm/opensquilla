@@ -1087,12 +1087,6 @@ class SessionManager:
         self.set_cached_epoch(reset.session_key, int(reset.epoch or 0))
         return reset
 
-    async def _archive_session_identity(self, node: SessionNode) -> None:
-        """Persist the raw archive before a same-key transcript reset."""
-
-        entries, summaries = await self.capture_session_archive(node)
-        await self.write_session_archive(node, entries, summaries)
-
     async def capture_session_archive(
         self,
         node: SessionNode,

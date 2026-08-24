@@ -1130,19 +1130,7 @@
       "modelMetadataProvenance": "服务商实时列表 · 官网参数优先，缺失时使用目录值"
     },
     "preset": {
-      "summary": "路由模板：{label}",
-      "desc": "一次性应用到模型路由；生效分层在模型路由中编辑。",
-      "customizedSummary": "模型路由当前使用：{label}。",
-      "customizedDesc": "生效分层在模型路由中查看和编辑。",
-      "synthesizedLabel": "已生成路由模板",
-      "synthesizedBadge": "已生成模板",
-      "customize": "查看模板详情 →",
-      "hide": "收起模板详情",
-      "apply": "应用到模型路由",
-      "viewInRouter": "打开模型路由 →",
-      "modeRecommended": "路由模板",
-      "modeCustom": "自定义分层",
-      "modeDisabled": "关"
+      "modeCustom": "自定义分层"
     },
     "modelStrategy": {
       "title": "模型路由",
@@ -1792,8 +1780,6 @@
       "routerSaved": "路由已保存。",
       "routerSavedRestart": "路由已保存。需要重启。",
       "ensembleSaved": "模型融合已保存。",
-      "presetApplied": "路由预设已应用。",
-      "presetAppliedRestart": "路由预设已应用。需要重启。",
       "channelSaved": "渠道已保存——本地校验通过；可点「测试连接」验证凭证",
       "channelSavedLive": "渠道已保存并生效——正以新配置运行",
       "channelStartFailed": "渠道已保存,但启动失败——请在状态中查看错误,然后用「重启」重试",
@@ -3023,16 +3009,6 @@
     "tile": {
       "installed": "已安装",
       "add": "下载"
-    },
-    "skillCard": {
-      "subSkillsTitle": "此元技能使用的子技能",
-      "uses": "使用",
-      "dependencies": "已声明依赖",
-      "pythonCount": "Python 包：{count}",
-      "binaryCount": "二进制依赖：{count}",
-      "envCount": "环境变量：{count}",
-      "missingCount": "缺失依赖：{count}",
-      "advisoryCount": "提示项：{count}"
     },
     "skillDetail": {
       "dialogLabel": "技能详情：{name}",

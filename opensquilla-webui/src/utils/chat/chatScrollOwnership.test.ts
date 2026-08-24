@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import {
   CHAT_WHEEL_DELTA_MODE_LINE,
   CHAT_WHEEL_DELTA_MODE_PAGE,
-  findNearestScrollableAncestor,
   getChatWheelDirection,
   normalizeChatWheelDelta,
   resolveChatWheelOwnership,
@@ -85,7 +84,6 @@ describe('chat scroll ownership', () => {
       canScroll: true,
       atBoundary: false,
     })
-    expect(findNearestScrollableAncestor(target, thread)).toBe(nested)
   })
 
   it('hands an edge gesture to the outer thread when nested scrolling is exhausted', () => {
@@ -182,7 +180,6 @@ describe('chat scroll ownership', () => {
     wheelAt(target, { deltaY: 20 })
 
     expect(ownership).toMatchObject({ owner: null })
-    expect(findNearestScrollableAncestor(target, boundary)).toBeNull()
   })
 
   it('retains the nearest edge owner when no outer container can continue', () => {
@@ -218,7 +215,6 @@ describe('chat scroll ownership', () => {
       deltaY: -20,
       target: nested,
     }
-    expect(findNearestScrollableAncestor(nested)).toBe(nested)
     expect(resolveChatWheelOwnership(event)).toMatchObject({
       owner: nested,
       canScroll: true,

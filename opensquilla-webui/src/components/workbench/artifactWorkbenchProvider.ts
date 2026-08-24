@@ -27,7 +27,6 @@ import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresen
 import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   artifactFromWorkbenchItem,
-  artifactsFromWorkbenchItem,
   initialSectionFromWorkbenchItem,
   initialSectionRequestIdFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
@@ -61,7 +60,6 @@ import {
   revokeArtifactPreviewLease,
   type ArtifactPreviewLease,
 } from '@/utils/workbench/artifactPreviewLease'
-import ArtifactCollectionPanel from './ArtifactCollectionPanel.vue'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
 
 type Translate = (key: string, params?: Record<string, unknown>) => string
@@ -112,11 +110,6 @@ export interface ArtifactWorkbenchProviderOptions {
     noticeShown: boolean
   }): Promise<void>
   showFullPreviewNotice?(): void
-  openArtifact(
-    artifact: ArtifactPayload,
-    sessionKey: string,
-    navigationArtifacts: readonly ArtifactPayload[],
-  ): void
   publishDocument?(request: {
     sessionKey: string
     documentId: string
@@ -2965,23 +2958,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 }
 
-class ArtifactCollectionRuntime implements WorkbenchPanelRuntime {
-  constructor(
-    private readonly options: ArtifactWorkbenchProviderOptions,
-  ) {}
-
-  handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
-    if (event.type !== 'artifact-open') return
-    const artifact = artifactEventPayload(event)
-    if (!artifact) return
-    this.options.openArtifact(
-      artifact,
-      artifactSessionKey(item, this.options),
-      artifactsFromWorkbenchItem(item),
-    )
-  }
-}
-
 function artifactHeader(
   item: WorkbenchItem,
 ): { title: string; subtitle?: string; icon?: ReturnType<typeof artifactIconName> } {
@@ -3178,29 +3154,6 @@ export function createArtifactWorkbenchDefinitions(
   options: ArtifactWorkbenchProviderOptions,
 ): readonly WorkbenchPanelDefinition[] {
   return [
-    {
-      kind: 'artifact-collection',
-      component: ArtifactCollectionPanel,
-      supports: item => item.kind === 'artifact-collection',
-      getHeader: item => ({
-        title: options.t('chat.deliverablesCount', {
-          count: artifactsFromWorkbenchItem(item).length,
-        }),
-      }),
-      getProps: item => ({
-        artifacts: artifactsFromWorkbenchItem(item),
-        emptyLabel: options.t('chat.noDeliverables'),
-        label: options.t('chat.sessionDeliverables'),
-        openArtifactLabel: (artifact: ArtifactPayload) => options.t(
-          'chat.openArtifact',
-          {
-            title: artifactFileTitle(artifact),
-            subtitle: artifactFileSubtitle(artifact),
-          },
-        ),
-      }),
-      createRuntime: () => new ArtifactCollectionRuntime(options),
-    },
     {
       kind: 'artifact-preview',
       component: ArtifactDocumentPanel,

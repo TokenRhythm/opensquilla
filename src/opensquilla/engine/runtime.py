@@ -305,7 +305,6 @@ from opensquilla.session.compaction_lifecycle import (
     compaction_memory_status,
     compaction_result_payload,
     durable_receipt_allows_destructive_compaction,
-    flush_receipt_allows_destructive_compaction,
     flush_receipt_is_successful_flush,
     flush_receipt_status_for_compaction,
     flush_trigger_enabled,
@@ -11243,12 +11242,6 @@ class TurnRunner:
             return (0, 0)
         return (estimate_tokens(rendered), len(rendered))
 
-    async def _durable_compaction_context_tokens(self, session_key: str) -> int:
-        """Compatibility projection of durable checkpoint token usage."""
-
-        tokens, _chars = await self._durable_compaction_context_measure(session_key)
-        return tokens
-
     async def _maybe_compact_on_t3_upgrade(
         self,
         session_key: str,
@@ -12950,9 +12943,6 @@ class TurnRunner:
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
-
-    def _flush_receipt_allows_destructive_compaction(self, receipt: Any) -> bool:
-        return flush_receipt_allows_destructive_compaction(receipt)
 
     def _compaction_circuit_open(self, session_key: str) -> bool:
         state = getattr(self, "_compaction_failures", {}).get(session_key)

@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
     },
     "preset": {
-      "summary": "Modèle de routage : {label}",
-      "desc": "Appliquez-le une fois pour remplir Routage des modèles ; modifiez-y les niveaux actifs.",
-      "customizedSummary": "Routage des modèles utilise déjà {label}.",
-      "customizedDesc": "Les niveaux actifs se modifient dans Routage des modèles.",
-      "synthesizedLabel": "Modèle de routage généré",
-      "synthesizedBadge": "Modèle généré",
-      "customize": "Voir les détails du modèle →",
-      "hide": "Masquer les détails du modèle",
-      "apply": "Appliquer à Routage des modèles",
-      "viewInRouter": "Ouvrir Routage des modèles →",
-      "modeRecommended": "modèle de routage",
-      "modeCustom": "personnalisé",
-      "modeDisabled": "désactivé"
+      "modeCustom": "personnalisé"
     },
     "modelStrategy": {
       "title": "Routage des modèles",
@@ -1704,8 +1692,6 @@
       "routerSaved": "Routeur enregistré.",
       "routerSavedRestart": "Routeur enregistré. Redémarrage requis.",
       "ensembleSaved": "Ensemble enregistré.",
-      "presetApplied": "Préréglage de routage appliqué.",
-      "presetAppliedRestart": "Préréglage de routage appliqué. Redémarrage requis.",
       "channelSaved": "Canal enregistré — configuration validée localement ; utilisez « Tester la connexion » pour vérifier les identifiants",
       "channelSavedLive": "Canal enregistré et appliqué — actif avec la nouvelle configuration",
       "channelStartFailed": "Canal enregistré, mais son démarrage a échoué — consultez son statut pour l'erreur, puis réessayez avec Redémarrer",
@@ -2935,16 +2921,6 @@
     "tile": {
       "installed": "Installé",
       "add": "Ajouter"
-    },
-    "skillCard": {
-      "subSkillsTitle": "Sous-compétences utilisées par cette méta-compétence",
-      "uses": "utilise",
-      "dependencies": "Dépendances déclarées",
-      "pythonCount": "Paquets Python : {count}",
-      "binaryCount": "Binaires : {count}",
-      "envCount": "Variables d’environnement : {count}",
-      "missingCount": "Dépendances manquantes : {count}",
-      "advisoryCount": "Avis : {count}"
     },
     "skillDetail": {
       "dialogLabel": "Détails de la compétence : {name}",

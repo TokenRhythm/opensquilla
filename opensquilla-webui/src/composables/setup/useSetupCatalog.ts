@@ -18,7 +18,6 @@ import {
 import {
   routerTierProviderParticipates,
   useSetupRouterForm,
-  type SetupTierRow,
 } from '@/composables/setup/useSetupRouterForm'
 import {
   useSetupEnsembleForm,
@@ -47,7 +46,7 @@ import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { saveFailedMessage } from '@/lib/rpcErrors'
 import { copyTextWithFallback } from '@/utils/browser'
-import { TEXT_TIERS, IMAGE_TIER, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
+import { TEXT_TIERS, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -111,11 +110,6 @@ export function localizeImageActionableDetail(detail: string): string {
 // ---------------------------------------------------------------------------
 
 interface ProviderPresetSpec {
-  presetId: string
-  label: string
-  description?: string
-  synthesized?: boolean
-  defaultModel?: string
   tiers?: Record<string, TierConfig>
 }
 
@@ -1955,58 +1949,6 @@ const ensembleTierCandidates = computed(() => routerPanel.value.tierRows
     tier: row.name,
   })))
 
-// ---------------------------------------------------------------------------
-// Routing preset card (Provider panel)
-// ---------------------------------------------------------------------------
-
-const selectedPreset = computed<ProviderPresetSpec | null>(() => providerSpec.value?.presets?.[0] || null)
-
-const presetRouterMode = computed(() => (
-  String(((status.value.sectionDetails || {}).router || {}).routerMode || 'recommended')
-))
-
-// "Configured beyond defaults": any unsaved router edits, or a persisted
-// non-recommended mode. A pristine install (no config file yet) defaults to
-// openrouter-mix on the wire, but nothing deliberate exists to clobber there,
-// so the apply path stays available for true first-run beginners.
-const presetRouterCustomized = computed(() => {
-  if (routerForm.isDirty.value) return true
-  if (status.value.hasConfig === false) return false
-  return presetRouterMode.value !== 'recommended'
-})
-
-function presetTierRows(preset: ProviderPresetSpec | null): SetupTierRow[] {
-  const tiers = preset?.tiers || {}
-  const order: string[] = [...TEXT_TIERS, IMAGE_TIER]
-  return Object.entries(tiers)
-    .map(([name, tier]) => ({ name: normalizeRouterTier(name) || name, tier }))
-    .filter(({ name }) => order.includes(name))
-    .sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name))
-    .map(({ name, tier }) => ({
-      name,
-      provider: tier.provider || '',
-      model: tier.model || '',
-      thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
-      supportsImage: tier.supportsImage || tier.supports_image || false,
-      ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
-        ? tier.ensembleEnabled
-        : tier.ensemble_enabled,
-      ensembleSelectionMode:
-        tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
-    }))
-}
-
-const presetPanel = computed(() => ({
-  hasPreset: Boolean(selectedPreset.value),
-  presetLabel: selectedPreset.value?.label || '',
-  presetDescription: selectedPreset.value?.description || '',
-  synthesized: selectedPreset.value?.synthesized === true,
-  tierRows: presetTierRows(selectedPreset.value),
-  tierLabel,
-  routerMode: presetRouterMode.value,
-  routerCustomized: presetRouterCustomized.value,
-}))
-
 const ensembleStatusText = computed(() => (
   ensembleForm.enabled.value ? t('setup.ensemble.statusOn') : t('setup.ensemble.statusOff')
 ))
@@ -3844,31 +3786,6 @@ async function saveModelStrategy(options: SaveOptions & {
   }
 }
 
-// Explicit-user-action preset application (the ONLY path that sends presetId):
-// saves the current provider form values plus the preset, then reloads so the
-// Router section and routerMode reflect the applied tiers. Confirm-free by
-// design — the Router section can always change the result afterwards.
-async function applyProviderPreset() {
-  if (providerInteractionLocked()) return
-  if (!providerForm.selectedProvider.value) {
-    pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
-    return
-  }
-  const presetId = selectedPreset.value?.presetId || providerForm.selectedProvider.value
-  try {
-    await rpc.call('onboarding.provider.configure', { ...providerConfigurePayload(), presetId })
-    const restart = await patchConfig(promotedForm.providerPatches())
-    await loadData()
-    if (providerEnvMissing.value) {
-      pushToast(t('setup.toast.envNotVisibleGateway', { envKey: providerEnvKey.value }), { tone: 'danger' })
-      return
-    }
-    pushToast(restart ? t('setup.toast.presetAppliedRestart') : t('setup.toast.presetApplied'))
-  } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-  }
-}
-
 async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
   if (searchDraftMissingKey.value) {
     pushToast(t('setup.capabilities.searchKeyRequired'), { tone: 'danger' })
@@ -4003,7 +3920,6 @@ async function copyConfigPath() {
     memoryPanel,
     modelStrategyPanel,
     routerPanel,
-    presetPanel,
     ensemblePanel,
     capabilitiesPanel,
     loadData,
@@ -4085,7 +4001,6 @@ async function copyConfigPath() {
     saveRouter,
     saveEnsemble,
     saveModelStrategy,
-    applyProviderPreset,
     saveSearch,
     saveMemory,
     saveImage,

@@ -166,7 +166,7 @@ describe('AppWorkbench annotation mode status', () => {
     ) || []
 
     expect(appWorkbenchSource).toContain('function artifactPreviewItemForExplicitOpen(')
-    expect(explicitOpenCalls).toHaveLength(3)
+    expect(explicitOpenCalls).toHaveLength(2)
     expect(appWorkbenchSource).not.toContain('let artifactSectionRequestId')
   })
 
