@@ -41,6 +41,7 @@ from opensquilla.private_paths import apply_windows_private_dacl, create_windows
 log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 0.01
+_POSIX_EMPTY_CONFIRMATIONS_REQUIRED = 2
 _CONTROL_READY_TIMEOUT_SECONDS = 2.0
 _WINDOWS_FROZEN_READY_TIMEOUT_SECONDS = 5.0
 _WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS = 0.25
@@ -2307,7 +2308,8 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
                 # Numeric /proc entries routinely disappear between listdir
                 # and open as unrelated processes exit. The anchor's own stat
                 # is mandatory; other vanished or malformed entries cannot be
-                # members of the final live snapshot.
+                # members of the final live snapshot. Consecutive empty
+                # confirmation below protects same-group fork/exit handoffs.
                 if int(name) == pgid:
                     return None
                 continue
@@ -2345,6 +2347,18 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
     if not members or pgid not in members:
         return None
     return tuple(members)
+
+
+def _advance_posix_empty_confirmation(
+    previous: int,
+    members: tuple[int, ...] | None,
+    own_pid: int,
+    *,
+    captured_alive: bool,
+) -> int:
+    if members == (own_pid,) and not captured_alive:
+        return previous + 1
+    return 0
 
 
 def _run_posix_group_anchor(control_path_raw: str) -> int:
@@ -2429,14 +2443,19 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
         stdin_open = True
         poll_delay = _POLL_INTERVAL_SECONDS
         poll_cap = 0.25 if os.path.isdir("/proc") else 1.0
+        empty_confirmations = 0
         while True:
             members = _posix_group_members(pgid)
-            if (
-                members is not None
-                and len(members) == 1
-                and members[0] == own_pid
-                and not _captured_posix_processes_alive(captured)
-            ):
+            captured_alive = members == (own_pid,) and _captured_posix_processes_alive(
+                captured
+            )
+            empty_confirmations = _advance_posix_empty_confirmation(
+                empty_confirmations,
+                members,
+                own_pid,
+                captured_alive=captured_alive,
+            )
+            if empty_confirmations >= _POSIX_EMPTY_CONFIRMATIONS_REQUIRED:
                 try:
                     sys.stdout.buffer.write(_POSIX_ANCHOR_EMPTY)
                     sys.stdout.buffer.flush()

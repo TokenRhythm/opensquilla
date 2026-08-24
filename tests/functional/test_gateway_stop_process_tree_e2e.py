@@ -88,6 +88,8 @@ class _StopProvider:
     async def _stream(self, call: int, messages: list[Message]) -> AsyncIterator[Any]:
         if call == 1:
             child_pid = self.evidence_dir / "child.pid"
+            leader_ready = self.evidence_dir / "leader-ready"
+            release_leader = self.evidence_dir / "release-leader"
             survived = self.evidence_dir / "descendant-survived"
             child_script = self.evidence_dir / "owned-child.py"
             parent_script = self.evidence_dir / "exited-parent.py"
@@ -96,9 +98,9 @@ class _StopProvider:
                 "import pathlib\n"
                 "import time\n"
                 f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
-                "time.sleep(30)\n"
+                "time.sleep(120)\n"
                 f"pathlib.Path({str(survived)!r}).write_text('survived')\n"
-                "time.sleep(30)\n",
+                "time.sleep(120)\n",
                 encoding="utf-8",
             )
             # Keep the long-lived descendant in the same process tree without
@@ -110,17 +112,30 @@ class _StopProvider:
                 "import sys\n"
                 "import time\n"
                 f"child_pid = pathlib.Path({str(child_pid)!r})\n"
+                f"leader_ready = pathlib.Path({str(leader_ready)!r})\n"
+                f"release_leader = pathlib.Path({str(release_leader)!r})\n"
                 "subprocess.Popen(\n"
                 f"    [sys.executable, {str(child_script)!r}],\n"
                 "    stdin=subprocess.DEVNULL,\n"
                 "    stdout=subprocess.DEVNULL,\n"
                 "    stderr=subprocess.DEVNULL,\n"
                 ")\n"
-                "deadline = time.monotonic() + 10\n"
-                "while not child_pid.exists() and time.monotonic() < deadline:\n"
+                "deadline = time.monotonic() + 45\n"
+                "while time.monotonic() < deadline:\n"
+                "    try:\n"
+                "        int(child_pid.read_text())\n"
+                "    except (FileNotFoundError, ValueError):\n"
+                "        time.sleep(0.05)\n"
+                "    else:\n"
+                "        break\n"
+                "else:\n"
+                "    raise RuntimeError('child did not publish its pid')\n"
+                "leader_ready.write_text('ready')\n"
+                "deadline = time.monotonic() + 45\n"
+                "while not release_leader.exists() and time.monotonic() < deadline:\n"
                 "    time.sleep(0.05)\n"
-                "if not child_pid.exists():\n"
-                "    raise RuntimeError('child did not publish its pid')\n",
+                "if not release_leader.exists():\n"
+                "    raise RuntimeError('leader release was not published')\n",
                 encoding="utf-8",
             )
             yield ToolUseStartEvent(
@@ -132,7 +147,7 @@ class _StopProvider:
                 tool_name="background_process",
                 arguments={
                     "command": _shell_command([sys.executable, str(parent_script)]),
-                    "timeout": 30,
+                    "timeout": 120,
                     "sandbox_permissions": "use_default",
                 },
             )
@@ -162,7 +177,7 @@ class _StopProvider:
                 arguments={
                     "action": "wait",
                     "session_id": session_id,
-                    "timeout": 5,
+                    "timeout": 90,
                 },
             )
             yield DoneEvent(
@@ -445,6 +460,7 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
         asyncio.get_running_loop().create_future()
     )
     descendant_identity: tuple[str, int] | None = None
+    release_leader = evidence / "release-leader"
     try:
         await _wait_for_health(port, process, gateway_log)
         await client.connect(f"ws://127.0.0.1:{port}/ws")
@@ -461,13 +477,15 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
                     leader_wait_result.set_result(frame)
 
         first_turn = asyncio.create_task(consume_first())
-        await _wait_for_file(evidence / "child.pid")
+        await _wait_for_file(evidence / "leader-ready", timeout=60.0)
+        child_pid = evidence / "child.pid"
         descendant_identity = _open_process_liveness(
-            int((evidence / "child.pid").read_text(encoding="utf-8"))
+            int(child_pid.read_text(encoding="utf-8"))
         )
+        release_leader.write_text("release", encoding="utf-8")
         wait_frame = await asyncio.wait_for(
             asyncio.shield(leader_wait_result),
-            timeout=10.0,
+            timeout=30.0,
         )
         wait_payload = json.loads(str(wait_frame.get("result", "")))
         assert wait_frame.get("is_error") is False
@@ -494,6 +512,8 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
         await _wait_for_health(port, process, gateway_log)
         assert process.poll() is None
     finally:
+        with contextlib.suppress(OSError):
+            release_leader.write_text("release", encoding="utf-8")
         if descendant_identity is not None:
             _close_process_liveness(descendant_identity)
         await client.close()
