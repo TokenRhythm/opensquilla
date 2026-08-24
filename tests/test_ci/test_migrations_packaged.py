@@ -76,6 +76,7 @@ def test_wheel_contains_migrations_and_webui_artifact(
         n.endswith("opensquilla/_migrations/V040__document_resources.py") for n in names
     ), f"V040 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert "opensquilla/gateway/static/dist/index.html" in names
+    assert "opensquilla/gateway/static/dist/desktop.html" in names
     assert f"opensquilla/gateway/static/dist/{MANIFEST_NAME}" in names
     assert packaged_probe == SYNTHETIC_JS
     assert packaged_runtime_catalog == (

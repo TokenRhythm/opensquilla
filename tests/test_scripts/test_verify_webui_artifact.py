@@ -83,11 +83,12 @@ def _artifact(
         )
 
     (dist / "assets").mkdir(parents=True)
-    (dist / "index.html").write_text(
+    synthetic_entrypoint = (
         '<script type="module" src="assets/app.js"></script>'
-        '<link rel="stylesheet" href="assets/app.css">',
-        encoding="utf-8",
+        '<link rel="stylesheet" href="assets/app.css">'
     )
+    for entrypoint_name in ("index.html", "desktop.html"):
+        (dist / entrypoint_name).write_text(synthetic_entrypoint, encoding="utf-8")
     (dist / "assets/app.js").write_text("console.log('hello')\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body { color: black; }\n", encoding="utf-8")
     if include_personal_audio:
@@ -114,6 +115,7 @@ def test_verify_dist_accepts_artifact_bound_to_current_source(tmp_path: Path) ->
     assert set(files) == {
         "assets/app.css",
         "assets/app.js",
+        "desktop.html",
         "index.html",
         MANIFEST_NAME,
     }
@@ -340,6 +342,11 @@ def test_node_verifier_rejects_sensitive_artifact_files(tmp_path: Path) -> None:
         '<link rel="stylesheet" href="assets/app.css">',
         encoding="utf-8",
     )
+    (dist / "desktop.html").write_text(
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
     (dist / ".env.production").write_text(
         "VITE_PRIVATE_TOKEN=must-not-ship\n",
         encoding="utf-8",
@@ -371,6 +378,11 @@ def test_python_accepts_node_manifest_with_unicode_artifact_names(tmp_path: Path
         '<link rel="stylesheet" href="assets/Ａ.css">',
         encoding="utf-8",
     )
+    (dist / "desktop.html").write_text(
+        '<script type="module" src="assets/😀.js"></script>'
+        '<link rel="stylesheet" href="assets/Ａ.css">',
+        encoding="utf-8",
+    )
 
     subprocess.run(
         ["node", str(NODE_VERIFIER), "--write", str(dist)],
@@ -396,6 +408,11 @@ def test_node_official_guard_rejects_tracks_in_the_tracked_playlist(
     (dist / "assets/app.js").write_text("console.log('hello')\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
     (dist / "index.html").write_text(
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
+    (dist / "desktop.html").write_text(
         '<script type="module" src="assets/app.js"></script>'
         '<link rel="stylesheet" href="assets/app.css">',
         encoding="utf-8",
