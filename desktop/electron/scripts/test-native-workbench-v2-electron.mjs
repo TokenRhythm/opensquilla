@@ -1517,28 +1517,42 @@ try {
         surfaceId: 'artifact:v3-bridge',
         enabled: true,
       })
-      const annotationRearmDocument = await v3Contents.debugger.sendCommand('DOM.getDocument', {
-        depth: -1,
-        pierce: false,
-      })
-      const annotationRearmNode = await v3Contents.debugger.sendCommand('DOM.querySelector', {
-        nodeId: annotationRearmDocument.root.nodeId,
-        selector: '#font-probe',
-      })
-      const annotationRearmDescription = await v3Contents.debugger.sendCommand(
-        'DOM.describeNode',
-        { nodeId: annotationRearmNode.nodeId },
+      const annotationPageClicksBeforeRearm = await v3Contents.executeJavaScript(
+        'Number(window.__annotationPageClicks || 0)',
       )
-      await manager.handleAnnotationNodeSelected(
-        manager.surfaces.get('artifact:v3-bridge'),
-        annotationRearmDescription.node.backendNodeId,
-      )
+      v3Contents.focus()
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: annotationX,
+        y: annotationY,
+        button: 'none',
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: annotationX,
+        y: annotationY,
+        button: 'left',
+        clickCount: 1,
+      })
+      await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: annotationX,
+        y: annotationY,
+        button: 'left',
+        clickCount: 1,
+      })
       const annotationRearmSelectionEvent = await waitFor(
         () => events.slice(annotationRearmEventsBefore).find(event =>
           event.surfaceId === 'artifact:v3-bridge'
           && event.type === 'annotation-selected'),
         'rearmed annotation selection',
       )
+      const annotationPageClicksAfterRearm = await v3Contents.executeJavaScript(
+        'Number(window.__annotationPageClicks || 0)',
+      )
+      if (annotationPageClicksAfterRearm !== annotationPageClicksBeforeRearm) {
+        throw new Error('The rearmed annotation picker leaked the click to the preview page.')
+      }
       const annotationRearmSelection = annotationRearmSelectionEvent.detail.selection
       const annotationRearmOverlayResult = await manager.showArtifactAnnotationOverlay({
         version: 3,
@@ -3376,6 +3390,8 @@ try {
   )
   assert.equal(result.annotationPostconditionFailure.ok, false)
   assert.deepEqual(result.annotationRollbackCommands, [
+    ['Overlay.setInspectMode', 'none', true],
+    ['Overlay.hideHighlight', null, false],
     ['Overlay.setInspectMode', 'searchForNode', true],
     ['Overlay.setInspectMode', 'none', true],
     ['Overlay.hideHighlight', null, false],

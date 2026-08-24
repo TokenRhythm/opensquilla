@@ -1540,6 +1540,22 @@ export class NativeWorkbenchSurfaceManager {
       }
     }
     this.clearAnnotationCandidate(record)
+    // Chromium normally exits inspect mode before dispatching
+    // Overlay.inspectNodeRequested, but that transition is not a reliable
+    // re-arm boundary on Windows. A later searchForNode command can resolve
+    // successfully while ordinary page clicks still pass through to the
+    // document. Make every enable an idempotent clean-arm transaction so the
+    // UI never advertises an active picker that Chromium did not install.
+    record.annotationPickerActive = false
+    const resetFailure = await this.clearAnnotationInspectState(record, true)
+    if (resetFailure) {
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: resetFailure,
+      }
+    }
     record.annotationPickerActive = true
     try {
       await this.cdpCommand(record, 'Overlay.setInspectMode', {
