@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from opensquilla.cli.agent_cmd import (
@@ -414,6 +415,37 @@ def test_run_agent_command_json_includes_artifacts(
     assert "session_key" not in output_artifact
     assert "sessionKey" not in json.dumps(output_artifact)
     assert output_artifact["download_url"] == "/api/v1/artifacts/art-cli"
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_run_agent_command_exits_nonzero_for_terminal_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    json_output: bool,
+) -> None:
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        return AgentRunResult(
+            status="error",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="",
+            usage={},
+            errors=[{"message": "Credentials rejected", "code": "401"}],
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        run_agent_command(message="hello", json_output=json_output)
+
+    assert exc_info.value.exit_code == 1
+    output = capsys.readouterr()
+    if json_output:
+        assert json.loads(output.out)["errors"] == [
+            {"message": "Credentials rejected", "code": "401"}
+        ]
+    else:
+        assert "Error: Credentials rejected" in output.err
 
 
 def test_run_agent_command_direct_call_normalizes_typer_defaults(

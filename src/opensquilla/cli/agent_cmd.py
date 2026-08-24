@@ -1035,3 +1035,5 @@ def run_agent_command(
                     _print_no_provider_error()
                     raise typer.Exit(1)
                 typer.echo(f"Error: {error['message']}", err=True)
+    if result.errors:
+        raise typer.Exit(1)
