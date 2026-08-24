@@ -51,6 +51,24 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class RouterHistoryReplayRequest:
+    """Turn-local replay inputs consumed only after routing has completed.
+
+    This object must never enter ``TurnContext.metadata``: it can retain a
+    transcript snapshot whose rows include user content and inline media.
+    Every field is hidden from ``repr`` so recording test doubles and error
+    reports cannot accidentally render those rows.
+    """
+
+    exclude_last_user: bool = field(repr=False)
+    bound_user_message_id: str | None = field(default=None, repr=False)
+    transcript_snapshot: TurnTranscriptSnapshot[Any] | None = field(
+        default=None,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True)
 class RunPipelineRequest:
     """Typed input for ``PipelineExecutionPort.run_pipeline``.
 
@@ -94,6 +112,10 @@ class RunPipelineRequest:
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
     provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    router_history_replay_request: RouterHistoryReplayRequest | None = field(
         default=None,
         repr=False,
     )
@@ -423,7 +445,11 @@ class PromptAssemblerStage:
                 inp.history_has_persisted_user or inp.persist_input
             ),
             "bound_user_message_id": inp.bound_user_message_id,
-            "include_capacity": bool(inp.attachments),
+            # Capacity is route-dependent (notably max_history_turns for image
+            # routes), so only semantic/sticky context is fetched here.  The
+            # opaque request below lets _run_pipeline project capacity after
+            # routing without putting transcript rows in metadata.
+            "include_capacity": False,
         }
         if inp.transcript_snapshot is not None:
             router_context_kwargs["transcript_snapshot"] = inp.transcript_snapshot
@@ -524,6 +550,17 @@ class PromptAssemblerStage:
             skill_catalog=(None if restricted_tool_boundary else inp.skill_catalog),
             usage_execution_context=inp.usage_execution_context,
             provider_request_correlation=inp.provider_request_correlation,
+            router_history_replay_request=(
+                RouterHistoryReplayRequest(
+                    exclude_last_user=(
+                        inp.history_has_persisted_user or inp.persist_input
+                    ),
+                    bound_user_message_id=inp.bound_user_message_id,
+                    transcript_snapshot=inp.transcript_snapshot,
+                )
+                if inp.attachments
+                else None
+            ),
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 
