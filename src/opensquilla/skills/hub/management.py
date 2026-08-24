@@ -1574,8 +1574,8 @@ class SkillManagementService:
                         },
                     )
                 )
-            target_file = str((target / "SKILL.md").resolve(strict=False))
-            observed_manifest_digest = str(source_digests.get(target_file) or "")
+            candidate_file = candidate.file_path if candidate is not None else ""
+            observed_manifest_digest = str(source_digests.get(candidate_file) or "")
             if observed_manifest_digest != expected_manifest_digest:
                 diagnostics.append(
                     _diagnostic(
