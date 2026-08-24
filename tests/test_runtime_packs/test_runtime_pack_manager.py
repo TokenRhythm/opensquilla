@@ -1046,6 +1046,292 @@ def test_remove_discards_component_downloads_but_preserves_other_components(
     assert (downloads / f"{unrelated}.meta.json").is_file()
 
 
+@pytest.mark.parametrize("complete", [False, True])
+def test_discard_download_clears_cached_archive_and_terminal_install_state(
+    tmp_path: Path,
+    complete: bool,
+) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    descriptor = service.catalog.descriptor("linux-x64", "python")
+    assert descriptor is not None
+    operation = service._write_operation(
+        service._new_operation(
+            "python",
+            RuntimeOperationKind.INSTALL,
+            total_bytes=len(body),
+        )
+    )
+    service._update_operation(
+        operation,
+        state=RuntimeOperationState.CANCELLED,
+        progress_bytes=len(body) if complete else len(body) // 2,
+    )
+    partial = service.root / "downloads" / f"{descriptor.sha256}.part"
+    metadata = service.root / "downloads" / f"{descriptor.sha256}.meta.json"
+    partial.write_bytes(body if complete else body[: len(body) // 2])
+    metadata.write_text(
+        json.dumps({"componentId": "python", "sha256": descriptor.sha256}),
+        encoding="utf-8",
+    )
+
+    before = next(item for item in service.status().components if item.component_id == "python")
+    assert before.resume_bytes > 0
+    assert before.resume_available is (not complete)
+
+    status = service.discard_download("python")
+    python = next(item for item in status.components if item.component_id == "python")
+
+    assert not partial.exists()
+    assert not metadata.exists()
+    assert service._read_operation("python") is None
+    assert python.resume_bytes == 0
+    assert python.operation is None
+    assert service.discard_download("python").components == status.components
+
+
+def test_discard_download_preserves_active_runtime_and_other_component_cache(
+    tmp_path: Path,
+) -> None:
+    old_body = _runtime_archive(tmp_path)
+    original = _service(tmp_path, old_body, _MemoryOpener(old_body))
+    installed = original.start_install("python")
+    assert original.wait_for_operation(installed.operation_id).state is (
+        RuntimeOperationState.COMPLETED
+    )
+    new_body = _runtime_archive(
+        tmp_path,
+        catalog_version="test.2",
+        version="3.13.15+test",
+    )
+    service = RuntimePackService(
+        _catalog(
+            new_body,
+            catalog_version="test.2",
+            version="3.13.15+test",
+            trusted_archive_sha256=(hashlib.sha256(old_body).hexdigest(),),
+        ),
+        root=original.root,
+        target="linux-x64",
+        opener=_MemoryOpener(new_body),
+    )
+    descriptor = service.catalog.descriptor("linux-x64", "python")
+    assert descriptor is not None
+    operation = service._write_operation(
+        service._new_operation(
+            "python",
+            RuntimeOperationKind.INSTALL,
+            total_bytes=len(new_body),
+        )
+    )
+    service._update_operation(
+        operation,
+        state=RuntimeOperationState.CANCELLED,
+        progress_bytes=len(new_body) // 2,
+    )
+    downloads = service.root / "downloads"
+    partial = downloads / f"{descriptor.sha256}.part"
+    metadata = downloads / f"{descriptor.sha256}.meta.json"
+    partial.write_bytes(new_body[: len(new_body) // 2])
+    metadata.write_text(
+        json.dumps({"componentId": "python", "sha256": descriptor.sha256}),
+        encoding="utf-8",
+    )
+    unrelated = "b" * 64
+    unrelated_partial = downloads / f"{unrelated}.part"
+    unrelated_metadata = downloads / f"{unrelated}.meta.json"
+    unrelated_partial.write_bytes(b"node partial")
+    unrelated_metadata.write_text(
+        json.dumps({"componentId": "node", "sha256": unrelated}),
+        encoding="utf-8",
+    )
+
+    service.discard_download("python")
+
+    active = service.active_runtime("python")
+    assert active is not None and active.version == "3.13.14+test"
+    assert not partial.exists()
+    assert not metadata.exists()
+    assert unrelated_partial.is_file()
+    assert unrelated_metadata.is_file()
+
+
+def test_discard_download_rejects_active_operation_and_reports_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    descriptor = service.catalog.descriptor("linux-x64", "python")
+    assert descriptor is not None
+    operation = service._write_operation(
+        service._new_operation(
+            "python",
+            RuntimeOperationKind.INSTALL,
+            total_bytes=len(body),
+        )
+    )
+    partial = service.root / "downloads" / f"{descriptor.sha256}.part"
+    partial.write_bytes(body[: len(body) // 2])
+
+    with pytest.raises(runtime_pack_manager.RuntimePackError):
+        service.discard_download("python")
+    assert partial.is_file()
+
+    service._update_operation(operation, state=RuntimeOperationState.CANCELLED)
+    original_unlink = Path.unlink
+
+    def fail_partial(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == partial:
+            raise PermissionError("injected cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_partial)
+    with pytest.raises(runtime_pack_manager.RuntimePackDiscardError) as excinfo:
+        service.discard_download("python")
+    assert str(tmp_path) not in str(excinfo.value)
+
+
+def test_discard_download_keeps_historical_metadata_when_archive_removal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    historical = "0" * 64
+    downloads = service.root / "downloads"
+    partial = downloads / f"{historical}.part"
+    metadata = downloads / f"{historical}.meta.json"
+    partial.write_bytes(b"historical partial")
+    metadata.write_text(
+        json.dumps({"componentId": "python", "sha256": historical}),
+        encoding="utf-8",
+    )
+    original_unlink = runtime_pack_manager._unlink_discard_path
+
+    def fail_historical_partial(path: Path) -> None:
+        if path == partial:
+            raise PermissionError("injected cleanup failure")
+        original_unlink(path)
+
+    monkeypatch.setattr(
+        runtime_pack_manager,
+        "_unlink_discard_path",
+        fail_historical_partial,
+    )
+    with pytest.raises(runtime_pack_manager.RuntimePackDiscardError):
+        service.discard_download("python")
+
+    assert partial.is_file()
+    assert metadata.is_file()
+
+    monkeypatch.setattr(runtime_pack_manager, "_unlink_discard_path", original_unlink)
+    service.discard_download("python")
+    assert not partial.exists()
+    assert not metadata.exists()
+
+
+def test_discard_download_reports_metadata_enumeration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    descriptor = service.catalog.descriptor("linux-x64", "python")
+    assert descriptor is not None
+    downloads = service.root / "downloads"
+    partial = downloads / f"{descriptor.sha256}.part"
+    partial.write_bytes(body[: len(body) // 2])
+    original_iterdir = Path.iterdir
+
+    def fail_download_listing(path: Path) -> Any:
+        if path == downloads:
+            raise PermissionError("injected enumeration failure")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_download_listing)
+
+    with pytest.raises(runtime_pack_manager.RuntimePackDiscardError):
+        service.discard_download("python")
+    assert partial.is_file()
+
+
+def test_discard_download_refuses_redirected_storage_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    descriptor = service.catalog.descriptor("linux-x64", "python")
+    assert descriptor is not None
+    downloads = service.root / "downloads"
+    downloads.rmdir()
+    external = tmp_path / "external-downloads"
+    external.mkdir()
+    sentinel = external / f"{descriptor.sha256}.part"
+    sentinel.write_bytes(b"keep")
+    try:
+        downloads.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(runtime_pack_manager.RuntimePackDiscardError):
+        service.discard_download("python")
+
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_discard_download_refuses_windows_junction_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+    downloads = service.root / "downloads"
+    original_is_junction = Path.is_junction
+    monkeypatch.setattr(
+        Path,
+        "is_junction",
+        lambda path: path == downloads or original_is_junction(path),
+    )
+
+    with pytest.raises(runtime_pack_manager.RuntimePackDiscardError):
+        service.discard_download("python")
+
+
+def test_discard_download_rejects_component_lock_contention(tmp_path: Path) -> None:
+    body = _runtime_archive(tmp_path)
+    service = _service(tmp_path, body, _MemoryOpener(body))
+
+    with runtime_pack_manager.ManagedArtifactInstallLock(service.root, "python", 0.0):
+        with pytest.raises(runtime_pack_manager.RuntimePackError):
+            service.discard_download("python")
+
+
+def test_discard_download_retries_transient_windows_file_sharing_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    class TransientPath:
+        def unlink(self, *, missing_ok: bool) -> None:
+            nonlocal attempts
+            assert missing_ok is True
+            attempts += 1
+            if attempts < 3:
+                error = PermissionError("temporarily busy")
+                error.winerror = 32
+                raise error
+
+    monkeypatch.setattr(runtime_pack_manager.os, "name", "nt")
+    monkeypatch.setattr(runtime_pack_manager.time, "sleep", sleeps.append)
+
+    runtime_pack_manager._unlink_discard_path(TransientPath())  # type: ignore[arg-type]
+
+    assert attempts == 3
+    assert sleeps == [0.02, 0.05]
+
+
 def test_untrusted_historical_activation_is_not_added_to_path(tmp_path: Path) -> None:
     old_body = _runtime_archive(tmp_path)
     original = _service(tmp_path, old_body, _MemoryOpener(old_body))

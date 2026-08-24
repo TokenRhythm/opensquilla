@@ -20,6 +20,7 @@ from opensquilla.runtime_packs.catalog import (
 )
 from opensquilla.runtime_packs.manager import (
     ActiveRuntime,
+    RuntimePackDiscardError,
     RuntimePackError,
     RuntimePackService,
     RuntimePackUnavailableError,
@@ -161,6 +162,21 @@ def remove_component(
         return _unavailable_operation(component_id, RuntimeOperationKind.REMOVE)
 
 
+def discard_download(
+    component_id: str,
+    state_dir: str | Path | None = None,
+) -> RuntimePackStatus:
+    try:
+        return get_runtime_pack_service(state_dir).discard_download(component_id)
+    except RuntimePackError:
+        raise
+    except Exception as exc:
+        _LOG.debug("Runtime Pack downloaded data could not be discarded", exc_info=True)
+        raise RuntimePackDiscardError(
+            "Runtime Pack downloaded data could not be removed. Retry after closing running tools."
+        ) from exc
+
+
 def apply_runtime_environment(
     environment: Mapping[str, str] | None,
     *,
@@ -226,6 +242,7 @@ __all__ = [
     "RuntimePackCatalog",
     "RuntimePackCatalogError",
     "RuntimePackDescriptor",
+    "RuntimePackDiscardError",
     "RuntimePackError",
     "RuntimePackResolver",
     "RuntimePackService",
@@ -235,6 +252,7 @@ __all__ = [
     "apply_runtime_environment",
     "cancel_install",
     "component_ids",
+    "discard_download",
     "discover_catalog_path",
     "get_runtime_pack_service",
     "load_default_catalog",
