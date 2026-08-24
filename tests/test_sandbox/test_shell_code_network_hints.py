@@ -1977,6 +1977,33 @@ async def test_uv_pip_install_uses_default_open_proxy_without_approval(
     assert get_approval_queue().list_pending("exec") == []
 
 
+def _assert_noop_profile_calls(
+    profile_calls: list[tuple[str, ...]],
+    command: str,
+) -> None:
+    assert len(profile_calls) == 2
+    assert profile_calls[0] == profile_calls[1]
+    argv = profile_calls[0]
+    if os.name != "nt":
+        assert argv == ("sh", "-lc", command)
+        return
+
+    from opensquilla.tools.builtin import shell
+
+    assert argv[:-1] == (
+        shell._trusted_windows_powershell_path(),
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    )
+    assert command in argv[-1]
+    assert "exit $global:LASTEXITCODE" in argv[-1]
+    assert "if (-not $?) { exit 1 }" in argv[-1]
+
+
 @pytest.mark.asyncio
 async def test_poetry_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
@@ -2024,10 +2051,7 @@ async def test_poetry_install_uses_default_open_proxy_without_approval(
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [
-        ("sh", "-lc", "poetry install"),
-        ("sh", "-lc", "poetry install"),
-    ]
+    _assert_noop_profile_calls(profile_calls, "poetry install")
     assert result == "exit_code=0\nok\n"
     assert get_approval_queue().list_pending("exec") == []
 
@@ -2079,10 +2103,7 @@ async def test_composer_install_uses_default_open_proxy_without_approval(
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [
-        ("sh", "-lc", "composer install"),
-        ("sh", "-lc", "composer install"),
-    ]
+    _assert_noop_profile_calls(profile_calls, "composer install")
     assert result == "exit_code=0\nok\n"
     assert get_approval_queue().list_pending("exec") == []
 

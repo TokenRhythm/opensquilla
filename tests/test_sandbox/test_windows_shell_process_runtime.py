@@ -113,6 +113,32 @@ def test_windows_noop_uses_direct_powershell(monkeypatch) -> None:
     assert shell._WINDOWS_SANDBOX_SHELL_HOST_CODE not in argv
 
 
+@pytest.mark.parametrize(
+    ("command", "package_bundle"),
+    [
+        ("poetry install", "python-package-install"),
+        ("composer install", "php-package-install"),
+    ],
+)
+def test_windows_noop_package_install_argv_preserves_capability_profile(
+    command: str,
+    package_bundle: str,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows direct PowerShell classification is Windows-only")
+
+    from opensquilla.sandbox.capability_profile import capability_profile_for_command
+    from opensquilla.tools.builtin import shell
+
+    profile = capability_profile_for_command(
+        shell._sandbox_shell_backend_argv(command, _noop_runtime())
+    )
+
+    assert profile.package_bundles == (package_bundle,)
+    assert profile.network_intent.value == "package_registry"
+    assert profile.confidence.value == "high"
+
+
 def test_posix_noop_keeps_sh() -> None:
     if os.name == "nt":
         pytest.skip("POSIX noop shell selection is non-Windows-only")
