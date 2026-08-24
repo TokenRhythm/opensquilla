@@ -11,6 +11,8 @@ import pytest
 
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
+pytestmark = pytest.mark.ci_serial
+
 
 def _windows_runtime() -> SimpleNamespace:
     return SimpleNamespace(
