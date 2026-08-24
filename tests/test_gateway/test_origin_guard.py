@@ -209,6 +209,37 @@ def test_malformed_or_non_http_origin_is_rejected(origin: str) -> None:
     assert response.json()["code"] == "FORBIDDEN_ORIGIN"
 
 
+def test_desktop_renderer_origin_is_exact_and_loopback_only() -> None:
+    with _client() as client:
+        accepted = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": "opensquilla-app://desktop"},
+        )
+        rejected = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": "opensquilla-app://desktop.evil"},
+        )
+
+    assert accepted.status_code == 200, accepted.text
+    assert rejected.status_code == 403
+
+    remote_config = GatewayConfig()
+    remote_config.host = "0.0.0.0"
+    with TestClient(
+        create_gateway_app(remote_config),
+        base_url="http://192.0.2.10:18791",
+        client=("192.0.2.20", 51000),
+    ) as remote_client:
+        remote = remote_client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": "opensquilla-app://desktop"},
+        )
+    assert remote.status_code == 403
+
+
 def test_shared_middleware_guards_dynamically_registered_mutation_routes() -> None:
     calls: list[str] = []
 

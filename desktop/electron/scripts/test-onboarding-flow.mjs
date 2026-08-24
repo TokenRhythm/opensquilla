@@ -135,6 +135,25 @@ async function bootWindow(app) {
   }, 'desktop boot window')
 }
 
+async function loadBootContractWindow(app) {
+  const desktopWindowId = await waitFor(async () => (
+    await app.evaluate(({ BrowserWindow }) => (
+      BrowserWindow.getAllWindows().find((candidate) => (
+        !candidate.isDestroyed()
+        && candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
+      ))?.id ?? null
+    ))
+  ), 'local Desktop renderer before the boot-page contract test')
+  await app.evaluate(async ({ BrowserWindow }, payload) => {
+    const window = BrowserWindow.fromId(payload.windowId)
+    if (!window || window.isDestroyed()) throw new Error('Desktop renderer is unavailable.')
+    await window.loadFile(payload.bootPath)
+  }, {
+    windowId: desktopWindowId,
+    bootPath: join(packageRoot, 'src', 'boot.html'),
+  })
+}
+
 async function sendBootEvent(app, channel, payload) {
   await app.evaluate(({ BrowserWindow }, event) => {
     const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -487,6 +506,11 @@ async function verifySubmitFeedbackAndSingleFlight() {
   )
   try {
     const page = await setupWindow(app)
+    // Normal startup now keeps the local Desktop renderer mounted while the
+    // runtime is unavailable. Load the recovery document explicitly so its
+    // timer/progress contract remains covered without restoring the old
+    // gateway-owned shell lifecycle.
+    await loadBootContractWindow(app)
     await verifyBootPhaseTimer(app)
     const submitClockOrigin = Date.now()
     await page.clock.install({ time: submitClockOrigin })
@@ -614,9 +638,34 @@ await verifySubmitFeedbackAndSingleFlight()
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
   'opensquilla-electron-onboarding-test-',
 )
+const rendererDiagnostics = []
+const observeRenderer = (candidate) => {
+  candidate.on('console', (message) => rendererDiagnostics.push(`console:${message.type()}:${message.text()}`))
+  candidate.on('pageerror', (error) => rendererDiagnostics.push(`pageerror:${error.message || error}`))
+}
+for (const candidate of app.windows()) observeRenderer(candidate)
+app.on('window', observeRenderer)
 
 try {
   const page = await setupWindow(app)
+  const desktopPage = await waitFor(async () => {
+    for (const candidate of app.windows()) {
+      if (candidate.isClosed()) continue
+      if (candidate.url().startsWith('opensquilla-app://desktop/')) return candidate
+    }
+    return null
+  }, 'local Desktop renderer')
+  assert.equal(
+    desktopPage.url(),
+    'opensquilla-app://desktop/chat/new',
+    'the local Desktop renderer must exist before onboarding and Gateway readiness',
+  )
+  assert.equal(await desktopPage.locator('#app').count(), 1)
+  const startingConnection = await desktopPage.evaluate(
+    () => window.opensquillaDesktop?.getGatewayConnection?.(),
+  )
+  assert.equal(startingConnection?.status, 'starting')
+  assert.equal(startingConnection?.wsUrl, null)
   const pageErrors = []
   page.on('pageerror', (error) => pageErrors.push(error.message || String(error)))
   const providerScreen = page.locator('[data-screen="1"]')
@@ -956,6 +1005,113 @@ try {
   assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.2"[\s\S]*?ensemble_enabled = true/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
+
+  const readyConnection = await waitFor(async () => {
+    const connection = await desktopPage.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    )
+    return connection?.status === 'ready' ? connection : null
+  }, 'ready Desktop Gateway descriptor')
+  assert.match(readyConnection.httpUrl, /^http:\/\/127\.0\.0\.1:\d+$/)
+  assert.equal(
+    readyConnection.wsUrl,
+    readyConnection.httpUrl.replace(/^http:/, 'ws:') + '/ws',
+  )
+  assert.equal(typeof readyConnection.instanceId, 'string')
+  const readyRendererState = await desktopPage.evaluate(() => {
+    const banner = document.getElementById('desktop-runtime-banner')
+    return {
+      appChildren: document.querySelector('#app')?.childElementCount ?? -1,
+      bannerHidden: banner?.hidden ?? null,
+      bannerState: banner?.dataset.state || '',
+      bannerText: banner?.textContent || '',
+      scripts: [...document.scripts].map(script => script.src || '<inline>'),
+    }
+  })
+  assert.equal(
+    readyRendererState.bannerHidden,
+    true,
+    `the local renderer should stay loaded and hide its runtime banner after readiness: ${JSON.stringify({ readyRendererState, rendererDiagnostics })}`,
+  )
+
+  const apiBoundary = await desktopPage.evaluate(async () => {
+    const response = await fetch('/api/system/status')
+    return {
+      status: response.status,
+      csp: response.headers.get('content-security-policy') || '',
+      nosniff: response.headers.get('x-content-type-options') || '',
+    }
+  })
+  assert.equal(apiBoundary.status, 200)
+  assert.match(apiBoundary.csp, /sandbox/)
+  assert.match(apiBoundary.csp, /frame-ancestors 'none'/)
+  assert.equal(apiBoundary.nosniff, 'nosniff')
+
+  await desktopPage.evaluate(() => window.location.assign('/api/system/status'))
+  await delay(300)
+  assert.equal(
+    desktopPage.url(),
+    'opensquilla-app://desktop/chat/new',
+    'API responses must not replace the privileged Desktop document',
+  )
+
+  const childFrameBoundary = await desktopPage.evaluate(async () => {
+    const frame = document.createElement('iframe')
+    frame.src = '/api/system/status'
+    document.body.appendChild(frame)
+    await new Promise(resolve => setTimeout(resolve, 300))
+    let location = 'inaccessible'
+    try { location = frame.contentWindow?.location.href || '' } catch {}
+    let bridge = 'inaccessible'
+    try { bridge = typeof frame.contentWindow?.opensquillaDesktop } catch {}
+    frame.remove()
+    return { bridge, location }
+  })
+  assert.notEqual(childFrameBoundary.location, 'opensquilla-app://desktop/api/system/status')
+  assert.notEqual(childFrameBoundary.bridge, 'object')
+
+  const browserControlWindowId = await app.evaluate(async ({ BrowserWindow }, url) => {
+    const window = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    })
+    await window.loadURL(url)
+    return window.id
+  }, `${readyConnection.httpUrl}/control/`)
+  const browserControlPage = await waitFor(async () => {
+    for (const candidate of app.windows()) {
+      if (candidate.isClosed()) continue
+      if (candidate.url().startsWith(`${readyConnection.httpUrl}/control`)) return candidate
+    }
+    return null
+  }, 'browser Control UI window')
+  await waitFor(
+    async () => await browserControlPage.locator('#app > *').count() > 0,
+    'browser Control UI Vue mount',
+  )
+  await app.evaluate(({ BrowserWindow }, id) => {
+    BrowserWindow.fromId(id)?.destroy()
+  }, browserControlWindowId)
+
+  const shutdownStatus = await desktopPage.evaluate(async () => {
+    const response = await fetch('/api/system/shutdown', { method: 'POST' })
+    return response.status
+  })
+  assert.equal(shutdownStatus, 202)
+  await waitFor(async () => {
+    const connection = await desktopPage.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    )
+    return connection?.status === 'error' ? connection : null
+  }, 'Gateway stop to become a Desktop capability error')
+  assert.equal(desktopPage.url(), 'opensquilla-app://desktop/chat/new')
+  assert.equal(await desktopPage.locator('#app').count(), 1)
+  assert.equal(await desktopPage.locator('#desktop-runtime-banner').isVisible(), true)
+  assert.equal(await desktopPage.locator('#desktop-runtime-retry').isVisible(), true)
 
   console.log(JSON.stringify({
     ok: true,

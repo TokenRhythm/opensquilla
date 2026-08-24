@@ -58,6 +58,10 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: true,
     rollupOptions: {
+      input: {
+        control: resolve(__dirname, 'index.html'),
+        desktop: resolve(__dirname, 'desktop.html'),
+      },
       output: {
         assetFileNames: (assetInfo) => {
           const info = assetInfo.name?.split('.') || []

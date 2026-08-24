@@ -55,6 +55,7 @@ describe('rpc link-token bootstrap', () => {
     clients.length = 0
     localStorage.clear()
     sessionStorage.clear()
+    delete window.opensquillaDesktop
     window.history.replaceState(null, '', '/control/sessions')
   })
 
@@ -207,5 +208,64 @@ describe('rpc link-token bootstrap', () => {
     expect(store.isLocalOwner).toBe(false)
     expect(store.canManageProjectWorkspaces).toBe(false)
     expect(store.canChooseProject).toBe(false)
+  })
+
+  it('waits for the Desktop supervisor and reconnects only for a ready runtime instance', async () => {
+    const publishRef: { current?: (payload: unknown) => void } = {}
+    window.opensquillaDesktop = {
+      getGatewayConnection: vi.fn(async () => ({
+        schemaVersion: 1,
+        revision: 1,
+        status: 'starting',
+        instanceId: 'runtime-a',
+        profileFingerprint: 'profile-a',
+        httpUrl: 'http://127.0.0.1:18791',
+        wsUrl: null,
+        authToken: null,
+        error: null,
+      })),
+      onGatewayConnectionChanged: vi.fn((callback) => {
+        publishRef.current = callback as (payload: unknown) => void
+        return () => undefined
+      }),
+    } as unknown as OpenSquillaDesktopApi
+
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(window.opensquillaDesktop?.getGatewayConnection).toHaveBeenCalled())
+    expect(connectCalls).toEqual([])
+
+    publishRef.current?.({
+      schemaVersion: 1,
+      revision: 2,
+      status: 'ready',
+      instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a',
+      httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws',
+      authToken: 'desktop-instance-token',
+      error: null,
+    })
+    expect(connectCalls).toEqual([{
+      url: 'ws://127.0.0.1:18791/ws',
+      token: 'desktop-instance-token',
+    }])
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('desktop-instance-token')
+    expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
+
+    publishRef.current?.({
+      schemaVersion: 1,
+      revision: 3,
+      status: 'error',
+      instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a',
+      httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: null,
+      authToken: null,
+      error: 'runtime stopped',
+    })
+    expect(clients[0].disconnect).toHaveBeenCalledOnce()
+    expect(store.error).toBe('runtime stopped')
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
   })
 })

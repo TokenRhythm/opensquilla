@@ -187,8 +187,8 @@ try {
   await page.emulateMedia({ colorScheme: null })
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
   await waitFor(
-    async () => page.url().includes('/control/chat'),
-    'Control UI to load on Chat',
+    async () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'Desktop renderer to load on Chat',
   )
   await page.waitForSelector('html[data-theme]', { timeout: 20_000 })
 
@@ -209,13 +209,13 @@ try {
   const settingsButton = page.locator('button.sidebar-fn-item[data-icon="settings"]')
   await settingsButton.waitFor({ state: 'visible', timeout: 20_000 })
   await settingsButton.click()
-  await page.waitForURL(url => url.pathname.includes('/control/settings'), {
+  await page.waitForURL(url => url.pathname.includes('/settings'), {
     timeout: 20_000,
   })
   const interfaceTab = page.locator('#settings-rail-interface')
   await interfaceTab.waitFor({ state: 'visible', timeout: 20_000 })
   await interfaceTab.click()
-  await page.waitForURL(url => url.pathname.endsWith('/control/settings/interface'), {
+  await page.waitForURL(url => url.pathname.endsWith('/settings/interface'), {
     timeout: 20_000,
   })
   await page.waitForSelector('input[name="appearance-theme"][value="system"]', {

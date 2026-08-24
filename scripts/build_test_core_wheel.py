@@ -61,13 +61,12 @@ def build_isolated_core_wheel(repo_root: Path, temp_root: Path) -> Path:
         b"window.__opensquillaPackagingProbe = true;\n"
     )
     (assets / "packaging-probe.css").write_bytes(b"body{}\n")
-    (dist / "index.html").write_text(
-        """<!doctype html>
+    synthetic_entrypoint = """<!doctype html>
 <link rel="stylesheet" href="./assets/packaging-probe.css">
 <script type="module" src="./assets/packaging-probe.js"></script>
-""",
-        encoding="utf-8",
-    )
+"""
+    for entrypoint_name in ("index.html", "desktop.html"):
+        (dist / entrypoint_name).write_text(synthetic_entrypoint, encoding="utf-8")
 
     records = []
     for path in sorted(dist.rglob("*")):

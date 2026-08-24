@@ -4,6 +4,7 @@ import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
   DesktopMainWindowCloseBehavior,
+  DesktopGatewayConnection,
   DesktopPreferences,
   DesktopRetryStartupResult,
   DesktopUpdateState,
@@ -47,6 +48,10 @@ declare global {
     dismissUpdate?: () => Promise<DesktopUpdateState>
     onUpdateState?: (callback: (payload: unknown) => void) => () => void
     getGatewayStatus: () => Promise<DesktopSettings['gateway']>
+    getGatewayConnection?: () => Promise<DesktopGatewayConnection>
+    onGatewayConnectionChanged?: (
+      callback: (payload: DesktopGatewayConnection) => void,
+    ) => () => void
     getCliInvocation?: () => Promise<unknown>
     revealGatewayLog: () => Promise<boolean>
     getDesktopSettings: () => Promise<DesktopSettings>
