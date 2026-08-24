@@ -29,6 +29,10 @@ def _isolated_agent_env(tmp_path: Path, base_url: str) -> dict[str, str]:
         "TMP",
     )
     env = {key: os.environ[key] for key in inherited_keys if key in os.environ}
+    if os.name == "nt":
+        windows_home = tmp_path / "windows-home"
+        windows_home.mkdir()
+        env["USERPROFILE"] = str(windows_home)
     project_root = Path(__file__).resolve().parents[2]
     env.update(
         {
