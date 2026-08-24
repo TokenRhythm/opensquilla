@@ -28,7 +28,12 @@ export interface UseChatRouterDecisionRuntimeOptions {
 }
 
 export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRuntimeOptions) {
-  const pendingRouterDecision = ref<{ payload: RouterDecisionPayload; decision: NormalizedRouterDecision } | null>(null)
+  const pendingRouterDecision = ref<{
+    payload: RouterDecisionPayload
+    decision: NormalizedRouterDecision
+    messageId: string
+  } | null>(null)
+  let localRouterMessageSeq = 0
 
   // Router and ensemble events can arrive throughout a long streamed answer.
   // They should follow the live edge only while the reader has elected to stay
@@ -137,13 +142,31 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     return true
   }
 
-  function appendRouterDecision(payload: RouterDecisionPayload, decision = normalizeRouterDecision(payload)) {
+  function validIdentityStreamSeq(value: unknown): number | null {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+      ? value
+      : null
+  }
+
+  function routerDecisionMessageId(
+    payload: RouterDecisionPayload,
+    identityStreamSeq?: number,
+  ): string {
+    const streamSeq = validIdentityStreamSeq(payload.stream_seq)
+      ?? validIdentityStreamSeq(identityStreamSeq)
+    if (streamSeq !== null) return `router-${options.sessionKey.value}-${streamSeq}`
+    localRouterMessageSeq += 1
+    return `router-${options.sessionKey.value}-${Date.now()}-${localRouterMessageSeq}`
+  }
+
+  function appendRouterDecision(
+    payload: RouterDecisionPayload,
+    decision: NormalizedRouterDecision,
+    messageId: string,
+  ) {
     if (!decision) return
     const turnId = payloadTurnId(payload)
     const acceptedDecision = freezeAcceptedRoutingMode(decision, turnId)
-    const messageId = payload?.stream_seq
-      ? `router-${options.sessionKey.value}-${payload.stream_seq}`
-      : `router-${options.sessionKey.value}-${Date.now()}`
     if (options.messages.value.some(message => message.messageId === messageId)) return
 
     options.messages.value.push({
@@ -158,7 +181,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     scrollToBottomIfFollowing()
   }
 
-  function queueRouterDecision(payload: RouterDecisionPayload) {
+  function queueRouterDecision(payload: RouterDecisionPayload, identityStreamSeq?: number) {
     const normalizedDecision = normalizeRouterDecision(payload)
     if (!normalizedDecision) return
     const decision = freezeAcceptedRoutingMode(
@@ -169,15 +192,16 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       const model = shortModelName(decision.model || decision.routed_model || '')
       options.setStreamActivity(model ? `Router selected · ${model}` : 'Router selected')
     }
-    pendingRouterDecision.value = { payload, decision }
-    appendRouterDecision(payload, decision)
+    const messageId = routerDecisionMessageId(payload, identityStreamSeq)
+    pendingRouterDecision.value = { payload, decision, messageId }
+    appendRouterDecision(payload, decision, messageId)
   }
 
   function flushPendingRouterDecision() {
     const pending = pendingRouterDecision.value
     if (!pending) return
     pendingRouterDecision.value = null
-    appendRouterDecision(pending.payload, pending.decision)
+    appendRouterDecision(pending.payload, pending.decision, pending.messageId)
   }
 
   function clearPendingRouterDecision() {

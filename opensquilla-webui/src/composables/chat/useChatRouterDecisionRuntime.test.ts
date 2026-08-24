@@ -39,6 +39,79 @@ function makeRuntime(
 }
 
 describe('router decision identity', () => {
+  it('reuses the live stream identity when the same decision is replayed from a snapshot', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    const decision = {
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    }
+    runtime.queueRouterDecision({ ...decision, stream_seq: 10 })
+    runtime.queueRouterDecision(decision, 10)
+    runtime.flushPendingRouterDecision()
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]?.messageId).toBe('router-sess-10')
+  })
+
+  it('reuses one generated identity when a sequence-free decision is flushed later', () => {
+    const now = vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(1_000)
+      .mockReturnValueOnce(2_000)
+    try {
+      const { runtime, messagesRef } = makeRuntime([], true, 'squilla_router')
+
+      runtime.queueRouterDecision({
+        tier: 'c1',
+        model: 'provider/first',
+        source: 'squilla_router',
+      })
+      runtime.flushPendingRouterDecision()
+
+      const routers = messagesRef.value.filter(message => message.role === 'router')
+      expect(routers).toHaveLength(1)
+      expect(routers[0]?.messageId).toBe('router-sess-1000-1')
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('keeps distinct sequence-free decisions unique inside the same millisecond', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      const { runtime, messagesRef } = makeRuntime([], true, 'squilla_router')
+
+      runtime.queueRouterDecision({
+        tier: 'c1',
+        model: 'provider/first',
+        source: 'squilla_router',
+      })
+      runtime.flushPendingRouterDecision()
+      runtime.queueRouterDecision({
+        tier: 'c2',
+        model: 'provider/second',
+        source: 'squilla_router',
+      })
+      runtime.flushPendingRouterDecision()
+
+      const routers = messagesRef.value.filter(message => message.role === 'router')
+      expect(routers.map(message => message.messageId)).toEqual([
+        'router-sess-1000-1',
+        'router-sess-1000-2',
+      ])
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('keeps emitted same-turn cards immutable and binds each physical call', () => {
     const { runtime, messagesRef } = makeRuntime([{
       role: 'user',
