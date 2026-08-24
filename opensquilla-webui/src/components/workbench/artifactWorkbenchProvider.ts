@@ -571,6 +571,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         : {}
       await this.handleAnnotationCancel(
         typeof payload.annotationId === 'string' ? payload.annotationId : '',
+        typeof payload.reason === 'string' ? payload.reason : '',
       )
       return
     }
@@ -1099,7 +1100,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         event.detail?.body || '',
       )
     } else if (event.type === 'annotation-cancel') {
-      await this.handleAnnotationCancel(event.detail?.annotationId || '')
+      await this.handleAnnotationCancel(
+        event.detail?.annotationId || '',
+        event.detail?.reason || '',
+      )
     } else if (event.type === 'annotation-overlay-fallback') {
       const annotationId = event.detail?.annotationId || this.annotationOverlayId
       if (!annotationId || annotationId !== this.annotationOverlayId) return
@@ -1555,9 +1559,30 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
   }
 
-  private async handleAnnotationCancel(annotationId: string) {
+  private async handleAnnotationCancel(annotationId: string, reason: string) {
     const fence = this.annotationOverlayFence(annotationId)
     if (!fence || this.annotationOverlayOperation) return
+    if (reason !== 'user-cancelled') {
+      // Desktop also uses annotation-cancel to report that the trusted editor
+      // was interrupted by surface/navigation lifecycle. Only the explicit
+      // button reason is destructive; every other (including future or
+      // missing) reason must keep the durable draft and its local recovery UI.
+      const operation = Symbol('annotation-interrupted')
+      this.annotationOverlayOperation = operation
+      try {
+        const body = this.annotationOverlayBody
+        this.preserveAnnotationFallback(reason || 'lifecycle-interrupted')
+        await Promise.all([
+          this.flushAnnotationBody(annotationId, body),
+          this.hideNativeSurfaceForAnnotationFallback(),
+        ])
+      } finally {
+        if (this.annotationOverlayOperation === operation) {
+          this.annotationOverlayOperation = null
+        }
+      }
+      return
+    }
     const operation = Symbol('annotation-cancel')
     this.annotationOverlayOperation = operation
     try {

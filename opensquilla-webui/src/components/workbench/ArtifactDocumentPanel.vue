@@ -438,7 +438,10 @@ function cancelAnnotationFallback() {
   if (!props.annotationFallback) return
   emit('workbench-event', {
     type: 'artifact-annotation-fallback-cancel',
-    payload: { annotationId: props.annotationFallback.annotationId },
+    payload: {
+      annotationId: props.annotationFallback.annotationId,
+      reason: 'user-cancelled',
+    },
   })
 }
 const documentFeatures = computed(() => props.documentFeatures)

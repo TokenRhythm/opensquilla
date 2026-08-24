@@ -30,6 +30,7 @@ const artifact: ArtifactPayload = {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -90,7 +91,406 @@ async function createNativeRuntimeHarness(
   }
 }
 
+async function createAnnotationDraftHarness(
+  showOverlayResult: NativeWorkbenchSurfaceResult = { ok: true },
+) {
+  const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
+  const workspace = {
+    ...legacy,
+    source: 'document-api' as const,
+    document: {
+      ...legacy.document,
+      documentId: 'document-1',
+      headRevisionId: 'revision-1',
+      capabilities: {
+        ...legacy.document.capabilities,
+        preview: true,
+        edit: true,
+        source: true,
+        promptAnnotations: false,
+      },
+    },
+  }
+  const createAnnotation = vi.fn(async (request: {
+    annotationId: string
+    sessionKey: string
+    documentId: string
+    revisionId: string
+  }) => ({
+    annotationId: request.annotationId,
+    sessionKey: request.sessionKey,
+    sessionId: null,
+    sessionEpoch: null,
+    documentId: request.documentId,
+    documentName: 'preview.html',
+    revisionId: request.revisionId,
+    generation: 1,
+    anchorId: 'anchor-1',
+    body: '',
+    status: 'draft' as const,
+    freshness: 'fresh' as const,
+    staleReason: null,
+    stateRevision: 1,
+    tagName: 'button',
+    locator: {},
+    quote: '<button>',
+    sourceExcerpt: null,
+    sentMessageId: null,
+    sentTurnId: null,
+    sentOrder: null,
+    createdAt: 1,
+    updatedAt: 1,
+    schemaVersion: 1,
+  }))
+  const updateAnnotation = vi.fn(async (_annotationId: string, _body: string) => null)
+  const discardAnnotation = vi.fn(async (_annotationId: string) => true)
+  const beginOverlayEdit = vi.fn()
+  const completeOverlayEdit = vi.fn()
+  const releaseOverlayEdit = vi.fn()
+  const closeOverlay = vi.fn(async (): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
+  const showOverlay = vi.fn(async (
+    _request: Parameters<NonNullable<NativeWorkbenchApi['showArtifactAnnotationOverlay']>>[0],
+  ): Promise<NativeWorkbenchSurfaceResult> => showOverlayResult)
+  const setSurfaceRect = vi.fn(async () => ({ ok: true as const }))
+  const pushToast = vi.fn()
+  const lease = {
+    version: 1 as const,
+    lease_id: 'apl-annotation-focused',
+    effective_mode: 'full' as const,
+    launch_url: 'http://p-0123456789abcdef0123456789abcdef.localhost:48721/index.html',
+    entrypoint: 'index.html',
+    expires_at: '2099-01-01T00:00:00Z',
+    preview_origin: 'http://p-0123456789abcdef0123456789abcdef.localhost:48721',
+    idle_timeout_seconds: 28_800,
+    source: {
+      kind: 'single_file' as const,
+      collection_status: 'not_applicable' as const,
+      file_count: 1,
+      total_bytes: 128,
+      warning_codes: [],
+    },
+  }
+  const nativeApi: NativeWorkbenchApi = {
+    getCapabilities: vi.fn(async () => ({
+      protocolVersions: [3] as Array<3>,
+      modes: ['full', 'offline'] as Array<'full' | 'offline'>,
+      maxSurfaces: 8,
+    })),
+    getArtifactAnnotationCapabilities: vi.fn(async () => ({
+      version: 3 as const,
+      available: true,
+      picker: true,
+      trustedOverlay: true,
+      overlayCopyVersion: 1 as const,
+    })),
+    setArtifactAnnotationMode: vi.fn(async () => ({ ok: true as const })),
+    showArtifactAnnotationOverlay: showOverlay,
+    closeArtifactAnnotationOverlay: closeOverlay,
+    screenshot: vi.fn(async () => ({
+      ok: true as const,
+      method: 'screenshot' as const,
+      value: {
+        mime: 'image/png' as const,
+        data: new Uint8Array([137, 80, 78, 71]),
+        width: 320,
+        height: 180,
+      },
+    })),
+    createArtifactPreviewLease: vi.fn(async () => ({
+      ok: true as const,
+      status: 201,
+      payload: lease,
+    })),
+    renewArtifactPreviewLease: vi.fn(async () => ({
+      ok: true as const,
+      status: 200,
+      payload: { version: 1 as const, lease_id: lease.lease_id, expires_at: lease.expires_at },
+    })),
+    revokeArtifactPreviewLease: vi.fn(async () => ({
+      ok: true as const,
+      status: 204,
+      payload: undefined,
+    })),
+    createSurface: vi.fn(async () => ({ ok: true as const })),
+    setSurfaceRect,
+    activateSurface: vi.fn(async () => ({ ok: true as const })),
+    destroySurface: vi.fn(async () => ({ ok: true as const })),
+    onSurfaceEvent: vi.fn(() => () => undefined),
+  }
+  const renderState: Record<string, unknown> = {}
+  const item = createArtifactPreviewWorkbenchItem({
+    artifact,
+    nativeHtml: true,
+    sessionKey: 'session-a',
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    artifactDocuments: {
+      load: vi.fn(async () => undefined),
+      snapshot: vi.fn(() => ({
+        key: 'fixture',
+        loading: false,
+        loaded: true,
+        stale: false,
+        error: null,
+        workspace,
+      })),
+      headArtifact: vi.fn(() => artifact),
+    },
+    promptAnnotations: {
+      create: createAnnotation,
+      update: updateAnnotation,
+      discard: discardAnnotation,
+      beginOverlayEdit,
+      completeOverlayEdit,
+      releaseOverlayEdit,
+      setActiveDocument: vi.fn(),
+    },
+    authToken: () => 'synthetic-token',
+    baseOrigin: 'http://127.0.0.1:18791',
+    confirmRemoteResources: vi.fn(async () => true),
+    currentSessionId: () => 'session-a',
+    openArtifact: vi.fn(),
+    platform: {
+      id: 'desktop',
+      capabilities: { canOpenArtifactsNatively: true },
+      files: {},
+    } as unknown as Platform,
+    previewLeasesEnabled: true,
+    pushToast,
+    t: key => key,
+  }).find(candidate => candidate.kind === 'artifact-preview')!
+  const runtime = await definition.createRuntime!(item, {
+    nativeWorkbenchApi: nativeApi,
+    getRenderState: () => renderState,
+    updateRenderState: patch => Object.assign(renderState, patch),
+    isItemOpen: () => true,
+    setExpanded: vi.fn(),
+    reportError: vi.fn(),
+  })
+
+  workspace.document.capabilities.promptAnnotations = true
+  workspace.document.capabilities.manualEdit = true
+  workspace.document.capabilities.selectionContext = true
+  workspace.document.capabilities.agentEdit = true
+  await runtime.resume?.(item)
+  await runtime.handleSurfaceRect?.({
+    itemId: item.id,
+    x: 300,
+    y: 40,
+    width: 600,
+    height: 500,
+    visible: true,
+  }, item)
+  await runtime.performAction?.('toggle-annotation-mode', item)
+  await runtime.handleNativeSurfaceEvent?.({
+    version: 3,
+    surfaceId: item.id,
+    type: 'annotation-selected',
+    detail: {
+      selection: {
+        selectionId: 'selection-focused',
+        tagName: 'button',
+        elementPath: '[["","button",1]]',
+        elementProofSha256: 'b'.repeat(64),
+        domSha256: 'a'.repeat(64),
+        rect: { x: 1, y: 2, width: 30, height: 20 },
+      },
+    },
+  }, item)
+  const annotationId = String(showOverlay.mock.calls[0]?.[0].annotationId || '')
+  expect(annotationId).not.toBe('')
+
+  return {
+    annotationId,
+    beginOverlayEdit,
+    closeOverlay,
+    completeOverlayEdit,
+    discardAnnotation,
+    item,
+    pushToast,
+    releaseOverlayEdit,
+    renderState,
+    runtime,
+    setSurfaceRect,
+    updateAnnotation,
+  }
+}
+
 describe('artifact Workbench provider', () => {
+  it.each([
+    'surface-hidden',
+    'surface-navigation',
+    'surface-reloaded',
+    'surface-closed',
+    'picker-cancelled',
+  ])('flushes a pending annotation before %s and keeps one fallback draft', async (reason) => {
+    vi.useFakeTimers()
+    const harness = await createAnnotationDraftHarness()
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-draft-change',
+      detail: { annotationId: harness.annotationId, body: 'Keep this lifecycle draft.' },
+    }, harness.item)
+    await vi.advanceTimersByTimeAsync(249)
+    expect(harness.updateAnnotation).not.toHaveBeenCalled()
+
+    let finishUpdate: (() => void) | null = null
+    harness.updateAnnotation.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        finishUpdate = resolve
+      })
+      return null
+    })
+    const cancel = {
+      version: 3 as const,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel' as const,
+      detail: { annotationId: harness.annotationId, reason },
+    }
+    const pendingCancel = harness.runtime.handleNativeSurfaceEvent?.(cancel, harness.item)
+    expect(harness.updateAnnotation).toHaveBeenCalledOnce()
+    await harness.runtime.handleNativeSurfaceEvent?.(cancel, harness.item)
+    const resolveUpdate: unknown = finishUpdate
+    if (typeof resolveUpdate !== 'function') throw new Error('annotation update is not pending')
+    resolveUpdate()
+    await pendingCancel
+
+    expect(harness.updateAnnotation).toHaveBeenCalledOnce()
+    expect(harness.updateAnnotation).toHaveBeenCalledWith(
+      harness.annotationId,
+      'Keep this lifecycle draft.',
+    )
+    expect(harness.discardAnnotation).not.toHaveBeenCalled()
+    expect(harness.releaseOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.renderState.annotationFallback).toMatchObject({
+      annotationId: harness.annotationId,
+      body: 'Keep this lifecycle draft.',
+      reason,
+    })
+    expect(harness.setSurfaceRect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ surfaceId: harness.item.id, visible: false }),
+    )
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(harness.updateAnnotation).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the local body, screenshot, and fallback when lifecycle flush fails', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:focused-annotation-preview')
+    const revokeScreenshotUrl = vi.spyOn(URL, 'revokeObjectURL')
+      .mockImplementation(() => undefined)
+    const harness = await createAnnotationDraftHarness({
+      ok: false,
+      code: 'PREVIEW_RENDERER_FAILED',
+      retryable: true,
+    })
+    harness.updateAnnotation.mockRejectedValueOnce(new Error('synthetic update failure'))
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-draft-change',
+      detail: { annotationId: harness.annotationId, body: 'Retry this saved-locally body.' },
+    }, harness.item)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel',
+      detail: { annotationId: harness.annotationId, reason: 'surface-reloaded' },
+    }, harness.item)
+
+    expect(harness.updateAnnotation).toHaveBeenCalledOnce()
+    expect(harness.discardAnnotation).not.toHaveBeenCalled()
+    expect(harness.releaseOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.renderState.annotationFallback).toMatchObject({
+      annotationId: harness.annotationId,
+      body: 'Retry this saved-locally body.',
+      reason: 'surface-reloaded',
+      screenshotUrl: 'blob:focused-annotation-preview',
+    })
+    expect(revokeScreenshotUrl).not.toHaveBeenCalled()
+    expect(harness.pushToast).toHaveBeenCalledWith(
+      'workbench.artifactAnnotation.updateFailed',
+      { tone: 'danger' },
+    )
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(harness.updateAnnotation).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { label: 'unknown', reason: 'future-surface-transition' },
+    { label: 'missing', reason: undefined },
+  ])('treats an $label annotation cancel reason as a recoverable interruption', async ({ reason }) => {
+    vi.useFakeTimers()
+    const harness = await createAnnotationDraftHarness()
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-draft-change',
+      detail: { annotationId: harness.annotationId, body: 'Preserve a future reason.' },
+    }, harness.item)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel',
+      detail: {
+        annotationId: harness.annotationId,
+        ...(reason ? { reason } : {}),
+      },
+    }, harness.item)
+
+    expect(harness.updateAnnotation).toHaveBeenCalledWith(
+      harness.annotationId,
+      'Preserve a future reason.',
+    )
+    expect(harness.discardAnnotation).not.toHaveBeenCalled()
+    expect(harness.renderState.annotationFallback).toMatchObject({
+      annotationId: harness.annotationId,
+      body: 'Preserve a future reason.',
+      reason: reason || 'lifecycle-interrupted',
+    })
+  })
+
+  it('discards an explicit user cancellation exactly once', async () => {
+    vi.useFakeTimers()
+    const harness = await createAnnotationDraftHarness()
+    harness.closeOverlay
+      .mockResolvedValueOnce({ ok: false })
+      .mockResolvedValueOnce({ ok: true })
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-draft-change',
+      detail: { annotationId: harness.annotationId, body: 'Discard only by intent.' },
+    }, harness.item)
+    const cancel = {
+      version: 3 as const,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel' as const,
+      detail: { annotationId: harness.annotationId, reason: 'user-cancelled' },
+    }
+    await harness.runtime.handleNativeSurfaceEvent?.(cancel, harness.item)
+    await harness.runtime.handleNativeSurfaceEvent?.(cancel, harness.item)
+
+    expect(harness.discardAnnotation).toHaveBeenCalledOnce()
+    expect(harness.discardAnnotation).toHaveBeenCalledWith(harness.annotationId)
+    expect(harness.closeOverlay).toHaveBeenCalledTimes(2)
+    expect(harness.updateAnnotation).not.toHaveBeenCalled()
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.releaseOverlayEdit).toHaveBeenCalledOnce()
+    expect(harness.renderState.annotationFallback).toBeNull()
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(harness.updateAnnotation).not.toHaveBeenCalled()
+    expect(harness.discardAnnotation).toHaveBeenCalledOnce()
+  })
+
   it('does not expose a Desktop native-open diagnostic in the toast', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>fixture</p>', {
       status: 200,
@@ -3143,7 +3543,7 @@ describe('artifact Workbench provider', () => {
     resolveDeferredDiscard = null
     const pendingOldCancel = runtime.handleComponentEvent?.({
       type: 'artifact-annotation-fallback-cancel',
-      payload: { annotationId: newSubmitAnnotationId },
+      payload: { annotationId: newSubmitAnnotationId, reason: 'user-cancelled' },
     }, item)
     await vi.waitFor(() => expect(resolveDeferredDiscard).toBeTypeOf('function'))
     workspace.document.headRevisionId = 'revision-5'
