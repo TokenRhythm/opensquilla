@@ -41,6 +41,10 @@ _WINDOWS_ACE_RE = re.compile(r"\(([^()]*)\)")
 _WINDOWS_HEX_ACCESS_MASK_RE = re.compile(r"0[xX][0-9A-Fa-f]{1,8}")
 
 
+class _WindowsPrivateDaclVerificationError(OSError):
+    """A bound path did not retain the DACL that was just installed."""
+
+
 class _WindowsFileAttributeTagInfo(ctypes.Structure):
     _fields_ = [
         ("file_attributes", ctypes.c_uint32),
@@ -569,7 +573,10 @@ def apply_windows_private_dacl(
             require_protected=True,
             canonicalize_sid=getattr(api, "canonical_sid", None),
         ):
-            raise OSError(0, "bound Windows path did not retain a private DACL")
+            raise _WindowsPrivateDaclVerificationError(
+                0,
+                "bound Windows path did not retain a private DACL",
+            )
 
 
 def create_windows_private_directory(
