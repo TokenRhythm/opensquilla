@@ -337,6 +337,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private annotationOverlayId = ''
   private annotationOverlayBody = ''
   private annotationOverlayOperation: symbol | null = null
+  private annotationOverlayDeferredCancel: {
+    attempt: number
+    annotationId: string
+    reason: string
+  } | null = null
   private annotationOverlayDiscarded: {
     attempt: number
     annotationId: string
@@ -360,6 +365,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private leaseRenewTimer: ReturnType<typeof setInterval> | null = null
   private readonly nativeRecoveryAttemptedKeys = new Set<string>()
   private nativeRecoveryInFlight: Promise<void> | null = null
+  private nativeSurfaceInstanceId = ''
   private defaultMode: WorkbenchPreviewMode
   private mode: WorkbenchPreviewMode
   private nativeProtocolVersion: NativeWorkbenchProtocolVersion = 1
@@ -1175,6 +1181,22 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
             }
           : {}),
       })
+      if (
+        event.detail?.action === 'annotation-picker'
+        && event.detail?.code === 'ANNOTATION_REARM_FAILED'
+        && event.detail?.surfaceInstanceId === this.nativeSurfaceInstanceId
+      ) {
+        // An unsupported target consumes Chromium's one-shot inspect mode.
+        // Desktop normally reinstalls it before reporting the rejection. If
+        // that reinstall fails, never leave the toolbar claiming the picker
+        // is armed; use the existing single bounded capability recovery path.
+        this.annotationPickerArmed = false
+        if (
+          this.annotationMode
+          && !this.annotationOverlayId
+          && !this.annotationSelectionPending
+        ) await this.setAnnotationMode(true)
+      }
     } else if (event.type === 'capability-expired') {
       await this.replaceLeasePreview()
     } else if (event.type === 'unresponsive') {
@@ -1488,7 +1510,12 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     generation: number
     surfaceId: string
     annotationId: string
-  }, rearm = false): Promise<{ ok: boolean; code?: string; retryable?: boolean }> {
+  }, rearm = false): Promise<{
+    ok: boolean
+    code?: string
+    retryable?: boolean
+    rearmed?: boolean
+  }> {
     const close = this.context.nativeWorkbenchApi?.closeArtifactAnnotationOverlay
     if (!close) return { ok: false }
     try {
@@ -1505,11 +1532,15 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           || (!rearm && result.code === 'ANNOTATION_UNAVAILABLE'))
       ) {
         // The scoped surface is already gone, so its trusted overlay is gone
-        // too. Treat close as acknowledged; after local cleanup the normal
-        // rearm path rebuilds the current surface once and retries the picker.
-        return { ok: true }
+        // too. Treat only the close as acknowledged. In particular, an
+        // atomic close did not rearm a picker on the vanished surface; after
+        // local cleanup the normal path must rebuild and arm the replacement.
+        return { ok: true, rearmed: false }
       }
-      return result
+      return {
+        ...result,
+        rearmed: rearm && result.ok,
+      }
     } catch {
       return {
         ok: false,
@@ -1533,6 +1564,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.annotationOverlayOperation = operation
     const atomicRearm = this.annotationAtomicCloseRearm && this.annotationMode
     const modeOperation = this.annotationModeOperation
+    let bodyFlushed = false
     try {
       // A prior cancel may already have durably discarded this draft while a
       // native close failed. It cannot be resurrected; only retry that close.
@@ -1541,6 +1573,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       if (!alreadyDiscarded) {
         this.annotationOverlayBody = body
         if (!await this.flushAnnotationBody(annotationId, body)) return
+        bodyFlushed = true
         if (!this.annotationOverlayFenceCurrent(fence)) return
       }
       const closed = await this.closeAnnotationOverlay(fence, atomicRearm)
@@ -1555,7 +1588,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       this.options.promptAnnotations?.completeOverlayEdit?.(annotationId)
       if (!this.clearAnnotationOverlayState(fence)) return
-      if (atomicRearm) {
+      if (atomicRearm && closed.rearmed === true) {
         if (
           modeOperation === this.annotationModeOperation
           && this.annotationMode
@@ -1578,12 +1611,27 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       if (this.annotationOverlayOperation === operation) {
         this.annotationOverlayOperation = null
       }
+      await this.reconcileDeferredAnnotationCancel(fence, bodyFlushed)
     }
   }
 
   private async handleAnnotationCancel(annotationId: string, reason: string) {
     const fence = this.annotationOverlayFence(annotationId)
-    if (!fence || this.annotationOverlayOperation) return
+    if (!fence) return
+    if (this.annotationOverlayOperation) {
+      // Desktop lifecycle cancellation may race an update/discard and its
+      // atomic close acknowledgement. Queue the exact ownership fence instead
+      // of dropping the event; otherwise Desktop can close the editor while
+      // WebUI permanently retains an unreachable annotationOverlayId.
+      if (reason !== 'user-cancelled') {
+        this.annotationOverlayDeferredCancel = {
+          attempt: fence.attempt,
+          annotationId: fence.annotationId,
+          reason: reason || 'lifecycle-interrupted',
+        }
+      }
+      return
+    }
     if (reason !== 'user-cancelled') {
       // Desktop also uses annotation-cancel to report that the trusted editor
       // was interrupted by surface/navigation lifecycle. Only the explicit
@@ -1645,7 +1693,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         return
       }
       if (!this.clearAnnotationOverlayState(fence)) return
-      if (atomicRearm) {
+      if (atomicRearm && closed.rearmed === true) {
         if (
           modeOperation === this.annotationModeOperation
           && this.annotationMode
@@ -1664,7 +1712,40 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       if (this.annotationOverlayOperation === operation) {
         this.annotationOverlayOperation = null
       }
+      await this.reconcileDeferredAnnotationCancel(fence)
     }
+  }
+
+  private async reconcileDeferredAnnotationCancel(fence: {
+    attempt: number
+    generation: number
+    surfaceId: string
+    annotationId: string
+  }, bodyAlreadyFlushed = false) {
+    const deferred = this.annotationOverlayDeferredCancel
+    if (
+      !deferred
+      || deferred.attempt !== fence.attempt
+      || deferred.annotationId !== fence.annotationId
+    ) return
+    this.annotationOverlayDeferredCancel = null
+    if (!this.annotationOverlayFenceCurrent(fence)) return
+
+    const discarded = this.annotationOverlayDiscarded?.attempt === fence.attempt
+      && this.annotationOverlayDiscarded.annotationId === fence.annotationId
+    if (discarded) {
+      if (this.clearAnnotationOverlayState(fence)) await this.syncSurfaceRect()
+      return
+    }
+
+    const body = this.annotationOverlayBody
+    this.preserveAnnotationFallback(deferred.reason)
+    await Promise.all([
+      bodyAlreadyFlushed
+        ? Promise.resolve(true)
+        : this.flushAnnotationBody(fence.annotationId, body),
+      this.hideNativeSurfaceForAnnotationFallback(),
+    ])
   }
 
   private clearAnnotationOverlayState(expected?: {
@@ -1682,6 +1763,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const annotationId = this.annotationOverlayId
     this.annotationUpdateTimer = null
     this.annotationOverlayOperation = null
+    this.annotationOverlayDeferredCancel = null
     this.annotationOverlayDiscarded = null
     this.annotationOverlayAttempt += 1
     this.annotationOverlayId = ''
@@ -1825,6 +1907,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const generation = this.generation + 1
     this.generation = generation
     this.createdSurface = true
+    this.nativeSurfaceInstanceId = ''
     this.context.updateRenderState({
       missingResources: resource.hasRelativeResources,
       nativeSurfaceState: 'loading',
@@ -1864,6 +1947,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       )
       return
     }
+    this.nativeSurfaceInstanceId = result.surfaceInstanceId || ''
     await this.syncSurfaceRect()
     if (generation !== this.generation || !this.createdSurface) return
     // Desktop only advertises the picker for the active, visible v3 surface.
@@ -2129,6 +2213,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     const generation = ++this.generation
     this.createdSurface = true
+    this.nativeSurfaceInstanceId = ''
     this.agentEditReleaseObserved = false
     this.context.updateRenderState({
       agentEditInProgress: false,
@@ -2156,6 +2241,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (generation !== this.generation) return
     if (!result.ok) {
       this.createdSurface = false
+      this.nativeSurfaceInstanceId = ''
       if (result.code === 'AGENT_EDIT_IN_PROGRESS') {
         await this.releaseLease()
         this.context.updateRenderState({
@@ -2171,6 +2257,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       throw surfaceError('Failed to create the native Workbench surface', result.message)
     }
+    this.nativeSurfaceInstanceId = result.surfaceInstanceId || ''
     if (!await this.syncSurfaceRect()) return
     if (generation !== this.generation || !this.createdSurface) return
     // createSurface resolves only after the native preview has loaded its
@@ -2636,7 +2723,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     // stale rect event incorrectly report "surface no longer exists" and tear
     // down the replacement as well.
     const hadSurface = this.createdSurface
+    const surfaceInstanceId = this.nativeSurfaceInstanceId
     this.createdSurface = false
+    this.nativeSurfaceInstanceId = ''
     const overlayId = this.annotationOverlayId
     const preserveModeIntent = this.annotationModeRestorePending || this.annotationMode
     let preserveAnnotationFallback = false
@@ -2714,12 +2803,18 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         // Keep the record logically owned when Desktop rejected destruction;
         // callers are allowed to retry the cleanup. Do not resurrect it if a
         // newer create/release transition already advanced the generation.
-        if (this.generation === releaseGeneration) this.createdSurface = hadSurface
+        if (this.generation === releaseGeneration) {
+          this.createdSurface = hadSurface
+          this.nativeSurfaceInstanceId = surfaceInstanceId
+        }
         return false
       }
       return true
     } catch {
-      if (this.generation === releaseGeneration) this.createdSurface = hadSurface
+      if (this.generation === releaseGeneration) {
+        this.createdSurface = hadSurface
+        this.nativeSurfaceInstanceId = surfaceInstanceId
+      }
       return false
     }
   }

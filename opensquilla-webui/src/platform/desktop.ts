@@ -191,6 +191,10 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
           : {}),
         ...(typeof rawDetail.action === 'string' ? { action: rawDetail.action } : {}),
         ...(typeof rawDetail.code === 'string' ? { code: rawDetail.code } : {}),
+        ...(typeof rawDetail.surfaceInstanceId === 'string'
+          && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.surfaceInstanceId)
+          ? { surfaceInstanceId: rawDetail.surfaceInstanceId }
+          : {}),
       }
     : undefined
   return {

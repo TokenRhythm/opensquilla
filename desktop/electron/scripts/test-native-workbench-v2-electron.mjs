@@ -1559,6 +1559,51 @@ try {
           && annotationRejectedSelectionRecord.annotationPickerActive === true,
         candidateCleared: annotationRejectedSelectionRecord.annotationCandidate === null,
       }
+      const annotationRearmFailureEventsBefore = events.length
+      const annotationRearmFailureCdpCommand = manager.cdpCommand.bind(manager)
+      let rejectAutomaticRearm = true
+      manager.cdpCommand = async (record, method, params) => {
+        if (
+          rejectAutomaticRearm
+          && method === 'Overlay.setInspectMode'
+          && params?.mode === 'searchForNode'
+        ) {
+          rejectAutomaticRearm = false
+          throw new Error('synthetic automatic picker rearm failure')
+        }
+        return await annotationRearmFailureCdpCommand(record, method, params)
+      }
+      await manager.handleAnnotationNodeSelected(
+        annotationRejectedSelectionRecord,
+        Number.MAX_SAFE_INTEGER,
+      )
+      manager.cdpCommand = annotationRearmFailureCdpCommand
+      const annotationRearmFailureEvent = events
+        .slice(annotationRearmFailureEventsBefore)
+        .find(event => event.surfaceId === 'artifact:v3-bridge'
+          && event.type === 'blocked-action'
+          && event.detail?.action === 'annotation-picker'
+          && event.detail?.code === 'ANNOTATION_REARM_FAILED'
+          && event.detail?.surfaceInstanceId
+            === annotationRejectedSelectionRecord.surfaceInstanceId)
+      const annotationPickerInactiveAfterRearmFailure =
+        annotationRejectedSelectionRecord.annotationPickerActive === false
+      const annotationPickerRecoveryAfterRearmFailure =
+        await manager.setArtifactAnnotationMode({
+          version: 3,
+          surfaceId: 'artifact:v3-bridge',
+          enabled: true,
+        })
+      const annotationRejectedSelectionRearmFailure = {
+        reported: Boolean(annotationRearmFailureEvent),
+        reasonStable: annotationRearmFailureEvent?.detail?.reason
+          === 'annotation-picker-rearm-failed',
+        rawErrorHidden: !events.slice(annotationRearmFailureEventsBefore).some(event =>
+          JSON.stringify(event).includes('synthetic automatic picker rearm failure')),
+        inactiveBeforeRecovery: annotationPickerInactiveAfterRearmFailure,
+        recovered: annotationPickerRecoveryAfterRearmFailure.ok
+          && annotationRejectedSelectionRecord.annotationPickerActive === true,
+      }
       const annotationPageClicksBeforeRearm = await v3Contents.executeJavaScript(
         'Number(window.__annotationPageClicks || 0)',
       )
@@ -3054,6 +3099,7 @@ try {
         annotationAtomicHandoffPendingState,
         annotationPickerRearm,
         annotationRejectedSelectionRecovery,
+        annotationRejectedSelectionRearmFailure,
         annotationRearmOverlayResult,
         annotationRearmCopy,
         annotationRearmLayout,
@@ -3578,6 +3624,13 @@ try {
     rejected: true,
     rearmed: true,
     candidateCleared: true,
+  })
+  assert.deepEqual(result.annotationRejectedSelectionRearmFailure, {
+    reported: true,
+    reasonStable: true,
+    rawErrorHidden: true,
+    inactiveBeforeRecovery: true,
+    recovered: true,
   })
   assert.equal(
     result.annotationLifecycleDiagnostics.some(entry => entry.phase === 'close-start'),

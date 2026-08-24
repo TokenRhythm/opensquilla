@@ -85,6 +85,7 @@ function artifactHtmlCsp(allowRemoteResources: boolean): string {
 
 interface NativeWorkbenchSurfaceRecord {
   id: string
+  surfaceInstanceId: string
   version: NativeWorkbenchCreateRequest['version']
   kind: NativeWorkbenchCreateRequest['kind']
   mode: NativeWorkbenchPreviewMode
@@ -1004,6 +1005,7 @@ export interface NativeWorkbenchSurfaceResult {
   code?: string
   retryable?: boolean
   message?: string
+  surfaceInstanceId?: string
 }
 
 export interface NativeWorkbenchAnnotationLifecycleDiagnostic {
@@ -1329,6 +1331,7 @@ export class NativeWorkbenchSurfaceManager {
     )
     const record: NativeWorkbenchSurfaceRecord = {
       id: request.surfaceId,
+      surfaceInstanceId: randomUUID(),
       version: request.version,
       kind: request.kind,
       mode,
@@ -1454,7 +1457,7 @@ export class NativeWorkbenchSurfaceManager {
       if (record.crashed) {
         return { ok: false, message: 'The native Workbench surface renderer failed.' }
       }
-      return { ok: true }
+      return { ok: true, surfaceInstanceId: record.surfaceInstanceId }
     } catch (error) {
       this.failRecord(record, 'error', { message: errorMessage(error) })
       await this.destroyRecord(record)
@@ -3780,7 +3783,21 @@ export class NativeWorkbenchSurfaceManager {
       // surface generation. A concurrent Stop, navigation, hide, or replace
       // advances the epoch and prevents this recovery from reactivating it.
       const rearmEpoch = ++record.annotationPickerEpoch
-      await this.armAnnotationPicker(record, rearmEpoch, generation, null)
+      const rearmed = await this.armAnnotationPicker(record, rearmEpoch, generation, null)
+      if (
+        !rearmed.ok
+        && this.annotationPickerTransitionIsCurrent(record, rearmEpoch, generation, null)
+      ) {
+        // Do not expose the raw CDP failure. WebUI uses this stable signal to
+        // clear its optimistic armed state and invoke the existing one-shot
+        // bounded recovery instead of leaving a pressed but inert toolbar.
+        this.emit(record, 'blocked-action', {
+          action: 'annotation-picker',
+          code: 'ANNOTATION_REARM_FAILED',
+          reason: 'annotation-picker-rearm-failed',
+          surfaceInstanceId: record.surfaceInstanceId,
+        })
+      }
     } finally {
       if (!retainedObjectGroup) {
         await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })

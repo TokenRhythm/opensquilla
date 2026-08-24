@@ -320,6 +320,7 @@ export interface NativeWorkbenchSurfaceResult {
   code?: string
   retryable?: boolean
   message?: string
+  surfaceInstanceId?: string
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -357,6 +358,7 @@ export interface NativeWorkbenchSurfaceEvent {
     canGoForward?: boolean
     action?: string
     code?: string
+    surfaceInstanceId?: string
     message?: string
     path?: string
     reason?: string

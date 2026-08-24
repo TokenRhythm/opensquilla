@@ -231,9 +231,19 @@ describe('native Workbench platform bridge', () => {
       type: 'annotation-draft-change',
       detail: { annotationId: '../invalid', body: 'x'.repeat(16 * 1024 + 1) },
     })
+    emit?.({
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        surfaceInstanceId: 'surface-instance-current',
+      },
+    })
 
-    expect(listener).toHaveBeenCalledOnce()
-    expect(listener).toHaveBeenCalledWith({
+    expect(listener).toHaveBeenCalledTimes(2)
+    expect(listener).toHaveBeenNthCalledWith(1, {
       version: 3,
       surfaceId: 'artifact:fixture',
       type: 'annotation-selected',
@@ -245,6 +255,16 @@ describe('native Workbench platform bridge', () => {
           elementProofSha256: 'b'.repeat(64),
           rect: { x: 1, y: 2, width: 30, height: 40 },
         },
+      },
+    })
+    expect(listener).toHaveBeenNthCalledWith(2, {
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        surfaceInstanceId: 'surface-instance-current',
       },
     })
   })

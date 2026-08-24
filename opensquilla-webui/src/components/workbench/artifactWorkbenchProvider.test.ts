@@ -155,7 +155,12 @@ async function createAnnotationDraftHarness(
   const setSurfaceRect = vi.fn(async () => ({ ok: true as const }))
   const setAnnotationMode = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['setArtifactAnnotationMode']>>[0],
-  ) => ({ ok: true as const }))
+  ): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
+  const createSurface = vi.fn(async (): Promise<NativeWorkbenchSurfaceResult> => ({
+    ok: true,
+    surfaceInstanceId: 'surface-instance-current',
+  }))
+  const destroySurface = vi.fn(async (): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
   const pushToast = vi.fn()
   const lease = {
     version: 1 as const,
@@ -216,10 +221,10 @@ async function createAnnotationDraftHarness(
       status: 204,
       payload: undefined,
     })),
-    createSurface: vi.fn(async () => ({ ok: true as const })),
+    createSurface,
     setSurfaceRect,
     activateSurface: vi.fn(async () => ({ ok: true as const })),
-    destroySurface: vi.fn(async () => ({ ok: true as const })),
+    destroySurface,
     onSurfaceEvent: vi.fn(() => () => undefined),
   }
   const renderState: Record<string, unknown> = {}
@@ -310,8 +315,10 @@ async function createAnnotationDraftHarness(
     beginOverlayEdit,
     closeOverlay,
     completeOverlayEdit,
+    createSurface,
     createAnnotation,
     discardAnnotation,
+    destroySurface,
     item,
     pushToast,
     releaseOverlayEdit,
@@ -553,6 +560,231 @@ describe('artifact Workbench provider', () => {
     expect(harness.showOverlay).toHaveBeenCalledTimes(2)
   })
 
+  it.each([
+    {
+      name: 'submit',
+      event: (annotationId: string) => ({
+        version: 3 as const,
+        surfaceId: 'artifact:artifact-1',
+        type: 'annotation-submit' as const,
+        detail: { annotationId, body: 'Recover the expired atomic handoff.' },
+      }),
+    },
+    {
+      name: 'cancel',
+      event: (annotationId: string) => ({
+        version: 3 as const,
+        surfaceId: 'artifact:artifact-1',
+        type: 'annotation-cancel' as const,
+        detail: { annotationId, reason: 'user-cancelled' },
+      }),
+    },
+  ])('rearms through the bounded path when atomic $name finds an expired surface', async ({
+    name,
+    event,
+  }) => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true)
+    const setModeCallsBeforeClose = harness.setAnnotationMode.mock.calls.length
+    const createCallsBeforeClose = harness.createSurface.mock.calls.length
+    harness.closeOverlay.mockResolvedValueOnce({
+      ok: false,
+      code: 'PREVIEW_CAPABILITY_EXPIRED',
+      retryable: true,
+    })
+    harness.setAnnotationMode
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 'PREVIEW_CAPABILITY_EXPIRED',
+        retryable: true,
+      })
+      .mockResolvedValueOnce({ ok: true })
+
+    await harness.runtime.handleNativeSurfaceEvent?.(
+      event(harness.annotationId),
+      harness.item,
+    )
+
+    expect(harness.releaseOverlayEdit).toHaveBeenCalledOnce()
+    const recoveryModeCalls = harness.setAnnotationMode.mock.calls
+      .slice(setModeCallsBeforeClose)
+      .map(([request]) => request.enabled)
+    expect(recoveryModeCalls[0]).toBe(true)
+    expect(recoveryModeCalls).toContain(false)
+    expect(recoveryModeCalls[recoveryModeCalls.length - 1]).toBe(true)
+    expect(harness.createSurface).toHaveBeenCalledTimes(createCallsBeforeClose + 1)
+    expect(harness.pushToast).not.toHaveBeenCalledWith(
+      'workbench.artifactAnnotation.closeFailed',
+      expect.anything(),
+    )
+    if (name === 'submit') {
+      expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+      expect(harness.discardAnnotation).not.toHaveBeenCalled()
+    } else {
+      expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+      expect(harness.discardAnnotation).toHaveBeenCalledOnce()
+    }
+  })
+
+  it('recovers once when rejected-target automatic rearm reports a stable failure', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-submit',
+      detail: {
+        annotationId: harness.annotationId,
+        body: 'Finish the first editor before testing picker recovery.',
+      },
+    }, harness.item)
+    const modeCallsBeforeFailure = harness.setAnnotationMode.mock.calls.length
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        reason: 'annotation-picker-rearm-failed',
+        surfaceInstanceId: 'surface-instance-current',
+      },
+    }, harness.item)
+
+    expect(harness.setAnnotationMode).toHaveBeenCalledTimes(modeCallsBeforeFailure + 1)
+    expect(harness.renderState).toMatchObject({
+      annotationMode: true,
+      annotationModeStopping: false,
+    })
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-selected',
+      detail: {
+        selection: {
+          selectionId: 'selection-after-rearm-failure',
+          tagName: 'button',
+          elementPath: '[["","button",2]]',
+          elementProofSha256: 'd'.repeat(64),
+          rect: { x: 40, y: 2, width: 30, height: 20 },
+        },
+      },
+    }, harness.item)
+    expect(harness.createAnnotation).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails closed when rejected-target picker recovery also fails', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-submit',
+      detail: {
+        annotationId: harness.annotationId,
+        body: 'Finish the editor before the terminal recovery failure.',
+      },
+    }, harness.item)
+    harness.setAnnotationMode.mockResolvedValue({
+      ok: false,
+      code: 'ANNOTATION_UNAVAILABLE',
+      retryable: true,
+    })
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        surfaceInstanceId: 'surface-instance-current',
+      },
+    }, harness.item)
+
+    expect(harness.renderState.annotationMode).toBe(false)
+    expect(harness.pushToast).toHaveBeenCalledWith(
+      'workbench.artifactAnnotation.unavailable',
+      { tone: 'danger' },
+    )
+  })
+
+  it('ignores a rejected-target rearm failure from a replaced surface instance', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-submit',
+      detail: {
+        annotationId: harness.annotationId,
+        body: 'Close the editor before the stale event arrives.',
+      },
+    }, harness.item)
+    const modeCallsBeforeStaleEvent = harness.setAnnotationMode.mock.calls.length
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        surfaceInstanceId: 'surface-instance-retired',
+      },
+    }, harness.item)
+
+    expect(harness.setAnnotationMode).toHaveBeenCalledTimes(modeCallsBeforeStaleEvent)
+    expect(harness.renderState.annotationMode).toBe(true)
+  })
+
+  it.each(['rejected', 'threw'] as const)(
+    'restores the surface identity when native destruction is %s',
+    async (failure) => {
+      const harness = await createAnnotationDraftHarness({ ok: true }, true)
+      await harness.runtime.handleNativeSurfaceEvent?.({
+        version: 3,
+        surfaceId: harness.item.id,
+        type: 'annotation-submit',
+        detail: {
+          annotationId: harness.annotationId,
+          body: 'Close the editor before testing failed surface release.',
+        },
+      }, harness.item)
+      if (failure === 'rejected') {
+        harness.destroySurface.mockResolvedValueOnce({ ok: false })
+      } else {
+        harness.destroySurface.mockRejectedValueOnce(new Error('synthetic destroy failure'))
+      }
+      const internal = harness.runtime as unknown as {
+        releaseNativeSurface(clearResource: boolean): Promise<boolean>
+      }
+      await expect(internal.releaseNativeSurface(false)).resolves.toBe(false)
+      await harness.runtime.handleSurfaceRect?.({
+        itemId: harness.item.id,
+        x: 300,
+        y: 40,
+        width: 600,
+        height: 500,
+        visible: true,
+      }, harness.item)
+      await harness.runtime.performAction?.('toggle-annotation-mode', harness.item)
+      const modeCallsBeforeMatchingEvent = harness.setAnnotationMode.mock.calls.length
+
+      await harness.runtime.handleNativeSurfaceEvent?.({
+        version: 3,
+        surfaceId: harness.item.id,
+        type: 'blocked-action',
+        detail: {
+          action: 'annotation-picker',
+          code: 'ANNOTATION_REARM_FAILED',
+          surfaceInstanceId: 'surface-instance-current',
+        },
+      }, harness.item)
+
+      expect(harness.setAnnotationMode).toHaveBeenCalledTimes(
+        modeCallsBeforeMatchingEvent + 1,
+      )
+    },
+  )
+
   it('keeps the trusted editor and draft ownership when atomic rearm fails', async () => {
     const harness = await createAnnotationDraftHarness({ ok: true }, true)
     harness.closeOverlay
@@ -615,7 +847,7 @@ describe('artifact Workbench provider', () => {
     expect(harness.releaseOverlayEdit).toHaveBeenCalledOnce()
   })
 
-  it('does not reactivate annotation mode from a late atomic close result after stop', async () => {
+  it('preserves a submitted draft when Stop supersedes an atomic close', async () => {
     const harness = await createAnnotationDraftHarness({ ok: true }, true)
     let finishClose: (() => void) | null = null
     harness.closeOverlay.mockImplementationOnce(async () => {
@@ -641,6 +873,15 @@ describe('artifact Workbench provider', () => {
 
     await harness.runtime.performAction?.('toggle-annotation-mode', harness.item)
     expect(harness.renderState.annotationMode).toBe(false)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel',
+      detail: {
+        annotationId: harness.annotationId,
+        reason: 'picker-cancelled',
+      },
+    }, harness.item)
     const resolveClose: unknown = finishClose
     if (typeof resolveClose !== 'function') throw new Error('atomic close is not pending')
     resolveClose()
@@ -650,10 +891,72 @@ describe('artifact Workbench provider', () => {
     expect(harness.renderState.annotationModeStopping).toBe(false)
     expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
     expect(harness.releaseOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateAnnotation).toHaveBeenCalledOnce()
+    expect(harness.renderState.annotationFallback).toMatchObject({
+      annotationId: harness.annotationId,
+      body: 'Do not resurrect a stopped picker.',
+      reason: 'picker-cancelled',
+    })
     expect(harness.setAnnotationMode.mock.calls.map(([request]) => request.enabled)).toEqual([
       true,
       false,
     ])
+  })
+
+  it('clears discarded ownership when Stop supersedes an atomic cancel', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true)
+    let finishClose: (() => void) | null = null
+    harness.closeOverlay.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        finishClose = resolve
+      })
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+      }
+    })
+    const pendingCancel = harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel',
+      detail: { annotationId: harness.annotationId, reason: 'user-cancelled' },
+    }, harness.item)
+    await vi.waitFor(() => expect(harness.closeOverlay).toHaveBeenCalledOnce())
+
+    await harness.runtime.performAction?.('toggle-annotation-mode', harness.item)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-cancel',
+      detail: { annotationId: harness.annotationId, reason: 'picker-cancelled' },
+    }, harness.item)
+    const resolveClose: unknown = finishClose
+    if (typeof resolveClose !== 'function') throw new Error('atomic close is not pending')
+    resolveClose()
+    await pendingCancel
+
+    expect(harness.discardAnnotation).toHaveBeenCalledOnce()
+    expect(harness.releaseOverlayEdit).toHaveBeenCalledOnce()
+    expect(harness.renderState.annotationFallback).toBeNull()
+    expect(harness.renderState.annotationMode).toBe(false)
+
+    await harness.runtime.performAction?.('toggle-annotation-mode', harness.item)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: harness.item.id,
+      type: 'annotation-selected',
+      detail: {
+        selection: {
+          selectionId: 'selection-after-cancel-stop',
+          tagName: 'button',
+          elementPath: '[["","button",2]]',
+          elementProofSha256: 'e'.repeat(64),
+          rect: { x: 40, y: 2, width: 30, height: 20 },
+        },
+      },
+    }, harness.item)
+    expect(harness.createAnnotation).toHaveBeenCalledTimes(2)
   })
 
   it('does not expose a Desktop native-open diagnostic in the toast', async () => {

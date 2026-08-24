@@ -179,6 +179,16 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
+  /const rearmed = await this\.armAnnotationPicker\([\s\S]*?!rearmed\.ok[\s\S]*?code: 'ANNOTATION_REARM_FAILED'[\s\S]*?surfaceInstanceId: record\.surfaceInstanceId/,
+  'a rejected target must report a stable failure when its one-shot picker cannot rearm',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId \}/,
+  'surface creation must return the exact instance identity used to fence late picker events',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
   /annotationRecordForCleanupRequest\(surfaceId\) \{[\s\S]*?record\.kind === 'artifact-preview'[\s\S]*?isArtifactBridgeProtocolVersion\(record\.version\)[\s\S]*?!record\.disposed/,
   'picker cleanup lookup must remain scoped to an undisposed artifact preview',
 )
