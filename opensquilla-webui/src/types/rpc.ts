@@ -795,6 +795,8 @@ export interface RouterDecisionPayload extends SessionEventPayload {
   source?: string
   routing_applied?: boolean
   decision?: unknown
+  router_tier_snapshot?: unknown
+  routerTierSnapshot?: unknown
 }
 
 /* ── LLM ensemble progress ─────────────────────────────────────────────

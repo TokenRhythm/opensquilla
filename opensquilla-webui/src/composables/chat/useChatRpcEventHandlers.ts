@@ -208,6 +208,8 @@ type ChatDoneUsageFields = {
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
   decision_id?: string
+  route_plan?: Record<string, unknown>
+  routePlan?: Record<string, unknown>
 }
 
 type ChatDoneUsagePayload = SessionDonePayload & ChatDoneUsageFields & {
@@ -1304,6 +1306,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
     if (direct.ensembleTrace != null && usage.ensembleTrace == null) {
       usage.ensembleTrace = direct.ensembleTrace as never
+    }
+    const directRoutePlan = direct.route_plan ?? direct.routePlan
+    if (directRoutePlan != null) {
+      // The terminal event carries the canonical persisted RoutePlan. It must
+      // replace a smaller nested usage receipt so its tier snapshot wins over
+      // both live state and compatibility payloads.
+      usage.route_plan = directRoutePlan as Record<string, unknown>
     }
     for (const key of [
       'coverage_status',

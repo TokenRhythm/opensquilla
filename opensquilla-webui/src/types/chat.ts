@@ -743,6 +743,8 @@ export interface ChatRenderedMessage {
   ensemble?: ChatEnsembleMeta
   gridCells?: ChatRouterCell[]
   winnerIdx?: number
+  /** Authoritative model from the historical routing decision, independent of UI cells. */
+  routerSelectedModel?: string
   parts?: import('./parts').ChatPart[]
   sources?: import('./parts').SourcePart[]
   statusHistory?: import('./parts').StatusPart[]
