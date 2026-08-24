@@ -19,6 +19,13 @@ def _windows_runtime() -> SimpleNamespace:
     )
 
 
+def _noop_runtime() -> SimpleNamespace:
+    return SimpleNamespace(
+        effective=SimpleNamespace(sandbox_enabled=True),
+        backend=SimpleNamespace(name="noop"),
+    )
+
+
 def _configure_approval_queue(
     monkeypatch,
     tmp_path,
@@ -76,6 +83,160 @@ def test_windows_exec_command_uses_shell_host_wrapper(monkeypatch, tmp_path) -> 
     assert argv[4] == "Write-Output ok"
     assert argv[5] == str(tmp_path)
     assert argv[6] == str(tmp_path / ".opensquilla-cache" / "shell-host")
+
+
+def test_windows_noop_uses_direct_powershell(monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows direct PowerShell selection is Windows-only")
+
+    from opensquilla.tools.builtin import shell
+
+    powershell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    command = "python -c \"print('ok')\""
+    monkeypatch.setattr(shell, "_trusted_windows_powershell_path", lambda: powershell_path)
+
+    argv = shell._sandbox_shell_backend_argv(command, _noop_runtime())
+
+    assert argv[:-1] == (
+        powershell_path,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    )
+    assert command in argv[-1]
+    assert "exit $global:LASTEXITCODE" in argv[-1]
+    assert "if (-not $?) { exit 1 }" in argv[-1]
+    assert "Invoke-OpenSquillaPythonProcess" not in argv[-1]
+    assert shell._WINDOWS_SANDBOX_SHELL_HOST_CODE not in argv
+
+
+def test_posix_noop_keeps_sh() -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX noop shell selection is non-Windows-only")
+
+    from opensquilla.tools.builtin import shell
+
+    argv = shell._sandbox_shell_backend_argv("printf ok", _noop_runtime())
+
+    assert argv == ("sh", "-lc", "printf ok")
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_returncode"),
+    [
+        ("Write-Output opensquilla-noop-exit; exit 7", 7),
+        ("cmd.exe /d /c exit 23", 23),
+    ],
+)
+def test_windows_noop_preserves_final_exit_code(
+    command: str,
+    expected_returncode: int,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows direct PowerShell execution is Windows-only")
+
+    from opensquilla.tools.builtin import shell
+
+    completed = subprocess.run(
+        shell._sandbox_shell_backend_argv(command, _noop_runtime()),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == expected_returncode
+
+
+@pytest.mark.asyncio
+async def test_windows_safe_noop_exec_command_runs_without_sh(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows Safe noop execution is Windows-only")
+
+    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import shell
+
+    _configure_approval_queue(monkeypatch, tmp_path, "auto-approve")
+    configure_runtime(
+        SandboxSettings(run_mode="safe", backend="noop"),
+        workspace=tmp_path,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            workspace_dir=str(tmp_path),
+            session_key="windows-safe-noop-foreground",
+            run_mode="safe",
+        )
+    )
+    try:
+        result = await shell.exec_command(
+            "Write-Output opensquilla-noop-foreground; exit 7",
+            workdir=str(tmp_path),
+        )
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+        reset_approval_queue()
+
+    assert "opensquilla-noop-foreground" in result
+    assert "exit_code=7" in result
+
+
+@pytest.mark.asyncio
+async def test_windows_safe_noop_background_process_runs_without_sh(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows Safe noop execution is Windows-only")
+
+    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import shell
+
+    _configure_approval_queue(monkeypatch, tmp_path, "auto-approve")
+    configure_runtime(
+        SandboxSettings(run_mode="safe", backend="noop"),
+        workspace=tmp_path,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            workspace_dir=str(tmp_path),
+            session_key="windows-safe-noop-background",
+            run_mode="safe",
+        )
+    )
+    try:
+        started = await shell.background_process(
+            "Write-Output opensquilla-noop-background; exit 9",
+            workdir=str(tmp_path),
+        )
+        session_id = started.splitlines()[0].split("=", 1)[1]
+        waited = json.loads(await shell.process("wait", session_id=session_id, timeout=10))
+        log = json.loads(await shell.process("log", session_id=session_id))
+    finally:
+        current_tool_context.reset(token)
+        shell._bg_sessions.clear()
+        reset_runtime()
+        reset_approval_queue()
+
+    assert waited["exited"] is True
+    assert waited["session"]["returncode"] == 9
+    assert waited["session"]["timed_out"] is False
+    assert "opensquilla-noop-background" in log["output"]
 
 
 @pytest.mark.asyncio
