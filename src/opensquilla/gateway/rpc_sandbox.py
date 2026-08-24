@@ -880,6 +880,39 @@ async def _handle_sandbox_runtime_remove(params: dict | None, ctx: RpcContext) -
     return {"operation": operation.to_public_dict()}
 
 
+@_d.method("sandbox.runtime.discard_download", scope="operator.admin")
+async def _handle_sandbox_runtime_discard_download(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict:
+    from opensquilla.runtime_packs import (
+        RuntimePackDiscardError,
+        RuntimePackError,
+        RuntimePackUnavailableError,
+        discard_download,
+    )
+
+    _require_owner(ctx, "sandbox.runtime.discard_download")
+    component_id = _runtime_component_param(params)
+    try:
+        status = await asyncio.to_thread(
+            discard_download,
+            component_id,
+            _runtime_state_dir(ctx),
+        )
+    except (RuntimePackDiscardError, RuntimePackUnavailableError) as exc:
+        raise RpcHandlerError(
+            "RUNTIME_DISCARD_FAILED",
+            "Runtime Pack downloaded data could not be removed. Retry after closing running tools.",
+        ) from exc
+    except RuntimePackError as exc:
+        raise RpcHandlerError(
+            "RUNTIME_JOB_CONFLICT",
+            "The Runtime Pack operation changed; refresh its status and try again.",
+        ) from exc
+    return {"status": status.to_public_dict()}
+
+
 @_d.method("sandbox.policy.update", scope="operator.write")
 async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.policy.update")
