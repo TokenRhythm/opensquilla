@@ -555,6 +555,40 @@ describe('useChatSessionBootstrap', () => {
     expect(subscribeSession).toHaveBeenCalledTimes(2)
   })
 
+  it('recovers once when connected wins the disconnect-association race', async () => {
+    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
+    let liveCalls = 0
+    const connectionClosed = new Error('connection closed')
+    const { api, subscribeSession } = createBootstrap({
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveInterrupted = resolve
+          })
+        }
+        if (liveCalls === 2) {
+          return { ...UNAVAILABLE_FOR_TEST, error: connectionClosed }
+        }
+        return LIVE_READY
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
+
+    // RpcClient can emit disconnected while a superseded bootstrap is being
+    // cancelled, before this run becomes active. Its replacement handshake is
+    // still observable, so remember that connected socket while this phase is
+    // settling and recover if both old-generation attempts fail.
+    api.handleConnectionState('connected')
+    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, error: connectionClosed })
+    await run.live
+
+    await vi.waitFor(() => expect(api.livePhase.value).toBe('ready'))
+    expect(subscribeSession).toHaveBeenCalledTimes(3)
+  })
+
   it('does not grant repeated replacement sockets unbounded recovery budgets', async () => {
     let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
     const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)

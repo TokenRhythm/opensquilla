@@ -310,6 +310,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "skill_catalog": request.skill_catalog,
             "usage_execution_context": request.usage_execution_context,
             "provider_request_correlation": request.provider_request_correlation,
+            "router_history_replay_request": request.router_history_replay_request,
         }
         accepted_kwargs = {
             name: value

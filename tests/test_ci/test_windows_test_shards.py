@@ -319,6 +319,21 @@ def _function_decorators(path: Path, function_name: str) -> set[str]:
     raise AssertionError(f"missing test function: {path}:{function_name}")
 
 
+def test_windows_shell_process_runtime_is_marked_ci_serial() -> None:
+    path = Path("tests/test_sandbox/test_windows_shell_process_runtime.py")
+    parsed = ast.parse(path.read_text(encoding="utf-8"))
+
+    assert any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in node.targets
+        )
+        and ast.unparse(node.value) == "pytest.mark.ci_serial"
+        for node in parsed.body
+    )
+
+
 def test_known_process_tree_flakes_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_process_tree.py"),

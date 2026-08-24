@@ -162,6 +162,47 @@ async def test_fork_copies_transcript_and_marks_fork(dispatcher, ctx, manager):
 
 
 @pytest.mark.asyncio
+async def test_fork_preserves_router_snapshot_after_parent_deletion(dispatcher, ctx, manager):
+    await manager.create(PARENT_KEY, agent_id="main")
+    snapshot = {
+        "version": 1,
+        "request_kind": "text",
+        "tiers": [
+            {
+                "tier": "c1",
+                "model": "synthetic/model",
+                "execution_kind": "single_model",
+            }
+        ],
+    }
+    await manager.append_message(PARENT_KEY, "user", "question", token_count=1)
+    await manager.append_message(
+        PARENT_KEY,
+        "assistant",
+        "answer",
+        token_count=1,
+        turn_usage={
+            "route_plan": {
+                "version": 2,
+                "tier": "c1",
+                "model": "synthetic/model",
+                "router_tier_snapshot": snapshot,
+            }
+        },
+    )
+
+    fork_res = await dispatcher.dispatch("r1", "sessions.fork", {"key": PARENT_KEY}, ctx)
+    assert fork_res.ok is True
+    child_key = fork_res.payload["key"]
+    delete_res = await dispatcher.dispatch("r2", "sessions.delete", {"key": PARENT_KEY}, ctx)
+    assert delete_res.ok is True
+
+    child_entries = await manager.get_transcript(child_key)
+    assert child_entries[-1].turn_usage is not None
+    assert child_entries[-1].turn_usage["route_plan"]["router_tier_snapshot"] == snapshot
+
+
+@pytest.mark.asyncio
 async def test_fork_before_message_copies_only_prefix(dispatcher, ctx, manager):
     _first, middle, _final = await _seed_parent_with_markers(manager)
 

@@ -12,6 +12,7 @@ replies are kept — with a positional-trim fallback when no id is supplied.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -21,9 +22,26 @@ from unittest.mock import MagicMock
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.history import (
+    HistoryReplayProjection,
+    project_history_replay_capacity,
+)
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.turn_runner.prompt_assembler_stage import (
+    RouterHistoryReplayRequest,
+)
+from opensquilla.engine.turn_runner.transcript_snapshot import TurnTranscriptSnapshot
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.provider import ChatConfig, DoneEvent, Message, TextDeltaEvent
+from opensquilla.provider import (
+    ChatConfig,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
+    DoneEvent,
+    Message,
+    TextDeltaEvent,
+)
+from opensquilla.provider.request_proof import estimate_provider_media_tokens
+from opensquilla.session.compaction import estimate_entry_model_replay_tokens
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     build_provider_compaction_context,
@@ -129,6 +147,24 @@ def _history_user_texts(messages: list[Message]) -> list[str]:
         for m in messages[:-1]
         if m.role == "user" and isinstance(m.content, str)
     ]
+
+
+def _inline_images(text: str, *payloads: bytes) -> str:
+    return json.dumps(
+        {
+            "text": text,
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": f"image-{index}.png",
+                    "size": len(payload),
+                    "data": base64.b64encode(payload).decode("ascii"),
+                }
+                for index, payload in enumerate(payloads, start=1)
+            ],
+        },
+        separators=(",", ":"),
+    )
 
 
 async def _run_and_capture(
@@ -351,6 +387,578 @@ async def test_router_capacity_does_not_double_count_bound_attachment_across_com
 
 
 @pytest.mark.asyncio
+async def test_router_capacity_projects_inline_images_after_route() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-inline-images"
+    await manager.create(key)
+    payloads = [bytes(range(256)) * 100, bytes(reversed(range(256))) * 100]
+    envelope = _inline_images("inspect both images", *payloads)
+    historical_user = await manager.append_message(key, "user", envelope)
+    await manager.append_message(key, "assistant", "historical answer")
+    current = await manager.append_message(key, "user", "current image turn")
+    entries = await manager.get_transcript(key)
+
+    context = await _new_runner(manager)._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    raw_tokens = estimate_entry_model_replay_tokens(historical_user)
+    media_reserve = sum(
+        estimate_provider_media_tokens("image", len(payload)) for payload in payloads
+    )
+    assert context["history_capacity_estimate_complete"] is True
+    assert context["history_capacity_message_count"] == 2
+    assert media_reserve <= context["history_capacity_estimated_tokens"] < raw_tokens
+
+    text_route_context = await _new_runner(manager)._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=False,
+    )
+    assert text_route_context["history_capacity_estimate_complete"] is True
+    assert text_route_context["history_capacity_estimated_tokens"] >= raw_tokens
+
+    ordinary_json = json.dumps(
+        {
+            "payload": "ordinary application data",
+            "preview_url": (
+                "data:image/png;base64," + base64.b64encode(payloads[0]).decode("ascii")
+            ),
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "data": base64.b64encode(payloads[0]).decode("ascii"),
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    manager._transcripts[key] = [
+        _TranscriptEntry(
+            role="user",
+            content=ordinary_json,
+            message_id="ordinary-json",
+        ),
+        current,
+    ]
+    ordinary_entries = await manager.get_transcript(key)
+    ordinary_context = await _new_runner(manager)._router_history_capacity_context(
+        key,
+        ordinary_entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=1,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+    assert ordinary_context["history_capacity_estimate_complete"] is True
+    assert ordinary_context["history_capacity_estimated_tokens"] >= estimate_tokens(
+        ordinary_json
+    )
+
+
+def test_router_capacity_does_not_discount_tool_argument_data_url() -> None:
+    data_url = "data:image/png;base64," + base64.b64encode(bytes(range(256)) * 80).decode(
+        "ascii"
+    )
+    projection = HistoryReplayProjection(
+        messages=(
+            Message(role="user", content="inspect tool input"),
+            Message(
+                role="assistant",
+                content=[
+                    ContentBlockToolUse(
+                        id="tool-data-url",
+                        name="inspect",
+                        input={"preview_url": data_url},
+                    )
+                ],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(
+                        tool_use_id="tool-data-url",
+                        content="done",
+                    )
+                ],
+            ),
+        )
+    )
+
+    capacity = project_history_replay_capacity(projection)
+
+    assert capacity.estimate_complete is True
+    assert capacity.media_block_count == 0
+    assert capacity.media_reserve_tokens == 0
+    assert capacity.estimated_tokens >= estimate_tokens(data_url)
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_applies_route_history_limit_and_bound_slice() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-route-limit"
+    await manager.create(key)
+    await manager.append_message(key, "user", "first user " + "x" * 8_000)
+    await manager.append_message(key, "assistant", "first answer " + "a" * 8_000)
+    await manager.append_message(key, "user", "second user " + "y" * 4_000)
+    await manager.append_message(key, "assistant", "second answer " + "b" * 4_000)
+    current = await manager.append_message(key, "user", "bound current " + "c" * 40_000)
+    await manager.append_message(key, "user", "queued future " + "q" * 40_000)
+    entries = await manager.get_transcript(key)
+    runner = _new_runner(manager)
+
+    async def project(max_history_turns: int) -> dict[str, Any]:
+        return await runner._router_history_capacity_context(
+            key,
+            entries,
+            exclude_last_user=True,
+            bound_user_message_id=current.message_id,
+            bound_index=4,
+            max_history_turns=max_history_turns,
+            preserve_image_attachments=False,
+        )
+
+    unlimited = await project(0)
+    one_turn = await project(1)
+    two_turns = await project(2)
+
+    assert unlimited["history_capacity_estimate_complete"] is True
+    assert one_turn["history_capacity_estimate_complete"] is True
+    assert two_turns["history_capacity_estimate_complete"] is True
+    assert unlimited["history_capacity_message_count"] == 4
+    assert one_turn["history_capacity_message_count"] == 2
+    assert two_turns["history_capacity_message_count"] == 4
+    assert one_turn["history_capacity_estimated_tokens"] < two_turns[
+        "history_capacity_estimated_tokens"
+    ]
+    assert two_turns["history_capacity_estimated_tokens"] == unlimited[
+        "history_capacity_estimated_tokens"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {
+            "type": "image/png",
+            "name": "broken.png",
+            "data": "this is not valid base64 ***",
+        },
+        {
+            "type": "application/x-unknown",
+            "name": "unknown.bin",
+            "data": base64.b64encode(b"unknown").decode("ascii"),
+        },
+        {
+            "type": "image/png",
+            "name": "missing.png",
+            "size": 1,
+            "sha256_ref": "0" * 64,
+        },
+    ],
+    ids=["invalid-base64", "unknown-mime", "missing-sha256-ref"],
+)
+async def test_router_capacity_invalid_inline_image_fails_closed(
+    attachment: dict[str, Any],
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-invalid-inline"
+    await manager.create(key)
+    invalid = json.dumps(
+        {
+            "text": "broken historical image",
+            "attachments": [attachment],
+        },
+        separators=(",", ":"),
+    )
+    await manager.append_message(key, "user", invalid)
+    await manager.append_message(key, "assistant", "historical answer")
+    current = await manager.append_message(key, "user", "current image turn")
+    entries = await manager.get_transcript(key)
+
+    context = await _new_runner(manager)._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    assert context["history_capacity_estimate_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_only_fails_closed_for_invalid_media_retained_by_route() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-invalid-route-tail"
+    await manager.create(key)
+    invalid = json.dumps(
+        {
+            "text": "broken historical image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": "broken.png",
+                    "data": "this is not valid base64 ***",
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    current = _TranscriptEntry(role="user", content="current", message_id="current")
+    runner = _new_runner(manager)
+
+    async def project(entries: list[_TranscriptEntry]) -> dict[str, Any]:
+        manager._transcripts[key] = entries
+        return await runner._router_history_capacity_context(
+            key,
+            entries,
+            exclude_last_user=True,
+            bound_user_message_id=current.message_id,
+            bound_index=len(entries) - 1,
+            max_history_turns=1,
+            preserve_image_attachments=True,
+        )
+
+    cropped_invalid = await project(
+        [
+            _TranscriptEntry("user", invalid, "old-broken"),
+            _TranscriptEntry("assistant", "old answer", "old-answer"),
+            _TranscriptEntry("user", "recent valid turn", "recent-valid"),
+            _TranscriptEntry("assistant", "recent answer", "recent-answer"),
+            current,
+        ]
+    )
+    retained_invalid = await project(
+        [
+            _TranscriptEntry("user", "old valid turn", "old-valid"),
+            _TranscriptEntry("assistant", "old answer", "old-answer"),
+            _TranscriptEntry("user", invalid, "recent-broken"),
+            _TranscriptEntry("assistant", "recent answer", "recent-answer"),
+            current,
+        ]
+    )
+
+    assert cropped_invalid["history_capacity_message_count"] == 2
+    assert cropped_invalid["history_capacity_estimate_complete"] is True
+    assert retained_invalid["history_capacity_message_count"] == 2
+    assert retained_invalid["history_capacity_estimate_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_accepts_retained_missing_reason_marker() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-missing-reason"
+    await manager.create(key)
+    missing = json.dumps(
+        {
+            "text": "inspect the unavailable image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": "lost.png",
+                    "missing_reason": "attachment persistence disabled",
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    await manager.append_message(key, "user", missing)
+    await manager.append_message(key, "assistant", "historical answer")
+    current = await manager.append_message(key, "user", "current image turn")
+    entries = await manager.get_transcript(key)
+    runner = _new_runner(manager)
+
+    replay = runner._project_history_replay(
+        entries,
+        excluded_entry_indexes={2},
+        trim_last_user=True,
+        bound_slice_applied=True,
+        image_replay_entry_indexes={0},
+        media_root=runner._attachment_media_root(),
+        session_id=key,
+        require_capacity_proof=True,
+    )
+    context = await runner._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    marker = "[historical attachment omitted: lost.png (image/png)]"
+    marker_count = sum(
+        message.content.count(marker)
+        for message in replay.messages
+        if isinstance(message.content, str)
+    )
+    assert marker_count == 1
+    assert replay.estimate_complete is True
+    assert context["history_capacity_message_count"] == 2
+    assert context["history_capacity_estimate_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_preserves_plain_token_floor_but_clears_inline_media_floor() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-token-floor"
+    await manager.create(key)
+    current = _TranscriptEntry(role="user", content="current", message_id="current")
+    runner = _new_runner(manager)
+    high_floor = 50_000
+
+    async def project(historical: _TranscriptEntry) -> dict[str, Any]:
+        entries = [
+            historical,
+            _TranscriptEntry("assistant", "short answer", f"{historical.message_id}-answer"),
+            current,
+        ]
+        manager._transcripts[key] = entries
+        return await runner._router_history_capacity_context(
+            key,
+            entries,
+            exclude_last_user=True,
+            bound_user_message_id=current.message_id,
+            bound_index=2,
+            max_history_turns=1,
+            preserve_image_attachments=True,
+        )
+
+    plain = await project(
+        _TranscriptEntry(
+            "user",
+            "small ordinary history row",
+            "plain",
+            token_count=high_floor,
+        )
+    )
+    inline_envelope = _inline_images(
+        "image history row",
+        bytes(range(256)) * 120,
+    )
+    inline_raw_floor = estimate_tokens(inline_envelope)
+    inline_media = await project(
+        _TranscriptEntry(
+            "user",
+            inline_envelope,
+            "inline-media",
+            token_count=inline_raw_floor,
+        )
+    )
+
+    assert plain["history_capacity_estimated_tokens"] >= high_floor
+    assert inline_media["history_capacity_estimate_complete"] is True
+    assert inline_media["history_capacity_estimated_tokens"] < inline_raw_floor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_raw_floor", [False, True])
+async def test_router_capacity_mixed_envelope_discounts_only_typed_image_data(
+    persist_raw_floor: bool,
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-mixed-image-document"
+    await manager.create(key)
+    image_data = base64.b64encode(bytes(range(256)) * 120).decode("ascii")
+    document_data = base64.b64encode(bytes(reversed(range(256))) * 80).decode("ascii")
+    envelope = json.dumps(
+        {
+            "text": "inspect the image and document",
+            "attachments": [
+                {"type": "image/png", "name": "image.png", "data": image_data},
+                {"type": "application/pdf", "name": "document.pdf", "data": document_data},
+            ],
+        },
+        separators=(",", ":"),
+    )
+    raw_floor = estimate_tokens(envelope)
+    historical = _TranscriptEntry(
+        "user",
+        envelope,
+        "mixed-history",
+        token_count=raw_floor if persist_raw_floor else None,
+    )
+    answer = _TranscriptEntry("assistant", "answer", "mixed-answer")
+    current = _TranscriptEntry("user", "current", "current")
+    entries = [historical, answer, current]
+    manager._transcripts[key] = entries
+
+    context = await _new_runner(manager)._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    # The image data becomes a typed media block, while the PDF base64 remains
+    # in the conservative residual token floor for this mixed row.
+    residual_envelope = envelope.replace(
+        json.dumps(image_data),
+        json.dumps(f"[history_image_omitted: {len(image_data)} chars]"),
+    )
+    expected_image_reserve = estimate_provider_media_tokens(
+        "image",
+        len(base64.b64decode(image_data, validate=True)),
+    )
+    assert context["history_capacity_estimate_complete"] is True
+    assert (
+        estimate_tokens(residual_envelope) + expected_image_reserve
+        <= context["history_capacity_estimated_tokens"]
+    )
+    assert context["history_capacity_estimated_tokens"] < raw_floor
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_projection_exception_fails_closed_at_request_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-projection-error"
+    await manager.create(key)
+    current = await manager.append_message(key, "user", "current")
+    runner = _new_runner(manager)
+
+    async def fail_projection(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("synthetic projection failure with private content")
+
+    monkeypatch.setattr(runner, "_router_history_capacity_context", fail_projection)
+    context = await runner._router_history_capacity_for_request(
+        key,
+        RouterHistoryReplayRequest(
+            exclude_last_user=True,
+            bound_user_message_id=current.message_id,
+        ),
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    assert context == {"history_capacity_estimate_complete": False}
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_request_resolves_bound_and_queued_users_from_snapshot() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-request-snapshot"
+    await manager.create(key)
+    prior_user = _TranscriptEntry("user", "prior user", "prior-user")
+    prior_answer = _TranscriptEntry("assistant", "prior answer", "prior-answer")
+    bound = _TranscriptEntry("user", "bound current " + "b" * 20_000, "bound")
+    queued = _TranscriptEntry("user", "queued future " + "q" * 20_000, "queued")
+
+    async def load_snapshot() -> list[_TranscriptEntry]:
+        return [prior_user, prior_answer, bound, queued]
+
+    snapshot = TurnTranscriptSnapshot(load_snapshot)
+    context = await _new_runner(manager)._router_history_capacity_for_request(
+        key,
+        RouterHistoryReplayRequest(
+            exclude_last_user=True,
+            bound_user_message_id=bound.message_id,
+            transcript_snapshot=snapshot,
+        ),
+        max_history_turns=1,
+        preserve_image_attachments=False,
+        reachable_provider_kinds={"tokenrhythm"},
+    )
+
+    assert snapshot.load_count == 1
+    assert context["history_capacity_estimate_complete"] is True
+    assert context["history_capacity_message_count"] == 2
+    assert context["history_capacity_estimated_tokens"] < estimate_tokens(bound.content)
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_request_snapshot_read_failure_is_incomplete() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-request-snapshot-failure"
+    await manager.create(key)
+
+    async def fail_snapshot() -> list[_TranscriptEntry]:
+        raise RuntimeError("private transcript read failure")
+
+    context = await _new_runner(manager)._router_history_capacity_for_request(
+        key,
+        RouterHistoryReplayRequest(
+            exclude_last_user=True,
+            transcript_snapshot=TurnTranscriptSnapshot(fail_snapshot),
+        ),
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    assert context == {"history_capacity_estimate_complete": False}
+
+
+def test_router_capacity_route_tail_repairs_tool_pairing() -> None:
+    projection = HistoryReplayProjection(
+        messages=(
+            Message(role="user", content="old turn"),
+            Message(
+                role="assistant",
+                content=[ContentBlockToolUse(id="old", name="lookup", input={})],
+            ),
+            Message(role="user", content="retained turn"),
+            Message(
+                role="user",
+                content=[ContentBlockToolResult(tool_use_id="old", content="old result")],
+            ),
+            Message(
+                role="assistant",
+                content=[ContentBlockToolUse(id="retained", name="lookup", input={})],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(
+                        tool_use_id="retained",
+                        content="retained result",
+                    )
+                ],
+            ),
+        )
+    )
+
+    capacity = project_history_replay_capacity(projection, max_history_turns=1)
+    use_ids = {
+        block.id
+        for message in capacity.messages
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolUse)
+    }
+    result_ids = {
+        block.tool_use_id
+        for message in capacity.messages
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolResult)
+    }
+
+    assert capacity.message_count == 3
+    assert use_ids == result_ids == {"retained"}
+
+
+@pytest.mark.asyncio
 async def test_router_capacity_adds_native_state_and_uncovered_portable_summary() -> None:
     manager = _FakeSessionManager()
     key = "agent:main:router-capacity-mixed-compaction"
@@ -407,6 +1015,101 @@ async def test_router_capacity_adds_native_state_and_uncovered_portable_summary(
     ) + estimate_tokens(rendered_residual)
     assert context["history_capacity_estimated_tokens"] == expected
     assert context["history_capacity_message_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_limits_native_state_with_combined_provider_replay() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-native-route-tail"
+    node = await manager.create(key)
+    await manager.append_message(key, "user", "old user " + "u" * 8_000)
+    await manager.append_message(key, "assistant", "old answer " + "a" * 8_000)
+    await manager.append_message(key, "user", "recent user")
+    await manager.append_message(key, "assistant", "recent answer")
+    current = await manager.append_message(key, "user", "current")
+    entries = await manager.get_transcript(key)
+    runner = _new_runner(manager)
+
+    without_native = await runner._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=4,
+        max_history_turns=1,
+    )
+    manager._context_states[key] = [
+        SessionContextState(
+            session_id=node.session_id,
+            session_key=key,
+            provider="anthropic",
+            model="synthetic-model",
+            state_kind="anthropic_compaction_block",
+            payload={"content": "native checkpoint " + "n" * 20_000},
+            covered_through_id=2,
+            portable=False,
+            cacheable=True,
+        )
+    ]
+
+    with_native = await runner._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=4,
+        max_history_turns=1,
+    )
+
+    # _load_history prepends native state before Agent.limit_turns. The older
+    # native assistant checkpoint is therefore cropped together with the old
+    # transcript turn and must not be added back by Router admission.
+    assert with_native == without_native
+    assert with_native["history_capacity_message_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_ignores_unreachable_provider_native_state() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-unreachable-native"
+    node = await manager.create(key)
+    await manager.append_message(key, "user", "history")
+    await manager.append_message(key, "assistant", "answer")
+    current = await manager.append_message(key, "user", "current")
+    entries = await manager.get_transcript(key)
+    manager._context_states[key] = [
+        SessionContextState(
+            session_id=node.session_id,
+            session_key=key,
+            provider="anthropic",
+            model="synthetic-model",
+            state_kind="anthropic_compaction_block",
+            payload={"content": "stale native checkpoint " + "n" * 20_000},
+            covered_through_id=0,
+            portable=False,
+            cacheable=True,
+        )
+    ]
+    runner = _new_runner(manager)
+
+    async def project(reachable: set[str]) -> dict[str, Any]:
+        return await runner._router_history_capacity_context(
+            key,
+            entries,
+            exclude_last_user=True,
+            bound_user_message_id=current.message_id,
+            bound_index=2,
+            reachable_provider_kinds=reachable,
+        )
+
+    tokenrhythm_view = await project({"tokenrhythm"})
+    anthropic_view = await project({"anthropic"})
+
+    assert tokenrhythm_view["history_capacity_message_count"] == 2
+    assert anthropic_view["history_capacity_message_count"] == 3
+    assert anthropic_view["history_capacity_estimated_tokens"] > tokenrhythm_view[
+        "history_capacity_estimated_tokens"
+    ]
 
 
 @pytest.mark.asyncio

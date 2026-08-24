@@ -880,6 +880,222 @@ describe('useChatRenderedMessages immutable route history', () => {
     expect(winner?.model).toBe('provider/original-model')
     expect(strip?.routerSource).toBe('classifier')
   })
+
+  it('restores the frozen candidate pool and lets the historical winner override it', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Historical question', ts: 1, turnId: 'turn-snapshot' },
+        {
+          role: 'assistant',
+          text: 'Historical answer',
+          ts: 2,
+          turnId: 'turn-snapshot',
+          restoredFromHistory: true,
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'historical/winner',
+            routing_source: 'classifier',
+            route_plan: {
+              version: 2,
+              tier: 'c1',
+              model: 'historical/winner',
+              source: 'classifier',
+              router_tier_snapshot: {
+                version: 1,
+                request_kind: 'text',
+                tiers: [
+                  { tier: 'c0', model: 'historical/fast', execution_kind: 'single_model' },
+                  { tier: 'c1', model: 'stale/conflict', execution_kind: 'ensemble' },
+                ],
+              },
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:snapshot'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'current/fast', supportsImage: false, imageOnly: false },
+        c1: { model: 'current/balanced', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual([
+      'historical/fast',
+      'historical/winner',
+    ])
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]).toMatchObject({
+      model: 'historical/winner',
+      executionKind: 'ensemble',
+    })
+    expect(strip?.routerSelectedModel).toBe('historical/winner')
+  })
+
+  it('rejects a damaged snapshot atomically and rebuilds with the historical winner', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Old question', ts: 1, turnId: 'turn-damaged' },
+        {
+          role: 'assistant',
+          text: 'Old answer',
+          ts: 2,
+          turnId: 'turn-damaged',
+          restoredFromHistory: true,
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'historical/winner',
+            routing_source: 'classifier',
+            route_plan: {
+              version: 2,
+              tier: 'c2',
+              model: 'historical/winner',
+              source: 'classifier',
+              router_tier_snapshot: {
+                version: 1,
+                request_kind: 'text',
+                tiers: [
+                  { tier: 'c0', model: 'damaged/one', execution_kind: 'single_model' },
+                  { tier: 't0', model: 'damaged/two', execution_kind: 'single_model' },
+                ],
+              },
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:damaged-snapshot'),
+      routerSlots: ref(['c0']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'current/fast', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'current/fast' }),
+      expect.objectContaining({ model: 'historical/winner', tiers: ['c2'] }),
+    ]))
+    expect(strip?.gridCells?.some(cell => cell.model?.startsWith('damaged/'))).toBe(false)
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('historical/winner')
+  })
+
+  it('shows only the historical winner when an old turn has no usable current pool', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Old question', ts: 1, turnId: 'turn-winner-only' },
+        {
+          role: 'assistant',
+          text: 'Old answer',
+          ts: 2,
+          turnId: 'turn-winner-only',
+          restoredFromHistory: true,
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'historical/only-winner',
+            routing_source: 'classifier',
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:winner-only'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells).toEqual([
+      expect.objectContaining({
+        tiers: ['c2'],
+        model: 'historical/only-winner',
+      }),
+    ])
+    expect(strip?.winnerIdx).toBe(0)
+  })
+
+  it('retains a valid live snapshot when an older done event omits it', () => {
+    const liveSnapshot = {
+      version: 1,
+      request_kind: 'text',
+      tiers: [
+        { tier: 'c0', model: 'frozen/fast', execution_kind: 'single_model' },
+        { tier: 'c1', model: 'frozen/winner', execution_kind: 'single_model' },
+      ],
+    }
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Live question', ts: 1, turnId: 'turn-live' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-live',
+          messageId: 'router-live',
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c1',
+            model: 'frozen/winner',
+            source: 'classifier',
+            router_tier_snapshot: liveSnapshot,
+          },
+        },
+        {
+          role: 'assistant',
+          text: 'Done',
+          ts: 3,
+          turnId: 'turn-live',
+          messageId: 'assistant-live',
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'frozen/winner',
+            routing_source: 'classifier',
+            route_plan: {
+              version: 1,
+              tier: 'c1',
+              model: 'frozen/winner',
+              source: 'classifier',
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:live-snapshot'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'current/fast', supportsImage: false, imageOnly: false },
+        c1: { model: 'current/balanced', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual(['frozen/fast', 'frozen/winner'])
+    expect(strip?.routerSettled).toBe(true)
+  })
 })
 
 describe('useChatRenderedMessages router visual mode', () => {
