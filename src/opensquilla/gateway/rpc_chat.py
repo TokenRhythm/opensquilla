@@ -118,6 +118,7 @@ _TURN_USAGE_PROJECTION_ALIASES = {
 _HISTORY_STRUCTURAL_RECEIPT_FIELDS = (
     ("model_usage_breakdown", "modelUsageBreakdown"),
     ("ensemble_trace", "ensembleTrace"),
+    ("route_plan", "routePlan"),
 )
 
 
@@ -132,6 +133,40 @@ def _history_structural_richness(value: object) -> tuple[int, int]:
     if isinstance(value, str):
         return (1, len(value)) if value.strip() else (0, 0)
     return (1, 0) if value is not None else (0, 0)
+
+
+def _history_route_plan_has_complete_snapshot(value: object) -> bool:
+    """Whether a route-plan candidate carries a minimally complete v1 snapshot."""
+
+    if not isinstance(value, Mapping):
+        return False
+    snapshot = value.get("router_tier_snapshot", value.get("routerTierSnapshot"))
+    if not isinstance(snapshot, Mapping):
+        return False
+    if snapshot.get("version") != 1 or snapshot.get("request_kind") not in {
+        "text",
+        "image",
+    }:
+        return False
+    tiers = snapshot.get("tiers")
+    if not isinstance(tiers, list) or not tiers:
+        return False
+    seen: set[str] = set()
+    for entry in tiers:
+        if not isinstance(entry, Mapping):
+            return False
+        tier = str(entry.get("tier") or "").strip().lower()
+        model = str(entry.get("model") or "").strip()
+        execution_kind = entry.get("execution_kind")
+        if (
+            not tier
+            or tier in seen
+            or not model
+            or execution_kind not in {"single_model", "ensemble"}
+        ):
+            return False
+        seen.add(tier)
+    return True
 
 
 def _clear_history_usage_for_indexes(
@@ -904,9 +939,21 @@ async def _project_missing_history_usage(
             if not candidates:
                 continue
             richest = candidates[0]
-            richest_score = _history_structural_richness(richest)
+            richest_score = (
+                int(
+                    snake_key == "route_plan"
+                    and _history_route_plan_has_complete_snapshot(richest)
+                ),
+                *_history_structural_richness(richest),
+            )
             for candidate in candidates[1:]:
-                candidate_score = _history_structural_richness(candidate)
+                candidate_score = (
+                    int(
+                        snake_key == "route_plan"
+                        and _history_route_plan_has_complete_snapshot(candidate)
+                    ),
+                    *_history_structural_richness(candidate),
+                )
                 if candidate_score > richest_score:
                     richest = candidate
                     richest_score = candidate_score

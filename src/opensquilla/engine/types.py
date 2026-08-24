@@ -438,6 +438,9 @@ class RouterDecisionEvent:
     routing_applied: bool = True
     rollout_phase: str = "full"
     context_window: int | None = None
+    # Display-safe, versioned candidate pool from the immutable RoutePlan.
+    # Appended for positional-construction and older consumer compatibility.
+    router_tier_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
