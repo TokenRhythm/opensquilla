@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session.html_anchors import ElementProofV2
 from opensquilla.gateway import desktop_artifact_bridge as bridge_module
 from opensquilla.gateway.desktop_artifact_bridge import (
     DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV,
@@ -406,6 +407,7 @@ async def test_capabilities_uses_authenticated_fixed_endpoint(
     assert capabilities.screenshot is True
     assert capabilities.office_flush is False
     assert capabilities.reload_surface is True
+    assert capabilities.annotation_proof_v2 is False
     request = calls[1]
     assert request["method"] == "POST"
     assert request["path"] == "/v1/capabilities"
@@ -416,12 +418,46 @@ async def test_capabilities_uses_authenticated_fixed_endpoint(
 
 
 @pytest.mark.asyncio
+async def test_capabilities_accepts_optional_annotation_proof_v2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "value": {
+                "version": 5,
+                "available": True,
+                "captureSelection": True,
+                "resolveAnnotationSelection": True,
+                "focusAnnotation": True,
+                "browserInspect": True,
+                "browserAct": True,
+                "screenshot": True,
+                "officeFlush": True,
+                "reloadSurface": True,
+                "annotationProofV2": True,
+            },
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:1234", token=_token())
+
+    capabilities = await client.capabilities()
+
+    assert capabilities.annotation_proof_v2 is True
+
+
+@pytest.mark.asyncio
 async def test_resolve_annotation_selection_is_typed_and_requires_exact_echo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     active_preview_artifact_id = "art-bridge-fixture"
     digest = "a" * 64
     element_proof = "c" * 64
+    proof_v2 = ElementProofV2(
+        stable_element_proof_sha256="d" * 64,
+        ancestor_class_commitments=("1" * 64, "2" * 64),
+    )
     element_path = json.dumps(
         [["", "html", 1], ["", "body", 1], ["", "button", 2]],
         separators=(",", ":"),
@@ -438,6 +474,10 @@ async def test_resolve_annotation_selection_is_typed_and_requires_exact_echo(
                 "elementPath": element_path,
                 "domSha256": digest,
                 "elementProofSha256": element_proof,
+                "annotationProofV2": {
+                    "stableElementProofSha256": proof_v2.stable_element_proof_sha256,
+                    "ancestorClassCommitments": list(proof_v2.ancestor_class_commitments),
+                },
                 "scopeId": "agent:fixture:webchat:fixture",
                 "rect": {"x": 10, "y": 20, "width": 80, "height": 24},
             },
@@ -460,6 +500,7 @@ async def test_resolve_annotation_selection_is_typed_and_requires_exact_echo(
     assert resolved.element_path == element_path
     assert resolved.dom_sha256 == digest
     assert resolved.element_proof_sha256 == element_proof
+    assert resolved.annotation_proof_v2 == proof_v2
     assert resolved.scope_id == "agent:fixture:webchat:fixture"
     request = json.loads(calls[1]["body"])
     assert request == {
@@ -559,6 +600,106 @@ async def test_resolve_annotation_selection_is_typed_and_requires_exact_echo(
             element_proof_sha256="not-a-proof",
         )
     assert mismatched_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "proof_v2",
+    [
+        {"stableElementProofSha256": "d" * 64},
+        {
+            "stableElementProofSha256": "d" * 64,
+            "ancestorClassCommitments": ["2" * 64, "1" * 64],
+        },
+        {
+            "stableElementProofSha256": "d" * 64,
+            "ancestorClassCommitments": ["1" * 64, "1" * 64],
+        },
+        {
+            "stableElementProofSha256": "d" * 64,
+            "ancestorClassCommitments": ["1" * 64] * 257,
+        },
+        {
+            "stableElementProofSha256": "not-a-digest",
+            "ancestorClassCommitments": [],
+        },
+    ],
+)
+async def test_resolve_annotation_selection_rejects_partial_or_unbounded_proof_v2(
+    monkeypatch: pytest.MonkeyPatch,
+    proof_v2: dict[str, object],
+) -> None:
+    artifact_id = "art-proof-v2-malformed"
+    element_path = json.dumps(
+        [["", "html", 1], ["", "body", 1], ["", "button", 1]],
+        separators=(",", ":"),
+    )
+    _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "method": "resolveAnnotationSelection",
+            "value": {
+                "activePreviewArtifactId": artifact_id,
+                "selectionId": "selection-proof-v2",
+                "tagName": "button",
+                "elementPath": element_path,
+                "elementProofSha256": "a" * 64,
+                "annotationProofV2": proof_v2,
+                "scopeId": "agent:fixture:webchat:fixture",
+                "rect": {"x": 1, "y": 2, "width": 3, "height": 4},
+            },
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    with pytest.raises(DesktopArtifactBridgeError, match="proof-v2"):
+        await client.resolve_annotation_selection(
+            active_preview_artifact_id=artifact_id,
+            selection_id="selection-proof-v2",
+            tag_name="button",
+            element_path=element_path,
+            element_proof_sha256="a" * 64,
+        )
+
+
+@pytest.mark.asyncio
+async def test_focus_annotation_sends_proof_v2_only_when_supplied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_id = "art-focus-proof-v2"
+    element_path = json.dumps(
+        [["", "html", 1], ["", "body", 1], ["", "section", 1]],
+        separators=(",", ":"),
+    )
+    proof_v2 = ElementProofV2(
+        stable_element_proof_sha256="d" * 64,
+        ancestor_class_commitments=("1" * 64,),
+    )
+    calls = _install_response(
+        monkeypatch,
+        {
+            "ok": True,
+            "method": "focusAnnotation",
+            "value": {"focused": True, "activePreviewArtifactId": artifact_id},
+        },
+    )
+    client = DesktopArtifactBridgeClient(endpoint="http://127.0.0.1:4321", token=_token())
+
+    assert await client.focus_annotation(
+        active_preview_artifact_id=artifact_id,
+        annotation_id="annotation-proof-v2",
+        scope_id="agent:fixture:webchat:fixture",
+        tag_name="section",
+        element_path=element_path,
+        element_proof_sha256="a" * 64,
+        annotation_proof_v2=proof_v2,
+    )
+    request = json.loads(calls[1]["body"])["request"]
+    assert request["annotationProofV2"] == {
+        "stableElementProofSha256": "d" * 64,
+        "ancestorClassCommitments": ["1" * 64],
+    }
 
 
 @pytest.mark.asyncio

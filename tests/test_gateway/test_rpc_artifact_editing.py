@@ -24,9 +24,11 @@ from opensquilla.artifact_session import (
     MutationAttemptStatus,
 )
 from opensquilla.artifact_session.html_anchors import (
+    ElementProofV2,
     canonical_browser_dom_digest,
     canonical_element_at_path,
     canonical_element_proof_sha256,
+    canonical_selection_proof_v2,
 )
 from opensquilla.artifacts import (
     ArtifactBundle,
@@ -128,6 +130,10 @@ def _annotation_proofs(html: str, element_path: str) -> tuple[str, str]:
         selected=selected,
     )
     return dom_sha256, element_proof_sha256
+
+
+def _annotation_proof_v2(html: str, element_path: str) -> ElementProofV2 | None:
+    return canonical_selection_proof_v2(html, element_path=element_path)
 
 
 async def _annotation_row_counts(env) -> tuple[int, int, int]:
@@ -287,8 +293,18 @@ async def test_prompt_annotation_create_replay_does_not_reuse_native_candidate(
 
 
 class _EchoAnnotationBridge:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        annotation_proof_v2: ElementProofV2 | None = None,
+        proof_v2_capable: bool = False,
+    ) -> None:
         self.resolve_calls: list[dict[str, object]] = []
+        self.annotation_proof_v2 = annotation_proof_v2
+        self.proof_v2_capable = proof_v2_capable
+
+    async def capabilities(self, **_kwargs):
+        return SimpleNamespace(annotation_proof_v2=self.proof_v2_capable)
 
     async def resolve_annotation_selection(self, **kwargs):
         self.resolve_calls.append(kwargs)
@@ -300,6 +316,7 @@ class _EchoAnnotationBridge:
             dom_sha256=kwargs["dom_sha256"],
             element_proof_sha256=kwargs["element_proof_sha256"],
             scope_id=SESSION_KEY,
+            annotation_proof_v2=self.annotation_proof_v2,
         )
 
 
@@ -553,6 +570,286 @@ async def test_prompt_annotation_accepts_unrelated_runtime_dom_mutation(
     assert anchor_context["semantic_profile_v1"]["normalized_text"] == "Title"
     assert "dom_sha256" not in anchor_context
     assert await _annotation_row_counts(env) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_html",
+    [
+        (
+            '<main class="shell base ready" id="app" data-state="source" '
+            'style="color:red"><section class="card reveal visible" data-zone="hero">'
+            '<span class="leaf" style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="base shell" id="app" data-state="source" style="color:red">'
+            '<section class="reveal card" data-zone="hero">'
+            '<span class="leaf" style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base shell" id="app" data-state="source" '
+            'style="color:red"><section class="card reveal reveal" data-zone="hero">'
+            '<span class="leaf" style="opacity:1">Leaf</span></section></main>'
+        ),
+    ],
+    ids=("add", "reorder", "duplicates"),
+)
+async def test_prompt_annotation_v2_accepts_additive_ancestor_class_mutations(
+    artifact_editing_env,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_html: str,
+) -> None:
+    env = artifact_editing_env
+    source_html = (
+        '<main class="shell base" id="app" data-state="source" style="color:red">'
+        '<section class="card reveal" data-zone="hero">'
+        '<span class="leaf" style="opacity:1">Leaf</span></section></main>'
+    )
+    _ref, document = await _adopt_html(env, source_html.encode())
+    element_path = json.dumps(
+        [
+            ["", "html", 1],
+            ["", "body", 1],
+            ["", "main", 1],
+            ["", "section", 1],
+            ["", "span", 1],
+        ],
+        separators=(",", ":"),
+    )
+    runtime_dom_sha256, runtime_v1 = _annotation_proofs(runtime_html, element_path)
+    source_v1 = _annotation_proofs(source_html, element_path)[1]
+    runtime_v2 = _annotation_proof_v2(runtime_html, element_path)
+    assert source_v1 != runtime_v1
+    assert runtime_v2 is not None
+
+    bridge = _EchoAnnotationBridge(
+        annotation_proof_v2=runtime_v2,
+        proof_v2_capable=True,
+    )
+    monkeypatch.setattr(
+        artifact_editing_rpc,
+        "get_desktop_artifact_bridge_client",
+        lambda: bridge,
+    )
+    params = {
+        "annotationId": "annotation-v2-accepted",
+        "sessionKey": SESSION_KEY,
+        "documentId": document["id"],
+        "revisionId": document["headRevisionId"],
+        "selection": {
+            "selectionId": "selection-v2-accepted",
+            "tagName": "span",
+            "elementPath": element_path,
+            "domSha256": runtime_dom_sha256,
+            "elementProofSha256": runtime_v1,
+        },
+        "body": "Update the leaf.",
+    }
+    created = await _dispatch(env, "artifacts.prompt_annotations.create", params)
+
+    assert created.error is None, created.error
+    context = created.payload["annotation"]["anchor"]["context"]
+    assert context["element_proof_sha256"] == source_v1
+    assert context["selection_element_proof_sha256"] == runtime_v1
+    assert not any("commitment" in key for key in context)
+    assert await _annotation_row_counts(env) == (1, 1, 1)
+
+    # Lost-response recovery uses the exact selected v1 proof stored in the
+    # anchor context and never asks Desktop to consume the candidate twice.
+    monkeypatch.setattr(
+        artifact_editing_rpc,
+        "get_desktop_artifact_bridge_client",
+        lambda: object(),
+    )
+    replayed = await _dispatch(env, "artifacts.prompt_annotations.create", params)
+    assert replayed.error is None, replayed.error
+    assert replayed.payload == created.payload
+    assert len(bridge.resolve_calls) == 1
+    assert await _annotation_row_counts(env) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_html",
+    [
+        (
+            '<main class="shell" id="app" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf" '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell other" id="app" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf" '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base" id="changed" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf" '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="changed" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf" '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:blue">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf" '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf changed" '
+            'style="opacity:1">Leaf</span></section></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            '<section class="card reveal" data-zone="hero"><span class="leaf" '
+            'style="opacity:.5">Leaf</span></section></main>'
+        ),
+    ],
+    ids=(
+        "remove-class",
+        "replace-class",
+        "ancestor-id",
+        "ancestor-data",
+        "ancestor-style",
+        "selected-class",
+        "selected-style",
+    ),
+)
+async def test_prompt_annotation_v2_rejects_non_additive_identity_changes_without_writes(
+    artifact_editing_env,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_html: str,
+) -> None:
+    env = artifact_editing_env
+    source_html = (
+        '<main class="shell base" id="app" data-state="source" style="color:red">'
+        '<section class="card reveal" data-zone="hero">'
+        '<span class="leaf" style="opacity:1">Leaf</span></section></main>'
+    )
+    _ref, document = await _adopt_html(env, source_html.encode())
+    element_path = json.dumps(
+        [
+            ["", "html", 1],
+            ["", "body", 1],
+            ["", "main", 1],
+            ["", "section", 1],
+            ["", "span", 1],
+        ],
+        separators=(",", ":"),
+    )
+    runtime_dom_sha256, runtime_v1 = _annotation_proofs(runtime_html, element_path)
+    runtime_v2 = _annotation_proof_v2(runtime_html, element_path)
+    assert runtime_v2 is not None
+    bridge = _EchoAnnotationBridge(
+        annotation_proof_v2=runtime_v2,
+        proof_v2_capable=True,
+    )
+    monkeypatch.setattr(
+        artifact_editing_rpc,
+        "get_desktop_artifact_bridge_client",
+        lambda: bridge,
+    )
+
+    rejected = await _dispatch(
+        env,
+        "artifacts.prompt_annotations.create",
+        {
+            "annotationId": "annotation-v2-rejected",
+            "sessionKey": SESSION_KEY,
+            "documentId": document["id"],
+            "revisionId": document["headRevisionId"],
+            "selection": {
+                "selectionId": "selection-v2-rejected",
+                "tagName": "span",
+                "elementPath": element_path,
+                "domSha256": runtime_dom_sha256,
+                "elementProofSha256": runtime_v1,
+            },
+            "body": "This must not persist.",
+        },
+    )
+
+    assert rejected.error is not None
+    assert rejected.error.code == "DOCUMENT_CHANGED"
+    assert len(bridge.resolve_calls) == 1
+    assert await _annotation_row_counts(env) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotation_v2_requires_capability_and_complete_bounded_evidence(
+    artifact_editing_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = artifact_editing_env
+    source_html = '<main class="shell base"><span id="leaf">Leaf</span></main>'
+    runtime_html = '<main class="shell base visible"><span id="leaf">Leaf</span></main>'
+    _ref, document = await _adopt_html(env, source_html.encode())
+    element_path = json.dumps(
+        [["", "html", 1], ["", "body", 1], ["", "main", 1], ["", "span", 1]],
+        separators=(",", ":"),
+    )
+    runtime_dom_sha256, runtime_v1 = _annotation_proofs(runtime_html, element_path)
+    runtime_v2 = _annotation_proof_v2(runtime_html, element_path)
+    assert runtime_v2 is not None
+    params = {
+        "annotationId": "annotation-v2-no-capability",
+        "sessionKey": SESSION_KEY,
+        "documentId": document["id"],
+        "revisionId": document["headRevisionId"],
+        "selection": {
+            "selectionId": "selection-v2-no-capability",
+            "tagName": "span",
+            "elementPath": element_path,
+            "domSha256": runtime_dom_sha256,
+            "elementProofSha256": runtime_v1,
+        },
+        "body": "No capability means strict v1.",
+    }
+
+    bridge = _EchoAnnotationBridge(
+        annotation_proof_v2=runtime_v2,
+        proof_v2_capable=False,
+    )
+    monkeypatch.setattr(
+        artifact_editing_rpc,
+        "get_desktop_artifact_bridge_client",
+        lambda: bridge,
+    )
+    no_capability = await _dispatch(env, "artifacts.prompt_annotations.create", params)
+    assert no_capability.error is not None
+    assert no_capability.error.code == "DOCUMENT_CHANGED"
+    assert await _annotation_row_counts(env) == (0, 0, 0)
+
+    bridge = _EchoAnnotationBridge(
+        annotation_proof_v2=SimpleNamespace(
+            stable_element_proof_sha256=runtime_v2.stable_element_proof_sha256,
+            ancestor_class_commitments=runtime_v2.ancestor_class_commitments,
+        ),  # type: ignore[arg-type]
+        proof_v2_capable=True,
+    )
+    monkeypatch.setattr(
+        artifact_editing_rpc,
+        "get_desktop_artifact_bridge_client",
+        lambda: bridge,
+    )
+    malformed = await _dispatch(
+        env,
+        "artifacts.prompt_annotations.create",
+        {
+            **params,
+            "annotationId": "annotation-v2-malformed",
+            "selection": {
+                **params["selection"],
+                "selectionId": "selection-v2-malformed",
+            },
+        },
+    )
+    assert malformed.error is not None
+    assert malformed.error.code == "ANNOTATION_UNAVAILABLE"
+    assert await _annotation_row_counts(env) == (0, 0, 0)
 
 
 @pytest.mark.asyncio
@@ -2301,6 +2598,10 @@ async def test_prompt_annotation_selection_is_revalidated_and_persisted_as_ancho
     class FakeBridge:
         def __init__(self) -> None:
             self.focus_calls: list[dict[str, object]] = []
+            self.proof_v2_capable = False
+
+        async def capabilities(self, **_kwargs):
+            return SimpleNamespace(annotation_proof_v2=self.proof_v2_capable)
 
         async def resolve_annotation_selection(self, **kwargs):
             return SimpleNamespace(
@@ -2375,6 +2676,25 @@ async def test_prompt_annotation_selection_is_revalidated_and_persisted_as_ancho
             "deadline_ms": 2_000,
         }
     ]
+    fake_bridge.proof_v2_capable = True
+    focused_v2 = await _dispatch(
+        env,
+        "artifacts.prompt_annotations.focus",
+        {"sessionKey": SESSION_KEY, "annotationId": annotation["id"]},
+    )
+    assert focused_v2.error is None, focused_v2.error
+    expected_proof_v2 = canonical_selection_proof_v2(html, element_path=element_path)
+    assert expected_proof_v2 is not None
+    assert fake_bridge.focus_calls[1] == {
+        "annotation_id": annotation["id"],
+        "scope_id": SESSION_KEY,
+        "active_preview_artifact_id": _ref.id,
+        "tag_name": "section",
+        "element_path": element_path,
+        "element_proof_sha256": element_proof_sha256,
+        "annotation_proof_v2": expected_proof_v2,
+        "deadline_ms": 2_000,
+    }
     listed = await _dispatch(
         env,
         "artifacts.prompt_annotations.list",
@@ -2412,7 +2732,7 @@ async def test_prompt_annotation_selection_is_revalidated_and_persisted_as_ancho
     assert discarded_focus.error is not None
     assert discarded_focus.error.code == "ANNOTATION_UNAVAILABLE"
     assert discarded_focus.error.details == {"reasonCode": "not_draft"}
-    assert len(fake_bridge.focus_calls) == 1
+    assert len(fake_bridge.focus_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -2735,6 +3055,41 @@ def test_element_proof_sha256_cross_runtime_golden() -> None:
     # ordering, and non-BMP values.
     assert element_proof_sha256 == (
         "26992606963b33b7d475a826bf0a48ae802e9ac7bfe43ed5cab3aa97b7f0c5c8"
+    )
+
+
+def test_element_proof_v2_cross_runtime_golden() -> None:
+    html = (
+        '<main class="shell α" data-label="😀">'
+        '<svg class="icon ready" viewBox="0 0 10 10">'
+        '<path aria-label="星😀" d="M0 0"></path></svg></main>'
+    )
+    element_path = json.dumps(
+        [
+            ["", "html", 1],
+            ["", "body", 1],
+            ["", "main", 1],
+            ["http://www.w3.org/2000/svg", "svg", 1],
+            ["http://www.w3.org/2000/svg", "path", 1],
+        ],
+        separators=(",", ":"),
+    )
+
+    proof_v2 = canonical_selection_proof_v2(html, element_path=element_path)
+
+    # Shared with Electron: stable v1-shaped tokens omit only unnamespaced
+    # ancestor class attributes; commitments hash the compact domain-separated
+    # JSON tuple and are de-duplicated then sorted as lowercase hex.
+    assert proof_v2 == ElementProofV2(
+        stable_element_proof_sha256=(
+            "26992606963b33b7d475a826bf0a48ae802e9ac7bfe43ed5cab3aa97b7f0c5c8"
+        ),
+        ancestor_class_commitments=(
+            "15ccaf87c7fc343055d0b26eedd8b4830f0e3fe8ad35783e45b743a1feba5662",
+            "32e98037d3929ef4440d88c8fbe4e03df5a9159c9657a234eff2da68dee0ea3a",
+            "5e65b9071e1268e5fc08d9b713c1220aef8fa800878b794f40b1c6e642ce9144",
+            "f5b127210b5887563e205dc9aaf0fc773e081149ae9f2b6dfb16321db5c8ab0f",
+        ),
     )
 
 

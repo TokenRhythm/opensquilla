@@ -1404,6 +1404,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           { tone: 'warn' },
         )
       } else if ([
+        'DOCUMENT_CHANGED',
         'ARTIFACT_ELEMENT_CHANGED',
         // Older Gateways used the whole-DOM name for the same recoverable
         // selection rejection. Keep the UX actionable during upgrades.

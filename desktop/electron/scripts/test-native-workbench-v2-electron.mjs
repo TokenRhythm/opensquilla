@@ -1134,7 +1134,21 @@ try {
       await v3Contents.executeJavaScript(`(() => {
         window.__annotationPageClicks = 0
         window.__annotationPreviewKeys = 0
-        document.getElementById('font-probe').addEventListener(
+        document.body.classList.add('fixture-source-shell')
+        const annotationTarget = document.getElementById('font-probe')
+        // Keep the click target above the concurrently playing media fixture.
+        // Chromium may resize the video after metadata arrives, otherwise a
+        // coordinate click can intermittently select the video instead.
+        const annotationTargetRect = annotationTarget.getBoundingClientRect()
+        annotationTarget.style.cssText += [
+          'position:absolute',
+          'z-index:2147483647',
+          'left:' + (window.scrollX + annotationTargetRect.x) + 'px',
+          'top:' + (window.scrollY + annotationTargetRect.y) + 'px',
+          'width:' + annotationTargetRect.width + 'px',
+          'height:' + annotationTargetRect.height + 'px',
+        ].join(';')
+        annotationTarget.addEventListener(
           'click',
           () => { window.__annotationPageClicks += 1 },
         )
@@ -1192,6 +1206,16 @@ try {
         throw new Error(`DOM annotation selection was rejected: ${JSON.stringify(annotationSelectedEvent)}`)
       }
       const selected = annotationSelectedEvent.detail.selection
+      if (selected.tagName !== 'div') {
+        throw new Error(`The annotation click selected ${selected.tagName} instead of font-probe.`)
+      }
+      const annotationSourceProofV2 = structuredClone(
+        manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate?.annotationProofV2,
+      )
+      if (!annotationSourceProofV2) {
+        throw new Error('The internal annotation proof-v2 was not retained.')
+      }
+      const annotationSelectionHidesProofV2 = !('annotationProofV2' in selected)
       const annotationPageClicks = await v3Contents.executeJavaScript(
         'Number(window.__annotationPageClicks || 0)',
       )
@@ -1199,6 +1223,9 @@ try {
       // must not invalidate its source-backed authorization proof.
       await v3Contents.executeJavaScript(
         "document.getElementById('lottie-probe').setAttribute('data-runtime-state', 'ready')",
+      )
+      await v3Contents.executeJavaScript(
+        "document.body.classList.add('fixture-runtime-visible')",
       )
       const resolvedSelection = await v3BridgeTarget.resolveAnnotationSelection(
         {
@@ -1210,6 +1237,14 @@ try {
           elementProofSha256: selected.elementProofSha256,
         },
         new AbortController().signal,
+      )
+      const annotationAncestorClassAdditionAccepted = Boolean(
+        resolvedSelection.annotationProofV2
+        && resolvedSelection.annotationProofV2.stableElementProofSha256
+          === annotationSourceProofV2.stableElementProofSha256
+        && annotationSourceProofV2.ancestorClassCommitments.every(commitment => (
+          resolvedSelection.annotationProofV2.ancestorClassCommitments.includes(commitment)
+        )),
       )
       const annotationWrongArtifactResolveRejected =
         await v3BridgeTarget.resolveAnnotationSelection(
@@ -1706,6 +1741,7 @@ try {
           tagName: selected.tagName,
           elementPath: selected.elementPath,
           elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
         },
         new AbortController().signal,
       )
@@ -1720,6 +1756,7 @@ try {
           tagName: selected.tagName,
           elementPath: selected.elementPath,
           elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
         },
         new AbortController().signal,
       ).then(() => false, () => true)
@@ -1732,6 +1769,7 @@ try {
           tagName: selected.tagName,
           elementPath: selected.elementPath,
           elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
         },
         new AbortController().signal,
       ).then(() => false, () => true)
@@ -1747,6 +1785,7 @@ try {
           tagName: selected.tagName,
           elementPath: selected.elementPath,
           elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
         },
         new AbortController().signal,
       ).then(() => false, () => true)
@@ -1765,12 +1804,79 @@ try {
           tagName: selected.tagName,
           elementPath: selected.elementPath,
           elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
         },
         new AbortController().signal,
       ).then(() => false, () => true)
       await v3Contents.executeJavaScript(
         "document.body.removeAttribute('data-ancestor-mismatch')",
       )
+      const focusWithSourceProof = overrides => v3BridgeTarget.focusAnnotation(
+        {
+          version: 3,
+          activePreviewArtifactId,
+          annotationId: 'annotation_electron_fixture',
+          scopeId: 'synthetic:v3-bridge',
+          tagName: selected.tagName,
+          elementPath: selected.elementPath,
+          elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
+          ...overrides,
+        },
+        new AbortController().signal,
+      )
+      await v3Contents.executeJavaScript(
+        "document.body.classList.remove('fixture-source-shell')",
+      )
+      const annotationAncestorClassRemovalRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript(`(() => {
+        document.body.classList.add('fixture-source-shell')
+        document.body.classList.remove('fixture-runtime-replacement')
+      })()`)
+      await v3Contents.executeJavaScript(`(() => {
+        document.body.classList.remove('fixture-source-shell')
+        document.body.classList.add('fixture-runtime-replacement')
+      })()`)
+      const annotationAncestorClassReplacementRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript(`(() => {
+        document.body.classList.remove('fixture-runtime-replacement')
+        document.body.classList.add('fixture-source-shell')
+      })()`)
+      await v3Contents.executeJavaScript(
+        "document.body.setAttribute('id', 'fixture-runtime-id')",
+      )
+      const annotationAncestorIdMismatchRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript("document.body.removeAttribute('id')")
+      await v3Contents.executeJavaScript(
+        "document.body.setAttribute('style', 'opacity: 0.99')",
+      )
+      const annotationAncestorStyleMismatchRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript("document.body.removeAttribute('style')")
+      await v3Contents.executeJavaScript(
+        "document.getElementById('font-probe').classList.add('fixture-selected-runtime')",
+      )
+      const annotationSelectedClassMismatchRejected = await focusWithSourceProof()
+        .then(() => false, () => true)
+      await v3Contents.executeJavaScript(
+        "document.getElementById('font-probe').removeAttribute('class')",
+      )
+      const mismatchedElementPath = JSON.stringify(
+        JSON.parse(selected.elementPath).map((segment, index, segments) => (
+          index === segments.length - 1
+            ? [segment[0], segment[1], segment[2] + 1]
+            : segment
+        )),
+      )
+      const annotationPathMismatchRejected = await focusWithSourceProof({
+        elementPath: mismatchedElementPath,
+      }).then(() => false, () => true)
+      const annotationTagMismatchRejected = await focusWithSourceProof({
+        tagName: 'span',
+      }).then(() => false, () => true)
       const annotationRefocus = await v3BridgeTarget.focusAnnotation(
         {
           version: 3,
@@ -1780,6 +1886,7 @@ try {
           tagName: selected.tagName,
           elementPath: selected.elementPath,
           elementProofSha256: selected.elementProofSha256,
+          annotationProofV2: annotationSourceProofV2,
         },
         new AbortController().signal,
       )
@@ -1804,6 +1911,10 @@ try {
         annotationId: 'annotation_fallback_fixture',
       })
       const annotationPreviewRestoredAfterFallback = v3View.getVisible()
+      await v3Contents.executeJavaScript(`(() => {
+        document.body.removeAttribute('class')
+        document.getElementById('font-probe').removeAttribute('style')
+      })()`)
       const annotationGoldenEventsBefore = events.length
       const annotationGoldenPicker = await manager.setArtifactAnnotationMode({
         version: 3,
@@ -2693,6 +2804,7 @@ try {
         v3BridgeCapabilities,
         v3AnnotationCapabilities,
         annotationPicker,
+        annotationSelectionHidesProofV2,
         annotationUnrelatedNodeCount,
         annotationSelected: {
           tagName: selected.tagName,
@@ -2703,6 +2815,7 @@ try {
         },
         annotationPageClicks,
         resolvedSelection,
+        annotationAncestorClassAdditionAccepted,
         annotationWrongArtifactResolveRejected,
         annotationOverlayResult,
         annotationOverlaySecurity,
@@ -2744,6 +2857,13 @@ try {
         annotationWrongArtifactFocusRejected,
         annotationDomMismatchRejected,
         annotationAncestorMismatchRejected,
+        annotationAncestorClassRemovalRejected,
+        annotationAncestorClassReplacementRejected,
+        annotationAncestorIdMismatchRejected,
+        annotationAncestorStyleMismatchRejected,
+        annotationSelectedClassMismatchRejected,
+        annotationPathMismatchRejected,
+        annotationTagMismatchRejected,
         annotationRefocus,
         annotationFallbackShow,
         annotationFallbackEvent,
@@ -3036,6 +3156,7 @@ try {
       captureSelection: false,
       resolveAnnotationSelection: true,
       focusAnnotation: true,
+      annotationProofV2: true,
       browserInspect: false,
       browserAct: false,
       bindCandidatePreview: false,
@@ -3057,6 +3178,11 @@ try {
     overlayCopyVersion: 1,
   })
   assert.equal(result.annotationPicker.ok, true)
+  assert.equal(
+    result.annotationSelectionHidesProofV2,
+    true,
+    'annotation-selected must not expose the internal proof-v2 to WebUI',
+  )
   assert.equal(
     result.annotationUnrelatedNodeCount,
     50010,
@@ -3222,6 +3348,18 @@ try {
   assert.equal(result.annotationWrongArtifactFocusRejected, true)
   assert.equal(result.annotationDomMismatchRejected, true)
   assert.equal(result.annotationAncestorMismatchRejected, true)
+  assert.equal(
+    result.annotationAncestorClassAdditionAccepted,
+    true,
+    'adding an ancestor class must preserve the source proof while returning refreshed commitments',
+  )
+  assert.equal(result.annotationAncestorClassRemovalRejected, true)
+  assert.equal(result.annotationAncestorClassReplacementRejected, true)
+  assert.equal(result.annotationAncestorIdMismatchRejected, true)
+  assert.equal(result.annotationAncestorStyleMismatchRejected, true)
+  assert.equal(result.annotationSelectedClassMismatchRejected, true)
+  assert.equal(result.annotationPathMismatchRejected, true)
+  assert.equal(result.annotationTagMismatchRejected, true)
   assert.deepEqual(result.annotationRefocus, {
     focused: true,
     activePreviewArtifactId: 'art-synthetic-v3-bridge',

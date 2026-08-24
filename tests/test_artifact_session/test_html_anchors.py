@@ -7,9 +7,13 @@ import pytest
 from lxml import html as lxml_html  # type: ignore[import-untyped]
 
 from opensquilla.artifact_session.html_anchors import (
+    ElementProofV2,
+    HtmlAnchorChangedError,
     canonical_element_at_path,
     canonical_element_proof_sha256,
+    canonical_element_proof_v2,
     canonical_opening_anchor,
+    canonical_selection_proof_v2,
     canonical_selection_proofs,
     contextual_candidate,
     enrich_anchor_context,
@@ -123,6 +127,109 @@ def test_canonical_selection_proofs_safely_parse_source_and_path() -> None:
 
     assert len(dom_sha256) == 64
     assert len(proof) == 64
+
+
+def test_element_proof_v2_accepts_only_additive_reordered_ancestor_classes() -> None:
+    source = (
+        '<main class="shell base" id="app"><section class="card reveal">'
+        '<span class="leaf" id="target">Leaf</span></section></main>'
+    )
+    runtime = (
+        '<main class="ready base shell shell" id="app">'
+        '<section class="visible reveal card"><span class="leaf" id="target">'
+        "Leaf</span></section></main>"
+    )
+    element_path = json.dumps(
+        [
+            ["", "html", 1],
+            ["", "body", 1],
+            ["", "main", 1],
+            ["", "section", 1],
+            ["", "span", 1],
+        ],
+        separators=(",", ":"),
+    )
+    source_v1 = canonical_selection_proofs(source, element_path=element_path)[1]
+    runtime_v1 = canonical_selection_proofs(runtime, element_path=element_path)[1]
+    source_v2 = canonical_selection_proof_v2(source, element_path=element_path)
+    runtime_v2 = canonical_selection_proof_v2(runtime, element_path=element_path)
+
+    assert source_v1 != runtime_v1
+    assert source_v2 is not None and runtime_v2 is not None
+    assert source_v2.stable_element_proof_sha256 == runtime_v2.stable_element_proof_sha256
+    assert set(source_v2.ancestor_class_commitments) < set(runtime_v2.ancestor_class_commitments)
+    locator, opening, _context = canonical_opening_anchor(
+        source,
+        element_path=element_path,
+        expected_element_proof_sha256=runtime_v1,
+        expected_tag_name="span",
+        expected_element_proof_v2=runtime_v2,
+    )
+    assert opening == '<span class="leaf" id="target">'
+    assert locator["tag_name"] == "span"
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        # Removing/replacing a source class token is not additive.
+        '<main class="shell" id="app" data-state="source" style="color:red">'
+        '<span id="target">Leaf</span></main>',
+        '<main class="shell other" id="app" data-state="source" style="color:red">'
+        '<span id="target">Leaf</span></main>',
+        # All non-class ancestor attributes remain strict, including style.
+        '<main class="shell base" id="changed" data-state="source" style="color:red">'
+        '<span id="target">Leaf</span></main>',
+        '<main class="shell base" id="app" data-state="changed" style="color:red">'
+        '<span id="target">Leaf</span></main>',
+        '<main class="shell base" id="app" data-state="source" style="color:blue">'
+        '<span id="target">Leaf</span></main>',
+        # The selected element keeps its complete attribute identity.
+        '<main class="shell base" id="app" data-state="source" style="color:red">'
+        '<span id="target" class="selected">Leaf</span></main>',
+        '<main class="shell base" id="app" data-state="source" style="color:red">'
+        '<span id="target" style="opacity:.5">Leaf</span></main>',
+    ],
+)
+def test_element_proof_v2_rejects_non_additive_or_non_class_changes(runtime: str) -> None:
+    source = (
+        '<main class="shell base" id="app" data-state="source" style="color:red">'
+        '<span id="target">Leaf</span></main>'
+    )
+    element_path = json.dumps(
+        [["", "html", 1], ["", "body", 1], ["", "main", 1], ["", "span", 1]],
+        separators=(",", ":"),
+    )
+    runtime_v1 = canonical_selection_proofs(runtime, element_path=element_path)[1]
+    runtime_v2 = canonical_selection_proof_v2(runtime, element_path=element_path)
+    assert runtime_v2 is not None
+
+    with pytest.raises(HtmlAnchorChangedError, match="selection proof"):
+        canonical_opening_anchor(
+            source,
+            element_path=element_path,
+            expected_element_proof_sha256=runtime_v1,
+            expected_tag_name="span",
+            expected_element_proof_v2=runtime_v2,
+        )
+
+
+def test_element_proof_v2_is_all_or_nothing_at_aggregate_limits() -> None:
+    root = lxml_html.document_fromstring("<main><span>Leaf</span></main>")
+    main = root.xpath("//main")[0]
+    selected = root.xpath("//span")[0]
+
+    main.set("class", " ".join(f"token-{index}" for index in range(257)))
+    assert canonical_element_proof_v2(root, selected=selected) is None
+
+    main.set("class", "x" * (64 * 1024 + 1))
+    assert canonical_element_proof_v2(root, selected=selected) is None
+
+    # Duplicate tokens are semantic duplicates, not partial commitments.
+    main.set("class", "\t".join(["same"] * 128))
+    proof = canonical_element_proof_v2(root, selected=selected)
+    assert isinstance(proof, ElementProofV2)
+    assert len(proof.ancestor_class_commitments) == 1
 
 
 def test_remap_never_chooses_first_ambiguous_candidate() -> None:

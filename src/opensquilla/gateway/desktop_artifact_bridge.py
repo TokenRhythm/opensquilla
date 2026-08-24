@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
 
+from opensquilla.artifact_session.html_anchors import ElementProofV2
+
 DESKTOP_ARTIFACT_BRIDGE_URL_ENV: Final = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL"
 DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV: Final = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN"
 DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION: Final = 5
@@ -173,6 +175,7 @@ class DesktopArtifactBridgeCapabilities:
     reload_surface: bool
     bind_candidate_preview: bool
     restore_canonical_preview: bool
+    annotation_proof_v2: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +195,7 @@ class DesktopArtifactResolvedAnnotationSelection:
     dom_sha256: str | None
     element_proof_sha256: str
     scope_id: str
+    annotation_proof_v2: ElementProofV2 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +261,55 @@ def _boolean(value: object, *, label: str) -> bool:
     return value
 
 
+def _annotation_proof_v2(value: object) -> ElementProofV2:
+    payload = _record(value, label="annotation proof-v2 response")
+    if set(payload) != {"stableElementProofSha256", "ancestorClassCommitments"}:
+        raise DesktopArtifactBridgeError(
+            "invalid-response", "The Desktop bridge annotation proof-v2 is invalid."
+        )
+    stable_digest = payload.get("stableElementProofSha256")
+    raw_commitments = payload.get("ancestorClassCommitments")
+    if (
+        not isinstance(stable_digest, str)
+        or not _SHA256_RE.fullmatch(stable_digest)
+        or not isinstance(raw_commitments, list)
+        or len(raw_commitments) > 256
+        or any(
+            not isinstance(commitment, str) or not _SHA256_RE.fullmatch(commitment)
+            for commitment in raw_commitments
+        )
+        or raw_commitments != sorted(set(raw_commitments))
+    ):
+        raise DesktopArtifactBridgeError(
+            "invalid-response", "The Desktop bridge annotation proof-v2 is invalid."
+        )
+    return ElementProofV2(
+        stable_element_proof_sha256=stable_digest,
+        ancestor_class_commitments=tuple(raw_commitments),
+    )
+
+
+def _annotation_proof_v2_payload(value: ElementProofV2) -> dict[str, object]:
+    stable_digest = value.stable_element_proof_sha256
+    commitments = value.ancestor_class_commitments
+    if (
+        not isinstance(stable_digest, str)
+        or not _SHA256_RE.fullmatch(stable_digest)
+        or not isinstance(commitments, tuple)
+        or len(commitments) > 256
+        or any(
+            not isinstance(commitment, str) or not _SHA256_RE.fullmatch(commitment)
+            for commitment in commitments
+        )
+        or list(commitments) != sorted(set(commitments))
+    ):
+        raise ValueError("Desktop artifact annotation proof-v2 is invalid")
+    return {
+        "stableElementProofSha256": stable_digest,
+        "ancestorClassCommitments": list(commitments),
+    }
+
+
 def _parse_capabilities(value: object) -> DesktopArtifactBridgeCapabilities:
     payload = _record(value, label="capabilities response")
     remote_version = payload.get("version")
@@ -301,6 +354,11 @@ def _parse_capabilities(value: object) -> DesktopArtifactBridgeCapabilities:
                 label="canonical preview restore capability",
             )
             if "restoreCanonicalPreview" in payload
+            else False
+        ),
+        annotation_proof_v2=(
+            _boolean(payload.get("annotationProofV2"), label="annotation proof-v2 capability")
+            if "annotationProofV2" in payload
             else False
         ),
     )
@@ -574,6 +632,11 @@ class DesktopArtifactBridgeClient:
         scope_id = _optional_string(
             value.get("scopeId"), label="annotation scope", max_chars=512
         )
+        annotation_proof_v2 = (
+            _annotation_proof_v2(value["annotationProofV2"])
+            if "annotationProofV2" in value
+            else None
+        )
         if (
             response_active_preview_artifact_id != active_preview_artifact_id
             or response_selection_id != selection_id
@@ -609,6 +672,7 @@ class DesktopArtifactBridgeClient:
             dom_sha256=dom_sha256,
             element_proof_sha256=element_proof_sha256,
             scope_id=scope_id,
+            annotation_proof_v2=annotation_proof_v2,
         )
 
     async def focus_annotation(
@@ -620,6 +684,7 @@ class DesktopArtifactBridgeClient:
         tag_name: str,
         element_path: str,
         element_proof_sha256: str,
+        annotation_proof_v2: ElementProofV2 | None = None,
         deadline_ms: int = 2_000,
     ) -> bool:
         if not isinstance(active_preview_artifact_id, str) or not _ARTIFACT_ID_RE.fullmatch(
@@ -642,16 +707,19 @@ class DesktopArtifactBridgeClient:
             element_proof_sha256
         ):
             raise ValueError("Desktop artifact annotation element proof is invalid")
+        request: dict[str, object] = {
+            "activePreviewArtifactId": active_preview_artifact_id,
+            "annotationId": annotation_id,
+            "scopeId": scope_id,
+            "tagName": tag_name,
+            "elementPath": element_path,
+            "elementProofSha256": element_proof_sha256,
+        }
+        if annotation_proof_v2 is not None:
+            request["annotationProofV2"] = _annotation_proof_v2_payload(annotation_proof_v2)
         value = await self._call(
             "focusAnnotation",
-            {
-                "activePreviewArtifactId": active_preview_artifact_id,
-                "annotationId": annotation_id,
-                "scopeId": scope_id,
-                "tagName": tag_name,
-                "elementPath": element_path,
-                "elementProofSha256": element_proof_sha256,
-            },
+            request,
             deadline_ms=deadline_ms,
         )
         if value != {

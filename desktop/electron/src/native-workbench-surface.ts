@@ -50,6 +50,7 @@ import {
   type NativeWorkbenchSurfaceRectRequest,
 } from './native-workbench-surface-contract.js'
 import type {
+  DesktopArtifactAnnotationProofV2,
   DesktopArtifactBrowserActRequest,
   DesktopArtifactBrowserActResult,
   DesktopArtifactBrowserInspectRequest,
@@ -195,6 +196,7 @@ interface NativeWorkbenchBrowserAnchor {
 
 interface NativeWorkbenchAnnotationCandidate {
   selection: NativeWorkbenchAnnotationSelection
+  annotationProofV2?: DesktopArtifactAnnotationProofV2
   viewportWidth: number
   viewportHeight: number
   documentGeneration: number
@@ -202,6 +204,25 @@ interface NativeWorkbenchAnnotationCandidate {
   objectId: string
   geometryTimer: NodeJS.Timeout | null
   geometryRefreshPending: boolean
+}
+
+type AnnotationProofV2MismatchReason =
+  | 'proof-v2-unavailable'
+  | 'stable-proof-mismatch'
+  | 'ancestor-class-token-removed'
+
+function annotationProofV2MismatchReason(
+  expected: DesktopArtifactAnnotationProofV2 | undefined,
+  runtime: DesktopArtifactAnnotationProofV2 | undefined,
+): AnnotationProofV2MismatchReason | null {
+  if (!expected || !runtime) return 'proof-v2-unavailable'
+  if (expected.stableElementProofSha256 !== runtime.stableElementProofSha256) {
+    return 'stable-proof-mismatch'
+  }
+  const runtimeCommitments = new Set(runtime.ancestorClassCommitments)
+  return expected.ancestorClassCommitments.every(commitment => (
+    runtimeCommitments.has(commitment)
+  )) ? null : 'ancestor-class-token-removed'
 }
 
 interface NativeWorkbenchAnnotationOverlayBinding {
@@ -357,6 +378,8 @@ const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
   }
   const segments = []
   const proofTokens = []
+  const stableProofTokens = []
+  const ancestorClassTokens = []
   let current = selected
   while (current) {
     if (segments.length >= 128) return { ok: false, reason: 'path-too-deep' }
@@ -376,6 +399,20 @@ const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
       attribute.value,
     ]).sort(compareJsonKeysByCodePoint)
     proofTokens.unshift([namespace, tagName, index, attributes])
+    if (current === selected) {
+      stableProofTokens.unshift([namespace, tagName, index, attributes])
+    } else {
+      stableProofTokens.unshift([
+        namespace,
+        tagName,
+        index,
+        attributes.filter(attribute => !(attribute[0] === '' && attribute[1] === 'class')),
+      ])
+      const tokens = attributes
+        .filter(attribute => attribute[0] === '' && attribute[1] === 'class')
+        .flatMap(attribute => attribute[2].split(/[\\t\\n\\f\\r ]+/).filter(Boolean))
+      ancestorClassTokens.unshift(Array.from(new Set(tokens)))
+    }
     current = current.parentElement
   }
   const elementPath = JSON.stringify(segments)
@@ -388,26 +425,69 @@ const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
   if (proofEncoded.byteLength > 4194304) {
     return { ok: false, reason: 'element-proof-too-large' }
   }
+  const stableProofEncoded = new TextEncoder().encode(
+    stableProofTokens.map(token => JSON.stringify(token)).join('\\n'),
+  )
+  let proofV2Available = true
+  let ancestorClassTokenBytes = 0
+  let ancestorClassTokenCount = 0
+  const ancestorClassCommitmentInputs = []
+  for (let depth = 0; depth < ancestorClassTokens.length; depth += 1) {
+    for (const token of ancestorClassTokens[depth]) {
+      ancestorClassTokenCount += 1
+      ancestorClassTokenBytes += new TextEncoder().encode(token).byteLength
+      ancestorClassCommitmentInputs.push([depth, token])
+    }
+  }
+  if (ancestorClassTokenCount > 256 || ancestorClassTokenBytes > 65536) {
+    proofV2Available = false
+  }
 
   const rect = selected.getBoundingClientRect()
   const viewport = window.visualViewport
-  return crypto.subtle.digest('SHA-256', proofEncoded).then(elementProofBuffer => ({
-    ok: true,
-    tagName: (selected.localName || selected.tagName || '').toLowerCase(),
-    elementPath,
-    elementProofSha256: Array.from(
-      new Uint8Array(elementProofBuffer),
-      byte => byte.toString(16).padStart(2, '0'),
-    ).join(''),
-    rect: {
-      x: rect.x,
-      y: rect.y,
-      width: rect.width,
-      height: rect.height,
-    },
-    viewportWidth: viewport ? viewport.width : window.innerWidth,
-    viewportHeight: viewport ? viewport.height : window.innerHeight,
-  }))
+  const toHex = buffer => Array.from(
+    new Uint8Array(buffer),
+    byte => byte.toString(16).padStart(2, '0'),
+  ).join('')
+  return Promise.all([
+    crypto.subtle.digest('SHA-256', proofEncoded),
+    crypto.subtle.digest('SHA-256', stableProofEncoded),
+  ]).then(async ([elementProofBuffer, stableElementProofBuffer]) => {
+    const stableElementProofSha256 = toHex(stableElementProofBuffer)
+    let annotationProofV2
+    if (proofV2Available) {
+      const commitmentBuffers = await Promise.all(
+        ancestorClassCommitmentInputs.map(([depth, token]) => crypto.subtle.digest(
+          'SHA-256',
+          new TextEncoder().encode(JSON.stringify([
+            'opensquilla.annotation.ancestor-class.v2',
+            stableElementProofSha256,
+            depth,
+            token,
+          ])),
+        )),
+      )
+      annotationProofV2 = {
+        stableElementProofSha256,
+        ancestorClassCommitments: Array.from(new Set(commitmentBuffers.map(toHex))).sort(),
+      }
+    }
+    return {
+      ok: true,
+      tagName: (selected.localName || selected.tagName || '').toLowerCase(),
+      elementPath,
+      elementProofSha256: toHex(elementProofBuffer),
+      ...(annotationProofV2 ? { annotationProofV2 } : {}),
+      rect: {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      },
+      viewportWidth: viewport ? viewport.width : window.innerWidth,
+      viewportHeight: viewport ? viewport.height : window.innerHeight,
+    }
+  })
 }`
 
 // Geometry refresh deliberately avoids re-running the element proof. The full
@@ -1654,6 +1734,7 @@ export class NativeWorkbenchSurfaceManager {
         : NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
       isCurrent: () => this.isActiveArtifactBridgeRecord(record),
       capabilities: {
+        annotationProofV2: true,
         captureSelection: false,
         resolveAnnotationSelection: (
           record.kind === 'artifact-preview'
@@ -1766,6 +1847,9 @@ export class NativeWorkbenchSurfaceManager {
           elementPath: candidate.selection.elementPath,
           ...(request.domSha256 === undefined ? {} : { domSha256: request.domSha256 }),
           elementProofSha256: candidate.selection.elementProofSha256,
+          ...(candidate.annotationProofV2 === undefined
+            ? {}
+            : { annotationProofV2: candidate.annotationProofV2 }),
           scopeId: record.scopeId,
           rect: { ...candidate.selection.rect },
         }
@@ -2599,11 +2683,25 @@ export class NativeWorkbenchSurfaceManager {
         throw new Error('The selected preview element is no longer editable.')
       }
       const current = parseNativeWorkbenchAnnotationSelection(raw)
-      if (
-        current.tagName !== candidate.selection.tagName
-        || current.elementPath !== candidate.selection.elementPath
-        || current.elementProofSha256 !== candidate.selection.elementProofSha256
-      ) throw new Error('The preview DOM changed after the element was selected.')
+      const strictProofMatches = (
+        current.elementProofSha256 === candidate.selection.elementProofSha256
+      )
+      if (current.tagName !== candidate.selection.tagName) {
+        throw new Error('The preview DOM changed after selection (tag-mismatch).')
+      }
+      if (current.elementPath !== candidate.selection.elementPath) {
+        throw new Error('The preview DOM changed after selection (path-mismatch).')
+      }
+      if (!strictProofMatches) {
+        const mismatchReason = annotationProofV2MismatchReason(
+          candidate.annotationProofV2,
+          current.annotationProofV2,
+        )
+        if (mismatchReason) {
+          throw new Error(`The preview DOM changed after selection (${mismatchReason}).`)
+        }
+      }
+      candidate.annotationProofV2 = current.annotationProofV2
       this.applyAnnotationGeometry(record, candidate, current)
     } catch (error) {
       if (record.annotationCandidate === candidate) this.clearAnnotationCandidate(record)
@@ -3111,11 +3209,26 @@ export class NativeWorkbenchSurfaceManager {
         throw new Error('The annotation element could not be inspected safely.')
       }
       const selection = parseNativeWorkbenchAnnotationSelection(inspected.result?.value)
-      if (
-        selection.tagName !== request.tagName
-        || selection.elementPath !== request.elementPath
-        || selection.elementProofSha256 !== request.elementProofSha256
-      ) throw new Error('The preview DOM no longer matches the annotation anchor.')
+      const strictProofMatches = (
+        selection.elementProofSha256 === request.elementProofSha256
+      )
+      if (selection.tagName !== request.tagName) {
+        throw new Error('The preview DOM no longer matches the annotation anchor (tag-mismatch).')
+      }
+      if (selection.elementPath !== request.elementPath) {
+        throw new Error('The preview DOM no longer matches the annotation anchor (path-mismatch).')
+      }
+      if (!strictProofMatches) {
+        const mismatchReason = annotationProofV2MismatchReason(
+          request.annotationProofV2,
+          selection.annotationProofV2,
+        )
+        if (mismatchReason) {
+          throw new Error(
+            `The preview DOM no longer matches the annotation anchor (${mismatchReason}).`,
+          )
+        }
+      }
       const described = await this.cdpCommand(record, 'DOM.describeNode', {
         objectId: selectedObjectId,
       }) as { node?: { backendNodeId?: unknown } }
@@ -3336,6 +3449,9 @@ export class NativeWorkbenchSurfaceManager {
       }
       record.annotationCandidate = {
         selection,
+        ...(candidate.annotationProofV2 === undefined
+          ? {}
+          : { annotationProofV2: candidate.annotationProofV2 }),
         viewportWidth: candidate.viewportWidth,
         viewportHeight: candidate.viewportHeight,
         documentGeneration: generation,

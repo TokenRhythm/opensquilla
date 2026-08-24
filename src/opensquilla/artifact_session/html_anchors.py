@@ -25,6 +25,11 @@ SOURCE_OFFSET_ENCODING = "unicode-code-point"
 MAX_SEMANTIC_PROFILE_BYTES = 4 * 1024
 MAX_CONTEXT_BYTES = 8 * 1024
 MAX_CANDIDATE_SOURCE_BYTES = 16 * 1024
+MAX_ANCESTOR_CLASS_COMMITMENTS = 256
+MAX_ANCESTOR_CLASS_TOKEN_BYTES = 64 * 1024
+
+_ANCESTOR_CLASS_COMMITMENT_DOMAIN = "opensquilla.annotation.ancestor-class.v2"
+_ASCII_CLASS_WHITESPACE_RE = re.compile(r"[\t\n\f\r ]+")
 
 _SAFE_ATTRIBUTES = (
     "id",
@@ -196,6 +201,14 @@ def _parse_elements(source: str) -> tuple[_Element, ...]:
 
 class HtmlAnchorChangedError(ValueError):
     """The browser selection no longer identifies the immutable HTML source."""
+
+
+@dataclass(frozen=True, slots=True)
+class ElementProofV2:
+    """Bounded proof that tolerates additive ancestor class tokens only."""
+
+    stable_element_proof_sha256: str
+    ancestor_class_commitments: tuple[str, ...]
 
 
 _HTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
@@ -527,6 +540,94 @@ def canonical_element_proof_sha256(
     return hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest()
 
 
+def canonical_element_proof_v2(
+    root: etree._Element,
+    *,
+    selected: etree._Element,
+) -> ElementProofV2 | None:
+    """Return the bounded v2 element proof, or ``None`` when it is too large.
+
+    The stable digest keeps the v1 path and attribute serialization, except
+    that an unnamespaced ``class`` attribute is omitted from non-selected
+    ancestors.  Each ancestor class token is committed separately so a source
+    token may be reordered, duplicated, or joined by additive runtime tokens,
+    while removal/replacement and moving a token to another depth still fail
+    closed.  No token or partial commitment set is returned on overflow.
+    """
+
+    ancestors: list[etree._Element] = []
+    current: etree._Element | None = selected
+    while current is not None:
+        ancestors.append(current)
+        if current is root:
+            break
+        current = current.getparent()
+    if not ancestors or ancestors[-1] is not root:
+        raise ValueError("The selected element is outside the canonical DOM")
+    ancestors.reverse()
+
+    stable_tokens: list[str] = []
+    ancestor_class_tokens: set[tuple[int, str]] = set()
+    class_token_bytes = 0
+    selected_depth = len(ancestors) - 1
+    for depth, element in enumerate(ancestors):
+        namespace, tag_name = _element_name(element)
+        attributes = _normalized_element_attributes(element)
+        if depth != selected_depth:
+            stable_attributes: list[list[str]] = []
+            for attribute in attributes:
+                if attribute[0] == "" and attribute[1] == "class":
+                    for token in _ASCII_CLASS_WHITESPACE_RE.split(attribute[2]):
+                        if not token:
+                            continue
+                        depth_token = (depth, token)
+                        if depth_token in ancestor_class_tokens:
+                            continue
+                        class_token_bytes += len(token.encode("utf-8"))
+                        ancestor_class_tokens.add(depth_token)
+                        if (
+                            len(ancestor_class_tokens) > MAX_ANCESTOR_CLASS_COMMITMENTS
+                            or class_token_bytes > MAX_ANCESTOR_CLASS_TOKEN_BYTES
+                        ):
+                            return None
+                    continue
+                stable_attributes.append(attribute)
+            attributes = stable_attributes
+        stable_tokens.append(
+            json.dumps(
+                [
+                    namespace,
+                    tag_name,
+                    _element_nth_of_type(element),
+                    attributes,
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    stable_digest = hashlib.sha256("\n".join(stable_tokens).encode("utf-8")).hexdigest()
+    commitments = {
+        hashlib.sha256(
+            json.dumps(
+                [
+                    _ANCESTOR_CLASS_COMMITMENT_DOMAIN,
+                    stable_digest,
+                    depth,
+                    token,
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        for depth, token in ancestor_class_tokens
+    }
+    return ElementProofV2(
+        stable_element_proof_sha256=stable_digest,
+        ancestor_class_commitments=tuple(sorted(commitments)),
+    )
+
+
 def parse_element_path(value: str) -> tuple[tuple[str, str, int], ...]:
     """Validate the canonical browser element path wire representation."""
 
@@ -592,6 +693,23 @@ def canonical_selection_proofs(source: str, *, element_path: str) -> tuple[str, 
     selected = canonical_element_at_path(root, element_path)
     dom_sha256 = canonical_browser_dom_digest(root, source=source)
     return dom_sha256, canonical_element_proof_sha256(root, selected=selected)
+
+
+def canonical_selection_proof_v2(
+    source: str,
+    *,
+    element_path: str,
+) -> ElementProofV2 | None:
+    """Safely derive the bounded v2 proof for one canonical source path."""
+
+    parser = lxml_html.HTMLParser(recover=True, no_network=True)
+    try:
+        root = lxml_html.document_fromstring(source, parser=parser)
+    except (etree.ParserError, ValueError) as exc:
+        raise ValueError("The canonical HTML source cannot be parsed safely") from exc
+    _normalize_browser_html_dom(root, source=source)
+    selected = canonical_element_at_path(root, element_path)
+    return canonical_element_proof_v2(root, selected=selected)
 
 
 def _canonical_element_path(root: etree._Element, selected: etree._Element) -> str:
@@ -701,6 +819,7 @@ def canonical_opening_anchor(
     element_path: str,
     expected_element_proof_sha256: str,
     expected_tag_name: str,
+    expected_element_proof_v2: ElementProofV2 | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     """Verify a browser selection and produce the shared source anchor shape."""
 
@@ -719,7 +838,17 @@ def canonical_opening_anchor(
         raise HtmlAnchorChangedError("selection tag no longer matches the source")
     actual_element_proof_sha256 = canonical_element_proof_sha256(root, selected=selected)
     if actual_element_proof_sha256 != expected_element_proof_sha256:
-        raise HtmlAnchorChangedError("selection proof no longer matches the source")
+        actual_element_proof_v2 = canonical_element_proof_v2(root, selected=selected)
+        if (
+            expected_element_proof_v2 is None
+            or actual_element_proof_v2 is None
+            or actual_element_proof_v2.stable_element_proof_sha256
+            != expected_element_proof_v2.stable_element_proof_sha256
+            or not set(actual_element_proof_v2.ancestor_class_commitments).issubset(
+                expected_element_proof_v2.ancestor_class_commitments
+            )
+        ):
+            raise HtmlAnchorChangedError("selection proof no longer matches the source")
     start, start_tag_end, _opening_tag_name = _opening_span_for_element(
         source,
         root=root,
@@ -1166,6 +1295,7 @@ def contextual_candidate(
 
 __all__ = [
     "ContextualCandidate",
+    "ElementProofV2",
     "HtmlAnchorChangedError",
     "HtmlAnchorResolution",
     "MAX_CONTEXT_BYTES",
@@ -1174,7 +1304,9 @@ __all__ = [
     "canonical_browser_dom_digest",
     "canonical_element_at_path",
     "canonical_element_proof_sha256",
+    "canonical_element_proof_v2",
     "canonical_opening_anchor",
+    "canonical_selection_proof_v2",
     "canonical_selection_proofs",
     "canonical_selection_context_for_locator",
     "contextual_candidate",

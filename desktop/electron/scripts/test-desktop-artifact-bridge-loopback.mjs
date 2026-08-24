@@ -16,6 +16,10 @@ let bindingReleaseCount = 0
 const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve })
 const annotationDigest = 'b'.repeat(64)
 const annotationElementProof = 'c'.repeat(64)
+const annotationProofV2 = {
+  stableElementProofSha256: 'd'.repeat(64),
+  ancestorClassCommitments: ['e'.repeat(64), 'f'.repeat(64)],
+}
 const activePreviewArtifactId = 'art-loopback-preview'
 const annotationPath = JSON.stringify([
   ['', 'html', 1],
@@ -24,6 +28,7 @@ const annotationPath = JSON.stringify([
 ])
 const target = {
   capabilities: {
+    annotationProofV2: true,
     captureSelection: false,
     resolveAnnotationSelection: true,
     focusAnnotation: true,
@@ -43,6 +48,7 @@ const target = {
     elementPath: request.elementPath,
     ...(request.domSha256 === undefined ? {} : { domSha256: request.domSha256 }),
     elementProofSha256: request.elementProofSha256,
+    annotationProofV2,
     scopeId: 'synthetic:scope',
     rect: { x: 10, y: 20, width: 80, height: 24 },
   }),
@@ -118,6 +124,7 @@ assert.deepEqual(capabilities, {
     captureSelection: false,
     resolveAnnotationSelection: true,
     focusAnnotation: true,
+    annotationProofV2: true,
     browserInspect: false,
     browserAct: false,
     bindCandidatePreview: false,
@@ -181,6 +188,7 @@ assert.deepEqual(await resolvedAnnotationResponse.json(), {
     elementPath: annotationPath,
     domSha256: annotationDigest,
     elementProofSha256: annotationElementProof,
+    annotationProofV2,
     scopeId: 'synthetic:scope',
     rect: { x: 10, y: 20, width: 80, height: 24 },
   },
@@ -208,6 +216,7 @@ assert.deepEqual(await resolvedAnnotationWithoutDomResponse.json(), {
     tagName: 'button',
     elementPath: annotationPath,
     elementProofSha256: annotationElementProof,
+    annotationProofV2,
     scopeId: 'synthetic:scope',
     rect: { x: 10, y: 20, width: 80, height: 24 },
   },
@@ -224,6 +233,7 @@ const focusAnnotationResponse = await post('/v1/invoke', {
     tagName: 'button',
     elementPath: annotationPath,
     elementProofSha256: annotationElementProof,
+    annotationProofV2,
   },
 })
 assert.equal(focusAnnotationResponse.status, 200)
@@ -232,6 +242,26 @@ assert.deepEqual(await focusAnnotationResponse.json(), {
   method: 'focusAnnotation',
   value: { focused: true, activePreviewArtifactId },
 })
+
+const malformedFocusProofResponse = await post('/v1/invoke', {
+  version: 3,
+  method: 'focusAnnotation',
+  request: {
+    version: 3,
+    activePreviewArtifactId,
+    annotationId: 'annotation_loopback_invalid_v2',
+    scopeId: 'synthetic:scope',
+    tagName: 'button',
+    elementPath: annotationPath,
+    elementProofSha256: annotationElementProof,
+    annotationProofV2: {
+      ...annotationProofV2,
+      ancestorClassCommitments: [...annotationProofV2.ancestorClassCommitments].reverse(),
+    },
+  },
+})
+assert.equal(malformedFocusProofResponse.status, 200)
+assert.equal((await malformedFocusProofResponse.json()).code, 'invalid-request')
 
 const reloadResponse = await post('/v1/invoke', {
   version: 3,

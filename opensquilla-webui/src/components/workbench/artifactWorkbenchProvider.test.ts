@@ -3144,8 +3144,11 @@ describe('artifact Workbench provider', () => {
     // A typed, recoverable selection rejection stays visible and actionable;
     // it must not open an editor or silently release the rearmed one-shot mode.
     expect(renderState.annotationMode).toBe(true)
+    const createCountBeforeChangedSelection = createAnnotation.mock.calls.length
+    const rearmCountBeforeChangedSelection = setMode.mock.calls.length
     rejectNextCreate = Object.assign(new Error('selected element changed'), {
-      code: 'ARTIFACT_ELEMENT_CHANGED',
+      code: 'DOCUMENT_CHANGED',
+      accepted: false,
     })
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
@@ -3162,6 +3165,7 @@ describe('artifact Workbench provider', () => {
         },
       },
     }, item)
+    expect(createAnnotation).toHaveBeenCalledTimes(createCountBeforeChangedSelection + 1)
     expect(showOverlay).toHaveBeenCalledOnce()
     expect(renderState.annotationFallback).toBeNull()
     expect(renderState.annotationMode).toBe(true)
@@ -3169,6 +3173,11 @@ describe('artifact Workbench provider', () => {
       'workbench.artifactAnnotation.elementChanged',
       { tone: 'warn', duration: 12_000 },
     )
+    expect(pushToast).not.toHaveBeenCalledWith(
+      'workbench.artifactAnnotation.createFailed',
+      expect.anything(),
+    )
+    expect(setMode).toHaveBeenCalledTimes(rearmCountBeforeChangedSelection + 1)
     expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([
       true,
       false,
@@ -3178,6 +3187,7 @@ describe('artifact Workbench provider', () => {
 
     // The recovered picker accepts a local proof after unrelated runtime DOM
     // changes, without a whole-DOM hash or an extra toolbar toggle.
+    const rearmCountBeforeRecoveredSelection = setMode.mock.calls.length
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
       surfaceId: item.id,
@@ -3202,6 +3212,7 @@ describe('artifact Workbench provider', () => {
       },
     }))
     expect(showOverlay).toHaveBeenCalledTimes(2)
+    expect(setMode).toHaveBeenCalledTimes(rearmCountBeforeRecoveredSelection)
 
     // If the scoped surface disappears while closing the trusted editor, the
     // persisted draft remains valid. Acknowledge the vanished overlay, rebuild

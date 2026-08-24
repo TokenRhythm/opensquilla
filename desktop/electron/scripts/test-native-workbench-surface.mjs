@@ -432,6 +432,12 @@ assert.deepEqual(
 )
 const selectionDigest = 'a'.repeat(64)
 const selectionElementProof = 'b'.repeat(64)
+const selectionStableElementProof = 'c'.repeat(64)
+const selectionAncestorClassCommitments = ['d'.repeat(64), 'e'.repeat(64)]
+const selectionProofV2 = {
+  stableElementProofSha256: selectionStableElementProof,
+  ancestorClassCommitments: selectionAncestorClassCommitments,
+}
 const activePreviewArtifactId = 'art-synthetic-preview'
 const selectionPath = JSON.stringify([
   ['', 'html', 1],
@@ -496,6 +502,63 @@ assert.deepEqual(
     elementProofSha256: selectionElementProof,
   },
 )
+assert.deepEqual(
+  parseDesktopArtifactFocusAnnotationRequest({
+    version: 3,
+    activePreviewArtifactId,
+    annotationId: 'annotation_v2',
+    scopeId: 'synthetic:scope',
+    tagName: 'button',
+    elementPath: selectionPath,
+    elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
+  }),
+  {
+    version: 3,
+    activePreviewArtifactId,
+    annotationId: 'annotation_v2',
+    scopeId: 'synthetic:scope',
+    tagName: 'button',
+    elementPath: selectionPath,
+    elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
+  },
+)
+for (const annotationProofV2 of [
+  {
+    ...selectionProofV2,
+    ancestorClassCommitments: [...selectionAncestorClassCommitments].reverse(),
+  },
+  {
+    ...selectionProofV2,
+    ancestorClassCommitments: [selectionAncestorClassCommitments[0], selectionAncestorClassCommitments[0]],
+  },
+  {
+    ...selectionProofV2,
+    ancestorClassCommitments: Array.from(
+      { length: 257 },
+      (_value, index) => index.toString(16).padStart(64, '0'),
+    ),
+  },
+  {
+    ...selectionProofV2,
+    unexpected: true,
+  },
+]) {
+  assert.throws(
+    () => parseDesktopArtifactFocusAnnotationRequest({
+      version: 3,
+      activePreviewArtifactId,
+      annotationId: 'annotation_invalid_v2',
+      scopeId: 'synthetic:scope',
+      tagName: 'button',
+      elementPath: selectionPath,
+      elementProofSha256: selectionElementProof,
+      annotationProofV2,
+    }),
+    /annotation proof-v2 is invalid/,
+  )
+}
 assert.throws(
   () => parseDesktopArtifactResolveAnnotationSelectionRequest({
     version: 3,
@@ -638,6 +701,7 @@ assert.deepEqual(
     tagName: 'button',
     elementPath: selectionPath,
     elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
     rect: { x: 1, y: 2, width: 30, height: 20 },
     viewportWidth: 800,
     viewportHeight: 600,
@@ -646,6 +710,7 @@ assert.deepEqual(
     tagName: 'button',
     elementPath: selectionPath,
     elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
     rect: { x: 1, y: 2, width: 30, height: 20 },
     viewportWidth: 800,
     viewportHeight: 600,
@@ -901,6 +966,7 @@ const controlledBridge = new DesktopArtifactBridge({
   getActiveTarget: () => ({
     isCurrent: () => true,
     capabilities: {
+      annotationProofV2: true,
       captureSelection: true,
       resolveAnnotationSelection: true,
       focusAnnotation: true,
@@ -969,6 +1035,7 @@ assert.deepEqual(controlledBridge.getCapabilities(), {
   captureSelection: true,
   resolveAnnotationSelection: true,
   focusAnnotation: true,
+  annotationProofV2: true,
   browserInspect: false,
   browserAct: false,
   bindCandidatePreview: false,
