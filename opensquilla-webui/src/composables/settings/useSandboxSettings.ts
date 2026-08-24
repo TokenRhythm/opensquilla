@@ -466,7 +466,10 @@ export function useSandboxSettings() {
   }
 
   async function runRuntimeAction(
-    method: 'sandbox.runtime.install' | 'sandbox.runtime.cancel' | 'sandbox.runtime.remove',
+    method: 'sandbox.runtime.install'
+      | 'sandbox.runtime.cancel'
+      | 'sandbox.runtime.discard_download'
+      | 'sandbox.runtime.remove',
     componentId: SandboxRuntimeComponentId,
     params: Record<string, unknown>,
     prepare?: () => Promise<boolean>,
@@ -499,6 +502,7 @@ export function useSandboxSettings() {
       return true
     } catch (error) {
       runtimeActionError[componentId] = errorMessage(error)
+      if (method === 'sandbox.runtime.discard_download') void loadRuntimeStatus()
       return false
     } finally {
       runtimeActionPending[componentId] = false
@@ -552,6 +556,12 @@ export function useSandboxSettings() {
 
   function removeRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
     return runRuntimeAction('sandbox.runtime.remove', componentId, { componentId })
+  }
+
+  function discardRuntimeDownload(
+    componentId: SandboxRuntimeComponentId,
+  ): Promise<boolean> {
+    return runRuntimeAction('sandbox.runtime.discard_download', componentId, { componentId })
   }
 
   async function loadDesktopPreference(): Promise<void> {
@@ -776,6 +786,7 @@ export function useSandboxSettings() {
     enableRuntime,
     installRuntime,
     cancelRuntime,
+    discardRuntimeDownload,
     removeRuntime,
     loadCapability,
     loadSetupStatus,

@@ -990,6 +990,7 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
     assert result["counts"]["accounted_provider_legs"] == 2
 
 
+@pytest.mark.ci_serial
 def test_fallback_case_proves_activity_precedes_backup_request_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

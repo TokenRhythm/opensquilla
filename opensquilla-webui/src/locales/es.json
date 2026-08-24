@@ -587,12 +587,12 @@
         "title": "Paquetes de ejecución", "description": "Las descargas se activan automáticamente. Seguro prioriza los paquetes instalados; Acceso completo mantiene primero las herramientas del sistema.", "target": "Destino de ejecución",
         "allowRuntime": "Permitir {runtime}", "progress": "Descarga de {runtime}: {progress}%",
         "states": {
-          "unknown": "Estado no disponible", "notInstalled": "No instalado", "disabled": "No activado", "installed": "Instalado", "installedVersion": "Instalado · {version}",
+          "unknown": "Estado no disponible", "notInstalled": "No instalado", "disabled": "No activado", "installed": "Instalado", "installedVersion": "Instalado · {version}", "updatePaused": "Actualización en pausa",
           "unsupported": "No disponible para este sistema", "corrupt": "Requiere reparación", "queued": "Esperando la descarga", "downloading": "Descargando", "downloadingProgress": "Descargando · {progress}%",
           "verifying": "Verificando la descarga", "extracting": "Instalando", "probing": "Comprobando el entorno", "activating": "Finalizando la instalación", "cancelling": "Cancelando", "queuedRemoval": "Esperando para eliminar", "removing": "Eliminando",
           "cancelled": "Descarga cancelada", "failed": "Error de descarga", "removeFailed": "Error al eliminar", "removeInterrupted": "Eliminación interrumpida", "interrupted": "Descarga pausada"
         },
-        "actions": { "enable": "Activar", "download": "Descargar", "cancel": "Cancelar", "resume": "Continuar", "retry": "Reintentar", "repair": "Reparar", "remove": "Eliminar", "retryRemove": "Reintentar eliminación" },
+        "actions": { "enable": "Activar", "download": "Descargar", "cancel": "Cancelar", "discardDownload": "Descartar descarga", "resume": "Continuar", "retry": "Reintentar", "repair": "Reparar", "remove": "Eliminar", "retryRemove": "Reintentar eliminación" },
         "sources": { "oss": "OSS de Pekín", "github": "Versiones de GitHub" }
       },
       "lan": {
