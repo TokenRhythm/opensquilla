@@ -401,12 +401,19 @@ async def test_posix_anchor_transport_failure_fails_closed() -> None:
 async def test_posix_anchor_outlives_leader_and_excludes_unrelated_group(tmp_path) -> None:
     child_pid = tmp_path / "owned-child.pid"
     owned_survived = tmp_path / "owned-survived"
+    owned_release = tmp_path / "owned-release"
     sibling_survived = tmp_path / "sibling-survived"
     child_script = (
-        "import os, pathlib, time; "
-        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); "
-        "time.sleep(0.8); "
-        f"pathlib.Path({str(owned_survived)!r}).write_text('survived')"
+        "import os\n"
+        "import pathlib\n"
+        "import time\n"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+        f"release = pathlib.Path({str(owned_release)!r})\n"
+        "deadline = time.monotonic() + 30\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if release.exists():\n"
+        f"    pathlib.Path({str(owned_survived)!r}).write_text('survived')\n"
     )
     parent_script = (
         "import subprocess, sys; "
@@ -438,11 +445,14 @@ async def test_posix_anchor_outlives_leader_and_excludes_unrelated_group(tmp_pat
         assert child_pid.exists()
         assert owner.is_active() is True
         assert await owner.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+        owned_release.write_text("release", encoding="utf-8")
         await asyncio.wait_for(sibling.wait(), timeout=2.0)
         await asyncio.sleep(0.9)
         assert not owned_survived.exists()
         assert sibling_survived.exists()
     finally:
+        with contextlib.suppress(OSError):
+            owned_release.write_text("release", encoding="utf-8")
         if owner.is_active():
             await owner.terminate(graceful_timeout=0.1, kill_timeout=1.0)
         if sibling.returncode is None:
@@ -700,6 +710,62 @@ def test_posix_proc_ignores_unrelated_pid_disappearing_during_snapshot(
     monkeypatch.setattr("builtins.open", selective_open)
 
     assert process_tree._posix_group_members(123) == (123,)
+
+
+def test_posix_empty_confirmation_requires_consecutive_complete_snapshots() -> None:
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        0,
+        (123,),
+        123,
+        captured_alive=False,
+    )
+    assert confirmations == 1
+
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        confirmations,
+        None,
+        123,
+        captured_alive=False,
+    )
+    assert confirmations == 0
+
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        confirmations,
+        (123,),
+        123,
+        captured_alive=True,
+    )
+    assert confirmations == 0
+
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        confirmations,
+        (123,),
+        123,
+        captured_alive=False,
+    )
+    assert confirmations == 1
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        confirmations,
+        (123, 456),
+        123,
+        captured_alive=False,
+    )
+    assert confirmations == 0
+
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        confirmations,
+        (123,),
+        123,
+        captured_alive=False,
+    )
+    assert confirmations == 1
+    confirmations = process_tree._advance_posix_empty_confirmation(
+        confirmations,
+        (123,),
+        123,
+        captured_alive=False,
+    )
+    assert confirmations == 2
 
 
 @pytest.mark.skipif(
