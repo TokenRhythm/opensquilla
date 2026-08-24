@@ -1968,6 +1968,30 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         run_kind: 'goal',
         model_usage_breakdown: [{ model: 'z-ai/glm-5.2', role: 'aggregator' }],
         ensemble_trace: { profile: 'default', llm_request_count: 5 },
+        route_plan: {
+          version: 2,
+          tier: 'c1',
+          model: 'z-ai/glm-5.2',
+          router_tier_snapshot: {
+            version: 1,
+            request_kind: 'text',
+            tiers: [{
+              tier: 'c1',
+              model: 'z-ai/glm-5.2',
+              execution_kind: 'single_model',
+            }],
+          },
+        },
+        usage: {
+          model: 'z-ai/glm-5.2',
+          input_tokens: 10,
+          output_tokens: 1,
+          route_plan: {
+            version: 1,
+            tier: 'c1',
+            model: 'stale/nested-model',
+          },
+        },
         coverage_status: 'usage_unknown',
         usage_unknown: true,
         unknown_usage_events: 1,
@@ -1982,6 +2006,13 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         coverage_status: 'usage_unknown',
         usage_unknown: true,
         unknown_usage_events: 1,
+        route_plan: {
+          version: 2,
+          router_tier_snapshot: {
+            version: 1,
+            request_kind: 'text',
+          },
+        },
       })
       expect(messages.value[1].model).toBe('z-ai/glm-5.2')
       expect(messages.value[1].input_tokens).toBe(10)

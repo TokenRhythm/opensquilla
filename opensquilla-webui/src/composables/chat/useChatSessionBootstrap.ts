@@ -648,13 +648,19 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     }
     const replacementConnected = run.awaitingReplacementConnection
     run.awaitingReplacementConnection = false
-    if (replacementConnected && run.live.running) {
+    if (run.live.running) {
       const interruptedPhase = run.live
-      const resumeOnReplacement = () => {
+      const resumeOnReplacement = (outcome?: SessionSubscriptionOutcome) => {
+        const transportFailedAfterConnected = (
+          !replacementConnected
+          && requiresFreshLiveQueue(outcome?.error)
+        )
         if (
-          !isCurrent(run)
+          (!replacementConnected && !transportFailedAfterConnected)
+          || !isCurrent(run)
           || run.live !== interruptedPhase
           || interruptedPhase.running
+          || run.lateReplacementRecoveryUsed
           || (
             livePhase.value !== 'connecting'
             && livePhase.value !== 'degraded'
@@ -663,11 +669,15 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         run.lateReplacementRecoveryUsed = true
         rearmCriticalQueue(run, false)
         // This is a continuation of the same outage, not a user-initiated
-        // retry. Preserve both the absolute deadline and attempts so repeated
-        // socket replacement cannot keep the UI in "connecting" forever.
+        // retry. Grant exactly one attempt on the authenticated socket. The
+        // connected event can win a route-switch race before the new run sees
+        // the matching disconnected event, so the interrupted phase may have
+        // already consumed both of its attempts on the retired generation.
+        // lateReplacementRecoveryUsed prevents later socket churn from
+        // repeatedly extending this recovery window.
         run.live = {
           ...liveRuntime(interruptedPhase.deadlineAt),
-          attempts: interruptedPhase.attempts,
+          attempts: 1,
           skipSnapshot: interruptedPhase.skipSnapshot,
         }
         run.live.promise = runLivePhase(run)
@@ -675,7 +685,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       // The replacement handshake can finish before the interrupted subscribe
       // observes its cancellation. Resume exactly once after that old phase
       // settles instead of leaving the UI indefinitely in "connecting".
-      void interruptedPhase.promise.then(resumeOnReplacement, resumeOnReplacement)
+      void interruptedPhase.promise.then(
+        resumeOnReplacement,
+        () => resumeOnReplacement(),
+      )
       return publicRun(run)
     }
     if (!run.live.running && livePhase.value === 'degraded') {
