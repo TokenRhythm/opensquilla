@@ -36,6 +36,13 @@ from opensquilla.session.storage import SessionStorage
 SESSION_KEY = "agent:main:webchat:workbench-resources"
 
 
+async def _sqlite_total_changes(storage: SessionStorage) -> int:
+    async with storage.conn.execute("SELECT total_changes()") as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return int(row[0])
+
+
 def test_workbench_resource_method_scopes_are_fail_closed() -> None:
     assert METHOD_SCOPES["workbench.resources.list"] == READ_SCOPE
     assert METHOD_SCOPES["workbench.resources.get"] == READ_SCOPE
@@ -659,7 +666,7 @@ async def test_resource_reads_do_not_change_sqlite_rows(resource_env) -> None:
     )
     # Warm the additive schema seam once, exactly as Gateway boot does.
     await ArtifactSessionService.from_session_storage(env.storage)
-    changes_before = env.storage.conn.total_changes
+    changes_before = await _sqlite_total_changes(env.storage)
 
     listed = await _dispatch(
         env,
@@ -708,7 +715,7 @@ async def test_resource_reads_do_not_change_sqlite_rows(resource_env) -> None:
     assert legacy_fetched.error is None, legacy_fetched.error
     assert legacy_fetched.payload == fetched.payload
     assert previewed.error is None, previewed.error
-    assert env.storage.conn.total_changes == changes_before
+    assert await _sqlite_total_changes(env.storage) == changes_before
 
 
 @pytest.mark.asyncio
@@ -960,7 +967,7 @@ async def test_invalid_html_attachments_fail_closed_without_read_side_writes(res
         payload=b"",
         staged=True,
     )
-    changes_before_reads = env.storage.conn.total_changes
+    changes_before_reads = await _sqlite_total_changes(env.storage)
 
     expected_reasons = {
         str(invalid_encoding["attachment_id"]): "html_encoding_unsupported",
@@ -1009,7 +1016,7 @@ async def test_invalid_html_attachments_fail_closed_without_read_side_writes(res
         assert opened.payload["reasonCode"] == expected_reason
         assert opened.payload["resource"]["resource"]["id"] == attachment_id
 
-    assert env.storage.conn.total_changes == changes_before_reads
+    assert await _sqlite_total_changes(env.storage) == changes_before_reads
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert await service.list_documents(
         session_key=SESSION_KEY,
@@ -1153,7 +1160,7 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
     )
     assert list(transcript_dir.iterdir()) == [transcript_dir / sha]
 
-    changes_before_read = env.storage.conn.total_changes
+    changes_before_read = await _sqlite_total_changes(env.storage)
     listed = await _dispatch(
         env,
         "workbench.resources.list",
@@ -1195,7 +1202,7 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
     inline_url = inline_get.payload["resource"]["downloadUrl"]
     assert inline_url.startswith("data:text/html;base64,")
     assert base64.b64decode(inline_url.split(",", 1)[1], validate=True) == html
-    assert env.storage.conn.total_changes == changes_before_read
+    assert await _sqlite_total_changes(env.storage) == changes_before_read
 
     imported_first = await _import_attachment(
         env,
@@ -1386,7 +1393,7 @@ async def test_import_expected_hash_is_validated_and_bound_to_idempotency(
     )
     expected = hashlib.sha256(payload).hexdigest()
     service = await ArtifactSessionService.from_session_storage(env.storage)
-    changes_before_invalid = env.storage.conn.total_changes
+    changes_before_invalid = await _sqlite_total_changes(env.storage)
     base_params = {
         "sessionKey": SESSION_KEY,
         "source": {"type": "attachment", "id": attachment["attachment_id"]},
@@ -1405,7 +1412,7 @@ async def test_import_expected_hash_is_validated_and_bound_to_idempotency(
         rejected = await _dispatch(env, "documents.import", rejected_params)
         assert rejected.error is not None
         assert rejected.error.code == "INVALID_REQUEST"
-    assert env.storage.conn.total_changes == changes_before_invalid
+    assert await _sqlite_total_changes(env.storage) == changes_before_invalid
     assert await service.list_documents(
         session_key=SESSION_KEY,
         session_id=env.session.session_id,
@@ -1728,7 +1735,7 @@ async def test_publish_receipt_pins_immutable_revision_and_recovers_promotion(
     )
     document_id = imported["document"]["id"]
     revision_id = imported["revision"]["id"]
-    changes_before_missing_revision = env.storage.conn.total_changes
+    changes_before_missing_revision = await _sqlite_total_changes(env.storage)
     missing_revision = await _dispatch(
         env,
         "documents.publish",
@@ -1753,7 +1760,7 @@ async def test_publish_receipt_pins_immutable_revision_and_recovers_promotion(
     )
     assert mismatched_aliases.error is not None
     assert mismatched_aliases.error.code == "INVALID_REQUEST"
-    assert env.storage.conn.total_changes == changes_before_missing_revision
+    assert await _sqlite_total_changes(env.storage) == changes_before_missing_revision
 
     original_promote = ArtifactStore.promote_internal_ref
     failed_once = False
