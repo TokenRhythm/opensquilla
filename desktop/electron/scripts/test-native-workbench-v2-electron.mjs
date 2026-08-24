@@ -1675,7 +1675,7 @@ try {
         annotationId: 'annotation_rearmed_fixture',
       }, 'rearmed annotation acknowledgement')
       const annotationRearmFocusCycles = []
-      const annotationRearmCycleCount = fixture.stressMode ? 3 : 1
+      const annotationRearmCycleCount = fixture.stressMode ? 8 : 4
       for (let cycle = 0; cycle < annotationRearmCycleCount; cycle += 1) {
         const cycleEventsBefore = events.length
         const cyclePicker = await manager.setArtifactAnnotationMode({
@@ -1683,28 +1683,42 @@ try {
           surfaceId: 'artifact:v3-bridge',
           enabled: true,
         })
-        const cycleDocument = await v3Contents.debugger.sendCommand('DOM.getDocument', {
-          depth: -1,
-          pierce: false,
-        })
-        const cycleNode = await v3Contents.debugger.sendCommand('DOM.querySelector', {
-          nodeId: cycleDocument.root.nodeId,
-          selector: '#font-probe',
-        })
-        const cycleDescription = await v3Contents.debugger.sendCommand(
-          'DOM.describeNode',
-          { nodeId: cycleNode.nodeId },
+        const cyclePageClicksBefore = await v3Contents.executeJavaScript(
+          'Number(window.__annotationPageClicks || 0)',
         )
-        await manager.handleAnnotationNodeSelected(
-          manager.surfaces.get('artifact:v3-bridge'),
-          cycleDescription.node.backendNodeId,
-        )
+        v3Contents.focus()
+        await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x: annotationX,
+          y: annotationY,
+          button: 'none',
+        })
+        await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+          type: 'mousePressed',
+          x: annotationX,
+          y: annotationY,
+          button: 'left',
+          clickCount: 1,
+        })
+        await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x: annotationX,
+          y: annotationY,
+          button: 'left',
+          clickCount: 1,
+        })
         const cycleSelectionEvent = await waitFor(
           () => events.slice(cycleEventsBefore).find(event =>
             event.surfaceId === 'artifact:v3-bridge'
             && event.type === 'annotation-selected'),
           `annotation rearm selection cycle ${cycle + 1}`,
         )
+        const cyclePageClicksAfter = await v3Contents.executeJavaScript(
+          'Number(window.__annotationPageClicks || 0)',
+        )
+        if (cyclePageClicksAfter !== cyclePageClicksBefore) {
+          throw new Error(`Annotation rearm cycle ${cycle + 1} leaked the click to the page.`)
+        }
         const cycleAnnotationId = `annotation_rearm_stress_${cycle + 1}`
         const cycleOverlayResult = await manager.showArtifactAnnotationOverlay({
           version: 3,
@@ -3330,7 +3344,7 @@ try {
   assert.equal(result.annotationRearmShiftEnterDidNotSubmit, true)
   assert.equal(result.annotationRearmSubmitAfterInterruptedComposition, true)
   assert.equal(result.annotationRearmOverlayClose.ok, true)
-  assert.equal(result.annotationRearmFocusCycles.length, result.stressMode ? 3 : 1)
+  assert.equal(result.annotationRearmFocusCycles.length, result.stressMode ? 8 : 4)
   assert.equal(
     result.annotationRearmFocusCycles.every(cycle =>
       cycle.picker
