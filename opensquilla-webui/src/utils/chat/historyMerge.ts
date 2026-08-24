@@ -90,14 +90,20 @@ export function mergeLiveOnlyFields(
   // History currently persists the canonical concatenated reasoning text but
   // not its physical-call boundaries. Preserve the just-finished structured
   // blocks after this function has already proved both rows are the same turn.
-  if (!server.reasoningBlocks?.length && prev.reasoningBlocks?.length) {
+  if (
+    !server.activitySnapshot?.complete
+    && !server.reasoningBlocks?.length
+    && prev.reasoningBlocks?.length
+  ) {
     merged.reasoningBlocks = prev.reasoningBlocks.map(block => ({ ...block }))
   }
 
   // The fold's phase snapshot supplies an exact same-session activity start.
   // History does not persist it, so retain the local snapshot across the first
   // authoritative refresh; a cold reload still correctly falls back to counts.
-  if ((prev.statusHistory?.length ?? 0) > 0 || (server.statusHistory?.length ?? 0) > 0) {
+  if (server.activitySnapshot?.complete && !server.activitySnapshotIncomplete) {
+    merged.statusHistory = (server.statusHistory ?? []).map(entry => ({ ...entry }))
+  } else if ((prev.statusHistory?.length ?? 0) > 0 || (server.statusHistory?.length ?? 0) > 0) {
     const serverRows = server.statusHistory ?? []
     const previousRows = prev.statusHistory ?? []
     const serverHasTaskPhases = serverRows.some(entry => entry.category !== 'maintenance')
@@ -129,7 +135,10 @@ export function mergeLiveOnlyFields(
         rows[index] = { ...rows[index], ...entry, at: rows[index]!.at }
       }
     }
-    merged.statusHistory = rows.sort((a, b) => a.at - b.at)
+    // Legacy/no-v2 rows keep their established timestamp merge behavior.
+    // Complete v2 snapshots return from the authoritative branch above and
+    // are never sorted by display timestamps.
+    merged.statusHistory = rows.sort((left, right) => left.at - right.at)
   }
 
   // routerSettled is sticky: once a strip has settled it stays settled.
@@ -158,6 +167,10 @@ export function mergeLiveOnlyFields(
     if (prev.turnId) merged.turnId = prev.turnId
   }
   if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
+  if (!server.activitySnapshot && prev.activitySnapshot) {
+    merged.activitySnapshot = prev.activitySnapshot
+    merged.activitySnapshotIncomplete = prev.activitySnapshotIncomplete
+  }
   if (!server.turnInputMode && prev.turnInputMode) {
     merged.turnInputMode = prev.turnInputMode
   }
@@ -179,7 +192,11 @@ export function mergeLiveOnlyFields(
   // timeline. Keep the just-finished snapshot so intermediate/answer roles and
   // their grouped call ids survive the immediate history replacement. A
   // non-empty server timeline remains authoritative.
-  if ((server.timeline?.length ?? 0) === 0 && (prev.timeline?.length ?? 0) > 0) {
+  if (
+    !server.activitySnapshot?.complete
+    && (server.timeline?.length ?? 0) === 0
+    && (prev.timeline?.length ?? 0) > 0
+  ) {
     merged.timeline = prev.timeline?.map(segment => ({ ...segment }))
     if ((prev.tool_calls?.length ?? 0) > 0) {
       merged.tool_calls = prev.tool_calls?.map(call => ({ ...call }))

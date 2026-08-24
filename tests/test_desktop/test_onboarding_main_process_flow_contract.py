@@ -103,6 +103,7 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     settings_stage = save.index("telemetry.stage('settings_persist'")
     imported = save.index("await saveImportedDesktopCredential(")
     ordinary = save.index("await saveDesktopCredential(payload, true)")
+    refresh_keychain = save.index("invalidateSecretStorageBackendCache()")
     settings_persisted = save.index("telemetry.markSettingsPersistedConfirmed()")
     finalize_stage = save.index("telemetry.stage('local_finalize'")
     locale = save.index("applyDesktopLocaleChoice(payload.locale)")
@@ -117,8 +118,8 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
 
     assert telemetry_start < recovery_stage < recovery < admission < writer_admitted
     assert writer_admitted < marker_stage < marker < settings_stage
-    assert settings_stage < imported < settings_persisted
-    assert settings_stage < ordinary < settings_persisted
+    assert settings_stage < refresh_keychain < imported < settings_persisted
+    assert refresh_keychain < ordinary < settings_persisted
     assert settings_persisted < finalize_stage < locale < clear_marker < finish
     assert finish < handoff_stage < lifecycle_guard < complete < telemetry_finish
     assert "app.isPackaged" in save

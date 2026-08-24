@@ -30,7 +30,11 @@
 
 ## Neuigkeiten
 
-- 📢 **2026-07-03** — Unser technischer Bericht **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)** (Vorschau) ist erschienen und wurde zusammen mit OpenSquilla **0.5.0 Preview 1** veröffentlicht. Er beschreibt, wie der harness-native Router alltäglichen Agent-Traffic in ein sich selbst verbesserndes Daten-Schwungrad verwandelt.
+- 📢 **2026-08-22** — Die englische Version unseres technischen Berichts ist jetzt auf aiXiv verfügbar: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). Wie man OpenSquilla zitiert, steht unter [Zitieren](#zitieren).
+
+- 📢 **2026-08-21** — PDF-Versionen unseres technischen Berichts sind jetzt in diesem Repository verfügbar: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
+
+- 📢 **2026-07-14** — Unser technischer Bericht **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** ist jetzt auf arXiv verfügbar. Er zeigt, wie der harness-native Router alltäglichen Agent-Traffic in ein sich selbst verbesserndes Daten-Schwungrad verwandelt und wie **Multi-Modell-Ensemble-Routing Fable 5 übertrifft**.
 
 ---
 
@@ -873,3 +877,23 @@ eröffne dann ein Issue oder einen Pull Request auf
 
 [Verhaltenskodex](CODE_OF_CONDUCT.md) · [Sicherheit](SECURITY.md) ·
 [Support](SUPPORT.md) · [Lizenz](LICENSE) (Apache-2.0)
+
+---
+
+## Zitieren
+
+Wenn Sie OpenSquilla in Ihrer Forschung verwenden, zitieren Sie bitte unseren technischen Bericht:
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

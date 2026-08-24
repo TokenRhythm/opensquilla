@@ -442,7 +442,7 @@ describe('RouterFxStrip ensemble panel', () => {
     expect(el.querySelectorAll('[data-status="done"]')).toHaveLength(1)
     expect(el.querySelectorAll('[data-status="failed"]')).toHaveLength(1)
     expect(el.querySelectorAll('[data-status="running"]')).toHaveLength(1)
-    expect(el.textContent).toContain('120 tok · 105s')
+    expect(el.textContent).toContain('120 token · 105s')
     expect(el.textContent).toContain('failed · 118s')
     expect(el.querySelector('[data-status="failed"] .router-fx-inspector__usage')?.getAttribute('title'))
       .toBe('provider timed out')
@@ -458,7 +458,7 @@ describe('RouterFxStrip ensemble panel', () => {
     aggregator.elapsedMs = 12_000
     await nextTick()
 
-    expect(el.textContent).toContain('240 tok · 12s')
+    expect(el.textContent).toContain('240 token · 12s')
     expect(el.textContent).toContain('2 candidates synthesizing')
     expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
     expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()

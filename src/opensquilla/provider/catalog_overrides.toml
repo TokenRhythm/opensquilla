@@ -721,6 +721,17 @@ input_cost_per_mtok = 0.43010752688172044
 output_cost_per_mtok = 0.8602150537634409
 cache_read_cost_per_mtok = 0.0035842293906810036
 
+[tokenrhythm."deepseek-v4-pro-0813"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 1.2903225806451613
+output_cost_per_mtok = 3.870967741935484
+cache_read_cost_per_mtok = 0.043010752688172046
+
 [tokenrhythm."glm-5"]
 context_window = 1000000
 max_output_tokens = 128000

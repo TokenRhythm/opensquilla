@@ -211,6 +211,43 @@ describe('useChatSteerDelivery', () => {
     }
   })
 
+  it('keeps the client boundary identity when later evidence carries only the durable id', () => {
+    const harness = createHarness()
+    try {
+      const item = harness.addPending()
+      harness.api.accept({
+        clientRequestId: REQUEST.client_request_id,
+        clientMessageId: REQUEST.client_message_id,
+        expectedTurnId: REQUEST.expected_turn_id,
+        userMessageId: 'user-steer',
+        disposition: 'steering',
+        revision: 1,
+      }, item)
+
+      harness.api.disposition({
+        userMessageId: 'user-steer',
+        disposition: 'applied',
+        revision: 2,
+        turnId: REQUEST.expected_turn_id,
+        appliedIteration: 2,
+        modelCallId: '2.0',
+      })
+
+      expect(harness.messages.value).toHaveLength(1)
+      expect(harness.checkpointForUserMessage.mock.calls).toEqual([
+        ['turn-current', 'client-steer'],
+        ['turn-current', 'client-steer'],
+      ])
+      expect(harness.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'client-steer',
+        '2.0',
+        2,
+      )
+    } finally {
+      harness.stop()
+    }
+  })
+
   it.each([
     ['cancelled', false, 'restore_to_composer'],
     ['rejected', true, 'resend_after_queue_drains'],

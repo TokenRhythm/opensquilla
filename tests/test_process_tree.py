@@ -48,6 +48,105 @@ def _synthetic_owner_reference(
     )
 
 
+@pytest.mark.parametrize(
+    ("frozen", "expected_prefix"),
+    [
+        (False, ("/synthetic/python", "-m", "opensquilla.process_tree")),
+        (True, ("/synthetic/gateway", "--internal-child", "process-tree")),
+    ],
+)
+def test_process_tree_child_argv_is_fixed_for_source_and_frozen_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    frozen: bool,
+    expected_prefix: tuple[str, ...],
+) -> None:
+    executable = "/synthetic/gateway" if frozen else "/synthetic/python"
+    monkeypatch.setattr(process_tree.sys, "executable", executable)
+    monkeypatch.setattr(process_tree.sys, "frozen", frozen, raising=False)
+
+    argv = process_tree._process_tree_child_argv(
+        "--windows-owned-launch",
+        "gate",
+        "ready",
+        "--",
+        "cmd",
+    )
+
+    assert argv == (
+        *expected_prefix,
+        "--windows-owned-launch",
+        "gate",
+        "ready",
+        "--",
+        "cmd",
+    )
+
+
+def test_windows_frozen_helper_ready_wait_is_extended_and_retried_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    delays: list[float] = []
+
+    class Gate:
+        def wait_ready(self, timeout: float) -> None:
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise TimeoutError("synthetic cold start")
+
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    process_tree._wait_for_windows_helper_ready(Gate())
+
+    assert waits == [5.0, 5.0]
+    assert delays == [0.25]
+
+
+def test_windows_frozen_helper_ready_wait_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    delays: list[float] = []
+
+    class Gate:
+        def wait_ready(self, timeout: float) -> None:
+            waits.append(timeout)
+            raise TimeoutError("synthetic frozen timeout")
+
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    with pytest.raises(TimeoutError, match="frozen timeout"):
+        process_tree._wait_for_windows_helper_ready(Gate())
+
+    assert waits == [5.0, 5.0]
+    assert delays == [0.25]
+
+
+def test_windows_source_helper_ready_timeout_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+
+    class Gate:
+        def wait_ready(self, timeout: float) -> None:
+            waits.append(timeout)
+            raise TimeoutError("synthetic source timeout")
+
+    monkeypatch.delattr(process_tree.sys, "frozen", raising=False)
+    monkeypatch.setattr(
+        process_tree.time,
+        "sleep",
+        lambda _delay: pytest.fail("source helper readiness must not retry"),
+    )
+
+    with pytest.raises(TimeoutError, match="source timeout"):
+        process_tree._wait_for_windows_helper_ready(Gate())
+
+    assert waits == [2.0]
+
+
 @pytest.mark.asyncio
 async def test_posix_anchor_creation_waits_for_ready(
     monkeypatch: pytest.MonkeyPatch,
@@ -1276,6 +1375,42 @@ async def test_windows_owned_launch_boots_helper_with_restricted_target_env() ->
     assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires a native packaged Windows Gateway")
+@pytest.mark.asyncio
+async def test_windows_packaged_gateway_first_exec_command(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = os.environ.get("OPENSQUILLA_PACKAGED_GATEWAY_BINARY", "")
+    if not gateway or not os.path.isfile(gateway):
+        pytest.skip("requires OPENSQUILLA_PACKAGED_GATEWAY_BINARY")
+
+    from opensquilla.tools.builtin import shell
+    from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+
+    monkeypatch.setattr(process_tree.sys, "executable", gateway)
+    monkeypatch.setattr(process_tree.sys, "frozen", True, raising=False)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            session_key="packaged-first-exec-command",
+            run_mode="full",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    try:
+        result = await shell.exec_command(
+            "Write-Output opensquilla-packaged-first-exec-ok",
+            workdir=str(tmp_path),
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "exit_code=0" in result
+    assert "opensquilla-packaged-first-exec-ok" in result
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job crash semantics")
 @pytest.mark.asyncio
 async def test_windows_gateway_crash_kills_job_and_reconcile_removes_stale_row(
@@ -1485,6 +1620,7 @@ def test_owner_registry_refuses_preexisting_symlink(
     assert unrelated.read_text(encoding="utf-8") == "unchanged"
 
 
+@pytest.mark.ci_serial
 def test_owner_registry_supports_concurrent_process_writers(tmp_path) -> None:
     state_dir = tmp_path / "synthetic-runtime-state"
     worker = textwrap.dedent(
@@ -1580,6 +1716,105 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
 
     assert directory_attempts == 3
     assert database_path.is_file()
+
+
+def test_windows_registry_retries_sidecar_identity_change(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"first")
+    attempts = 0
+
+    def replace_once(
+        path: object,
+        *,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        assert directory is False
+        attempts += 1
+        if attempts == 1:
+            replacement = sidecar.with_name("replacement.sqlite3-journal")
+            replacement.write_bytes(b"replacement")
+            os.replace(replacement, sidecar)
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_once)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == 2
+    assert sidecar.read_bytes() == b"replacement"
+
+
+def test_windows_registry_retries_sidecar_identity_change_before_acl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"first")
+    attempts = 0
+
+    def replace_then_fail(
+        _path: object,
+        *,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        assert directory is False
+        attempts += 1
+        if attempts == 1:
+            replacement = sidecar.with_name("replacement.sqlite3-journal")
+            replacement.write_bytes(b"replacement")
+            os.replace(replacement, sidecar)
+            raise OSError("synthetic bound path changed")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_then_fail)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == 2
+    assert sidecar.read_bytes() == b"replacement"
+
+
+def test_windows_registry_sidecar_identity_change_remains_fail_closed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"initial")
+    attempts = 0
+
+    def replace_always(
+        path: object,
+        *,
+        directory: bool,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        assert directory is False
+        attempts += 1
+        replacement = sidecar.with_name(f"replacement-{attempts}.sqlite3-journal")
+        replacement.write_bytes(str(attempts).encode())
+        os.replace(replacement, sidecar)
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_always)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="sidecar changed during privacy hardening",
+    ):
+        process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == len(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS) + 1
 
 
 def test_owner_registry_hardens_preexisting_sqlite_sidecars(

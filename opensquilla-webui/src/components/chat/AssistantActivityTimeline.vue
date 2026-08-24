@@ -151,6 +151,7 @@ const props = withDefaults(defineProps<{
   stateScope?: string
   statusPosition?: 'all' | 'before-reasoning' | 'after-reasoning'
   showItems?: boolean
+  preserveItemGroups?: boolean
 }>(), {
   statusPosition: 'all',
   showItems: true,
@@ -227,6 +228,7 @@ function clusterItem(
 const items = computed<ChatStreamTimelineItem[]>(() => {
   if (props.showItems === false) return []
   if (props.timelineItems?.length) {
+    if (props.preserveItemGroups) return props.timelineItems
     const clusterByCall = new Map(
       props.projection.activityClusters.flatMap(cluster =>
         cluster.calls.map(call => [call.renderKey, cluster] as const),

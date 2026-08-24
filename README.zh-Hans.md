@@ -30,7 +30,11 @@
 
 ## 最新动态
 
-- 📢 **2026-07-03** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)**（预览版）已发布，随 OpenSquilla **0.5.0 Preview 1** 一同放出。报告详细介绍了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮。
+- 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)。如何引用 OpenSquilla 请见[引用](#引用)。
+
+- 📢 **2026-08-21** —— 技术报告的 PDF 版本现已收录在本仓库中：[English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
+
+- 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型集成路由如何超越 Fable 5**。
 
 ---
 
@@ -710,3 +714,23 @@ OpenSquilla 的灵感来自
 
 [行为准则](CODE_OF_CONDUCT.md) · [安全](SECURITY.md) ·
 [支持](SUPPORT.md) · [许可证](LICENSE)（Apache-2.0）
+
+---
+
+## 引用
+
+如果你在研究中使用了 OpenSquilla，请引用我们的技术报告：
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

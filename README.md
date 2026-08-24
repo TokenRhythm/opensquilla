@@ -25,6 +25,10 @@
 
 ## News
 
+- 📢 **2026-08-22** — The English version of our technical report is now on aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). See [Citation](#citation) for how to cite OpenSquilla.
+
+- 📢 **2026-08-21** — PDF versions of our technical report are now available in this repo: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
+
 - 📢 **2026-07-14** — Our technical report **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** is now on arXiv. It shows how the harness-native router turns everyday agent traffic into a self-improving data flywheel, and how **multi-model ensemble routing surpasses Fable 5**.
 
 ---
@@ -895,3 +899,23 @@ issue or pull request on
 [Privacy](PRIVACY.md) · [Code signing policy](docs/code-signing-policy.md) ·
 [Third-party notices](THIRD_PARTY_NOTICES.md) · [Support](SUPPORT.md) ·
 [License](LICENSE) (Apache-2.0)
+
+---
+
+## Citation
+
+If you use OpenSquilla in your research, please cite our technical report:
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

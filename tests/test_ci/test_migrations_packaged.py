@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -117,24 +118,22 @@ def test_installed_wheel_resolves_migrations(
     """An installed wheel resolves both the historical and latest migration."""
     venv_dir = tmp_path / "venv"
     subprocess.run(
-        ["uv", "venv", "--seed", str(venv_dir)],
+        ["uv", "venv", str(venv_dir), "--python", sys.executable],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
         timeout=120,
     )
-    pip = venv_dir / ("Scripts" if os.name == "nt" else "bin") / "pip"
-    py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / "python"
+    py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python"
+    )
 
-    # 120s was tight enough that Windows CI runners began timing out as
-    # the base dependency list grew (each transitive wheel adds I/O the
-    # Defender real-time scanner has to walk through). Ubuntu still
-    # completes in ~30s; Windows now needs ~90-150s. Bumping the budget
-    # rather than skipping preserves the test's intent — verify the
-    # built wheel installs cleanly into a fresh venv and the migration
-    # resolver finds V010 afterwards.
+    # Use uv's installer against the fresh interpreter instead of seeding pip
+    # and then invoking a second resolver. This keeps the clean-install
+    # contract while reusing the hosted runner's uv cache; Windows Defender
+    # otherwise scans the same dependency wheels twice.
     subprocess.run(
-        [str(pip), "install", str(isolated_core_wheel)],
+        ["uv", "pip", "install", "--python", str(py), str(isolated_core_wheel)],
         check=True,
         capture_output=True,
         timeout=300,

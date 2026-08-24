@@ -1,7 +1,12 @@
 import {
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+  NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   parseNativeWorkbenchSurfaceId,
 } from './native-workbench-surface-contract.js'
+
+export type NativeWorkbenchAnnotationProtocolVersion =
+  | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
 
 export const NATIVE_WORKBENCH_ANNOTATION_BODY_MAX_BYTES = 16 * 1024
 export const NATIVE_WORKBENCH_ANNOTATION_ELEMENT_PATH_MAX_LENGTH = 4096
@@ -12,7 +17,7 @@ const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
 
 export interface NativeWorkbenchAnnotationCapabilities {
-  version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  version: NativeWorkbenchAnnotationProtocolVersion
   available: boolean
   picker: boolean
   trustedOverlay: boolean
@@ -32,13 +37,13 @@ export interface NativeWorkbenchAnnotationOverlayCopy {
 }
 
 export interface NativeWorkbenchAnnotationModeRequest {
-  version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  version: NativeWorkbenchAnnotationProtocolVersion
   surfaceId: string
   enabled: boolean
 }
 
 export interface NativeWorkbenchAnnotationOverlayShowRequest {
-  version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  version: NativeWorkbenchAnnotationProtocolVersion
   surfaceId: string
   selectionId: string
   annotationId: string
@@ -48,7 +53,7 @@ export interface NativeWorkbenchAnnotationOverlayShowRequest {
 }
 
 export interface NativeWorkbenchAnnotationOverlayCloseRequest {
-  version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  version: NativeWorkbenchAnnotationProtocolVersion
   surfaceId: string
   annotationId?: string
 }
@@ -146,7 +151,8 @@ function parseExactRequest(
   const request = objectRecord(value)
   if (
     !request
-    || request.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+    || (request.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+      && request.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4)
     || Object.keys(request).some(key => !allowedKeys.includes(key))
   ) {
     throw new Error(`The native Workbench annotation ${label} request is invalid.`)
@@ -183,7 +189,7 @@ export function parseNativeWorkbenchAnnotationModeRequest(
     throw new Error('The native Workbench annotation mode is invalid.')
   }
   return {
-    version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
     enabled: request.enabled,
   }
@@ -219,7 +225,7 @@ export function parseNativeWorkbenchAnnotationOverlayShowRequest(
     }
   }
   return {
-    version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
     selectionId: parseNativeWorkbenchAnnotationOpaqueId(request.selectionId, 'selection'),
     annotationId: parseNativeWorkbenchAnnotationOpaqueId(request.annotationId, 'annotation'),
@@ -239,7 +245,7 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
     'overlay close',
   )
   return {
-    version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
     ...(request.annotationId === undefined
       ? {}

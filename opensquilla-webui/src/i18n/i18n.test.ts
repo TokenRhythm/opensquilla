@@ -311,8 +311,13 @@ describe('catalog parity', () => {
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)
+    const intentionalEnglishTerms = new Set(['chat.routerFx.ensembleTokens'])
     const leaked = Object.keys(enFlat).filter(
-      (k) => typeof zhFlat[k] === 'string' && zhFlat[k] === enFlat[k] && /[A-Za-z]/.test(zhFlat[k] as string),
+      (k) =>
+        typeof zhFlat[k] === 'string'
+        && zhFlat[k] === enFlat[k]
+        && /[A-Za-z]/.test(zhFlat[k] as string)
+        && !intentionalEnglishTerms.has(k),
     )
     expect(leaked).toEqual([])
   })

@@ -3171,7 +3171,10 @@ class _GoalArtifactFallbackSelector:
         )
         self._remaining = [
             self.current_config,
-            SimpleNamespace(provider="test-fallback", model="deepseek-v4-flash"),
+            SimpleNamespace(
+                provider="test-fallback",
+                model="synthetic-tool-capable",
+            ),
         ]
 
     def clone(self) -> _GoalArtifactFallbackSelector:
@@ -3189,7 +3192,7 @@ class _GoalArtifactFallbackSelector:
         return list(self._remaining)
 
     def resolve(self) -> Any:
-        if self.current_config.model == "deepseek-v4-flash":
+        if self.current_config.model == "synthetic-tool-capable":
             return self.fallback
         return self.primary
 
@@ -3387,7 +3390,7 @@ async def test_goal_post_publish_selector_keeps_the_active_fallback_leg(
 
     assert selector.primary.calls == 1
     assert selector.fallback_calls == 1
-    assert selector.current_config.model == "deepseek-v4-flash"
+    assert selector.current_config.model == "synthetic-tool-capable"
     assert fallback.calls == 4
     assert control_calls == ["progress:completed", "goal:complete"]
     assert qa_calls == []

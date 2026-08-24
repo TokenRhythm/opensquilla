@@ -17,11 +17,13 @@ from opensquilla.artifact_session import (
     ArtifactBlobRef,
     ArtifactKind,
     ArtifactSessionService,
+    ChangeSetStatus,
     MutationAttemptStatus,
 )
 from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore
 from opensquilla.gateway.artifact_mutation_recovery import (
     reconcile_pending_artifact_mutations,
+    reject_orphaned_artifact_drafts,
 )
 
 USER = Actor(ActorKind.USER, "user-recovery")
@@ -103,6 +105,823 @@ async def test_restart_terminalizes_reserve_only_attempt(tmp_path: Path) -> None
         )
         assert receipt.status is MutationAttemptStatus.FAILED
         assert receipt.failure_code == "process_restarted_before_candidate"
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_orphaned_candidate_draft(tmp_path: Path) -> None:
+    service = await ArtifactSessionService.open(tmp_path / "draft-recovery.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id="orphan-draft",
+            candidate_loop=True,
+        )
+        payload = b"<h1>orphan</h1>"
+        ref = store.publish_bytes(
+            payload,
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="orphan.html",
+            mime="text/html",
+            source="artifact_html_agent_candidate",
+            visibility="internal",
+        )
+        staged = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.examined == 1
+        assert summary.rejected == 1
+        assert staged.status.value == "draft"
+        rejected = await service.get_change_set(draft.change_set_id)
+        assert rejected.status.value == "rejected"
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(ref.id, session_id=SESSION_ID)
+        assert len(await service.list_revisions(created.document.document_id)) == 1
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_removes_candidate_published_before_draft_cas(tmp_path: Path) -> None:
+    """A crash between blob publication and candidate CAS must not leak bytes."""
+
+    service = await ArtifactSessionService.open(tmp_path / "pre-cas-orphan.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        turn_id = "pre-cas-orphan"
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id=turn_id,
+            candidate_loop=True,
+        )
+        turn_digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+        ref = store.publish_bytes(
+            b"<h1>published before CAS</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="pre-cas.html",
+            mime="text/html",
+            source=f"document_html_agent_candidate:{turn_digest}",
+            visibility="internal",
+        )
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.examined == 1
+        assert summary.rejected == 1
+        assert summary.deleted_candidates == 1
+        assert (await service.get_change_set(draft.change_set_id)).status.value == "rejected"
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(ref.id, session_id=SESSION_ID)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_leaves_ordinary_manual_draft_untouched(tmp_path: Path) -> None:
+    """Boot cleanup must not reject collaboration/manual DRAFT change sets."""
+
+    service = await ArtifactSessionService.open(tmp_path / "manual-draft.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            # Collaboration/review may key an ordinary agent proposal by turn;
+            # the explicit candidate_loop audit flag remains false.
+            turn_id="ordinary-agent-draft",
+        )
+        ref = store.publish_bytes(
+            b"<h1>manual draft</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="manual.html",
+            mime="text/html",
+            source="document_manual_draft",
+            visibility="internal",
+        )
+        staged = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=USER,
+        )
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.examined == 0
+        assert summary.rejected == 0
+        assert summary.ambiguous == 0
+        current = await service.get_change_set(draft.change_set_id)
+        assert current.status is ChangeSetStatus.DRAFT
+        assert current.state_revision == staged.state_revision
+        assert store.resolve_for_download(ref.id, session_id=SESSION_ID)[0].id == ref.id
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_mutation_recovery_rejects_candidate_draft_before_terminalizing_receipt(
+    tmp_path: Path,
+) -> None:
+    """A crash during finish rejects the candidate before marking receipt failed."""
+
+    service = await ArtifactSessionService.open(tmp_path / "draft-attempt.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        turn_id = "draft-attempt"
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id=turn_id,
+            candidate_loop=True,
+        )
+        await _reserve(
+            service,
+            document_id=created.document.document_id,
+            revision_id=created.revision.revision_id,
+            turn_id=turn_id,
+        )
+        payload = b"<h1>staged before finish</h1>"
+        artifact_id = store.allocate_artifact_id()
+        digest = hashlib.sha256(payload).hexdigest()
+        await service.register_mutation_candidate(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            candidate_session_id=SESSION_ID,
+            candidate_artifact_id=artifact_id,
+            candidate_artifact_sha256=digest,
+        )
+        ref = store.publish_bytes(
+            payload,
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="draft-attempt.html",
+            mime="text/html",
+            source="artifact_html_agent_edit",
+            visibility="internal",
+            artifact_id=artifact_id,
+        )
+        await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+
+        summary = await reconcile_pending_artifact_mutations(service, store)
+
+        assert summary.failed == 1
+        assert summary.ambiguous == 0
+        assert (
+            await service.get_change_set(draft.change_set_id)
+        ).status is ChangeSetStatus.REJECTED
+        receipt = await service.reconcile_mutation_attempt(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            tool_use_id=f"tool-{turn_id}",
+        )
+        assert receipt.status is MutationAttemptStatus.FAILED
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(ref.id, session_id=SESSION_ID)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_mutation_recovery_preserves_unmarked_agent_draft(
+    tmp_path: Path,
+) -> None:
+    """An ordinary turn-scoped agent draft is not a candidate-loop draft."""
+
+    service = await ArtifactSessionService.open(tmp_path / "ordinary-attempt.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        turn_id = "ordinary-attempt"
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id=turn_id,
+        )
+        await _reserve(
+            service,
+            document_id=created.document.document_id,
+            revision_id=created.revision.revision_id,
+            turn_id=turn_id,
+        )
+        payload = b"<h1>ordinary proposal</h1>"
+        artifact_id = store.allocate_artifact_id()
+        digest = hashlib.sha256(payload).hexdigest()
+        await service.register_mutation_candidate(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            candidate_session_id=SESSION_ID,
+            candidate_artifact_id=artifact_id,
+            candidate_artifact_sha256=digest,
+        )
+        ref = store.publish_bytes(
+            payload,
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="ordinary-proposal.html",
+            mime="text/html",
+            source="artifact_html_agent_edit",
+            visibility="internal",
+            artifact_id=artifact_id,
+        )
+        await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+
+        summary = await reconcile_pending_artifact_mutations(service, store)
+
+        assert summary.ambiguous == 1
+        assert summary.failed == 0
+        assert (await service.get_change_set(draft.change_set_id)).status is ChangeSetStatus.DRAFT
+        receipt = await service.reconcile_mutation_attempt(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            tool_use_id=f"tool-{turn_id}",
+        )
+        assert receipt.status is MutationAttemptStatus.AMBIGUOUS
+        assert store.resolve_for_download(ref.id, session_id=SESSION_ID)[0].id == ref.id
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_retries_lost_candidate_draft_reject_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reject CAS that loses its response converges from the durable row."""
+
+    service = await ArtifactSessionService.open(tmp_path / "reject-response.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id="reject-response",
+            candidate_loop=True,
+        )
+        ref = store.publish_bytes(
+            b"<h1>lost reject response</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="lost-reject.html",
+            mime="text/html",
+            source="artifact_html_agent_candidate",
+            visibility="internal",
+        )
+        await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+        original_reject = (
+            service.reject_candidate_draft_and_fail_attempt_for_recovery
+        )
+
+        async def reject_then_lose_response(**kwargs: object):
+            await original_reject(**kwargs)
+            raise RuntimeError("reject response lost")
+
+        monkeypatch.setattr(
+            service,
+            "reject_candidate_draft_and_fail_attempt_for_recovery",
+            reject_then_lose_response,
+        )
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.rejected == 1
+        assert (
+            await service.get_change_set(draft.change_set_id)
+        ).status is ChangeSetStatus.REJECTED
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(ref.id, session_id=SESSION_ID)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_cleans_superseded_candidates_after_applied_commit(
+    tmp_path: Path,
+) -> None:
+    """A failed eager delete cannot strand a replaced candidate after commit."""
+
+    service = await ArtifactSessionService.open(tmp_path / "applied-candidates.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        turn_id = "applied-superseded"
+        turn_digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+        source = f"document_html_agent_candidate:{turn_digest}"
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id=turn_id,
+            candidate_loop=True,
+        )
+        first_ref = store.publish_bytes(
+            b"<h1>candidate one</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="candidate-one.html",
+            mime="text/html",
+            source=source,
+            visibility="internal",
+        )
+        first = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(first_ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+        second_ref = store.publish_bytes(
+            b"<h1>candidate two</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="candidate-two.html",
+            mime="text/html",
+            source=source,
+            visibility="internal",
+        )
+        second = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=first.state_revision,
+            candidate_artifact=_blob_from_ref(second_ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "verification_passed"},
+            actor=AGENT,
+        )
+        await service.commit_draft_change_set_atomically(
+            change_set_id=draft.change_set_id,
+            expected_change_set_state_revision=second.state_revision,
+            expected_head_revision_id=created.revision.revision_id,
+            expected_document_state_revision=created.document.state_revision,
+            actor=AGENT,
+            expected_candidate_sha256=second_ref.sha256,
+        )
+        # Simulate a process dying after the final DRAFT -> APPLIED transaction
+        # but before the best-effort deletion of the superseded first blob.
+        assert store.resolve_for_download(first_ref.id, session_id=SESSION_ID)
+        assert store.resolve_for_download(second_ref.id, session_id=SESSION_ID)
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.examined == 0
+        assert summary.rejected == 0
+        assert summary.deleted_candidates == 1
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(first_ref.id, session_id=SESSION_ID)
+        assert (
+            store.resolve_for_download(second_ref.id, session_id=SESSION_ID)[0].id
+            == second_ref.id
+        )
+        assert len(await service.list_revisions(created.document.document_id)) == 2
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_markers_advance_past_bounded_applied_journal_page(
+    tmp_path: Path,
+) -> None:
+    service = await ArtifactSessionService.open(tmp_path / "applied-cleanup-pagination.db")
+    store = ArtifactStore(tmp_path / "media")
+    superseded = []
+    try:
+        for index in range(6):
+            created = await service.create_document(
+                session_key=f"agent:main:webchat:applied-page-{index}",
+                session_id=SESSION_ID,
+                name=f"Applied page {index}",
+                kind=ArtifactKind.HTML,
+                initial_artifact=_blob(f"base-page-{index}"),
+                actor=USER,
+            )
+            turn_id = f"applied-cleanup-page-{index}"
+            digest = hashlib.sha256(turn_id.encode()).hexdigest()
+            source = f"document_html_agent_candidate:{digest}"
+            draft = await service.create_change_set(
+                document_id=created.document.document_id,
+                base_revision_id=created.revision.revision_id,
+                operations=({"op": "replace_text"},),
+                actor=AGENT,
+                turn_id=turn_id,
+                candidate_loop=True,
+            )
+            old_ref = store.publish_bytes(
+                f"<h1>old {index}</h1>".encode(),
+                session_id=SESSION_ID,
+                session_key=created.document.session_key,
+                name=f"old-{index}.html",
+                mime="text/html",
+                source=source,
+                visibility="internal",
+            )
+            superseded.append(old_ref)
+            old = await service.update_draft_change_set_candidate(
+                change_set_id=draft.change_set_id,
+                expected_state_revision=draft.state_revision,
+                candidate_artifact=_blob_from_ref(old_ref),
+                operations=({"op": "replace_text"},),
+                validation={"status": "candidate_staged"},
+                actor=AGENT,
+            )
+            final_ref = store.publish_bytes(
+                f"<h1>final {index}</h1>".encode(),
+                session_id=SESSION_ID,
+                session_key=created.document.session_key,
+                name=f"final-{index}.html",
+                mime="text/html",
+                source=source,
+                visibility="internal",
+            )
+            final = await service.update_draft_change_set_candidate(
+                change_set_id=draft.change_set_id,
+                expected_state_revision=old.state_revision,
+                candidate_artifact=_blob_from_ref(final_ref),
+                operations=({"op": "replace_text"},),
+                validation={"status": "verification_passed"},
+                actor=AGENT,
+            )
+            await service.commit_draft_change_set_atomically(
+                change_set_id=draft.change_set_id,
+                expected_change_set_state_revision=final.state_revision,
+                expected_head_revision_id=created.revision.revision_id,
+                expected_document_state_revision=created.document.state_revision,
+                actor=AGENT,
+                expected_candidate_sha256=final_ref.sha256,
+            )
+
+        first = await reject_orphaned_artifact_drafts(service, store, batch_size=1)
+        second = await reject_orphaned_artifact_drafts(service, store, batch_size=1)
+        assert first.deleted_candidates == 5
+        assert second.deleted_candidates == 1
+        assert await service.list_applied_candidate_artifacts(limit=10) == ()
+        for ref in superseded:
+            with pytest.raises(ArtifactNotFoundError):
+                store.resolve_for_download(ref.id, session_id=SESSION_ID)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_candidates_when_applied_head_blob_is_missing(
+    tmp_path: Path,
+) -> None:
+    """Never sweep turn candidates when the durable final artifact is absent."""
+
+    service = await ArtifactSessionService.open(tmp_path / "applied-missing-head.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        turn_id = "applied-missing-head"
+        digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+        source = f"document_html_agent_candidate:{digest}"
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id=turn_id,
+            candidate_loop=True,
+        )
+        first_ref = store.publish_bytes(
+            b"<h1>candidate one</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="candidate-one.html",
+            mime="text/html",
+            source=source,
+            visibility="internal",
+        )
+        first = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(first_ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+        final_ref = store.publish_bytes(
+            b"<h1>candidate final</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="candidate-final.html",
+            mime="text/html",
+            source=source,
+            visibility="internal",
+        )
+        final = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=first.state_revision,
+            candidate_artifact=_blob_from_ref(final_ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "verification_passed"},
+            actor=AGENT,
+        )
+        await service.commit_draft_change_set_atomically(
+            change_set_id=draft.change_set_id,
+            expected_change_set_state_revision=final.state_revision,
+            expected_head_revision_id=created.revision.revision_id,
+            expected_document_state_revision=created.document.state_revision,
+            actor=AGENT,
+            expected_candidate_sha256=final_ref.sha256,
+        )
+        assert store.delete_ref(session_id=SESSION_ID, artifact_id=final_ref.id)
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.examined == 0
+        assert summary.deleted_candidates == 0
+        assert summary.ambiguous >= 1
+        # The superseded blob remains available for manual repair/reconcile;
+        # cleanup must not delete it after discovering a missing final head.
+        assert store.resolve_for_download(first_ref.id, session_id=SESSION_ID)[0].id == first_ref.id
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_draft_and_closes_reserved_finish_receipt(
+    tmp_path: Path,
+) -> None:
+    service = await ArtifactSessionService.open(tmp_path / "draft-reserved.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        turn_id = "orphan-draft-reserved"
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id=turn_id,
+            candidate_loop=True,
+        )
+        await _reserve(
+            service,
+            document_id=created.document.document_id,
+            revision_id=created.revision.revision_id,
+            turn_id=turn_id,
+        )
+        payload = b"<h1>orphan-reserved</h1>"
+        ref = store.publish_bytes(
+            payload,
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="orphan-reserved.html",
+            mime="text/html",
+            source="artifact_html_agent_candidate",
+            visibility="internal",
+        )
+        await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+
+        draft_summary = await reject_orphaned_artifact_drafts(service, store)
+        assert draft_summary.rejected == 1
+
+        # The draft rejection proves that no durable revision can be produced
+        # by the pre-commit receipt.  The subsequent pass must therefore see
+        # no ambiguous unresolved attempt.
+        mutation_summary = await reconcile_pending_artifact_mutations(service, store)
+        assert mutation_summary.examined == 0
+        receipt = await service.reconcile_mutation_attempt(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            tool_use_id=f"tool-{turn_id}",
+        )
+        assert receipt.status is MutationAttemptStatus.FAILED
+        assert receipt.failure_code == "process_restarted_before_commit"
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(ref.id, session_id=SESSION_ID)
+        assert len(await service.list_revisions(created.document.document_id)) == 1
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_retries_physical_cleanup_after_reject_transaction(
+    tmp_path: Path,
+) -> None:
+    """A crash after the reject CAS is recoverable without a schema marker."""
+
+    service = await ArtifactSessionService.open(tmp_path / "reject-journal.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id="reject-journal",
+            candidate_loop=True,
+        )
+        ref = store.publish_bytes(
+            b"<h1>journaled orphan</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="journaled-orphan.html",
+            mime="text/html",
+            source="artifact_html_agent_candidate",
+            visibility="internal",
+        )
+        await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+
+        # Model the process dying after this transaction commits but before
+        # the ArtifactStore deletion can run.
+        await service.reject_draft_change_set_and_cleanup(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision + 1,
+            actor=AGENT,
+            reason="user_cancelled",
+        )
+        assert store.resolve_for_download(ref.id, session_id=SESSION_ID)
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+        assert summary.deleted_candidates == 1
+        with pytest.raises(ArtifactNotFoundError):
+            store.resolve_for_download(ref.id, session_id=SESSION_ID)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_markers_advance_past_bounded_rejected_journal_page(
+    tmp_path: Path,
+) -> None:
+    """Cleaned audit rows must not permanently starve later candidates."""
+
+    service = await ArtifactSessionService.open(tmp_path / "cleanup-pagination.db")
+    store = ArtifactStore(tmp_path / "media")
+    refs = []
+    try:
+        created = await _created(service)
+        for index in range(6):
+            draft = await service.create_change_set(
+                document_id=created.document.document_id,
+                base_revision_id=created.revision.revision_id,
+                operations=({"op": "replace_text", "index": index},),
+                actor=AGENT,
+                turn_id=f"cleanup-page-{index}",
+                candidate_loop=True,
+            )
+            ref = store.publish_bytes(
+                f"<h1>candidate {index}</h1>".encode(),
+                session_id=SESSION_ID,
+                session_key=created.document.session_key,
+                name=f"candidate-{index}.html",
+                mime="text/html",
+                source="document_html_agent_candidate:cleanup-page",
+                visibility="internal",
+            )
+            refs.append(ref)
+            staged = await service.update_draft_change_set_candidate(
+                change_set_id=draft.change_set_id,
+                expected_state_revision=draft.state_revision,
+                candidate_artifact=_blob_from_ref(ref),
+                operations=({"op": "replace_text", "index": index},),
+                validation={"status": "candidate_staged"},
+                actor=AGENT,
+            )
+            await service.reject_draft_change_set_and_cleanup(
+                change_set_id=draft.change_set_id,
+                expected_state_revision=staged.state_revision,
+                actor=AGENT,
+                reason="synthetic cleanup backlog",
+            )
+
+        deleted = 0
+        passes = 0
+        while await service.list_rejected_candidate_artifacts(limit=10):
+            summary = await reject_orphaned_artifact_drafts(
+                service,
+                store,
+                batch_size=1,
+            )
+            assert summary.deleted_candidates > 0
+            deleted += summary.deleted_candidates
+            passes += 1
+            assert passes <= 6
+        assert deleted == 6
+        assert passes >= 2
+        assert await service.list_rejected_candidate_artifacts(limit=10) == ()
+        for ref in refs:
+            with pytest.raises(ArtifactNotFoundError):
+                store.resolve_for_download(ref.id, session_id=SESSION_ID)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_delete_candidate_on_ordinary_reject(tmp_path: Path) -> None:
+    """Only candidate-loop cleanup may detach/delete a rejected proposal blob."""
+
+    service = await ArtifactSessionService.open(tmp_path / "ordinary-reject.db")
+    store = ArtifactStore(tmp_path / "media")
+    try:
+        created = await _created(service)
+        draft = await service.create_change_set(
+            document_id=created.document.document_id,
+            base_revision_id=created.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=AGENT,
+            turn_id="ordinary-reject",
+        )
+        ref = store.publish_bytes(
+            b"<h1>ordinary rejected proposal</h1>",
+            session_id=SESSION_ID,
+            session_key=created.document.session_key,
+            name="ordinary-rejected.html",
+            mime="text/html",
+            source="document_manual_proposal",
+            visibility="internal",
+        )
+        staged = await service.update_draft_change_set_candidate(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=draft.state_revision,
+            candidate_artifact=_blob_from_ref(ref),
+            operations=({"op": "replace_text"},),
+            validation={"status": "candidate_staged"},
+            actor=AGENT,
+        )
+        await service.reject_change_set(
+            change_set_id=draft.change_set_id,
+            expected_state_revision=staged.state_revision,
+            actor=AGENT,
+            reason="reviewer_declined",
+        )
+
+        summary = await reject_orphaned_artifact_drafts(service, store)
+
+        assert summary.rejected == 0
+        assert summary.deleted_candidates == 0
+        assert store.resolve_for_download(ref.id, session_id=SESSION_ID)[0].id == ref.id
     finally:
         await service.close()
 

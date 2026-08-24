@@ -35,7 +35,6 @@ from opensquilla.recovery.settings_transaction import (
     apply_desktop_settings,
     recover_desktop_settings,
 )
-from opensquilla.sandbox.upgrade_migration import inspect_sandbox_upgrade
 
 recovery_app = typer.Typer(
     help="Inspect and repair Desktop profiles without starting the runtime.",
@@ -63,6 +62,11 @@ def sandbox_upgrade_status(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Inspect the retained sandbox-upgrade journal without changing it."""
+    # Keep the ordinary recovery process below the runtime import boundary.
+    # ``opensquilla.sandbox`` exposes a broad public surface at package import
+    # time; only this diagnostic command needs the migration implementation.
+    from opensquilla.sandbox.upgrade_migration import inspect_sandbox_upgrade
+
     report = inspect_sandbox_upgrade(home)
     if json_output:
         typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))

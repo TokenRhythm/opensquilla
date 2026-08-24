@@ -60,6 +60,7 @@ from opensquilla.tools.builtin.artifact_range_grants import (
     ArtifactRangeGrantError,
     DocumentGrantBinding,
     ResolvedRangeGrant,
+    clear_context_registry,
     document_grant_registry_for_context,
     registry_for_context,
 )
@@ -135,22 +136,83 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _candidate_source(adapter_id: str, turn_id: str) -> str:
+    """Build a restart-recovery marker for one turn's hidden candidates.
+
+    The turn id itself is deliberately not persisted in the artifact source;
+    a short hash gives recovery an exact, bounded ownership key without
+    exposing arbitrary task metadata in artifact listings.
+    """
+
+    turn_digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+    return f"document_{adapter_id}_agent_candidate:{turn_digest}"
+
+
 async def _emit_artifact_state(
     scope: _ArtifactScope,
     *,
     action: str,
     revision_id: str | None = None,
     change_set_id: str | None = None,
-) -> None:
-    """Best-effort metadata notification after a durable mutation commits."""
+) -> bool:
+    """Best-effort metadata notification after a durable mutation commits.
+
+    The boolean lets a loop remember that the notification was actually
+    delivered.  A finish response can be replayed after the SQLite commit;
+    callers must not emit ``source.patched`` twice, but should retry when the
+    first best-effort notification itself failed.
+    """
 
     emitter = scope.ctx.artifact_event_emitter
     if not callable(emitter):
-        return
+        return False
     try:
-        latest = await scope.service.latest_audit_event(scope.document.document_id)
+        # ``source.patched`` is delivered after the durable transaction and
+        # may be retried after a lost response.  Resolve its sequence from the
+        # exact committed revision/change set; using the document's newest row
+        # can point clients at an unrelated later mutation and suppress the
+        # refresh via their monotonic sequence fence.
+        exact_lookup = getattr(scope.service, "audit_event_for_mutation", None)
+        if callable(exact_lookup) and (revision_id is not None or change_set_id is not None):
+            latest = await exact_lookup(
+                scope.document.document_id,
+                revision_id=revision_id,
+                change_set_id=change_set_id,
+            )
+        elif revision_id is not None or change_set_id is not None:
+            # Compatibility with older service doubles: filter the append-only
+            # list locally instead of falling back to an unrelated newest row.
+            list_events = getattr(scope.service, "list_audit_events", None)
+            latest = None
+            if callable(list_events):
+                events = await list_events(scope.document.document_id)
+                for event in events:
+                    event_type = getattr(event, "event_type", "")
+                    exact_pair = revision_id is not None and change_set_id is not None
+                    if not exact_pair and not (
+                        isinstance(event_type, str)
+                        and (
+                            event_type.startswith("revision.")
+                            or event_type
+                            in {
+                                "document.created",
+                                "document.restored",
+                                "document.reverted",
+                                "change_set.applied",
+                            }
+                        )
+                    ):
+                        continue
+                    if revision_id is not None and event.revision_id != revision_id:
+                        continue
+                    if change_set_id is not None and event.change_set_id != change_set_id:
+                        continue
+                    if latest is None or event.sequence > latest.sequence:
+                        latest = event
+        else:
+            latest = await scope.service.latest_audit_event(scope.document.document_id)
         if latest is None:
-            return
+            return False
         await emitter(
             {
                 "artifactEventSeq": latest.sequence,
@@ -160,8 +222,9 @@ async def _emit_artifact_state(
                 "action": action,
             }
         )
+        return True
     except Exception:  # noqa: BLE001 - notification failure cannot undo the mutation
-        pass
+        return False
 
 
 def _format_for(name: str, media_type: str, kind: object | None = None) -> str:
@@ -354,6 +417,39 @@ async def _current_payload(
     scope: _ArtifactScope,
 ) -> tuple[ArtifactStore, ArtifactRef, bytes]:
     store = _store(scope)
+    # PromptAnnotation candidate loops keep the canonical Document head frozen
+    # until ``document_finish(commit)``.  Once a draft exists, all subsequent
+    # source reads and writers must operate on that draft rather than silently
+    # falling back to the old revision.  The controller only exposes an opaque
+    # blob reference; path resolution and integrity checks remain owned by the
+    # session-scoped ArtifactStore.
+    candidate_controller = getattr(scope.ctx, "artifact_candidate_loop_controller", None)
+    candidate_blob = getattr(candidate_controller, "candidate_artifact", None)
+    if candidate_blob is not None:
+        try:
+            ref, path = await asyncio.to_thread(
+                store.resolve_for_download,
+                candidate_blob.artifact_id,
+                session_id=scope.context.session_id,
+            )
+            payload = await asyncio.to_thread(path.read_bytes)
+        except (ArtifactError, OSError, ValueError):
+            raise SafeToolError(
+                "The current candidate bytes failed integrity validation. Discard and retry."
+            ) from None
+        if (
+            ref.session_key != scope.context.session_key
+            or ref.sha256 != candidate_blob.sha256
+            or ref.name != candidate_blob.filename
+            or ref.mime != candidate_blob.media_type
+            or ref.size != candidate_blob.byte_size
+            or len(payload) != ref.size
+            or hashlib.sha256(payload).hexdigest() != ref.sha256
+        ):
+            raise SafeToolError(
+                "The current candidate bytes failed integrity validation. Discard and retry."
+            )
+        return store, ref, payload
     try:
         ref, path = await asyncio.to_thread(
             store.resolve_for_download,
@@ -378,6 +474,333 @@ async def _current_payload(
             "The current artifact bytes failed integrity validation. Reopen or regenerate it."
         )
     return store, ref, payload
+
+
+async def _stage_prepared_document_mutation(
+    prepared: PreparedDocumentMutation,
+    *,
+    tool_use_id: str | None = None,
+    proposal_sha256: str | None = None,
+) -> str | None:
+    """Publish a validated candidate without advancing the Document head.
+
+    The normal document tools retain their historical immediate-commit path.
+    A PromptAnnotation turn injects ``ArtifactCandidateLoopController`` and
+    therefore takes this branch: bytes are published as an internal artifact,
+    the single draft ChangeSet is CAS-updated, and the model receives a
+    ``candidate_staged`` result.  No revision/event is emitted here.
+    """
+
+    scope = prepared.scope
+    controller = getattr(scope.ctx, "artifact_candidate_loop_controller", None)
+    if controller is None:
+        return None
+
+    # A provider may replay a writer call after its response was lost.  Check
+    # the turn-local DRAFT receipt before publishing another physical blob;
+    # the controller persists the opaque id/digest in validation JSON, so this
+    # also works after a controller is reconstructed from the same turn.
+    replay_candidate = getattr(controller, "replay_candidate", None)
+    if (
+        callable(replay_candidate)
+        and isinstance(tool_use_id, str)
+        and tool_use_id
+        and isinstance(proposal_sha256, str)
+        and proposal_sha256
+    ):
+        replay = await replay_candidate(
+            tool_use_id=tool_use_id,
+            proposal_sha256=proposal_sha256,
+        )
+        if replay is not None:
+            prepared.release_grants()
+            state = getattr(controller, "state", None)
+            return _json(
+                {
+                    "status": "candidate_staged",
+                    "durable": False,
+                    "replayed": True,
+                    "candidateSha256": getattr(state, "candidate_sha256", None),
+                    "candidateEpoch": getattr(state, "candidate_epoch", None),
+                    "changeSetState": "draft",
+                    "nextAction": "document_browser_inspect",
+                }
+            )
+
+    max_bytes = scope.ctx.artifact_max_bytes
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        max_bytes = DEFAULT_ARTIFACT_MAX_BYTES
+    disk_budget = scope.ctx.artifact_disk_budget_bytes
+    if not isinstance(disk_budget, int) or isinstance(disk_budget, bool) or disk_budget <= 0:
+        disk_budget = DEFAULT_ARTIFACT_DISK_BUDGET_BYTES
+
+    previous_blob = getattr(controller, "candidate_artifact", None)
+    candidate: ArtifactRef | None = None
+    try:
+        # Persist the turn-local DRAFT before publishing bytes.  If the process
+        # dies after the blob is created but before the candidate CAS returns,
+        # restart recovery can reject this empty/staged draft and use the
+        # turn-scoped source marker to remove the orphan.  Publishing first
+        # would leave an unjournaled internal bucket when draft creation itself
+        # loses its response.
+        ensure_draft = getattr(controller, "ensure_draft", None)
+        if callable(ensure_draft):
+            await ensure_draft(
+                operations=prepared.operations,
+                actor=prepared.actor,
+                summary=prepared.summary,
+            )
+        candidate_id = prepared.store.allocate_artifact_id()
+        candidate = await asyncio.to_thread(
+            prepared.store.publish_bytes,
+            prepared.candidate_bytes,
+            session_id=scope.context.session_id,
+            session_key=scope.context.session_key,
+            name=prepared.ref.name,
+            mime=prepared.ref.mime,
+            source=_candidate_source(prepared.adapter_id, prepared.turn_id),
+            max_bytes=max_bytes,
+            disk_budget_bytes=disk_budget,
+            visibility="internal",
+            artifact_id=candidate_id,
+        )
+        candidate_validation = await asyncio.to_thread(
+            _validated_payload,
+            prepared.candidate_bytes,
+            artifact_format=prepared.artifact_format,
+            ref=candidate,
+        )
+        _staged = await controller.stage_candidate(
+            candidate_artifact=ArtifactBlobRef(
+                artifact_id=candidate.id,
+                sha256=candidate.sha256,
+                filename=candidate.name,
+                media_type=candidate.mime,
+                byte_size=candidate.size,
+            ),
+            operations=prepared.operations,
+            actor=prepared.actor,
+            validation={
+                **candidate_validation,
+                **prepared.validation_summary,
+                "source_sha256": candidate.sha256,
+                "status": "candidate_staged",
+            },
+            summary=prepared.summary,
+            tool_use_id=tool_use_id,
+            proposal_sha256=proposal_sha256,
+        )
+        # Another in-flight retry may have won the DRAFT CAS while this call
+        # was publishing its private blob.  The controller returns the
+        # already-durable ChangeSet in that case; never bind or advertise the
+        # unreferenced blob created by the losing request.
+        if (
+            candidate is not None
+            and _staged is not None
+            and isinstance(tool_use_id, str)
+            and isinstance(proposal_sha256, str)
+            and getattr(_staged, "candidate_artifact_id", None) != candidate.id
+        ):
+            try:
+                await asyncio.to_thread(
+                    prepared.store.delete_ref,
+                    session_id=scope.context.session_id,
+                    artifact_id=candidate.id,
+                )
+            except Exception:  # noqa: BLE001 - orphan GC remains the safe fallback
+                pass
+            prepared.release_grants()
+            state = getattr(controller, "state", None)
+            return _json(
+                {
+                    "status": "candidate_staged",
+                    "durable": False,
+                    "replayed": True,
+                    "candidateSha256": getattr(state, "candidate_sha256", None),
+                    "candidateEpoch": getattr(state, "candidate_epoch", None),
+                    "changeSetState": "draft",
+                    "nextAction": "document_browser_inspect",
+                }
+            )
+    except BaseException:
+        # A draft CAS may have committed just before its response was lost.
+        # Reconcile the turn-local controller before deciding whether the new
+        # blob is safe to delete; deleting a blob still referenced by DRAFT
+        # would strand a candidate that recovery can no longer verify.
+        if candidate is not None:
+            reconcile = getattr(controller, "reconcile", None)
+            if callable(reconcile):
+                try:
+                    await asyncio.shield(reconcile())
+                except BaseException:  # noqa: BLE001 - retain the original error
+                    pass
+            durable_candidate = getattr(controller, "candidate_artifact", None)
+            candidate_is_referenced = bool(
+                durable_candidate is not None
+                and durable_candidate.artifact_id == candidate.id
+                and durable_candidate.sha256 == candidate.sha256
+            )
+            if not candidate_is_referenced:
+                try:
+                    await asyncio.to_thread(
+                        prepared.store.delete_ref,
+                        session_id=scope.context.session_id,
+                        artifact_id=candidate.id,
+                    )
+                except Exception:  # noqa: BLE001 - preserve the original failure
+                    pass
+        prepared.release_grants()
+        raise
+
+    # Grants describe the source bytes used by this proposal.  A new candidate
+    # epoch must force fresh inspect/read/locate evidence on the next iteration.
+    prepared.release_grants()
+    clear_context_registry(scope.ctx)
+    setattr(scope.ctx, "_artifact_browser_verification_token", None)
+    setattr(scope.ctx, "_artifact_browser_verification_sha256", None)
+    if previous_blob is not None and previous_blob.artifact_id != candidate.id:
+        try:
+            await asyncio.to_thread(
+                prepared.store.delete_ref,
+                session_id=scope.context.session_id,
+                artifact_id=previous_blob.artifact_id,
+            )
+        except Exception:  # noqa: BLE001 - orphan GC remains the safe fallback
+            pass
+    state = getattr(controller, "state", None)
+    # Bind only an opaque gateway-issued handle when a v4 bridge implements the
+    # optional candidate-preview method.  Older clients remain source-only and
+    # cannot claim a verified visual commit.
+    bridge = getattr(scope.ctx, "desktop_artifact_bridge", None)
+    preview_service = getattr(scope.ctx, "artifact_preview_service", None)
+    bind = getattr(bridge, "bind_candidate_preview", None)
+    preview_handle = getattr(controller, "preview_handle", None)
+    previous_preview_bound = bool(
+        getattr(scope.ctx, "_artifact_candidate_preview_bound", False)
+        or getattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", False)
+    )
+    setattr(scope.ctx, "_artifact_candidate_preview_bound", False)
+    register_preview = getattr(preview_service, "register_candidate_preview", None)
+    preview_registered = False
+    registration_attempted = callable(register_preview) and isinstance(preview_handle, str)
+    # From this point onward a cancellation may leave either the Gateway
+    # mapping or the native surface half-updated.  Keep cleanup eligible until
+    # a successful canonical restore proves that both sides are detached.
+    setattr(scope.ctx, "_artifact_candidate_preview_registration_attempted", registration_attempted)
+    setattr(
+        scope.ctx,
+        "_artifact_candidate_preview_cleanup_pending",
+        previous_preview_bound or (registration_attempted and callable(bind)),
+    )
+    if callable(register_preview) and isinstance(preview_handle, str):
+        try:
+            register_preview(
+                handle=preview_handle,
+                artifact_id=candidate.id,
+                session_id=scope.context.session_id,
+                session_key=scope.context.session_key,
+            )
+            preview_registered = True
+        except asyncio.CancelledError:
+            # Registration is synchronous today, but preserve the same
+            # fail-closed cleanup contract if the preview service becomes
+            # cancellable in a future implementation.
+            setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", True)
+            raise
+        except Exception:  # noqa: BLE001 - source candidate remains recoverable
+            # Never let a stale mapping for the same opaque handle be reused for
+            # this newer candidate.  Source staging remains recoverable, but a
+            # visual bind is forbidden until the Gateway can register the exact
+            # candidate bytes.
+            retire_preview = getattr(preview_service, "retire_candidate_preview", None)
+            if callable(retire_preview) and isinstance(preview_handle, str):
+                try:
+                    retire_preview(preview_handle)
+                except Exception:  # noqa: BLE001 - bounded in-memory cleanup
+                    pass
+            preview_service = None
+    if callable(bind) and preview_registered and isinstance(preview_handle, str):
+        try:
+            # The bridge client starts in v3 for rolling compatibility and
+            # upgrades to v4 after its capability handshake.  Candidate
+            # preview binding is a v4-only operation, so perform that
+            # handshake before invoking the method instead of treating a
+            # still-unnegotiated client as an old Electron shell.
+            capabilities = getattr(bridge, "capabilities", None)
+            if callable(capabilities):
+                await capabilities()
+            await bind(preview_handle)
+            setattr(scope.ctx, "_artifact_candidate_preview_bound", True)
+            setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", False)
+        except asyncio.CancelledError:
+            # Do not retire an opaque handle while bind may have reached the
+            # renderer.  The turn-finalizer will restore canonical preview and
+            # release the mapping under a shielded cleanup task.
+            setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", True)
+            raise
+        except Exception:  # noqa: BLE001 - preserve cleanup state on bridge faults
+            setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", True)
+            return _json(
+                {
+                    "status": "candidate_staged",
+                    "candidateSha256": candidate.sha256,
+                    "candidateEpoch": getattr(state, "candidate_epoch", None),
+                    "preview": "unavailable",
+                    "warning": (
+                        "The candidate is staged but the bound preview could not be updated."
+                    ),
+                    "nextAction": "document_finish_discard",
+                }
+            )
+    elif callable(bind) and not preview_registered:
+        setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", previous_preview_bound)
+        return _json(
+            {
+                "status": "candidate_staged",
+                "candidateSha256": candidate.sha256,
+                "candidateEpoch": getattr(state, "candidate_epoch", None),
+                "preview": "unavailable",
+                "warning": (
+                    "The candidate is staged but its opaque preview handle could not be registered."
+                ),
+                "nextAction": "document_finish_discard",
+            }
+        )
+    elif not callable(bind):
+        # Without a v4 bridge (whether or not registration was available), a
+        # candidate can never produce the verification receipt required by
+        # document_finish(commit).  Retire any registered mapping and avoid
+        # sending the model into an inspect/unavailable retry loop.
+        if preview_registered:
+            retire_preview = getattr(preview_service, "retire_candidate_preview", None)
+            if callable(retire_preview):
+                try:
+                    retire_preview(preview_handle)
+                except Exception:  # noqa: BLE001 - bounded in-memory cleanup
+                    pass
+        setattr(scope.ctx, "_artifact_candidate_preview_cleanup_pending", False)
+        return _json(
+            {
+                "status": "candidate_staged",
+                "candidateSha256": candidate.sha256,
+                "candidateEpoch": getattr(state, "candidate_epoch", None),
+                "preview": "unavailable",
+                "warning": (
+                    "The candidate is staged but no compatible bound preview bridge is available."
+                ),
+                "nextAction": "document_finish_discard",
+            }
+        )
+    return _json(
+        {
+            "status": "candidate_staged",
+            "durable": False,
+            "candidateSha256": candidate.sha256,
+            "candidateEpoch": getattr(state, "candidate_epoch", None),
+            "changeSetState": "draft",
+            "nextAction": "document_browser_inspect",
+        }
+    )
 
 
 async def _require_single_file_html(
@@ -539,6 +962,21 @@ class _ElementCollector(HTMLParser):
         self.handle_starttag(tag, attrs)
 
 
+def _candidate_epoch(scope: _ArtifactScope) -> int:
+    """Return the current draft epoch for grant/result binding.
+
+    Ordinary document turns use epoch zero.  PromptAnnotation candidate turns
+    advance this value whenever a writer replaces the draft, so source cursors
+    and semantic grants are cryptographically scoped to the bytes they saw.
+    """
+
+    controller = getattr(scope.ctx, "artifact_candidate_loop_controller", None)
+    value = getattr(controller, "candidate_epoch", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _range_binding(
     scope: _ArtifactScope,
     source_sha256: str,
@@ -559,6 +997,7 @@ def _range_binding(
         source_sha256=source_sha256,
         adapter_id=adapter_id,
         adapter_version=adapter_version,
+        candidate_epoch=_candidate_epoch(scope),
     )
 
 
@@ -582,6 +1021,7 @@ def _document_grant_binding(
         source_sha256=source_sha256,
         adapter_id=adapter_id,
         adapter_version=adapter_version,
+        candidate_epoch=_candidate_epoch(scope),
     )
 
 
@@ -2409,6 +2849,13 @@ async def _commit_prepared_document_mutation(
     actor = prepared.actor
     registry = prepared.registry
     reservation_id = prepared.reservation_id
+
+    # Candidate-loop callers stage before this legacy durable path. Keep this
+    # guard here as well for direct/internal callers that bypass the semantic
+    # tool adapters.
+    staged_result = await _stage_prepared_document_mutation(prepared)
+    if staged_result is not None:
+        return staged_result
 
     if (
         prepared.base_revision_id != scope.revision.revision_id

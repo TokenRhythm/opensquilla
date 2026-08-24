@@ -338,9 +338,9 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
 @pytest.mark.parametrize(
     ("routed_tier", "expected_model", "expect_ensemble"),
     [
-        ("c0", "qwen3.7-flash", False),
-        ("c1", "deepseek-v4-flash-0731", False),
-        ("c2", "glm-5.2", False),
+        ("c0", "deepseek-v4-flash-0731", False),
+        ("c1", "deepseek-v4-pro-0813", False),
+        ("c2", "kimi-k2.7-code", False),
         # Shared C3 triggers the global plan without replacing the configured
         # direct/fallback selector head.
         ("c3", "deepseek-v4-flash-0731", True),

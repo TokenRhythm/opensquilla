@@ -298,6 +298,7 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
     # awaited before respawn rather than reused. The boot page has a separate
     # non-destructive resume path below.
     assert "if (gatewayStartPromise)" in retry
+    assert "invalidateSecretStorageBackendCache()" in retry
     join_call = "const exited = await stopAndJoinAllLifecycleOwnedGateways()"
     assert join_call in retry
     assert "if (!exited)" in retry
@@ -354,6 +355,8 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     )
 
     assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
+    assert "openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain')" in preload
+    assert "invalidateSecretStorageBackendCache()" in resume_flow
     assert "const pendingStart = gatewayStartPromise" in resume_flow
     assert "await resumeOwnedGatewayStartup(" in resume_flow
     assert "if (!gateway)" in resume_flow
@@ -554,7 +557,8 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert "const result = await resumeStartup()" in retry_flow
     assert "result && result.ok === false" in retry_flow
     assert "result.error || msg.errorDefault" in retry_flow
-    assert "applyError({ message: result.error || msg.errorDefault })" in retry_flow
+    assert "message: result.error || msg.errorDefault" in retry_flow
+    assert "code: result.code" in retry_flow
     assert "errorPanel.classList.add('visible')" in apply_error
     assert "retryButton.disabled = false" in retry_flow
     assert "recoveryRetryButton.disabled = false" in retry_flow
@@ -577,7 +581,45 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert boot_html.count("profileInUse:") == 6
 
 
-def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None:
+def test_keychain_startup_recovery_is_actionable_without_plaintext_fallback() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    boot_html = _read("desktop/electron/src/boot.html")
+
+    assert "type BootErrorCode = 'keychain_unavailable'" in main_ts
+    assert "code?: BootErrorCode" in main_ts
+    assert "throw new DesktopStartupError(" in main_ts
+    assert "'keychain_unavailable'" in main_ts
+    assert "...(error instanceof DesktopStartupError ? { code: error.code } : {})" in main_ts
+    assert "function invalidateSecretStorageBackendCache(): void" in main_ts
+    assert "const MAC_KEYCHAIN_ACCESS_PATHS = [" in main_ts
+    assert "/System/Library/CoreServices/Applications/Keychain Access.app" in main_ts
+    assert "/Applications/Utilities/Keychain Access.app" in main_ts
+    assert "if (process.platform !== 'darwin') return false" in main_ts
+
+    open_keychain = _section(
+        main_ts,
+        "ipcMain.handle('desktop:boot:open-keychain'",
+        "interface BootResumeAuthority",
+    )
+    assert "trustedRecoveryIpc(event)" in open_keychain
+    assert "openMacKeychainAccess()" in open_keychain
+    assert "ipcRenderer.invoke('desktop:boot:open-keychain')" in preload
+
+    assert 'id="openKeychain"' in boot_html
+    assert 'data-i18n="openKeychain"' in boot_html
+    assert "payload.code === 'keychain_unavailable'" in boot_html
+    assert "openKeychainButton.hidden = !keychainUnavailable" in boot_html
+    assert "api.openKeychainAccess()" in boot_html
+    assert "keychainUnavailable:" in boot_html
+    assert boot_html.count("openKeychain:") == 6
+    assert boot_html.count("keychainUnavailable:") == 6
+
+    encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
+    assert "catch {\n      return plainSecret(secret)" not in encryption
+
+
+def test_boot_error_and_recovery_states_freeze_determinate_progress() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     paused_styles = _section(
         boot_html,
@@ -595,12 +637,16 @@ def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None
         "async function runRecoveryAction",
     )
 
-    assert "animation: none" in paused_styles
+    assert "opacity: 0.45" in paused_styles
+    assert "@keyframes progress" not in boot_html
+    assert "animation: progress" not in boot_html
     assert "body.errored .loader::before" in paused_styles
     assert "body.errored .loader span" in paused_styles
     assert "animation-play-state: paused" in paused_styles
     assert "document.body.classList.add('errored')" in apply_error
     assert "document.body.classList.add('recovering', 'errored')" in render_recovery
+    assert "resetBootProgressOnNextStatus = true" in apply_error
+    assert "resetBootProgressOnNextStatus = true" in render_recovery
 
 
 def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() -> None:
@@ -642,6 +688,65 @@ def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() 
     assert "phaseStartedAt = performance.now() - Math.max(0, wallAgeMs)" in apply_status
     assert "updateTimer()" in apply_status
     assert "performance.now() - phaseStartedAt" in timer
+
+
+def test_boot_progress_reports_only_completed_startup_milestones() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    main_ts = _read("desktop/electron/src/main.ts")
+    apply_status = _section(
+        boot_html,
+        "function applyStatus(payload)",
+        "function applyError(payload)",
+    )
+    render_progress = _section(
+        boot_html,
+        "function renderBootProgress()",
+        "function applyStatus(payload)",
+    )
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert 'id="startupProgress"' in boot_html
+    assert 'role="progressbar"' in boot_html
+    assert 'aria-labelledby="phase"' in boot_html
+    assert 'aria-valuemin="0"' in boot_html
+    assert 'aria-valuemax="4"' in boot_html
+    assert 'aria-valuenow="0"' in boot_html
+    assert 'id="progressCount">0/4<' in boot_html
+
+    for phase, value in {
+        "profile": 0,
+        "'gateway-start'": 1,
+        "'gateway-health'": 2,
+        "control": 3,
+        "ready": 4,
+    }.items():
+        assert f"{phase}: {value}" in boot_html
+
+    assert "Math.max(completedBootMilestones, reportedProgress)" in apply_status
+    assert "if (Number.isInteger(reportedProgress))" in apply_status
+    assert "if (resetBootProgressOnNextStatus)" in apply_status
+    assert "resetBootProgressOnNextStatus = false" in apply_status
+    assert "const activeStep = stepMap[phaseId]" in apply_status
+    assert "if (activeStep) setStepState" in apply_status
+    assert "stepMap[phaseId] || 'profile'" not in apply_status
+    assert "--boot-progress" in render_progress
+    assert "aria-valuenow" in render_progress
+    assert "progressCount.textContent" in render_progress
+
+    assert (
+        "sendBootStatus('profile')\n"
+        "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
+        in start_gateway
+    )
+    assert (
+        "sendBootStatus('gateway-health')\n"
+        "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
+        not in start_gateway
+    )
 
 
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
@@ -745,6 +850,8 @@ def test_primary_repair_ui_is_accessible_without_profile_choices() -> None:
 def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     locale_keys = (
+        "openKeychain",
+        "keychainUnavailable",
         "recoveryTitle",
         "recoveryTitleLockBusy",
         "recoveryTitleUpdate",
@@ -1399,6 +1506,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
+    assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
     assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
     assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
@@ -1416,14 +1524,32 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "DESKTOP_ENSEMBLE_PROFILES[selectionMode]" in main_ts
 
     expected_models = (
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
         "kimi-k2.7-code",
         "glm-5.2",
         "kimi-k2.6",
     )
     for model in expected_models:
         assert model in tokenrhythm_profile
+    assert "ensembleEnabled: true" in tokenrhythm_profile
+    assert "thinkingLevel" not in tokenrhythm_profile
+    assert "ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}" in main_ts
+
+
+def test_desktop_legacy_inline_router_does_not_inherit_new_c3_ensemble() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    normalizer = _read("desktop/electron/src/router-tier-normalization.ts")
+    package_json = json.loads(_read("desktop/electron/package.json"))
+
+    assert "normalizeRouterTiers" in main_ts
+    assert "for (const tier of Object.values(out)) delete tier.ensembleEnabled" in normalizer
+    assert "hasOwnProperty.call(tier, 'ensembleEnabled')" in normalizer
+    assert "hasOwnProperty.call(tier, 'ensemble_enabled')" in normalizer
+    assert "normalizeBooleanSetting(ensembleEnabled, false)" in normalizer
+    assert package_json["scripts"]["test:router-tier-normalization"] == (
+        "npm run build && node scripts/test-router-tier-normalization.mjs"
+    )
 
 
 def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer() -> None:
@@ -2411,9 +2537,27 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "real Electron process" in gate
     assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
     assert "requires an unlocked foreground GUI session" in native
+    assert "OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'" in native
+    assert "const annotationGeometryDeltas = fixture.stressMode" in native
+    assert "? [96, -24, 24, -32, 32]" in native
+    assert "const annotationRearmCycleCount = fixture.stressMode ? 3 : 1" in native
+    assert "restoreTrustedAnnotationInputFocus" in native
+    assert "state.ownerFocused" in native
+    assert "&& state.nativeFocused" in native
+    assert "&& state.documentFocused" in native
+    assert "&& state.editorFocused" in native
+    assert "(!ownerFocused || nativeFocused)" not in native
+    assert "(!cycle.ownerFocused || cycle.nativeFocused)" not in native
+    assert native.count("type: 'char'") == 1
+    assert native.count(".insertText(") == 1
+    assert "window.__opensquillaNativeInputProbe" in native
+    assert "observed.input.length > 0" in native
+    assert "ELECTRON_FOREGROUND_PREREQUISITE_MISSING" in native
+    assert "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED" in native
+    assert "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED" in native
     assert ci.count(
         "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
-    ) == 2
+    ) == 3
 
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
@@ -2864,15 +3008,42 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     script = _read(
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
+    main = _read("desktop/electron/src/main.ts")
+    lifecycle = _read("desktop/electron/src/gateway-lifecycle.ts")
 
     assert package_json["scripts"]["test:gateway-orphan-recovery-flow"] == (
         "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
-    assert "await launchDesktop()" in script
+    assert "await launchDesktop(" in script
     assert "loaded.record.pid !== firstRecord.pid" in script
     assert "waitForDesktopGatewayOwnershipRelease" in script
+    assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
+    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main
+    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in script
+    assert "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + CONTROL_UI_ROUTE_TIMEOUT_MS" in script
+    assert (
+        "VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS"
+        in script
+    )
+    assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
+    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000" in script
+    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
+    assert (
+        "createPhaseBudget(\n"
+        "    'windows-electron-child-cleanup',\n"
+        "    WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS,\n"
+        "  )"
+    ) in script
+    assert "timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS" in script
+    assert "phase.remainingMs('first-window')" in script
+    assert "phase.remainingMs('control-ui-route')" in script
+    assert "DESKTOP_E2E_PHASE_TIMEOUT:" in script
+    assert "DESKTOP_E2E_PHASE_FAILED:" in script
+    assert "DESKTOP_E2E_PROCESS_EXITED:" in script
+    assert "if (flowSucceeded && stillLive.length === 0)" in script
+    assert "async function waitFor(check, label, timeoutMs = 60_000)" not in script
 
 
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
@@ -3381,6 +3552,15 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     )
     save_index = reconcile.index("await saveImportedDesktopCredential(")
     assert save_index < reconcile.index("await clearPendingMigrationProviderSetup()", save_index)
+
+    pending_reconciliation = _section(
+        main_ts,
+        "async function recoverPendingMigrationReconciliation",
+        "function desktopStartupLog",
+    )
+    assert pending_reconciliation.index(
+        "beginDesktopWriterOperation('recover imported provider settings')"
+    ) < pending_reconciliation.index("readPendingMigrationProviderSetup()")
 
     encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
     assert "desktopSecretStoragePolicyBackend()" in encryption

@@ -1,3 +1,5 @@
+import json
+
 from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
 from opensquilla.gateway import session_streams
 from opensquilla.gateway.session_streams import (
@@ -302,6 +304,44 @@ def test_live_turn_snapshot_preserves_text_steer_text_boundary_order() -> None:
         first["stream_seq"],
         applied["stream_seq"],
         second["stream_seq"],
+    ]
+
+
+def test_live_turn_snapshot_keeps_adjacent_retry_model_calls_distinct() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    session_key = "agent:main:steered-retry"
+    task_id = "task-steered-retry"
+
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {
+            "task_id": task_id,
+            "text": "first attempt",
+            "model_call_id": "2.0",
+            "iteration": 2,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {
+            "task_id": task_id,
+            "text": "retry attempt",
+            "model_call_id": "2.1",
+            "iteration": 2,
+        },
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert [event.payload["text"] for event in snapshot.events] == [
+        "first attempt",
+        "retry attempt",
+    ]
+    assert [event.payload["model_call_id"] for event in snapshot.events] == [
+        "2.0",
+        "2.1",
     ]
 
 
@@ -846,7 +886,11 @@ def test_provider_activity_pulses_are_lossy_in_replay_but_keep_phase_boundaries(
         "reasoning",
     ]
     assert activity[-1].payload["pulse"] == 2
-    assert activity[-1].stream_seq == latest["stream_seq"]
+    # Heartbeats update the existing row but retain its first activity order;
+    # the last pulse's transport sequence must not move the phase.
+    assert activity[-1].stream_seq == 2
+    assert activity[-1].payload["stream_seq"] == 2
+    assert latest["stream_seq"] == 4
 
 
 def test_reset_session_streams_starts_a_fresh_embedded_gateway_generation() -> None:
@@ -864,3 +908,121 @@ def test_reset_session_streams_starts_a_fresh_embedded_gateway_generation() -> N
         assert first.current_seq("agent:main:test") == 1
     finally:
         reset_session_streams()
+
+
+def test_terminal_handoff_retains_only_sanitized_v2_and_is_single_use() -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:terminal-snapshot"
+    common = {"task_id": "task-1", "turn_id": "task-1"}
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**common, "phase": "requesting"},
+    )
+    registry.record(
+        session_key,
+        "session.event.tool_use_start",
+        {
+            **common,
+            "tool_use_id": "tool-1",
+            "tool_name": "write_file",
+            "arguments": {"file_path": "C:/private/secret.txt"},
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.tool_result",
+        {
+            **common,
+            "tool_use_id": "tool-1",
+            "tool_name": "write_file",
+            "result": "PRIVATE RESULT",
+        },
+    )
+    registry.record(session_key, "session.event.done", common)
+
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key,
+        "task-1",
+        turn_id="task-1",
+    )
+    assert snapshot is not None
+    assert snapshot["complete"] is True
+    serialized = json.dumps(snapshot)
+    assert "C:/private" not in serialized
+    assert "PRIVATE RESULT" not in serialized
+    assert "arguments" not in serialized
+    assert registry.take_terminal_activity_snapshot(
+        session_key,
+        "task-1",
+        turn_id="task-1",
+    ) is None
+
+
+def test_live_snapshot_keeps_text_presentation_boundaries(monkeypatch) -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:text-presentation"
+    common = {"task_id": "task-1", "turn_id": "task-1"}
+    clock = iter((1_000, 2_000, 3_000))
+    monkeypatch.setattr(session_streams, "_epoch_time_ms", lambda: next(clock))
+    first = registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**common, "text": "process", "presentation": "intermediate"},
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**common, "text": " answer", "presentation": "answer"},
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**common, "text": " continued", "presentation": "answer"},
+    )
+
+    text_events = [
+        event
+        for event in registry.live_snapshot(session_key).events
+        if event.event_name == "session.event.text_delta"
+    ]
+    assert [(event.payload["text"], event.stream_seq) for event in text_events] == [
+        ("process", first["stream_seq"]),
+        (" answer continued", 2),
+    ]
+    assert text_events[1].payload["emitted_at"] == 2_000
+    assert text_events[1].payload["ended_at"] == 3_000
+
+
+def test_generation_reset_preserves_tool_start_when_result_proves_completion() -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:result-completed-tool"
+    common = {"task_id": "task-1", "turn_id": "task-1", "generation_epoch": 0}
+    registry.record(
+        session_key,
+        "session.event.tool_use_start",
+        {**common, "tool_use_id": "tool-1", "tool_name": "lookup"},
+    )
+    registry.record(
+        session_key,
+        "session.event.tool_result",
+        {**common, "tool_use_id": "tool-1", "tool_name": "lookup", "result": "ok"},
+    )
+    registry.record(
+        session_key,
+        "session.event.answer_generation_reset",
+        {
+            **common,
+            "old_generation_epoch": 0,
+            "new_generation_epoch": 1,
+            "preserve_completed_tools": True,
+        },
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert [event.event_name for event in snapshot.events] == [
+        "session.event.tool_use_start",
+        "session.event.tool_result",
+        "session.event.answer_generation_reset",
+    ]

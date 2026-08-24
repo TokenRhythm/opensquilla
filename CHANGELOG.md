@@ -6,8 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Fresh and managed TokenRhythm configurations now use DeepSeek V4 Flash 0731
+  for C0, DeepSeek V4 Pro 0813 as the direct and C1 default, Kimi K2.7 Code for
+  C2, and GLM 5.2 B5 fusion for C3. Existing custom inline tiers are not
+  migrated, and the mixed-family preset continues to leave thinking levels
+  unset.
 ### Fixed
 
+- Desktop startup now shows monotonic, milestone-based progress without
+  estimating remaining time or changing recovery and Gateway startup behavior.
 - Stop now acknowledges immediately for provider and ordinary tool work while
   safely settling in-flight filesystem mutations before publishing a terminal
   turn. Late provider or tool results are discarded, timed-out writes retain

@@ -202,6 +202,35 @@ def test_delete_ref_removes_only_the_requested_artifact(tmp_path: Path) -> None:
     assert store.resolve_for_download(second.id, session_id="session-1")[0] == second
 
 
+def test_list_internal_refs_is_bounded_and_excludes_listed_artifacts(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    hidden = store.publish_bytes(
+        b"hidden",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="hidden.html",
+        mime="text/html",
+        source="document_html_agent_candidate:turn-hash",
+        visibility="internal",
+    )
+    listed = store.publish_bytes(
+        b"listed",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="listed.html",
+        mime="text/html",
+        source="document_html_agent_candidate:turn-hash",
+    )
+
+    refs = store.list_internal_refs(
+        "session-1",
+        source_suffix="_agent_candidate:turn-hash",
+        limit=1,
+    )
+    assert tuple(ref.id for ref in refs) == (hidden.id,)
+    assert listed.id not in {ref.id for ref in refs}
+
+
 def test_preallocated_artifact_id_is_exclusive_and_restart_deletable(
     tmp_path: Path,
 ) -> None:

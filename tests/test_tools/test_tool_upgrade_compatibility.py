@@ -105,4 +105,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "tool_result_retrieval_available",
         "parent_session_key",
         "parent_task_id",
+        "artifact_candidate_loop_controller",
+        "artifact_preview_service",
+        "tool_result_media",
     ]

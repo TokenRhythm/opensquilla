@@ -589,6 +589,8 @@ export interface ChatSendParams {
 
 export interface ChatSendResponse {
   sessionKey?: string
+  /** Snake-case alias returned by older Gateway/WebSocket serializers. */
+  session_key?: string
   message_id?: string
   user_message_id?: string
   client_message_id?: string

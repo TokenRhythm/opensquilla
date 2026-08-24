@@ -9,6 +9,7 @@ import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.gateway.artifact_contexts import PROMPT_ANNOTATION_TOOL_NAMES
 from opensquilla.observability.prompt_report import build_prompt_report
 from opensquilla.provider import (
     ContentBlockText,
@@ -19,8 +20,10 @@ from opensquilla.provider import (
     ToolDefinition,
     ToolInputSchema,
 )
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.types import DoneEvent, TextDeltaEvent
 from opensquilla.session.models import TranscriptEntry
+from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import ToolContext
 
 
@@ -58,6 +61,39 @@ class _DoneProvider:
         yield DoneEvent(stop_reason="end_turn")
 
 
+class _ProjectingTokenRhythmProvider(_DoneProvider):
+    provider_name = "tokenrhythm"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.payload: dict[str, Any] = {}
+        self._wire_provider = OpenAIProvider(
+            api_key="synthetic-fixed-model-key",
+            model="glm-5.2",
+            base_url="https://tokenrhythm.studio/v1",
+            provider_kind="tokenrhythm",
+            provider_id="tokenrhythm",
+        )
+
+    async def chat(
+        self,
+        messages: list[Any],
+        tools: list[Any] | None = None,
+        config: Any | None = None,
+    ) -> Any:
+        self.calls += 1
+        self.messages = list(messages)
+        self.tools = tools
+        self.config = config
+        self.payload = self._wire_provider.project_final_request(
+            messages,
+            tools,
+            config,
+        ).payload
+        yield TextDeltaEvent(text="verified")
+        yield DoneEvent(stop_reason="end_turn")
+
+
 async def _unused_tool_handler(call: Any) -> ToolResult:
     return ToolResult(
         tool_use_id=call.tool_use_id,
@@ -71,19 +107,48 @@ async def _unused_tool_handler(call: Any) -> ToolResult:
     "capabilities",
     [
         None,
-        ModelCapabilities(supports_tools=False),
         ModelCapabilities(supports_tools=True),
     ],
 )
-async def test_artifact_mutation_rejects_unverified_tool_model_before_provider(
+async def test_artifact_mutation_allows_unknown_tool_capability(
     capabilities: ModelCapabilities | None,
 ) -> None:
-    provider = _NeverCalledProvider()
+    provider = _DoneProvider()
     agent = Agent(
         provider=provider,
         config=AgentConfig(
             metadata={"artifact_operation_class": "selection_edit"},
             model_capabilities=capabilities,
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="document_apply",
+                description="Apply granted document mutations.",
+                input_schema=ToolInputSchema(properties={}, required=[]),
+            )
+        ],
+        tool_handler=_unused_tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("apply the annotation")]
+
+    assert provider.calls == 1
+    assert provider.tools is not None
+    assert [tool.name for tool in provider.tools] == ["document_apply"]
+    assert not any(
+        event.kind == "error" and event.code == "artifact_model_tools_unsupported"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_artifact_mutation_rejects_explicitly_unsupported_tool_model() -> None:
+    provider = _NeverCalledProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            metadata={"artifact_operation_class": "selection_edit"},
+            model_capabilities=ModelCapabilities(supports_tools=False),
         ),
         tool_definitions=[
             ToolDefinition(
@@ -127,6 +192,46 @@ async def test_artifact_mutation_allows_authoritatively_verified_tool_model() ->
     events = [event async for event in agent.run_turn("apply the annotation")]
 
     assert provider.calls == 1
+    assert not any(
+        event.kind == "error" and event.code == "artifact_model_tools_unsupported"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixed_tokenrhythm_glm_5_2_receives_all_annotation_tools_when_unverified() -> None:
+    tool_context = ToolContext(
+        is_owner=True,
+        exclusive_tools=PROMPT_ANNOTATION_TOOL_NAMES,
+        allowed_tools=set(PROMPT_ANNOTATION_TOOL_NAMES),
+        surfaced_tools=set(PROMPT_ANNOTATION_TOOL_NAMES),
+    )
+    tool_definitions = get_default_registry().to_tool_definitions(tool_context)
+    provider = _ProjectingTokenRhythmProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            provider_id="tokenrhythm",
+            model_id="glm-5.2",
+            metadata={"artifact_operation_class": "selection_edit"},
+            model_capabilities=ModelCapabilities(supports_tools=True),
+            model_tools_capability_verified=False,
+        ),
+        tool_definitions=tool_definitions,
+        tool_handler=_unused_tool_handler,
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("apply the annotation")]
+
+    assert provider.calls == 1
+    assert provider.tools is not None
+    assert len(provider.tools) == len(PROMPT_ANNOTATION_TOOL_NAMES)
+    assert {tool.name for tool in provider.tools} == PROMPT_ANNOTATION_TOOL_NAMES
+    assert len(provider.payload["tools"]) == len(PROMPT_ANNOTATION_TOOL_NAMES)
+    assert {
+        tool["function"]["name"] for tool in provider.payload["tools"]
+    } == PROMPT_ANNOTATION_TOOL_NAMES
     assert not any(
         event.kind == "error" and event.code == "artifact_model_tools_unsupported"
         for event in events

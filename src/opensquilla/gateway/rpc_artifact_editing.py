@@ -1204,7 +1204,45 @@ async def _emit_artifact_state(
     revision_id: str | None = None,
     change_set_id: str | None = None,
 ) -> None:
-    latest = await service.latest_audit_event(document_id)
+    # Resolve a notification sequence from the exact durable mutation.  A
+    # source.patched replay can happen after another audit event has landed;
+    # ``latest_audit_event`` would then fence the UI with the wrong sequence.
+    exact_lookup = getattr(service, "audit_event_for_mutation", None)
+    if callable(exact_lookup) and (revision_id is not None or change_set_id is not None):
+        latest = await exact_lookup(
+            document_id,
+            revision_id=revision_id,
+            change_set_id=change_set_id,
+        )
+    elif revision_id is not None or change_set_id is not None:
+        latest = None
+        list_events = getattr(service, "list_audit_events", None)
+        if callable(list_events):
+            for event in await list_events(document_id):
+                event_type = getattr(event, "event_type", "")
+                exact_pair = revision_id is not None and change_set_id is not None
+                if not exact_pair and not (
+                    isinstance(event_type, str)
+                    and (
+                        event_type.startswith("revision.")
+                        or event_type
+                        in {
+                            "document.created",
+                            "document.restored",
+                            "document.reverted",
+                            "change_set.applied",
+                        }
+                    )
+                ):
+                    continue
+                if revision_id is not None and event.revision_id != revision_id:
+                    continue
+                if change_set_id is not None and event.change_set_id != change_set_id:
+                    continue
+                if latest is None or event.sequence > latest.sequence:
+                    latest = event
+    else:
+        latest = await service.latest_audit_event(document_id)
     if latest is None:
         return
     payload = {

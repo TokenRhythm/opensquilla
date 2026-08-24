@@ -42,7 +42,9 @@ from .models import (
     WriterLease,
 )
 from .mutation_attempts import (
+    ArtifactCandidateLoopController,
     ArtifactMutationAttemptController,
+    CandidateLoopState,
     MutationAttemptReservation,
 )
 from .mutation_outcomes import document_mutation_outcome_from_attempt
@@ -62,6 +64,7 @@ __all__ = [
     "AnchorState",
     "ArtifactBlobRef",
     "ArtifactConflictError",
+    "ArtifactCandidateLoopController",
     "ArtifactKind",
     "ArtifactMutationAttemptController",
     "ArtifactNotFoundError",
@@ -72,6 +75,7 @@ __all__ = [
     "AuditEvent",
     "ChangeSet",
     "ChangeSetStatus",
+    "CandidateLoopState",
     "CommitResult",
     "Document",
     "DocumentImportAttempt",

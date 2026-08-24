@@ -592,12 +592,12 @@ class ModelCatalog:
         """Return whether ``supports_tools`` came from an authoritative layer.
 
         ``resolve_entry`` deliberately synthesizes ``supports_tools=True`` for
-        unknown models to preserve the historical general-chat behavior.  A
-        source-backed Artifact mutation cannot use that optimistic fallback:
-        it grants a model a persistent writer tool.  This helper therefore
-        answers provenance, not capability value, and stays false unless a
-        user override, live catalog, packaged correction, snapshot, or a
-        trusted host rule explicitly supplied the tools flag.
+        unknown models so agent turns keep their authorized tool surface. This
+        helper answers provenance, not authorization or capability admission,
+        and stays false unless a user override, live catalog, packaged
+        correction, snapshot, or a trusted host rule explicitly supplied the
+        tools flag. Callers must not turn an unverified value into a tools
+        denial; only an explicit ``supports_tools=False`` does that.
         """
 
         provider_id = str(provider_name or "").strip().lower()

@@ -781,6 +781,7 @@ summary.control-row--divider:focus-visible {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 /* Subagent indent: a left rail mirrors the console list's nested look. The

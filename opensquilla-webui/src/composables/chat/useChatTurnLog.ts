@@ -60,6 +60,7 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   const accumulator = new TurnAccumulator()
   let acceptedFrames: Frame[] = []
   let appendIndex = 0
+  let acceptedActivityOrder: number | undefined
   let snapshotDirty = false
   let publishPending = false
   let triggerSnapshot: () => void = () => {}
@@ -126,7 +127,15 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   }
 
   function appendFrame(frame: FrameInput) {
-    const accepted = { ...frame, seq: appendIndex++ } as Frame
+    const accepted = {
+      ...frame,
+      seq: appendIndex++,
+      ...(frame.activityOrder !== undefined
+        ? { activityOrder: frame.activityOrder }
+        : acceptedActivityOrder !== undefined
+          ? { activityOrder: acceptedActivityOrder }
+          : {}),
+    } as Frame
     accumulator.append(accepted)
     // The published frame stream is diagnostic-only in production, but the
     // compact accepted log is needed to rebuild the accumulator after an answer
@@ -156,10 +165,17 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     acceptedFrames = []
     events.value = []
     appendIndex = 0
+    acceptedActivityOrder = undefined
     snapshotDirty = true
     publishPending = false
     refreshSnapshot()
     triggerSnapshot()
+  }
+
+  function setAcceptedActivityOrder(value: number | undefined): void {
+    acceptedActivityOrder = Number.isSafeInteger(value) && Number(value) > 0
+      ? Number(value)
+      : undefined
   }
 
   function checkpointText() {
@@ -283,6 +299,7 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     events,
     useReducer,
     appendFrame,
+    setAcceptedActivityOrder,
     publish,
     resetLog,
     checkpointText,

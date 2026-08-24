@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type {
   PendingInputWal,
@@ -165,18 +165,33 @@ describe('useChatSend prompt annotations', () => {
     )
   })
 
+  it('publishes both request and canonical session keys after draft materialization', async () => {
+    const harness = createHarness()
+    harness.rpc.call.mockResolvedValueOnce({
+      sessionKey: 'agent:main:webchat:canonical',
+      task_id: 'task-1',
+      acceptedPromptAnnotationIds: ['annotation-2'],
+    })
+
+    await harness.api.onSend()
+
+    expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
+      ['annotation-2', 'annotation-1'],
+      ['annotation-2'],
+      'agent:main:webchat:canonical',
+      'agent:main:webchat:test',
+    )
+  })
+
   it('does not infer acceptance when an older response omits accepted IDs', async () => {
     const harness = createHarness()
     harness.rpc.call.mockResolvedValue({ sessionKey: 'agent:main:webchat:test', task_id: 'task-1' })
 
     await harness.api.onSend()
 
-    expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
-      ['annotation-2', 'annotation-1'],
-      [],
-      'agent:main:webchat:test',
-    )
-    expect(harness.options.messages.value[0]?.promptAnnotations).toBeUndefined()
+    expect(harness.options.acknowledgePromptAnnotations).not.toHaveBeenCalled()
+    expect(harness.options.messages.value[0]?.promptAnnotations?.map(item => item.annotationId))
+      .toEqual(['annotation-2', 'annotation-1'])
   })
 
   it('keeps a stale batch completely local while send is blocked', async () => {
@@ -437,5 +452,22 @@ describe('useChatSend prompt annotations', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('retains annotation ids when a queued follow-up drains after the first turn', async () => {
+    const harness = createHarness({ promptAnnotationIds: ref([]) })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-annotation-follow-up',
+      ownerSessionKey: 'agent:main:webchat:test',
+      text: 'Apply the second selected edit.',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(harness.api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    }))
   })
 })

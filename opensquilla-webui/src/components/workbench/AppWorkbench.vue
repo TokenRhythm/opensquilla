@@ -246,6 +246,7 @@ import {
   type ArtifactPromptAnnotationReuseDetail,
   type ArtifactPromptAnnotationsAcceptedDetail,
 } from '@/workbench/promptAnnotations'
+import { PromptAnnotationAcceptanceQueue } from '@/workbench/promptAnnotationAcceptanceQueue'
 import { useWorkbenchStore } from '@/workbench/store'
 import type {
   NativeSurfaceRect,
@@ -466,6 +467,22 @@ workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   t: (key, params) => String(t(key, params || {})),
 }), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
+const promptAnnotationAcceptanceQueue = new PromptAnnotationAcceptanceQueue()
+let promptAnnotationAcceptanceFlush: Promise<void> | null = null
+let promptAnnotationAcceptanceFlushRequested = false
+let promptAnnotationAcceptanceRetryTimer: ReturnType<typeof setTimeout> | null = null
+let promptAnnotationAcceptanceRetryDelay = 250
+const stopPromptAnnotationLifecycle = store.onLifecycle(event => {
+  // The acceptance response can arrive before the resource/session descriptor
+  // is mounted. Open and update are the authoritative handoff boundaries;
+  // activation/resume also cover a tab that was already retained but hidden.
+  if (
+    event.type === 'open'
+    || event.type === 'update'
+    || event.type === 'activate'
+    || event.type === 'resume'
+  ) schedulePromptAnnotationAcceptanceFlush()
+})
 
 function resourceSessionKey(item: WorkbenchItem): string {
   return item.scope.type === 'session' ? item.scope.id : ''
@@ -985,26 +1002,95 @@ async function onPromptAnnotationReuse(event: Event) {
   detail.complete?.(true)
 }
 
+async function deliverPromptAnnotationAcceptance(
+  item: WorkbenchItem,
+  acceptedIds: readonly string[],
+): Promise<boolean> {
+  // A descriptor may be replaced while the runtime queue is draining. Keep
+  // the acknowledgement queued in that case; the store's update lifecycle
+  // will retry against the authoritative descriptor.
+  const current = store.items.find(candidate => candidate.id === item.id)
+  if (current !== item || item.kind !== 'artifact-preview') return false
+  runtimeManager.handleComponentEvent(item, {
+    type: 'artifact-prompt-annotations-accepted',
+    payload: { acceptedIds: [...acceptedIds] },
+  })
+  await runtimeManager.flush(item.id)
+  if (store.items.find(candidate => candidate.id === item.id) !== item) return false
+  // A stale descriptor can pass the identity check while its runtime is still
+  // being disposed/recreated.  In that window handleComponentEvent is a
+  // no-op; consuming the acknowledgement would leave the native picker active
+  // forever because no later event would replay it.  Keep it queued until the
+  // matching runtime exists and has processed the event.
+  if (!runtimeManager.hasRuntime(item.id)) return false
+  const state = runtimeManager.getRenderState(item.id)
+  // A runtime instance may be present before its provider constructor has
+  // published the initial render state. Treat that as an unprocessed event,
+  // rather than consuming the acknowledgement from an empty state object.
+  if (
+    !Object.prototype.hasOwnProperty.call(state, 'annotationMode')
+    || !Object.prototype.hasOwnProperty.call(state, 'annotationModeStopping')
+  ) return false
+  // `setArtifactAnnotationMode(false)` reports failures through render state
+  // rather than throwing. Do not consume the acknowledgement until the native
+  // picker is confirmed inactive; a later lifecycle/retry can then finish the
+  // cleanup instead of leaving the orange picker pressed for the next turn.
+  return state.annotationMode !== true && state.annotationModeStopping !== true
+}
+
+async function flushPromptAnnotationAcceptanceQueue(): Promise<void> {
+  await nextTick()
+  // A session can also have a resource collection or browser tab open. Only
+  // artifact previews can consume this event; passing other session-scoped
+  // items to the queue would make a no-op look like a failed delivery and
+  // retain an already-applied acknowledgement until TTL expiry.
+  const artifactItems = store.items.filter(item => item.kind === 'artifact-preview')
+  await promptAnnotationAcceptanceQueue.flush(
+    artifactItems,
+    sessionKeyFromWorkbenchItem,
+    deliverPromptAnnotationAcceptance,
+  )
+  if (promptAnnotationAcceptanceQueue.size === 0) {
+    promptAnnotationAcceptanceRetryDelay = 250
+    return
+  }
+  if (promptAnnotationAcceptanceRetryTimer) return
+  const delay = promptAnnotationAcceptanceRetryDelay
+  promptAnnotationAcceptanceRetryDelay = Math.min(delay * 2, 4_000)
+  promptAnnotationAcceptanceRetryTimer = setTimeout(() => {
+    promptAnnotationAcceptanceRetryTimer = null
+    schedulePromptAnnotationAcceptanceFlush()
+  }, delay)
+}
+
+function schedulePromptAnnotationAcceptanceFlush(): void {
+  if (promptAnnotationAcceptanceRetryTimer) {
+    clearTimeout(promptAnnotationAcceptanceRetryTimer)
+    promptAnnotationAcceptanceRetryTimer = null
+  }
+  if (promptAnnotationAcceptanceFlush) {
+    promptAnnotationAcceptanceFlushRequested = true
+    return
+  }
+  promptAnnotationAcceptanceFlush = flushPromptAnnotationAcceptanceQueue()
+    .catch(() => undefined)
+    .finally(() => {
+      promptAnnotationAcceptanceFlush = null
+      if (!promptAnnotationAcceptanceFlushRequested) return
+      promptAnnotationAcceptanceFlushRequested = false
+      schedulePromptAnnotationAcceptanceFlush()
+    })
+}
+
 async function onPromptAnnotationsAccepted(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
   if (!detail?.sessionKey || detail.acceptedIds.length === 0) return
-  // Chat acceptance can update the resource descriptor in the same render
-  // tick. Resolve the authoritative item after that update; RuntimeManager
-  // intentionally drops events carrying a stale descriptor identity.
-  await nextTick()
-  const pendingFlushes: Promise<void>[] = []
-  for (const item of store.items) {
-    if (
-      item.kind !== 'artifact-preview'
-      || sessionKeyFromWorkbenchItem(item) !== detail.sessionKey
-    ) continue
-    runtimeManager.handleComponentEvent(item, {
-      type: 'artifact-prompt-annotations-accepted',
-      payload: { acceptedIds: [...detail.acceptedIds] },
-    })
-    pendingFlushes.push(runtimeManager.flush(item.id))
+  // Chat acceptance can update the resource descriptor after this event. Keep
+  // the acknowledgement until an artifact item exists instead of relying on
+  // a fixed number of render ticks.
+  if (promptAnnotationAcceptanceQueue.enqueue(detail)) {
+    schedulePromptAnnotationAcceptanceFlush()
   }
-  await Promise.all(pendingFlushes)
 }
 
 async function beforeCloseItem(
@@ -1255,6 +1341,11 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   documentContextController.detach()
+  stopPromptAnnotationLifecycle()
+  promptAnnotationAcceptanceQueue.clear()
+  if (promptAnnotationAcceptanceRetryTimer) clearTimeout(promptAnnotationAcceptanceRetryTimer)
+  promptAnnotationAcceptanceRetryTimer = null
+  promptAnnotationAcceptanceFlushRequested = false
   window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
   window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
   window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)

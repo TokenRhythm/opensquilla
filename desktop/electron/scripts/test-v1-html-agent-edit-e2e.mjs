@@ -28,6 +28,7 @@ const INITIAL_HEADING = 'Synthetic draft heading'
 const MANUAL_HEADING = 'Manual V1 heading'
 const APPLIED_HEADING = 'Agent-patched V1 heading'
 const PATCHED_TITLE = 'Patched V1 fixture'
+const PRESERVED_COPY = 'This byte range must remain unchanged.'
 const GENERATED_HTML = `<!doctype html>
 <html lang="en">
   <head><meta charset="utf-8"><title>Synthetic V1 fixture</title></head>
@@ -51,6 +52,7 @@ const DUPLICATED_TARGET_HTML = UNRELATED_HTML.replace(
 )
 const ANNOTATION_BODY = 'Explain this synthetic paragraph without editing it.'
 const SECOND_ANNOTATION_BODY = 'Keep this heading concise and accessible.'
+const FOLLOW_UP_ANNOTATION_BODY = 'Confirm the heading remains readable after the first answer.'
 const AMBIGUOUS_ANNOTATION_BODY = 'Remove only the paragraph I selected.'
 const GENERATE_MESSAGE = 'Create and publish the requested synthetic single-file HTML page.'
 const ANNOTATION_MESSAGE = 'Answer the selected annotations without changing the document.'
@@ -60,6 +62,7 @@ const EXPECTED_ANNOTATION_TOOLS = [
   'document_apply',
   'document_inspect',
   'document_locate',
+  'document_patch',
   'document_read',
 ]
 const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
@@ -741,13 +744,128 @@ async function openGeneratedArtifact(page) {
     'Preview selected on artifact open',
     TIMEOUT_MS,
   )
+  await waitForReadyArtifactPreview(page)
+}
+
+async function waitForReadyArtifactPreview(page) {
   await page.locator('[data-document-section="preview"]').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await page.locator('.artifact-preview[data-preview-state="ready"]').waitFor({
     state: 'visible',
     timeout: TIMEOUT_MS,
   })
 }
 
-async function openGeneratedArtifactSource(page) {
+function normalizeRenderedSource(value) {
+  return String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .trim()
+}
+
+async function sourceEditorSnapshot(page) {
+  const studio = page.locator('.artifact-html-studio')
+  if (await studio.count() === 0) {
+    return {
+      editorPresent: false,
+      inputPresent: false,
+      renderedSource: '',
+    }
+  }
+  return await studio.evaluate(section => {
+    const editor = section.querySelector('.monaco-editor')
+    const inputs = editor?.querySelectorAll('textarea.inputarea, .native-edit-context') || []
+    const input = inputs.length ? inputs[inputs.length - 1] : null
+    const inputKind = input instanceof HTMLTextAreaElement
+      ? 'textarea'
+      : input?.classList.contains('native-edit-context')
+        ? 'native-edit-context'
+        : null
+    const inputReadOnly = input instanceof HTMLTextAreaElement ? input.readOnly : null
+    const ariaAutocomplete = input?.getAttribute('aria-autocomplete')
+    const inputEditable = inputKind === 'textarea'
+      ? inputReadOnly === false
+      : inputKind === 'native-edit-context'
+        ? ariaAutocomplete === 'both' || ariaAutocomplete === 'list'
+        : false
+    const active = document.activeElement
+    const save = section.querySelector('.artifact-html-studio__action')
+    const status = section.querySelector('.artifact-html-studio__status')
+    const renderedSource = editor?.querySelector('.view-lines')?.innerText || ''
+    return {
+      editorPresent: Boolean(editor),
+      inputPresent: Boolean(input),
+      inputKind,
+      inputEditable,
+      inputReadOnly,
+      ariaReadOnly: input?.getAttribute('aria-readonly'),
+      ariaAutocomplete,
+      focused: Boolean(input && active === input),
+      activeElement: active instanceof HTMLElement
+        ? {
+            tag: active.tagName.toLowerCase(),
+            className: String(active.className || ''),
+            role: active.getAttribute('role'),
+            ariaLabel: active.getAttribute('aria-label'),
+          }
+        : null,
+      status: status?.getAttribute('data-state'),
+      statusText: status?.textContent?.trim() || '',
+      saveDisabled: save instanceof HTMLButtonElement ? save.disabled : null,
+      error: section.querySelector('.artifact-html-studio__error')?.textContent?.trim() || '',
+      renderedSource,
+      renderedSourceLength: renderedSource.length,
+    }
+  })
+}
+
+async function waitForEditableSourceEditor(page, expectedSourceText) {
+  const editor = page.locator('.artifact-html-studio .monaco-editor')
+  await editor.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  let lastSnapshot = {}
+  try {
+    await waitFor(async () => {
+      lastSnapshot = await sourceEditorSnapshot(page)
+      const sourceLoaded = normalizeRenderedSource(lastSnapshot.renderedSource)
+        .includes(normalizeRenderedSource(expectedSourceText))
+      return lastSnapshot.editorPresent
+        && lastSnapshot.inputPresent
+        && lastSnapshot.inputEditable
+        && lastSnapshot.ariaReadOnly !== 'true'
+        && sourceLoaded
+        && !lastSnapshot.error
+    }, 'loaded and editable source editor', TIMEOUT_MS)
+
+    await editor.click()
+    const input = editor.locator('textarea.inputarea, .native-edit-context').last()
+    await input.focus()
+    await waitFor(async () => {
+      lastSnapshot = await sourceEditorSnapshot(page)
+      return lastSnapshot.focused
+        && lastSnapshot.inputEditable
+        && lastSnapshot.ariaReadOnly !== 'true'
+    }, 'focused editable Monaco input', 5_000)
+    return lastSnapshot
+  } catch (error) {
+    throw new Error(`${error.message}; editor snapshot: ${JSON.stringify(lastSnapshot)}`)
+  }
+}
+
+function changedSourceLines(previousSource, nextSource) {
+  const previousLines = new Set(
+    previousSource.split('\n').map(line => normalizeRenderedSource(line)).filter(Boolean),
+  )
+  const changed = nextSource
+    .split('\n')
+    .map(line => normalizeRenderedSource(line))
+    .filter(line => line && !previousLines.has(line))
+  assert.ok(changed.length > 0, 'replacement source must change at least one rendered model line')
+  return changed
+}
+
+async function openGeneratedArtifactSource(page, expectedSourceText = INITIAL_HEADING) {
   await openGeneratedArtifact(page)
   const sourceTab = page.getByRole('tab', { name: /^Source/ })
   await sourceTab.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
@@ -757,25 +875,202 @@ async function openGeneratedArtifactSource(page) {
     'Source selected after explicit user action',
     TIMEOUT_MS,
   )
-  await page.locator('.artifact-html-studio .monaco-editor').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await waitForEditableSourceEditor(page, expectedSourceText)
 }
 
-async function replaceSourceInEditor(page, source) {
+async function replaceSourceInEditor(page, source, previousSource, expectedCurrentText) {
   const editor = page.locator('.artifact-html-studio .monaco-editor')
-  await editor.click()
+  const before = await waitForEditableSourceEditor(page, expectedCurrentText)
+  const input = editor.locator('textarea.inputarea, .native-edit-context').last()
+  await input.focus()
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
   await page.keyboard.insertText(source)
   const save = page.locator('.artifact-html-studio__action')
-  await waitFor(async () => !await save.isDisabled(), 'dirty source editor', TIMEOUT_MS)
+  const expectedChangedLines = changedSourceLines(previousSource, source)
+  let changedSnapshot = {}
+  try {
+    await waitFor(async () => {
+      changedSnapshot = await sourceEditorSnapshot(page)
+      const rendered = normalizeRenderedSource(changedSnapshot.renderedSource)
+      return changedSnapshot.status === 'dirty'
+        && changedSnapshot.saveDisabled === false
+        && expectedChangedLines.every(line => rendered.includes(line))
+        && normalizeRenderedSource(changedSnapshot.renderedSource)
+          !== normalizeRenderedSource(before.renderedSource)
+    }, 'changed Monaco model and dirty source editor', 10_000)
+  } catch (error) {
+    throw new Error(`${error.message}; editor snapshot: ${JSON.stringify(changedSnapshot)}`)
+  }
+  assert.equal(await save.isDisabled(), false, 'changed Monaco model must enable Save')
   await save.click()
   await waitFor(
     async () => await page.locator('.artifact-html-studio__status').getAttribute('data-state') === 'saved',
     'saved source editor',
     TIMEOUT_MS,
   )
+}
+
+async function gatewayHealthSnapshot(port) {
+  const url = `http://127.0.0.1:${port}/health`
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(2_000) })
+    const body = await response.text()
+    return {
+      url,
+      reachable: true,
+      status: response.status,
+      body: body.slice(0, 2_000),
+    }
+  } catch (error) {
+    return {
+      url,
+      reachable: false,
+      error: String(error?.message || error),
+    }
+  }
+}
+
+async function diagnosticCall(label, operation, timeoutMs = 3_000) {
+  const controller = new AbortController()
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      delay(timeoutMs, undefined, { signal: controller.signal }).then(() => {
+        throw new Error(`${label} timed out after ${timeoutMs}ms`)
+      }),
+    ])
+  } finally {
+    controller.abort()
+  }
+}
+
+async function captureFailureEvidence({
+  app,
+  page,
+  error,
+  gatewayPort,
+  isolationRoot,
+  userDataDir,
+  pageErrors,
+  consoleErrors,
+}) {
+  const reportRoot = process.env.CI_REPORT_DIR?.trim()
+    || join(isolationRoot, 'failure-evidence')
+  await mkdir(reportRoot, { recursive: true })
+
+  const rawAttempt = process.env.OPENSQUILLA_DESKTOP_E2E_ATTEMPT
+    || process.env.GITHUB_RUN_ATTEMPT
+    || '1'
+  const attempt = rawAttempt.replace(/[^a-zA-Z0-9._-]/g, '_')
+  const reportStem = `v1-html-agent-edit-failure-attempt-${attempt}-${Date.now()}`
+
+  // Capture process, Gateway, and on-disk logs first. Renderer inspection is
+  // best-effort because a frozen renderer is one of the failures diagnosed by
+  // this report and must not prevent the durable evidence from being written.
+  let electronProcess = null
+  try {
+    const child = app?.process()
+    if (child) {
+      electronProcess = {
+        pid: child.pid,
+        exitCode: child.exitCode,
+        signalCode: child.signalCode,
+        killed: child.killed,
+      }
+    }
+  } catch (caught) {
+    electronProcess = { error: String(caught?.message || caught) }
+  }
+
+  const gateway = await gatewayHealthSnapshot(gatewayPort)
+  const copiedLogs = {}
+  for (const name of ['desktop.log', 'gateway.log']) {
+    const source = join(userDataDir, 'logs', name)
+    const destination = join(reportRoot, `${reportStem}-${name}`)
+    try {
+      await cp(source, destination)
+      copiedLogs[name] = destination
+    } catch (caught) {
+      copiedLogs[name] = { error: String(caught?.message || caught), source }
+    }
+  }
+
+  let renderer
+  let screenshot = null
+  if (page && !page.isClosed()) {
+    try {
+      const shell = await diagnosticCall('renderer shell snapshot', () => page.evaluate(() => {
+        const connection = document.querySelector('.conn-pill')
+        const active = document.activeElement
+        return {
+          url: location.href,
+          connection: connection
+            ? {
+                className: String(connection.className || ''),
+                text: connection.textContent?.trim() || '',
+              }
+            : null,
+          activeElement: active instanceof HTMLElement
+            ? {
+                tag: active.tagName.toLowerCase(),
+                className: String(active.className || ''),
+                role: active.getAttribute('role'),
+                ariaLabel: active.getAttribute('aria-label'),
+              }
+            : null,
+        }
+      }))
+      renderer = {
+        available: true,
+        ...shell,
+      }
+    } catch (caught) {
+      renderer = {
+        available: false,
+        shellError: String(caught?.message || caught),
+      }
+    }
+    try {
+      renderer.sourceEditor = await diagnosticCall(
+        'source editor snapshot',
+        () => sourceEditorSnapshot(page),
+      )
+    } catch (caught) {
+      renderer.sourceEditorError = String(caught?.message || caught)
+    }
+    try {
+      const screenshotPath = join(reportRoot, `${reportStem}.png`)
+      await diagnosticCall(
+        'failure screenshot',
+        () => page.screenshot({ path: screenshotPath, fullPage: true, timeout: 3_000 }),
+      )
+      screenshot = screenshotPath
+    } catch (caught) {
+      renderer.screenshotError = String(caught?.message || caught)
+    }
+  } else {
+    renderer = {
+      available: false,
+      error: 'renderer page is unavailable or already closed',
+    }
+  }
+
+  const captured = {
+    capturedAt: new Date().toISOString(),
+    beforeElectronClose: true,
+    error: String(error?.stack || error),
+    isolationRoot,
+    renderer,
+    electronProcess,
+    gateway,
+    pageErrors: [...pageErrors],
+    consoleErrors: [...consoleErrors],
+    screenshot,
+    copiedLogs,
+  }
+  const reportPath = join(reportRoot, `${reportStem}.json`)
+  await writeFile(reportPath, `${JSON.stringify(captured, null, 2)}\n`, 'utf8')
+  return { ...captured, reportPath }
 }
 
 async function verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab) {
@@ -900,22 +1195,56 @@ async function previewWebContentsSnapshot(electronApp) {
   })
 }
 
-async function selectElementInNativePreview(electronApp, selector) {
-  return await electronApp.evaluate(async ({ webContents }, targetSelector) => {
-    const contents = webContents.getAllWebContents().find(candidate => {
+async function selectElementInNativePreview(electronApp, selector, expectedSourceMarker) {
+  return await electronApp.evaluate(async ({ webContents }, input) => {
+    const { targetSelector, expectedMarker } = input
+    let contents = null
+    const candidates = []
+    for (const candidate of webContents.getAllWebContents()) {
       try {
         const url = new URL(candidate.getURL())
-        if (!url.hostname.endsWith('.localhost')) return false
         const owner = candidate.getOwnerBrowserWindow()
         const view = owner?.contentView.children.find(item => (
           item.webContents?.id === candidate.id
         ))
-        return view?.getVisible?.() === true
+        const snapshot = {
+          id: candidate.id,
+          url: candidate.getURL().startsWith('data:')
+            ? `${candidate.getURL().slice(0, 32)}…`
+            : candidate.getURL(),
+          host: url.hostname,
+          visible: view?.getVisible?.() === true,
+          bounds: view?.getBounds?.() || null,
+          ownerDestroyed: owner?.isDestroyed?.() ?? null,
+        }
+        if (!url.hostname.endsWith('.localhost')) {
+          candidates.push(snapshot)
+          continue
+        }
+        if (view?.getVisible?.() !== true) {
+          candidates.push(snapshot)
+          continue
+        }
+        if (expectedMarker) {
+          const source = await candidate.executeJavaScript(
+            'document.documentElement?.outerHTML || ""',
+            true,
+          )
+          snapshot.markerMatched = source.includes(expectedMarker)
+          if (!snapshot.markerMatched) {
+            candidates.push(snapshot)
+            continue
+          }
+        }
+        contents = candidate
+        break
       } catch {
-        return false
+        continue
       }
-    })
-    if (!contents) throw new Error('Native HTML preview WebContents was not found.')
+    }
+    if (!contents) {
+      throw new Error(`Native HTML preview WebContents was not found: ${JSON.stringify(candidates)}`)
+    }
     const rect = await contents.executeJavaScript(`(() => {
       const element = document.querySelector(${JSON.stringify(targetSelector)})
       if (!element) return null
@@ -942,7 +1271,7 @@ async function selectElementInNativePreview(electronApp, selector) {
       type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
     })
     return { x, y, url: contents.getURL(), tagName: rect.tagName }
-  }, selector)
+  }, { targetSelector: selector, expectedMarker: expectedSourceMarker })
 }
 
 async function annotationOverlayState(electronApp) {
@@ -977,6 +1306,22 @@ async function annotationOverlayState(electronApp) {
     }
     return null
   })
+}
+
+async function waitForFreshAnnotationOverlay(electronApp, expectedTarget, label) {
+  return await waitFor(
+    async () => {
+      const state = await annotationOverlayState(electronApp)
+      return state?.visible
+        && state.focused
+        && state.body === ''
+        && state.target.includes(expectedTarget)
+        ? state
+        : null
+    },
+    label,
+    TIMEOUT_MS,
+  )
 }
 
 async function typeAndSubmitAnnotation(electronApp, body) {
@@ -1060,7 +1405,9 @@ if (provider) await seedDesktopCredential(userDataDir, provider.baseUrl)
 const developmentElectronRoot = await createDevelopmentElectronRoot(isolationRoot)
 
 let app
+let activePage
 let runError
+let failureEvidence
 const pageErrors = []
 const consoleErrors = []
 const externalRequests = []
@@ -1077,6 +1424,8 @@ const evidence = {
   annotationAcceptanceEvents: [],
   annotationModeAfterAcceptance: null,
   annotationRequests: 0,
+  followUpAnnotationRequests: 0,
+  followUpAnnotationModeExited: false,
   annotationsPrepared: 0,
   contextualLocateCalls: 0,
   contextualCandidateErrors: 0,
@@ -1108,6 +1457,7 @@ try {
   }
 
   const page = await app.firstWindow({ timeout: STARTUP_TIMEOUT_MS })
+  activePage = page
   const testWindowWidth = MANUAL_MODE
     ? MANUAL_TEST_WINDOW_WIDTH
     : TEST_WINDOW_WIDTH
@@ -1258,17 +1608,14 @@ try {
   assert.match(await versionsTab.innerText(), /1/)
   assert.match(await changesTab.innerText(), /0/)
 
-  await replaceSourceInEditor(page, MANUAL_HTML)
+  await replaceSourceInEditor(page, MANUAL_HTML, GENERATED_HTML, INITIAL_HEADING)
   await waitFor(async () => /2/.test(await versionsTab.innerText()), 'Versions = 2', TIMEOUT_MS)
   await waitFor(async () => /1/.test(await changesTab.innerText()), 'Changes = 1', TIMEOUT_MS)
   evidence.versionsAfterManualSave = await versionsTab.innerText()
 
   const previewTab = page.getByRole('tab', { name: /^Preview/ })
   await previewTab.click()
-  await page.locator('[data-document-section="preview"]').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await waitForReadyArtifactPreview(page)
   await waitFor(async () => {
     const snapshot = await previewWebContentsSnapshot(app)
     evidence.manualPreviewSnapshot = snapshot
@@ -1277,16 +1624,17 @@ try {
 
   const annotationButton = page.getByRole('button', { name: 'Annotate preview' })
   await armAnnotationPicker(page, annotationButton)
-  const selected = await selectElementInNativePreview(app, '#preserved-copy')
+  const selected = await selectElementInNativePreview(
+    app,
+    '#preserved-copy',
+    MANUAL_HEADING,
+  )
   evidence.selectedPreviewUrl = selected.url
   assert.equal(selected.tagName, 'p')
-  const overlay = await waitFor(
-    async () => {
-      const state = await annotationOverlayState(app)
-      return state?.target && !/^<[^>]+>$/.test(state.target) && state.focused ? state : null
-    },
+  const overlay = await waitForFreshAnnotationOverlay(
+    app,
+    PRESERVED_COPY,
     'trusted annotation overlay',
-    TIMEOUT_MS,
   )
   assert.doesNotMatch(overlay.target, /^<[^>]+>$/)
   assert.equal(
@@ -1317,15 +1665,12 @@ try {
   // must survive the native preview rebuild.
   const sourceTab = page.getByRole('tab', { name: /^Source/ })
   await sourceTab.click()
-  await replaceSourceInEditor(page, UNRELATED_HTML)
+  await replaceSourceInEditor(page, UNRELATED_HTML, MANUAL_HTML, MANUAL_HEADING)
   await waitFor(async () => /3/.test(await versionsTab.innerText()), 'Versions = 3', TIMEOUT_MS)
   await waitFor(async () => /2/.test(await changesTab.innerText()), 'Changes = 2', TIMEOUT_MS)
   evidence.versionsAfterUnrelatedSave = await versionsTab.innerText()
   await previewTab.click()
-  await page.locator('[data-document-section="preview"]').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await waitForReadyArtifactPreview(page)
   const restoredAnnotationButton = page.getByRole('button', { name: 'Stop annotating' })
   await assertAnnotationPickerArmed(page, restoredAnnotationButton)
   assert.equal(
@@ -1334,15 +1679,16 @@ try {
     'an unrelated source change must not make the user restart annotation mode',
   )
 
-  const secondSelected = await selectElementInNativePreview(app, '#editable-heading')
+  const secondSelected = await selectElementInNativePreview(
+    app,
+    '#editable-heading',
+    'unrelated source change',
+  )
   assert.equal(secondSelected.tagName, 'h1')
-  const secondOverlay = await waitFor(
-    async () => {
-      const state = await annotationOverlayState(app)
-      return state?.target && !/^<[^>]+>$/.test(state.target) && state.focused ? state : null
-    },
+  const secondOverlay = await waitForFreshAnnotationOverlay(
+    app,
+    MANUAL_HEADING,
     'second trusted annotation overlay',
-    TIMEOUT_MS,
   )
   assert.doesNotMatch(secondOverlay.target, /^<[^>]+>$/)
   await typeAndSubmitAnnotation(app, SECOND_ANNOTATION_BODY)
@@ -1415,7 +1761,7 @@ try {
   await waitFor(
     () => provider.requests.slice(annotationRequestStart)
       .some(payload => annotationToolNames(payload).length > 0),
-    'annotation exact4 provider request',
+    'annotation document-tool provider request',
     TIMEOUT_MS,
   )
   await waitForSettledTurn(page)
@@ -1460,23 +1806,84 @@ try {
 
   const annotationRequests = provider.requests.slice(annotationRequestStart)
     .filter(payload => annotationToolNames(payload).length > 0)
-  assert.equal(annotationRequests.length, 1, 'annotation answer must use one exact4 request')
+  assert.equal(annotationRequests.length, 1, 'annotation answer must use one document-tool request')
   assert.deepEqual(annotationToolNames(annotationRequests[0]), EXPECTED_ANNOTATION_TOOLS)
   evidence.annotationRequests = annotationRequests.length
+
+  // Regression for the reported flow: after one accepted selection/question,
+  // arm the picker again, create a new selection, and send it as a second
+  // independent turn. The acceptance handoff must not leave the native picker
+  // pressed or consume the second annotation as ordinary chat text.
+  await armAnnotationPicker(page, page.getByRole('button', { name: 'Annotate preview' }))
+  await waitForReadyArtifactPreview(page)
+  const followUpSelected = await selectElementInNativePreview(
+    app,
+    '#editable-heading',
+    MANUAL_HEADING,
+  )
+  assert.equal(followUpSelected.tagName, 'h1')
+  await waitForFreshAnnotationOverlay(
+    app,
+    MANUAL_HEADING,
+    'follow-up trusted annotation overlay',
+  )
+  await typeAndSubmitAnnotation(app, FOLLOW_UP_ANNOTATION_BODY)
+  await page.locator('.chat-prompt-annotation-chip').filter({
+    hasText: FOLLOW_UP_ANNOTATION_BODY,
+  }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await waitFor(async () => !await annotationOverlayState(app),
+    'follow-up annotation editor acknowledged and closed', TIMEOUT_MS)
+  const followUpRequestStart = provider.requests.length
+  await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
+  await submitChatComposer(page)
+  await waitFor(
+    () => provider.requests.slice(followUpRequestStart)
+      .some(payload => annotationToolNames(payload).length > 0),
+    'follow-up annotation document-tool provider request',
+    TIMEOUT_MS,
+  )
+  await waitForSettledTurn(page)
+  await waitFor(
+    async () => {
+      const state = await page.evaluate(() => ({
+        statusCount: document.querySelectorAll(
+          '[data-testid="workbench-annotation-mode-status"]',
+        ).length,
+        stopButtonCount: [...document.querySelectorAll('button')]
+          .filter(button => button.getAttribute('aria-label') === 'Stop annotating')
+          .length,
+      }))
+      return state.stopButtonCount === 0 && state.statusCount === 0
+    },
+    'follow-up annotation mode exit after accepted send',
+    TIMEOUT_MS,
+  )
+  assert.equal(
+    await page.locator('.chat-prompt-annotation-chip').count(),
+    0,
+    'the second accepted annotation must leave the composer',
+  )
+  const followUpAnnotationRequests = provider.requests.slice(followUpRequestStart)
+    .filter(payload => annotationToolNames(payload).length > 0)
+  assert.equal(followUpAnnotationRequests.length, 1)
+  assert.deepEqual(annotationToolNames(followUpAnnotationRequests[0]), EXPECTED_ANNOTATION_TOOLS)
+  evidence.followUpAnnotationRequests = followUpAnnotationRequests.length
+  evidence.followUpAnnotationModeExited = true
 
   // Create a new selection, then move the original element and introduce two
   // indistinguishable candidates. The accepted turn may ask AI to help, but a
   // repeated ambiguous candidate must never mint a grant or advance history.
   await armAnnotationPicker(page, page.getByRole('button', { name: 'Annotate preview' }))
-  const ambiguousSelected = await selectElementInNativePreview(app, '#preserved-copy')
+  const ambiguousSelected = await selectElementInNativePreview(
+    app,
+    '#preserved-copy',
+    MANUAL_HEADING,
+  )
   assert.equal(ambiguousSelected.tagName, 'p')
-  await waitFor(
-    async () => {
-      const state = await annotationOverlayState(app)
-      return state?.visible && state.focused ? state : null
-    },
+  await waitForFreshAnnotationOverlay(
+    app,
+    PRESERVED_COPY,
     'contextual annotation overlay',
-    TIMEOUT_MS,
   )
   await typeAndSubmitAnnotation(app, AMBIGUOUS_ANNOTATION_BODY)
   await page.locator('.chat-prompt-annotation-chip').filter({
@@ -1486,14 +1893,16 @@ try {
     'contextual annotation editor acknowledged and closed', TIMEOUT_MS)
 
   await sourceTab.click()
-  await replaceSourceInEditor(page, DUPLICATED_TARGET_HTML)
+  await replaceSourceInEditor(
+    page,
+    DUPLICATED_TARGET_HTML,
+    UNRELATED_HTML,
+    'unrelated source change',
+  )
   await waitFor(async () => /4/.test(await versionsTab.innerText()), 'Versions = 4', TIMEOUT_MS)
   await waitFor(async () => /3/.test(await changesTab.innerText()), 'Changes = 3', TIMEOUT_MS)
   await previewTab.click()
-  await page.locator('[data-document-section="preview"]').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await waitForReadyArtifactPreview(page)
   await assertAnnotationPickerArmed(
     page,
     page.getByRole('button', { name: 'Stop annotating' }),
@@ -1550,6 +1959,7 @@ try {
   await verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
   evidence.patchedSourceRemainedEditable = true
   await previewTab.click()
+  await waitForReadyArtifactPreview(page)
   await waitFor(async () => {
     const snapshot = await previewWebContentsSnapshot(app)
     return snapshot.some(item => item.heading === APPLIED_HEADING)
@@ -1632,10 +2042,7 @@ try {
     'Preview selected from resource navigation',
     TIMEOUT_MS,
   )
-  await page.locator('[data-document-section="preview"]').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
-  })
+  await waitForReadyArtifactPreview(page)
 
   assert.equal(
     await page.locator('[data-testid="chat-session-action-workbench"]').count(),
@@ -1653,6 +2060,7 @@ try {
 
   await app.close()
   app = undefined
+  activePage = undefined
   await delay(1_000)
   pageErrors.length = 0
   consoleErrors.length = 0
@@ -1663,6 +2071,7 @@ try {
   })
   await installOfflineRequestGuard(app, externalRequests)
   const recoveredPage = await app.firstWindow({ timeout: STARTUP_TIMEOUT_MS })
+  activePage = recoveredPage
   recoveredPage.on('pageerror', error => pageErrors.push(String(error?.message || error)))
   recoveredPage.on('console', message => {
     if (message.type() === 'error') consoleErrors.push(message.text())
@@ -1696,7 +2105,7 @@ try {
   )
   await generatedArtifactCard(recoveredPage).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
   assert.equal(await generatedArtifactCard(recoveredPage).count(), 1)
-  await openGeneratedArtifactSource(recoveredPage)
+  await openGeneratedArtifactSource(recoveredPage, APPLIED_HEADING)
   const recoveredVersionsTab = recoveredPage.getByRole('tab', { name: /Versions/ })
   await waitFor(
     async () => /5/.test(await recoveredVersionsTab.innerText()),
@@ -1705,6 +2114,7 @@ try {
   )
   evidence.recoveredRevisionCount = 5
   await recoveredPage.getByRole('tab', { name: /^Preview/ }).click()
+  await waitForReadyArtifactPreview(recoveredPage)
   await waitFor(async () => {
     const snapshot = await previewWebContentsSnapshot(app)
     return snapshot.some(item => item.heading === APPLIED_HEADING)
@@ -1715,13 +2125,12 @@ try {
 } catch (error) {
   runError = error
 } finally {
-  await app?.close().catch(() => {})
   if (!runError && !MANUAL_MODE) {
     try {
       evidence.durableMutation = await readDurableMutationEvidence(isolationRoot)
       assert.deepEqual(evidence.durableMutation, {
         allAttemptsLinked: 4,
-        annotations: 3,
+        annotations: 4,
         appliedAttempts: 4,
         attemptLinksCommittedObjects: 4,
         bindingTargetsDocument: true,
@@ -1735,12 +2144,67 @@ try {
         originalDeliverableUnchanged: true,
         revisionOneReusesDeliverable: true,
         revisions: 5,
-        sentAnnotations: 3,
+        sentAnnotations: 4,
         sourceBindings: 1,
       })
     } catch (error) {
       runError = error
     }
+  }
+  if (runError) {
+    try {
+      failureEvidence = await captureFailureEvidence({
+        app,
+        page: activePage,
+        error: runError,
+        gatewayPort,
+        isolationRoot,
+        userDataDir,
+        pageErrors,
+        consoleErrors,
+      })
+    } catch (error) {
+      failureEvidence = {
+        capturedAt: new Date().toISOString(),
+        beforeElectronClose: true,
+        captureError: String(error?.stack || error),
+      }
+    }
+  }
+  try {
+    if (app) {
+      await diagnosticCall('Electron shutdown', () => app.close(), 15_000)
+    }
+  } catch (error) {
+    const shutdownError = new Error(
+      `Electron did not shut down cleanly: ${String(error?.message || error)}`,
+    )
+    if (!runError) {
+      runError = shutdownError
+      try {
+        failureEvidence = await captureFailureEvidence({
+          app,
+          page: activePage,
+          error: runError,
+          gatewayPort,
+          isolationRoot,
+          userDataDir,
+          pageErrors,
+          consoleErrors,
+        })
+      } catch (captureError) {
+        failureEvidence = {
+          capturedAt: new Date().toISOString(),
+          beforeElectronClose: true,
+          captureError: String(captureError?.stack || captureError),
+        }
+      }
+    } else if (failureEvidence) {
+      failureEvidence.shutdownError = String(shutdownError.stack || shutdownError)
+    }
+    try {
+      app?.process()?.kill()
+    } catch {}
   }
   await provider?.close().catch(() => {})
   await delay(100)
@@ -1752,6 +2216,7 @@ try {
       pageErrors,
       consoleErrors,
       externalRequests,
+      failureEvidence,
       evidence,
     }, null, 2))
   }

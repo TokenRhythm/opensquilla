@@ -50,6 +50,11 @@ class ArtifactRangeBinding:
     source_sha256: str
     adapter_id: str = "html"
     adapter_version: int = 1
+    # Candidate-loop writers replace the draft bytes without changing the
+    # canonical revision.  Keep that ephemeral epoch in the binding key so a
+    # grant/cursor from the previous candidate cannot be replayed even if a
+    # caller retains a reference after the registry is cleared.
+    candidate_epoch: int = 0
 
     @property
     def key(self) -> tuple[object, ...]:
@@ -63,6 +68,7 @@ class ArtifactRangeBinding:
             self.source_sha256,
             self.adapter_id,
             self.adapter_version,
+            self.candidate_epoch,
         )
 
 
@@ -79,6 +85,8 @@ class DocumentGrantBinding:
     source_sha256: str
     adapter_id: str
     adapter_version: int
+    # See ``ArtifactRangeBinding.candidate_epoch``.
+    candidate_epoch: int = 0
 
     @property
     def key(self) -> tuple[object, ...]:
@@ -92,6 +100,7 @@ class DocumentGrantBinding:
             self.source_sha256,
             self.adapter_id,
             self.adapter_version,
+            self.candidate_epoch,
         )
 
 
@@ -515,12 +524,12 @@ class DocumentMutationGrantRegistry:
             self._source_reads.clear()
 
     def reserve_tool_attempt(self, *, attempt_key: str) -> int:
-        """Bound identical inspection or locate calls while allowing one safe replay.
+        """Bound malformed/recovery attempts that must not loop forever.
 
-        A second identical call covers a provider retry or a lost result without
-        broadening authority. Further calls cannot reveal anything new within the
-        immutable turn binding, so rejecting them prevents an Agent from looping on
-        a deterministic outcome.
+        Normal document inspection, source reads, and semantic lookups are
+        deliberately repeatable in the autonomous candidate loop. This small
+        counter remains for exceptional paths such as invalid cursor recovery,
+        where retrying the same malformed input cannot produce new authority.
         """
 
         if not isinstance(attempt_key, str) or not attempt_key:
@@ -533,9 +542,9 @@ class DocumentMutationGrantRegistry:
             if attempts >= MAX_IDENTICAL_DOCUMENT_TOOL_CALLS_PER_TURN:
                 raise ArtifactRangeGrantError(
                     "ARTIFACT_RANGE_QUERY_LIMIT",
-                    "This document inspection or target query was already repeated. "
-                    "Reuse the earlier result, leave an unsupported item unchanged, "
-                    "and finish without calling it again.",
+                    "This malformed document-tool recovery input was repeated. "
+                    "Read the current source again with a fresh valid cursor or "
+                    "finish without retrying the malformed input.",
                 )
             attempts += 1
             self._tool_attempts[attempt_key] = attempts

@@ -23,6 +23,16 @@ export function applyProgrammaticScroll(
 }
 
 /**
+ * Forget a pending application-owned position without consuming a scroll
+ * event. Chat session hand-offs reuse the same outer element, so a correction
+ * queued for the previous session must not be allowed to classify the first
+ * native event in the next one as programmatic.
+ */
+export function clearProgrammaticScroll(container: HTMLElement): void {
+  expectedProgrammaticScrollTop.delete(container)
+}
+
+/**
  * Returns the consumed application target and whether this event reached it.
  * A mismatch immediately releases the marker so a real reader gesture is never
  * swallowed by a stale correction.

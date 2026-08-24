@@ -22,6 +22,7 @@ export interface ChatRouteHeaderModel {
   copyIcon: Readonly<Ref<IconName>>
   copyLiveText: Readonly<Ref<string>>
   deliverableCount: Readonly<Ref<number>>
+  hasNewDeliverable: Readonly<Ref<boolean>>
   shareMode: Readonly<Ref<boolean>>
   shareableMessageCount: Readonly<Ref<number>>
 }
@@ -52,6 +53,7 @@ export interface ChatRouteHeaderBridge {
     copyIcon: ComputedRef<IconName>
     copyLiveText: ComputedRef<string>
     deliverableCount: ComputedRef<number>
+    hasNewDeliverable: ComputedRef<boolean>
     shareMode: ComputedRef<boolean>
     shareableMessageCount: ComputedRef<number>
   }
@@ -127,6 +129,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
       copyIcon: computed(() => ownerValue('copyIcon', DEFAULT_COPY_ICON)),
       copyLiveText: computed(() => ownerValue('copyLiveText', '')),
       deliverableCount: computed(() => ownerValue('deliverableCount', 0)),
+      hasNewDeliverable: computed(() => ownerValue('hasNewDeliverable', false)),
       shareMode: computed(() => ownerValue('shareMode', false)),
       shareableMessageCount: computed(() => ownerValue('shareableMessageCount', 0)),
     },

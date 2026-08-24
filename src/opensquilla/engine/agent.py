@@ -338,6 +338,68 @@ _TURN_OBJECTIVE_REMINDER_ON = {"on", "1", "true", "yes"}
 _TURN_OBJECTIVE_REMINDER_OFF = {"off", "0", "false", "no"}
 _TURN_OBJECTIVE_REMINDER_TRIM_PREFIX = "trim:"
 
+# Candidate writers are intentionally non-durable until ``document_finish``.
+# The turn generator yields its DoneEvent before ``run_turn``'s outer finally
+# gets a chance to reject an abandoned draft, so a terminal outcome must not
+# expose the intermediate ``candidate_staged``/verification statuses.  Keep
+# this projection local to the engine boundary; the durable mutation ledger
+# remains the source of truth for committed/ambiguous receipts.
+_OPEN_CANDIDATE_STATUSES = frozenset(
+    {"candidate_staged", "verification_passed", "verification_failed"}
+)
+_TERMINAL_CANDIDATE_OUTCOME_STATUSES = frozenset({"applied", "discarded", "ambiguous"})
+
+
+def _normalize_uncommitted_candidate_outcome(
+    outcome: Mapping[str, Any] | None,
+    controller: Any | None,
+) -> dict[str, Any] | None:
+    """Project an abandoned candidate to a truthful public turn outcome.
+
+    Candidate bytes are rejected by the outer turn cleanup when a model never
+    calls ``document_finish``.  Since that cleanup runs after the generator's
+    final event, normalize the event before it is emitted.  Already durable
+    or restart-recoverable statuses are preserved exactly.
+    """
+
+    state = getattr(controller, "state", None)
+    state_status = str(getattr(state, "status", "") or "")
+    if (
+        state_status not in _OPEN_CANDIDATE_STATUSES
+        or not getattr(state, "candidate_sha256", None)
+    ):
+        return None if outcome is None else dict(outcome)
+    current = str((outcome or {}).get("status", "") or "")
+    if current in _TERMINAL_CANDIDATE_OUTCOME_STATUSES:
+        return None if outcome is None else dict(outcome)
+    normalized = dict(outcome or {})
+    durable_finish_unresolved = bool(
+        getattr(controller, "discard_blocked_by_other_finish", False)
+        or getattr(controller, "_mutation_attempt_id", None)
+        or getattr(controller, "_mutation_attempt_tool_use_id", None)
+    )
+    if durable_finish_unresolved:
+        normalized.update(
+            {
+                "version": 1,
+                "status": "ambiguous",
+                "phase": "commit",
+                "retryPolicy": "reconcile",
+                "code": "document_finish_commit_ambiguous",
+            }
+        )
+        return normalized
+    normalized.update(
+        {
+            "version": 1,
+            "status": "not_applied",
+            "phase": "commit",
+            "retryPolicy": "new_turn",
+            "code": "document_candidate_discarded_on_turn_close",
+        }
+    )
+    return normalized
+
 
 def _resolve_turn_objective_reminder() -> tuple[bool, int]:
     """Resolve the turn-objective reminder override.
@@ -3321,8 +3383,11 @@ class Agent:
                     supports_reasoning=bool(
                         getattr(resolved_capabilities, "supports_reasoning", False)
                     ),
-                    supports_tools=bool(
-                        getattr(resolved_capabilities, "supports_tools", True)
+                    # Capability metadata is advisory.  Unknown/unverified
+                    # values must keep the authorized tool surface; only an
+                    # explicit false is a denial.
+                    supports_tools=(
+                        getattr(resolved_capabilities, "supports_tools", None) is not False
                     ),
                     supports_streaming=bool(
                         getattr(resolved_capabilities, "supports_streaming", True)
@@ -4153,8 +4218,9 @@ class Agent:
         reason: str,
         *,
         requires_vision: bool = False,
+        requires_tools: bool = False,
     ) -> bool:
-        if requires_vision:
+        if requires_vision or requires_tools:
             constrained_fallback = getattr(
                 self.provider,
                 "fallback_after_invalid_response_with_capabilities",
@@ -4166,7 +4232,8 @@ class Agent:
                 return bool(
                     constrained_fallback(
                         reason,
-                        requires_vision=True,
+                        requires_vision=requires_vision,
+                        requires_tools=requires_tools,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - fallback support is optional
@@ -4174,7 +4241,8 @@ class Agent:
                     "provider.invalid_response_fallback_failed",
                     session_key=self._session_key,
                     reason=reason,
-                    requires_vision=True,
+                    requires_vision=requires_vision,
+                    requires_tools=requires_tools,
                     error=str(exc),
                 )
                 return False
@@ -6636,6 +6704,29 @@ class Agent:
                 ):
                     yield event
         finally:
+            # A staged candidate is never an implicit commit.  If the turn is
+            # cancelled, times out, or exits without document_finish, reject
+            # the draft before releasing the rest of the turn authorities.
+            candidate_cleanup = asyncio.create_task(
+                self._discard_uncommitted_candidate("turn_closed")
+            )
+            while not candidate_cleanup.done():
+                try:
+                    await asyncio.shield(candidate_cleanup)
+                except asyncio.CancelledError:
+                    # Keep the cleanup task running even when the turn itself
+                    # is cancelled a second time; an uncommitted candidate and
+                    # its opaque preview mapping must not be abandoned merely
+                    # because the provider stopped streaming.
+                    continue
+            try:
+                candidate_cleanup.result()
+            except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
+                logger.warning(
+                    "agent.candidate_loop_cleanup_task_failed",
+                    session_key=self._session_key,
+                    exc_info=True,
+                )
             writer_cleanup = asyncio.create_task(
                 self._finalize_unresolved_artifact_writer_intent()
             )
@@ -6656,11 +6747,26 @@ class Agent:
             # every terminal path (including cancellation and provider abort)
             # before this ToolContext can be reused or discarded.
             if self._tool_context is not None:
+                # Screenshot bytes are request-scoped evidence.  Drop any
+                # attachment left behind by a cancelled/failed dispatch so a
+                # reused context cannot retain binary data across turns.
+                self._tool_context.tool_result_media.clear()
                 callbacks = tuple(self._tool_context.turn_cleanup_callbacks)
                 self._tool_context.turn_cleanup_callbacks.clear()
                 for callback in callbacks:
                     try:
-                        callback()
+                        result = callback()
+                        if inspect.isawaitable(result):
+                            cleanup_task = asyncio.ensure_future(result)
+                            cleanup_cancelled = False
+                            while not cleanup_task.done():
+                                try:
+                                    await asyncio.shield(cleanup_task)
+                                except asyncio.CancelledError:
+                                    cleanup_cancelled = True
+                            cleanup_task.result()
+                            if cleanup_cancelled:
+                                logger.debug("agent.turn_authority_cleanup_completed_after_cancel")
                     except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
                         logger.warning(
                             "agent.turn_authority_cleanup_failed",
@@ -7123,6 +7229,7 @@ class Agent:
         # manufacturing a mutation outcome or spending a second provider call
         # on the mutation-only finalizer.
         document_mutation_attempted = False
+        candidate_loop_nudges = 0
 
         def _document_mutation_response_locale() -> str:
             configured = str(
@@ -7181,6 +7288,7 @@ class Agent:
             translations = {
                 "en": {
                     "applied": "The document changes were applied.",
+                    "discarded": "The document changes were discarded; the page was not updated.",
                     "conflict": "The document changed; refresh it before trying again.",
                     "ambiguous": (
                         "The change result is uncertain; refresh and verify the version."
@@ -7190,6 +7298,7 @@ class Agent:
                 },
                 "zh": {
                     "applied": "文档修改已成功应用。",
+                    "discarded": "文档修改已放弃，页面未更新。",
                     "conflict": "文档已发生变化，请刷新后重试。",
                     "ambiguous": "修改结果暂时无法确认，请刷新并核对版本。",
                     "not_applied": "文档修改未能应用。",
@@ -7197,6 +7306,10 @@ class Agent:
                 },
                 "de": {
                     "applied": "Die Dokumentänderungen wurden angewendet.",
+                    "discarded": (
+                        "Die Dokumentänderungen wurden verworfen; die Seite wurde nicht "
+                        "aktualisiert."
+                    ),
                     "conflict": (
                         "Das Dokument wurde geändert; aktualisieren Sie es vor einem "
                         "neuen Versuch."
@@ -7210,6 +7323,10 @@ class Agent:
                 },
                 "es": {
                     "applied": "Se aplicaron los cambios del documento.",
+                    "discarded": (
+                        "Se descartaron los cambios del documento; la página no se "
+                        "actualizó."
+                    ),
                     "conflict": (
                         "El documento cambió; actualízalo antes de volver a intentarlo."
                     ),
@@ -7221,6 +7338,10 @@ class Agent:
                 },
                 "fr": {
                     "applied": "Les modifications du document ont été appliquées.",
+                    "discarded": (
+                        "Les modifications du document ont été abandonnées ; la page "
+                        "n’a pas été mise à jour."
+                    ),
                     "conflict": (
                         "Le document a changé ; actualisez-le avant de réessayer."
                     ),
@@ -7232,6 +7353,7 @@ class Agent:
                 },
                 "ja": {
                     "applied": "文書の変更を適用しました。",
+                    "discarded": "文書の変更を破棄しました。ページは更新されていません。",
                     "conflict": "文書が変更されています。更新してから再試行してください。",
                     "ambiguous": "変更結果を確認できません。更新して版を確認してください。",
                     "not_applied": "文書の変更は適用されませんでした。",
@@ -7409,7 +7531,7 @@ class Agent:
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
         document_mutation_summary_deadline: float | None = None
         document_mutation_summary_deadline_candidate: float | None = None
-        if _total_deadline is not None and self._artifact_writer_controller() is not None:
+        if _total_deadline is not None and self._artifact_mutation_turn_active():
             summary_reserve_seconds = min(
                 15.0,
                 max(1.0, float(self.config.timeout) * 0.1),
@@ -7512,10 +7634,9 @@ class Agent:
             return True
 
         configured_capabilities = self.config.model_capabilities
-        tools_supported = (
-            True
-            if configured_capabilities is None
-            else bool(getattr(configured_capabilities, "supports_tools", True))
+        tools_supported = bool(
+            configured_capabilities is None
+            or getattr(configured_capabilities, "supports_tools", None) is not False
         )
         artifact_tools_verified = bool(
             self.config.model_tools_capability_verified
@@ -7523,46 +7644,50 @@ class Agent:
             and getattr(configured_capabilities, "supports_tools", False)
         )
         artifact_operation = str(metadata.get("artifact_operation_class") or "").strip()
-        artifact_requires_verified_tools = artifact_operation in {
+        artifact_requires_tools = artifact_operation in {
             "selection_edit",
             "structural_edit",
             "conflict_recovery",
         }
         if (
-            artifact_requires_verified_tools
+            artifact_requires_tools
             and self.tool_definitions
+            and tools_supported
             and not artifact_tools_verified
+        ):
+            # Capability provenance is routing metadata, not tool authority.
+            # Unknown deployments keep the agent's already-authorized tool
+            # surface; dispatch, grants, and commit validation remain the
+            # side-effect boundary.
+            self._write_turn_call_log(
+                "turn_policy_decision",
+                action="allow_tools",
+                reason="artifact_model_tools_capability_unknown",
+                code="artifact_model_tools_capability_unknown",
+                artifact_operation_class=artifact_operation,
+            )
+        if (
+            artifact_requires_tools
+            and self.tool_definitions
+            and not tools_supported
         ):
             self._write_turn_call_log(
                 "turn_policy_decision",
-                action="answer_without_tools",
+                action="reject",
                 reason="artifact_model_tools_unsupported",
                 code="artifact_model_tools_unsupported",
                 artifact_operation_class=artifact_operation,
             )
-            if self._artifact_writer_controller() is not None:
-                # Selection context is still useful to a text-only model. Hide
-                # document tools and let the ordinary answer path complete;
-                # no writer intent exists, so there is no mutation outcome.
-                tools_supported = False
-                yield WarningEvent(
-                    code="artifact_model_tools_unsupported",
-                    message=(
-                        "The selected model is not verified for document tool calling; "
-                        "it can still answer from the selected context."
-                    ),
-                )
-            else:
-                terminal_error = ErrorEvent(
-                    message=(
-                        "The selected model is not verified for tool calling, so the artifact "
-                        "was left unchanged. Choose a tool-capable model and retry."
-                    ),
-                    code="artifact_model_tools_unsupported",
-                )
-                yield self._transition(AgentState.ERROR)
-                yield terminal_error
-                return
+            terminal_error = ErrorEvent(
+                message=(
+                    "The selected model explicitly does not support tool calling, so the "
+                    "artifact was left unchanged. Choose a tool-capable model and retry."
+                ),
+                code="artifact_model_tools_unsupported",
+            )
+            yield self._transition(AgentState.ERROR)
+            yield terminal_error
+            return
         provider_tool_definitions = self.tool_definitions or None
         if not tools_supported:
             provider_tool_definitions = None
@@ -7655,8 +7780,8 @@ class Agent:
                 capabilities = self.config.model_capabilities
                 return (
                     max(0, int(self.config.context_window_tokens or 0)),
-                    bool(
-                        getattr(capabilities, "supports_tools", True)
+                    (
+                        getattr(capabilities, "supports_tools", None) is not False
                         if capabilities is not None
                         else True
                     ),
@@ -7709,7 +7834,11 @@ class Agent:
                 context_window = 0
             return (
                 context_window,
-                capabilities.get("supports_tools") is True,
+                # Capability discovery is advisory.  Unknown/unverified
+                # candidates must retain the tool surface; only an explicit
+                # ``False`` is a safe reason to steer a continuation away
+                # from tools.
+                capabilities.get("supports_tools") is not False,
                 capabilities.get("supports_vision") is True,
                 leg_kind,
             )
@@ -8095,7 +8224,7 @@ class Agent:
                             "Set AgentConfig.max_iterations=0 for unlimited tasks."
                         )
                     if (
-                        self._artifact_writer_controller() is not None
+                        self._artifact_mutation_turn_active()
                         and document_mutation_attempted
                         and not document_mutation_finalization_attempted
                     ):
@@ -8399,7 +8528,7 @@ class Agent:
                         getattr(self.config, "max_turn_llm_calls", 0)
                     )
                     if (
-                        self._artifact_writer_controller() is not None
+                        self._artifact_mutation_turn_active()
                         and document_mutation_attempted
                         and not document_mutation_finalization_pending
                         and not document_mutation_finalization_attempted
@@ -8820,7 +8949,7 @@ class Agent:
                         ),
                     )
                     if (
-                        self._artifact_writer_controller() is not None
+                        self._artifact_mutation_turn_active()
                         and document_mutation_attempted
                     ):
                         call_chat_cfg = call_chat_cfg.model_copy(
@@ -10486,7 +10615,7 @@ class Agent:
                             )
                             break
                         if (
-                            self._artifact_writer_controller() is not None
+                            self._artifact_mutation_turn_active()
                             and document_mutation_attempted
                             and not document_mutation_finalization_attempted
                         ):
@@ -10612,7 +10741,7 @@ class Agent:
                             break
                         if (
                             enforced_stream_deadline is None
-                            and self._artifact_writer_controller() is not None
+                            and self._artifact_mutation_turn_active()
                             and document_mutation_attempted
                         ):
                             # Provider adapters may surface their own socket/read
@@ -10789,7 +10918,7 @@ class Agent:
                             )
                             break
                         if (
-                            self._artifact_writer_controller() is not None
+                            self._artifact_mutation_turn_active()
                             and document_mutation_attempted
                             and not document_mutation_finalization_attempted
                         ):
@@ -11492,6 +11621,7 @@ class Agent:
                                     requires_vision=(
                                         self._count_image_blocks(request_messages) > 0
                                     ),
+                                    requires_tools=bool(provider_tools_for_call),
                                 )
                             ):
                                 _invalid_response_fallback_done = True
@@ -11941,6 +12071,7 @@ class Agent:
                                 requires_vision=(
                                     self._count_image_blocks(request_messages) > 0
                                 ),
+                                requires_tools=bool(provider_tools_for_call),
                             )
                         ):
                             _invalid_response_fallback_done = True
@@ -13294,7 +13425,7 @@ class Agent:
                         )
                         if (
                             should_retry
-                            and self._artifact_writer_controller() is not None
+                            and self._artifact_mutation_turn_active()
                             and document_mutation_attempted
                         ):
                             # Restricted document turns reserve exactly one provider call
@@ -13326,7 +13457,7 @@ class Agent:
                             should_retry = False
                         if not should_retry:
                             if (
-                                self._artifact_writer_controller() is not None
+                                self._artifact_mutation_turn_active()
                                 and document_mutation_attempted
                                 and not document_mutation_finalization_attempted
                             ):
@@ -13400,7 +13531,8 @@ class Agent:
                         )
                         if resolved_retry_delay is None or retry_exceeds_deadline:
                             if self._switch_to_invalid_response_fallback(
-                                failure_kind.value
+                                failure_kind.value,
+                                requires_tools=bool(provider_tools_for_call),
                             ):
                                 next_provider_activity_reason = reason
                                 yield ProviderActivityEvent(
@@ -13466,7 +13598,7 @@ class Agent:
 
                 if terminal_error is not None:
                     if (
-                        self._artifact_writer_controller() is not None
+                        self._artifact_mutation_turn_active()
                         and document_mutation_attempted
                         and not document_mutation_finalization_attempted
                     ):
@@ -13712,33 +13844,120 @@ class Agent:
                     for tc in tool_calls
                     if tc.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
                 ]
-                if len(writer_calls) > 1:
-                    for writer_call in writer_calls:
+                candidate_controller = getattr(
+                    self._tool_context,
+                    "artifact_candidate_loop_controller",
+                    None,
+                )
+                finish_calls = [
+                    tc for tc in tool_calls if tc.tool_name == "document_finish"
+                ]
+                browser_calls = [
+                    tc
+                    for tc in tool_calls
+                    if tc.tool_name.startswith("document_browser_")
+                ]
+                # A finish decision is a lifecycle boundary, never another
+                # sibling operation in the same provider response.  Reject
+                # the complete batch before any handler runs so a writer
+                # cannot stage a candidate while finish(discard/commit) is
+                # being evaluated against the pre-write state.
+                candidate_batch_conflict = bool(
+                    candidate_controller is not None
+                    and (
+                        len(finish_calls) > 1
+                        or (
+                            finish_calls
+                            and (writer_calls or browser_calls)
+                        )
+                        or (writer_calls and browser_calls)
+                    )
+                )
+                if candidate_controller is not None and (
+                    writer_calls or candidate_batch_conflict
+                ):
+                    # Preflight rejection happens before dispatch installs the
+                    # tool contextvar. Invalidate any prior browser receipt
+                    # here as well, so a blocked writer batch cannot be
+                    # followed by a commit using stale evidence.
+                    if self._tool_context is not None:
+                        setattr(self._tool_context, "_artifact_browser_verification_token", None)
+                        setattr(self._tool_context, "_artifact_browser_verification_sha256", None)
+                    invalidate = getattr(
+                        candidate_controller,
+                        "invalidate_verification",
+                        None,
+                    )
+                    if callable(invalidate):
+                        try:
+                            await invalidate(reason="writer_preflight")
+                        except Exception:  # noqa: BLE001 - stale candidate fails closed
+                            pass
+                rejected_writer_calls = writer_calls if len(writer_calls) > 1 else []
+                rejected_loop_calls = (
+                    [*writer_calls, *finish_calls, *browser_calls]
+                    if candidate_batch_conflict
+                    else rejected_writer_calls
+                )
+                seen_rejected_ids: set[str] = set()
+                for rejected_call in rejected_loop_calls:
+                    if rejected_call.tool_use_id in seen_rejected_ids:
+                        continue
+                    seen_rejected_ids.add(rejected_call.tool_use_id)
+                    rejection_reason: str = (
+                        "document_finish_must_be_alone"
+                        if finish_calls
+                        else "writer_and_browser_must_be_sequential"
+                        if writer_calls and browser_calls
+                        else "parallel_document_writers"
+                    )
+                    if rejected_call.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS:
                         batch_result = ToolResult(
-                            tool_use_id=writer_call.tool_use_id,
-                            tool_name=writer_call.tool_name,
+                            tool_use_id=rejected_call.tool_use_id,
+                            tool_name=rejected_call.tool_name,
                             content=json.dumps(
                                 {
                                     "status": "error",
-                                    "reason": "parallel_document_writers",
-                                    "retry_allowed": False,
+                                    "reason": rejection_reason,
+                                    "retry_allowed": True,
                                 },
                                 ensure_ascii=False,
                             ),
                             is_error=True,
                             execution_status=runtime_execution_status(
                                 "error",
-                                reason="parallel_document_writers",
+                                reason=rejection_reason,
                             ),
                         )
-                        preflight_tool_results[writer_call.tool_use_id] = (
+                        preflight_tool_results[rejected_call.tool_use_id] = (
                             await self._reject_artifact_writer_preflight(
-                                writer_call,
+                                rejected_call,
                                 batch_result,
-                                failure_code="parallel_document_writers",
-                                force_finalize=True,
+                                failure_code=rejection_reason,
+                                force_finalize=(
+                                    not candidate_batch_conflict
+                                    and len(writer_calls) > 1
+                                ),
                             )
                         )
+                        continue
+                    preflight_tool_results[rejected_call.tool_use_id] = ToolResult(
+                        tool_use_id=rejected_call.tool_use_id,
+                        tool_name=rejected_call.tool_name,
+                        content=json.dumps(
+                            {
+                                "status": "error",
+                                "reason": rejection_reason,
+                                "retry_allowed": True,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        is_error=True,
+                        execution_status=runtime_execution_status(
+                            "error",
+                            reason=rejection_reason,
+                        ),
+                    )
                 resolved_tool_calls: list[ToolCall] = []
                 for tc in tool_calls:
                     if tc.tool_use_id in preflight_tool_results:
@@ -13955,6 +14174,53 @@ class Agent:
                         continue
                     if document_mutation_finalization_attempted:
                         break
+                    candidate_controller = getattr(
+                        self._tool_context,
+                        "artifact_candidate_loop_controller",
+                        None,
+                    )
+                    candidate_state = getattr(candidate_controller, "state", None)
+                    if (
+                        candidate_controller is not None
+                        and str(getattr(candidate_state, "status", ""))
+                        in {"candidate_staged", "verification_passed", "verification_failed"}
+                        and getattr(candidate_state, "candidate_sha256", None)
+                    ):
+                        # A natural-language stop cannot silently publish a
+                        # draft.  Keep the autonomous loop alive and let the
+                        # model choose another verification/repair action or
+                        # explicitly call document_finish(discard).  Global
+                        # deadline/cost/call guards remain authoritative.
+                        candidate_loop_nudges += 1
+                        if visible_text and final_text_parts:
+                            final_text_parts.pop()
+                        turn_messages.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "A document candidate is still staged and has not been "
+                                    "committed. Continue inspecting or repairing it, then "
+                                    "call document_finish(commit) only after fresh preview "
+                                    "verification, or call document_finish(discard). Do not "
+                                    "claim that the page is updated yet."
+                                ),
+                            )
+                        )
+                        self._write_turn_call_log(
+                            "document_candidate_loop_nudge",
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                            nudge_count=candidate_loop_nudges,
+                        )
+                        yield WarningEvent(
+                            code="document_candidate_requires_finish",
+                            message=(
+                                "A staged document candidate requires verification and an "
+                                "explicit commit or discard decision."
+                            ),
+                        )
+                        yield self._transition(AgentState.THINKING)
+                        continue
                     if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
                         # Keep the assistant output already emitted above, then
@@ -14668,7 +14934,7 @@ class Agent:
                     _get_tool_concurrency_policy,
                 )
 
-                tool_result_blocks: list[ContentBlockToolResult] = []
+                tool_result_blocks: list[Any] = []
                 executed_results: list[ToolResult] = []
                 turn_yielded = False
 
@@ -15709,6 +15975,53 @@ class Agent:
                             turn_yielded = True
                     elif self._is_turn_yield_result(result) or result.terminates_turn:
                         turn_yielded = True
+                    # Browser screenshots are kept out of the JSON tool text.
+                    # Promote only the authenticated, turn-local attachment
+                    # produced for this exact tool call.  A model with an
+                    # explicitly text-only capability still receives the
+                    # bounded screenshot metadata, but not an image block;
+                    # DOM/console/browser actions remain usable in that mode.
+                    media_context = self._tool_context or current_tool_context.get()
+                    media_by_call = (
+                        getattr(media_context, "tool_result_media", None)
+                        if media_context is not None
+                        else None
+                    )
+                    raw_media = (
+                        media_by_call.pop(tc.tool_use_id, [])
+                        if isinstance(media_by_call, dict)
+                        else []
+                    )
+                    vision_capabilities = getattr(self.config, "model_capabilities", None)
+                    vision_enabled = (
+                        self.config.model_vision_support == "supported"
+                        or getattr(vision_capabilities, "supports_vision", False) is True
+                    )
+                    provider_name = str(
+                        getattr(self.provider, "provider_name", "") or ""
+                    ).casefold()
+                    if provider_name == "ensemble":
+                        vision_enabled = False
+                    image_blocks: list[ContentBlockImage] = []
+                    if vision_enabled and isinstance(raw_media, list):
+                        for item in raw_media[:1]:
+                            if not isinstance(item, dict):
+                                continue
+                            mime = item.get("mime")
+                            data = item.get("data")
+                            if mime != "image/png" or not isinstance(data, str):
+                                continue
+                            # The bridge already enforces the byte limit; keep
+                            # a second encoded-size guard at this boundary so
+                            # a compromised test double cannot inflate context.
+                            if not 1 <= len(data) <= 16 * 1024 * 1024:
+                                continue
+                            image_blocks.append(
+                                ContentBlockImage(
+                                    media_type="image/png",
+                                    data=data,
+                                )
+                            )
                     tool_result_blocks.append(
                         ContentBlockToolResult(
                             tool_use_id=projected_result.tool_use_id,
@@ -15717,6 +16030,7 @@ class Agent:
                             execution_status=projected_result.execution_status,
                         )
                     )
+                    tool_result_blocks.extend(image_blocks)
 
                 terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
                 if terminal_artifacts:
@@ -16207,7 +16521,7 @@ class Agent:
                     terminal_error = budget_error
                 if (
                     terminal_error is not None
-                    and self._artifact_writer_controller() is not None
+                    and self._artifact_mutation_turn_active()
                     and document_mutation_attempted
                     and not document_mutation_finalization_attempted
                 ):
@@ -16272,7 +16586,7 @@ class Agent:
                     and _loop.time() > tool_deadline
                 ):
                     if (
-                        self._artifact_writer_controller() is not None
+                        self._artifact_mutation_turn_active()
                         and document_mutation_attempted
                         and not document_mutation_finalization_attempted
                     ):
@@ -16548,7 +16862,7 @@ class Agent:
                     code="agent_runtime_timeout",
                 )
             elif (
-                self._artifact_writer_controller() is not None
+                self._artifact_mutation_turn_active()
                 and document_mutation_attempted
             ):
                 if document_mutation_outcome is None:
@@ -16589,7 +16903,7 @@ class Agent:
             ]
 
         if (
-            self._artifact_writer_controller() is not None
+            self._artifact_mutation_turn_active()
             and document_mutation_attempted
         ):
             if document_mutation_outcome is None:
@@ -16601,6 +16915,93 @@ class Agent:
                     "code": "document_mutation_not_proposed",
                 }
             current_final_text = "".join(final_text_parts)
+            candidate_controller = getattr(
+                self._tool_context or current_tool_context.get(),
+                "artifact_candidate_loop_controller",
+                None,
+            )
+            candidate_state = getattr(candidate_controller, "state", None)
+            candidate_status = str(getattr(candidate_state, "status", "") or "")
+            candidate_is_open = bool(
+                candidate_controller is not None
+                and candidate_status in {"open", *_OPEN_CANDIDATE_STATUSES}
+            )
+            candidate_terminal_without_commit = bool(
+                candidate_controller is not None
+                and candidate_status in {"discarded", "ambiguous"}
+            )
+            if candidate_is_open:
+                # ``run_turn`` emits DoneEvent before its outer cleanup rejects
+                # an abandoned draft. Project every still-open candidate to a
+                # terminal, truthful outcome here; otherwise a provider's
+                # earlier "updated" narration could survive as the public
+                # answer even though no durable revision exists.
+                normalized_candidate_outcome = (
+                    _normalize_uncommitted_candidate_outcome(
+                        document_mutation_outcome,
+                        candidate_controller,
+                    )
+                )
+                normalized_status = str(
+                    (normalized_candidate_outcome or {}).get("status") or ""
+                )
+                if normalized_status not in _TERMINAL_CANDIDATE_OUTCOME_STATUSES:
+                    unresolved_finish = bool(
+                        getattr(
+                            candidate_controller,
+                            "discard_blocked_by_other_finish",
+                            False,
+                        )
+                        or getattr(candidate_controller, "_mutation_attempt_id", None)
+                        or getattr(
+                            candidate_controller,
+                            "_mutation_attempt_tool_use_id",
+                            None,
+                        )
+                    )
+                    normalized_candidate_outcome = {
+                        "version": 1,
+                        "status": "ambiguous" if unresolved_finish else "not_applied",
+                        "phase": "commit",
+                        "retryPolicy": "reconcile" if unresolved_finish else "new_turn",
+                        "code": (
+                            "document_finish_commit_ambiguous"
+                            if unresolved_finish
+                            else "document_candidate_discarded_on_turn_close"
+                        ),
+                    }
+                    document_mutation_outcome = normalized_candidate_outcome
+                    current_final_text = _document_mutation_fallback_text()
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(text=current_final_text)
+                    yield WarningEvent(
+                        code="document_candidate_final_text_normalized",
+                        message=(
+                            "The staged candidate was not durably committed; the final "
+                            "text was replaced with the authoritative outcome."
+                        ),
+                    )
+            candidate_outcome_status = str(
+                (document_mutation_outcome or {}).get("status") or ""
+            )
+            if (
+                (candidate_is_open or candidate_terminal_without_commit)
+                and candidate_outcome_status != "applied"
+            ):
+                authoritative_final_text = _document_mutation_fallback_text()
+                if current_final_text != authoritative_final_text:
+                    current_final_text = authoritative_final_text
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(text=current_final_text)
+                    yield WarningEvent(
+                        code="document_candidate_final_text_normalized",
+                        message=(
+                            "The document candidate has no confirmed commit; the final "
+                            "text was replaced with the authoritative outcome."
+                        ),
+                    )
             if document_mutation_finalization_attempted:
                 from opensquilla.engine.silent_reply import normalize_silent_reply
 
@@ -17019,6 +17420,14 @@ class Agent:
                 *(parent_breakdown_rows if rolled_subagent_usage else []),
                 *turn_model_usage_breakdown,
             ]
+        )
+        # ``run_turn`` rejects an uncommitted candidate in its outer finally,
+        # which runs after this generator has emitted DoneEvent.  Normalize the
+        # public outcome first so a candidate that the model abandoned or that
+        # hit a global guard cannot be rendered as a successful/staged update.
+        document_mutation_outcome = _normalize_uncommitted_candidate_outcome(
+            document_mutation_outcome,
+            getattr(self._tool_context, "artifact_candidate_loop_controller", None),
         )
         has_usage = bool(
             done_input_tokens
@@ -20418,7 +20827,437 @@ class Agent:
             or not (_PROMPT_ANNOTATION_WRITER_TOOLS & ctx.surfaced_tools)
         ):
             return None
+        # Autonomous PromptAnnotation turns stage writers in their draft
+        # candidate controller. Do not arm the legacy one-call mutation receipt
+        # controller, which would otherwise reconcile a staged proposal as an
+        # ambiguous durable commit and close the loop prematurely.
+        if getattr(ctx, "artifact_candidate_loop_controller", None) is not None:
+            return None
         return ctx.artifact_mutation_attempt_controller
+
+    def _artifact_mutation_turn_active(self) -> bool:
+        """Return whether this turn has any document mutation authority.
+
+        The legacy writer controller intentionally stays separate from the
+        candidate-loop controller: the former owns the immediate durable
+        receipt, while the latter owns a DRAFT until ``document_finish``.
+        Budget, timeout, and provider-failure gates need to recognize both
+        authorities so an abandoned candidate cannot fall through to a
+        generic final answer.
+        """
+
+        ctx = self._tool_context or current_tool_context.get()
+        return bool(
+            self._artifact_writer_controller() is not None
+            or getattr(ctx, "artifact_candidate_loop_controller", None) is not None
+        )
+
+    async def _discard_uncommitted_candidate(self, reason: str) -> None:
+        """Reject an open PromptAnnotation draft on every non-commit exit."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        controller = getattr(ctx, "artifact_candidate_loop_controller", None)
+        if controller is None:
+            return
+        # Reconcile before inspecting the in-memory state.  A create/change
+        # set response can be lost after SQLite commits, leaving this process
+        # with ``change_set=None`` even though a durable DRAFT exists.  The
+        # shield lets the read finish during normal turn-finalization without
+        # turning a cleanup probe into a second mutation.
+        reconcile = getattr(controller, "reconcile", None)
+        if callable(reconcile):
+            try:
+                await asyncio.shield(reconcile())
+            except Exception:  # noqa: BLE001 - discard remains best effort
+                logger.warning(
+                    "agent.candidate_loop_reconcile_failed",
+                    session_key=self._session_key,
+                    reason=reason,
+                    exc_info=True,
+                )
+        # A duplicate ``document_finish`` may have reserved the durable
+        # mutation under another tool_use_id.  This turn is not allowed to
+        # reject the shared DRAFT or restore the winner's candidate preview;
+        # leave both intact for the owning call/recovery worker.
+        candidate_state_after_reconcile = getattr(controller, "state", None)
+        candidate_status_after_reconcile = str(
+            getattr(candidate_state_after_reconcile, "status", "") or ""
+        )
+        if bool(getattr(controller, "discard_blocked_by_other_finish", False)) and (
+            candidate_status_after_reconcile not in {"committed", "discarded"}
+        ):
+            logger.info(
+                "agent.candidate_loop_cleanup_deferred_to_finish_owner",
+                session_key=self._session_key,
+                reason=reason,
+            )
+            return
+        # If cancellation happened after the atomic commit but before the
+        # browser tool emitted ``source.patched``, finish cleanup must repair
+        # the notification gap.  The audit row is already durable, so this is
+        # a retryable delivery step and never changes the revision outcome.
+        candidate_state = getattr(controller, "state", None)
+        if str(getattr(candidate_state, "status", "")) == "discarded":
+            # The repository clears candidate columns as part of the reject
+            # CAS.  The controller retains the last blob ref solely for this
+            # physical cleanup; it is safe to retry when a discard response
+            # was lost after SQLite committed.
+            discarded_change_set = getattr(controller, "change_set", None)
+            discarded_status = getattr(discarded_change_set, "status", "")
+            discarded_status = str(
+                getattr(discarded_status, "value", discarded_status) or ""
+            ).lower()
+            candidate_blob = getattr(controller, "candidate_artifact", None)
+            media_root = getattr(ctx, "artifact_media_root", None)
+            session_id = getattr(ctx, "artifact_session_id", None)
+            if (
+                candidate_blob is not None
+                and discarded_status == "rejected"
+                and isinstance(media_root, str)
+                and media_root
+                and isinstance(session_id, str)
+                and session_id
+            ):
+                try:
+                    from opensquilla.artifacts import ArtifactStore
+
+                    await asyncio.to_thread(
+                        ArtifactStore(media_root).delete_ref,
+                        session_id=session_id,
+                        artifact_id=candidate_blob.artifact_id,
+                    )
+                except Exception:  # noqa: BLE001 - orphan cleanup is retryable
+                    logger.warning(
+                        "agent.candidate_discard_blob_cleanup_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+        if (
+            str(getattr(candidate_state, "status", "")) == "committed"
+            and not bool(getattr(ctx, "_artifact_source_patched_emitted", False))
+        ):
+            emitter = getattr(ctx, "artifact_event_emitter", None)
+            service = getattr(ctx, "artifact_session", None)
+            change_set = getattr(controller, "change_set", None)
+            document_id = getattr(candidate_state, "document_id", None)
+            revision_id = getattr(change_set, "applied_revision_id", None)
+            change_set_id = getattr(change_set, "change_set_id", None)
+            exact_audit = getattr(service, "audit_event_for_mutation", None)
+            list_audit = getattr(service, "list_audit_events", None)
+            if callable(emitter) and isinstance(document_id, str):
+                try:
+                    if callable(exact_audit) and isinstance(revision_id, str) and isinstance(
+                        change_set_id, str
+                    ):
+                        latest = await asyncio.shield(
+                            exact_audit(
+                                document_id,
+                                revision_id=revision_id,
+                                change_set_id=change_set_id,
+                            )
+                        )
+                    else:
+                        latest = None
+                        if callable(list_audit):
+                            events = await asyncio.shield(list_audit(document_id))
+                            for event in events:
+                                event_type = getattr(event, "event_type", "")
+                                exact_pair = isinstance(revision_id, str) and isinstance(
+                                    change_set_id, str
+                                )
+                                if not exact_pair and not (
+                                    isinstance(event_type, str)
+                                    and (
+                                        event_type.startswith("revision.")
+                                        or event_type
+                                        in {
+                                            "document.created",
+                                            "document.restored",
+                                            "document.reverted",
+                                            "change_set.applied",
+                                        }
+                                    )
+                                ):
+                                    continue
+                                if (
+                                    isinstance(revision_id, str)
+                                    and event.revision_id != revision_id
+                                ) or (
+                                    isinstance(change_set_id, str)
+                                    and event.change_set_id != change_set_id
+                                ):
+                                    continue
+                                if latest is None or event.sequence > latest.sequence:
+                                    latest = event
+                    if latest is not None:
+                        await asyncio.shield(
+                            emitter(
+                                {
+                                    "artifactEventSeq": latest.sequence,
+                                    "documentId": document_id,
+                                    "revisionId": revision_id,
+                                    "changeSetId": change_set_id,
+                                    "action": "source.patched",
+                                }
+                            )
+                        )
+                        setattr(ctx, "_artifact_source_patched_emitted", True)
+                except Exception:  # noqa: BLE001 - notification is best effort
+                    logger.warning(
+                        "agent.candidate_commit_event_retry_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+        # A cancellation can interrupt finish after the durable commit/reject
+        # but before the bridge restore flags are updated.  Treat an active
+        # binding itself as cleanup work (not only the explicit pending bit),
+        # including terminal ``committed``/``discarded`` controllers.
+        if bool(
+            getattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+            or getattr(ctx, "_artifact_candidate_preview_bound", False)
+            or getattr(controller, "candidate_artifact", None) is not None
+        ):
+            restore = getattr(
+                getattr(ctx, "desktop_artifact_bridge", None),
+                "restore_canonical_preview",
+                None,
+            )
+            restored = False
+            if callable(restore):
+                try:
+                    preview_handle = getattr(controller, "preview_handle", None)
+                    if isinstance(preview_handle, str):
+                        restored = bool(
+                            await asyncio.shield(restore(preview_handle))
+                        )
+                except Exception:  # noqa: BLE001 - a later UI refresh may retry
+                    logger.warning(
+                        "agent.candidate_preview_commit_cleanup_retry_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+            if restored:
+                retire = getattr(
+                    getattr(ctx, "artifact_preview_service", None),
+                    "retire_candidate_preview",
+                    None,
+                )
+                handle = getattr(controller, "preview_handle", None)
+                if callable(retire) and isinstance(handle, str):
+                    try:
+                        retire(handle)
+                    except Exception:  # noqa: BLE001 - bounded best effort
+                        pass
+                setattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+                setattr(ctx, "_artifact_candidate_preview_bound", False)
+                setattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+            elif not callable(restore):
+                # The bridge disappeared between turns; there is no native
+                # handle left that can be retried. Retire the in-memory
+                # mapping rather than keeping cleanup_pending forever.
+                retire = getattr(
+                    getattr(ctx, "artifact_preview_service", None),
+                    "retire_candidate_preview",
+                    None,
+                )
+                handle = getattr(controller, "preview_handle", None)
+                if callable(retire) and isinstance(handle, str):
+                    try:
+                        retire(handle)
+                    except Exception:  # noqa: BLE001 - bounded best effort
+                        pass
+                setattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+                setattr(ctx, "_artifact_candidate_preview_bound", False)
+                setattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+        state = getattr(controller, "state", None)
+        state_status = str(getattr(state, "status", ""))
+        change_set = getattr(controller, "change_set", None)
+        has_open_draft = (
+            state_status == "open"
+            and getattr(change_set, "status", None) == "draft"
+        )
+        if state_status not in {
+            "candidate_staged",
+            "verification_passed",
+            "verification_failed",
+        } and not has_open_draft:
+            return
+        try:
+            from opensquilla.artifact_session import Actor, ActorKind
+
+            actor_id = str(
+                getattr(ctx, "agent_id", "")
+                or self.config.tool_result_store_agent_id
+                or (self.config.metadata or {}).get("agent_id")
+                or ""
+            ).strip()
+            if not actor_id and self._session_key:
+                from opensquilla.session.keys import parse_agent_id
+
+                actor_id = str(parse_agent_id(self._session_key) or "").strip()
+            if not actor_id:
+                return
+            candidate_blob = getattr(controller, "candidate_artifact", None)
+            had_candidate_preview = bool(
+                getattr(controller, "candidate_artifact", None) is not None
+                or getattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+                or getattr(ctx, "_artifact_candidate_preview_bound", False)
+                or getattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+            )
+            discard = getattr(controller, "discard", None) or getattr(controller, "reject", None)
+            if callable(discard):
+                discard_actor = Actor(ActorKind.AGENT, actor_id)
+                # The controller performs its own one-shot CAS recovery, but
+                # the outer turn can still observe a response-loss/error after
+                # that bounded pass.  Reconcile once and retry only while the
+                # exact turn remains an open draft; never spin during cleanup.
+                for discard_attempt in range(2):
+                    try:
+                        await discard(actor=discard_actor, reason=reason)
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if bool(
+                            getattr(controller, "discard_blocked_by_other_finish", False)
+                        ):
+                            logger.info(
+                                "agent.candidate_loop_cleanup_deferred_to_finish_owner",
+                                session_key=self._session_key,
+                                reason=reason,
+                            )
+                            return
+                        if discard_attempt != 0:
+                            raise
+                        reconcile = getattr(controller, "reconcile", None)
+                        if not callable(reconcile):
+                            raise
+                        try:
+                            await asyncio.shield(reconcile())
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            raise
+                        refreshed_state = getattr(controller, "state", None)
+                        refreshed_status = str(
+                            getattr(refreshed_state, "status", "") or ""
+                        )
+                        refreshed_change_set = getattr(controller, "change_set", None)
+                        refreshed_open_draft = (
+                            refreshed_status == "open"
+                            and getattr(refreshed_change_set, "status", None) == "draft"
+                        )
+                        if refreshed_status in {"committed", "discarded"}:
+                            break
+                        if refreshed_status not in {
+                            "candidate_staged",
+                            "verification_passed",
+                            "verification_failed",
+                        } and not refreshed_open_draft:
+                            raise
+            # Never delete the physical candidate unless the durable
+            # ChangeSet is confirmed REJECTED.  A discard CAS can race a
+            # commit or remain unresolved after both bounded retries; in
+            # either case the blob may already be the canonical revision (or
+            # still be referenced by a live DRAFT), so deletion would corrupt
+            # the artifact.  The restart cleanup journal handles unresolved
+            # drafts safely on a later pass.
+            final_candidate_state = getattr(controller, "state", None)
+            final_candidate_status = str(
+                getattr(final_candidate_state, "status", "") or ""
+            )
+            final_change_set = getattr(controller, "change_set", None)
+            final_change_set_status = getattr(final_change_set, "status", "")
+            final_change_set_status = str(
+                getattr(final_change_set_status, "value", final_change_set_status)
+                or ""
+            ).lower()
+            confirmed_rejected = (
+                final_candidate_status == "discarded"
+                and final_change_set_status == "rejected"
+            )
+            if candidate_blob is not None and confirmed_rejected:
+                try:
+                    from opensquilla.artifacts import ArtifactStore
+
+                    media_root = getattr(ctx, "artifact_media_root", None)
+                    session_id = getattr(ctx, "artifact_session_id", None)
+                    if isinstance(media_root, str) and media_root and isinstance(session_id, str):
+                        await asyncio.to_thread(
+                            ArtifactStore(media_root).delete_ref,
+                            session_id=session_id,
+                            artifact_id=candidate_blob.artifact_id,
+                        )
+                except Exception:  # noqa: BLE001 - orphan GC remains safe
+                    pass
+            # An empty DRAFT has never been bound to a candidate preview.  Do
+            # not invoke a bridge restore for it; restoring a canonical surface
+            # here could detach another turn's active preview.
+            restore = (
+                getattr(
+                    getattr(ctx, "desktop_artifact_bridge", None),
+                    "restore_canonical_preview",
+                    None,
+                )
+                if candidate_blob is not None or had_candidate_preview
+                else None
+            )
+            restored = False
+            if callable(restore):
+                try:
+                    preview_handle = getattr(controller, "preview_handle", None)
+                    if isinstance(preview_handle, str):
+                        restored = bool(
+                            await asyncio.shield(restore(preview_handle))
+                        )
+                except Exception:  # noqa: BLE001 - fallback retirement still runs
+                    logger.warning(
+                        "agent.candidate_preview_restore_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+            if not restored:
+                if callable(restore):
+                    # Native restore keeps its opaque handle when Gateway
+                    # release fails. Preserve the mapping and mark cleanup
+                    # pending so a later turn/shutdown retry can complete the
+                    # release; retiring it now would make that retry return
+                    # NOT_FOUND while the native surface still owns the handle.
+                    setattr(ctx, "_artifact_candidate_preview_cleanup_pending", True)
+                    # Keep the binding marker true while the native surface
+                    # still owns the handle; this is a cleanup-pending state,
+                    # not proof that the candidate was detached.
+                    setattr(ctx, "_artifact_candidate_preview_bound", True)
+                else:
+                    # A web/legacy turn may still have registered an opaque
+                    # candidate mapping even though no Desktop bridge is
+                    # bound. Without a restore method there is no native
+                    # handle to reconcile, so retire the mapping directly.
+                    retire = getattr(
+                        getattr(ctx, "artifact_preview_service", None),
+                        "retire_candidate_preview",
+                        None,
+                    )
+                    handle = getattr(controller, "preview_handle", None)
+                    if callable(retire) and isinstance(handle, str):
+                        try:
+                            retire(handle)
+                        except Exception:  # noqa: BLE001 - cleanup remains best effort
+                            pass
+                    setattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - cleanup must not mask the turn outcome
+            logger.warning(
+                "agent.candidate_loop_cleanup_failed",
+                session_key=self._session_key,
+                reason=reason,
+                exc_info=True,
+            )
 
     async def _reserve_artifact_writer_intent(
         self,
@@ -20437,6 +21276,13 @@ class Agent:
             or tool_name not in ctx.surfaced_tools
         ):
             return None
+        # Candidate-loop writers are staged in the turn-scoped draft
+        # controller. They must not be routed through the legacy
+        # ArtifactMutationAttemptController, whose reservation would treat the
+        # first proposal as a durable commit and close the autonomous loop.
+        if getattr(ctx, "artifact_candidate_loop_controller", None) is not None:
+            self._active_artifact_writer_intent_id = None
+            return "candidate"
         controller = ctx.artifact_mutation_attempt_controller
         if controller is None:
             self._write_turn_call_log(
@@ -20507,6 +21353,25 @@ class Agent:
 
         if not tool_use_id:
             return
+        candidate_context = self._tool_context or current_tool_context.get()
+        candidate_controller = getattr(
+            candidate_context,
+            "artifact_candidate_loop_controller",
+            None,
+        )
+        if candidate_controller is not None:
+            # Candidate writers never reserve a durable mutation attempt. A
+            # provider stream failure still invalidates any prior browser
+            # receipt so a subsequent finish cannot publish stale evidence.
+            invalidate = getattr(candidate_controller, "invalidate_verification", None)
+            if callable(invalidate):
+                try:
+                    await invalidate(reason=failure_code)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - an open/closed candidate is fenced
+                    pass
+            return
         controller = self._artifact_writer_controller()
         if controller is None:
             return
@@ -20537,19 +21402,46 @@ class Agent:
         """Return a pure proposal error to the loop without a durable attempt."""
 
         controller = self._artifact_writer_controller()
-        if controller is None or tool_call.tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
+        candidate_context = self._tool_context or current_tool_context.get()
+        candidate_controller = getattr(
+            candidate_context,
+            "artifact_candidate_loop_controller",
+            None,
+        )
+        if (
+            controller is None
+            and candidate_controller is None
+        ) or tool_call.tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
             return result
-        try:
-            await controller.reject_proposal(tool_call.tool_use_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - no durable side effect exists
-            logger.warning(
-                "agent.artifact_mutation_preflight_rejection_failed",
-                session_key=self._session_key,
-                tool_use_id=tool_call.tool_use_id,
-                exc_info=True,
-            )
+        if candidate_controller is not None:
+            # Candidate-loop writer calls are rejected before dispatch and
+            # therefore have no legacy mutation-attempt proposal to release.
+            # Invalidate any receipt that preceded this conflicting batch so a
+            # later finish cannot commit against stale evidence.
+            invalidate = getattr(candidate_controller, "invalidate_verification", None)
+            if callable(invalidate):
+                try:
+                    await invalidate(reason=failure_code)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - an open/closed candidate is already fenced
+                    pass
+        else:
+            # The guard above establishes that the legacy controller is
+            # present whenever this branch is reached; make that invariant
+            # explicit for static analysis as well as future refactors.
+            assert controller is not None
+            try:
+                await controller.reject_proposal(tool_call.tool_use_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - no durable side effect exists
+                logger.warning(
+                    "agent.artifact_mutation_preflight_rejection_failed",
+                    session_key=self._session_key,
+                    tool_use_id=tool_call.tool_use_id,
+                    exc_info=True,
+                )
         digest = hashlib.sha256(
             json.dumps(
                 tool_call.arguments,

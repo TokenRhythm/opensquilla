@@ -301,6 +301,9 @@
                     && runtime.status.installedBytes !== null"
                 >
                   {{ formatBytes(runtime.status.installedBytes) }}
+                  <template v-if="runtime.status.operation?.source">
+                    · {{ runtimeSourceLabel(runtime.status.operation.source) }}
+                  </template>
                 </small>
                 <small v-else-if="runtime.status.operation?.source">
                   {{ runtimeSourceLabel(runtime.status.operation.source) }}

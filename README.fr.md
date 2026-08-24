@@ -30,7 +30,11 @@
 
 ## Actualités
 
-- 📢 **2026-07-03** — Notre rapport technique **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)** (préversion) est disponible, publié en même temps qu'OpenSquilla **0.5.0 Preview 1**. Il détaille comment le routeur natif du harness transforme le trafic quotidien des agents en un volant d'inertie de données qui s'améliore de lui-même.
+- 📢 **2026-08-22** — La version anglaise de notre rapport technique est désormais disponible sur aiXiv : [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). Voir [Citation](#citation) pour savoir comment citer OpenSquilla.
+
+- 📢 **2026-08-21** — Les versions PDF de notre rapport technique sont désormais disponibles dans ce dépôt : [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
+
+- 📢 **2026-07-14** — Notre rapport technique **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** est désormais disponible sur arXiv. Il montre comment le routeur natif du harness transforme le trafic quotidien des agents en un volant d'inertie de données qui s'améliore de lui-même, et comment **le routage d'ensemble multi-modèles surpasse Fable 5**.
 
 ---
 
@@ -841,3 +845,23 @@ compétences et travail sur le runtime central. Consultez
 
 [Code de conduite](CODE_OF_CONDUCT.md) · [Sécurité](SECURITY.md) ·
 [Support](SUPPORT.md) · [Licence](LICENSE) (Apache-2.0)
+
+---
+
+## Citation
+
+Si vous utilisez OpenSquilla dans vos travaux de recherche, merci de citer notre rapport technique :
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

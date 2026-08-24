@@ -100,6 +100,70 @@ _REPEATED_CALL_NOTICE_ENV = "OPENSQUILLA_REPEATED_CALL_NOTICE"
 # result content.
 _REPEATED_CALL_NOTICE_MAX_ENTRIES = 1024
 _PROMPT_ANNOTATION_WRITERS = frozenset({"document_apply", "document_patch"})
+_PROMPT_ANNOTATION_LOOP_CONTROL = frozenset(
+    {
+        "document_browser_act",
+        "document_browser_inspect",
+        "document_browser_reload",
+        "document_browser_screenshot",
+        "document_finish",
+    }
+)
+
+# Runtime resource guards are deliberately terminal even inside an autonomous
+# candidate loop.  These controls mean the platform has exhausted a global
+# budget (rather than the model having made a correctable browser/source
+# mistake); the Agent must enter its tools-disabled wrap-up path and the outer
+# turn cleanup will discard any uncommitted candidate.
+_CANDIDATE_GLOBAL_CONTROL_REASONS = frozenset(
+    {
+        "tool_run_budget_exhausted",
+        "turn_llm_call_budget_exceeded",
+        "turn_input_token_budget_exceeded",
+        "turn_output_token_budget_exceeded",
+        "turn_billed_cost_budget_exceeded",
+        "turn_cost_budget_exceeded",
+        "turn_tool_error_budget_exceeded",
+        "agent_runtime_timeout",
+        "total_timeout",
+    }
+)
+
+
+def _prompt_annotation_candidate_enabled(
+    tool_call: ToolCall,
+    ctx: ToolContext | None,
+) -> bool:
+    """Whether this call belongs to the draft-candidate agent loop."""
+
+    return bool(
+        ctx is not None
+        and getattr(ctx, "artifact_candidate_loop_controller", None) is not None
+        and tool_call.tool_name
+        in (_PROMPT_ANNOTATION_WRITERS | _PROMPT_ANNOTATION_LOOP_CONTROL)
+        and (
+            (exclusive := getattr(ctx, "exclusive_tools", None)) is None
+            or tool_call.tool_name in exclusive
+        )
+    )
+
+
+def _prompt_annotation_agent_loop_enabled() -> bool:
+    """Return whether this bound turn can continue after a durable writer.
+
+    The candidate controller may later replace the compatibility writer path,
+    but the public signal is intentionally the surfaced loop-control tool set.
+    Ordinary document turns and legacy PromptAnnotation clients retain their
+    existing terminal-writer behavior.
+    """
+
+    ctx = current_tool_context.get()
+    if ctx is None:
+        return False
+    surfaced = getattr(ctx, "surfaced_tools", None)
+    exclusive = getattr(ctx, "exclusive_tools", None)
+    names = exclusive if exclusive is not None else surfaced
+    return bool(names is not None and _PROMPT_ANNOTATION_LOOP_CONTROL <= set(names))
 # ToolSpec carries no mutating/read-only flag, so hash-compare only tools whose
 # results are pure functions of their arguments and observed state. Execution
 # and write tools stay excluded: byte-identical output from them is no proof
@@ -1397,7 +1461,10 @@ def _prompt_annotation_writer_is_guarded(
     return bool(
         tool_call.tool_name in _PROMPT_ANNOTATION_WRITERS
         and ctx is not None
-        and ctx.artifact_mutation_attempt_controller is not None
+        and (
+            ctx.artifact_mutation_attempt_controller is not None
+            or getattr(ctx, "artifact_candidate_loop_controller", None) is not None
+        )
         and ctx.surfaced_tools is not None
         and tool_call.tool_name in ctx.surfaced_tools
         and (
@@ -1533,6 +1600,118 @@ def _set_mutation_payload_control(
     result.content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
+def _candidate_finish_has_durable_attempt(context: Any | None) -> bool:
+    """Return whether ``document_finish`` crossed its durable receipt boundary.
+
+    The candidate controller keeps this identity turn-local while a finish
+    request reserves/registers its mutation attempt.  A failure after that
+    point cannot safely be treated like a normal validation error: the receipt
+    may be RESERVED, APPLIED, or unreadable.  Support the public property used
+    by newer controllers and the private field retained by older in-process
+    controllers so rolling upgrades remain fail-closed.
+    """
+
+    controller = getattr(context, "artifact_candidate_loop_controller", None)
+    if controller is None:
+        return False
+    for name in (
+        "mutation_attempt_id",
+        "_mutation_attempt_id",
+        "mutation_attempt_tool_use_id",
+        "_mutation_attempt_tool_use_id",
+    ):
+        value = getattr(controller, name, None)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _candidate_finish_is_ambiguous(
+    *,
+    tool_call: ToolCall,
+    payload: Mapping[str, Any] | None,
+    exception: BaseException | None,
+    context: Any | None,
+) -> bool:
+    """Classify only durable finish uncertainty as an ambiguous outcome.
+
+    Browser/runtime failures and pre-commit validation errors are recoverable
+    observations for the model.  The exception is different only when a
+    ``document_finish`` call has already reserved a durable mutation attempt;
+    retrying another writer could then create a second side effect.  Handlers
+    may also mark an explicitly ambiguous result, useful for a lost response
+    after an atomic transaction.
+    """
+
+    if tool_call.tool_name != "document_finish":
+        return False
+    if bool(getattr(exception, "candidate_commit_ambiguous", False)):
+        return True
+    if isinstance(payload, Mapping):
+        if str(payload.get("status") or "").strip().lower() == "ambiguous":
+            return True
+        for key in ("outcome_code", "outcomeCode", "reason", "code"):
+            value = payload.get(key)
+            if isinstance(value, str) and value in {
+                "document_finish_commit_ambiguous",
+                "DOCUMENT_FINISH_COMMIT_AMBIGUOUS",
+                "mutation_attempt_ambiguous",
+            }:
+                return True
+    return _candidate_finish_has_durable_attempt(context)
+
+
+async def _candidate_terminal_receipt(
+    *,
+    tool_call: ToolCall,
+    context: Any | None,
+) -> ToolResult | None:
+    """Project a terminal candidate state after a late dispatch exception."""
+
+    if tool_call.tool_name != "document_finish" or context is None:
+        return None
+    controller = getattr(context, "artifact_candidate_loop_controller", None)
+    if controller is None:
+        return None
+    state = getattr(controller, "state", None)
+    status = str(getattr(state, "status", "") or "")
+    if status not in {"committed", "discarded"}:
+        # A response can be lost immediately after the repository transaction
+        # and before the controller updates its local state.  Reconcile once
+        # before declaring the late exception unrecoverable.
+        reconcile = getattr(controller, "reconcile", None)
+        if callable(reconcile):
+            try:
+                await reconcile()
+            except Exception:  # noqa: BLE001 - preserve the original failure
+                return None
+            state = getattr(controller, "state", None)
+            status = str(getattr(state, "status", "") or "")
+    if status == "committed":
+        return _mutation_receipt_result(
+            tool_call,
+            status="applied",
+            reason="document_mutation_applied_after_dispatch_failure",
+        )
+    if status == "discarded":
+        result = ToolResult(
+            tool_use_id=tool_call.tool_use_id,
+            tool_name=tool_call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "discarded",
+                    "reason": "document_mutation_discarded_after_dispatch_failure",
+                    "retry_allowed": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            is_error=False,
+        )
+        return await _candidate_loop_effect_result(result, tool_call=tool_call)
+    return None
+
+
 def _mutation_effect_result(
     result: ToolResult,
     *,
@@ -1545,6 +1724,19 @@ def _mutation_effect_result(
     attempt: Any | None = None,
     extra_outcome: Mapping[str, Any] | None = None,
 ) -> ToolResult:
+    # A PromptAnnotation autonomous loop keeps the model in control after the
+    # first durable compatibility writer so it can inspect the bound preview
+    # and explicitly call document_finish.  Only a confirmed committed result
+    # is converted; ambiguous/failed receipts still close the side-effect
+    # boundary fail-closed.
+    if (
+        loop_action == "finalize_without_tools"
+        and effect_state == "committed"
+        and result.tool_name in _PROMPT_ANNOTATION_WRITERS
+        and _prompt_annotation_agent_loop_enabled()
+    ):
+        loop_action = "continue"
+        retry_policy = "same_turn"
     result.terminates_turn = False
     result.terminal_response_text = None
     result.effect_outcome = ToolEffectOutcome(
@@ -1569,6 +1761,405 @@ def _mutation_effect_result(
     return result
 
 
+async def _candidate_loop_effect_result(
+    result: ToolResult,
+    *,
+    tool_call: ToolCall,
+    exception: BaseException | None = None,
+) -> ToolResult:
+    """Attach loop semantics to candidate/browser/finish results.
+
+    Candidate writers and browser observations are deliberately non-terminal;
+    only a durable ``document_finish`` decision closes the loop.  Keeping this
+    projection in dispatch makes the same contract apply to schema failures,
+    policy denials, and handler exceptions.
+    """
+
+    context = current_tool_context.get()
+    invalidate = getattr(
+        getattr(context, "artifact_candidate_loop_controller", None),
+        "invalidate_verification",
+        None,
+    )
+    if tool_call.tool_name in _PROMPT_ANNOTATION_WRITERS or tool_call.tool_name in {
+        "document_browser_act",
+        "document_browser_reload",
+    }:
+        # A failed proposal/action must not leave an earlier receipt usable.
+        # Keep this cleanup best-effort: the public result remains the stable
+        # model-facing error even if the draft was already closed elsewhere.
+        if context is not None:
+            setattr(context, "_artifact_browser_verification_token", None)
+            setattr(context, "_artifact_browser_verification_sha256", None)
+            setattr(context, "_artifact_browser_binding_generation", None)
+        if callable(invalidate):
+            try:
+                await invalidate(reason="candidate_loop_operation")
+            except Exception:  # noqa: BLE001 - stale/closed candidates fail closed below
+                pass
+    try:
+        payload = json.loads(result.content)
+    except (TypeError, ValueError):
+        payload = None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    candidate_preview_unavailable = (
+        tool_call.tool_name in _PROMPT_ANNOTATION_WRITERS
+        and isinstance(payload, dict)
+        and payload.get("preview") == "unavailable"
+    )
+    # ``document_finish`` crosses the durable revision boundary before tool
+    # accounting/telemetry is finalized.  A budget tracker or hook can fail
+    # after that commit and hand us an error-shaped result; never project that
+    # as ``not_applied`` or ask the model to retry.  The controller's terminal
+    # state is the authoritative local receipt for this still-running turn.
+    candidate_controller = getattr(context, "artifact_candidate_loop_controller", None)
+    candidate_state = getattr(candidate_controller, "state", None)
+    if (
+        tool_call.tool_name == "document_finish"
+        and getattr(candidate_state, "status", None) in {"committed", "discarded"}
+        and (exception is not None or status != "applied" or result.is_error)
+    ):
+        terminal_status = (
+            "applied"
+            if getattr(candidate_state, "status", None) == "committed"
+            else "discarded"
+        )
+        return _mutation_receipt_result(
+            tool_call,
+            status=terminal_status,
+            reason=(
+                "document_mutation_applied_after_accounting_failure"
+                if terminal_status == "applied"
+                else "document_mutation_discarded_after_accounting_failure"
+            ),
+        )
+    if candidate_preview_unavailable:
+        # Without a bindable preview the candidate can never produce the
+        # verification receipt required by document_finish(commit). End the
+        # tool loop immediately; the turn finalizer rejects the staged draft.
+        result.content = json.dumps(
+            {
+                "status": "error",
+                "category": "DOCUMENT_PREVIEW_UNAVAILABLE",
+                "message_key": "document.previewUnavailable",
+                "retry_policy": "new_turn",
+                "next_action": "finalize_without_tools",
+                "retry_allowed": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        result.is_error = True
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="none",
+            retry_policy="new_turn",
+            loop_action="finalize_without_tools",
+            outcome_code="document_preview_unavailable",
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": "not_applied",
+                    "phase": "candidate",
+                    "retryPolicy": "new_turn",
+                    "code": "document_preview_unavailable",
+                }
+            },
+        )
+        _set_mutation_payload_control(
+            result,
+            retry_policy="new_turn",
+            outcome_code="document_preview_unavailable",
+        )
+        result.terminates_turn = True
+        result.terminal_response_text = None
+        return result
+    # The ordinary tool-run budget is a global circuit breaker, not a model
+    # correction opportunity.  Close the loop here so an open candidate is
+    # discarded by the turn cleanup and the tools-disabled finalizer can report
+    # a truthful not-applied outcome.  All other candidate/browser failures are
+    # intentionally fed back to the model: it may inspect again, repair with a
+    # different writer, or explicitly call document_finish(discard).
+    budget_exhausted = isinstance(exception, ToolRunBudgetExceededError) or (
+        isinstance(payload, dict)
+        and payload.get("status") == "control"
+        and (
+            payload.get("reason") in _CANDIDATE_GLOBAL_CONTROL_REASONS
+            or payload.get("retry_allowed") is False
+        )
+    )
+    if budget_exhausted:
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="none",
+            retry_policy="new_turn",
+            loop_action="finalize_without_tools",
+            outcome_code="document_tool_budget_exhausted",
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": "not_applied",
+                    "phase": "verification"
+                    if tool_call.tool_name.startswith("document_browser_")
+                    else "candidate",
+                    "retryPolicy": "new_turn",
+                    "code": "document_tool_budget_exhausted",
+                }
+            },
+        )
+        _set_mutation_payload_control(
+            result,
+            retry_policy="new_turn",
+            outcome_code="document_tool_budget_exhausted",
+        )
+        result.terminates_turn = False
+        result.terminal_response_text = None
+        return result
+    # Runtime control results (for example a browser tool budget exhaustion)
+    # are intentionally ``is_error=False`` so generic tool accounting does not
+    # treat them as handler failures.  Only the explicit global-control reasons
+    # above close the loop; ordinary retry_allowed=false envelopes are still
+    # model feedback in this autonomous turn.
+    payload_retry_disallowed = (
+        isinstance(payload, dict) and payload.get("retry_allowed") is False
+    )
+    bridge_category = str(getattr(exception, "category", "") or "")
+    bridge_retry_policy = str(getattr(exception, "retry_policy", "") or "")
+    bridge_next_action = str(getattr(exception, "next_action", "") or "")
+    if bridge_category:
+        result.content = json.dumps(
+            {
+                "status": "error",
+                "category": bridge_category,
+                "message_key": (
+                    "document.previewUnavailable"
+                    if getattr(exception, "terminal_binding_loss", False) is True
+                    else "document.actionResultUnknown"
+                    if bridge_category == "DOCUMENT_ACTION_RESULT_UNKNOWN"
+                    else "document.editFailed"
+                ),
+                "retry_policy": bridge_retry_policy or "same_turn",
+                "next_action": bridge_next_action or "retry",
+                "retry_allowed": bridge_retry_policy != "new_turn",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        result.is_error = True
+    browser_preview_unavailable = (
+        tool_call.tool_name.startswith("document_browser_")
+        and getattr(exception, "terminal_binding_loss", False) is True
+    )
+    if browser_preview_unavailable:
+        # A terminal binding loss cannot be repaired by another browser
+        # iteration. Close the tool loop after the first failure; turn cleanup
+        # safely discards any uncommitted candidate.
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="none",
+            retry_policy="new_turn",
+            loop_action="finalize_without_tools",
+            outcome_code="document_preview_unavailable",
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": "not_applied",
+                    "phase": "verification",
+                    "retryPolicy": "new_turn",
+                    "code": "document_preview_unavailable",
+                }
+            },
+        )
+        _set_mutation_payload_control(
+            result,
+            retry_policy="new_turn",
+            outcome_code="document_preview_unavailable",
+        )
+        result.terminates_turn = True
+        result.terminal_response_text = None
+        return result
+    durable_ambiguous = _candidate_finish_is_ambiguous(
+        tool_call=tool_call,
+        payload=payload if isinstance(payload, Mapping) else None,
+        exception=exception,
+        context=context,
+    )
+    if durable_ambiguous and status not in {"applied", "discarded"}:
+        # A finish request that already reserved a durable mutation receipt is
+        # not safe to replay as another writer.  Keep the outcome explicitly
+        # ambiguous and enter the no-tools finalizer; the receipt/reconcile
+        # path remains authoritative for restart recovery.
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="unknown",
+            retry_policy="reconcile",
+            loop_action="finalize_without_tools",
+            outcome_code="document_finish_commit_ambiguous",
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": "ambiguous",
+                    "phase": "commit",
+                    "retryPolicy": "reconcile",
+                    "code": "document_finish_commit_ambiguous",
+                }
+            },
+        )
+        _set_mutation_payload_control(
+            result,
+            retry_policy="reconcile",
+            outcome_code="document_finish_commit_ambiguous",
+        )
+        result.terminates_turn = False
+        result.terminal_response_text = None
+        return result
+    if exception is not None or result.is_error or payload_retry_disallowed:
+        # ``SafeToolError`` is deliberately conservative in the generic
+        # envelope (many classes set retry_allowed=false), but that bit does
+        # not mean the autonomous document loop must terminate.  A browser
+        # runtime exception, stale anchor, unavailable preview, or rejected
+        # writer is useful feedback for the model and is safe to retry under
+        # the global deadline/cost/call guards.
+        retry_policy = "same_turn"
+        loop_action = "continue"
+        outcome_code = (
+            "document_browser_verification_failed"
+            if tool_call.tool_name.startswith("document_browser_")
+            else "document_finish_retry"
+            if tool_call.tool_name == "document_finish"
+            else "document_candidate_retry"
+        )
+        status = (
+            "verification_failed"
+            if tool_call.tool_name.startswith("document_browser_")
+            else "not_applied"
+        )
+        phase = (
+            "verification"
+            if tool_call.tool_name.startswith("document_browser_")
+            else "commit"
+            if tool_call.tool_name == "document_finish"
+            else "candidate"
+        )
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="started" if tool_call.tool_name != "document_finish" else "none",
+            retry_policy=retry_policy,
+            loop_action=loop_action,
+            outcome_code=outcome_code,
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": status,
+                    "phase": phase,
+                    "retryPolicy": retry_policy,
+                    "code": outcome_code,
+                }
+            },
+        )
+        _set_mutation_payload_control(
+            result,
+            retry_policy=retry_policy,
+            outcome_code=outcome_code,
+        )
+        result.terminates_turn = False
+        result.terminal_response_text = None
+        return result
+
+    if tool_call.tool_name == "document_finish" and status in {"applied", "discarded"}:
+        committed = status == "applied"
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="committed" if committed else "none",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            outcome_code=(
+                "document_mutation_applied"
+                if committed
+                else "document_mutation_discarded"
+            ),
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": status,
+                    "phase": "commit" if committed else "discard",
+                    "retryPolicy": "never",
+                    "code": (
+                        "document_mutation_applied"
+                        if committed
+                        else "document_mutation_discarded"
+                    ),
+                }
+            },
+        )
+        result.terminates_turn = False
+        result.terminal_response_text = None
+        return result
+
+    phase = "candidate" if tool_call.tool_name in _PROMPT_ANNOTATION_WRITERS else "verification"
+    if status:
+        mutation_status = status
+    elif tool_call.tool_name == "document_browser_inspect":
+        # Only inspect creates a verification receipt.  Diagnostic/action
+        # tools must not be projected as proof that a candidate is healthy.
+        mutation_status = "verification_passed"
+    elif tool_call.tool_name == "document_browser_screenshot":
+        mutation_status = "screenshot_observed"
+    elif tool_call.tool_name == "document_browser_act":
+        mutation_status = "action_applied"
+    elif tool_call.tool_name == "document_browser_reload":
+        mutation_status = "reload_observed"
+    else:
+        mutation_status = "candidate_staged"
+    extra: dict[str, Any] = {}
+    if isinstance(payload, dict):
+        for key in ("candidateSha256", "candidateEpoch", "verificationToken", "generation"):
+            if key in payload:
+                extra[key] = payload[key]
+    result.effect_outcome = ToolEffectOutcome(
+        effect_state="started",
+        retry_policy="same_turn",
+        loop_action="continue",
+        outcome_code=(
+            "document_preview_unavailable"
+            if candidate_preview_unavailable
+            else (
+                "document_candidate_staged"
+                if phase == "candidate"
+                else "document_verification_observed"
+            )
+        ),
+        safe_details={
+            "documentMutationOutcome": {
+                "version": 1,
+                "status": mutation_status,
+                "phase": phase,
+                "retryPolicy": "same_turn",
+                "code": (
+                    "document_preview_unavailable"
+                    if candidate_preview_unavailable
+                    else (
+                        "document_candidate_staged"
+                        if phase == "candidate"
+                        else "document_verification_observed"
+                    )
+                ),
+                **extra,
+            }
+        },
+    )
+    _set_mutation_payload_control(
+        result,
+        retry_policy="same_turn",
+        outcome_code=(
+            "document_preview_unavailable"
+            if candidate_preview_unavailable
+            else (
+                "document_candidate_staged"
+                if phase == "candidate"
+                else "document_verification_observed"
+            )
+        ),
+    )
+    result.terminates_turn = False
+    result.terminal_response_text = None
+    return result
+
+
 def _mutation_receipt_result(
     tool_call: ToolCall,
     *,
@@ -1590,6 +2181,18 @@ def _mutation_receipt_result(
         effect_state = "committed"
         retry_policy = "never"
         mutation_status = "applied"
+    elif status == "discarded":
+        payload = {
+            "status": "discarded",
+            "tool": tool_call.tool_name,
+            "reason": reason,
+            "retry_allowed": False,
+        }
+        execution_state = "success"
+        preservation_class = "normal"
+        effect_state = "none"
+        retry_policy = "never"
+        mutation_status = "discarded"
     elif status == "ambiguous":
         payload = {
             "status": "ambiguous",
@@ -1620,7 +2223,7 @@ def _mutation_receipt_result(
         tool_use_id=tool_call.tool_use_id,
         tool_name=tool_call.tool_name,
         content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        is_error=status != "applied",
+        is_error=status not in {"applied", "discarded"},
         execution_status=normalize_execution_status(
             {
                 "version": 1,
@@ -1629,7 +2232,7 @@ def _mutation_receipt_result(
                 "timed_out": False,
                 "truncated": False,
                 "reason": reason,
-                "source": "replay" if status == "applied" else "tool_runtime",
+                "source": "replay" if status in {"applied", "discarded"} else "tool_runtime",
                 "preservation_class": preservation_class,
             }
         ),
@@ -1655,7 +2258,20 @@ async def _finish_artifact_mutation_failure(
     proposal_failures: OrderedDict[int, list[str]] | None = None,
     exception: BaseException | None = None,
 ) -> ToolResult:
+    if bool(getattr(controller, "is_candidate_loop", False)):
+        return await _candidate_loop_effect_result(
+            result,
+            tool_call=tool_call,
+            exception=exception,
+        )
     if controller is None:
+        ctx = current_tool_context.get()
+        if _prompt_annotation_candidate_enabled(tool_call, ctx):
+            return await _candidate_loop_effect_result(
+                result,
+                tool_call=tool_call,
+                exception=exception,
+            )
         return result
     stable_code = (
         exception.code
@@ -1884,6 +2500,18 @@ async def _finish_artifact_mutation_cleanup_ambiguity(
 ) -> ToolResult:
     """Preserve a failed candidate for deterministic restart reconciliation."""
 
+    if bool(getattr(controller, "is_candidate_loop", False)):
+        result = ToolResult(
+            tool_use_id=tool_call.tool_use_id,
+            tool_name=tool_call.tool_name,
+            content=json.dumps(
+                {"status": "verification_failed", "retry_allowed": True},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            is_error=True,
+        )
+        return await _candidate_loop_effect_result(result, tool_call=tool_call)
     if controller is None:
         return _mutation_receipt_result(
             tool_call,
@@ -2014,6 +2642,37 @@ async def _mark_artifact_mutation_cancelled(
     tool_call: ToolCall,
 ) -> None:
     if controller is None:
+        return
+    if bool(getattr(controller, "is_candidate_loop", False)):
+        # A cancellation can arrive after the candidate commit transaction has
+        # crossed the durable CAS but before ``ArtifactCandidateLoopController``
+        # updates its in-memory status.  Reconcile first; otherwise the outer
+        # turn cleanup may try to reject an already-applied ChangeSet and lose
+        # the authoritative result.  A failed reconciliation remains a safe
+        # open candidate and is invalidated below for a later recovery pass.
+        reconcile = getattr(controller, "reconcile", None)
+        if callable(reconcile):
+            try:
+                await reconcile()
+            except asyncio.CancelledError:
+                # We are already handling the original cancellation.  Keep
+                # the cleanup best-effort without masking that cause.
+                pass
+            except Exception:  # noqa: BLE001 - recovery remains fail-closed
+                log.warning(
+                    "dispatch.candidate_cancel_reconcile_failed",
+                    tool_use_id=tool_call.tool_use_id,
+                    exc_info=True,
+                )
+        state = getattr(controller, "state", None)
+        if str(getattr(state, "status", "") or "") in {"committed", "discarded"}:
+            return
+        invalidate = getattr(controller, "invalidate_verification", None)
+        if callable(invalidate):
+            try:
+                await invalidate(reason="writer_cancelled")
+            except Exception:  # noqa: BLE001 - cancellation keeps original cause
+                pass
         return
     try:
         if not bool(controller.owns_commit(tool_call.tool_use_id)):
@@ -2152,12 +2811,23 @@ def build_tool_handler(
 
     async def _handler(tool_call: ToolCall) -> ToolResult:  # type: ignore[return]
         effective_ctx = current_tool_context.get() or ctx
-        mutation_controller = (
-            effective_ctx.artifact_mutation_attempt_controller
-            if _prompt_annotation_writer_is_guarded(tool_call, effective_ctx)
-            and effective_ctx is not None
-            else None
-        )
+        mutation_controller = None
+        if _prompt_annotation_candidate_enabled(tool_call, effective_ctx):
+            mutation_controller = getattr(
+                effective_ctx,
+                "artifact_candidate_loop_controller",
+                None,
+            )
+        elif _prompt_annotation_writer_is_guarded(tool_call, effective_ctx):
+            mutation_controller = getattr(
+                effective_ctx,
+                "artifact_candidate_loop_controller",
+                None,
+            ) or (
+                getattr(effective_ctx, "artifact_mutation_attempt_controller", None)
+                if effective_ctx is not None
+                else None
+            )
 
         # 1. Ingress injection guard.
         injection_envelope = _check_injection_guard(tool_call, effective_ctx)
@@ -2480,16 +3150,43 @@ def build_tool_handler(
                         exception=exception,
                     )
                     # 7. Single finalisation point.
-                    final_result = await finalize(
+                    candidate_loop = _prompt_annotation_candidate_enabled(
                         tool_call,
                         effective_ctx,
-                        raw_result,
-                        exception,
-                        artifact_start,
-                        _budget_tracker_for(effective_ctx),
-                        registered,
                     )
-                    if mutation_controller is not None:
+                    try:
+                        final_result = await finalize(
+                            tool_call,
+                            effective_ctx,
+                            raw_result,
+                            exception,
+                            artifact_start,
+                            _budget_tracker_for(effective_ctx),
+                            registered,
+                        )
+                    except Exception as finalize_exception:
+                        if candidate_loop:
+                            recovered_result = await _candidate_terminal_receipt(
+                                tool_call=tool_call,
+                                context=effective_ctx,
+                            )
+                            if recovered_result is not None:
+                                return _maybe_apply_repeated_call_notice(
+                                    recovered_result,
+                                    tool_call=tool_call,
+                                    effective_ctx=effective_ctx,
+                                    raw_result=raw_result,
+                                    exception=finalize_exception,
+                                    seen=repeated_call_seen,
+                                )
+                        raise finalize_exception
+                    if candidate_loop:
+                        final_result = await _candidate_loop_effect_result(
+                            final_result,
+                            tool_call=tool_call,
+                            exception=exception,
+                        )
+                    elif mutation_controller is not None:
                         if isinstance(
                             exception,
                             ArtifactMutationCleanupAmbiguousError,

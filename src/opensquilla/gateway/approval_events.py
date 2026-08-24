@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 from opensquilla.gateway.scopes import APPROVALS_SCOPE
+from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.safety.secret_redaction import redact_secret_value
 from opensquilla.sandbox.elevation import ApprovalDisplay
 
@@ -342,9 +343,20 @@ def register_approval_event_bridge(
         event_name = approval_event_name(event, info)
         if event_name is None:
             return
+        payload = build_approval_event_payload(info)
+        session_key = str(payload.get("session_key") or "").strip()
+        if session_key:
+            # Approval events use their public, already-redacted projection.
+            # Recording before broadcast gives both the live client and the
+            # terminal v2 snapshot the same authoritative stream_seq.
+            payload = get_session_streams().record(
+                session_key,
+                event_name,
+                payload,
+            )
         emit_coro = event_bridge.broadcast_scoped(
             event_name,
-            build_approval_event_payload(info),
+            payload,
             required_scope=APPROVALS_SCOPE,
         )
         try:

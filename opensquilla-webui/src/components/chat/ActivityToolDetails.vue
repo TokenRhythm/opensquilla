@@ -298,6 +298,40 @@ function formatBytes(value: number): string {
 }
 
 function formatLine(line: ActivityToolDetailLine): string {
+  if (line.kind === 'document-category') {
+    const category = {
+      DOCUMENT_PREVIEW_UNAVAILABLE: t('shared.runTrace.documentPreviewUnavailableCategory'),
+      DOCUMENT_ACTION_RESULT_UNKNOWN: t('shared.runTrace.documentActionUnknownCategory'),
+      DOCUMENT_EDIT_FAILED: t('shared.runTrace.documentEditFailedCategory'),
+    }[line.category]
+    return t('shared.runTrace.documentErrorCategory', {
+      category,
+      code: line.category,
+    })
+  }
+  if (line.kind === 'document-message') {
+    return t({
+      'document.previewUnavailable': 'shared.runTrace.documentPreviewUnavailableMessage',
+      'document.actionResultUnknown': 'shared.runTrace.documentActionUnknownMessage',
+      'document.editFailed': 'shared.runTrace.documentEditFailedMessage',
+    }[line.messageKey])
+  }
+  if (line.kind === 'document-retry') {
+    return t({
+      same_turn: 'shared.runTrace.documentRetrySameTurn',
+      new_turn: 'shared.runTrace.documentRetryNewTurn',
+      never: 'shared.runTrace.documentRetryNever',
+    }[line.policy])
+  }
+  if (line.kind === 'document-next-action') {
+    return t({
+      retry: 'shared.runTrace.documentNextRetry',
+      reinspect: 'shared.runTrace.documentNextReinspect',
+      finalize_without_tools: 'shared.runTrace.documentNextFinalize',
+      start_new_turn: 'shared.runTrace.documentNextNewTurn',
+      stop: 'shared.runTrace.documentNextStop',
+    }[line.action])
+  }
   if (line.kind === 'bytes') {
     return t('shared.runTrace.activityBytesWritten', { size: formatBytes(line.bytes) })
   }

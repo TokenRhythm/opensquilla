@@ -932,6 +932,7 @@ async def handle_ws_connection(
     memory_retrievers: dict[str, Any] | None = None,
     prompt_cache_keepalive_service: Any = None,
     skill_management_service: Any = None,
+    artifact_preview_service: Any = None,
 ) -> None:
     """Main WebSocket connection handler."""
     if not websocket_origin_allowed(ws, config):
@@ -1166,6 +1167,7 @@ async def handle_ws_connection(
             provider_stats=provider_stats,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
             skill_management_service=skill_management_service,
+            artifact_preview_service=artifact_preview_service,
         )
     except WebSocketDisconnect:
         pass
@@ -1260,6 +1262,7 @@ async def _message_loop(
     provider_stats: Any = None,
     prompt_cache_keepalive_service: Any = None,
     skill_management_service: Any = None,
+    artifact_preview_service: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -1381,6 +1384,7 @@ async def _message_loop(
                 memory_managers=memory_managers or {},
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
+                artifact_preview_service=artifact_preview_service,
             )
             if _should_detach_rpc_request(method, params):
                 if (

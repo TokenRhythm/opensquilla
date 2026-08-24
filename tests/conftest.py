@@ -10,6 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
+# Skill manifests fingerprint complete bundled trees.  Test imports can create
+# derived ``__pycache__`` files between the loader's two integrity scans, so
+# disable bytecode writes for the controller, xdist workers, and child tests.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -24,6 +30,87 @@ os.environ.setdefault(
     "OPENSQUILLA_USER_STATE_DIR",
     str(_PYTEST_STATE_ROOT / "profile-lock-state"),
 )
+
+_XDIST_SCOPE_ENV = "OPENSQUILLA_PYTEST_XDIST_SCOPE"
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+
+
+def _safe_xdist_component(value: str) -> str:
+    """Return a path-safe, stable xdist run or worker identifier."""
+
+    safe = "".join(
+        character if character.isalnum() or character in "-._" else "_"
+        for character in value
+    )
+    component = safe[:80].rstrip(".") or "unknown"
+    windows_stem = component.split(".", 1)[0].upper()
+    if windows_stem in _WINDOWS_RESERVED_COMPONENTS:
+        component = f"_{component}"
+    return component
+
+
+def _xdist_runtime_roots(
+    *,
+    state_root: Path,
+    log_root: Path,
+    user_state_root: Path,
+    run_uid: str,
+    worker_id: str,
+) -> dict[str, Path]:
+    """Derive disjoint runtime roots for one xdist worker."""
+
+    relative_scope = (
+        Path(".pytest-xdist")
+        / _safe_xdist_component(run_uid)
+        / _safe_xdist_component(worker_id)
+    )
+    return {
+        "OPENSQUILLA_STATE_DIR": state_root / relative_scope,
+        "OPENSQUILLA_LOG_DIR": log_root / relative_scope,
+        "OPENSQUILLA_USER_STATE_DIR": user_state_root / relative_scope,
+    }
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Move shared runtime directories below a worker-specific xdist scope."""
+
+    worker_input = getattr(config, "workerinput", None)
+    if not isinstance(worker_input, dict):
+        return
+    worker_id = str(
+        worker_input.get("workerid")
+        or os.environ.get("PYTEST_XDIST_WORKER")
+        or "worker"
+    )
+    run_uid = str(
+        worker_input.get("testrunuid")
+        or os.environ.get("PYTEST_XDIST_TESTRUNUID")
+        or "session"
+    )
+    scope = f"{_safe_xdist_component(run_uid)}/{_safe_xdist_component(worker_id)}"
+    if os.environ.get(_XDIST_SCOPE_ENV) == scope:
+        return
+
+    roots = _xdist_runtime_roots(
+        state_root=Path(os.environ["OPENSQUILLA_STATE_DIR"]),
+        log_root=Path(os.environ["OPENSQUILLA_LOG_DIR"]),
+        user_state_root=Path(os.environ["OPENSQUILLA_USER_STATE_DIR"]),
+        run_uid=run_uid,
+        worker_id=worker_id,
+    )
+    for env_key, path in roots.items():
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[env_key] = str(path)
+    os.environ[_XDIST_SCOPE_ENV] = scope
 
 _PROVIDER_ENV_KEYS = (
     "AIHUBMIX_API_KEY",
@@ -246,102 +333,47 @@ def migrated_db(migrated_db_factory: Callable[[str | None], Path]) -> Path:
     return migrated_db_factory(None)
 
 
-@pytest.fixture(scope="session")
-def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build the core wheel from an isolated source tree with a synthetic UI.
+_PREBUILT_CORE_WHEEL_ENV = "OPENSQUILLA_TEST_CORE_WHEEL"
+_PREBUILT_CORE_WHEEL_SHA_ENV = "OPENSQUILLA_TEST_CORE_WHEEL_SHA256"
 
-    A source checkout intentionally has no generated Vue ``dist`` tree, while
-    standard wheel builds fail closed without a verified artifact. Packaging
-    contract tests share this minimal artifact so they continue to test the
-    real Hatch wheel selection without requiring a frontend build or mutating
-    the checkout under test.
-    """
+
+def _prebuilt_core_wheel_from_environment() -> Path | None:
+    """Return and content-verify the controller-built wheel, when provided."""
 
     import hashlib
-    import json
+
+    raw_path = os.environ.get(_PREBUILT_CORE_WHEEL_ENV)
+    if not raw_path:
+        return None
+    wheel = Path(raw_path).resolve()
+    if not wheel.is_file() or wheel.suffix != ".whl":
+        raise AssertionError(f"invalid prebuilt core wheel: {wheel}")
+
+    expected_digest = os.environ.get(_PREBUILT_CORE_WHEEL_SHA_ENV)
+    if not expected_digest:
+        raise AssertionError("prebuilt core wheel is missing its SHA-256 contract")
+    actual_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    if actual_digest != expected_digest:
+        raise AssertionError(
+            "prebuilt core wheel SHA-256 mismatch "
+            f"(expected {expected_digest}, got {actual_digest})"
+        )
+    return wheel
+
+
+@pytest.fixture(scope="session")
+def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Reuse the CI controller wheel or build one local session fallback."""
+
     import shutil
-    import subprocess
 
-    from scripts.verify_webui_artifact import MANIFEST_NAME, source_fingerprint
-
+    prebuilt = _prebuilt_core_wheel_from_environment()
+    if prebuilt is not None:
+        return prebuilt
     if shutil.which("uv") is None:
         pytest.skip("uv not on PATH")
 
+    from scripts.build_test_core_wheel import build_isolated_core_wheel
+
     temp_root = tmp_path_factory.mktemp("isolated-core-wheel")
-    build_root = temp_root / "source"
-    build_root.mkdir()
-    def ignored(source: str, names: list[str]) -> set[str]:
-        source_path = Path(source).resolve()
-        generated = {
-            name
-            for name in names
-            if name in {"node_modules", "coverage", "test-results", "__pycache__"}
-            or name.endswith(".pyc")
-        }
-        if source_path == (_REPO_ROOT / "src/opensquilla/gateway/static").resolve():
-            generated.add("dist")
-        if source_path == (_REPO_ROOT / "opensquilla-webui").resolve():
-            generated.add("dist")
-        return generated
-
-    for directory in ("src", "migrations", "opensquilla-webui", "scripts"):
-        shutil.copytree(_REPO_ROOT / directory, build_root / directory, ignore=ignored)
-    for filename in (
-        ".gitignore",
-        "LICENSE",
-        "README.md",
-        "hatch_build.py",
-        "pyproject.toml",
-    ):
-        shutil.copy2(_REPO_ROOT / filename, build_root / filename)
-    runtime_catalog = Path("desktop/electron/runtime/runtime-pack-catalog.json")
-    (build_root / runtime_catalog).parent.mkdir(parents=True)
-    shutil.copy2(_REPO_ROOT / runtime_catalog, build_root / runtime_catalog)
-
-    dist = build_root / "src" / "opensquilla" / "gateway" / "static" / "dist"
-    assets = dist / "assets"
-    assets.mkdir(parents=True)
-    (assets / "packaging-probe.js").write_bytes(b"window.__opensquillaPackagingProbe = true;\n")
-    (assets / "packaging-probe.css").write_bytes(b"body{}\n")
-    (dist / "index.html").write_text(
-        """<!doctype html>
-<link rel="stylesheet" href="./assets/packaging-probe.css">
-<script type="module" src="./assets/packaging-probe.js"></script>
-""",
-        encoding="utf-8",
-    )
-
-    records = []
-    for path in sorted(dist.rglob("*")):
-        if not path.is_file() or path.name == MANIFEST_NAME:
-            continue
-        content = path.read_bytes()
-        records.append(
-            {
-                "path": path.relative_to(dist).as_posix(),
-                "size": len(content),
-                "sha256": hashlib.sha256(content).hexdigest(),
-            }
-        )
-    manifest = {
-        "schemaVersion": 1,
-        "sourceFingerprint": source_fingerprint(build_root / "opensquilla-webui"),
-        "files": records,
-    }
-    (dist / MANIFEST_NAME).write_text(
-        f"{json.dumps(manifest, indent=2)}\n",
-        encoding="utf-8",
-    )
-
-    wheel_dir = temp_root / "wheel"
-    result = subprocess.run(
-        ["uv", "build", "--out-dir", str(wheel_dir)],
-        cwd=build_root,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert result.returncode == 0, f"uv build failed: {result.stderr}"
-    wheels = list(wheel_dir.glob("opensquilla-*.whl"))
-    assert len(wheels) == 1, f"Expected 1 wheel, got {wheels}"
-    return wheels[0]
+    return build_isolated_core_wheel(_REPO_ROOT, temp_root)

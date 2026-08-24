@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
@@ -14,8 +15,10 @@ from opensquilla.artifacts import (
     ArtifactBundleSourceFile,
     ArtifactStore,
 )
+from opensquilla.gateway import desktop_artifact_bridge as bridge_module
 from opensquilla.gateway.artifact_preview import (
     ArtifactPreviewLeaseService,
+    PreviewLeaseExpiredError,
     create_artifact_preview_resource_app,
     register_artifact_preview_routes,
 )
@@ -28,6 +31,16 @@ _AUTH_HEADERS = {
     "Authorization": "Bearer secret",
     "x-opensquilla-session-key": _SESSION_KEY,
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolate_desktop_bridge_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep preview auth tests independent from process-level bridge state."""
+
+    monkeypatch.setattr(bridge_module, "_runtime_client_initialized", False)
+    monkeypatch.setattr(bridge_module, "_runtime_client", None)
+    monkeypatch.delenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN", raising=False)
 
 
 class _SessionManager:
@@ -280,6 +293,423 @@ def test_full_loopback_lease_uses_isolated_random_localhost_origin(tmp_path: Pat
     assert "content-security-policy" not in resource.headers
     assert "access-control-allow-origin" not in resource.headers
     assert wrong_host.status_code == 404
+
+
+def test_desktop_candidate_preview_materialization_is_opaque_and_session_fenced(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ref = _publish_html(tmp_path, b"<!doctype html><h1>candidate</h1>")
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    bridge_token = "desktop-bridge-secret"
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN", bridge_token)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:18791",
+        client=("127.0.0.1", 51000),
+    ) as client:
+        unauthorized = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        resolved = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle},
+            headers={"Authorization": f"Bearer {bridge_token}"},
+        )
+        released = client.delete(
+            f"/api/v1/desktop-artifact-candidate-preview/{handle}",
+            headers={"Authorization": f"Bearer {bridge_token}"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert resolved.status_code == 200, resolved.text
+    payload = resolved.json()
+    assert payload["candidate_handle"] == handle
+    assert payload["candidate_artifact_id"] == ref.id
+    assert payload["scope_id"] == _SESSION_KEY
+    # Candidate materialization has no client-controlled mode.  With no
+    # canonical lease proving an explicit mode, it must fail closed to offline.
+    assert payload["effective_mode"] == "offline"
+    assert payload["launch_url"].startswith("http://p-")
+    assert ref.id not in handle
+    assert released.status_code == 204
+
+
+def test_candidate_preview_authentication_precedes_request_validation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ref = _publish_html(tmp_path, b"<!doctype html><h1>candidate</h1>")
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    bridge_token = "desktop-bridge-secret"
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN", bridge_token)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:18791",
+        client=("127.0.0.1", 51000),
+    ) as client:
+        unauthorized = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle, "mode": "bogus"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        malformed = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle, "mode": "bogus"},
+            headers={"Authorization": f"Bearer {bridge_token}"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert malformed.status_code == 400
+
+
+def test_candidate_preview_is_always_offline_even_with_canonical_full(
+    tmp_path: Path,
+) -> None:
+    ref = _publish_html(tmp_path)
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    full_lease, _ = service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="full",
+        client="desktop",
+    )
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    # Candidate HTML is controlled by the model and may contain scripts or
+    # interactive elements.  It must not inherit the canonical full-network
+    # realm used for ordinary user previews.
+    assert service.resolve_candidate_preview(handle).mode == "offline"
+
+    # Canonical leases and a previously materialized candidate lease must not
+    # influence the candidate's fail-closed mode.
+    offline_lease, _ = service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="web",
+    )
+    assert service.resolve_candidate_preview(handle).mode == "offline"
+    candidate_lease, _ = service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="full",
+        client="desktop",
+    )
+    service.attach_candidate_lease(handle, candidate_lease.lease_id)
+    service.revoke(
+        full_lease.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    service.revoke(
+        offline_lease.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    assert service.resolve_candidate_preview(handle).mode == "offline"
+
+
+def test_retiring_candidate_preview_revokes_materialized_lease(
+    tmp_path: Path,
+) -> None:
+    ref = _publish_html(tmp_path)
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    lease, token = service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="desktop",
+    )
+    assert service.attach_candidate_lease(handle, lease.lease_id) is True
+
+    retired = service.retire_candidate_preview(handle)
+
+    assert retired is not None
+    assert retired.lease_id == lease.lease_id
+    with pytest.raises(PreviewLeaseExpiredError):
+        service.resolve_token(token)
+    assert service.attach_candidate_lease(handle, lease.lease_id) is False
+
+
+def test_candidate_lease_attach_is_fenced_to_resolved_binding_identity(
+    tmp_path: Path,
+) -> None:
+    first = _publish_html(tmp_path, b"<!doctype html><h1>first</h1>")
+    second = _publish_html(tmp_path, b"<!doctype html><h1>second</h1>")
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=first.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    resolved = service.resolve_candidate_preview(handle)
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=second.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    lease, _ = service.create(
+        artifact_id=first.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="desktop",
+    )
+
+    assert service.attach_candidate_lease(
+        handle,
+        lease.lease_id,
+        expected_artifact_id=resolved.artifact_id,
+        expected_session_id=resolved.session_id,
+        expected_session_key=resolved.session_key,
+    ) is False
+    assert service.resolve_candidate_preview(handle).artifact_id == second.id
+    # The caller must revoke a lease when the fenced attach fails; this test
+    # also confirms the lease remains independently revocable and is not
+    # silently associated with the replacement candidate mapping.
+    service.revoke(
+        lease.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+
+
+def test_replacing_candidate_binding_revokes_previous_materialized_lease(
+    tmp_path: Path,
+) -> None:
+    first = _publish_html(tmp_path, b"<!doctype html><h1>first</h1>")
+    second = _publish_html(tmp_path, b"<!doctype html><h1>second</h1>")
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=first.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    lease, token = service.create(
+        artifact_id=first.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="desktop",
+    )
+    assert service.attach_candidate_lease(handle, lease.lease_id) is True
+
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=second.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+
+    assert service.resolve_candidate_preview(handle).artifact_id == second.id
+    with pytest.raises(PreviewLeaseExpiredError):
+        service.resolve_token(token)
+
+
+def test_candidate_lease_attach_requires_candidate_offline_mode(
+    tmp_path: Path,
+) -> None:
+    ref = _publish_html(tmp_path)
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    canonical, _ = service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="full",
+        client="desktop",
+    )
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    resolved = service.resolve_candidate_preview(handle)
+    assert resolved.mode == "offline"
+    service.revoke(
+        canonical.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    candidate, _ = service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="desktop",
+    )
+
+    assert service.attach_candidate_lease(
+        handle,
+        candidate.lease_id,
+        expected_artifact_id=resolved.artifact_id,
+        expected_session_id=resolved.session_id,
+        expected_session_key=resolved.session_key,
+        expected_mode=resolved.mode,
+    ) is True
+    service.revoke(
+        candidate.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    assert service.resolve_candidate_preview(handle).mode == "offline"
+
+
+def test_candidate_lease_attach_rejects_revoked_or_cross_scope_lease(
+    tmp_path: Path,
+) -> None:
+    first = _publish_html(tmp_path, b"<!doctype html><h1>first</h1>")
+    second = _publish_html(tmp_path, b"<!doctype html><h1>second</h1>")
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=first.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    wrong_artifact, _ = service.create(
+        artifact_id=second.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="desktop",
+    )
+    assert service.attach_candidate_lease(handle, wrong_artifact.lease_id) is False
+    service.revoke(
+        wrong_artifact.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    matching, _ = service.create(
+        artifact_id=first.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="offline",
+        client="desktop",
+    )
+    service.revoke(
+        matching.lease_id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    assert service.attach_candidate_lease(handle, matching.lease_id) is False
+
+
+def test_candidate_preview_endpoint_uses_canonical_mode_not_request_input(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ref = _publish_html(tmp_path, b"<!doctype html><h1>candidate</h1>")
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="full",
+        client="desktop",
+    )
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    bridge_token = "desktop-bridge-secret"
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN", bridge_token)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:18791",
+        client=("127.0.0.1", 51000),
+    ) as client:
+        rejected = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            # The bridge protocol is intentionally opaque and does not accept
+            # a client-controlled mode field.
+            json={"version": 1, "candidateHandle": handle, "mode": "offline"},
+            headers={"Authorization": f"Bearer {bridge_token}"},
+        )
+        resolved = client.post(
+            "/api/v1/desktop-artifact-candidate-preview/resolve",
+            json={"version": 1, "candidateHandle": handle},
+            headers={"Authorization": f"Bearer {bridge_token}"},
+        )
+
+    assert rejected.status_code == 400
+    assert resolved.status_code == 200, resolved.text
+    # The request cannot opt into full mode, and neither can a canonical full
+    # lease: model-controlled candidate previews are always offline.
+    assert resolved.json()["effective_mode"] == "offline"
+
+
+def test_candidate_preview_force_offline_overrides_canonical_full(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ref = _publish_html(tmp_path)
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path))
+    service.create(
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        mode="full",
+        client="desktop",
+    )
+    monkeypatch.setenv("OPENSQUILLA_PREVIEW_FORCE_OFFLINE", "1")
+    handle = "candidate_0123456789abcdef"
+    service.register_candidate_preview(
+        handle=handle,
+        artifact_id=ref.id,
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+    )
+    assert service.resolve_candidate_preview(handle).mode == "offline"
 
 
 def test_https_loopback_webui_can_use_full_preview_mode(tmp_path: Path) -> None:

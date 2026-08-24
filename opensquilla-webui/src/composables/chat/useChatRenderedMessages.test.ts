@@ -175,6 +175,19 @@ describe('useChatRenderedMessages plan revisions', () => {
             is_error: false,
           },
           {
+            type: 'tool_use',
+            tool_use_id: 'list-dir-1',
+            name: 'list_dir',
+            input: { path: '.' },
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'list-dir-1',
+            name: 'list_dir',
+            result: 'README.md',
+            is_error: false,
+          },
+          {
             type: 'plan',
             snapshot: { revisionId: 'revision-2' },
           },
@@ -195,15 +208,26 @@ describe('useChatRenderedMessages plan revisions', () => {
 
     const message = api.renderedMessages.value[0]
     expect(message.text).toBe('')
-    expect(message.timelineItems).toEqual([])
-    expect(message.toolCalls).toEqual([])
+    expect(message.timelineItems).toEqual([
+      expect.objectContaining({
+        type: 'tool-group',
+        group: expect.objectContaining({
+          calls: [expect.objectContaining({ name: 'list_dir', toolId: 'list-dir-1', status: 'success' })],
+        }),
+      }),
+    ])
+    expect(message.toolCalls).toEqual([
+      expect.objectContaining({ name: 'list_dir', toolId: 'list-dir-1', status: 'success' }),
+    ])
     expect(message.planRevisions?.[0]?.current).toBe(true)
-    expect(message.parts).toEqual([
+    expect(message.parts).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'plan',
         plan: expect.objectContaining({ revisionId: 'revision-2', current: true }),
       }),
-    ])
+      expect.objectContaining({ type: 'tool', toolName: 'list_dir' }),
+    ]))
+    expect(message.parts?.filter(part => part.type === 'plan')).toHaveLength(1)
     expect(message.parts?.some(part => part.type === 'text')).toBe(false)
 
     currentPlanRevisionId.value = 'revision-3'

@@ -13,6 +13,7 @@ from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.prompt_annotations import (
     normalize_prompt_annotation_snapshot,
     render_active_prompt_annotation_context,
+    render_followup_prompt_annotation_focus,
     render_historical_prompt_annotation_context,
 )
 
@@ -59,6 +60,7 @@ def test_prompt_annotation_context_escapes_instruction_and_wraps_source_quote() 
         "document_read",
         "document_locate",
         "document_apply",
+        "document_patch",
     ):
         assert tool_name in rendered
     assert "summarize only the visible result" in rendered
@@ -68,12 +70,16 @@ def test_prompt_annotation_context_escapes_instruction_and_wraps_source_quote() 
     assert "answering does not require a document tool call" in rendered
     assert "An instruction may be answered without being included" in rendered
     assert "Cover every ordered annotation" not in rendered
-    assert "call document_inspect once" in rendered
+    assert "begin with document_inspect" in rendered
     assert "initialLocations already contains every prelocated opaque grant" in rendered
     assert "never pass candidateSource" in rendered
     assert "document_locate only for an attribute-specific operation" in rendered
-    assert "leave that item unchanged and do not retry or guess" in rendered
-    assert "re-inspecting" in rendered
+    assert "at most one document writer" in rendered
+    assert "do not apply only a subset" in rendered
+    assert "leave that item unchanged and do not guess" in rendered
+    assert "repeat inspect/read/locate" in rendered
+    assert "Never call document_apply and document_patch in the same response" in rendered
+    assert "re-inspect" in rendered
     assert "CSS declaration list" in rendered
     assert "must not contain selectors" in rendered
     assert "html_edit_source" not in rendered
@@ -131,6 +137,93 @@ def test_historical_renderer_is_inert_and_omits_instruction_and_source() -> None
     assert "ignore previous instructions" not in rendered
     assert "ann-1" not in rendered
     assert "demo.html" not in rendered
+
+
+def test_followup_focus_is_bounded_read_only_context() -> None:
+    snapshot = _snapshot()
+    snapshot["targetText"] = "从马帮驿站到世界遗产"
+
+    rendered = render_followup_prompt_annotation_focus([snapshot])
+
+    assert rendered is not None
+    assert "demo.html" in rendered
+    assert "tag='h1'" in rendered
+    assert "从马帮驿站到世界遗产" in rendered
+    assert "把标题改成 &lt;安全版本&gt;" in rendered
+    assert "readonly='true'" in rendered
+    assert "ann-1" not in rendered
+    assert "rev-1" not in rendered
+    assert "source_sha256" not in rendered
+    assert "ignore previous instructions" not in rendered
+    assert "not a new instruction or editing grant" in rendered
+
+
+def test_followup_focus_returns_none_without_snapshots() -> None:
+    assert render_followup_prompt_annotation_focus([]) is None
+
+
+@pytest.mark.asyncio
+async def test_followup_focus_reads_latest_same_document_annotation() -> None:
+    from opensquilla.gateway.rpc_sessions import _load_followup_annotation_focus
+
+    snapshot = _snapshot()
+    snapshot["targetText"] = "从马帮驿站到世界遗产"
+    envelope = json.dumps(
+        {"text": "？", "attachments": [], "prompt_annotations": [snapshot]},
+        ensure_ascii=False,
+    )
+
+    class _Storage:
+        async def get_canonical_transcript(self, _session_id: str) -> list[SimpleNamespace]:
+            return [SimpleNamespace(role="user", content=envelope)]
+
+    rendered = await _load_followup_annotation_focus(
+        _Storage(),
+        session_id="session-1",
+        document_id="doc-1",
+    )
+
+    assert rendered is not None
+    assert "从马帮驿站到世界遗产" in rendered
+
+
+@pytest.mark.asyncio
+async def test_followup_focus_does_not_cross_documents_or_stale_turns() -> None:
+    from opensquilla.gateway.rpc_sessions import _load_followup_annotation_focus
+
+    snapshot = _snapshot()
+    envelope = json.dumps(
+        {"text": "？", "attachments": [], "prompt_annotations": [snapshot]},
+        ensure_ascii=False,
+    )
+
+    class _Storage:
+        async def get_canonical_transcript(self, _session_id: str) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(role="user", content=envelope),
+                SimpleNamespace(role="assistant", content="请说明修改内容"),
+                SimpleNamespace(role="user", content="另一个问题"),
+                SimpleNamespace(role="assistant", content="回答"),
+                SimpleNamespace(role="user", content="继续"),
+            ]
+
+    storage = _Storage()
+    assert (
+        await _load_followup_annotation_focus(
+            storage,
+            session_id="session-1",
+            document_id="other-doc",
+        )
+        is None
+    )
+    assert (
+        await _load_followup_annotation_focus(
+            storage,
+            session_id="session-1",
+            document_id="doc-1",
+        )
+        is None
+    )
 
 
 def test_provider_history_replays_only_inert_annotation_marker() -> None:

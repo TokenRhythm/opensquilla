@@ -22,6 +22,7 @@ from opensquilla.sandbox.runtime_manifest import (
 class ChildRole(StrEnum):
     """Fixed internal roles that a packaged Gateway may execute."""
 
+    PROCESS_TREE = "process-tree"
     FILESYSTEM_WORKER = "filesystem-worker"
     LINUX_HELPER = "linux-helper"
     WINDOWS_DEFAULT_RUNNER = "windows-default-runner"
@@ -33,6 +34,7 @@ class InternalChildDispatchError(ValueError):
 
 
 _ROLE_MODULES: dict[ChildRole, str] = {
+    ChildRole.PROCESS_TREE: "opensquilla.process_tree",
     ChildRole.FILESYSTEM_WORKER: "opensquilla.sandbox.filesystem_worker",
     ChildRole.LINUX_HELPER: "opensquilla.sandbox.backend.linux_helper",
     ChildRole.WINDOWS_DEFAULT_RUNNER: "opensquilla.sandbox.backend.windows_default_runner",
@@ -165,6 +167,12 @@ def internal_child_argv(
     )
 
 
+def _run_process_tree(args: Sequence[str]) -> int:
+    from opensquilla.process_tree import main
+
+    return int(main(args))
+
+
 def _run_filesystem_worker(args: Sequence[str]) -> int:
     from opensquilla.sandbox.filesystem_worker import main
 
@@ -192,6 +200,7 @@ def _run_directory_picker(args: Sequence[str]) -> int:
 
 
 _ROLE_HANDLERS: dict[ChildRole, Callable[[Sequence[str]], int]] = {
+    ChildRole.PROCESS_TREE: _run_process_tree,
     ChildRole.FILESYSTEM_WORKER: _run_filesystem_worker,
     ChildRole.LINUX_HELPER: _run_linux_helper,
     ChildRole.WINDOWS_DEFAULT_RUNNER: _run_windows_default_runner,

@@ -20,6 +20,7 @@ from opensquilla.engine.types import (
 from opensquilla.persistence.meta_run_writer import open_meta_run_writer
 from opensquilla.persistence.migrator import apply_pending
 from opensquilla.skills.loader import SkillLoader
+from opensquilla.skills.meta.executors import skill_exec
 from opensquilla.skills.meta.inputs import make_meta_inputs
 from opensquilla.skills.meta.orchestrator import (
     MetaOrchestrator,
@@ -71,6 +72,45 @@ def _make_meta_spec(
         final_text_mode=final_text_mode,
         output_contract=output_contract or {},
     )
+
+
+class _FakeSkillExecProcess:
+    """Finished child used for output/validation contracts without spawn cost."""
+
+    pid = 4242
+
+    def __init__(self, *, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        del input
+        return self.stdout, self.stderr
+
+
+def _mock_skill_exec_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    returncode: int = 0,
+) -> dict[str, Any]:
+    """Replace only the process boundary; keep skill_exec validation real."""
+
+    captured: dict[str, Any] = {}
+
+    async def fake_spawn(*argv: str, **kwargs: Any) -> _FakeSkillExecProcess:
+        captured["argv"] = list(argv)
+        captured["kwargs"] = kwargs
+        return _FakeSkillExecProcess(
+            stdout=stdout,
+            stderr=stderr,
+            returncode=returncode,
+        )
+
+    monkeypatch.setattr(skill_exec, "create_owned_subprocess_exec", fake_spawn)
+    return captured
 
 
 def test_parser_returns_none_for_regular_skill() -> None:
@@ -2086,7 +2126,9 @@ async def test_orchestrator_skill_exec_invokes_subprocess(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_skill_exec_propagates_nonzero_exit(tmp_path: Path) -> None:
+async def test_orchestrator_skill_exec_propagates_nonzero_exit(
+    tmp_path: Path,
+) -> None:
     skill_dir = tmp_path / "fail_skill"
     skill_dir.mkdir()
     script = skill_dir / "fail.py"
@@ -2130,15 +2172,14 @@ async def test_orchestrator_skill_exec_propagates_nonzero_exit(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_orchestrator_skill_exec_uses_sanitized_stdout_failure_detail(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     skill_dir = tmp_path / "stdout_fail_skill"
     skill_dir.mkdir()
-    script = skill_dir / "fail.py"
-    script.write_text(
-        "import sys\n"
-        "sys.stdout.write('\\x1b[31mQUALITY_GATE: block\\x1b[0m\\x00: citations missing\\n')\n"
-        "raise SystemExit(2)\n",
-        encoding="utf-8",
+    _mock_skill_exec_launcher(
+        monkeypatch,
+        stdout=b"\x1b[31mQUALITY_GATE: block\x1b[0m\x00: citations missing\n",
+        returncode=2,
     )
 
     fake_spec = _make_skill_spec("stdout-fail-skill", content="x")
@@ -2169,17 +2210,17 @@ async def test_orchestrator_skill_exec_uses_sanitized_stdout_failure_detail(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_skill_exec_bounds_combined_failure_detail(tmp_path: Path) -> None:
+async def test_orchestrator_skill_exec_bounds_combined_failure_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     skill_dir = tmp_path / "long_fail_skill"
     skill_dir.mkdir()
-    script = skill_dir / "fail.py"
-    script.write_text(
-        "import sys\n"
-        "sys.stderr.write('primary diagnostic\\n')\n"
-        "sys.stdout.write('QUALITY_GATE: block\\n' + "
-        "('detail ' * 1000) + 'TAIL_MUST_NOT_LEAK\\n')\n"
-        "raise SystemExit(3)\n",
-        encoding="utf-8",
+    _mock_skill_exec_launcher(
+        monkeypatch,
+        stdout=("QUALITY_GATE: block\n" + ("detail " * 1000) + "TAIL_MUST_NOT_LEAK\n").encode(),
+        stderr=b"primary diagnostic\n",
+        returncode=3,
     )
 
     fake_spec = _make_skill_spec("long-fail-skill", content="x")
@@ -2219,12 +2260,10 @@ async def test_orchestrator_skill_exec_redacts_sensitive_env_value_from_stdout(
     monkeypatch.setenv("META_EXEC_TEST_API_KEY", secret)
     skill_dir = tmp_path / "secret_fail_skill"
     skill_dir.mkdir()
-    script = skill_dir / "fail.py"
-    script.write_text(
-        "import os\n"
-        "print('provider rejected ' + os.environ['META_EXEC_TEST_API_KEY'])\n"
-        "raise SystemExit(4)\n",
-        encoding="utf-8",
+    _mock_skill_exec_launcher(
+        monkeypatch,
+        stdout=f"provider rejected {secret}\n".encode(),
+        returncode=4,
     )
 
     fake_spec = _make_skill_spec("secret-fail-skill", content="x")
@@ -2307,18 +2346,17 @@ async def test_orchestrator_skill_exec_rejects_cwd_outside_workspace(
 @pytest.mark.asyncio
 async def test_orchestrator_skill_exec_creates_missing_workspace_dir(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     skill_dir = tmp_path / "cwd_skill"
     skill_dir.mkdir()
-    script = skill_dir / "echo_cwd.py"
-    script.write_text(
-        "from pathlib import Path\n"
-        "print(Path.cwd())\n",
-        encoding="utf-8",
-    )
 
     workspace = tmp_path / "missing" / "workspace"
     assert not workspace.exists()
+    captured = _mock_skill_exec_launcher(
+        monkeypatch,
+        stdout=f"{workspace}\n".encode(),
+    )
 
     fake_spec = _make_skill_spec("cwd-skill", content="x")
     fake_spec.base_dir = str(skill_dir)
@@ -2348,6 +2386,7 @@ async def test_orchestrator_skill_exec_creates_missing_workspace_dir(
     assert result.ok, result.error
     assert workspace.exists()
     assert Path(result.step_outputs["x"]) == workspace
+    assert captured["kwargs"]["cwd"] == str(workspace)
 
 
 @pytest.mark.asyncio

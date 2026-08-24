@@ -17,6 +17,7 @@ from opensquilla.channels.types import (
 )
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentConfig, DoneEvent
+from opensquilla.gateway import boot as boot_module
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
     _gateway_home,
@@ -2583,10 +2584,19 @@ def test_workspace_state_mismatch_emits_warning(
         "OPENSQUILLA_GATEWAY_CONFIG_PATH",
         str(tmp_path / "gateway-3" / "config.toml"),
     )
-    monkeypatch.setattr(
-        "opensquilla.gateway.boot.log.warning",
-        lambda event, **kwargs: warnings.append({"event": event, **kwargs}),
-    )
+    real_log = boot_module.log
+
+    class _WarningLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            warnings.append({"event": event, **kwargs})
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_log, name)
+
+    # Replace the module logger as a whole.  Patching a method on
+    # BoundLoggerLazyProxy freezes an ephemeral bound logger during teardown,
+    # which makes later capture_logs() assertions observe the wrong processor.
+    monkeypatch.setattr(boot_module, "log", _WarningLog())
     config = GatewayConfig(
         state_dir=str(tmp_path / "gateway-3" / "state"),
         workspace_dir=str(tmp_path / "gateway-1" / "workspace"),

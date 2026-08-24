@@ -1067,7 +1067,7 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
         grant_kind: str,
         input_value: object | None,
     ) -> PreparedAdapterMutation:
-        """Support the pre-existing source-range helper outside the exact4 path."""
+        """Support the pre-existing source-range helper outside the restricted prompt path."""
 
         parts = grant_kind.split("|")
         if len(parts) != 7 or "|".join(parts[:3]) + "|" != _GRANT_PREFIX:

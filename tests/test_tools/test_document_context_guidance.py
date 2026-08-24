@@ -39,10 +39,11 @@ def test_document_patch_schema_requires_bound_read_result_not_workspace_copy() -
     properties = registered.spec.parameters["properties"]
     edit_properties = properties["edits"]["items"]["properties"]
 
-    assert "only tool that updates the current bound HTML Document" in description
+    assert "Exact-source writer for the current bound HTML Document" in description
+    assert "semantic grants cannot express" in description
     assert "view=source and no cursor" in description
     assert "write_file, edit_file, and apply_patch" in description
-    assert "cannot replace this operation" in description
+    assert "cannot update the bound Document" in description
     assert "exact sha256 returned by document_read" in properties["expectedSha256"][
         "description"
     ]

@@ -162,7 +162,7 @@ _DEFAULT_MODELS = {
     "tencent_tokenhub_intl": "deepseek-v3.2",
     "tencent_token_plan": "hy3",
     "tencent_token_plan_anthropic": "hy3",
-    "tokenrhythm": "deepseek-v4-flash",
+    "tokenrhythm": "deepseek-v4-pro-0813",
 }
 
 # Test-only floors for providers whose models spend reasoning tokens out of
