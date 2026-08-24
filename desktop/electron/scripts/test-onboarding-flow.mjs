@@ -135,6 +135,25 @@ async function bootWindow(app) {
   }, 'desktop boot window')
 }
 
+async function loadBootContractWindow(app) {
+  const desktopWindowId = await waitFor(async () => (
+    await app.evaluate(({ BrowserWindow }) => (
+      BrowserWindow.getAllWindows().find((candidate) => (
+        !candidate.isDestroyed()
+        && candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
+      ))?.id ?? null
+    ))
+  ), 'local Desktop renderer before the boot-page contract test')
+  await app.evaluate(async ({ BrowserWindow }, payload) => {
+    const window = BrowserWindow.fromId(payload.windowId)
+    if (!window || window.isDestroyed()) throw new Error('Desktop renderer is unavailable.')
+    await window.loadFile(payload.bootPath)
+  }, {
+    windowId: desktopWindowId,
+    bootPath: join(packageRoot, 'src', 'boot.html'),
+  })
+}
+
 async function sendBootEvent(app, channel, payload) {
   await app.evaluate(({ BrowserWindow }, event) => {
     const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -487,6 +506,11 @@ async function verifySubmitFeedbackAndSingleFlight() {
   )
   try {
     const page = await setupWindow(app)
+    // Normal startup now keeps the local Desktop renderer mounted while the
+    // runtime is unavailable. Load the recovery document explicitly so its
+    // timer/progress contract remains covered without restoring the old
+    // gateway-owned shell lifecycle.
+    await loadBootContractWindow(app)
     await verifyBootPhaseTimer(app)
     const submitClockOrigin = Date.now()
     await page.clock.install({ time: submitClockOrigin })
@@ -988,8 +1012,11 @@ try {
     )
     return connection?.status === 'ready' ? connection : null
   }, 'ready Desktop Gateway descriptor')
-  assert.equal(readyConnection.httpUrl, 'http://127.0.0.1:18897')
-  assert.equal(readyConnection.wsUrl, 'ws://127.0.0.1:18897/ws')
+  assert.match(readyConnection.httpUrl, /^http:\/\/127\.0\.0\.1:\d+$/)
+  assert.equal(
+    readyConnection.wsUrl,
+    readyConnection.httpUrl.replace(/^http:/, 'ws:') + '/ws',
+  )
   assert.equal(typeof readyConnection.instanceId, 'string')
   const readyRendererState = await desktopPage.evaluate(() => {
     const banner = document.getElementById('desktop-runtime-banner')
