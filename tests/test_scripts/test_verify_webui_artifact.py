@@ -367,6 +367,41 @@ def test_node_verifier_rejects_sensitive_artifact_files(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_node_verifier_rejects_multiple_control_entry_scripts(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "assets/app.js").write_text("console.log('app')\n", encoding="utf-8")
+    (dist / "assets/shared.js").write_text(
+        "console.log('shared')\n",
+        encoding="utf-8",
+    )
+    (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
+    (dist / "index.html").write_text(
+        '<script type="module" src="assets/shared.js"></script>'
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
+    (dist / "desktop.html").write_text(
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(NODE_VERIFIER), "--write", str(dist)],
+        cwd=REPO_ROOT / "opensquilla-webui",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "exactly one executable module script for Gateway injection" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_python_accepts_node_manifest_with_unicode_artifact_names(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     assets = dist / "assets"

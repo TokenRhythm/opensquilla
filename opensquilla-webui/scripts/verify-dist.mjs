@@ -291,7 +291,20 @@ export function verifyDist(
   }
 
   for (const entry of ['index.html', 'desktop.html']) {
-    const references = referencedEntryAssets(readFileSync(resolve(root, entry), 'utf8'))
+    const entryHtml = readFileSync(resolve(root, entry), 'utf8')
+    const references = referencedEntryAssets(entryHtml)
+    if (entry === 'index.html') {
+      const moduleScriptCount = [
+        ...entryHtml.matchAll(
+          /<script\b(?=[^>]*\btype=["']module["'])[^>]*\bsrc=["'][^"']+["'][^>]*>/gi,
+        ),
+      ].length
+      if (moduleScriptCount !== 1) {
+        throw new Error(
+          `Web UI index.html must reference exactly one executable module script for Gateway injection; found ${moduleScriptCount}.`,
+        )
+      }
+    }
     if (!references.some((path) => path.endsWith('.js'))) {
       throw new Error(`Web UI ${entry} does not reference an entry JavaScript module.`)
     }

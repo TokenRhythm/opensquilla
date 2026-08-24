@@ -33,8 +33,8 @@ def _write_vite_static(static_dir: Path) -> Path:
         '<link rel="stylesheet" crossorigin href="./assets/index.css">',
         encoding="utf-8",
     )
-    (assets_dir / "index.js").write_text("export {};\n", encoding="utf-8")
-    (assets_dir / "index.css").write_text("body{}\n", encoding="utf-8")
+    (assets_dir / "index.js").write_bytes(b"export {};\n")
+    (assets_dir / "index.css").write_bytes(b"body{}\n")
     return dist_dir
 
 
