@@ -228,6 +228,37 @@ async def test_sync_manager_search_indexes_pending_session_delta(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sync_manager_searches_existing_sessions_without_pending_delta(tmp_path):
+    class NoopStore:
+        async def index_file(self, **_kwargs):
+            return 0
+
+        async def remove_file(self, _path):
+            return None
+
+    class FakeSessionIndexer:
+        def __init__(self) -> None:
+            self.calls: list[bool] = []
+
+        async def sync(self, *, force: bool = False):
+            self.calls.append(force)
+            return SimpleNamespace(indexed=1, removed=0)
+
+    indexer = FakeSessionIndexer()
+    manager = MemorySyncManager(
+        store=NoopStore(),  # type: ignore[arg-type]
+        workspace_dir=tmp_path,
+        memory_dir=tmp_path / "memory",
+        session_indexer=indexer,
+    )
+
+    await manager.sync(reason="search:tool")
+    await manager.sync(reason="search:tool")
+
+    assert indexer.calls == [False]
+
+
+@pytest.mark.asyncio
 async def test_memory_search_tool_outputs_sessions_source(tmp_path):
     registry = ToolRegistry()
 

@@ -208,6 +208,50 @@ pre {
   border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
 }
 
+/* ── Chat topbar semantic state contract ───────────────────────────────────
+   Domain classes say WHAT a control represents; data-state says HOW urgent it
+   is. Components consume these variables while value themes may add a restrained
+   halo for non-normal states. Keeping the four severity values here prevents
+   connection/update lifecycle names from leaking into theme-specific CSS. */
+.topbar .topbar-state {
+  --topbar-state-channel: var(--text-muted);
+  --topbar-state-fill: color-mix(in srgb, var(--text-muted) 7%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--text-muted) 24%, var(--border));
+}
+
+.topbar .topbar-state[data-state="normal"] {
+  --topbar-state-channel: var(--text-muted);
+  --topbar-state-fill: var(--bg-surface);
+  --topbar-state-border: var(--border);
+}
+
+/* A healthy connection remains recognizable as healthy without becoming an
+   attention surface. World themes intentionally do not add a glow to normal. */
+.topbar .topbar-state--connection[data-state="normal"],
+.topbar .topbar-state--system[data-state="normal"] {
+  --topbar-state-channel: var(--ok);
+  --topbar-state-fill: color-mix(in srgb, var(--ok) 10%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--ok) 28%, var(--border));
+}
+
+.topbar .topbar-state[data-state="info"] {
+  --topbar-state-channel: var(--accent);
+  --topbar-state-fill: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--accent) 32%, var(--border));
+}
+
+.topbar .topbar-state[data-state="warning"] {
+  --topbar-state-channel: var(--warn);
+  --topbar-state-fill: color-mix(in srgb, var(--warn) 12%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--warn) 34%, var(--border));
+}
+
+.topbar .topbar-state[data-state="danger"] {
+  --topbar-state-channel: var(--danger);
+  --topbar-state-fill: color-mix(in srgb, var(--danger) 12%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--danger) 34%, var(--border));
+}
+
 /* The one ambient "alive/working" pulse — opacity only (compositor-cheap, no
    paint), reused by the connection pill, the sidebar running dot, the work-card
    dots and the meta-skill chip so the whole running view breathes together. */
@@ -678,6 +722,47 @@ pre {
   flex-shrink: 0;
 }
 
+/* Pinned, Projects, and Recents are peer display zones. Each heading owns its
+   own count; rows move between zones instead of being repeated underneath. */
+.sidebar-zone + .sidebar-zone {
+  margin-top: var(--sp-2);
+}
+
+.sidebar-zone-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 40px;
+  padding: 4px 10px;
+  color: var(--sidebar-text-soft);
+  flex-shrink: 0;
+}
+
+.sidebar-zone-heading__label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-zone-heading__count {
+  min-width: 18px;
+  padding: 0 var(--sp-1);
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  line-height: 20px;
+}
+
+.sidebar-zone-heading__count + .sidebar-cmd-btn {
+  margin-left: auto;
+}
+
 /* Sits tight against its count — the two read as one "Tasks 24" label. The
    controls after them take the spare width (see .sidebar-recents-count). */
 .sidebar-recents-eyebrow {
@@ -847,6 +932,20 @@ pre {
   padding: 4px 8px 8px;
 }
 
+.sidebar-history-page-state {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-xs);
+  text-align: center;
+}
+
+.sidebar-history-page-state .sidebar-history-retry {
+  margin-top: 0;
+}
+
 /* Active agent-filter chip, dismissible, shown at the top of Recents */
 .sidebar-filter-row {
   display: flex;
@@ -914,6 +1013,14 @@ pre {
   50% { opacity: 0.4; }
 }
 
+.sidebar-history-title,
+.sidebar-session-preview__title {
+  font-family: var(--font-sans);
+  font-size: 0.828125rem;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
 .sidebar-history-title {
   flex: 1;
   min-width: 0;
@@ -921,9 +1028,6 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: inherit;
-  font-size: 0.828125rem;
-  font-weight: 500;
-  line-height: 1.35;
 }
 
 .sidebar-history-pin {
@@ -1032,31 +1136,7 @@ pre {
   margin-top: var(--sp-2);
 }
 
-/* Project work stays grouped under its folder. The first unbound task opens a
-   second, deliberately separated "Recents" zone without introducing another
-   card or divider line into the quiet sidebar surface. */
-.sidebar-history-row--recent-start {
-  margin-top: 43px;
-}
-
-.sidebar-history-row--recent-start::before {
-  content: attr(data-zone-label);
-  position: absolute;
-  top: -35px;
-  left: calc(4px - var(--row-depth, 0) * 14px);
-  right: 4px;
-  display: flex;
-  align-items: center;
-  min-height: 28px;
-  color: var(--sidebar-text-soft);
-  font-size: var(--fs-sm);
-  font-weight: 400;
-  line-height: 20px;
-  pointer-events: none;
-}
-
 .sidebar-zone-empty {
-  margin-top: 13px;
   padding: 0 4px 8px;
 }
 
@@ -1282,6 +1362,66 @@ pre {
 
 .sidebar-project-create-btn + .sidebar-cmd-btn {
   margin-left: 0;
+}
+
+/* Session detail card is teleported to <body>, so it can escape the sidebar's
+   clipping boundary. Positioning is computed beside the hovered/focused row. */
+.sidebar-session-preview {
+  position: fixed;
+  z-index: 320;
+  box-sizing: border-box;
+  width: 272px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg);
+  color: var(--text);
+  pointer-events: none;
+}
+
+.sidebar-session-preview__head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+}
+
+.sidebar-session-preview__title {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.sidebar-session-preview__time {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.sidebar-session-preview__project {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  margin-top: var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+
+.sidebar-session-preview__project svg {
+  flex: 0 0 auto;
+}
+
+.sidebar-session-preview__project span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sidebar-history-row.is-selected .sidebar-history-item {
@@ -1874,8 +2014,7 @@ pre {
     width: 44px;
   }
 
-  .topbar--chat .topbar-right--attention .conn-pill,
-  .topbar--chat .topbar-right--attention .bgm-menu-wrap,
+  .topbar--chat .topbar-right--attention > .conn-pill,
   .topbar--chat .topbar-right--attention .lang-menu-wrap,
   .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
     display: none;
@@ -2075,6 +2214,15 @@ pre {
     transition-duration: 0.01ms !important; /* motion-allow: reduced-motion kill-switch, not a token */
     scroll-behavior: auto !important;
   }
+
+  /* State changes must remain immediate and stable even when a value theme
+     supplies its own topbar halo or pseudo-element. */
+  .topbar .topbar-state,
+  .topbar .topbar-state::before,
+  .topbar .topbar-state::after {
+    animation: none !important; /* motion-allow: explicit topbar state freeze */
+    transition: none !important; /* motion-allow: explicit topbar state freeze */
+  }
 }
 
 /* ── Forced colors (Windows High Contrast) ───────────────────────────────
@@ -2099,4 +2247,17 @@ pre {
     outline: 2px solid CanvasText !important;
     outline-offset: 2px;
   }
+
+  /* Do not rely on token colour alone for concurrent topbar states. Border
+     patterns preserve the severity distinction in Windows High Contrast. */
+  .topbar .topbar-state {
+    background: Canvas !important;
+    border-color: CanvasText !important;
+    box-shadow: none !important;
+    color: CanvasText !important;
+    forced-color-adjust: none;
+  }
+  .topbar .topbar-state[data-state="info"] { border-style: dotted !important; }
+  .topbar .topbar-state[data-state="warning"] { border-style: dashed !important; }
+  .topbar .topbar-state[data-state="danger"] { border-width: 2px !important; }
 }

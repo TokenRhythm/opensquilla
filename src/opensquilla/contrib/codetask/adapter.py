@@ -1,10 +1,9 @@
 """LocalAdapter: run an OpenSquilla agent as a host subprocess.
 
-Unlike the swebench OpenSquillaAdapter (which crosses a Docker boundary via
-``docker exec``), this runs ``opensquilla agent`` directly on the host with
-the repo as the working directory. Provider credentials are inherited from
-the runner's environment — no env-file is needed because there is no
-container boundary to cross (codex review #3).
+This runs ``opensquilla agent`` directly on the host with the repo as the
+working directory. Provider credentials are inherited from the runner's
+environment, so no env-file is needed because there is no container boundary
+to cross (codex review #3).
 """
 
 from __future__ import annotations

@@ -4,6 +4,19 @@ import type { SessionRow, SortedRow } from '@/types/usage'
 
 const t = i18n.global.t
 
+function nonEmptyText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function usageRowIdentity(row: SessionRow, sessionKey: string, sessionLabel: string): string {
+  return nonEmptyText(sessionKey)
+    || nonEmptyText(row.sessionId)
+    || nonEmptyText(row.session_id)
+    || nonEmptyText(row.session)
+    || nonEmptyText(row.key)
+    || sessionLabel
+}
+
 export function useUsageSessionRows(options: {
   visibleSessions: ComputedRef<SessionRow[]>
   rangeHiddenHint: ComputedRef<string>
@@ -39,7 +52,7 @@ export function useUsageSessionRows(options: {
         raw: row,
         sessionKey,
         sessionLabel,
-        rowIdentity: sessionKey || sessionLabel,
+        rowIdentity: usageRowIdentity(row, sessionKey, sessionLabel),
         modified,
         inputTokens: options.numericRowVal(row, 'input_tokens', 'inputTokens'),
         outputTokens: options.numericRowVal(row, 'output_tokens', 'outputTokens'),

@@ -100,6 +100,21 @@ def test_local_free_row_labels_free_basis(monkeypatch: pytest.MonkeyPatch) -> No
     assert row["priceSource"] == "local_free"
 
 
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_generic_custom_free_row_preserves_zero_estimate_provenance(
+    monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    su = SessionUsage()
+    su.add(10_000, 500, model_id="gpt-4.1", provider=provider)
+
+    row = su.model_breakdown[0]
+    assert row["costUsd"] == 0.0
+    assert row["costSource"] == "unavailable"
+    assert row["estimateBasis"] == "free"
+    assert row["priceSource"] == "custom_free"
+
+
 def test_unbilled_counters_accumulate_only_when_call_is_unbilled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

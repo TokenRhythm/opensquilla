@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -71,6 +71,7 @@ from opensquilla.channels.system_messages import render_channel_message
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     DoneEvent,
     EnsembleProgressEvent,
@@ -79,6 +80,8 @@ from opensquilla.engine.types import (
     RunHeartbeatEvent,
     TextDeltaEvent,
     ToolResultEvent,
+    ToolUseDeltaEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     done_text_snapshot,
 )
@@ -356,7 +359,7 @@ def _compute_channel_cap(config: Any) -> int:
     """
     task_runtime_cfg = getattr(config, "task_runtime", None) if config is not None else None
     raw_cap: int = getattr(task_runtime_cfg, "channel_inflight_cap", 8)
-    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 4)
+    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 8)
     formula_cap = max(2 * max_concurrency, 1)
     return min(raw_cap, formula_cap)
 
@@ -648,7 +651,32 @@ async def run_channel_dispatch(
             ) -> None:
                 await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl, channel_rpc_context_factory=channel_rpc_context_factory, admission_decision=_admission, busy_input_mode=busy_input_mode)  # noqa: E501
 
-            await debounce_coordinator.schedule(session_key, msg, window_s=debounce_window_s, on_fire=_on_debounce_fire)  # noqa: E501
+            acquire_intent = getattr(
+                task_runtime,
+                "acquire_explicit_ingress_intent",
+                None,
+            )
+            intent_lease = (
+                await acquire_intent(session_key) if callable(acquire_intent) else None
+            )
+
+            async def _release_debounce_intent(
+                _lease: Any = intent_lease,
+            ) -> None:
+                if _lease is not None:
+                    await _lease.release()
+
+            try:
+                await debounce_coordinator.schedule(
+                    session_key,
+                    msg,
+                    window_s=debounce_window_s,
+                    on_fire=_on_debounce_fire,
+                    on_settled=_release_debounce_intent,
+                )
+            except BaseException:
+                await _release_debounce_intent()
+                raise
             continue
         # fmt: on
 
@@ -681,17 +709,19 @@ async def run_channel_dispatch(
                     route_envelope=route_envelope,
                 )
 
-        await _apply_saved_channel_run_context(
-            route_envelope,
-            session_manager=session_manager,
-            config=config,
-            workspace_dir=None,
-            principal_is_owner=principal_is_owner,
-        )
+        ingested: AttachmentIngestResult | None = None
+        if not atomic_channel_acceptance:
+            await _apply_saved_channel_run_context(
+                route_envelope,
+                session_manager=session_manager,
+                config=config,
+                workspace_dir=None,
+                principal_is_owner=principal_is_owner,
+            )
 
-        ingested = await _ingest_channel_message_attachments(
-            channel=channel, msg=msg, config=config
-        )
+            ingested = await _ingest_channel_message_attachments(
+                channel=channel, msg=msg, config=config
+            )
 
         if not atomic_channel_acceptance:
             async with _maybe_lock(session_lock):
@@ -707,7 +737,10 @@ async def run_channel_dispatch(
         await status_reactor.received(msg)
 
         if task_runtime is not None:
-            from opensquilla.gateway.task_runtime import TaskQueueFullError
+            from opensquilla.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeShuttingDownError,
+            )
 
             # Cap check BEFORE enqueue/append: reject early so no transcript
             # entry is written and no runtime turn is started when the channel
@@ -770,9 +803,11 @@ async def run_channel_dispatch(
                             ingested=ingested,
                             raw_content=raw_content,
                             config=config,
+                            principal_is_owner=principal_is_owner,
                             busy_input_mode=busy_input_mode,
                         )
                     else:
+                        assert ingested is not None
                         stream_relay = _RuntimeChannelStreamRelay.maybe_start(
                             channel,
                             msg,
@@ -864,6 +899,17 @@ async def run_channel_dispatch(
                     await channel.send(
                         _route_envelope_reply_message(
                             workspace_message,
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
+                if isinstance(exc, TaskRuntimeShuttingDownError):
+                    await status_reactor.failed(msg)
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "The Gateway is shutting down. Please retry after it restarts.",
                             route_envelope,
                         )
                     )
@@ -978,6 +1024,7 @@ async def run_channel_dispatch(
         typing_task = _start_typing_keepalive(channel, msg)
         try:
             # Gap 4: Run agent turn with streaming (or batch fallback)
+            assert ingested is not None
             await _run_turn_with_streaming(
                 channel,
                 turn_runner,
@@ -1532,15 +1579,21 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if not atomic_channel_acceptance:
             await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
 
-    await _apply_saved_channel_run_context(
-        route_envelope,
-        session_manager=session_manager,
-        config=config,
-        workspace_dir=None,
-        principal_is_owner=principal_is_owner,
-    )
+    ingested: AttachmentIngestResult | None = None
+    if not atomic_channel_acceptance:
+        await _apply_saved_channel_run_context(
+            route_envelope,
+            session_manager=session_manager,
+            config=config,
+            workspace_dir=None,
+            principal_is_owner=principal_is_owner,
+        )
 
-    ingested = await _ingest_channel_message_attachments(channel=channel, msg=msg, config=config)
+        ingested = await _ingest_channel_message_attachments(
+            channel=channel,
+            msg=msg,
+            config=config,
+        )
 
     if not atomic_channel_acceptance:
         async with _maybe_lock(session_lock):
@@ -1549,7 +1602,10 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
     raw_content = getattr(combined, "raw_content", None) or msg.content
-    from opensquilla.gateway.task_runtime import TaskQueueFullError
+    from opensquilla.gateway.task_runtime import (
+        TaskQueueFullError,
+        TaskRuntimeShuttingDownError,
+    )
 
     # Cap check BEFORE enqueue/append: reject early so no transcript entry is
     # written and no runtime turn is started (accept-then-drop fix).
@@ -1598,9 +1654,11 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                     ingested=ingested,
                     raw_content=raw_content,
                     config=config,
+                    principal_is_owner=principal_is_owner,
                     busy_input_mode=busy_input_mode,
                 )
             else:
+                assert ingested is not None
                 stream_relay = _RuntimeChannelStreamRelay.maybe_start(channel, msg, task_runtime, config)  # noqa: E501
                 channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
                 if channel_overflow_policy is not None:
@@ -1652,6 +1710,15 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
             await channel.send(
                 _route_envelope_reply_message(
                     workspace_message,
+                    route_envelope,
+                )
+            )
+            return
+        if isinstance(exc, TaskRuntimeShuttingDownError):
+            await status_reactor.failed(msg)
+            await channel.send(
+                _route_envelope_reply_message(
+                    "The Gateway is shutting down. Please retry after it restarts.",
                     route_envelope,
                 )
             )
@@ -1871,7 +1938,12 @@ def _optional_positive_config_float(config: Any, attr: str, default: float) -> f
     return value if value > 0 else None
 
 
-def _wrap_channel_turn_stream(stream: Any, config: Any) -> Any:
+def _wrap_channel_turn_stream(
+    stream: Any,
+    config: Any,
+    *,
+    context_bound: bool | None = None,
+) -> Any:
     from opensquilla.engine.stream_wrappers import wrap_stream
 
     raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
@@ -1888,6 +1960,7 @@ def _wrap_channel_turn_stream(stream: Any, config: Any) -> Any:
         ),
         heartbeat_phase="channel",
         heartbeat_message="Still working",
+        context_bound=context_bound,
     )
 
 
@@ -2001,6 +2074,7 @@ async def _run_turn_with_streaming(
     )
     principal_is_owner = _stamp_channel_admin_principal(config, envelope, msg)
     storage = get_session_storage(session_manager)
+    session = None
     if storage is not None:
         session = await storage.get_session(session_key)
         if session is None:
@@ -2038,6 +2112,16 @@ async def _run_turn_with_streaming(
     from opensquilla.sandbox.policy_store import pin_sandbox_policy
 
     pin_sandbox_policy(tool_ctx, config)
+    from opensquilla.gateway.session_model_routing import (
+        capture_accepted_model_routing_config,
+    )
+
+    accepted_config = await capture_accepted_model_routing_config(
+        config,
+        session_manager,
+        session_key=session_key,
+        run_kind="channel_turn",
+    )
     use_streaming = resolve_channel_stream_policy(channel).relay_stream
 
     if use_streaming:
@@ -2051,6 +2135,7 @@ async def _run_turn_with_streaming(
             semantic_message,
             config,
             attachments,
+            accepted_config=accepted_config,
         )
     else:
         await _run_turn_batch_path(
@@ -2063,6 +2148,7 @@ async def _run_turn_with_streaming(
             semantic_message,
             config,
             attachments,
+            accepted_config=accepted_config,
         )
 
 
@@ -2200,12 +2286,15 @@ class _RuntimeChannelStreamRelay:
         self._queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._artifacts: list[dict[str, Any]] = []
         self.delivered_artifact_keys: set[str] = set()
+        self.attempted_artifact_keys: set[str] = set()
+        self._attempted_artifact_ids: set[str] = set()
         self._task: asyncio.Task[Any] | None = None
         self._closed = False
         self._live_preview = _channel_can_replace_streamed_text(channel)
         self._text_deltas: list[str] = []
         self._done_snapshot_present = False
         self._done_snapshot_text = ""
+        self._terminal_generation_reset = False
         self._stream_handle: _StreamedMessageHandle | None = None
         self.text_emitted = False
         self.stream_error: BaseException | None = None
@@ -2343,6 +2432,18 @@ class _RuntimeChannelStreamRelay:
         if artifact is not None:
             self._artifacts.append(artifact)
             return
+        generation_reset = _generation_reset_snapshot(event)
+        if generation_reset is not None:
+            terminal, snapshot_text = generation_reset
+            # A reset invalidates every delta from the previous generation.
+            # Keep only the authoritative replacement as the baseline for a
+            # later generation or as the terminal snapshot for final failure.
+            self._text_deltas[:] = [snapshot_text] if snapshot_text else []
+            if terminal:
+                self._done_snapshot_present = True
+                self._done_snapshot_text = snapshot_text
+                self._terminal_generation_reset = True
+            return
         snapshot_present, snapshot_text = done_text_snapshot(event)
         if snapshot_present and (
             isinstance(event, DoneEvent)
@@ -2386,6 +2487,17 @@ class _RuntimeChannelStreamRelay:
     def has_terminal_snapshot(self) -> bool:
         return self._done_snapshot_present
 
+    @property
+    def has_terminal_generation_reset(self) -> bool:
+        return self._terminal_generation_reset
+
+    def attempted_artifact(self, artifact: dict[str, Any]) -> bool:
+        artifact_id = artifact.get("id")
+        if isinstance(artifact_id, str) and artifact_id in self._attempted_artifact_ids:
+            return True
+        key = _artifact_delivery_key(artifact)
+        return bool(key and key in self.attempted_artifact_keys)
+
     async def close(self, timeout: float = 10.0) -> None:
         if self._closed:
             return
@@ -2398,7 +2510,10 @@ class _RuntimeChannelStreamRelay:
         terminal_text = (
             self._done_snapshot_text if self._done_snapshot_present else "".join(self._text_deltas)
         )
-        if not self._live_preview and terminal_text:
+        if (
+            not self._live_preview
+            or (self._terminal_generation_reset and not self.text_emitted)
+        ) and terminal_text:
             await self._queue.put(terminal_text)
             self.text_emitted = True
         if artifact_lines:
@@ -2471,6 +2586,17 @@ class _RuntimeChannelStreamRelay:
                 self._undelivered_index = len(self._yielded_chunks)
 
         if _can_deliver_channel_files(self._channel):
+            self.attempted_artifact_keys.update(
+                key
+                for artifact in self._artifacts
+                if (key := _artifact_delivery_key(artifact))
+            )
+            self._attempted_artifact_ids.update(
+                artifact_id
+                for artifact in self._artifacts
+                if isinstance((artifact_id := artifact.get("id")), str)
+                and artifact_id
+            )
             undelivered = await _deliver_artifacts_as_channel_files(
                 self._channel,
                 self._inbound,
@@ -2509,6 +2635,43 @@ def _text_delta_from_event(event: Any) -> str:
     return ""
 
 
+def _text_delta_event_payload(event: TextDeltaEvent) -> dict[str, Any]:
+    """Serialize a channel-origin text delta through the full public contract."""
+
+    payload = asdict(event)
+    payload.pop("kind", None)
+    return payload
+
+
+def _generation_reset_snapshot(event: Any) -> tuple[bool, str] | None:
+    """Return the public reset terminal flag and authoritative replacement."""
+
+    terminal_text: object = None
+    authoritative_text: object = ""
+    if isinstance(event, AnswerGenerationResetEvent):
+        terminal = bool(event.terminal)
+        terminal_text = event.terminal_text_snapshot
+        authoritative_text = event.authoritative_text_snapshot
+    elif isinstance(event, dict) and event.get("kind") == "answer_generation_reset":
+        terminal = bool(event.get("terminal", False))
+        terminal_text = event.get("terminal_text_snapshot")
+        authoritative_text = event.get("authoritative_text_snapshot")
+    elif getattr(event, "kind", None) == "answer_generation_reset":
+        terminal = bool(getattr(event, "terminal", False))
+        terminal_text = getattr(event, "terminal_text_snapshot", None)
+        authoritative_text = getattr(event, "authoritative_text_snapshot", "")
+    else:
+        return None
+
+    if terminal and isinstance(terminal_text, str) and terminal_text:
+        return True, terminal_text
+    if isinstance(authoritative_text, str) and authoritative_text:
+        return terminal, authoritative_text
+    if terminal:
+        return True, "The model could not complete this answer."
+    return False, ""
+
+
 def _artifact_event_payload(event: Any) -> dict[str, Any] | None:
     if isinstance(event, ArtifactEvent):
         return artifact_payload(event)
@@ -2520,7 +2683,7 @@ def _artifact_event_payload(event: Any) -> dict[str, Any] | None:
 
 
 def _router_decision_payload(event: RouterDecisionEvent) -> dict[str, Any]:
-    return {
+    payload = {
         "tier": event.tier,
         "tier_index": event.tier_index,
         "model": event.model,
@@ -2536,6 +2699,40 @@ def _router_decision_payload(event: RouterDecisionEvent) -> dict[str, Any]:
         "rollout_phase": event.rollout_phase,
         "context_window": event.context_window,
     }
+    if event.router_tier_snapshot is not None:
+        payload["router_tier_snapshot"] = event.router_tier_snapshot
+    return payload
+
+
+def _terminal_generation_reset_text(event: AnswerGenerationResetEvent) -> str:
+    """Return the one safe user-visible terminal replacement for a reset."""
+
+    terminal_text = event.terminal_text_snapshot
+    if isinstance(terminal_text, str) and terminal_text:
+        return terminal_text
+    if event.authoritative_text_snapshot:
+        return event.authoritative_text_snapshot
+    return "The model could not complete this answer."
+
+
+async def _emit_generation_reset(
+    event_bridge: EventBridge | None,
+    session_key: str,
+    event: AnswerGenerationResetEvent,
+) -> None:
+    if event_bridge is None:
+        return
+    # Serialize through the public wire boundary so the internal terminal
+    # failure metadata used for persistence never reaches subscribers.
+    from opensquilla.gateway.protocol import serialize_public_event
+
+    payload = serialize_public_event(event)
+    payload.pop("kind", None)
+    await event_bridge.emit(
+        session_key,
+        "session.event.answer_generation_reset",
+        payload,
+    )
 
 
 def _ensemble_progress_payload(event: EnsembleProgressEvent) -> dict[str, Any]:
@@ -2559,6 +2756,24 @@ def _tool_use_start_payload(event: ToolUseStartEvent) -> dict[str, Any]:
         "tool_use_id": event.tool_use_id,
         "tool_name": event.tool_name,
         "name": event.tool_name,
+        "synthetic_from_text": event.synthetic_from_text,
+    }
+
+
+def _tool_use_delta_payload(event: ToolUseDeltaEvent) -> dict[str, Any]:
+    return {
+        "tool_use_id": event.tool_use_id,
+        "json_fragment": event.json_fragment,
+    }
+
+
+def _tool_use_end_payload(event: ToolUseEndEvent) -> dict[str, Any]:
+    return {
+        "tool_use_id": event.tool_use_id,
+        "tool_name": event.tool_name,
+        "name": event.tool_name,
+        "arguments": event.arguments,
+        "input": event.arguments,
         "synthetic_from_text": event.synthetic_from_text,
     }
 
@@ -3030,7 +3245,7 @@ async def _record_main_delivery_context_after_acceptance(
         )
 
 
-async def _accept_channel_runtime_turn(
+async def _accept_channel_runtime_turn_impl(
     *,
     channel: Any,
     msg: IncomingMessage,
@@ -3106,6 +3321,16 @@ async def _accept_channel_runtime_turn(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    from opensquilla.session.goals import ClaimGoalMutation, GoalClaimCandidate
+
+    goal_claim_candidate: GoalClaimCandidate | None = None
+    current_goal = await storage.get_goal(session_key)
+    if current_goal is not None and current_goal.status == "active":
+        goal_claim_candidate = GoalClaimCandidate(
+            session_id=current_goal.session_id,
+            epoch=current_goal.session_epoch,
+            goal_id=current_goal.goal_id,
+        )
     workspace_guard = None
     bound_workspace_id = getattr(intent_plan.node, "workspace_id", None)
     if isinstance(bound_workspace_id, str) and bound_workspace_id:
@@ -3153,8 +3378,27 @@ async def _accept_channel_runtime_turn(
                 stream_relay.emit if stream_relay is not None else None
             ),
             overflow_policy=overflow_policy,
+            goal_candidate=(
+                goal_claim_candidate.as_task_detail()
+                if goal_claim_candidate is not None
+                else None
+            ),
         )
         try:
+            if intent_plan.action == "create":
+                from opensquilla.gateway.session_model_routing import (
+                    capture_prepared_session_model_routing_config,
+                )
+
+                await task_runtime.freeze_acceptance(
+                    reservation,
+                    accepted_config=capture_prepared_session_model_routing_config(
+                        config,
+                        intent_plan.node,
+                    ),
+                )
+            else:
+                await task_runtime.freeze_acceptance(reservation)
             acceptance = await storage.accept_turn(
                 entry,
                 expected_epoch=expected_epoch,
@@ -3167,6 +3411,11 @@ async def _accept_channel_runtime_turn(
                 session_node=intent_plan.node if intent_plan.action == "create" else None,
                 session_updates=delivery_fields,
                 workspace_guard=workspace_guard,
+                goal_mutation=(
+                    ClaimGoalMutation(candidate=goal_claim_candidate)
+                    if goal_claim_candidate is not None
+                    else None
+                ),
             )
         except BaseException:
             await task_runtime.abort_reservation(reservation)
@@ -3200,7 +3449,14 @@ async def _accept_channel_runtime_turn(
                 task_id=acceptance.receipt.task_id,
                 exc_info=True,
             )
-            if not reservation.activated:
+            if reservation.activated:
+                log.warning(
+                    "channel.turn_activation_error_after_start",
+                    session_key=session_key,
+                    task_id=acceptance.receipt.task_id,
+                )
+                handle = await task_runtime.activate(reservation)
+            else:
                 try:
                     await task_runtime.abort_reservation(reservation)
                 except Exception:  # noqa: BLE001 - preserve accepted channel handling.
@@ -3210,27 +3466,46 @@ async def _accept_channel_runtime_turn(
                         task_id=acceptance.receipt.task_id,
                         exc_info=True,
                     )
-            try:
-                await storage.update_agent_task(
-                    acceptance.receipt.task_id,
-                    status="failed",
-                    finished_at=int(time.time() * 1000),
-                    terminal_reason="activation_failed",
-                    error_class=type(exc).__name__,
-                    error_message=str(exc),
+                goal_compensated = False
+                goal_service = getattr(task_runtime, "goal_service", None)
+                compensate_goal = getattr(
+                    goal_service,
+                    "compensate_activation_failure",
+                    None,
                 )
-            except Exception:  # noqa: BLE001 - preserve accepted channel handling.
-                log.warning(
-                    "channel.turn_activation_failure_record_failed",
-                    session_key=session_key,
+                if acceptance.goal_context is not None and callable(compensate_goal):
+                    try:
+                        await compensate_goal(acceptance.goal_context.as_task_detail())
+                        goal_compensated = True
+                    except Exception:  # noqa: BLE001 - preserve accepted handling.
+                        log.warning(
+                            "channel.goal_activation_compensation_failed",
+                            session_key=session_key,
+                            task_id=acceptance.receipt.task_id,
+                            exc_info=True,
+                        )
+                if not goal_compensated:
+                    try:
+                        await storage.update_agent_task(
+                            acceptance.receipt.task_id,
+                            status="failed",
+                            finished_at=int(time.time() * 1000),
+                            terminal_reason="activation_failed",
+                            error_class=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    except Exception:  # noqa: BLE001 - preserve accepted handling.
+                        log.warning(
+                            "channel.turn_activation_failure_record_failed",
+                            session_key=session_key,
+                            task_id=acceptance.receipt.task_id,
+                            exc_info=True,
+                        )
+                handle = TaskHandle(
                     task_id=acceptance.receipt.task_id,
-                    exc_info=True,
+                    session_key=acceptance.receipt.accepted_session_key,
+                    status=AgentTaskStatus.FAILED,
                 )
-            handle = TaskHandle(
-                task_id=acceptance.receipt.task_id,
-                session_key=acceptance.receipt.accepted_session_key,
-                status=AgentTaskStatus.FAILED,
-            )
 
         try:
             session_manager.notify_message_appended(entry)
@@ -3258,6 +3533,51 @@ async def _accept_channel_runtime_turn(
             return await _commit_and_activate()
 
     return await complete_durable_ingress(_commit_with_session_admission())
+
+
+async def _accept_channel_runtime_turn(
+    *,
+    channel: Any,
+    msg: IncomingMessage,
+    session_manager: Any,
+    session_key: str,
+    route_envelope: Any,
+    task_runtime: Any,
+    ingested: AttachmentIngestResult | None,
+    raw_content: str,
+    config: Any,
+    principal_is_owner: bool | None = None,
+    busy_input_mode: str = "followup",
+) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
+    """Fence user intent before channel session/workspace preparation."""
+
+    async with task_runtime.explicit_ingress_intent(route_envelope.session_key):
+        if ingested is None:
+            assert principal_is_owner is not None
+            await _apply_saved_channel_run_context(
+                route_envelope,
+                session_manager=session_manager,
+                config=config,
+                workspace_dir=None,
+                principal_is_owner=principal_is_owner,
+            )
+            ingested = await _ingest_channel_message_attachments(
+                channel=channel,
+                msg=msg,
+                config=config,
+            )
+        return await _accept_channel_runtime_turn_impl(
+            channel=channel,
+            msg=msg,
+            session_manager=session_manager,
+            session_key=session_key,
+            route_envelope=route_envelope,
+            task_runtime=task_runtime,
+            ingested=ingested,
+            raw_content=raw_content,
+            config=config,
+            busy_input_mode=busy_input_mode,
+        )
 
 
 async def _append_channel_user_message(
@@ -3683,6 +4003,15 @@ async def _deliver_runtime_channel_reply(
         ):
             return
     else:
+        if (
+            stream_relay is not None
+            and stream_relay.has_terminal_generation_reset
+            and stream_relay.text_emitted
+            and stream_relay.stream_error is None
+        ):
+            # The reset snapshot is the one visible terminal outcome.  close()
+            # has already reconciled any speculative preview to that value.
+            return
         content = build_terminal_reply(record)
         if (
             stream_relay is not None
@@ -3701,6 +4030,12 @@ async def _deliver_runtime_channel_reply(
             ]
         content = _strip_artifact_markers_from_channel_text(content)
         content = _strip_delivered_artifact_image_references(content, artifacts)
+        if stream_relay is not None and stream_relay.attempted_artifact_keys:
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if not stream_relay.attempted_artifact(artifact)
+            ]
         if _can_deliver_channel_files(channel):
             if content:
                 await _deliver_reply_or_notify(
@@ -3783,6 +4118,8 @@ async def _run_turn_batch_path(
     semantic_message: str | None,
     config: Any,
     attachments: list[dict[str, Any]] | None = None,
+    *,
+    accepted_config: Any = None,
 ) -> None:
     """Batch mode: accumulate all text, send once at the end."""
     text_parts: list[str] = []
@@ -3790,6 +4127,7 @@ async def _run_turn_batch_path(
     done_snapshot_text = ""
     artifacts: list[dict[str, Any]] = []
     error_occurred = False
+    terminal_generation_reset_text: str | None = None
     clarify_card_sent = False
 
     run_kwargs: dict[str, Any] = {
@@ -3804,12 +4142,25 @@ async def _run_turn_batch_path(
     if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
         run_kwargs["attachments"] = attachments
     try:
-        stream = turn_runner.run(
-            msg.content,
-            session_key,
-            **run_kwargs,
+        from opensquilla.gateway.session_model_routing import (
+            accepted_model_routing_stream,
         )
-        async for event in _wrap_channel_turn_stream(stream, config):
+
+        stream = accepted_model_routing_stream(
+            turn_runner.run(
+                msg.content,
+                session_key,
+                **run_kwargs,
+            ),
+            accepted_config,
+        )
+        from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+        async for event in _wrap_channel_turn_stream(
+            stream,
+            config,
+            context_bound=is_context_bound_owner(turn_runner),
+        ):
             if isinstance(event, TextDeltaEvent):
                 if clarify_card_sent:
                     continue
@@ -3818,16 +4169,32 @@ async def _run_turn_batch_path(
                     await event_bridge.emit(
                         session_key,
                         "session.event.text_delta",
-                        {
-                            "text": event.text,
-                            "presentation": getattr(event, "presentation", "answer"),
-                        },
+                        _text_delta_event_payload(event),
                     )
             elif isinstance(event, DoneEvent):
                 snapshot_present, snapshot_text = done_text_snapshot(event)
                 if snapshot_present:
                     done_snapshot_present = True
                     done_snapshot_text = snapshot_text
+            elif isinstance(event, AnswerGenerationResetEvent):
+                await _emit_generation_reset(event_bridge, session_key, event)
+                text_parts.clear()
+                done_snapshot_present = bool(event.authoritative_text_snapshot)
+                done_snapshot_text = event.authoritative_text_snapshot
+                if event.terminal:
+                    log.error(
+                        "channel_dispatch.agent_terminal_generation_reset",
+                        session_key=session_key,
+                        failure_kind=event.terminal_failure_kind or None,
+                    )
+                    terminal_generation_reset_text = _terminal_generation_reset_text(
+                        event
+                    )
+                    error_occurred = True
+                    # Keep draining the shared TurnRunner. Its accounting-only
+                    # Done is hidden from this public stream, but reaching EOF
+                    # is what lets the finalizer persist usage and the error.
+                    continue
             elif artifact := _artifact_event_payload(event):
                 artifacts.append(artifact)
                 if event_bridge is not None:
@@ -3859,6 +4226,20 @@ async def _run_turn_batch_path(
                         "session.event.tool_use_start",
                         _tool_use_start_payload(event),
                     )
+            elif isinstance(event, ToolUseDeltaEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_delta",
+                        _tool_use_delta_payload(event),
+                    )
+            elif isinstance(event, ToolUseEndEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_end",
+                        _tool_use_end_payload(event),
+                    )
             elif isinstance(event, ToolResultEvent):
                 if event_bridge is not None:
                     await event_bridge.emit(
@@ -3869,11 +4250,13 @@ async def _run_turn_batch_path(
                 if await _maybe_send_clarify_channel_card(channel, msg, event):
                     clarify_card_sent = True
             elif isinstance(event, ErrorEvent):
+                if terminal_generation_reset_text is not None:
+                    continue
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
-                    code=event.code,
-                    message=event.message,
+                    failure_kind=event.failure_kind or None,
+                    error_id=event.error_id or None,
                 )
                 await channel.send(
                     _build_reply_message(
@@ -3890,17 +4273,22 @@ async def _run_turn_batch_path(
                 break
     except TimeoutError as exc:
         log.error("channel_dispatch.agent_stream_timeout", session_key=session_key)
-        await channel.send(
-            _build_reply_message(
-                channel,
-                build_terminal_reply(_terminal_payload_from_exception(exc)),
-                msg,
+        if terminal_generation_reset_text is None:
+            await channel.send(
+                _build_reply_message(
+                    channel,
+                    build_terminal_reply(_terminal_payload_from_exception(exc)),
+                    msg,
+                )
             )
-        )
         text_parts.clear()
         error_occurred = True
 
-    if not error_occurred:
+    if terminal_generation_reset_text is not None:
+        await channel.send(
+            _build_reply_message(channel, terminal_generation_reset_text, msg)
+        )
+    elif not error_occurred:
         content = done_snapshot_text if done_snapshot_present else "".join(text_parts)
         content = _strip_artifact_markers_from_channel_text(content)
         content = _strip_delivered_artifact_image_references(content, artifacts)
@@ -3929,6 +4317,8 @@ async def _run_turn_streaming_path(
     semantic_message: str | None,
     config: Any,
     attachments: list[dict[str, Any]] | None = None,
+    *,
+    accepted_config: Any = None,
 ) -> None:
     """Streaming mode: feed text deltas through an async queue to send_streaming.
 
@@ -3942,6 +4332,7 @@ async def _run_turn_streaming_path(
     done_snapshot_present = False
     done_snapshot_text = ""
     stream_error: str | None = None
+    terminal_generation_reset = False
     stream_task_error: BaseException | None = None
     stream_handle: _StreamedMessageHandle | None = None
     terminal_reconcile_fallback = ""
@@ -3990,12 +4381,25 @@ async def _run_turn_streaming_path(
             run_kwargs["semantic_message"] = semantic_message
         if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
             run_kwargs["attachments"] = attachments
-        stream = turn_runner.run(
-            msg.content,
-            session_key,
-            **run_kwargs,
+        from opensquilla.gateway.session_model_routing import (
+            accepted_model_routing_stream,
         )
-        async for event in _wrap_channel_turn_stream(stream, config):
+
+        stream = accepted_model_routing_stream(
+            turn_runner.run(
+                msg.content,
+                session_key,
+                **run_kwargs,
+            ),
+            accepted_config,
+        )
+        from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+        async for event in _wrap_channel_turn_stream(
+            stream,
+            config,
+            context_bound=is_context_bound_owner(turn_runner),
+        ):
             if isinstance(event, TextDeltaEvent):
                 if clarify_card_sent:
                     continue
@@ -4009,16 +4413,30 @@ async def _run_turn_streaming_path(
                     await event_bridge.emit(
                         session_key,
                         "session.event.text_delta",
-                        {
-                            "text": event.text,
-                            "presentation": getattr(event, "presentation", "answer"),
-                        },
+                        _text_delta_event_payload(event),
                     )
             elif isinstance(event, DoneEvent):
                 snapshot_present, snapshot_text = done_text_snapshot(event)
                 if snapshot_present:
                     done_snapshot_present = True
                     done_snapshot_text = snapshot_text
+            elif isinstance(event, AnswerGenerationResetEvent):
+                await _emit_generation_reset(event_bridge, session_key, event)
+                text_parts.clear()
+                done_snapshot_present = bool(event.authoritative_text_snapshot)
+                done_snapshot_text = event.authoritative_text_snapshot
+                if event.terminal:
+                    log.error(
+                        "channel_dispatch.agent_terminal_generation_reset",
+                        session_key=session_key,
+                        failure_kind=event.terminal_failure_kind or None,
+                    )
+                    terminal_generation_reset = True
+                    done_snapshot_present = True
+                    done_snapshot_text = _terminal_generation_reset_text(event)
+                    # Drain through finalization before closing the wrapper;
+                    # stopping here can cancel DB/accounting work in progress.
+                    continue
             elif artifact := _artifact_event_payload(event):
                 artifacts.append(artifact)
                 if event_bridge is not None:
@@ -4050,6 +4468,20 @@ async def _run_turn_streaming_path(
                         "session.event.tool_use_start",
                         _tool_use_start_payload(event),
                     )
+            elif isinstance(event, ToolUseDeltaEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_delta",
+                        _tool_use_delta_payload(event),
+                    )
+            elif isinstance(event, ToolUseEndEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_end",
+                        _tool_use_end_payload(event),
+                    )
             elif isinstance(event, ToolResultEvent):
                 if event_bridge is not None:
                     await event_bridge.emit(
@@ -4060,11 +4492,13 @@ async def _run_turn_streaming_path(
                 if await _maybe_send_clarify_channel_card(channel, msg, event):
                     clarify_card_sent = True
             elif isinstance(event, ErrorEvent):
+                if terminal_generation_reset:
+                    continue
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
-                    code=event.code,
-                    message=event.message,
+                    failure_kind=event.failure_kind or None,
+                    error_id=event.error_id or None,
                 )
                 stream_error = append_error_ref(
                     build_terminal_reply(_terminal_payload_from_error_event(event)),
@@ -4073,7 +4507,8 @@ async def _run_turn_streaming_path(
                 break
     except TimeoutError as exc:
         log.error("channel_dispatch.agent_stream_timeout", session_key=session_key)
-        stream_error = build_terminal_reply(_terminal_payload_from_exception(exc))
+        if not terminal_generation_reset:
+            stream_error = build_terminal_reply(_terminal_payload_from_exception(exc))
     finally:
         if not live_preview:
             terminal_text = done_snapshot_text if done_snapshot_present else "".join(text_parts)
@@ -4178,7 +4613,7 @@ async def _run_turn_streaming_path(
             await channel.send(
                 _build_reply_message(channel, stream_error, msg),
             )
-    elif artifacts:
+    elif artifacts and not terminal_generation_reset:
         if _can_deliver_channel_files(channel):
             undelivered = await _deliver_artifacts_as_channel_files(channel, msg, artifacts, config)
         else:

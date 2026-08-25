@@ -4,6 +4,7 @@ import type { Skill, SkillDependencyInstallOutcome } from '@/types/skills'
 import {
   installActionsForCurrentDependencies,
   normalizeSkill,
+  skillCatalogKey,
   skillDependencySummary,
 } from '@/composables/skills/useSkillsCatalog'
 
@@ -13,7 +14,12 @@ interface SkillDetailRpc {
 
 interface SkillDetailControllerOptions {
   rpc: SkillDetailRpc
-  installDeps: (name: string, installId: string) => Promise<SkillDependencyInstallOutcome>
+  installDeps: (
+    name: string,
+    installId: string,
+    skillInstallId?: string,
+    instanceId?: string,
+  ) => Promise<SkillDependencyInstallOutcome>
   closeDelayMs?: number
 }
 
@@ -41,13 +47,14 @@ export function useSkillDetailController(
   const closeDelayMs = options.closeDelayMs ?? 600
   let requestGeneration = 0
   let closeTimer: ReturnType<typeof setTimeout> | null = null
-  let closeTimerSkill = ''
-  let installRequest: { generation: number; name: string } | null = null
+  let closeTimerIdentity = ''
+  let installRequest: { generation: number; identity: string } | null = null
+  let activeIdentity = ''
 
   function clearCloseTimer() {
     if (closeTimer) clearTimeout(closeTimer)
     closeTimer = null
-    closeTimerSkill = ''
+    closeTimerIdentity = ''
   }
 
   function beginRequest(): number {
@@ -56,12 +63,20 @@ export function useSkillDetailController(
     return requestGeneration
   }
 
-  function isCurrent(generation: number, name: string): boolean {
-    return requestGeneration === generation && selectedSkill.value?.name === name
+  function isCurrent(generation: number, identity: string): boolean {
+    return requestGeneration === generation && activeIdentity === identity
   }
 
-  async function fetchLatest(name: string, seed: Skill): Promise<Skill> {
-    const detail = await options.rpc.call('skills.get', { name }) as Skill
+  async function fetchLatest(seed: Skill): Promise<Skill> {
+    const params: Record<string, unknown> = {
+      name: seed.name,
+      includeLifecycle: true,
+    }
+    if (seed.instance_id) params.instanceId = seed.instance_id
+    if (seed.install_id) params.installId = seed.install_id
+    const detail = await options.rpc.call('skills.get', {
+      ...params,
+    }) as Skill
     // Eligible rows omit legacy missing_* fields. Clear the seed diagnostics
     // before merging so a transition to ready cannot retain stale list data.
     return normalizeSkill({
@@ -71,29 +86,31 @@ export function useSkillDetailController(
       missing_env_any: [],
       dependency_summary: undefined,
       ...detail,
-      name,
+      name: seed.name,
     })
   }
 
   async function openSkill(skill: Skill) {
     const generation = beginRequest()
-    const name = skill.name
+    const identity = skillCatalogKey(skill)
+    activeIdentity = identity
     selectedSkill.value = normalizeSkill(skill)
     selectedSkillError.value = ''
     installFeedback.value = ''
     selectedSkillLoading.value = true
     try {
-      const latest = await fetchLatest(name, skill)
-      if (isCurrent(generation, name)) selectedSkill.value = latest
+      const latest = await fetchLatest(skill)
+      if (isCurrent(generation, identity)) selectedSkill.value = latest
     } catch (error) {
-      if (isCurrent(generation, name)) selectedSkillError.value = errorMessage(error)
+      if (isCurrent(generation, identity)) selectedSkillError.value = errorMessage(error)
     } finally {
-      if (isCurrent(generation, name)) selectedSkillLoading.value = false
+      if (isCurrent(generation, identity)) selectedSkillLoading.value = false
     }
   }
 
   function closeSkill() {
     beginRequest()
+    activeIdentity = ''
     selectedSkill.value = null
     selectedSkillLoading.value = false
     selectedSkillError.value = ''
@@ -111,7 +128,9 @@ export function useSkillDetailController(
     }
 
     const generation = beginRequest()
-    const currentInstallRequest = { generation, name }
+    const identity = skillCatalogKey(selectedSkill.value)
+    activeIdentity = identity
+    const currentInstallRequest = { generation, identity }
     installRequest = currentInstallRequest
     selectedSkillError.value = ''
     installFeedback.value = ''
@@ -122,8 +141,8 @@ export function useSkillDetailController(
       // than the possibly stale list/card payload. This also prevents an old
       // dialog from invoking an action that is no longer a current dependency.
       const seed = selectedSkill.value
-      const latestBeforeInstall = await fetchLatest(name, seed)
-      if (!isCurrent(generation, name)) return false
+      const latestBeforeInstall = await fetchLatest(seed)
+      if (!isCurrent(generation, identity)) return false
       selectedSkill.value = latestBeforeInstall
       selectedSkillLoading.value = false
 
@@ -134,8 +153,13 @@ export function useSkillDetailController(
         return false
       }
 
-      const outcome = await options.installDeps(name, installId)
-      if (!isCurrent(generation, name)) return false
+      const outcome = await options.installDeps(
+        name,
+        installId,
+        latestBeforeInstall.install_id || '',
+        latestBeforeInstall.instance_id || '',
+      )
+      if (!isCurrent(generation, identity)) return false
       if (!outcome.success) {
         installFeedback.value = outcome.message
           || i18n.global.t('cronSkills.registry.installFailed')
@@ -144,8 +168,8 @@ export function useSkillDetailController(
 
       // The install result is useful for immediate envAny completeness, while
       // skills.get remains authoritative for the dialog and action list.
-      const latestAfterInstall = await fetchLatest(name, latestBeforeInstall)
-      if (!isCurrent(generation, name)) return false
+      const latestAfterInstall = await fetchLatest(latestBeforeInstall)
+      if (!isCurrent(generation, identity)) return false
       selectedSkill.value = latestAfterInstall
 
       const missingCount = skillDependencySummary(latestAfterInstall).missing.count
@@ -167,23 +191,24 @@ export function useSkillDetailController(
       }
 
       installFeedback.value = i18n.global.t('cronSkills.skillDetail.installComplete')
-      closeTimerSkill = name
+      closeTimerIdentity = identity
       closeTimer = setTimeout(() => {
         if (
           requestGeneration === generation
-          && closeTimerSkill === name
-          && selectedSkill.value?.name === name
+          && closeTimerIdentity === identity
+          && selectedSkill.value !== null
+          && skillCatalogKey(selectedSkill.value) === identity
         ) {
           closeSkill()
         }
       }, closeDelayMs)
       return true
     } catch (error) {
-      if (isCurrent(generation, name)) selectedSkillError.value = errorMessage(error)
+      if (isCurrent(generation, identity)) selectedSkillError.value = errorMessage(error)
       return false
     } finally {
       if (installRequest === currentInstallRequest) installRequest = null
-      if (isCurrent(generation, name)) selectedSkillLoading.value = false
+      if (isCurrent(generation, identity)) selectedSkillLoading.value = false
     }
   }
 

@@ -62,6 +62,8 @@ jobs:
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
       - name: Install runtime dependencies
         run: uv sync --frozen

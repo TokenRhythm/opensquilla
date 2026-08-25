@@ -4,7 +4,7 @@
     class="chat-composer"
     :class="{
       'chat-composer--new-landing': isNewLanding,
-      'chat-composer--collapsed': collapsed,
+      'chat-composer--collapsed': collapsed && promptAnnotations.length === 0,
       'chat-composer--floating': floating,
       'chat-composer--docked': !floating,
     }"
@@ -28,12 +28,90 @@
             </span>
             <span class="attachment-chip__name">{{ att.name }}</span>
             <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
-            <button v-if="att.kind === 'failed' && att.file" class="attachment-action" title="Retry upload" aria-label="Retry upload" @click="emit('retryAttachment', i)">
+            <button v-if="att.kind === 'failed' && att.file" class="attachment-action" :title="t('chat.retryUpload')" :aria-label="t('chat.retryUpload')" @click="emit('retryAttachment', i)">
               <Icon name="refresh" :size="12" />
             </button>
             <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">
               <Icon name="x" :size="12" />
             </button>
+          </div>
+        </div>
+      </div>
+      <div v-if="promptAnnotations.length > 0" class="chat-collapse-region">
+        <div
+          class="chat-prompt-annotations"
+          :aria-label="t('chat.promptAnnotations.draftLabel')"
+          aria-live="polite"
+          data-testid="composer-prompt-annotations"
+        >
+          <div class="chat-prompt-annotations__header" data-testid="composer-prompt-annotations-label">
+            <Icon name="chat" :size="13" aria-hidden="true" />
+            <span>{{ t('chat.promptAnnotations.label') }} · {{ promptAnnotations.length }}</span>
+          </div>
+          <div
+            v-for="annotation in promptAnnotations"
+            :key="annotation.annotationId"
+            class="chat-prompt-annotation-chip"
+            :data-annotation-id="annotation.annotationId"
+            role="group"
+          >
+            <span class="chat-prompt-annotation-chip__rail" aria-hidden="true" />
+            <form
+              v-if="editingAnnotationId === annotation.annotationId"
+              class="chat-prompt-annotation-chip__editor"
+              @submit.prevent="saveAnnotationEdit(annotation.annotationId)"
+            >
+              <input
+                ref="annotationInputEl"
+                v-model="annotationDraftBody"
+                type="text"
+                :maxlength="promptAnnotationMaxBodyLength"
+                :aria-label="t('chat.promptAnnotations.editLabel')"
+                @keydown.esc.prevent="cancelAnnotationEdit"
+              />
+              <button
+                type="submit"
+                :disabled="annotationDraftBody.trim().length === 0 || annotationDraftTooLong"
+              >
+                {{ t('common.save') }}
+              </button>
+              <button type="button" @click="cancelAnnotationEdit">
+                {{ t('common.cancel') }}
+              </button>
+            </form>
+            <template v-else>
+              <button
+                type="button"
+                class="chat-prompt-annotation-chip__main"
+                :title="annotation.body"
+                @click="emit('jumpPromptAnnotation', annotation.annotationId)"
+              >
+                <span class="chat-prompt-annotation-chip__target">
+                  {{ promptAnnotationTargetLabel(annotation, t) }}
+                </span>
+                <span class="chat-prompt-annotation-chip__text">
+                  {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
+                </span>
+              </button>
+              <button
+                type="button"
+                class="attachment-action"
+                :aria-label="t('chat.promptAnnotations.editLabel')"
+                :title="t('chat.promptAnnotations.editLabel')"
+                @click="beginAnnotationEdit(annotation)"
+              >
+                <Icon name="edit" :size="12" />
+              </button>
+              <button
+                type="button"
+                class="attachment-action attachment-remove"
+                :aria-label="t('chat.promptAnnotations.removeLabel')"
+                :title="t('chat.promptAnnotations.removeLabel')"
+                @click="emit('discardPromptAnnotation', annotation.annotationId)"
+              >
+                <Icon name="x" :size="12" />
+              </button>
+            </template>
           </div>
         </div>
       </div>
@@ -72,7 +150,7 @@
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
-            @input="emit('input', $event)"
+            @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
             @compositionstart="emit('compositionChange', true)"
             @compositionend="emit('compositionChange', false)"
@@ -97,10 +175,16 @@
               </button>
               <ChatComposerAddMenu
                 v-if="addMenuOpen"
+                :avoid-element="addMenuAvoidElement"
                 :attachments-disabled="replanActive"
+                :goal-mode-active="goalDraftArmed"
+                :goal-mode-available="goalModeAvailable === true"
+                :goal-mode-busy="goalModeBusy === true"
+                :goal-mode-existing="goalModeExisting === true"
                 :plan-mode-active="collaborationMode === 'plan'"
                 :plan-mode-available="planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
+                @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="fileInputEl?.click()"
                 @close="addMenuOpen = false"
@@ -155,16 +239,21 @@
               <span>{{ t('chat.codingMode.activeLabel') }}</span>
               <Icon name="x" :size="12" aria-hidden="true" />
             </button>
-            <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
+            <div
+              v-if="sessionRoutingAvailable"
+              ref="modelRoutingAnchorEl"
+              class="chat-settings-anchor"
+            >
               <button
                 class="btn btn--icon btn--ghost chat-model-routing-btn"
                 :class="[
-                  `chat-model-routing-btn--${modelRoutingMode}`,
-                  { 'is-active': modelRoutingOpen || modelRoutingMode !== 'off' },
+                  `chat-model-routing-btn--${sessionRoutingMode}`,
+                  { 'is-active': modelRoutingOpen || sessionRoutingMode !== 'off' },
                 ]"
-                :title="t('chat.composer.modelRouting')"
-                :aria-label="t('chat.composer.modelRouting')"
+                :title="t('chat.composer.sessionModelRouting')"
+                :aria-label="t('chat.composer.sessionModelRouting')"
                 :aria-expanded="modelRoutingOpen ? 'true' : 'false'"
+                :aria-disabled="sessionRoutingControlBlocked ? 'true' : 'false'"
                 @click="toggleModelRouting"
               >
                 <Icon name="router" :size="17" />
@@ -176,10 +265,10 @@
               </button>
               <ChatComposerModelRouting
                 v-if="modelRoutingOpen"
-                :model-routing-mode="modelRoutingMode"
-                :busy="modelRoutingSettingsBusy"
+                :model-routing-mode="sessionRoutingMode"
+                :busy="sessionRoutingBusy || sessionRoutingControlBlocked"
                 @close="modelRoutingOpen = false"
-                @set-model-routing-mode="emit('setModelRoutingMode', $event)"
+                @set-session-routing-mode="emit('setSessionRoutingMode', $event)"
               />
             </div>
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
@@ -284,6 +373,10 @@
               </div>
             </div>
           </div>
+          <ChatComposerGoalMode
+            :active="goalDraftArmed"
+            @disarm="emit('disarmGoal')"
+          />
           <ChatComposerPlanMode
             :available="planModeAvailable === true"
             :mode="collaborationMode || 'default'"
@@ -313,10 +406,12 @@
                 key="send"
                 class="btn btn--icon btn--primary chat-send-btn"
                 :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
-                :title="sendBlockedMessage || sendButtonTitle"
+                :title="sendBlockedMessage
+                  || (sessionRoutingBusy ? t('chat.composer.routingUpdateBlocked') : sendButtonTitle)"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                 :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-                :disabled="Boolean(sendBlockedMessage) || inputDisabled"
+                :aria-busy="sessionRoutingBusy ? 'true' : 'false'"
+                :disabled="Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
               >
                 <Icon name="arrowUp" :size="17" />
@@ -355,6 +450,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
+import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
 import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
@@ -363,6 +459,12 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
+import type { PromptAnnotation } from '@/types/promptAnnotations'
+import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
+import {
+  PROMPT_ANNOTATION_MAX_BODY_LENGTH,
+  promptAnnotationBodyWithinLimit,
+} from '@/types/promptAnnotations'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -390,16 +492,24 @@ const props = withDefaults(defineProps<{
   safeSetupAvailable?: boolean
   runModeLocked: boolean
   runModeLockMessage: string
-  modelRoutingMode: ModelRoutingMode
-  modelRoutingSettingsBusy: boolean
+  sessionRoutingMode: ModelRoutingMode
+  sessionRoutingBusy: boolean
+  sessionRoutingControlBlocked?: boolean
+  sessionRoutingAvailable?: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
+  addMenuAvoidElement?: HTMLElement | null
+  goalDraftArmed?: boolean
+  goalModeAvailable?: boolean
+  goalModeBusy?: boolean
+  goalModeExisting?: boolean
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
   projectWorkspace?: { id: string; name: string; path: string } | null
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
   projectStatusMessage?: string
+  promptAnnotations?: readonly PromptAnnotation[]
   canCloseProject?: boolean
   canChooseProject?: boolean
   planModeAvailable?: boolean
@@ -420,9 +530,13 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  sessionRoutingAvailable: true,
+  sessionRoutingControlBlocked: false,
+  goalDraftArmed: false,
   inputDisabled: false,
   safeSetupAvailable: false,
   floating: false,
+  promptAnnotations: () => [],
 })
 
 const emit = defineEmits<{
@@ -436,9 +550,11 @@ const emit = defineEmits<{
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
-  setModelRoutingMode: [mode: ModelRoutingMode]
+  setSessionRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
+  armGoal: []
+  disarmGoal: []
   cancelReplan: []
   voiceInput: []
   voiceSetup: []
@@ -446,6 +562,9 @@ const emit = defineEmits<{
   stop: []
   chooseProject: []
   closeProject: []
+  updatePromptAnnotation: [annotationId: string, body: string]
+  discardPromptAnnotation: [annotationId: string]
+  jumpPromptAnnotation: [annotationId: string]
   openPromptCacheKeepalive: []
   refreshPromptCacheKeepalive: []
   /** Request the parent to restore the full (expanded) composer. */
@@ -457,13 +576,72 @@ const { t } = useI18n()
 const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
+
+function onTextareaInput(event: Event) {
+  // vModelText skips model updates while the element's internal IME
+  // composition flag is set (`if (e.target.composing) return` in
+  // @vue/runtime-dom). On Windows a paste can land while that flag is
+  // stale after a composition round-trip, leaving the model — and the
+  // send button's readiness — out of sync with what the textarea shows.
+  //
+  // A paste handler cannot repair this: in real browsers the paste event
+  // fires BEFORE the default insertion mutates the DOM, so any handler
+  // (or nextTick scheduled from it) still reads the empty value. The
+  // input event with inputType "insertFromPaste" fires AFTER the browser
+  // has written the pasted text, so syncing the model from the DOM at
+  // that stage restores readiness even when vModelText skipped the
+  // update. This is a no-op whenever v-model already picked up the
+  // change.
+  if (event instanceof InputEvent && event.inputType === 'insertFromPaste') {
+    const field = event.currentTarget
+    if (field instanceof HTMLTextAreaElement
+      && field === textareaEl.value
+      && inputText.value !== field.value) {
+      inputText.value = field.value
+    }
+  }
+  // Keep parent input consumers (auto-resize, slash commands, draft state)
+  // downstream of the reconciliation so they observe the pasted model.
+  emit('input', event)
+}
+
 const fileInputEl = ref<HTMLInputElement | null>(null)
 const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
+const editingAnnotationId = ref('')
+const annotationDraftBody = ref('')
+const annotationInputEl = ref<HTMLInputElement[] | null>(null)
+const promptAnnotationMaxBodyLength = PROMPT_ANNOTATION_MAX_BODY_LENGTH
+const annotationDraftTooLong = computed(() => (
+  !promptAnnotationBodyWithinLimit(annotationDraftBody.value)
+))
 const showProjectContext = computed(() =>
   Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
 )
+
+function beginAnnotationEdit(annotation: PromptAnnotation) {
+  editingAnnotationId.value = annotation.annotationId
+  annotationDraftBody.value = annotation.body
+  void nextTick(() => {
+    const inputs = annotationInputEl.value
+    const input = Array.isArray(inputs) ? inputs[inputs.length - 1] : inputs
+    input?.focus()
+    input?.select()
+  })
+}
+
+function cancelAnnotationEdit() {
+  editingAnnotationId.value = ''
+  annotationDraftBody.value = ''
+}
+
+function saveAnnotationEdit(annotationId: string) {
+  const body = annotationDraftBody.value.trim()
+  if (!body || !promptAnnotationBodyWithinLimit(body)) return
+  emit('updatePromptAnnotation', annotationId, body)
+  cancelAnnotationEdit()
+}
 const promptCacheKeepaliveStatusText = computed(() => {
   const status = props.promptCacheKeepaliveStatus
   if (!status || status.state === 'off') return ''
@@ -628,10 +806,13 @@ function attachmentIcon(att: Attachment): IconName {
 }
 
 function attachmentMeta(att: Attachment): string {
-  if (att.kind === 'failed') return att.error ? `FAILED · ${att.error}` : 'FAILED'
+  if (att.kind === 'failed') {
+    const failed = t('chat.status.failed')
+    return att.error ? `${failed} · ${att.error}` : failed
+  }
   const mime = att.mime || ''
   const subtype = mime.includes('/') ? mime.split('/')[1] : mime
-  const label = subtype ? subtype.toUpperCase() : 'FILE'
+  const label = subtype ? subtype.toUpperCase() : t('chat.fileLabel')
   const size = typeof att.size === 'number'
     ? `${Math.max(1, Math.round(att.size / 1024))} KB`
     : ''
@@ -640,7 +821,7 @@ function attachmentMeta(att: Attachment): string {
 
 function attachmentTitle(att: Attachment): string {
   if (att.kind === 'failed') {
-    return att.error ? `${att.name}: ${att.error}` : `${att.name}: failed`
+    return att.error ? `${att.name}: ${att.error}` : t('chat.toast.uploadFailed', { name: att.name })
   }
   return att.name
 }
@@ -785,6 +966,7 @@ defineExpose<ChatComposerExpose>({
 .chat-project-chip[data-status="error"] {
   background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
+
 .chat-coding-mode-chip {
   flex: 0 0 auto;
   min-height: 30px;
@@ -911,6 +1093,136 @@ defineExpose<ChatComposerExpose>({
   flex-wrap: wrap;
   gap: 0.375rem;
   margin-bottom: 0.5rem;
+}
+
+.chat-prompt-annotations {
+  display: grid;
+  max-height: 8.75rem;
+  overflow-y: auto;
+  padding: 0.375rem 0.75rem 0;
+}
+
+.chat-prompt-annotations__header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.5rem;
+  margin-bottom: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
+.chat-prompt-annotation-chip {
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.375rem 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.chat-prompt-annotations__header + .chat-prompt-annotation-chip {
+  border-top: 1px solid var(--border);
+}
+
+.chat-prompt-annotation-chip__rail {
+  width: 3px;
+  align-self: stretch;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+
+.chat-prompt-annotation-chip__main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  min-width: 0;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-prompt-annotation-chip__main:hover,
+.chat-prompt-annotation-chip__main:focus-visible {
+  outline: 0;
+  color: var(--accent);
+}
+
+.chat-prompt-annotation-chip__target,
+.chat-prompt-annotation-chip__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-prompt-annotation-chip__target {
+  padding: 0.125rem 0.375rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-prompt-annotation-chip__text {
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+
+.chat-prompt-annotation-chip__editor {
+  display: grid;
+  grid-column: 2 / -1;
+  grid-template-columns: minmax(8rem, 1fr) auto auto;
+  gap: 0.25rem;
+}
+
+.chat-prompt-annotation-chip__editor input {
+  min-width: 0;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+}
+
+.chat-prompt-annotation-chip__editor button {
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.chat-prompt-annotation-chip > .attachment-action {
+  width: 2rem;
+  height: 2rem;
+  flex-basis: 2rem;
+  border-radius: var(--radius-control);
+}
+
+.chat-prompt-annotation-chip > .attachment-action:hover,
+.chat-prompt-annotation-chip > .attachment-action:focus-visible {
+  outline: 0;
+  background: var(--bg-hover);
+}
+
+@media (max-width: 600px) {
+  .chat-prompt-annotation-chip__main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chat-prompt-annotation-chip__target {
+    display: none;
+  }
+
 }
 
 .attachment-chip {
@@ -1557,6 +1869,13 @@ defineExpose<ChatComposerExpose>({
 .chat-send-btn.btn--primary.is-ready:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
+}
+
+/* A routing CAS is usually shorter than a visual transition. Keep the send
+   button stable while native disabled semantics prevent submission. */
+.chat-send-btn[aria-busy='true']:disabled {
+  cursor: progress;
+  opacity: 1;
 }
 
 @keyframes spin {

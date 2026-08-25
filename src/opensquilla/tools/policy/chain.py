@@ -20,6 +20,7 @@ from typing import cast
 from opensquilla.tools.policy.checks import (
     AllowListPolicy,
     DenyListPolicy,
+    ExclusiveToolCeilingPolicy,
     GuestSafePolicy,
     OwnerOnlyPolicy,
     PermissionMatrixPolicy,
@@ -33,6 +34,7 @@ POLICY_CHAIN: tuple[PolicyCheck, ...] = cast(tuple[PolicyCheck, ...], (
     GuestSafePolicy(),
     DenyListPolicy(),
     PrivateMemoryScopePolicy(),
+    ExclusiveToolCeilingPolicy(),
     AllowListPolicy(),
     ProfilePolicy(),
     PermissionMatrixPolicy(),

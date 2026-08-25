@@ -4,6 +4,8 @@
   "description": "Compact full git diff patch output while preserving file and hunk headers plus changed lines.",
   "match": {
     "toolNames": ["exec"],
+    "gitSubcommands": ["diff"],
+    "strictOutputRegex": "^diff --git\\s",
     "commandIncludesAny": ["git diff ", "&& git diff ", "; git diff ", "\ngit diff "]
   },
   "transforms": {

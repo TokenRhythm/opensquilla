@@ -4,6 +4,7 @@
   "description": "Compact xcodebuild output while preserving real diagnostics, failed commands, and final status.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["xcodebuild"],
     "commandIncludesAny": ["xcodebuild ", "&& xcodebuild ", "; xcodebuild ", "\nxcodebuild "]
   },
   "transforms": {

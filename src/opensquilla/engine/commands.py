@@ -386,6 +386,24 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=90,
     ),
     CommandDef(
+        name="/routing",
+        usage="/routing [direct|router|ensemble]",
+        description="Choose or inspect the current session's model routing.",
+        execution={
+            _T: _local("session.routing"),
+            _S: _local("session.routing"),
+        },
+        argument_choices=(
+            ArgumentChoice("direct", "Use the selected model directly from the next turn."),
+            ArgumentChoice("router", "Use Squilla Router from the next turn."),
+            ArgumentChoice("ensemble", "Use Model Ensemble from the next turn."),
+        ),
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.NEXT_TURN,
+        presentation=CommandPresentation.PICKER,
+        order=19,
+    ),
+    CommandDef(
         name="/strategy",
         usage="/strategy [direct|router|ensemble|status]",
         description="Choose or inspect the shared model strategy.",
@@ -567,6 +585,19 @@ _COMMANDS: tuple[CommandDef, ...] = (
         busy_policy=CommandBusyPolicy.IMMEDIATE,
         presentation=CommandPresentation.PANEL,
         order=180,
+    ),
+    CommandDef(
+        name="/goal",
+        usage="/goal [status|clear [--confirm]|pause|resume|<description>]",
+        description="Set a long-running goal for the agent to pursue.",
+        execution={
+            _T: _local("goal.set"),
+            _W: _local("goal.set"),
+        },
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=185,
     ),
     CommandDef(
         name="/permissions",

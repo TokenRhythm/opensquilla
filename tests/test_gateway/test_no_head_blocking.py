@@ -62,6 +62,14 @@ def _make_storage() -> Any:
     return storage
 
 
+def test_task_runtime_constructor_defaults_to_eight_slots() -> None:
+    async def turn_handler(_run: Any) -> None:
+        return None
+
+    runtime = TaskRuntime(storage=_make_storage(), turn_handler=turn_handler)
+    assert runtime._max_concurrency == 8
+
+
 # ---------------------------------------------------------------------------
 # no_head_blocking_with_idle_slots
 # ---------------------------------------------------------------------------
@@ -127,4 +135,55 @@ async def test_no_head_blocking_with_idle_slots() -> None:
     assert last_start <= start_deadline, (
         f"Last session started {last_start:.2f}s after enqueue — head-blocking "
         f"suspected (expected all 4 within {start_deadline}s): {started_at}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_staggered_fourth_session_fills_last_idle_slot() -> None:
+    """A/B/C already running must not leave D parked behind a running RR head."""
+
+    agent_id = "agent-staggered-slot"
+    release_handlers = asyncio.Event()
+    started = {
+        label: asyncio.Event()
+        for label in ("A", "B", "C", "D")
+    }
+
+    async def turn_handler(run: Any) -> None:
+        label = run.session_key.rsplit("-", 1)[-1]
+        started[label].set()
+        await release_handlers.wait()
+
+    runtime = TaskRuntime(
+        storage=_make_storage(),
+        turn_handler=turn_handler,
+        max_concurrency=4,
+        max_pending_per_session=None,
+    )
+    handles = []
+    try:
+        for label in ("A", "B", "C"):
+            env = _make_envelope(agent_id, f"{agent_id}::sess-{label}")
+            handles.append(await runtime.enqueue(env, f"start {label}"))
+            await asyncio.wait_for(started[label].wait(), timeout=1.0)
+
+        assert runtime._global_in_flight == 3
+
+        d_env = _make_envelope(agent_id, f"{agent_id}::sess-D")
+        handles.append(await runtime.enqueue(d_env, "start D later"))
+        try:
+            await asyncio.wait_for(started["D"].wait(), timeout=0.5)
+        except TimeoutError:
+            d_started_before_release = False
+        else:
+            d_started_before_release = True
+    finally:
+        release_handlers.set()
+        await asyncio.gather(
+            *(runtime.wait(handle.task_id, timeout=5.0) for handle in handles),
+            return_exceptions=True,
+        )
+
+    assert d_started_before_release, (
+        "D did not claim the fourth idle slot while A/B/C were already running"
     )

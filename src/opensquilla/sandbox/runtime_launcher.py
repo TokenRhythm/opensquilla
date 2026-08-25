@@ -22,6 +22,7 @@ from opensquilla.sandbox.runtime_manifest import (
 class ChildRole(StrEnum):
     """Fixed internal roles that a packaged Gateway may execute."""
 
+    PROCESS_TREE = "process-tree"
     FILESYSTEM_WORKER = "filesystem-worker"
     LINUX_HELPER = "linux-helper"
     WINDOWS_DEFAULT_RUNNER = "windows-default-runner"
@@ -33,6 +34,7 @@ class InternalChildDispatchError(ValueError):
 
 
 _ROLE_MODULES: dict[ChildRole, str] = {
+    ChildRole.PROCESS_TREE: "opensquilla.process_tree",
     ChildRole.FILESYSTEM_WORKER: "opensquilla.sandbox.filesystem_worker",
     ChildRole.LINUX_HELPER: "opensquilla.sandbox.backend.linux_helper",
     ChildRole.WINDOWS_DEFAULT_RUNNER: "opensquilla.sandbox.backend.windows_default_runner",
@@ -103,10 +105,30 @@ def apply_bundled_runtime_path(
 
     result = dict(environment or {})
     path_key = next((key for key in result if key.casefold() == "path"), "PATH")
+    # Runtime Packs are independent from the application bundle and from Gateway
+    # boot.  A finalized application-owned catalog takes precedence over the old
+    # v0.5.3 bundled layout even when no optional component is installed.
+    try:
+        from opensquilla.runtime_packs import apply_runtime_environment, status_snapshot
+
+        if status_snapshot().management_supported:
+            return apply_runtime_environment(
+                result,
+                mode=mode,
+                policy=policy,
+                require_managed=require_bundled,
+            )
+    except (OSError, RuntimeError, ValueError):
+        # Runtime Pack state is deliberately fail-open for application startup.
+        # Strict guest execution is handled below by clearing PATH.
+        pass
     resolver = bundled_runtime_resolver()
     if resolver is None:
+        if require_bundled:
+            result[path_key] = ""
         return result
-    resolved = resolver.path_for(mode, split_path(result.get(path_key)), policy=policy)
+    host_path = () if require_bundled else split_path(result.get(path_key))
+    resolved = resolver.path_for(mode, host_path, policy=policy)
     result[path_key] = os.pathsep.join(str(path) for path in resolved)
     return result
 
@@ -145,6 +167,12 @@ def internal_child_argv(
     )
 
 
+def _run_process_tree(args: Sequence[str]) -> int:
+    from opensquilla.process_tree import main
+
+    return int(main(args))
+
+
 def _run_filesystem_worker(args: Sequence[str]) -> int:
     from opensquilla.sandbox.filesystem_worker import main
 
@@ -172,6 +200,7 @@ def _run_directory_picker(args: Sequence[str]) -> int:
 
 
 _ROLE_HANDLERS: dict[ChildRole, Callable[[Sequence[str]], int]] = {
+    ChildRole.PROCESS_TREE: _run_process_tree,
     ChildRole.FILESYSTEM_WORKER: _run_filesystem_worker,
     ChildRole.LINUX_HELPER: _run_linux_helper,
     ChildRole.WINDOWS_DEFAULT_RUNNER: _run_windows_default_runner,

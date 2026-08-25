@@ -14,6 +14,7 @@ import {
   DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL,
   canonicalDesktopGatewayIdentityPayload,
   canonicalDesktopGatewayShutdownPayload,
+  desktopGatewayAuthToken,
   desktopGatewayIdentityProof,
   desktopGatewayOwnershipMatchesLaunch,
   desktopGatewayOwnershipRecordPath,
@@ -27,6 +28,7 @@ import {
   requestVerifiedDesktopGatewayShutdown,
   sameDesktopGatewayOwnershipInstance,
   verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayLaunchOwnership,
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import {
@@ -70,6 +72,11 @@ assert.equal(
   'the Electron proof must remain byte-identical to Python\'s golden vector',
 )
 assert.equal(
+  desktopGatewayAuthToken(nonce),
+  'fe0aa74bf86e4f81f2e752de1f4fd6c40441fa83e53289825d3051c414f15e2c',
+  'the renderer credential must remain byte-identical to Python\'s derivation',
+)
+assert.equal(
   canonicalDesktopGatewayShutdownPayload(record, challenge),
   '{"action":"shutdown","challenge":"0123456789abcdef0123456789abcdef",'
     + '"pid":4242,"port":18791,"profile_fingerprint":"0123456789abcdef0123456789abcdef'
@@ -100,6 +107,52 @@ assert.equal(
   false,
   'the per-launch nonce remains mandatory',
 )
+
+{
+  const authority = {
+    instanceNonce: nonce,
+    profileFingerprint: record.profile_fingerprint,
+    port: record.port,
+  }
+  let challengeCalls = 0
+  assert.equal(
+    await verifyDesktopGatewayLaunchOwnership('/profile/current', authority, {
+      load: () => ({ status: 'valid', record }),
+      verify: async () => {
+        challengeCalls += 1
+        return true
+      },
+    }),
+    true,
+    'a matching launch record plus identity challenge proves the listener',
+  )
+  assert.equal(challengeCalls, 1)
+
+  assert.equal(
+    await verifyDesktopGatewayLaunchOwnership('/profile/current', authority, {
+      load: () => ({
+        status: 'valid',
+        record: { ...record, instance_nonce: 'x'.repeat(43) },
+      }),
+      verify: async () => {
+        challengeCalls += 1
+        return true
+      },
+    }),
+    false,
+    'a healthy foreign listener cannot inherit authority from a live launcher child',
+  )
+  assert.equal(challengeCalls, 1, 'a foreign record is rejected before any challenge')
+
+  assert.equal(
+    await verifyDesktopGatewayLaunchOwnership('/profile/current', authority, {
+      load: () => ({ status: 'valid', record }),
+      verify: async () => false,
+    }),
+    false,
+    'a matching record without a successful identity challenge fails closed',
+  )
+}
 
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-desktop-gateway-owner-'))
 try {

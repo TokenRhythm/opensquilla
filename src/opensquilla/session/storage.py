@@ -28,11 +28,40 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.cost_rollup import rollup_cost_source
+from opensquilla.session.goals import (
+    GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
+    GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
+    GOAL_UNFINISHED_STATUSES,
+    ClaimCurrentGoalMutation,
+    ClaimGoalMutation,
+    ExpectedGoal,
+    GoalClaimCandidate,
+    GoalCommandRequest,
+    GoalCommandResult,
+    GoalConflictError,
+    GoalGuardrailPause,
+    GoalObjectiveUpdate,
+    GoalStatus,
+    GoalTaskAcceptance,
+    GoalTurnContext,
+    GoalValidationError,
+    StartGoalMutation,
+    automatic_goal_task_id,
+    effective_goal_turn_context,
+    goal_snapshot,
+    goal_turn_context,
+    normalize_goal_objective,
+    normalize_goal_progress,
+    normalize_goal_reason,
+)
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
     CollaborationMode,
+    GoalCommandReceiptRecord,
+    GoalRecord,
     MemoryDurableReceipt,
     MetaControlIntent,
     MetaLaunchDraft,
@@ -73,15 +102,21 @@ from opensquilla.session.usage_ledger import (
     UsageLedgerConflictError,
     UsageLedgerState,
     UsageLegacyBaseline,
+    nanos_to_usd,
     usd_to_nanos,
     validate_usage_billing_receipt,
     validate_usage_completion,
     validate_usage_event_start,
     validate_usage_item,
 )
+from opensquilla.turn_outcome_projection import (
+    attach_fork_terminal_outcome_projection,
+    turn_id_from_context,
+)
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
+    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -127,6 +162,30 @@ class StorageConnectionPoisonedError(RuntimeError):
 
 class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
+
+
+class SessionRoutingConflictError(ValueError):
+    """Raised when a session routing compare-and-set fence is stale."""
+
+
+class PendingChatInputConflictError(ValueError):
+    """Raised when a staged-input identity or compare-and-set fence conflicts."""
+
+
+class PendingChatInputCapacityError(RuntimeError):
+    """Raised when a session already owns the maximum staged inputs."""
+
+
+class PendingChatInputNotFoundError(KeyError):
+    """Raised when a staged input disappeared before it could be dispatched."""
+
+
+class PendingChatInputCancelledError(RuntimeError):
+    """Raised when a durable cancellation tombstone rejects a delayed enqueue."""
+
+
+class PendingChatInputAlreadyDispatchedError(RuntimeError):
+    """Raised when a delayed enqueue targets an already accepted staged input."""
 
 
 class MetaControlIntentConflictError(ValueError):
@@ -187,6 +246,10 @@ class TurnAcceptanceResult:
     collaboration_mode: str | None = None
     collaboration_revision: int | None = None
     active_plan_revision_id: str | None = None
+    goal: GoalRecord | None = None
+    goal_context: GoalTurnContext | None = None
+    goal_candidate: GoalClaimCandidate | None = None
+    goal_command_response: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +259,38 @@ class StrandedSteerInput:
     entry: TranscriptEntry
     receipt: TurnIngressReceipt
     target_task: AgentTaskRecord
+
+
+@dataclass(frozen=True, slots=True)
+class PendingChatInput:
+    """One server-staged follow-up awaiting exactly-once dispatch."""
+
+    pending_input_id: str
+    session_key: str
+    source_scope: str
+    client_request_id: str
+    client_message_id: str
+    request_fingerprint: str
+    payload: dict[str, Any]
+    position: int
+    state_revision: int
+    created_at: int
+    updated_at: int
+    schema_version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class PendingChatInputDispatchReceipt:
+    """Durable binding between one staged identity and its accepted turn receipt."""
+
+    pending_input_id: str
+    session_key: str
+    source_scope: str
+    client_request_id: str
+    client_message_id: str
+    request_fingerprint: str
+    accepted_at: int
+    schema_version: int = 1
 
 
 async def _verify_project_workspace_guard(
@@ -413,8 +508,24 @@ def _serialized_read[**P, R](
 # collaboration-mode state. Version 15 added immutable plan revisions. Version
 # 16 added mutable, compare-and-set plan runs. Version 17 added durable hidden
 # MetaSkill control intents. Version 18 added the bounded MetaSkill launch outbox
-# and discard tombstones.
-SCHEMA_VERSION = 18
+# and discard tombstones. Version 19 added the generation-fenced current Goal
+# and Goal command idempotency ledger. Version 20 added the durable Goal origin
+# message anchor used by reconnect-safe transcript presentation. Version 21
+# added the bounded durable pending-chat-input outbox.
+# Version 22 added durable ArtifactSession documents, immutable revisions,
+# change sets, editor sessions, anchors, and audit events. Version 23 added
+# prompt-annotation drafts atomically consumed by chat turns. Version 24 added
+# durable idempotency receipts for artifact mutation attempts. Version 25 added
+# the persistent per-session model-routing mode and its compare-and-set revision.
+SCHEMA_VERSION = 25
+MAX_PENDING_CHAT_INPUTS = 5
+
+# These fields have their own atomic resolver/CAS API.  Whole-session writes
+# may seed them when inserting a new row, but must never replace the value of
+# an existing row from a stale ``SessionNode`` snapshot.
+_SESSION_DEDICATED_WRITER_COLUMNS = frozenset(
+    {"model_routing_mode", "model_routing_revision"}
+)
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -444,6 +555,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     auth_profile_override TEXT,
     auth_profile_override_source TEXT,
     context_tokens INTEGER,
+    model_routing_mode TEXT,
+    model_routing_revision INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -621,6 +734,84 @@ _CREATE_IDX_PLAN_RUNS_DRIVER = """
 CREATE INDEX IF NOT EXISTS idx_plan_runs_driver
 ON plan_runs(driver_id)
 WHERE driver_id IS NOT NULL
+"""
+
+_CREATE_SESSION_GOALS = """
+CREATE TABLE IF NOT EXISTS session_goals (
+    session_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    session_epoch INTEGER NOT NULL DEFAULT 0 CHECK (session_epoch >= 0),
+    goal_id TEXT NOT NULL UNIQUE,
+    objective TEXT NOT NULL CHECK (length(objective) BETWEEN 1 AND 4000),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'paused', 'blocked', 'usage_limited', 'complete')),
+    state_revision INTEGER NOT NULL DEFAULT 1 CHECK (state_revision >= 1),
+    objective_revision INTEGER NOT NULL DEFAULT 1 CHECK (objective_revision >= 1),
+    progress_revision INTEGER NOT NULL DEFAULT 0 CHECK (progress_revision >= 0),
+    progress_json TEXT,
+    continuation_seq INTEGER NOT NULL DEFAULT 0 CHECK (continuation_seq >= 0),
+    active_task_id TEXT,
+    source_user_message_id TEXT,
+    terminal_task_id TEXT,
+    turns_started INTEGER NOT NULL DEFAULT 0 CHECK (turns_started >= 0),
+    turns_settled INTEGER NOT NULL DEFAULT 0 CHECK (turns_settled >= 0),
+    window_turns_started INTEGER NOT NULL DEFAULT 0 CHECK (window_turns_started >= 0),
+    active_time_ms INTEGER NOT NULL DEFAULT 0 CHECK (active_time_ms >= 0),
+    window_active_time_ms INTEGER NOT NULL DEFAULT 0 CHECK (window_active_time_ms >= 0),
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    pause_reason TEXT,
+    blocked_reason TEXT,
+    terminal_reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    finished_at_ms INTEGER,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+    FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+)
+"""
+
+_CREATE_IDX_SESSION_GOALS_ACTIVE_TASK = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_goals_active_task
+ON session_goals(active_task_id)
+WHERE active_task_id IS NOT NULL
+"""
+
+_CREATE_IDX_SESSION_GOALS_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_session_goals_status
+ON session_goals(status, updated_at_ms)
+"""
+
+_CREATE_GOAL_COMMAND_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS goal_command_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    source_scope TEXT NOT NULL,
+    request_session_key TEXT NOT NULL,
+    client_request_id TEXT NOT NULL,
+    action TEXT NOT NULL
+        CHECK (action IN ('set', 'edit', 'pause', 'resume', 'clear')),
+    request_fingerprint TEXT NOT NULL,
+    accepted_session_id TEXT NOT NULL,
+    accepted_session_epoch INTEGER NOT NULL DEFAULT 0
+        CHECK (accepted_session_epoch >= 0),
+    response_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (request_session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+)
+"""
+
+_CREATE_IDX_GOAL_COMMAND_RECEIPTS_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_command_receipts_request
+ON goal_command_receipts(source_scope, request_session_key, client_request_id)
+"""
+
+_CREATE_IDX_GOAL_COMMAND_RECEIPTS_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_goal_command_receipts_session
+ON goal_command_receipts(request_session_key, created_at_ms)
 """
 
 _CREATE_TRANSCRIPT = """
@@ -848,6 +1039,80 @@ ON turn_ingress_receipts(source_scope, request_session_key, client_request_id)
 _CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION = """
 CREATE INDEX IF NOT EXISTS idx_turn_ingress_receipts_accepted_session
 ON turn_ingress_receipts(accepted_session_key, accepted_at)
+"""
+
+_CREATE_PENDING_CHAT_INPUTS = """
+CREATE TABLE IF NOT EXISTS pending_chat_inputs (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    source_scope           TEXT NOT NULL,
+    client_request_id      TEXT NOT NULL,
+    client_message_id      TEXT NOT NULL,
+    request_fingerprint    TEXT NOT NULL,
+    payload_json           TEXT NOT NULL,
+    position               INTEGER NOT NULL DEFAULT 0,
+    state_revision         INTEGER NOT NULL DEFAULT 1 CHECK (state_revision >= 1),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_inputs_request
+ON pending_chat_inputs(session_key, client_request_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_inputs_message
+ON pending_chat_inputs(session_key, client_message_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_SESSION_ORDER = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_inputs_session_order
+ON pending_chat_inputs(session_key, position, created_at, pending_input_id)
+"""
+
+_CREATE_PENDING_CHAT_INPUT_CANCELLATIONS = """
+CREATE TABLE IF NOT EXISTS pending_chat_input_cancellations (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    cancelled_at           INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_CANCELLATIONS_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_input_cancellations_session
+ON pending_chat_input_cancellations(session_key, cancelled_at, pending_input_id)
+"""
+
+_CREATE_PENDING_CHAT_INPUT_DISPATCH_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS pending_chat_input_dispatch_receipts (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    source_scope           TEXT NOT NULL,
+    client_request_id      TEXT NOT NULL,
+    client_message_id      TEXT NOT NULL,
+    request_fingerprint    TEXT NOT NULL,
+    accepted_at            INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_input_dispatch_request
+ON pending_chat_input_dispatch_receipts(source_scope, session_key, client_request_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_input_dispatch_message
+ON pending_chat_input_dispatch_receipts(session_key, client_message_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_input_dispatch_session
+ON pending_chat_input_dispatch_receipts(session_key, accepted_at, pending_input_id)
 """
 
 _CREATE_META_CONTROL_INTENTS = """
@@ -1268,6 +1533,9 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "payload",
         "steps",
         "step_states",
+        "progress",
+        "progress_json",
+        "response_json",
     }
     bool_fields = {
         "total_tokens_fresh",
@@ -1289,6 +1557,10 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         else:
             result[k] = v
     return result
+
+
+def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
+    return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
 
 
 def _py_lower(value: Any) -> Any:
@@ -1423,6 +1695,24 @@ def _json_object_or_none(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionListCursor:
+    """Stable descending sort position for a session-list page."""
+
+    activity_at: int
+    updated_at: int
+    session_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionListPage:
+    """One keyset-paginated page of sessions."""
+
+    sessions: list[SessionNode]
+    next_cursor: SessionListCursor | None
+    has_more: bool
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -1434,8 +1724,12 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._connection_generation = 0
+        self._transcript_reader: Any | None = None
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
+        self._transcript_reader_lock = asyncio.Lock()
+        self._transcript_reader_fallback_warned = False
         self._usage_backfill_index_lock = asyncio.Lock()
         self._usage_backfill_indexes_ready = False
         self._legacy_project_adoption_lock = asyncio.Lock()
@@ -1488,8 +1782,20 @@ class SessionStorage:
 
         self._legacy_project_adoption_generation += 1
 
-    async def connect(self) -> None:
+    async def connect(
+        self,
+        *,
+        goal_pause_reason: str = "process_restart",
+    ) -> None:
+        if (
+            self._conn is not None
+            or self._transcript_reader is not None
+            or self._meta_launch_draft_gc_task is not None
+        ):
+            await self.close()
+        self._poisoned = False
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
+        self._connection_generation += 1
         self._conn.row_factory = aiosqlite.Row
         # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
         # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
@@ -1507,10 +1813,17 @@ class SessionStorage:
             await self._conn.create_function(  # type: ignore[attr-defined]
                 name, arity, function, deterministic=True
             )
-        await self._conn.execute("PRAGMA journal_mode=WAL")
+        async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
+            journal_mode_row = await cur.fetchone()
+        journal_mode = (
+            str(journal_mode_row[0]).strip().lower()
+            if journal_mode_row is not None
+            else ""
+        )
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
-        await self._initialize_schema()
+        await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+        await self._open_transcript_reader(journal_mode)
         self._meta_launch_draft_gc_task = asyncio.create_task(
             self._run_meta_launch_draft_gc(),
             name="session-storage-meta-launch-draft-gc",
@@ -1529,9 +1842,96 @@ class SessionStorage:
             with contextlib.suppress(asyncio.CancelledError):
                 await gc_task
         async with self._operation_lock:
-            if self._conn:
-                await self._conn.close()
-                self._conn = None
+            async with self._transcript_reader_lock:
+                reader, self._transcript_reader = self._transcript_reader, None
+                conn, self._conn = self._conn, None
+                try:
+                    if reader is not None:
+                        await reader.close()
+                finally:
+                    if conn is not None:
+                        await conn.close()
+
+    def _warn_transcript_reader_fallback_once(
+        self,
+        reason: str,
+        journal_mode: str,
+    ) -> None:
+        if self._transcript_reader_fallback_warned:
+            return
+        self._transcript_reader_fallback_warned = True
+        safe_reason = (
+            reason
+            if reason in {"journal_mode_not_wal", "memory_database", "open_failed"}
+            else "unknown"
+        )
+        safe_journal_mode = (
+            journal_mode
+            if journal_mode in {"delete", "memory", "off", "persist", "truncate", "wal"}
+            else "unknown"
+        )
+        log.warning(
+            "session_storage.transcript_reader_fallback reason=%s journal_mode=%s",
+            safe_reason,
+            safe_journal_mode,
+            extra={
+                "event": "session_storage.transcript_reader_fallback",
+                "reason": safe_reason,
+                "journal_mode": safe_journal_mode,
+            },
+        )
+
+    async def _open_transcript_reader(self, journal_mode: str) -> None:
+        if self._db_path == ":memory:":
+            self._warn_transcript_reader_fallback_once("memory_database", journal_mode)
+            return
+        if journal_mode != "wal":
+            self._warn_transcript_reader_fallback_once(
+                "journal_mode_not_wal",
+                journal_mode,
+            )
+            return
+
+        reader: Any | None = None
+        try:
+            reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+            reader.row_factory = aiosqlite.Row
+            async with reader.execute("PRAGMA query_only=ON"):
+                pass
+            async with reader.execute(
+                f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}"
+            ):
+                pass
+            async with reader.execute("PRAGMA journal_mode") as cur:
+                reader_journal_mode_row = await cur.fetchone()
+            reader_journal_mode = (
+                str(reader_journal_mode_row[0]).strip().lower()
+                if reader_journal_mode_row is not None
+                else ""
+            )
+            if reader_journal_mode != "wal":
+                await reader.close()
+                self._warn_transcript_reader_fallback_once(
+                    "journal_mode_not_wal",
+                    reader_journal_mode,
+                )
+                return
+            async with reader.execute("PRAGMA query_only") as cur:
+                query_only_row = await cur.fetchone()
+            if query_only_row is None or int(query_only_row[0]) != 1:
+                raise RuntimeError("transcript reader query-only mode unavailable")
+        except asyncio.CancelledError:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            raise
+        except Exception:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            self._warn_transcript_reader_fallback_once("open_failed", journal_mode)
+            return
+        self._transcript_reader = reader
 
     async def _run_meta_launch_draft_gc(self) -> None:
         """Physically enforce raw-draft retention while the Gateway stays up."""
@@ -1558,10 +1958,15 @@ class SessionStorage:
 
     async def _retire_poisoned_connection(self) -> None:
         self._poisoned = True
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            with contextlib.suppress(BaseException):
-                await conn.close()
+        async with self._transcript_reader_lock:
+            reader, self._transcript_reader = self._transcript_reader, None
+            conn, self._conn = self._conn, None
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            if conn is not None:
+                with contextlib.suppress(BaseException):
+                    await conn.close()
 
     async def _finish_sqlite_call(self, awaitable: Awaitable[Any]) -> Any:
         """Do not release the operation gate while a cancelled DB call is still queued."""
@@ -1724,7 +2129,40 @@ class SessionStorage:
             if acquired:
                 self._operation_lock.release()
 
-    async def _initialize_schema(self) -> None:
+    @property
+    def connection_generation(self) -> int:
+        """Monotonic identity for consumers that cache per-connection setup."""
+
+        if self._conn is None:
+            raise RuntimeError("Storage not connected. Call connect() first.")
+        return self._connection_generation
+
+    @asynccontextmanager
+    async def read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Run a bounded read snapshot on the canonical connection.
+
+        The operation gate prevents interleaving transactions on the shared
+        aiosqlite connection.  A deferred ``BEGIN`` intentionally avoids
+        reserving SQLite's writer slot, so independent WAL writers remain
+        available while the short snapshot runs.
+        """
+
+        qualified_operation = f"read.{operation}"
+        async with self._operation_lock:
+            self._raise_if_poisoned()
+            conn = self.conn
+            try:
+                await self._finish_sqlite_call(conn.execute("BEGIN"))
+                yield conn
+            finally:
+                if bool(getattr(conn, "in_transaction", False)):
+                    await self._rollback_transaction(conn, qualified_operation)
+
+    async def _initialize_schema(
+        self,
+        *,
+        goal_pause_reason: str = "process_restart",
+    ) -> None:
         assert self._conn is not None
         await self._conn.execute(_CREATE_SESSIONS)
         await self._conn.execute(_CREATE_PROJECT_WORKSPACES)
@@ -1740,6 +2178,12 @@ class SessionStorage:
         await self._conn.execute(_CREATE_IDX_PLAN_RUNS_SESSION_HISTORY)
         await self._conn.execute(_CREATE_IDX_PLAN_RUNS_REVISION)
         await self._conn.execute(_CREATE_IDX_PLAN_RUNS_DRIVER)
+        await self._conn.execute(_CREATE_SESSION_GOALS)
+        await self._conn.execute(_CREATE_IDX_SESSION_GOALS_ACTIVE_TASK)
+        await self._conn.execute(_CREATE_IDX_SESSION_GOALS_STATUS)
+        await self._conn.execute(_CREATE_GOAL_COMMAND_RECEIPTS)
+        await self._conn.execute(_CREATE_IDX_GOAL_COMMAND_RECEIPTS_REQUEST)
+        await self._conn.execute(_CREATE_IDX_GOAL_COMMAND_RECEIPTS_SESSION)
         await self._conn.execute(_CREATE_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
@@ -1760,6 +2204,18 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUTS)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_SESSION_ORDER)
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUT_CANCELLATIONS)
+        await self._conn.execute(
+            _CREATE_IDX_PENDING_CHAT_INPUT_CANCELLATIONS_SESSION
+        )
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUT_DISPATCH_RECEIPTS)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION)
         await self._conn.execute(_CREATE_META_CONTROL_INTENTS)
         await self._conn.execute(_CREATE_IDX_META_CONTROL_CORRELATION)
         await self._conn.execute(_CREATE_IDX_META_CONTROL_SESSION_STATUS)
@@ -1805,6 +2261,7 @@ class SessionStorage:
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
         await self._migrate_collaboration_columns()
+        await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
@@ -1838,7 +2295,9 @@ class SessionStorage:
             "started_at",
         }
         if required_recovery_columns <= session_columns:
-            await self.mark_abandoned_agent_tasks()
+            await self.mark_abandoned_agent_tasks(
+                goal_pause_reason=goal_pause_reason,
+            )
 
     async def prepare_usage_backfill_indexes(self) -> None:
         """Build optional historical-scan indexes after Gateway readiness.
@@ -2033,6 +2492,27 @@ class SessionStorage:
             """
         )
         await self._conn.commit()
+
+    async def _migrate_model_routing_columns(self) -> None:
+        """Idempotently add durable per-session model-routing state."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        additions = {
+            "model_routing_mode": "ALTER TABLE sessions ADD COLUMN model_routing_mode TEXT",
+            "model_routing_revision": (
+                "ALTER TABLE sessions ADD COLUMN "
+                "model_routing_revision INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        changed = False
+        for column, sql in additions.items():
+            if column not in columns:
+                await self._conn.execute(sql)
+                changed = True
+        if changed:
+            await self._conn.commit()
 
     async def _migrate_derived_title_column(self) -> None:
         """Idempotently add the derived_title column to an existing sessions table.
@@ -2712,6 +3192,13 @@ class SessionStorage:
         async with self._write_transaction("initialize_usage_ledger") as conn:
             existing = await self._get_usage_state_on_conn(conn)
             if existing is not None:
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn,
+                    captured_at_ms=max(
+                        captured_at_ms,
+                        existing.ledger_started_at_ms + 1,
+                    ),
+                )
                 return existing
 
             await conn.execute(
@@ -2848,6 +3335,265 @@ class SessionStorage:
             assert state is not None
             return state
 
+    @staticmethod
+    async def _repair_post_cutover_usage_baselines_on_conn(
+        conn: Any,
+        *,
+        captured_at_ms: int,
+        session_key: str | None = None,
+    ) -> None:
+        """Repair only generations whose ledger-only ancestry is provable.
+
+        Cutover state and every then-current generation baseline are committed
+        by one transaction. Consequently, a current ``(session_id, epoch)``
+        missing from an existing cutover was created later and has no legacy
+        usage, even when reset preserved an older session ``created_at`` value.
+        Its first baseline is zero; for a later epoch, the baseline is the
+        latest earlier baseline plus intervening live-provider ledger events.
+
+        Mutable compatibility totals are intentionally ignored: normal Done
+        turns may already be present there while cancelled turns may not be, so
+        snapshotting or subtracting them is not authoritative.
+        """
+
+        await conn.execute(
+            """
+            WITH ranked_candidates AS (
+                SELECT
+                    s.session_key,
+                    s.session_id,
+                    usage_nonnegative_int(s.epoch) AS session_epoch,
+                    COALESCE(NULLIF(s.agent_id, ''), 'main') AS agent_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.session_id, usage_nonnegative_int(s.epoch)
+                        ORDER BY s.session_key
+                    ) AS candidate_rank
+                FROM sessions AS s
+                JOIN usage_ledger_state AS state ON state.singleton_id = 1
+                WHERE (? IS NULL OR s.session_key = ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM usage_legacy_baselines AS current_baseline
+                      WHERE current_baseline.session_id = s.session_id
+                        AND current_baseline.session_epoch =
+                            usage_nonnegative_int(s.epoch)
+                  )
+            ), candidates AS (
+                SELECT session_id, session_epoch, agent_id
+                FROM ranked_candidates
+                WHERE candidate_rank = 1
+            ), anchor_epochs AS (
+                SELECT
+                    candidate.*,
+                    MAX(baseline.session_epoch) AS anchor_epoch
+                FROM candidates AS candidate
+                LEFT JOIN usage_legacy_baselines AS baseline
+                  ON baseline.session_id = candidate.session_id
+                 AND baseline.session_epoch < candidate.session_epoch
+                GROUP BY
+                    candidate.session_id,
+                    candidate.session_epoch,
+                    candidate.agent_id
+            ), anchored AS (
+                SELECT
+                    anchor.session_id,
+                    anchor.session_epoch,
+                    anchor.agent_id,
+                    COALESCE(anchor.anchor_epoch, 0) AS ledger_from_epoch,
+                    COALESCE(baseline.input_tokens, 0) AS base_input_tokens,
+                    COALESCE(baseline.output_tokens, 0) AS base_output_tokens,
+                    COALESCE(baseline.cache_read_tokens, 0) AS base_cache_read_tokens,
+                    COALESCE(baseline.cache_write_tokens, 0) AS base_cache_write_tokens,
+                    COALESCE(baseline.cost_nanos, 0) AS base_cost_nanos,
+                    COALESCE(baseline.billed_cost_nanos, 0) AS base_billed_cost_nanos,
+                    COALESCE(baseline.estimated_cost_nanos, 0)
+                        AS base_estimated_cost_nanos,
+                    COALESCE(baseline.cost_source, 'none') AS base_cost_source,
+                    COALESCE(baseline.missing_cost_entries, 0)
+                        AS base_missing_cost_entries
+                FROM anchor_epochs AS anchor
+                LEFT JOIN usage_legacy_baselines AS baseline
+                  ON baseline.session_id = anchor.session_id
+                 AND baseline.session_epoch = anchor.anchor_epoch
+            ), rolled AS (
+                SELECT
+                    anchored.*,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.input_tokens ELSE 0 END), 0) AS live_input_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.output_tokens ELSE 0 END), 0) AS live_output_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cache_read_tokens ELSE 0 END), 0)
+                        AS live_cache_read_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cache_write_tokens ELSE 0 END), 0)
+                        AS live_cache_write_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cost_nanos ELSE 0 END), 0) AS live_cost_nanos,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.billed_cost_nanos ELSE 0 END), 0)
+                        AS live_billed_cost_nanos,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.estimated_cost_nanos ELSE 0 END), 0)
+                        AS live_estimated_cost_nanos,
+                    COALESCE(SUM(CASE
+                        WHEN event.event_id IS NULL THEN 0
+                        WHEN event.status = 'finalized' THEN event.missing_cost_entries
+                        ELSE MAX(1, event.missing_cost_entries)
+                    END), 0) AS live_missing_cost_entries,
+                    COALESCE(SUM(CASE
+                        WHEN event.status = 'finalized'
+                         AND event.cost_source IN ('provider_billed', 'mixed')
+                        THEN 1 ELSE 0 END), 0) AS live_provider_billed_entries,
+                    COALESCE(SUM(CASE
+                        WHEN event.status = 'finalized'
+                         AND event.estimated_cost_nanos > 0
+                        THEN 1 ELSE 0 END), 0) AS live_estimated_cost_entries
+                FROM anchored
+                LEFT JOIN usage_events AS event
+                  ON event.session_id = anchored.session_id
+                 AND event.session_epoch >= anchored.ledger_from_epoch
+                 AND event.session_epoch < anchored.session_epoch
+                 AND event.origin = 'live_provider'
+                GROUP BY
+                    anchored.session_id,
+                    anchored.session_epoch,
+                    anchored.agent_id,
+                    anchored.ledger_from_epoch,
+                    anchored.base_input_tokens,
+                    anchored.base_output_tokens,
+                    anchored.base_cache_read_tokens,
+                    anchored.base_cache_write_tokens,
+                    anchored.base_cost_nanos,
+                    anchored.base_billed_cost_nanos,
+                    anchored.base_estimated_cost_nanos,
+                    anchored.base_cost_source,
+                    anchored.base_missing_cost_entries
+            ), classified AS (
+                SELECT
+                    rolled.*,
+                    (
+                        rolled.base_cost_source IN ('provider_billed', 'mixed')
+                        OR rolled.base_billed_cost_nanos + rolled.live_billed_cost_nanos > 0
+                        OR rolled.live_provider_billed_entries > 0
+                    ) AS has_billed,
+                    (
+                        rolled.base_estimated_cost_nanos
+                            + rolled.live_estimated_cost_nanos > 0
+                        OR rolled.live_estimated_cost_entries > 0
+                    ) AS has_estimate,
+                    (
+                        rolled.base_missing_cost_entries
+                            + rolled.live_missing_cost_entries > 0
+                    ) AS has_unavailable
+                FROM rolled
+            )
+            INSERT OR IGNORE INTO usage_legacy_baselines (
+                session_id, session_epoch, agent_id, captured_at_ms,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, cost_nanos, billed_cost_nanos,
+                estimated_cost_nanos, cost_source, missing_cost_entries
+            )
+            SELECT
+                session_id,
+                session_epoch,
+                agent_id,
+                MAX(
+                    ?,
+                    (SELECT ledger_started_at_ms + 1
+                     FROM usage_ledger_state WHERE singleton_id = 1)
+                ),
+                base_input_tokens + live_input_tokens,
+                base_output_tokens + live_output_tokens,
+                base_input_tokens + live_input_tokens
+                    + base_output_tokens + live_output_tokens,
+                base_cache_read_tokens + live_cache_read_tokens,
+                base_cache_write_tokens + live_cache_write_tokens,
+                base_cost_nanos + live_cost_nanos,
+                base_billed_cost_nanos + live_billed_cost_nanos,
+                base_estimated_cost_nanos + live_estimated_cost_nanos,
+                CASE
+                    WHEN has_billed + has_estimate + has_unavailable > 1 THEN 'mixed'
+                    WHEN has_billed THEN 'provider_billed'
+                    WHEN has_estimate THEN 'opensquilla_estimate'
+                    WHEN has_unavailable THEN 'unavailable'
+                    ELSE 'none'
+                END,
+                base_missing_cost_entries + live_missing_cost_entries
+            FROM classified
+            """,
+            (session_key, session_key, captured_at_ms),
+        )
+
+    @staticmethod
+    async def _ensure_usage_baseline_for_session_on_conn(
+        conn: Any,
+        *,
+        session_key: str,
+    ) -> None:
+        """Snapshot a new durable session generation after ledger cutover.
+
+        This helper is only called in the transaction that creates a generation,
+        before its compatibility totals can contain that generation's live
+        ledger events. Persisted missing generations are repaired separately
+        only when their post-cutover ancestry is provable.
+        """
+
+        captured_at_ms = _now_ms()
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO usage_legacy_baselines (
+                session_id, session_epoch, agent_id, captured_at_ms,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, cost_nanos, billed_cost_nanos,
+                estimated_cost_nanos, cost_source, missing_cost_entries
+            )
+            SELECT
+                session_id,
+                usage_nonnegative_int(epoch),
+                COALESCE(NULLIF(agent_id, ''), 'main'),
+                MAX(
+                    ?,
+                    (SELECT ledger_started_at_ms + 1
+                     FROM usage_ledger_state WHERE singleton_id = 1)
+                ),
+                usage_nonnegative_int(input_tokens),
+                usage_nonnegative_int(output_tokens),
+                usage_nonnegative_int(input_tokens) + usage_nonnegative_int(output_tokens),
+                usage_nonnegative_int(cache_read),
+                usage_nonnegative_int(cache_write),
+                usage_cost_total(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                usage_cost_billed(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                usage_cost_estimated(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                COALESCE(NULLIF(cost_source, ''), 'none'),
+                usage_nonnegative_int(missing_cost_entries)
+                    + usage_invalid_int(epoch)
+                    + usage_invalid_int(input_tokens)
+                    + usage_invalid_int(output_tokens)
+                    + usage_invalid_int(total_tokens)
+                    + usage_invalid_int(cache_read)
+                    + usage_invalid_int(cache_write)
+                    + usage_invalid_int(missing_cost_entries)
+                    + CASE WHEN usage_nonnegative_int(total_tokens)
+                        != usage_nonnegative_int(input_tokens)
+                           + usage_nonnegative_int(output_tokens)
+                      THEN 1 ELSE 0 END
+                    + usage_cost_anomaly(
+                        total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                      )
+            FROM sessions
+            WHERE session_key = ?
+              AND EXISTS (SELECT 1 FROM usage_ledger_state WHERE singleton_id = 1)
+            """,
+            (captured_at_ms, session_key),
+        )
+
     @_serialized_read
     async def get_usage_ledger_state(self) -> UsageLedgerState | None:
         async with self.conn.execute(
@@ -2938,6 +3684,488 @@ class SessionStorage:
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_usage_event_from_row(row) for row in rows]
+
+    @_serialized_read
+    async def get_turn_usage_projection(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        turn_id: str,
+    ) -> dict[str, Any] | None:
+        """Project one turn's durable provider-call ledger into chat metadata.
+
+        Finalized calls contribute measured usage. Started/unknown calls never
+        fabricate token counts, but they do make the projection explicitly
+        incomplete so cancellation cannot look fully accounted.
+        """
+
+        async with self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS event_count,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                    AS input_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                    AS output_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN reasoning_tokens ELSE 0 END), 0)
+                    AS reasoning_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cache_read_tokens ELSE 0 END), 0)
+                    AS cache_read_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cache_write_tokens ELSE 0 END), 0)
+                    AS cache_write_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN total_tokens ELSE 0 END), 0)
+                    AS total_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                    AS cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN billed_cost_nanos ELSE 0 END), 0)
+                    AS billed_cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN estimated_cost_nanos ELSE 0 END), 0)
+                    AS estimated_cost_nanos,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' THEN missing_cost_entries
+                    ELSE MAX(1, missing_cost_entries)
+                END), 0) AS missing_cost_entries,
+                COALESCE(SUM(CASE WHEN status != 'finalized' THEN 1 ELSE 0 END), 0)
+                    AS unknown_event_count,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                    THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                    THEN 1 ELSE 0 END), 0) AS estimated_cost_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND coverage_status != 'complete'
+                    THEN 1 ELSE 0 END), 0) AS incomplete_finalized_count
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND turn_id = ?
+              AND origin = 'live_provider'
+            """,
+            (session_id, session_epoch, turn_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or int(row["event_count"] or 0) == 0:
+            return None
+
+        async with self.conn.execute(
+            """
+            SELECT provider, model
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND turn_id = ?
+              AND origin = 'live_provider'
+            ORDER BY call_index DESC, event_id DESC
+            LIMIT 1
+            """,
+            (session_id, session_epoch, turn_id),
+        ) as cur:
+            identity = await cur.fetchone()
+
+        billed_cost = nanos_to_usd(int(row["billed_cost_nanos"] or 0))
+        estimated_cost = nanos_to_usd(int(row["estimated_cost_nanos"] or 0))
+        missing_entries = max(0, int(row["missing_cost_entries"] or 0))
+        unknown_events = max(0, int(row["unknown_event_count"] or 0))
+        incomplete = max(0, int(row["incomplete_finalized_count"] or 0))
+        cost_source = rollup_cost_source(
+            billed_cost_usd=billed_cost,
+            estimated_cost_component_usd=estimated_cost,
+            missing_cost_entries=missing_entries,
+            provider_billed_entries=max(0, int(row["provider_billed_entries"] or 0)),
+            estimated_cost_entries=max(0, int(row["estimated_cost_entries"] or 0)),
+        )
+        coverage_status = "usage_unknown" if unknown_events or incomplete else "complete"
+        return {
+            "input_tokens": max(0, int(row["input_tokens"] or 0)),
+            "output_tokens": max(0, int(row["output_tokens"] or 0)),
+            "reasoning_tokens": max(0, int(row["reasoning_tokens"] or 0)),
+            "cached_tokens": max(0, int(row["cache_read_tokens"] or 0)),
+            "cache_write_tokens": max(0, int(row["cache_write_tokens"] or 0)),
+            "total_tokens": max(0, int(row["total_tokens"] or 0)),
+            "cost_usd": nanos_to_usd(int(row["cost_nanos"] or 0)),
+            "billed_cost": billed_cost,
+            "estimated_cost_component_usd": estimated_cost,
+            "cost_source": cost_source,
+            "missing_cost_entries": missing_entries,
+            "coverage_status": coverage_status,
+            "usage_unknown": coverage_status != "complete",
+            "unknown_usage_events": unknown_events,
+            "provider": str(identity["provider"] or "") if identity is not None else "",
+            "model": str(identity["model"] or "") if identity is not None else "",
+        }
+
+    @_serialized_read
+    async def get_turn_usage_projections(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        turn_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-project ledger usage for a bounded transcript page."""
+
+        stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
+        if not stable_turn_ids:
+            return {}
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE:
+            raise ValueError("too many turn ids for one usage projection page")
+        placeholders = ", ".join("?" for _ in stable_turn_ids)
+        async with self.conn.execute(
+            f"""
+            SELECT * FROM usage_events
+            WHERE session_id = ? AND session_epoch = ?
+              AND origin = 'live_provider'
+              AND turn_id IN ({placeholders})
+            ORDER BY turn_id, call_index, event_id
+            """,  # noqa: S608 - placeholders are generated from a bounded list
+            (session_id, session_epoch, *stable_turn_ids),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        grouped: dict[str, list[UsageEventRecord]] = {}
+        for row in rows:
+            event = _usage_event_from_row(row)
+            if event.turn_id:
+                grouped.setdefault(event.turn_id, []).append(event)
+
+        projections: dict[str, dict[str, Any]] = {}
+        for stable_turn_id, events in grouped.items():
+            totals = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 0,
+                "cost_nanos": 0,
+                "billed_cost_nanos": 0,
+                "estimated_cost_nanos": 0,
+                "missing_cost_entries": 0,
+            }
+            unknown_events = 0
+            incomplete = False
+            provider_billed_entries = 0
+            estimated_cost_entries = 0
+            for event in events:
+                if event.status != "finalized":
+                    unknown_events += 1
+                    totals["missing_cost_entries"] += max(
+                        1, int(event.missing_cost_entries or 0)
+                    )
+                    continue
+                totals["input_tokens"] += max(0, int(event.input_tokens or 0))
+                totals["output_tokens"] += max(0, int(event.output_tokens or 0))
+                totals["reasoning_tokens"] += max(0, int(event.reasoning_tokens or 0))
+                totals["cached_tokens"] += max(0, int(event.cache_read_tokens or 0))
+                totals["cache_write_tokens"] += max(
+                    0, int(event.cache_write_tokens or 0)
+                )
+                totals["total_tokens"] += max(0, int(event.total_tokens or 0))
+                totals["cost_nanos"] += max(0, int(event.cost_nanos or 0))
+                totals["billed_cost_nanos"] += max(
+                    0, int(event.billed_cost_nanos or 0)
+                )
+                totals["estimated_cost_nanos"] += max(
+                    0, int(event.estimated_cost_nanos or 0)
+                )
+                totals["missing_cost_entries"] += max(
+                    0, int(event.missing_cost_entries or 0)
+                )
+                provider_billed_entries += int(
+                    event.cost_source in {"provider_billed", "mixed"}
+                )
+                estimated_cost_entries += int(event.estimated_cost_nanos > 0)
+                incomplete = incomplete or event.coverage_status != "complete"
+
+            billed_cost = nanos_to_usd(totals["billed_cost_nanos"])
+            estimated_cost = nanos_to_usd(totals["estimated_cost_nanos"])
+            coverage_status = (
+                "usage_unknown" if unknown_events or incomplete else "complete"
+            )
+            latest = events[-1]
+            projections[stable_turn_id] = {
+                "input_tokens": totals["input_tokens"],
+                "output_tokens": totals["output_tokens"],
+                "reasoning_tokens": totals["reasoning_tokens"],
+                "cached_tokens": totals["cached_tokens"],
+                "cache_write_tokens": totals["cache_write_tokens"],
+                "total_tokens": totals["total_tokens"],
+                "cost_usd": nanos_to_usd(totals["cost_nanos"]),
+                "billed_cost": billed_cost,
+                "estimated_cost_component_usd": estimated_cost,
+                "cost_source": rollup_cost_source(
+                    billed_cost_usd=billed_cost,
+                    estimated_cost_component_usd=estimated_cost,
+                    missing_cost_entries=totals["missing_cost_entries"],
+                    provider_billed_entries=provider_billed_entries,
+                    estimated_cost_entries=estimated_cost_entries,
+                ),
+                "missing_cost_entries": totals["missing_cost_entries"],
+                "coverage_status": coverage_status,
+                "usage_unknown": coverage_status != "complete",
+                "unknown_usage_events": unknown_events,
+                "provider": latest.provider or "",
+                "model": latest.model or "",
+            }
+        return projections
+
+    @_serialized_read
+    async def get_turn_ids_continuing_after_cursor(
+        self,
+        *,
+        session_id: str,
+        created_at: int,
+        entry_id: int,
+        turn_ids: Sequence[str],
+    ) -> set[str]:
+        """Return the turns whose assistant history continues past a page.
+
+        Canonical history pages are contiguous keyset slices over
+        ``(created_at, id)``, so a turn with no assistant row after the page's
+        last cursor already holds its terminal row inside that page. Only rows
+        beyond the cursor can move terminality onto a later page, and the
+        newest page has none, so the common read is one empty index seek
+        rather than a scan of the whole session.
+        """
+
+        stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
+        if not stable_turn_ids:
+            return set()
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE - 8:
+            raise ValueError("too many turn ids for one usage continuation probe")
+        requested_rows = ", ".join("(?)" for _ in stable_turn_ids)
+        sql = f"""
+            WITH requested(turn_id) AS (
+                VALUES {requested_rows}
+            ),
+            continuing AS (
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
+                UNION ALL
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM compacted_transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND original_entry_id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
+            )
+            SELECT DISTINCT turn_id
+            FROM continuing
+            WHERE turn_id IN (SELECT turn_id FROM requested)
+        """  # noqa: S608 - placeholders are generated from a bounded list
+        async with self.conn.execute(
+            sql,
+            (
+                *stable_turn_ids,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        return {str(row["turn_id"] or "") for row in rows if row["turn_id"]}
+
+    async def reconcile_session_usage_totals_from_ledger(
+        self,
+        *,
+        session_key: str,
+        expected_epoch: int,
+    ) -> SessionNode | None:
+        """Set compatibility session totals from the ledger, idempotently.
+
+        The cutover baseline owns pre-ledger totals. Only live provider events
+        are added, because backfilled transcript events describe usage already
+        captured by that baseline.
+        """
+
+        stable_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("reconcile_session_usage_totals") as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (stable_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None:
+                return None
+            actual_epoch = max(0, int(session_row["epoch"] or 0))
+            if actual_epoch != expected_epoch:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=stable_key,
+                    expected_epoch=expected_epoch,
+                )
+            session_id = str(session_row["session_id"])
+
+            async with conn.execute(
+                """
+                SELECT * FROM usage_legacy_baselines
+                WHERE session_id = ? AND session_epoch = ?
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                baseline = await cur.fetchone()
+            if baseline is None:
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn,
+                    captured_at_ms=_now_ms(),
+                    session_key=stable_key,
+                )
+                async with conn.execute(
+                    """
+                    SELECT * FROM usage_legacy_baselines
+                    WHERE session_id = ? AND session_epoch = ?
+                    """,
+                    (session_id, expected_epoch),
+                ) as cur:
+                    baseline = await cur.fetchone()
+            if baseline is None:
+                # No cutover means this storage is not ledger-authoritative;
+                # preserve the legacy DoneEvent rollup path.
+                return None
+
+            async with conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                        AS input_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                        AS output_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN cache_read_tokens ELSE 0 END), 0)
+                        AS cache_read_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN cache_write_tokens ELSE 0 END), 0)
+                        AS cache_write_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                        AS cost_nanos,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN billed_cost_nanos ELSE 0 END), 0)
+                        AS billed_cost_nanos,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN estimated_cost_nanos ELSE 0 END), 0)
+                        AS estimated_cost_nanos,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' THEN missing_cost_entries
+                        ELSE MAX(1, missing_cost_entries)
+                    END), 0) AS missing_cost_entries,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                        THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                        THEN 1 ELSE 0 END), 0) AS estimated_cost_entries
+                FROM usage_events
+                WHERE session_id = ? AND session_epoch = ? AND origin = 'live_provider'
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                live = await cur.fetchone()
+            assert live is not None
+            async with conn.execute(
+                """
+                SELECT provider, model
+                FROM usage_events
+                WHERE session_id = ? AND session_epoch = ?
+                  AND origin = 'live_provider' AND status = 'finalized'
+                ORDER BY completed_at_ms DESC, call_index DESC, event_id DESC
+                LIMIT 1
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                latest_identity = await cur.fetchone()
+
+            input_tokens = max(0, int(baseline["input_tokens"] or 0)) + max(
+                0, int(live["input_tokens"] or 0)
+            )
+            output_tokens = max(0, int(baseline["output_tokens"] or 0)) + max(
+                0, int(live["output_tokens"] or 0)
+            )
+            cache_read = max(0, int(baseline["cache_read_tokens"] or 0)) + max(
+                0, int(live["cache_read_tokens"] or 0)
+            )
+            cache_write = max(0, int(baseline["cache_write_tokens"] or 0)) + max(
+                0, int(live["cache_write_tokens"] or 0)
+            )
+            cost_nanos = max(0, int(baseline["cost_nanos"] or 0)) + max(
+                0, int(live["cost_nanos"] or 0)
+            )
+            billed_nanos = max(0, int(baseline["billed_cost_nanos"] or 0)) + max(
+                0, int(live["billed_cost_nanos"] or 0)
+            )
+            estimated_nanos = max(0, int(baseline["estimated_cost_nanos"] or 0)) + max(
+                0, int(live["estimated_cost_nanos"] or 0)
+            )
+            missing_entries = max(0, int(baseline["missing_cost_entries"] or 0)) + max(
+                0, int(live["missing_cost_entries"] or 0)
+            )
+            baseline_source = str(baseline["cost_source"] or "none")
+            cost_source = rollup_cost_source(
+                billed_cost_usd=nanos_to_usd(billed_nanos),
+                estimated_cost_component_usd=nanos_to_usd(estimated_nanos),
+                missing_cost_entries=missing_entries,
+                provider_billed_entries=(
+                    int(baseline_source in {"provider_billed", "mixed"})
+                    + max(0, int(live["provider_billed_entries"] or 0))
+                ),
+                estimated_cost_entries=(
+                    int(int(baseline["estimated_cost_nanos"] or 0) > 0)
+                    + max(0, int(live["estimated_cost_entries"] or 0))
+                ),
+            )
+            await conn.execute(
+                """
+                UPDATE sessions
+                SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
+                    total_tokens_fresh = 1, estimated_cost_usd = ?, total_cost_usd = ?,
+                    billed_cost_usd = ?, estimated_cost_component_usd = ?,
+                    cost_source = ?, missing_cost_entries = ?,
+                    cache_read = ?, cache_write = ?,
+                    model_override = COALESCE(?, model_override),
+                    model_provider = COALESCE(?, model_provider)
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    input_tokens,
+                    output_tokens,
+                    input_tokens + output_tokens,
+                    nanos_to_usd(cost_nanos),
+                    nanos_to_usd(cost_nanos),
+                    nanos_to_usd(billed_nanos),
+                    nanos_to_usd(estimated_nanos),
+                    cost_source,
+                    missing_entries,
+                    cache_read,
+                    cache_write,
+                    (
+                        str(latest_identity["model"])
+                        if latest_identity is not None and latest_identity["model"]
+                        else None
+                    ),
+                    (
+                        str(latest_identity["provider"])
+                        if latest_identity is not None and latest_identity["provider"]
+                        else None
+                    ),
+                    stable_key,
+                    expected_epoch,
+                ),
+            )
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (stable_key,),
+            ) as cur:
+                updated = await cur.fetchone()
+            assert updated is not None
+            return SessionNode(**_deserialize_row(dict(updated)))
 
     @_serialized_read
     async def query_usage_event_items(
@@ -3820,7 +5048,7 @@ class SessionStorage:
         placeholders = ", ".join("?" for _ in cols)
         update_columns = []
         for c in cols:
-            if c == "session_key":
+            if c == "session_key" or c in _SESSION_DEDICATED_WRITER_COLUMNS:
                 continue
             if c == "epoch":
                 # Hard guarantee: epoch can only increase, never roll back.
@@ -3834,6 +5062,22 @@ class SessionStorage:
             f"ON CONFLICT(session_key) DO UPDATE SET {updates}"
         )
         async with self._write_transaction("upsert_session") as conn:
+            async with conn.execute(
+                """
+                SELECT session_id, epoch, model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (node.session_key,),
+            ) as cursor:
+                previous_identity = await cursor.fetchone()
+            if previous_identity is not None:
+                # Keep the caller-visible node coherent with the dedicated
+                # writer fields that this general-purpose UPSERT preserves.
+                node.model_routing_mode = previous_identity["model_routing_mode"]
+                node.model_routing_revision = max(
+                    0,
+                    int(previous_identity["model_routing_revision"] or 0),
+                )
             if expected_session_id is not None:
                 if node.session_id != expected_session_id:
                     raise KeyError(
@@ -3849,6 +5093,14 @@ class SessionStorage:
                         f"Session generation changed: {node.session_key}"
                     )
             await conn.execute(sql, values)
+            if previous_identity is None or (
+                str(previous_identity["session_id"]) != node.session_id
+                or int(previous_identity["epoch"] or 0) != int(node.epoch or 0)
+            ):
+                await self._ensure_usage_baseline_for_session_on_conn(
+                    conn,
+                    session_key=node.session_key,
+                )
 
     @_serialized_read
     async def get_session(self, session_key: str) -> SessionNode | None:
@@ -3962,7 +5214,8 @@ class SessionStorage:
             {where}
             ORDER BY
                 max(sessions.updated_at, COALESCE(active_tasks.active_at, 0)) DESC,
-                sessions.updated_at DESC
+                sessions.updated_at DESC,
+                sessions.session_key DESC
             LIMIT ? OFFSET ?
         """
         query_params = [
@@ -3976,11 +5229,131 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_read
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        cursor: SessionListCursor | None = None,
+        guest_owner_id: str | None = None,
+    ) -> SessionListPage:
+        """Return a stable keyset page in the same order as ``list_sessions``."""
+
+        page_limit = max(1, int(limit))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return SessionListPage(sessions=[], next_cursor=None, has_more=False)
+            clauses.append(
+                "sessions.session_key GLOB ? "
+                "AND (length(sessions.session_key) - "
+                "length(replace(sessions.session_key, ':', ''))) = 5"
+            )
+            params.append(f"agent:?*:webchat:guest:{owner_id}:?*")
+        source_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        cursor_where = ""
+        cursor_params: list[Any] = []
+        if cursor is not None:
+            cursor_where = """
+                WHERE list_activity_at < ?
+                   OR (list_activity_at = ? AND updated_at < ?)
+                   OR (
+                       list_activity_at = ?
+                       AND updated_at = ?
+                       AND session_key < ?
+                   )
+            """
+            cursor_params = [
+                cursor.activity_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.session_key,
+            ]
+
+        sql = f"""
+            WITH active_tasks AS (
+                SELECT
+                    session_key,
+                    MAX(
+                        max(
+                            max(COALESCE(updated_at, 0), COALESCE(started_at, 0)),
+                            COALESCE(created_at, 0)
+                        )
+                    ) AS active_at
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                GROUP BY session_key
+            ), ordered_sessions AS (
+                SELECT
+                    sessions.*,
+                    max(
+                        sessions.updated_at,
+                        COALESCE(active_tasks.active_at, 0)
+                    ) AS list_activity_at
+                FROM sessions
+                LEFT JOIN active_tasks
+                    ON active_tasks.session_key = sessions.session_key
+                {source_where}
+            )
+            SELECT *
+            FROM ordered_sessions
+            {cursor_where}
+            ORDER BY list_activity_at DESC, updated_at DESC, session_key DESC
+            LIMIT ?
+        """
+        query_params = [
+            AgentTaskStatus.QUEUED.value,
+            AgentTaskStatus.RUNNING.value,
+            *params,
+            *cursor_params,
+            page_limit + 1,
+        ]
+        async with self.conn.execute(sql, query_params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > page_limit
+        page_rows = rows[:page_limit]
+        sessions: list[SessionNode] = []
+        positions: list[SessionListCursor] = []
+        for row in page_rows:
+            data = dict(row)
+            activity_at = int(data.pop("list_activity_at"))
+            session = SessionNode(**_deserialize_row(data))
+            sessions.append(session)
+            positions.append(
+                SessionListCursor(
+                    activity_at=activity_at,
+                    updated_at=int(session.updated_at),
+                    session_key=session.session_key,
+                )
+            )
+        next_cursor = positions[-1] if has_more and positions else None
+        return SessionListPage(
+            sessions=sessions,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
     async def _delete_session_rows(
         self,
         conn: aiosqlite.Connection,
         session: SessionNode,
     ) -> None:
+        from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+        # ArtifactSession state is fenced and removed inside the same durable
+        # boundary as the owning session.  A failure aborts the whole delete;
+        # post-commit filesystem cleanup is intentionally handled separately.
+        await purge_session_on_connection(
+            conn,
+            session_id=session.session_id,
+            boundary="session_delete",
+        )
         for table in (
             "transcript_entries",
             "compacted_transcript_entries",
@@ -4014,6 +5387,18 @@ class SessionStorage:
             )
         await conn.execute(
             "DELETE FROM turn_ingress_receipts WHERE accepted_session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_inputs WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_input_cancellations WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
             (session.session_key,),
         )
         await conn.execute(
@@ -4070,6 +5455,18 @@ class SessionStorage:
                 (session_key,),
             )
             await conn.execute(
+                "DELETE FROM pending_chat_inputs WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_input_cancellations WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
                 "DELETE FROM meta_control_intents WHERE session_key = ?",
                 (session_key,),
             )
@@ -4086,23 +5483,46 @@ class SessionStorage:
             return
         await self._cleanup_deleted_session(session)
 
-    async def prune_stale_sessions(self, before_ms: int) -> int:
-        """Delete sessions not updated since before_ms epoch ms. Returns count deleted."""
-        async with self._operation_lock:
-            self._raise_if_poisoned()
-            async with self.conn.execute(
-                "SELECT session_key FROM sessions WHERE updated_at < ?",
+    async def prune_stale_session_records(self, before_ms: int) -> list[SessionNode]:
+        """Delete and return the exact stale session generations committed."""
+
+        deleted: list[SessionNode] = []
+        async with self._write_transaction("prune_stale_sessions") as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE updated_at < ?",
                 (before_ms,),
             ) as cur:
                 rows = await cur.fetchall()
-        session_keys = [row[0] for row in rows]
-        for session_key in session_keys:
-            await self.delete_session(session_key)
-        return len(session_keys)
+            for row in rows:
+                session = SessionNode(**_deserialize_row(dict(row)))
+                await self._delete_session_rows(conn, session)
+                deleted.append(session)
+        for session in deleted:
+            await self._cleanup_deleted_session(session)
+        return deleted
+
+    async def prune_stale_sessions(self, before_ms: int) -> int:
+        """Delete sessions not updated since before_ms epoch ms. Returns count deleted."""
+
+        return len(await self.prune_stale_session_records(before_ms))
 
     @_serialized_read
-    async def count_sessions(self) -> int:
-        async with self.conn.execute("SELECT COUNT(*) FROM sessions") as cur:
+    async def count_sessions(self, guest_owner_id: str | None = None) -> int:
+        where = ""
+        params: tuple[str, ...] = ()
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return 0
+            where = (
+                "WHERE session_key GLOB ? "
+                "AND (length(session_key) - length(replace(session_key, ':', ''))) = 5"
+            )
+            params = (f"agent:?*:webchat:guest:{owner_id}:?*",)
+        async with self.conn.execute(
+            f"SELECT COUNT(*) FROM sessions {where}",  # noqa: S608 - fixed clause
+            params,
+        ) as cur:
             row = await cur.fetchone()
         return row[0] if row else 0
 
@@ -4117,12 +5537,20 @@ class SessionStorage:
                 "UPDATE sessions SET epoch = epoch + 1 WHERE session_key = ?",
                 (session_key,),
             )
+            await conn.execute(
+                "DELETE FROM session_goals WHERE session_key = ?",
+                (session_key,),
+            )
             async with conn.execute(
                 "SELECT epoch FROM sessions WHERE session_key = ?", (session_key,)
             ) as cur:
                 row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=session_key,
+            )
             return int(row[0])
 
     async def advance_reset_epoch(self, session_key: str) -> int:
@@ -4147,6 +5575,10 @@ class SessionStorage:
                 row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=session_key,
+            )
             await self._tombstone_meta_launches_for_boundary(
                 conn,
                 session_key=session_key,
@@ -4217,6 +5649,181 @@ class SessionStorage:
                 (normalized_key, normalized_value, _now_ms()),
             )
         return normalized_value
+
+    # ── Per-session model routing ──────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_model_routing_mode(value: str) -> str:
+        mode = value.strip().lower() if isinstance(value, str) else ""
+        if mode not in {"direct", "router", "ensemble"}:
+            raise ValueError("model routing mode must be direct, router, or ensemble")
+        return mode
+
+    @_serialized_read
+    async def _read_model_routing_state(self, session_key: str) -> Any:
+        async with self.conn.execute(
+            """
+            SELECT model_routing_mode, model_routing_revision
+            FROM sessions WHERE session_key = ?
+            """,
+            (session_key,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def resolve_model_routing_mode(
+        self,
+        session_key: str,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Read one session's mode, atomically materializing legacy NULL rows.
+
+        A NULL only represents a pre-feature (or not-yet-materialized) row.  It
+        is never returned to an execution caller: the fallback is persisted
+        under the write transaction so subsequent global changes cannot alter
+        the session's routing policy.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        fallback = self._normalize_model_routing_mode(fallback_mode)
+        row = await self._read_model_routing_state(session_key)
+        if row is None:
+            raise KeyError(f"Session not found: {session_key}")
+        raw_mode = row["model_routing_mode"]
+        revision = max(0, int(row["model_routing_revision"] or 0))
+        if raw_mode is not None:
+            return {
+                "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                "revision": revision,
+                "source": "session",
+                "initialized": False,
+            }
+
+        # Only legacy NULL rows require writer ownership. Re-read after taking
+        # that ownership because another process may have materialized the row
+        # between the read-only fast path and BEGIN IMMEDIATE.
+        async with self._write_transaction("resolve_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            raw_mode = row["model_routing_mode"]
+            revision = max(0, int(row["model_routing_revision"] or 0))
+            if raw_mode is not None:
+                return {
+                    "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                    "revision": revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1
+                WHERE session_key = ? AND model_routing_mode IS NULL
+                """,
+                (fallback, session_key),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                # Another writer materialized the row after our read.  Read
+                # its authoritative choice rather than overwriting it.
+                async with conn.execute(
+                    """
+                    SELECT model_routing_mode, model_routing_revision
+                    FROM sessions WHERE session_key = ?
+                    """,
+                    (session_key,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"Session not found: {session_key}")
+                return {
+                    "mode": self._normalize_model_routing_mode(
+                        str(row["model_routing_mode"])
+                    ),
+                    "revision": max(0, int(row["model_routing_revision"] or 0)),
+                    "source": "session",
+                    "initialized": False,
+                }
+            return {
+                "mode": fallback,
+                "revision": revision + 1,
+                "source": "legacy_initialized",
+                "initialized": True,
+            }
+
+    async def set_model_routing_mode(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set one persisted session routing mode."""
+
+        session_key = canonicalize_session_key(session_key)
+        normalized_mode = self._normalize_model_routing_mode(mode)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        async with self._write_transaction("set_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            current_mode = row["model_routing_mode"]
+            current_revision = max(0, int(row["model_routing_revision"] or 0))
+            if current_mode == normalized_mode:
+                # A lost acknowledgement may retry the same durable choice
+                # with the caller's older generation. Treat that as idempotent
+                # rather than forcing a needless UI reload.
+                return {
+                    "mode": normalized_mode,
+                    "revision": current_revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            if expected_revision is not None and current_revision != expected_revision:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1,
+                    updated_at = ?
+                WHERE session_key = ? AND model_routing_revision = ?
+                """,
+                (normalized_mode, _now_ms(), session_key, current_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            return {
+                "mode": normalized_mode,
+                "revision": current_revision + 1,
+                "source": "session",
+                "initialized": current_mode is None,
+            }
 
     # ── Collaboration plans ────────────────────────────────────────────────
 
@@ -4576,6 +6183,8 @@ class SessionStorage:
         self,
         session_key: str,
     ) -> PlanRevisionRecord | None:
+        """Return the current user-visible Plan revision, never Goal internals."""
+
         session_key = canonicalize_session_key(session_key)
         async with self.conn.execute(
             """
@@ -4584,6 +6193,12 @@ class SessionStorage:
             JOIN plan_revisions
               ON plan_revisions.revision_id = sessions.active_plan_revision_id
             WHERE sessions.session_key = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM plan_runs
+                  WHERE plan_runs.plan_revision_id = plan_revisions.revision_id
+                    AND plan_runs.driver_kind = 'goal'
+              )
             """,
             (session_key,),
         ) as cur:
@@ -4851,6 +6466,26 @@ class SessionStorage:
     @_serialized_read
     async def get_plan_run(self, run_id: str) -> PlanRunRecord | None:
         return await self._select_plan_run_on_conn(self.conn, run_id)
+
+    @_serialized_read
+    async def get_latest_plan_run_for_revision(
+        self,
+        plan_revision_id: str,
+    ) -> PlanRunRecord | None:
+        """Return the newest execution overlay attached to a plan revision."""
+
+        async with self.conn.execute(
+            """
+            SELECT *
+            FROM plan_runs
+            WHERE plan_revision_id = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (plan_revision_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else PlanRunRecord(**_deserialize_row(dict(row)))
 
     @_serialized_read
     async def get_active_plan_run(
@@ -5186,6 +6821,73 @@ class SessionStorage:
             assert updated is not None
             return updated
 
+    async def reopen_completed_plan_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        reason: str,
+    ) -> PlanRunRecord:
+        """Reopen a completed run at its first step as paused.
+
+        Recovery-only transition for goal-driven runs whose generic settle
+        path completed the run before the goal continuation driver could
+        terminalize it: the goal ledger row is left stranded as "running"
+        while the driver refuses to operate on a terminal run. Reopening at
+        the first step restores the resumable ``goal_turn_finished`` anchor
+        so the driver/recovery can parse the last turn's marker and apply the
+        correct terminal outcome.
+        """
+
+        reason = reason.strip()
+        if not reason:
+            raise PlanValidationError("reopen reason is required")
+        async with self._write_transaction("reopen_completed_plan_run") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            if run.status != PlanRunStatus.COMPLETED.value:
+                raise PlanRunConflictError(
+                    f"cannot reopen a {run.status} plan run"
+                )
+            if not run.step_states:
+                raise PlanRunConflictError("plan run has no steps to reopen")
+            states = [dict(state) for state in run.step_states]
+            states[0]["status"] = "in_progress"
+            states[0].pop("reason", None)
+            timestamp = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'paused',
+                    step_states = ?,
+                    current_step_id = ?,
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    pause_reason = ?,
+                    terminal_reason = NULL,
+                    finished_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND state_revision = ?
+                """,
+                (
+                    _serialize(states),
+                    str(states[0].get("step_id") or ""),
+                    reason,
+                    timestamp,
+                    run_id,
+                    expected_state_revision,
+                ),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
+
     async def pause_plan_run(
         self,
         run_id: str,
@@ -5299,7 +7001,1792 @@ class SessionStorage:
             assert updated is not None
             return updated
 
+    # ── Goal run ledger CRUD ────────────────────────────────────────────────
+
+    # Goal writes below are deliberately named transitions.  There is no
+    # open-ended field update API and no timestamp-based compare-and-set.
+
+    @staticmethod
+    def _goal_from_row(row: Any | None) -> GoalRecord | None:
+        if row is None:
+            return None
+        return GoalRecord(**_deserialize_row(dict(row)))
+
+    @classmethod
+    async def _select_goal_on_conn(
+        cls,
+        conn: Any,
+        *,
+        session_key: str | None = None,
+        goal_id: str | None = None,
+    ) -> GoalRecord | None:
+        if (session_key is None) == (goal_id is None):
+            raise ValueError("select Goal by exactly one identity")
+        params: tuple[Any, ...]
+        if session_key is not None:
+            query = "SELECT * FROM session_goals WHERE session_key = ?"
+            params = (session_key,)
+        else:
+            query = "SELECT * FROM session_goals WHERE goal_id = ?"
+            params = (goal_id,)
+        async with conn.execute(query, params) as cur:
+            return cls._goal_from_row(await cur.fetchone())
+
+    @staticmethod
+    async def _select_goal_command_receipt_on_conn(
+        conn: Any,
+        command: GoalCommandRequest,
+    ) -> GoalCommandReceiptRecord | None:
+        async with conn.execute(
+            """
+            SELECT * FROM goal_command_receipts
+            WHERE source_scope = ?
+              AND request_session_key = ?
+              AND client_request_id = ?
+            """,
+            (
+                command.source_scope,
+                command.request_session_key,
+                command.client_request_id,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return GoalCommandReceiptRecord(**_deserialize_row(dict(row)))
+
+    @classmethod
+    async def _replay_goal_command_on_conn(
+        cls,
+        conn: Any,
+        command: GoalCommandRequest,
+    ) -> GoalCommandResult | None:
+        receipt = await cls._select_goal_command_receipt_on_conn(conn, command)
+        if receipt is None:
+            return None
+        if (
+            receipt.action != command.action
+            or receipt.request_fingerprint != command.request_fingerprint
+        ):
+            raise GoalConflictError(
+                "IDEMPOTENCY_CONFLICT",
+                "clientRequestId was already used for a different Goal command",
+            )
+        goal = await cls._select_goal_on_conn(
+            conn,
+            session_key=command.request_session_key,
+        )
+        return GoalCommandResult(
+            response=dict(receipt.response_json),
+            goal=goal,
+            replayed=True,
+        )
+
+    @staticmethod
+    async def _insert_goal_command_receipt_on_conn(
+        conn: Any,
+        *,
+        command: GoalCommandRequest,
+        accepted_session_id: str,
+        accepted_session_epoch: int,
+        response: dict[str, Any],
+    ) -> GoalCommandReceiptRecord:
+        receipt = GoalCommandReceiptRecord(
+            source_scope=command.source_scope,
+            request_session_key=command.request_session_key,
+            client_request_id=command.client_request_id,
+            action=command.action,
+            request_fingerprint=command.request_fingerprint,
+            accepted_session_id=accepted_session_id,
+            accepted_session_epoch=accepted_session_epoch,
+            response_json=response,
+        )
+        data = receipt.model_dump()
+        columns = list(data)
+        placeholders = ", ".join("?" for _ in columns)
+        await conn.execute(
+            f"INSERT INTO goal_command_receipts ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            [_serialize(data[column]) for column in columns],
+        )
+        return receipt
+
+    @staticmethod
+    async def _insert_goal_on_conn(conn: Any, goal: GoalRecord) -> None:
+        data = goal.model_dump()
+        columns = list(data)
+        placeholders = ", ".join("?" for _ in columns)
+        await conn.execute(
+            f"INSERT INTO session_goals ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            [_serialize(data[column]) for column in columns],
+        )
+
+    @staticmethod
+    def _prepare_goal_command(
+        command: GoalCommandRequest,
+        *,
+        action: str,
+        session_key: str,
+    ) -> GoalCommandRequest:
+        command.validate()
+        canonical_key = canonicalize_session_key(session_key)
+        if command.action != action:
+            raise GoalValidationError(
+                f"expected Goal action {action}, got {command.action}",
+                code="INVALID_GOAL_COMMAND",
+            )
+        if canonicalize_session_key(command.request_session_key) != canonical_key:
+            raise GoalValidationError(
+                "Goal command session key does not match its target",
+                code="INVALID_GOAL_COMMAND",
+            )
+        return replace(command, request_session_key=canonical_key)
+
+    @staticmethod
+    def _goal_mutation_response(
+        *,
+        command: GoalCommandRequest,
+        goal: GoalRecord | None,
+        session_id: str,
+        epoch: int,
+        task_id: str | None = None,
+        user_message_id: str | None = None,
+        previous_goal_id: str | None = None,
+        execution_state: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "clientRequestId": command.client_request_id,
+            "sessionKey": command.request_session_key,
+            "sessionId": session_id,
+            "epoch": epoch,
+            "taskId": task_id,
+            "userMessageId": user_message_id,
+            "previousGoalId": previous_goal_id,
+            "goal": (
+                goal_snapshot(goal, execution_state=execution_state)
+                if goal is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    async def _goal_execution_state_on_conn(
+        conn: Any,
+        goal: GoalRecord,
+    ) -> str:
+        if goal.active_task_id is None:
+            return "idle"
+        async with conn.execute(
+            "SELECT status FROM agent_tasks WHERE task_id = ?",
+            (goal.active_task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None and str(row["status"]) == AgentTaskStatus.QUEUED.value:
+            return "queued"
+        return "working"
+
+    @_serialized_read
+    async def get_goal(self, session_key: str) -> GoalRecord | None:
+        return await self._select_goal_on_conn(
+            self.conn,
+            session_key=canonicalize_session_key(session_key),
+        )
+
+    @_serialized_read
+    async def get_goal_by_id(self, goal_id: str) -> GoalRecord | None:
+        return await self._select_goal_on_conn(self.conn, goal_id=goal_id)
+
+    @_serialized_read
+    async def get_goal_command_receipt(
+        self,
+        command: GoalCommandRequest,
+    ) -> GoalCommandResult | None:
+        command = self._prepare_goal_command(
+            command,
+            action=command.action,
+            session_key=command.request_session_key,
+        )
+        return await self._replay_goal_command_on_conn(self.conn, command)
+
+    @classmethod
+    async def _require_expected_goal_on_conn(
+        cls,
+        conn: Any,
+        *,
+        session_key: str,
+        expected: ExpectedGoal,
+    ) -> GoalRecord:
+        goal = await cls._select_goal_on_conn(conn, session_key=session_key)
+        if goal is None:
+            raise GoalConflictError("GOAL_NOT_FOUND", "No Goal exists for this session")
+        if (
+            goal.session_id != expected.session_id
+            or goal.session_epoch != expected.epoch
+        ):
+            raise GoalConflictError(
+                "SESSION_GENERATION_CHANGED",
+                "The session generation changed before the Goal command",
+                current=goal,
+            )
+        if (
+            goal.goal_id != expected.goal_id
+            or goal.state_revision != expected.state_revision
+        ):
+            raise GoalConflictError(
+                "STALE_GOAL",
+                "The Goal changed before the command",
+                current=goal,
+            )
+        return goal
+
+    @staticmethod
+    async def _require_default_goal_mode_on_conn(
+        conn: Any,
+        *,
+        goal: GoalRecord,
+    ) -> None:
+        async with conn.execute(
+            """
+            SELECT collaboration_mode
+            FROM sessions
+            WHERE session_key = ? AND session_id = ? AND epoch = ?
+            """,
+            (goal.session_key, goal.session_id, goal.session_epoch),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise GoalConflictError(
+                "SESSION_GENERATION_CHANGED",
+                "The session generation changed before Goal admission",
+                current=goal,
+            )
+        if str(row["collaboration_mode"]) != CollaborationMode.DEFAULT.value:
+            raise GoalConflictError(
+                "PLAN_MODE_ACTIVE",
+                "Goal execution cannot start while Plan mode is active",
+                current=goal,
+            )
+        async with conn.execute(
+            """
+            SELECT 1 FROM plan_runs
+            WHERE session_key = ?
+              AND driver_kind = 'manual'
+              AND status IN ('queued', 'running', 'paused', 'blocked')
+            LIMIT 1
+            """,
+            (goal.session_key,),
+        ) as cur:
+            if await cur.fetchone() is not None:
+                raise GoalConflictError(
+                    "PLAN_RUN_ACTIVE",
+                    "A manual Plan run is active for this session",
+                    current=goal,
+                )
+
+    @staticmethod
+    async def _require_idle_goal_session_on_conn(
+        conn: Any,
+        *,
+        session_key: str,
+        exclude_task_id: str | None = None,
+    ) -> None:
+        params: list[Any] = [
+            session_key,
+            AgentTaskStatus.QUEUED.value,
+            AgentTaskStatus.RUNNING.value,
+        ]
+        task_clause = ""
+        if exclude_task_id is not None:
+            task_clause = " AND task_id != ?"
+            params.append(exclude_task_id)
+        async with conn.execute(
+            "SELECT task_id, status FROM agent_tasks "
+            "WHERE session_key = ? AND status IN (?, ?)"
+            + task_clause
+            + " ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            params,
+        ) as cur:
+            busy = await cur.fetchone()
+        if busy is not None:
+            raise GoalConflictError(
+                "GOAL_BUSY",
+                "The session already has a queued or running task",
+            )
+
     # ── AgentTask ledger CRUD ───────────────────────────────────────────────
+
+    async def edit_goal(
+        self,
+        *,
+        session_key: str,
+        expected: ExpectedGoal,
+        objective: str,
+        command: GoalCommandRequest,
+        adoption_task_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> GoalCommandResult:
+        session_key = canonicalize_session_key(session_key)
+        command = self._prepare_goal_command(
+            command,
+            action="edit",
+            session_key=session_key,
+        )
+        objective = normalize_goal_objective(objective)
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("edit_goal") as conn:
+            replay = await self._replay_goal_command_on_conn(conn, command)
+            if replay is not None:
+                return replay
+            goal = await self._require_expected_goal_on_conn(
+                conn,
+                session_key=session_key,
+                expected=expected,
+            )
+            if (
+                goal.status == GoalStatus.COMPLETE.value
+                and goal.active_task_id is not None
+            ):
+                raise GoalConflictError(
+                    "GOAL_BUSY",
+                    "The completed Goal is still settling its terminal task",
+                    current=goal,
+                )
+            async with conn.execute(
+                """
+                UPDATE session_goals
+                SET objective = ?,
+                    objective_revision = objective_revision + 1,
+                    progress_json = NULL,
+                    progress_revision = progress_revision + 1,
+                    state_revision = state_revision + 1,
+                    status = CASE
+                        WHEN status = 'complete' THEN 'active' ELSE status
+                    END,
+                    terminal_task_id = NULL,
+                    window_turns_started = CASE
+                        WHEN status = 'complete' THEN 0 ELSE window_turns_started
+                    END,
+                    window_active_time_ms = CASE
+                        WHEN status = 'complete' THEN 0 ELSE window_active_time_ms
+                    END,
+                    pause_reason = CASE
+                        WHEN status = 'complete' THEN NULL ELSE pause_reason
+                    END,
+                    blocked_reason = NULL,
+                    terminal_reason = CASE
+                        WHEN status IN ('blocked', 'complete') THEN NULL
+                        ELSE terminal_reason
+                    END,
+                    updated_at_ms = ?,
+                    finished_at_ms = CASE
+                        WHEN status = 'complete' THEN NULL ELSE finished_at_ms
+                    END
+                WHERE session_key = ? AND goal_id = ? AND state_revision = ?
+                """,
+                (
+                    objective,
+                    timestamp,
+                    session_key,
+                    expected.goal_id,
+                    expected.state_revision,
+                ),
+            ) as cur:
+                if (cur.rowcount or 0) != 1:
+                    raise GoalConflictError(
+                        "STALE_GOAL",
+                        "The Goal changed before it could be edited",
+                    )
+            updated = await self._select_goal_on_conn(conn, session_key=session_key)
+            assert updated is not None
+            if (
+                adoption_task_id is not None
+                and updated.active_task_id == adoption_task_id
+            ):
+                async with conn.execute(
+                    "SELECT * FROM agent_tasks WHERE task_id = ?",
+                    (adoption_task_id,),
+                ) as task_cur:
+                    task_row = await task_cur.fetchone()
+                if task_row is not None:
+                    task = AgentTaskRecord(**_deserialize_row(dict(task_row)))
+                    details = dict(task.details or {})
+                    accepted_context = effective_goal_turn_context(details)
+                    if (
+                        task.session_key == session_key
+                        and task.status
+                        in {AgentTaskStatus.QUEUED, AgentTaskStatus.RUNNING}
+                        and accepted_context is not None
+                        and accepted_context.session_id == updated.session_id
+                        and accepted_context.epoch == updated.session_epoch
+                        and accepted_context.goal_id == updated.goal_id
+                        and accepted_context.task_id == adoption_task_id
+                    ):
+                        next_context = GoalTurnContext(
+                            session_id=updated.session_id,
+                            epoch=updated.session_epoch,
+                            goal_id=updated.goal_id,
+                            objective_revision=updated.objective_revision,
+                            objective_snapshot=updated.objective,
+                            task_id=adoption_task_id,
+                            continuation_seq=accepted_context.continuation_seq,
+                            automatic=accepted_context.automatic,
+                        )
+                        pending_update = GoalObjectiveUpdate(
+                            context=next_context,
+                            state_revision=updated.state_revision,
+                            accepted_at_ms=timestamp,
+                        )
+                        details[GOAL_OBJECTIVE_UPDATE_DETAIL_KEY] = (
+                            pending_update.as_task_detail()
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE agent_tasks
+                            SET details = ?, updated_at = ?
+                            WHERE task_id = ? AND status IN (?, ?)
+                            """,
+                            (
+                                _serialize(details),
+                                timestamp,
+                                adoption_task_id,
+                                AgentTaskStatus.QUEUED.value,
+                                AgentTaskStatus.RUNNING.value,
+                            ),
+                        )
+            response = self._goal_mutation_response(
+                command=command,
+                goal=updated,
+                session_id=updated.session_id,
+                epoch=updated.session_epoch,
+                execution_state=await self._goal_execution_state_on_conn(
+                    conn,
+                    updated,
+                ),
+            )
+            await self._insert_goal_command_receipt_on_conn(
+                conn,
+                command=command,
+                accepted_session_id=updated.session_id,
+                accepted_session_epoch=updated.session_epoch,
+                response=response,
+            )
+            return GoalCommandResult(response=response, goal=updated, replayed=False)
+
+    async def claim_goal_objective_update(
+        self,
+        update: GoalObjectiveUpdate,
+        *,
+        now_ms: int | None = None,
+    ) -> GoalObjectiveUpdate | None:
+        """Claim a pending objective edit at an ordinary Agent safe boundary."""
+
+        context = update.context
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("claim_goal_objective_update") as conn:
+            goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            if (
+                goal is None
+                or goal.session_id != context.session_id
+                or goal.session_epoch != context.epoch
+                or goal.objective_revision != context.objective_revision
+                or goal.objective != context.objective_snapshot
+                or goal.active_task_id != context.task_id
+                or goal.status
+                not in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
+            ):
+                return None
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ?",
+                (context.task_id,),
+            ) as task_cur:
+                task_row = await task_cur.fetchone()
+            if task_row is None:
+                return None
+            task = AgentTaskRecord(**_deserialize_row(dict(task_row)))
+            details = dict(task.details or {})
+            pending = GoalObjectiveUpdate.from_task_detail(
+                details.get(GOAL_OBJECTIVE_UPDATE_DETAIL_KEY)
+            )
+            if (
+                task.status != AgentTaskStatus.RUNNING
+                or task.session_key != goal.session_key
+                or pending is None
+                or pending.context != context
+                or pending.state_revision != update.state_revision
+                or pending.status not in {"pending", "claimed"}
+            ):
+                return None
+            claimed = GoalObjectiveUpdate(
+                context=context,
+                state_revision=pending.state_revision,
+                accepted_at_ms=pending.accepted_at_ms,
+                status="claimed",
+            )
+            details[GOAL_OBJECTIVE_UPDATE_DETAIL_KEY] = claimed.as_task_detail()
+            await conn.execute(
+                "UPDATE agent_tasks SET details = ?, updated_at = ? WHERE task_id = ?",
+                (_serialize(details), timestamp, context.task_id),
+            )
+            return claimed
+
+    async def apply_goal_objective_update(
+        self,
+        update: GoalObjectiveUpdate,
+        *,
+        iteration: int,
+        model_call_id: str,
+        now_ms: int | None = None,
+    ) -> GoalObjectiveUpdate | None:
+        """Promote a claimed edit to effective Goal tool authority."""
+
+        context = update.context
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("apply_goal_objective_update") as conn:
+            goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            if (
+                goal is None
+                or goal.session_id != context.session_id
+                or goal.session_epoch != context.epoch
+                or goal.objective_revision != context.objective_revision
+                or goal.objective != context.objective_snapshot
+                or goal.active_task_id != context.task_id
+                or goal.status
+                not in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
+            ):
+                return None
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ?",
+                (context.task_id,),
+            ) as task_cur:
+                task_row = await task_cur.fetchone()
+            if task_row is None:
+                return None
+            task = AgentTaskRecord(**_deserialize_row(dict(task_row)))
+            details = dict(task.details or {})
+            claimed = GoalObjectiveUpdate.from_task_detail(
+                details.get(GOAL_OBJECTIVE_UPDATE_DETAIL_KEY)
+            )
+            if (
+                task.status != AgentTaskStatus.RUNNING
+                or task.session_key != goal.session_key
+                or claimed is None
+                or claimed.context != context
+                or claimed.state_revision != update.state_revision
+                or claimed.status != "claimed"
+            ):
+                return None
+            applied = GoalObjectiveUpdate(
+                context=context,
+                state_revision=claimed.state_revision,
+                accepted_at_ms=claimed.accepted_at_ms,
+                status="applied",
+            )
+            applied_detail = applied.as_task_detail()
+            applied_detail["appliedIteration"] = iteration
+            applied_detail["modelCallId"] = model_call_id
+            applied_detail["appliedAtMs"] = timestamp
+            details[GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY] = context.as_task_detail()
+            details[GOAL_OBJECTIVE_UPDATE_DETAIL_KEY] = applied_detail
+            await conn.execute(
+                "UPDATE agent_tasks SET details = ?, updated_at = ? WHERE task_id = ?",
+                (_serialize(details), timestamp, context.task_id),
+            )
+            return applied
+
+    async def pause_goal(
+        self,
+        *,
+        session_key: str,
+        expected: ExpectedGoal,
+        command: GoalCommandRequest,
+        reason: str = "user",
+        now_ms: int | None = None,
+    ) -> GoalCommandResult:
+        session_key = canonicalize_session_key(session_key)
+        command = self._prepare_goal_command(
+            command,
+            action="pause",
+            session_key=session_key,
+        )
+        reason = normalize_goal_reason(reason) or "user"
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("pause_goal") as conn:
+            replay = await self._replay_goal_command_on_conn(conn, command)
+            if replay is not None:
+                return replay
+            goal = await self._require_expected_goal_on_conn(
+                conn,
+                session_key=session_key,
+                expected=expected,
+            )
+            if goal.status != GoalStatus.ACTIVE.value:
+                raise GoalConflictError(
+                    "GOAL_NOT_RESUMABLE",
+                    "Only an active Goal can be paused",
+                    current=goal,
+                )
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET status = 'paused',
+                    state_revision = state_revision + 1,
+                    terminal_task_id = NULL,
+                    pause_reason = ?,
+                    terminal_reason = NULL,
+                    updated_at_ms = ?,
+                    finished_at_ms = NULL
+                WHERE session_key = ? AND goal_id = ? AND state_revision = ?
+                """,
+                (
+                    reason,
+                    timestamp,
+                    session_key,
+                    expected.goal_id,
+                    expected.state_revision,
+                ),
+            )
+            updated = await self._select_goal_on_conn(conn, session_key=session_key)
+            assert updated is not None
+            response = self._goal_mutation_response(
+                command=command,
+                goal=updated,
+                session_id=updated.session_id,
+                epoch=updated.session_epoch,
+                execution_state=await self._goal_execution_state_on_conn(
+                    conn,
+                    updated,
+                ),
+            )
+            await self._insert_goal_command_receipt_on_conn(
+                conn,
+                command=command,
+                accepted_session_id=updated.session_id,
+                accepted_session_epoch=updated.session_epoch,
+                response=response,
+            )
+            return GoalCommandResult(response=response, goal=updated, replayed=False)
+
+    async def resume_goal(
+        self,
+        *,
+        session_key: str,
+        expected: ExpectedGoal,
+        command: GoalCommandRequest,
+        now_ms: int | None = None,
+    ) -> GoalCommandResult:
+        session_key = canonicalize_session_key(session_key)
+        command = self._prepare_goal_command(
+            command,
+            action="resume",
+            session_key=session_key,
+        )
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("resume_goal") as conn:
+            replay = await self._replay_goal_command_on_conn(conn, command)
+            if replay is not None:
+                return replay
+            goal = await self._require_expected_goal_on_conn(
+                conn,
+                session_key=session_key,
+                expected=expected,
+            )
+            if goal.status not in {
+                GoalStatus.PAUSED.value,
+                GoalStatus.BLOCKED.value,
+                GoalStatus.USAGE_LIMITED.value,
+            }:
+                raise GoalConflictError(
+                    "GOAL_NOT_RESUMABLE",
+                    "This Goal is not resumable",
+                    current=goal,
+                )
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET status = 'active',
+                    state_revision = state_revision + 1,
+                    terminal_task_id = NULL,
+                    window_turns_started = 0,
+                    window_active_time_ms = 0,
+                    pause_reason = NULL,
+                    terminal_reason = NULL,
+                    updated_at_ms = ?,
+                    finished_at_ms = NULL
+                WHERE session_key = ? AND goal_id = ? AND state_revision = ?
+                """,
+                (timestamp, session_key, expected.goal_id, expected.state_revision),
+            )
+            updated = await self._select_goal_on_conn(conn, session_key=session_key)
+            assert updated is not None
+            response = self._goal_mutation_response(
+                command=command,
+                goal=updated,
+                session_id=updated.session_id,
+                epoch=updated.session_epoch,
+                execution_state=await self._goal_execution_state_on_conn(
+                    conn,
+                    updated,
+                ),
+            )
+            await self._insert_goal_command_receipt_on_conn(
+                conn,
+                command=command,
+                accepted_session_id=updated.session_id,
+                accepted_session_epoch=updated.session_epoch,
+                response=response,
+            )
+            return GoalCommandResult(response=response, goal=updated, replayed=False)
+
+    async def clear_goal(
+        self,
+        *,
+        session_key: str,
+        expected: ExpectedGoal,
+        command: GoalCommandRequest,
+    ) -> GoalCommandResult:
+        session_key = canonicalize_session_key(session_key)
+        command = self._prepare_goal_command(
+            command,
+            action="clear",
+            session_key=session_key,
+        )
+        async with self._write_transaction("clear_goal") as conn:
+            replay = await self._replay_goal_command_on_conn(conn, command)
+            if replay is not None:
+                return replay
+            goal = await self._require_expected_goal_on_conn(
+                conn,
+                session_key=session_key,
+                expected=expected,
+            )
+            if goal.active_task_id is not None:
+                async with conn.execute(
+                    "SELECT details FROM agent_tasks WHERE task_id = ?",
+                    (goal.active_task_id,),
+                ) as task_cur:
+                    task_row = await task_cur.fetchone()
+                if task_row is not None:
+                    details_raw = _deserialize_row(
+                        {"details": task_row["details"]}
+                    ).get("details")
+                    details = (
+                        dict(details_raw) if isinstance(details_raw, dict) else {}
+                    )
+                    objective_update = GoalObjectiveUpdate.from_task_detail(
+                        details.get(GOAL_OBJECTIVE_UPDATE_DETAIL_KEY)
+                    )
+                    # Clear linearizes at the durable Goal row. A pending
+                    # update can no longer be claimed, while a claim already
+                    # handed to the Agent may remain in that task's assembled
+                    # prompt. Mark both pending and claimed states revoked so
+                    # a late provider start cannot promote either one to Goal
+                    # tool authority. Applied task evidence is intentionally
+                    # retained; deleting the Goal row still fences every later
+                    # progress or terminal write from the surviving task.
+                    if (
+                        objective_update is not None
+                        and objective_update.status != "applied"
+                    ):
+                        revoked = GoalObjectiveUpdate(
+                            context=objective_update.context,
+                            state_revision=objective_update.state_revision,
+                            accepted_at_ms=objective_update.accepted_at_ms,
+                            status="revoked",
+                        )
+                        details[GOAL_OBJECTIVE_UPDATE_DETAIL_KEY] = (
+                            revoked.as_task_detail()
+                        )
+                        await conn.execute(
+                            "UPDATE agent_tasks SET details = ? WHERE task_id = ?",
+                            (_serialize(details), goal.active_task_id),
+                        )
+            async with conn.execute(
+                """
+                DELETE FROM session_goals
+                WHERE session_key = ? AND goal_id = ? AND state_revision = ?
+                """,
+                (session_key, expected.goal_id, expected.state_revision),
+            ) as cur:
+                if (cur.rowcount or 0) != 1:
+                    raise GoalConflictError(
+                        "STALE_GOAL",
+                        "The Goal changed before it could be cleared",
+                    )
+            response = self._goal_mutation_response(
+                command=command,
+                goal=None,
+                previous_goal_id=goal.goal_id,
+                session_id=goal.session_id,
+                epoch=goal.session_epoch,
+            )
+            await self._insert_goal_command_receipt_on_conn(
+                conn,
+                command=command,
+                accepted_session_id=goal.session_id,
+                accepted_session_epoch=goal.session_epoch,
+                response=response,
+            )
+            return GoalCommandResult(response=response, goal=None, replayed=False)
+
+    async def accept_goal_continuation(
+        self,
+        *,
+        expected: ExpectedGoal,
+        expected_continuation_seq: int,
+        task_record: AgentTaskRecord,
+        max_turns: int = 50,
+        runtime_budget_seconds: int = 3_600,
+        workspace_guard: ProjectWorkspaceGuard | None = None,
+        now_ms: int | None = None,
+    ) -> GoalTaskAcceptance | GoalGuardrailPause:
+        """Atomically bind and persist the next automatic Goal AgentTask."""
+
+        if task_record.status != AgentTaskStatus.QUEUED:
+            raise GoalValidationError(
+                "A Goal continuation task must start queued",
+                code="INVALID_GOAL_COMMAND",
+            )
+        if isinstance(max_turns, bool) or not 1 <= max_turns <= 500:
+            raise GoalValidationError(
+                "max_turns must be between 1 and 500",
+                code="INVALID_GOAL_GUARDRAIL",
+            )
+        if (
+            isinstance(runtime_budget_seconds, bool)
+            or not 60 <= runtime_budget_seconds <= 86_400
+        ):
+            raise GoalValidationError(
+                "runtime_budget_seconds must be between 60 and 86400",
+                code="INVALID_GOAL_GUARDRAIL",
+            )
+        task_record.session_key = canonicalize_session_key(task_record.session_key)
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("accept_goal_continuation") as conn:
+            goal = await self._require_expected_goal_on_conn(
+                conn,
+                session_key=task_record.session_key,
+                expected=expected,
+            )
+            if goal.status != GoalStatus.ACTIVE.value:
+                raise GoalConflictError(
+                    "GOAL_NOT_RESUMABLE",
+                    "Only an active Goal can continue",
+                    current=goal,
+                )
+            if goal.active_task_id is not None:
+                raise GoalConflictError(
+                    "GOAL_BUSY",
+                    "The Goal already owns a task",
+                    current=goal,
+                )
+            if goal.continuation_seq != expected_continuation_seq:
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The Goal continuation sequence changed",
+                    current=goal,
+                )
+            await self._require_default_goal_mode_on_conn(conn, goal=goal)
+            async with conn.execute(
+                """
+                SELECT collaboration_revision FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (goal.session_key, goal.session_id, goal.session_epoch),
+            ) as collaboration_cur:
+                collaboration_row = await collaboration_cur.fetchone()
+            if collaboration_row is None:
+                raise GoalConflictError(
+                    "SESSION_GENERATION_CHANGED",
+                    "The Goal session generation no longer exists",
+                    current=goal,
+                )
+            await _verify_project_workspace_guard(
+                conn,
+                session_node=None,
+                entry_session_key=task_record.session_key,
+                workspace_guard=workspace_guard,
+            )
+            await self._require_idle_goal_session_on_conn(
+                conn,
+                session_key=task_record.session_key,
+            )
+            guardrail_reason: str | None = None
+            if goal.window_turns_started >= max_turns:
+                guardrail_reason = "turn_limit"
+            elif goal.window_active_time_ms >= runtime_budget_seconds * 1000:
+                guardrail_reason = "runtime_limit"
+            if guardrail_reason is not None:
+                async with conn.execute(
+                    """
+                    UPDATE session_goals
+                    SET status = 'paused',
+                        state_revision = state_revision + 1,
+                        pause_reason = ?,
+                        terminal_reason = ?,
+                        updated_at_ms = ?
+                    WHERE session_key = ?
+                      AND goal_id = ?
+                      AND state_revision = ?
+                      AND active_task_id IS NULL
+                      AND status = 'active'
+                    """,
+                    (
+                        guardrail_reason,
+                        guardrail_reason,
+                        timestamp,
+                        goal.session_key,
+                        goal.goal_id,
+                        goal.state_revision,
+                    ),
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        raise GoalConflictError(
+                            "STALE_GOAL",
+                            "The Goal changed before guardrail evaluation",
+                        )
+                paused = await self._select_goal_on_conn(
+                    conn,
+                    session_key=goal.session_key,
+                )
+                assert paused is not None
+                return GoalGuardrailPause(goal=paused, reason=guardrail_reason)
+            next_seq = goal.continuation_seq + 1
+            expected_task_id = automatic_goal_task_id(
+                goal.goal_id,
+                goal.objective_revision,
+                next_seq,
+            )
+            if task_record.task_id != expected_task_id:
+                raise GoalValidationError(
+                    "Automatic Goal task id does not match its continuation fence",
+                    code="INVALID_GOAL_COMMAND",
+                )
+            context = GoalTurnContext(
+                session_id=goal.session_id,
+                epoch=goal.session_epoch,
+                goal_id=goal.goal_id,
+                objective_revision=goal.objective_revision,
+                objective_snapshot=goal.objective,
+                task_id=task_record.task_id,
+                continuation_seq=next_seq,
+                automatic=True,
+            )
+            details = dict(task_record.details or {})
+            details.pop("goal_candidate", None)
+            details["goal_context"] = context.as_task_detail()
+            metadata_raw = details.get("metadata")
+            metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+            metadata["required_collaboration_mode"] = "default"
+            metadata["required_collaboration_revision"] = int(
+                collaboration_row["collaboration_revision"]
+            )
+            details["metadata"] = metadata
+            task_record.details = details
+            await self._insert_agent_task(conn, task_record)
+            async with conn.execute(
+                """
+                UPDATE session_goals
+                SET active_task_id = ?,
+                    terminal_task_id = NULL,
+                    continuation_seq = ?,
+                    turns_started = turns_started + 1,
+                    window_turns_started = window_turns_started + 1,
+                    state_revision = state_revision + 1,
+                    updated_at_ms = ?
+                WHERE session_key = ?
+                  AND goal_id = ?
+                  AND state_revision = ?
+                  AND active_task_id IS NULL
+                  AND status = 'active'
+                """,
+                (
+                    task_record.task_id,
+                    next_seq,
+                    timestamp,
+                    goal.session_key,
+                    goal.goal_id,
+                    goal.state_revision,
+                ),
+            ) as cur:
+                if (cur.rowcount or 0) != 1:
+                    raise GoalConflictError(
+                        "STALE_GOAL",
+                        "The Goal changed before continuation acceptance",
+                    )
+            updated = await self._select_goal_on_conn(
+                conn,
+                session_key=goal.session_key,
+            )
+            assert updated is not None
+            return GoalTaskAcceptance(goal=updated, context=context)
+
+    async def claim_goal_for_queued_task(
+        self,
+        *,
+        candidate: GoalClaimCandidate,
+        task_id: str,
+        frozen_collaboration_mode: str,
+        now_ms: int | None = None,
+    ) -> GoalTaskAcceptance | None:
+        """Best-effort claim of the still-current Goal at task activation."""
+
+        if frozen_collaboration_mode != CollaborationMode.DEFAULT.value:
+            return None
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("claim_goal_for_queued_task") as conn:
+            async with conn.execute(
+                """
+                SELECT session_key, details FROM agent_tasks
+                WHERE task_id = ? AND status = ?
+                """,
+                (task_id, AgentTaskStatus.QUEUED.value),
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None:
+                return None
+            session_key = str(task_row["session_key"])
+            task_details_raw = _deserialize_row(
+                {"details": task_row["details"]}
+            ).get("details")
+            task_details = (
+                dict(task_details_raw)
+                if isinstance(task_details_raw, dict)
+                else {}
+            )
+            # The in-memory activation hook only carries an advisory copy.  The
+            # durable queued task is the authority for whether this explicit
+            # user turn was ever admitted as a candidate for this Goal.  Never
+            # let a stale/forged callback attach an ordinary queued task to a
+            # Goal it did not carry at acceptance time.
+            if (
+                GoalClaimCandidate.from_task_detail(
+                    task_details.get("goal_candidate")
+                )
+                != candidate
+            ):
+                return None
+            goal = await self._select_goal_on_conn(conn, session_key=session_key)
+            if (
+                goal is None
+                or goal.session_id != candidate.session_id
+                or goal.session_epoch != candidate.epoch
+                or goal.goal_id != candidate.goal_id
+                or goal.status != GoalStatus.ACTIVE.value
+                or goal.active_task_id is not None
+            ):
+                return None
+            try:
+                await self._require_default_goal_mode_on_conn(conn, goal=goal)
+            except GoalConflictError as exc:
+                if exc.code in {
+                    "SESSION_GENERATION_CHANGED",
+                    "PLAN_MODE_ACTIVE",
+                    "PLAN_RUN_ACTIVE",
+                }:
+                    return None
+                raise
+            async with conn.execute(
+                """
+                SELECT collaboration_revision FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (session_key, goal.session_id, goal.session_epoch),
+            ) as collaboration_cur:
+                collaboration_row = await collaboration_cur.fetchone()
+            if collaboration_row is None:
+                return None
+            async with conn.execute(
+                """
+                SELECT 1 FROM agent_tasks
+                WHERE session_key = ? AND task_id != ? AND status = ?
+                LIMIT 1
+                """,
+                (session_key, task_id, AgentTaskStatus.RUNNING.value),
+            ) as cur:
+                if await cur.fetchone() is not None:
+                    return None
+            context = goal_turn_context(goal, task_id=task_id, automatic=False)
+            details = task_details
+            details.pop("goal_candidate", None)
+            details["goal_context"] = context.as_task_detail()
+            metadata_raw = details.get("metadata")
+            metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+            metadata["required_collaboration_mode"] = "default"
+            metadata["required_collaboration_revision"] = int(
+                collaboration_row["collaboration_revision"]
+            )
+            details["metadata"] = metadata
+            await conn.execute(
+                "UPDATE agent_tasks SET details = ?, updated_at = ? WHERE task_id = ?",
+                (_serialize(details), timestamp, task_id),
+            )
+            async with conn.execute(
+                """
+                UPDATE session_goals
+                SET active_task_id = ?,
+                    terminal_task_id = NULL,
+                    turns_started = turns_started + 1,
+                    window_turns_started = window_turns_started + 1,
+                    state_revision = state_revision + 1,
+                    updated_at_ms = ?
+                WHERE session_key = ? AND goal_id = ? AND active_task_id IS NULL
+                """,
+                (task_id, timestamp, session_key, goal.goal_id),
+            ) as cur:
+                if (cur.rowcount or 0) != 1:
+                    raise GoalConflictError(
+                        "STALE_GOAL",
+                        "The Goal changed during queued-task claim",
+                    )
+            updated = await self._select_goal_on_conn(conn, session_key=session_key)
+            assert updated is not None
+            return GoalTaskAcceptance(goal=updated, context=context)
+
+    @staticmethod
+    async def _require_persisted_goal_context_on_conn(
+        conn: Any,
+        *,
+        context: GoalTurnContext,
+        expected_session_key: str,
+        current: GoalRecord,
+    ) -> AgentTaskRecord:
+        """Require the exact frozen Goal context stored on the owning task.
+
+        A task id plus mutable Goal-row fields is not enough evidence for a
+        tool write: delayed callbacks must also match the immutable context
+        accepted with the AgentTask.  This makes ``objective_snapshot`` and the
+        remaining generation scalars real storage fences rather than values
+        trusted only because the current caller supplied them.
+        """
+
+        async with conn.execute(
+            "SELECT * FROM agent_tasks WHERE task_id = ?",
+            (context.task_id,),
+        ) as cur:
+            task_row = await cur.fetchone()
+        if task_row is None:
+            raise GoalConflictError(
+                "STALE_GOAL",
+                "The owning Goal task no longer exists",
+                current=current,
+            )
+        task = AgentTaskRecord(**_deserialize_row(dict(task_row)))
+        task_details = task.details if isinstance(task.details, dict) else {}
+        if (
+            task.session_key != expected_session_key
+            or effective_goal_turn_context(task_details) != context
+        ):
+            raise GoalConflictError(
+                "STALE_GOAL",
+                "The task does not carry this Goal generation",
+                current=current,
+            )
+        return task
+
+    async def commit_goal_terminal(
+        self,
+        context: GoalTurnContext,
+        *,
+        status: str,
+        blocked_reason: str | None = None,
+        now_ms: int | None = None,
+    ) -> GoalRecord:
+        """Durably commit an owning task's structured complete/blocked result."""
+
+        if status not in {GoalStatus.COMPLETE.value, GoalStatus.BLOCKED.value}:
+            raise GoalValidationError(
+                "update_goal status must be complete or blocked",
+                code="INVALID_GOAL_STATUS",
+            )
+        reason = normalize_goal_reason(blocked_reason)
+        if status == GoalStatus.COMPLETE.value and reason is not None:
+            raise GoalValidationError(
+                "blocked reason is only valid for blocked Goals",
+                code="INVALID_GOAL_REASON",
+            )
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("commit_goal_terminal") as conn:
+            goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            if goal is None:
+                raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
+            if (
+                goal.session_id != context.session_id
+                or goal.session_epoch != context.epoch
+                or goal.objective_revision != context.objective_revision
+            ):
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The Goal objective changed before terminal commit",
+                    current=goal,
+                )
+            await self._require_persisted_goal_context_on_conn(
+                conn,
+                context=context,
+                expected_session_key=goal.session_key,
+                current=goal,
+            )
+            if goal.status in {GoalStatus.COMPLETE.value, GoalStatus.BLOCKED.value}:
+                if goal.status == status and goal.terminal_task_id == context.task_id:
+                    return goal
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The Goal already has a different terminal result",
+                    current=goal,
+                )
+            if (
+                goal.status not in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
+                or goal.active_task_id != context.task_id
+            ):
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The task no longer owns this Goal",
+                    current=goal,
+                )
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET status = ?,
+                    state_revision = state_revision + 1,
+                    terminal_task_id = ?,
+                    blocked_reason = ?,
+                    pause_reason = NULL,
+                    terminal_reason = ?,
+                    updated_at_ms = ?,
+                    finished_at_ms = ?
+                WHERE goal_id = ?
+                  AND objective_revision = ?
+                  AND active_task_id = ?
+                """,
+                (
+                    status,
+                    context.task_id,
+                    reason if status == GoalStatus.BLOCKED.value else None,
+                    "model_blocked"
+                    if status == GoalStatus.BLOCKED.value
+                    else "model_complete",
+                    timestamp,
+                    timestamp if status == GoalStatus.COMPLETE.value else None,
+                    context.goal_id,
+                    context.objective_revision,
+                    context.task_id,
+                ),
+            )
+            updated = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            assert updated is not None
+            return updated
+
+    async def update_goal_progress(
+        self,
+        context: GoalTurnContext,
+        *,
+        explanation: object | None,
+        steps: object,
+        now_ms: int | None = None,
+    ) -> GoalRecord:
+        """Replace progress for the exact owning Goal objective."""
+
+        progress = normalize_goal_progress(explanation=explanation, steps=steps)
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("update_goal_progress") as conn:
+            goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            if goal is None:
+                raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
+            if (
+                goal.session_id != context.session_id
+                or goal.session_epoch != context.epoch
+                or goal.objective_revision != context.objective_revision
+                or goal.active_task_id != context.task_id
+                or goal.status
+                not in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
+            ):
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The task no longer owns this Goal objective",
+                    current=goal,
+                )
+            await self._require_persisted_goal_context_on_conn(
+                conn,
+                context=context,
+                expected_session_key=goal.session_key,
+                current=goal,
+            )
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET progress_json = ?,
+                    progress_revision = progress_revision + 1,
+                    updated_at_ms = ?
+                WHERE goal_id = ?
+                  AND objective_revision = ?
+                  AND active_task_id = ?
+                """,
+                (
+                    json.dumps(
+                        progress,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    timestamp,
+                    context.goal_id,
+                    context.objective_revision,
+                    context.task_id,
+                ),
+            )
+            updated = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            assert updated is not None
+            return updated
+
+    @staticmethod
+    async def _turn_usage_totals_on_conn(
+        conn: Any,
+        *,
+        context: GoalTurnContext,
+    ) -> dict[str, int]:
+        async with conn.execute(
+            """
+            SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                   COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM usage_events
+            WHERE turn_id = ? AND session_id = ? AND session_epoch = ?
+              AND status = 'finalized'
+            """,
+            (context.task_id, context.session_id, context.epoch),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        return {
+            name: max(0, int(row[name] or 0))
+            for name in (
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "total_tokens",
+            )
+        }
+
+    @_serialized_read
+    async def get_turn_usage_totals(
+        self,
+        context: GoalTurnContext,
+    ) -> dict[str, int]:
+        return await self._turn_usage_totals_on_conn(self.conn, context=context)
+
+    async def settle_goal_task(
+        self,
+        context: GoalTurnContext,
+        *,
+        max_turns: int,
+        runtime_budget_seconds: int,
+        usage_limited: bool = False,
+        successor_expected: bool = False,
+        process_restart: bool = False,
+        now_ms: int | None = None,
+    ) -> GoalRecord | None:
+        """Settle one authoritative terminal task exactly once by owner CAS."""
+
+        if isinstance(max_turns, bool) or not 1 <= max_turns <= 500:
+            raise GoalValidationError(
+                "max_turns must be between 1 and 500",
+                code="INVALID_GOAL_GUARDRAIL",
+            )
+        if (
+            isinstance(runtime_budget_seconds, bool)
+            or not 60 <= runtime_budget_seconds <= 86_400
+        ):
+            raise GoalValidationError(
+                "runtime_budget_seconds must be between 60 and 86400",
+                code="INVALID_GOAL_GUARDRAIL",
+            )
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("settle_goal_task") as conn:
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ?",
+                (context.task_id,),
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None:
+                raise GoalConflictError(
+                    "GOAL_BUSY",
+                    "The authoritative Goal task is unavailable",
+                )
+            task = AgentTaskRecord(**_deserialize_row(dict(task_row)))
+            if task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.RUNNING}:
+                raise GoalConflictError(
+                    "GOAL_BUSY",
+                    "The Goal task has not reached a durable terminal state",
+                )
+            task_details = task.details if isinstance(task.details, dict) else {}
+            persisted_context = effective_goal_turn_context(task_details)
+            if persisted_context != context:
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The terminal task does not carry this Goal generation",
+                )
+            goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            if (
+                goal is None
+                or goal.session_id != context.session_id
+                or goal.session_epoch != context.epoch
+                or task.session_key != goal.session_key
+                or goal.active_task_id != context.task_id
+            ):
+                return None
+
+            usage = await self._turn_usage_totals_on_conn(conn, context=context)
+            duration_ms = 0
+            if task.started_at is not None and task.finished_at is not None:
+                duration_ms = max(0, task.finished_at - task.started_at)
+            active_time_after = goal.active_time_ms + duration_ms
+            window_active_after = goal.window_active_time_ms + duration_ms
+
+            status = goal.status
+            pause_reason = goal.pause_reason
+            blocked_reason = goal.blocked_reason
+            terminal_reason = goal.terminal_reason
+            finished_at_ms = goal.finished_at_ms
+            terminal_task_id = (
+                goal.terminal_task_id
+                if goal.status in {
+                    GoalStatus.COMPLETE.value,
+                    GoalStatus.BLOCKED.value,
+                }
+                and goal.terminal_task_id == context.task_id
+                else None
+            )
+            same_objective = goal.objective_revision == context.objective_revision
+            # A blocked Goal retains its old blocker internally across Resume
+            # so the first resumed prompt can explain what was previously in
+            # the way.  Consume that historical value only after the task has
+            # really entered RUNNING; queued cancellation/activation failure
+            # never reached a provider and must leave it for the next Resume.
+            if (
+                same_objective
+                and task.started_at is not None
+                and status in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
+            ):
+                blocked_reason = None
+            # System/user pauses are authoritative.  The still-owning task may
+            # subsequently commit a structured complete/blocked result, but a
+            # plain terminal callback must not erase lease_revoked,
+            # process_restart, user pause, or another already-durable pause.
+            # Terminal classification and guardrails apply only while the Goal
+            # remains active.
+            if status == GoalStatus.ACTIVE.value:
+                if usage_limited:
+                    status = GoalStatus.USAGE_LIMITED.value
+                    pause_reason = "usage_limited"
+                    blocked_reason = None
+                    terminal_reason = "usage_limited"
+                    finished_at_ms = None
+                elif task.status == AgentTaskStatus.SUCCEEDED:
+                    if not same_objective:
+                        # A successful owner that did not consume the latest
+                        # objective simply releases ownership. The ordinary
+                        # idle gate will continue the revised Goal without
+                        # applying old-objective guardrails to it.
+                        pass
+                    elif goal.window_turns_started >= max_turns:
+                        status = GoalStatus.PAUSED.value
+                        pause_reason = "turn_limit"
+                        terminal_reason = "turn_limit"
+                    elif window_active_after >= runtime_budget_seconds * 1000:
+                        status = GoalStatus.PAUSED.value
+                        pause_reason = "runtime_limit"
+                        terminal_reason = "runtime_limit"
+                elif task.status in {AgentTaskStatus.FAILED, AgentTaskStatus.TIMEOUT}:
+                    if task.error_class == "goal_checkpoint_required":
+                        # Artifact delivery already succeeded, so a missing
+                        # bookkeeping checkpoint is resumable orchestration
+                        # state rather than an objective-level blocker.
+                        status = GoalStatus.PAUSED.value
+                        pause_reason = "goal_checkpoint_required"
+                        blocked_reason = None
+                        terminal_reason = "goal_checkpoint_required"
+                    else:
+                        status = GoalStatus.BLOCKED.value
+                        pause_reason = None
+                        blocked_reason = normalize_goal_reason(
+                            task.error_class
+                            or task.terminal_reason
+                            or "turn_error"
+                        )
+                        terminal_reason = "turn_error"
+                        finished_at_ms = None
+                elif task.status == AgentTaskStatus.CANCELLED:
+                    if successor_expected:
+                        status = GoalStatus.ACTIVE.value
+                        pause_reason = None
+                    elif process_restart:
+                        status = GoalStatus.PAUSED.value
+                        pause_reason = "process_restart"
+                        terminal_reason = "process_restart"
+                    else:
+                        status = GoalStatus.PAUSED.value
+                        pause_reason = "user_cancelled"
+                        terminal_reason = "user_cancelled"
+                elif task.status == AgentTaskStatus.ABANDONED:
+                    status = GoalStatus.PAUSED.value
+                    pause_reason = "process_restart"
+                    terminal_reason = "process_restart"
+
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET status = ?,
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_task_id = ?,
+                    turns_settled = turns_settled + 1,
+                    active_time_ms = ?,
+                    window_active_time_ms = ?,
+                    input_tokens = input_tokens + ?,
+                    output_tokens = output_tokens + ?,
+                    reasoning_tokens = reasoning_tokens + ?,
+                    cache_read_tokens = cache_read_tokens + ?,
+                    cache_write_tokens = cache_write_tokens + ?,
+                    total_tokens = total_tokens + ?,
+                    pause_reason = ?,
+                    blocked_reason = ?,
+                    terminal_reason = ?,
+                    finished_at_ms = ?,
+                    updated_at_ms = ?
+                WHERE goal_id = ? AND active_task_id = ?
+                """,
+                (
+                    status,
+                    terminal_task_id,
+                    active_time_after,
+                    window_active_after,
+                    usage["input_tokens"],
+                    usage["output_tokens"],
+                    usage["reasoning_tokens"],
+                    usage["cache_read_tokens"],
+                    usage["cache_write_tokens"],
+                    usage["total_tokens"],
+                    pause_reason,
+                    blocked_reason,
+                    terminal_reason,
+                    finished_at_ms,
+                    timestamp,
+                    context.goal_id,
+                    context.task_id,
+                ),
+            )
+            return await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+
+    async def _compensate_goal_task(
+        self,
+        context: GoalTurnContext,
+        *,
+        reason: str,
+        now_ms: int | None,
+    ) -> GoalRecord | None:
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction(f"compensate_goal_{reason}") as conn:
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ?",
+                (context.task_id,),
+            ) as task_cur:
+                task_row = await task_cur.fetchone()
+            if task_row is None:
+                return None
+            task = AgentTaskRecord(**_deserialize_row(dict(task_row)))
+            task_details = task.details if isinstance(task.details, dict) else {}
+            if effective_goal_turn_context(task_details) != context:
+                raise GoalConflictError(
+                    "STALE_GOAL",
+                    "The compensated task does not carry this Goal generation",
+                )
+            usage = await self._turn_usage_totals_on_conn(conn, context=context)
+            duration_ms = 0
+            if task.started_at is not None:
+                duration_ms = max(
+                    0,
+                    int(task.finished_at if task.finished_at is not None else timestamp)
+                    - task.started_at,
+                )
+            await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET status = ?, terminal_reason = ?, updated_at = ?,
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE task_id = ? AND status IN (?, ?)
+                """,
+                (
+                    AgentTaskStatus.ABANDONED.value,
+                    reason,
+                    timestamp,
+                    timestamp,
+                    context.task_id,
+                    AgentTaskStatus.QUEUED.value,
+                    AgentTaskStatus.RUNNING.value,
+                ),
+            )
+            goal = await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+            if (
+                goal is None
+                or goal.session_id != context.session_id
+                or goal.session_epoch != context.epoch
+                or goal.active_task_id != context.task_id
+            ):
+                return None
+            preserve_status = goal.status in {
+                GoalStatus.COMPLETE.value,
+                GoalStatus.BLOCKED.value,
+            }
+            terminal_task_id = (
+                goal.terminal_task_id
+                if preserve_status and goal.terminal_task_id == context.task_id
+                else None
+            )
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET status = ?, state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_task_id = ?,
+                    turns_settled = turns_settled + 1,
+                    active_time_ms = active_time_ms + ?,
+                    window_active_time_ms = window_active_time_ms + ?,
+                    input_tokens = input_tokens + ?,
+                    output_tokens = output_tokens + ?,
+                    reasoning_tokens = reasoning_tokens + ?,
+                    cache_read_tokens = cache_read_tokens + ?,
+                    cache_write_tokens = cache_write_tokens + ?,
+                    total_tokens = total_tokens + ?,
+                    pause_reason = ?,
+                    terminal_reason = CASE
+                        WHEN status IN ('complete', 'blocked') THEN terminal_reason
+                        ELSE ?
+                    END,
+                    blocked_reason = CASE
+                        WHEN status IN ('active', 'paused') AND ? THEN NULL
+                        ELSE blocked_reason
+                    END,
+                    updated_at_ms = ?
+                WHERE goal_id = ? AND active_task_id = ?
+                """,
+                (
+                    goal.status if preserve_status else GoalStatus.PAUSED.value,
+                    terminal_task_id,
+                    duration_ms,
+                    duration_ms,
+                    usage["input_tokens"],
+                    usage["output_tokens"],
+                    usage["reasoning_tokens"],
+                    usage["cache_read_tokens"],
+                    usage["cache_write_tokens"],
+                    usage["total_tokens"],
+                    goal.pause_reason if preserve_status else reason,
+                    reason,
+                    int(
+                        task.started_at is not None
+                        and goal.objective_revision == context.objective_revision
+                    ),
+                    timestamp,
+                    context.goal_id,
+                    context.task_id,
+                ),
+            )
+            return await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+
+    async def compensate_goal_activation_failure(
+        self,
+        context: GoalTurnContext,
+        *,
+        reason: str = "activation_failed",
+        now_ms: int | None = None,
+    ) -> GoalRecord | None:
+        if reason not in {
+            "activation_failed",
+            "feature_disabled",
+            "lease_revoked",
+            "process_restart",
+        }:
+            raise GoalValidationError(
+                "Invalid Goal activation compensation reason",
+                code="INVALID_GOAL_COMMAND",
+            )
+        return await self._compensate_goal_task(
+            context,
+            reason=reason,
+            now_ms=now_ms,
+        )
+
+    async def compensate_terminal_persistence_failure(
+        self,
+        context: GoalTurnContext,
+        *,
+        now_ms: int | None = None,
+    ) -> GoalRecord | None:
+        return await self._compensate_goal_task(
+            context,
+            reason="persistence_error",
+            now_ms=now_ms,
+        )
+
+    async def pause_goal_for_system(
+        self,
+        *,
+        session_key: str,
+        goal_id: str,
+        expected_state_revision: int,
+        reason: str,
+        now_ms: int | None = None,
+    ) -> GoalRecord | None:
+        """Pause an active Goal for a trusted lifecycle boundary.
+
+        The owning task, if any, is deliberately preserved so it may deliver a
+        structured terminal result.  Disconnect and kill-switch callers do not
+        mint user command receipts.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        reason = normalize_goal_reason(reason) or "system"
+        timestamp = _now_ms() if now_ms is None else now_ms
+        async with self._write_transaction("pause_goal_for_system") as conn:
+            current = await self._select_goal_on_conn(conn, session_key=session_key)
+            if current is None:
+                return None
+            if (
+                current.goal_id != goal_id
+                or current.state_revision != expected_state_revision
+            ):
+                return None
+            if current.status != GoalStatus.ACTIVE.value:
+                return None
+            async with conn.execute(
+                """
+                UPDATE session_goals
+                SET status = 'paused', state_revision = state_revision + 1,
+                    terminal_task_id = NULL,
+                    pause_reason = ?, terminal_reason = ?, updated_at_ms = ?,
+                    finished_at_ms = NULL
+                WHERE session_key = ? AND goal_id = ? AND state_revision = ?
+                """,
+                (
+                    reason,
+                    reason,
+                    timestamp,
+                    session_key,
+                    goal_id,
+                    expected_state_revision,
+                ),
+            ) as cur:
+                if (cur.rowcount or 0) != 1:
+                    return None
+            updated = await self._select_goal_on_conn(conn, session_key=session_key)
+            assert updated is not None
+            return updated
 
     @staticmethod
     async def _insert_agent_task(conn: Any, task: AgentTaskRecord) -> None:
@@ -5410,10 +8897,51 @@ class SessionStorage:
         return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
 
     @_serialized_read
+    async def has_queued_goal_successor(
+        self,
+        *,
+        session_key: str,
+        context: GoalTurnContext,
+    ) -> bool:
+        """Return whether any queued task can inherit this exact Goal generation.
+
+        This is intentionally unbounded: queue length is configuration-driven,
+        so a correctness decision cannot depend on an arbitrary hydration page.
+        """
+
+        async with self.conn.execute(
+            """
+            SELECT details FROM agent_tasks
+            WHERE session_key = ? AND status = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (
+                canonicalize_session_key(session_key),
+                AgentTaskStatus.QUEUED.value,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            details_raw = _deserialize_row({"details": row["details"]}).get("details")
+            details = details_raw if isinstance(details_raw, dict) else {}
+            candidate = GoalClaimCandidate.from_task_detail(details.get("goal_candidate"))
+            successor_context = GoalTurnContext.from_task_detail(
+                details.get("goal_context")
+            )
+            for successor in (candidate, successor_context):
+                if (
+                    successor is not None
+                    and successor.session_id == context.session_id
+                    and successor.epoch == context.epoch
+                    and successor.goal_id == context.goal_id
+                ):
+                    return True
+        return False
+
+    @_serialized_read
     async def list_recent_agent_tasks(
         self,
         session_key: str,
-        *,
         limit: int = 100,
     ) -> list[AgentTaskRecord]:
         """Return the newest task state needed by interactive hydration."""
@@ -5788,8 +9316,24 @@ class SessionStorage:
                     bucket.append(task)
         return grouped
 
-    async def mark_abandoned_agent_tasks(self, now_ms: int | None = None) -> int:
-        """Mark non-terminal persisted tasks as abandoned after process restart."""
+    async def mark_abandoned_agent_tasks(
+        self,
+        now_ms: int | None = None,
+        *,
+        goal_pause_reason: str = "process_restart",
+    ) -> int:
+        """Mark non-terminal tasks abandoned and pause Goals at startup.
+
+        ``goal_pause_reason`` lets the Gateway distinguish an ordinary process
+        restart from startup with Goal execution disabled.  The default keeps
+        existing callers compatible; only the two startup classifications are
+        accepted so this recovery API cannot become an open-ended Goal update.
+        """
+
+        if goal_pause_reason not in {"process_restart", "feature_disabled"}:
+            raise ValueError(
+                "goal_pause_reason must be process_restart or feature_disabled"
+            )
         ts = now_ms or _now_ms()
         plan_run_reconciliation = {
             "cancelled": 0,
@@ -5819,6 +9363,29 @@ class SessionStorage:
                 ),
             ) as task_cur:
                 restart_task_rows = await task_cur.fetchall()
+            # Capture Goal owners before queued/running tasks are rewritten.
+            # ``updated_at`` is the last durable running heartbeat, so it is a
+            # safe recovery cutoff that excludes Gateway downtime when a task
+            # has no terminal ``finished_at`` yet.
+            async with conn.execute(
+                """
+                SELECT goal.session_key AS goal_session_key,
+                       goal.session_id AS goal_session_id,
+                       goal.session_epoch AS goal_session_epoch,
+                       goal.goal_id AS goal_id,
+                       goal.active_task_id AS active_task_id,
+                       task.session_key AS task_session_key,
+                       task.started_at AS task_started_at,
+                       task.finished_at AS task_finished_at,
+                       task.updated_at AS task_updated_at,
+                       task.details AS task_details
+                FROM session_goals AS goal
+                JOIN agent_tasks AS task
+                  ON task.task_id = goal.active_task_id
+                WHERE goal.active_task_id IS NOT NULL
+                """
+            ) as goal_owner_cur:
+                goal_owner_rows = await goal_owner_cur.fetchall()
             async with conn.execute(
                 """
                 SELECT DISTINCT session_key
@@ -5920,6 +9487,119 @@ class SessionStorage:
                         "process_restart",
                     ),
                 )
+            for owner_row in goal_owner_rows:
+                details_raw = _deserialize_row(
+                    {"details": owner_row["task_details"]}
+                ).get("details")
+                details = dict(details_raw) if isinstance(details_raw, dict) else {}
+                context = effective_goal_turn_context(details)
+                if (
+                    context is None
+                    or context.task_id != str(owner_row["active_task_id"])
+                    or context.goal_id != str(owner_row["goal_id"])
+                    or context.session_id != str(owner_row["goal_session_id"])
+                    or context.epoch != int(owner_row["goal_session_epoch"])
+                    or str(owner_row["task_session_key"])
+                    != str(owner_row["goal_session_key"])
+                ):
+                    # Fail closed: stale/corrupt ownership is released by the
+                    # fallback update below, but is never attributed to Goal
+                    # accounting without its frozen generation evidence.
+                    continue
+
+                usage = await self._turn_usage_totals_on_conn(conn, context=context)
+                started_at_raw = owner_row["task_started_at"]
+                finished_at_raw = owner_row["task_finished_at"]
+                last_running_at_raw = owner_row["task_updated_at"]
+                duration_ms = 0
+                if started_at_raw is not None:
+                    started_at = int(started_at_raw)
+                    running_cutoff = int(
+                        finished_at_raw
+                        if finished_at_raw is not None
+                        else last_running_at_raw
+                    )
+                    duration_ms = max(0, running_cutoff - started_at)
+
+                async with conn.execute(
+                    """
+                    UPDATE session_goals
+                    SET status = CASE
+                            WHEN status = 'active' THEN 'paused'
+                            ELSE status
+                        END,
+                        state_revision = state_revision + 1,
+                        active_task_id = NULL,
+                        turns_settled = turns_settled + 1,
+                        active_time_ms = active_time_ms + ?,
+                        window_active_time_ms = window_active_time_ms + ?,
+                        input_tokens = input_tokens + ?,
+                        output_tokens = output_tokens + ?,
+                        reasoning_tokens = reasoning_tokens + ?,
+                        cache_read_tokens = cache_read_tokens + ?,
+                        cache_write_tokens = cache_write_tokens + ?,
+                        total_tokens = total_tokens + ?,
+                        pause_reason = CASE
+                            WHEN status = 'active' THEN ?
+                            ELSE pause_reason
+                        END,
+                        terminal_reason = CASE
+                            WHEN status = 'active' THEN ?
+                            ELSE terminal_reason
+                        END,
+                        blocked_reason = CASE
+                            WHEN status IN ('active', 'paused') AND ? THEN NULL
+                            ELSE blocked_reason
+                        END,
+                        updated_at_ms = ?
+                    WHERE goal_id = ? AND active_task_id = ?
+                    """,
+                    (
+                        duration_ms,
+                        duration_ms,
+                        usage["input_tokens"],
+                        usage["output_tokens"],
+                        usage["reasoning_tokens"],
+                        usage["cache_read_tokens"],
+                        usage["cache_write_tokens"],
+                        usage["total_tokens"],
+                        goal_pause_reason,
+                        goal_pause_reason,
+                        int(started_at_raw is not None),
+                        ts,
+                        context.goal_id,
+                        context.task_id,
+                    ),
+                ) as goal_cur:
+                    if (goal_cur.rowcount or 0) != 1:
+                        log.warning(
+                            "goal.restart_settlement_cas_miss goal_id=%s task_id=%s",
+                            context.goal_id,
+                            context.task_id,
+                        )
+            # A Goal execution lease is process-local.  Restart therefore
+            # atomically pauses every active Goal (including an idle one) and
+            # releases any persisted owner.  Other unfinished/terminal states
+            # keep their semantic status while stale ownership is cleared.
+            await conn.execute(
+                """
+                UPDATE session_goals
+                SET status = CASE WHEN status = 'active' THEN 'paused' ELSE status END,
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    pause_reason = CASE
+                        WHEN status = 'active' THEN ?
+                        ELSE pause_reason
+                    END,
+                    terminal_reason = CASE
+                        WHEN status = 'active' THEN ?
+                        ELSE terminal_reason
+                    END,
+                    updated_at_ms = ?
+                WHERE status = 'active' OR active_task_id IS NOT NULL
+                """,
+                (goal_pause_reason, goal_pause_reason, ts),
+            )
             # A persisted PlanRun and its AgentTask form one ownership lease.
             # Process restart abandons the in-memory task, so release that lease
             # in the same recovery transaction. Preserve the run/driver and its
@@ -6363,6 +10043,116 @@ class SessionStorage:
                 expected_epoch=expected_epoch,
             )
 
+    @classmethod
+    async def _upsert_transcript_entry(
+        cls,
+        conn: Any,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int | None,
+    ) -> bool:
+        """Materialize or replace one row identified by session + message id.
+
+        ``message_id`` is not made a database-wide unique key: it is a
+        caller-supplied identity scoped to the current session.  The enclosing
+        write transaction serializes the select/update-or-insert decision, and
+        the epoch guard remains identical to ordinary transcript writes.
+        """
+
+        if expected_epoch is not None:
+            async with conn.execute(
+                "SELECT epoch FROM sessions WHERE session_key = ?",
+                (entry.session_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None or int(session_row[0]) != expected_epoch:
+                await cls._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+
+        async with conn.execute(
+            """
+            SELECT id, created_at
+            FROM transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (entry.session_id, entry.message_id),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing is None:
+            await cls._insert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            return True
+
+        entry.id = int(existing[0])
+        entry.created_at = int(existing[1])
+        data = entry.model_dump(exclude={"id", "created_at"})
+        assignments = [f"{column} = ?" for column in data]
+        values = [_serialize(data[column]) for column in data]
+        values.append(entry.id)
+        await conn.execute(
+            f"UPDATE transcript_entries SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
+        return False
+
+    async def upsert_transcript_entry_and_touch(
+        self,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int,
+        updated_at: int,
+        token_delta: int = 0,
+        mark_total_tokens_stale: bool = False,
+    ) -> bool:
+        """Upsert caller-identified content and touch its session once.
+
+        Returns ``True`` only when a new row was materialized.  Replaying the
+        same finalization therefore cannot add another transcript row or count
+        its token delta a second time.
+        """
+
+        entry.session_key = canonicalize_session_key(entry.session_key)
+        async with self._write_transaction("upsert_transcript_entry_and_touch") as conn:
+            inserted = await self._upsert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            effective_token_delta = token_delta if inserted else 0
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?,
+                    total_tokens = total_tokens + ?,
+                    total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    updated_at,
+                    effective_token_delta,
+                    int(mark_total_tokens_stale and inserted),
+                    entry.session_key,
+                    expected_epoch,
+                ),
+            ) as cur:
+                touched = cur.rowcount or 0
+            if touched == 0:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+        return inserted
+
     async def append_transcript_entry_and_touch(
         self,
         entry: TranscriptEntry,
@@ -6494,7 +10284,12 @@ class SessionStorage:
         source_scope: str,
         request_session_key: str,
         client_request_id: str,
-    ) -> tuple[TurnIngressReceipt, AgentTaskStatus | None, bool] | None:
+    ) -> tuple[
+        TurnIngressReceipt,
+        AgentTaskStatus | None,
+        bool,
+        dict[str, Any],
+    ] | None:
         async with conn.execute(
             """
             SELECT receipt.*, task.status AS accepted_task_status,
@@ -6523,7 +10318,12 @@ class SessionStorage:
                 if isinstance(parsed, dict):
                     task_details = parsed
         receipt = TurnIngressReceipt(**_deserialize_row(raw))
-        return receipt, task_status, bool(task_details.get("fresh_user_session", False))
+        return (
+            receipt,
+            task_status,
+            bool(task_details.get("fresh_user_session", False)),
+            task_details,
+        )
 
     @_serialized_read
     async def get_turn_ingress_receipt(
@@ -6543,12 +10343,18 @@ class SessionStorage:
         )
         if selected is None:
             return None
-        receipt, task_status, fresh_user_session = selected
+        receipt, task_status, fresh_user_session, task_details = selected
         return TurnAcceptanceResult(
             receipt=receipt,
             replayed=True,
             fresh_user_session=fresh_user_session,
             task_status=task_status,
+            goal_context=GoalTurnContext.from_task_detail(
+                task_details.get("goal_context")
+            ),
+            goal_candidate=GoalClaimCandidate.from_task_detail(
+                task_details.get("goal_candidate")
+            ),
         )
 
     async def replay_turn_ingress_receipt(
@@ -6587,7 +10393,7 @@ class SessionStorage:
             )
             if selected is None:
                 return None
-            receipt, task_status, fresh_user_session = selected
+            receipt, task_status, fresh_user_session, task_details = selected
             await conn.execute(
                 """
                 DELETE FROM meta_launch_drafts
@@ -6600,7 +10406,722 @@ class SessionStorage:
                 replayed=True,
                 fresh_user_session=fresh_user_session,
                 task_status=task_status,
+                goal_context=GoalTurnContext.from_task_detail(
+                    task_details.get("goal_context")
+                ),
+                goal_candidate=GoalClaimCandidate.from_task_detail(
+                    task_details.get("goal_candidate")
+                ),
             )
+
+    @staticmethod
+    def _pending_chat_input_from_row(row: Any) -> PendingChatInput:
+        raw = dict(row)
+        payload_raw = raw.pop("payload_json", None)
+        try:
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else None
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("pending chat input contains invalid payload JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("pending chat input payload must be an object")
+        return PendingChatInput(payload=payload, **raw)
+
+    @staticmethod
+    async def _select_pending_chat_input(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> PendingChatInput | None:
+        async with conn.execute(
+            "SELECT * FROM pending_chat_inputs WHERE pending_input_id = ?",
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            SessionStorage._pending_chat_input_from_row(row)
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    async def _select_pending_chat_input_cancellation(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> tuple[str, int] | None:
+        async with conn.execute(
+            """
+            SELECT session_key, cancelled_at
+            FROM pending_chat_input_cancellations
+            WHERE pending_input_id = ?
+            """,
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return str(row["session_key"]), int(row["cancelled_at"])
+
+    @staticmethod
+    async def _select_pending_chat_input_dispatch_receipt(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> PendingChatInputDispatchReceipt | None:
+        async with conn.execute(
+            """
+            SELECT * FROM pending_chat_input_dispatch_receipts
+            WHERE pending_input_id = ?
+            """,
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            PendingChatInputDispatchReceipt(**_deserialize_row(dict(row)))
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    async def _find_pending_chat_input_dispatch_receipts(
+        conn: Any,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+    ) -> list[PendingChatInputDispatchReceipt]:
+        async with conn.execute(
+            """
+            SELECT * FROM pending_chat_input_dispatch_receipts
+            WHERE pending_input_id = ?
+               OR (
+                    session_key = ?
+                AND source_scope = ?
+                AND client_request_id = ?
+               )
+               OR (session_key = ? AND client_message_id = ?)
+            ORDER BY accepted_at ASC, pending_input_id ASC
+            """,
+            (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                session_key,
+                client_message_id,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            PendingChatInputDispatchReceipt(**_deserialize_row(dict(row)))
+            for row in rows
+        ]
+
+    @staticmethod
+    async def _insert_pending_chat_input_dispatch_receipt(
+        conn: Any,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        accepted_at: int,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO pending_chat_input_dispatch_receipts (
+                pending_input_id, session_key, source_scope,
+                client_request_id, client_message_id, request_fingerprint, accepted_at,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                client_message_id,
+                request_fingerprint,
+                accepted_at,
+            ),
+        )
+
+    async def enqueue_pending_chat_input(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        payload: dict[str, Any],
+        position: int | None = None,
+    ) -> tuple[PendingChatInput, bool]:
+        """Stage one follow-up, returning ``(row, replayed)``.
+
+        Capacity and all three stable identities are checked under the same
+        write lock.  An ambiguous enqueue can therefore retry byte-for-byte;
+        the retry either returns the original row or raises a hard conflict.
+        """
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        source_scope = source_scope.strip()
+        client_request_id = client_request_id.strip()
+        client_message_id = client_message_id.strip()
+        request_fingerprint = request_fingerprint.strip()
+        identifiers = {
+            "pending_input_id": pending_input_id,
+            "session_key": session_key,
+            "source_scope": source_scope,
+            "client_request_id": client_request_id,
+            "client_message_id": client_message_id,
+            "request_fingerprint": request_fingerprint,
+        }
+        if any(not value for value in identifiers.values()):
+            raise ValueError("pending input identities must be non-empty")
+        for name in ("pending_input_id", "client_request_id", "client_message_id"):
+            if len(identifiers[name]) > 256:
+                raise ValueError(f"{name} must not exceed 256 characters")
+        if len(session_key) > 512 or len(source_scope) > 256:
+            raise ValueError("pending input session/source identity is too long")
+        if not isinstance(payload, dict):
+            raise ValueError("pending input payload must be an object")
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = _now_ms()
+        async with self._write_transaction("enqueue_pending_chat_input") as conn:
+            dispatch_receipts = (
+                await self._find_pending_chat_input_dispatch_receipts(
+                    conn,
+                    pending_input_id=pending_input_id,
+                    session_key=session_key,
+                    source_scope=source_scope,
+                    client_request_id=client_request_id,
+                    client_message_id=client_message_id,
+                )
+            )
+            if dispatch_receipts:
+                exact = (
+                    len(dispatch_receipts) == 1
+                    and dispatch_receipts[0].pending_input_id == pending_input_id
+                    and dispatch_receipts[0].session_key == session_key
+                    and dispatch_receipts[0].source_scope == source_scope
+                    and dispatch_receipts[0].client_request_id
+                    == client_request_id
+                    and dispatch_receipts[0].client_message_id
+                    == client_message_id
+                    and dispatch_receipts[0].request_fingerprint
+                    == request_fingerprint
+                )
+                if exact:
+                    raise PendingChatInputAlreadyDispatchedError(
+                        "pending input was already dispatched"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input dispatch identity was already used"
+                )
+            cancellation = await self._select_pending_chat_input_cancellation(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if cancellation is not None:
+                cancelled_session_key, _cancelled_at = cancellation
+                if cancelled_session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input cancellation belongs to a different session"
+                    )
+                raise PendingChatInputCancelledError(
+                    "pending input was durably cancelled"
+                )
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE pending_input_id = ?
+                   OR (session_key = ? AND client_request_id = ?)
+                   OR (session_key = ? AND client_message_id = ?)
+                ORDER BY created_at ASC
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    client_request_id,
+                    session_key,
+                    client_message_id,
+                ),
+            ) as cur:
+                matches = await cur.fetchall()
+            if matches:
+                rows = [self._pending_chat_input_from_row(row) for row in matches]
+                first = rows[0]
+                exact = (
+                    len(rows) == 1
+                    and first.pending_input_id == pending_input_id
+                    and first.session_key == session_key
+                    and first.source_scope == source_scope
+                    and first.client_request_id == client_request_id
+                    and first.client_message_id == client_message_id
+                    and first.request_fingerprint == request_fingerprint
+                    and first.payload == payload
+                )
+                if exact:
+                    return first, True
+                raise PendingChatInputConflictError(
+                    "pending input identity was already used for a different payload"
+                )
+
+            async with conn.execute(
+                "SELECT COUNT(*) FROM pending_chat_inputs WHERE session_key = ?",
+                (session_key,),
+            ) as cur:
+                count_row = await cur.fetchone()
+            if int(count_row[0] if count_row is not None else 0) >= MAX_PENDING_CHAT_INPUTS:
+                raise PendingChatInputCapacityError(
+                    f"session already has {MAX_PENDING_CHAT_INPUTS} pending inputs"
+                )
+            if position is None:
+                async with conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 "
+                    "FROM pending_chat_inputs WHERE session_key = ?",
+                    (session_key,),
+                ) as cur:
+                    position_row = await cur.fetchone()
+                position = int(position_row[0] if position_row is not None else 0)
+            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                raise ValueError("position must be a non-negative integer")
+            await conn.execute(
+                """
+                INSERT INTO pending_chat_inputs (
+                    pending_input_id, session_key, source_scope,
+                    client_request_id, client_message_id, request_fingerprint,
+                    payload_json, position, state_revision, created_at, updated_at,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1)
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    source_scope,
+                    client_request_id,
+                    client_message_id,
+                    request_fingerprint,
+                    payload_json,
+                    position,
+                    now,
+                    now,
+                ),
+            )
+            row = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            assert row is not None
+            return row, False
+
+    @_serialized_read
+    async def get_pending_chat_input(
+        self,
+        pending_input_id: str,
+    ) -> PendingChatInput | None:
+        return await self._select_pending_chat_input(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+        )
+
+    @_serialized_read
+    async def get_pending_chat_input_dispatch_receipt(
+        self,
+        pending_input_id: str,
+    ) -> PendingChatInputDispatchReceipt | None:
+        return await self._select_pending_chat_input_dispatch_receipt(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+        )
+
+    async def consume_replayed_pending_chat_input(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        expected_revision: int,
+    ) -> bool:
+        """Remove a stale staged row after its turn receipt already committed.
+
+        Older or racing clients may retry enqueue after another tab committed
+        dispatch but before observing its acknowledgement.  The accepted turn
+        remains exactly once through ``turn_ingress_receipts``; this repair
+        consumes the otherwise permanent queue ghost only after all durable
+        request and message identities match the dispatch receipt.
+        """
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        source_scope = source_scope.strip()
+        client_request_id = client_request_id.strip()
+        client_message_id = client_message_id.strip()
+        request_fingerprint = request_fingerprint.strip()
+        if any(
+            not value
+            for value in (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                client_message_id,
+                request_fingerprint,
+            )
+        ):
+            raise ValueError("pending dispatch replay identities must be non-empty")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+
+        async with self._write_transaction(
+            "consume_replayed_pending_chat_input"
+        ) as conn:
+            receipts = await self._find_pending_chat_input_dispatch_receipts(
+                conn,
+                pending_input_id=pending_input_id,
+                session_key=session_key,
+                source_scope=source_scope,
+                client_request_id=client_request_id,
+                client_message_id=client_message_id,
+            )
+            if len(receipts) != 1:
+                raise PendingChatInputConflictError(
+                    "pending input dispatch receipt is missing or ambiguous"
+                )
+            receipt = receipts[0]
+            if (
+                receipt.session_key != session_key
+                or receipt.source_scope != source_scope
+                or receipt.client_request_id != client_request_id
+                or receipt.client_message_id != client_message_id
+                or receipt.request_fingerprint != request_fingerprint
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input does not match its accepted dispatch receipt"
+                )
+
+            pending = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if pending is None:
+                return False
+            if (
+                pending.session_key != session_key
+                or pending.source_scope != source_scope
+                or pending.client_request_id != client_request_id
+                or pending.client_message_id != client_message_id
+                or pending.request_fingerprint != request_fingerprint
+                or pending.state_revision != expected_revision
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input changed before dispatch replay cleanup"
+                )
+            async with conn.execute(
+                """
+                DELETE FROM pending_chat_inputs
+                WHERE pending_input_id = ?
+                  AND session_key = ?
+                  AND source_scope = ?
+                  AND client_request_id = ?
+                  AND client_message_id = ?
+                  AND request_fingerprint = ?
+                  AND state_revision = ?
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    source_scope,
+                    client_request_id,
+                    client_message_id,
+                    request_fingerprint,
+                    expected_revision,
+                ),
+            ) as cur:
+                consumed = int(cur.rowcount or 0)
+            if consumed != 1:
+                raise PendingChatInputConflictError(
+                    "pending input changed before dispatch replay cleanup"
+                )
+            return True
+
+    @_serialized_read
+    async def list_pending_chat_inputs(self, session_key: str) -> list[PendingChatInput]:
+        session_key = canonicalize_session_key(session_key)
+        async with self.conn.execute(
+            """
+            SELECT * FROM pending_chat_inputs
+            WHERE session_key = ?
+            ORDER BY position ASC, created_at ASC, pending_input_id ASC
+            """,
+            (session_key,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._pending_chat_input_from_row(row) for row in rows]
+
+    async def update_pending_chat_input(
+        self,
+        pending_input_id: str,
+        *,
+        session_key: str,
+        expected_revision: int,
+        position: int,
+    ) -> PendingChatInput:
+        """Move one row using a monotonic compare-and-set revision."""
+
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+            raise ValueError("position must be a non-negative integer")
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("update_pending_chat_input") as conn:
+            async with conn.execute(
+                """
+                UPDATE pending_chat_inputs
+                SET position = ?, state_revision = state_revision + 1, updated_at = ?
+                WHERE pending_input_id = ? AND session_key = ? AND state_revision = ?
+                """,
+                (position, _now_ms(), pending_input_id, session_key, expected_revision),
+            ) as cur:
+                changed = int(cur.rowcount or 0)
+            if changed != 1:
+                existing = await self._select_pending_chat_input(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if existing is None:
+                    raise PendingChatInputNotFoundError(pending_input_id)
+                if existing.session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input belongs to a different session"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input revision changed before update"
+                )
+            row = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            assert row is not None
+            return row
+
+    async def reorder_pending_chat_inputs(
+        self,
+        *,
+        session_key: str,
+        expected_revisions: list[tuple[str, int]],
+    ) -> list[PendingChatInput]:
+        """Replace one session's complete pending order atomically.
+
+        The caller supplies every currently staged row in the desired order.
+        Comparing the complete identity set and every state revision prevents a
+        concurrent enqueue, cancel, dispatch, or peer reorder from producing a
+        partially-applied order.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        if not 2 <= len(expected_revisions) <= MAX_PENDING_CHAT_INPUTS:
+            raise ValueError(
+                f"expected_revisions must contain 2-{MAX_PENDING_CHAT_INPUTS} rows"
+            )
+        pending_ids: list[str] = []
+        revisions: dict[str, int] = {}
+        for raw_pending_id, revision in expected_revisions:
+            pending_input_id = raw_pending_id.strip()
+            if not pending_input_id or len(pending_input_id) > 256:
+                raise ValueError("pending_input_id must be a non-empty bounded string")
+            if pending_input_id in revisions:
+                raise ValueError("pending_input_id values must be unique")
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise ValueError("expected revision must be a positive integer")
+            pending_ids.append(pending_input_id)
+            revisions[pending_input_id] = revision
+
+        async with self._write_transaction("reorder_pending_chat_inputs") as conn:
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                current_rows = await cur.fetchall()
+            current = [self._pending_chat_input_from_row(row) for row in current_rows]
+            if len(current) != len(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            current_by_id = {row.pending_input_id: row for row in current}
+            if set(current_by_id) != set(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            for pending_input_id, expected_revision in revisions.items():
+                if current_by_id[pending_input_id].state_revision != expected_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before reorder"
+                    )
+
+            updated_at = _now_ms()
+            for position, pending_input_id in enumerate(pending_ids):
+                async with conn.execute(
+                    """
+                    UPDATE pending_chat_inputs
+                    SET position = ?, state_revision = state_revision + 1,
+                        updated_at = ?
+                    WHERE pending_input_id = ? AND session_key = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        position,
+                        updated_at,
+                        pending_input_id,
+                        session_key,
+                        revisions[pending_input_id],
+                    ),
+                ) as cur:
+                    if int(cur.rowcount or 0) != 1:
+                        raise PendingChatInputConflictError(
+                            "pending input changed during reorder"
+                        )
+
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                reordered_rows = await cur.fetchall()
+            return [self._pending_chat_input_from_row(row) for row in reordered_rows]
+
+    async def cancel_pending_chat_input(
+        self,
+        pending_input_id: str,
+        *,
+        session_key: str,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Cancel one staged row; missing rows are an idempotent success."""
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        async with self._write_transaction("cancel_pending_chat_input") as conn:
+            existing = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if existing is None:
+                dispatch_receipt = (
+                    await self._select_pending_chat_input_dispatch_receipt(
+                        conn,
+                        pending_input_id=pending_input_id,
+                    )
+                )
+                if dispatch_receipt is not None:
+                    if dispatch_receipt.session_key != session_key:
+                        raise PendingChatInputConflictError(
+                            "pending input dispatch belongs to a different session"
+                        )
+                    return False
+                cancellation = await self._select_pending_chat_input_cancellation(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if cancellation is not None:
+                    if cancellation[0] != session_key:
+                        raise PendingChatInputConflictError(
+                            "pending input cancellation belongs to a different session"
+                        )
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO pending_chat_input_cancellations (
+                        pending_input_id, session_key, cancelled_at, schema_version
+                    ) VALUES (?, ?, ?, 1)
+                    """,
+                    (pending_input_id, session_key, _now_ms()),
+                )
+                return False
+            if existing.session_key != session_key:
+                raise PendingChatInputConflictError(
+                    "pending input belongs to a different session"
+                )
+            if (
+                expected_revision is not None
+                and existing.state_revision != expected_revision
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input revision changed before cancellation"
+                )
+            dispatch_receipt = await self._select_pending_chat_input_dispatch_receipt(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if dispatch_receipt is not None:
+                if dispatch_receipt.session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch belongs to a different session"
+                    )
+            else:
+                cancellation = await self._select_pending_chat_input_cancellation(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if cancellation is not None and cancellation[0] != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input cancellation belongs to a different session"
+                    )
+                if cancellation is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO pending_chat_input_cancellations (
+                            pending_input_id, session_key, cancelled_at, schema_version
+                        ) VALUES (?, ?, ?, 1)
+                        """,
+                        (pending_input_id, session_key, _now_ms()),
+                    )
+            await conn.execute(
+                "DELETE FROM pending_chat_inputs WHERE pending_input_id = ?",
+                (pending_input_id,),
+            )
+            return True
 
     @staticmethod
     async def _select_meta_control_intent(
@@ -7453,7 +11974,6 @@ class SessionStorage:
         if int(node.epoch or 0) != expected_epoch + 1:
             raise ValueError("reset epoch must advance exactly once")
 
-        session_data = node.model_dump()
         async with self._write_transaction("reset_session") as conn:
             async with conn.execute(
                 """
@@ -7472,6 +11992,9 @@ class SessionStorage:
                 )
             assert previous_row is not None
             previous_node = SessionNode(**_deserialize_row(dict(previous_row)))
+            node.model_routing_mode = previous_node.model_routing_mode
+            node.model_routing_revision = previous_node.model_routing_revision
+            session_data = node.model_dump()
             snapshot = ResetArchiveSnapshot(
                 node=previous_node,
                 entries=tuple(
@@ -7489,11 +12012,25 @@ class SessionStorage:
             )
             await archive_writer(snapshot)
 
-            assignments = [f"{column} = ?" for column in session_data if column != "session_key"]
+            from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+            await purge_session_on_connection(
+                conn,
+                session_id=expected_session_id,
+                boundary="session_reset",
+            )
+
+            assignments = [
+                f"{column} = ?"
+                for column in session_data
+                if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
+            ]
             values = [
                 _serialize(value)
                 for column, value in session_data.items()
                 if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
             ]
             async with conn.execute(
                 f"UPDATE sessions SET {', '.join(assignments)} "
@@ -7512,8 +12049,18 @@ class SessionStorage:
                     session_key=node.session_key,
                     expected_epoch=expected_epoch,
                 )
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=node.session_key,
+            )
 
             await self._delete_reset_history(conn, expected_session_id)
+            # Reset rotates the Goal generation boundary.  Command receipts
+            # remain attached to the stable session key for safe replay.
+            await conn.execute(
+                "DELETE FROM session_goals WHERE session_key = ?",
+                (node.session_key,),
+            )
             await conn.execute(
                 """
                 UPDATE session_context_states
@@ -7561,6 +12108,9 @@ class SessionStorage:
             )
 
         _clear_pending_meta_launch_boundary(node.session_key)
+        from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+        await run_session_artifact_cleanup(expected_session_id, node.session_key)
 
     async def accept_turn(
         self,
@@ -7587,6 +12137,15 @@ class SessionStorage:
         expected_collaboration_revision: int | None = None,
         expected_active_plan_revision_id: str | None = None,
         require_idle_for_current_plan_implementation: bool = False,
+        goal_mutation: (
+            StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
+        ) = None,
+        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
+        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
+        prompt_annotation_turn_id: str | None = None,
+        pending_input_id: str | None = None,
+        pending_input_fingerprint: str | None = None,
+        pending_input_revision: int | None = None,
     ) -> TurnAcceptanceResult:
         """Commit one user message, optional task, and request receipt atomically.
 
@@ -7623,6 +12182,52 @@ class SessionStorage:
             raise ValueError(
                 "idle Plan implementation admission requires an accepted plan run"
             )
+        if goal_mutation is not None and plan_run is not None:
+            raise ValueError("Goal turns cannot start or claim a Plan run")
+        if goal_mutation is not None and meta_control_intent_id is not None:
+            raise ValueError("Goal turns cannot consume a MetaSkill control intent")
+        expected_prompt_annotations = tuple(expected_prompt_annotations)
+        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
+        if expected_prompt_annotations and prepared_prompt_annotation_targets:
+            raise ValueError(
+                "prompt annotation acceptance cannot use legacy and prepared inputs together"
+            )
+        prompt_annotation_acceptance = bool(
+            expected_prompt_annotations or prepared_prompt_annotation_targets
+        )
+        if prompt_annotation_acceptance:
+            if session_node is not None or merge_into_task:
+                raise ValueError(
+                    "prompt annotations require an existing session and a distinct turn"
+                )
+            if not isinstance(prompt_annotation_turn_id, str) or not (
+                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
+            ):
+                raise ValueError("prompt_annotation_turn_id is required")
+        pending_guard_values = (
+            pending_input_id,
+            pending_input_fingerprint,
+            pending_input_revision,
+        )
+        if any(value is not None for value in pending_guard_values) and not all(
+            value is not None for value in pending_guard_values
+        ):
+            raise ValueError("pending input dispatch guard must be complete")
+        if pending_input_id is not None:
+            pending_input_id = pending_input_id.strip()
+            pending_input_fingerprint = str(pending_input_fingerprint).strip()
+            if not pending_input_id or not pending_input_fingerprint:
+                raise ValueError("pending input dispatch identity must not be blank")
+            if request_fingerprint != pending_input_fingerprint:
+                raise PendingChatInputConflictError(
+                    "pending input fingerprint must match the accepted turn fingerprint"
+                )
+            if (
+                isinstance(pending_input_revision, bool)
+                or not isinstance(pending_input_revision, int)
+                or pending_input_revision < 1
+            ):
+                raise ValueError("pending input revision must be a positive integer")
 
         request_session_key = canonicalize_session_key(request_session_key)
         entry.session_key = canonicalize_session_key(entry.session_key)
@@ -7631,6 +12236,44 @@ class SessionStorage:
             task_record.agent_id = normalize_agent_id(task_record.agent_id)
             if task_record.session_key != entry.session_key:
                 raise ValueError("task and transcript session keys must match")
+        if isinstance(goal_mutation, StartGoalMutation):
+            if task_record is None or merge_into_task:
+                raise ValueError("Goal set requires one newly accepted runtime task")
+            goal_mutation.goal.session_key = canonicalize_session_key(
+                goal_mutation.goal.session_key
+            )
+            # Storage owns the atomic transcript/Goal binding. Callers created
+            # before the anchor field existed may omit it, but no caller may
+            # bind a Goal to a different transcript row.
+            if goal_mutation.goal.source_user_message_id is None:
+                goal_mutation.goal.source_user_message_id = entry.message_id
+            goal_mutation.goal.objective = normalize_goal_objective(
+                goal_mutation.goal.objective
+            )
+            command = self._prepare_goal_command(
+                goal_mutation.command,
+                action="set",
+                session_key=entry.session_key,
+            )
+            goal_mutation = replace(goal_mutation, command=command)
+            if (
+                goal_mutation.goal.session_key != entry.session_key
+                or goal_mutation.goal.session_id != entry.session_id
+                or goal_mutation.goal.session_epoch != expected_epoch
+                or goal_mutation.goal.active_task_id != task_record.task_id
+                or goal_mutation.goal.source_user_message_id != entry.message_id
+                or command.source_scope != source_scope.strip()
+                or command.client_request_id != client_request_id.strip()
+                or command.request_fingerprint != request_fingerprint
+            ):
+                raise ValueError(
+                    "Goal set, transcript, task and idempotency identities must match"
+                )
+        elif isinstance(
+            goal_mutation,
+            (ClaimGoalMutation, ClaimCurrentGoalMutation),
+        ) and task_record is None:
+            raise ValueError("Goal claim requires an accepted runtime task")
         if receipt_task_id is not None:
             receipt_task_id = receipt_task_id.strip()
             if not receipt_task_id:
@@ -7731,6 +12374,7 @@ class SessionStorage:
                 "active_plan_revision_id may only select the accepted plan run"
             )
 
+        pending_dispatch_client_message_id: str | None = None
         async with self._write_transaction("accept_turn") as conn:
             selected = await self._select_turn_ingress_receipt(
                 conn,
@@ -7739,11 +12383,17 @@ class SessionStorage:
                 client_request_id=client_request_id,
             )
             if selected is not None:
-                receipt, task_status, fresh_user_session = selected
+                receipt, task_status, fresh_user_session, task_details = selected
                 if receipt.request_fingerprint != request_fingerprint:
+                    if isinstance(goal_mutation, StartGoalMutation):
+                        raise GoalConflictError(
+                            "IDEMPOTENCY_CONFLICT",
+                            "clientRequestId was already used for a different Goal command",
+                        )
                     raise TurnIngressConflictError(
                         "client_request_id was already used for a different turn"
                     )
+                goal_command_result: GoalCommandResult | None = None
                 # Repair an outbox left by an older build that committed the
                 # receipt before learning to consume drafts atomically.
                 await conn.execute(
@@ -7753,12 +12403,137 @@ class SessionStorage:
                     """,
                     (request_session_key, client_request_id),
                 )
+                if pending_input_id is not None:
+                    dispatch_receipt = (
+                        await self._select_pending_chat_input_dispatch_receipt(
+                            conn,
+                            pending_input_id=pending_input_id,
+                        )
+                    )
+                    if dispatch_receipt is None or (
+                        dispatch_receipt.session_key != request_session_key
+                        or dispatch_receipt.source_scope != source_scope
+                        or dispatch_receipt.client_request_id != client_request_id
+                        or dispatch_receipt.request_fingerprint
+                        != pending_input_fingerprint
+                    ):
+                        raise PendingChatInputConflictError(
+                            "pending input is not bound to the accepted turn receipt"
+                        )
+                    pending = await self._select_pending_chat_input(
+                        conn,
+                        pending_input_id=pending_input_id,
+                    )
+                    if pending is not None:
+                        if (
+                            pending.session_key != request_session_key
+                            or pending.source_scope != source_scope
+                            or pending.client_request_id != client_request_id
+                            or pending.client_message_id
+                            != dispatch_receipt.client_message_id
+                            or pending.request_fingerprint
+                            != pending_input_fingerprint
+                            or pending.state_revision != pending_input_revision
+                        ):
+                            raise PendingChatInputConflictError(
+                                "pending input does not match the accepted turn receipt"
+                            )
+                        await conn.execute(
+                            "DELETE FROM pending_chat_inputs WHERE pending_input_id = ?",
+                            (pending_input_id,),
+                        )
+                if isinstance(goal_mutation, StartGoalMutation):
+                    goal_command_result = await self._replay_goal_command_on_conn(
+                        conn,
+                        goal_mutation.command,
+                    )
+                    if goal_command_result is None:
+                        raise RuntimeError(
+                            "Goal turn receipt exists without its atomic command receipt"
+                        )
                 return TurnAcceptanceResult(
                     receipt=receipt,
                     replayed=True,
                     fresh_user_session=fresh_user_session,
                     task_status=task_status,
+                    goal=(
+                        goal_command_result.goal
+                        if goal_command_result is not None
+                        else None
+                    ),
+                    goal_command_response=(
+                        goal_command_result.response
+                        if goal_command_result is not None
+                        else None
+                    ),
+                    goal_context=GoalTurnContext.from_task_detail(
+                        task_details.get("goal_context")
+                    ),
+                    goal_candidate=GoalClaimCandidate.from_task_detail(
+                        task_details.get("goal_candidate")
+                    ),
                 )
+
+            if prompt_annotation_acceptance:
+                from opensquilla.artifact_session import (
+                    consume_prepared_prompt_annotations_on_conn,
+                    consume_prompt_annotations_on_conn,
+                )
+
+                assert prompt_annotation_turn_id is not None
+                if prepared_prompt_annotation_targets:
+                    await consume_prepared_prompt_annotations_on_conn(
+                        conn,
+                        prepared_targets=prepared_prompt_annotation_targets,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+                else:
+                    await consume_prompt_annotations_on_conn(
+                        conn,
+                        expected_annotations=expected_prompt_annotations,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+            if pending_input_id is not None:
+                pending = await self._select_pending_chat_input(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if pending is None:
+                    raise PendingChatInputNotFoundError(pending_input_id)
+                if (
+                    pending.session_key != request_session_key
+                    or pending.source_scope != source_scope
+                    or pending.client_request_id != client_request_id
+                    or pending.request_fingerprint != pending_input_fingerprint
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch identity changed before acceptance"
+                    )
+                if pending.state_revision != pending_input_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before acceptance"
+                    )
+                turn_context = entry.turn_context if isinstance(entry.turn_context, dict) else {}
+                turn_client_message_id = turn_context.get("client_message_id")
+                if (
+                    isinstance(turn_client_message_id, str)
+                    and turn_client_message_id
+                    and turn_client_message_id != pending.client_message_id
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input message identity changed before acceptance"
+                    )
+                pending_dispatch_client_message_id = pending.client_message_id
 
             if meta_control_intent_id is not None:
                 if task_record is None:
@@ -7811,6 +12586,16 @@ class SessionStorage:
                 ):
                     raise MetaControlIntentConflictError(
                         "MetaSkill control task lost its authorized payload"
+                    )
+
+            if isinstance(goal_mutation, StartGoalMutation):
+                command_replay = await self._replay_goal_command_on_conn(
+                    conn,
+                    goal_mutation.command,
+                )
+                if command_replay is not None:
+                    raise RuntimeError(
+                        "Goal command receipt exists without its atomic turn receipt"
                     )
 
             # Existing-session Plan operations require compare-and-set guards
@@ -7891,6 +12676,11 @@ class SessionStorage:
             )
 
             reset_archive_snapshot: ResetArchiveSnapshot | None = None
+            accepted_goal: GoalRecord | None = None
+            accepted_goal_context: GoalTurnContext | None = None
+            accepted_goal_candidate: GoalClaimCandidate | None = None
+            accepted_goal_command_response: dict[str, Any] | None = None
+            accepted_goal_previous_id: str | None = None
             if session_node is not None:
                 session_data = session_node.model_dump()
                 if reset_from_session_id is None:
@@ -7900,6 +12690,10 @@ class SessionStorage:
                         f"INSERT INTO sessions ({', '.join(session_cols)}) "
                         f"VALUES ({session_placeholders})",
                         [_serialize(session_data[col]) for col in session_cols],
+                    )
+                    await self._ensure_usage_baseline_for_session_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
                     )
                 else:
                     previous_epoch = max(0, expected_epoch - 1)
@@ -7926,6 +12720,10 @@ class SessionStorage:
                     previous_node = SessionNode(
                         **_deserialize_row(dict(previous_row))
                     )
+                    session_node.model_routing_mode = previous_node.model_routing_mode
+                    session_node.model_routing_revision = (
+                        previous_node.model_routing_revision
+                    )
                     reset_archive_snapshot = ResetArchiveSnapshot(
                         node=previous_node,
                         entries=tuple(
@@ -7944,15 +12742,26 @@ class SessionStorage:
                     if reset_archive_writer is not None:
                         await reset_archive_writer(reset_archive_snapshot)
                         reset_archive_snapshot = None
+                    from opensquilla.artifact_session.lifecycle import (
+                        purge_session_on_connection,
+                    )
+
+                    await purge_session_on_connection(
+                        conn,
+                        session_id=reset_from_session_id,
+                        boundary="session_reset",
+                    )
                     assignments = [
                         f"{column} = ?"
                         for column in session_data
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     values = [
                         _serialize(value)
                         for column, value in session_data.items()
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     async with conn.execute(
                         f"UPDATE sessions SET {', '.join(assignments)} "
@@ -7971,7 +12780,15 @@ class SessionStorage:
                             session_key=session_node.session_key,
                             expected_epoch=previous_epoch,
                         )
+                    await self._ensure_usage_baseline_for_session_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                    )
                     await self._delete_reset_history(conn, reset_from_session_id)
+                    await conn.execute(
+                        "DELETE FROM session_goals WHERE session_key = ?",
+                        (session_node.session_key,),
+                    )
                     await conn.execute(
                         """
                         UPDATE session_context_states
@@ -8044,6 +12861,193 @@ class SessionStorage:
                             *sorted(PLAN_RUN_ACTIVE_STATUSES),
                         ],
                     )
+
+            if isinstance(goal_mutation, StartGoalMutation):
+                assert task_record is not None
+                goal = goal_mutation.goal
+                if (
+                    goal.status != GoalStatus.ACTIVE.value
+                    or goal.state_revision != 1
+                    or goal.objective_revision != 1
+                    or goal.progress_revision != 0
+                    or goal.continuation_seq != 0
+                    or goal.active_task_id != task_record.task_id
+                    or goal.source_user_message_id != entry.message_id
+                    or goal.terminal_task_id is not None
+                    or goal.turns_started != 1
+                    or goal.turns_settled != 0
+                    or goal.window_turns_started != 1
+                ):
+                    raise GoalValidationError(
+                        "Goal set requires a fresh Goal bound to its first task",
+                        code="INVALID_GOAL_COMMAND",
+                    )
+                current = await self._select_goal_on_conn(
+                    conn,
+                    session_key=entry.session_key,
+                )
+                if current is not None:
+                    if current.status in GOAL_UNFINISHED_STATUSES:
+                        raise GoalConflictError(
+                            "GOAL_ACTIVE",
+                            "An unfinished Goal already exists for this session",
+                            current=current,
+                        )
+                    if current.active_task_id is not None:
+                        raise GoalConflictError(
+                            "GOAL_BUSY",
+                            "The completed Goal still owns an unsettled task",
+                            current=current,
+                        )
+                await self._require_default_goal_mode_on_conn(conn, goal=goal)
+                await self._require_idle_goal_session_on_conn(
+                    conn,
+                    session_key=entry.session_key,
+                )
+                if current is not None:
+                    accepted_goal_previous_id = current.goal_id
+                    await conn.execute(
+                        "DELETE FROM session_goals WHERE session_key = ?",
+                        (entry.session_key,),
+                    )
+                accepted_goal_context = goal_turn_context(
+                    goal,
+                    task_id=task_record.task_id,
+                    automatic=False,
+                )
+                task_details = dict(task_record.details or {})
+                task_details.pop("goal_candidate", None)
+                task_details["goal_context"] = accepted_goal_context.as_task_detail()
+                task_record.details = task_details
+                await self._insert_goal_on_conn(conn, goal)
+                accepted_goal = goal
+
+            elif isinstance(
+                goal_mutation,
+                (ClaimGoalMutation, ClaimCurrentGoalMutation),
+            ):
+                assert task_record is not None
+                current = await self._select_goal_on_conn(
+                    conn,
+                    session_key=entry.session_key,
+                )
+                if isinstance(goal_mutation, ClaimCurrentGoalMutation):
+                    matching_active = (
+                        current is not None
+                        and current.session_id == entry.session_id
+                        and current.session_epoch == expected_epoch
+                        and current.status == GoalStatus.ACTIVE.value
+                    )
+                    candidate = (
+                        GoalClaimCandidate(
+                            session_id=current.session_id,
+                            epoch=current.session_epoch,
+                            goal_id=current.goal_id,
+                        )
+                        if matching_active and current is not None
+                        else None
+                    )
+                else:
+                    candidate = goal_mutation.candidate
+                    matching_active = (
+                        current is not None
+                        and current.session_id == candidate.session_id
+                        and current.session_epoch == candidate.epoch
+                        and current.goal_id == candidate.goal_id
+                        and current.status == GoalStatus.ACTIVE.value
+                    )
+                if matching_active:
+                    assert current is not None and candidate is not None
+                    async with conn.execute(
+                        """
+                        SELECT collaboration_mode FROM sessions
+                        WHERE session_key = ? AND session_id = ? AND epoch = ?
+                        """,
+                        (entry.session_key, entry.session_id, expected_epoch),
+                    ) as mode_cur:
+                        mode_row = await mode_cur.fetchone()
+                    mode_is_default = (
+                        mode_row is not None
+                        and str(mode_row["collaboration_mode"])
+                        == CollaborationMode.DEFAULT.value
+                    )
+                    async with conn.execute(
+                        """
+                        SELECT 1 FROM agent_tasks
+                        WHERE session_key = ? AND status IN (?, ?)
+                        LIMIT 1
+                        """,
+                        (
+                            entry.session_key,
+                            AgentTaskStatus.QUEUED.value,
+                            AgentTaskStatus.RUNNING.value,
+                        ),
+                    ) as busy_cur:
+                        has_existing_task = await busy_cur.fetchone() is not None
+                    async with conn.execute(
+                        """
+                        SELECT 1 FROM plan_runs
+                        WHERE session_key = ?
+                          AND driver_kind = 'manual'
+                          AND status IN ('queued', 'running', 'paused', 'blocked')
+                        LIMIT 1
+                        """,
+                        (entry.session_key,),
+                    ) as plan_cur:
+                        has_manual_plan_run = await plan_cur.fetchone() is not None
+                    can_claim_now = (
+                        mode_is_default
+                        and current.active_task_id is None
+                        and not has_existing_task
+                        and not has_manual_plan_run
+                        and not merge_into_task
+                    )
+                    task_details = dict(task_record.details or {})
+                    if can_claim_now:
+                        accepted_goal_context = goal_turn_context(
+                            current,
+                            task_id=task_record.task_id,
+                            automatic=False,
+                        )
+                        task_details.pop("goal_candidate", None)
+                        task_details["goal_context"] = (
+                            accepted_goal_context.as_task_detail()
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE session_goals
+                            SET active_task_id = ?,
+                                terminal_task_id = NULL,
+                                turns_started = turns_started + 1,
+                                window_turns_started = window_turns_started + 1,
+                                state_revision = state_revision + 1,
+                                updated_at_ms = ?
+                            WHERE session_key = ? AND goal_id = ?
+                              AND active_task_id IS NULL AND status = 'active'
+                            """,
+                            (
+                                task_record.task_id,
+                                updated_at,
+                                entry.session_key,
+                                current.goal_id,
+                            ),
+                        )
+                        accepted_goal = await self._select_goal_on_conn(
+                            conn,
+                            session_key=entry.session_key,
+                        )
+                    else:
+                        task_details["goal_candidate"] = candidate.as_task_detail()
+                        accepted_goal_candidate = candidate
+                    task_record.details = task_details
+                else:
+                    # The candidate is advisory.  A generation/status mismatch
+                    # turns this into an ordinary user task, including when it
+                    # is collected into a queued task that carried an older
+                    # candidate in memory or durable details.
+                    task_details = dict(task_record.details or {})
+                    task_details.pop("goal_candidate", None)
+                    task_record.details = task_details
 
             if plan_revision is not None:
                 await self._create_plan_revision_on_conn(
@@ -8176,7 +13180,14 @@ class SessionStorage:
                     if isinstance(task_metadata_raw, dict)
                     else {}
                 )
-                if task_metadata.get("required_collaboration_mode") in {
+                if accepted_goal_context is not None:
+                    task_metadata["required_collaboration_mode"] = "default"
+                    task_metadata["required_collaboration_revision"] = int(
+                        accepted_collaboration_row["collaboration_revision"]
+                    )
+                    task_details["metadata"] = task_metadata
+                    task_record.details = task_details
+                elif task_metadata.get("required_collaboration_mode") in {
                     "default",
                     "plan",
                 }:
@@ -8214,6 +13225,24 @@ class SessionStorage:
                         else {}
                     )
                     details = {**existing_details, **incoming_details}
+                    if (
+                        isinstance(
+                            goal_mutation,
+                            (ClaimGoalMutation, ClaimCurrentGoalMutation),
+                        )
+                        and accepted_goal_context is None
+                        and accepted_goal_candidate is None
+                    ):
+                        details.pop("goal_candidate", None)
+                    # A queued task that already owns a frozen Goal context
+                    # remains that same Goal turn when later user input is
+                    # collected into it.  The current-Goal marker may have
+                    # produced an advisory candidate for the incoming input,
+                    # but durable task details must never carry both forms.
+                    if GoalTurnContext.from_task_detail(
+                        details.get("goal_context")
+                    ) is not None:
+                        details.pop("goal_candidate", None)
                     message_ids = _ordered_detail_message_ids(
                         existing_details.get("persisted_user_message_id"),
                         existing_details.get("persisted_user_message_ids"),
@@ -8285,6 +13314,41 @@ class SessionStorage:
                     task_record.details = details
                     await self._insert_agent_task(conn, task_record)
 
+                authoritative_task_details = dict(task_record.details or {})
+                accepted_goal_context = (
+                    accepted_goal_context
+                    or GoalTurnContext.from_task_detail(
+                        authoritative_task_details.get("goal_context")
+                    )
+                )
+                if accepted_goal_context is None:
+                    accepted_goal_candidate = GoalClaimCandidate.from_task_detail(
+                        authoritative_task_details.get("goal_candidate")
+                    )
+                else:
+                    accepted_goal_candidate = None
+
+            if isinstance(goal_mutation, StartGoalMutation):
+                assert accepted_goal is not None
+                assert task_record is not None
+                accepted_goal_command_response = self._goal_mutation_response(
+                    command=goal_mutation.command,
+                    goal=accepted_goal,
+                    session_id=accepted_goal.session_id,
+                    epoch=accepted_goal.session_epoch,
+                    task_id=task_record.task_id,
+                    user_message_id=entry.message_id,
+                    previous_goal_id=accepted_goal_previous_id,
+                    execution_state="queued",
+                )
+                await self._insert_goal_command_receipt_on_conn(
+                    conn,
+                    command=goal_mutation.command,
+                    accepted_session_id=accepted_goal.session_id,
+                    accepted_session_epoch=accepted_goal.session_epoch,
+                    response=accepted_goal_command_response,
+                )
+
             receipt = TurnIngressReceipt(
                 source_scope=source_scope,
                 request_session_key=request_session_key,
@@ -8307,6 +13371,50 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
+            if pending_input_id is not None:
+                if pending_dispatch_client_message_id is None:
+                    raise AssertionError(
+                        "validated pending input lost its client message identity"
+                    )
+                try:
+                    await self._insert_pending_chat_input_dispatch_receipt(
+                        conn,
+                        pending_input_id=pending_input_id,
+                        session_key=request_session_key,
+                        source_scope=source_scope,
+                        client_request_id=client_request_id,
+                        client_message_id=pending_dispatch_client_message_id,
+                        request_fingerprint=str(pending_input_fingerprint),
+                        accepted_at=receipt.accepted_at,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch identity was already consumed"
+                    ) from exc
+                async with conn.execute(
+                    """
+                    DELETE FROM pending_chat_inputs
+                    WHERE pending_input_id = ?
+                      AND session_key = ?
+                      AND source_scope = ?
+                      AND client_request_id = ?
+                      AND request_fingerprint = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        pending_input_id,
+                        request_session_key,
+                        source_scope,
+                        client_request_id,
+                        pending_input_fingerprint,
+                        pending_input_revision,
+                    ),
+                ) as cur:
+                    consumed = int(cur.rowcount or 0)
+                if consumed != 1:
+                    raise PendingChatInputConflictError(
+                        "pending input changed before atomic dispatch"
+                    )
             await conn.execute(
                 """
                 DELETE FROM meta_launch_drafts
@@ -8360,6 +13468,10 @@ class SessionStorage:
                     if accepted_collaboration_row["active_plan_revision_id"] is not None
                     else None
                 ),
+                goal=accepted_goal,
+                goal_context=accepted_goal_context,
+                goal_candidate=accepted_goal_candidate,
+                goal_command_response=accepted_goal_command_response,
             )
         if reset_from_session_id is not None:
             _clear_pending_meta_launch_boundary(
@@ -8367,21 +13479,134 @@ class SessionStorage:
                 preserve_client_request_id=client_request_id,
                 preserve_message=entry.content,
             )
+            from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+            await run_session_artifact_cleanup(reset_from_session_id, entry.session_key)
         return acceptance_result
 
-    @_serialized_read
-    async def get_transcript(
-        self, session_id: str, limit: int | None = None, offset: int = 0
-    ) -> list[TranscriptEntry]:
+    async def _fetchall_transcript_rows(self, cursor: Any) -> list[Any]:
+        return cast(
+            list[Any],
+            await self._finish_sqlite_call(cursor.fetchall()),
+        )
+
+    async def _fetch_transcript_rows(
+        self,
+        conn: Any,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
         # SQLite requires LIMIT before OFFSET; use -1 for unlimited
         limit_val = limit if limit is not None else -1
         sql = (
             "SELECT * FROM transcript_entries WHERE session_id = ? "
             "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"
         )
-        async with self.conn.execute(sql, (session_id, limit_val, offset)) as cur:
-            rows = await cur.fetchall()
-        return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
+        async with conn.execute(sql, (session_id, limit_val, offset)) as cur:
+            return await self._fetchall_transcript_rows(cur)
+
+    async def _fetch_transcript_rows_on_writer(
+        self,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            async with self._operation_lock:
+                self._raise_if_poisoned()
+                return cast(
+                    list[Any],
+                    await self._finish_sqlite_call(
+                        self._fetch_transcript_rows(
+                            self.conn,
+                            session_id,
+                            limit,
+                            offset,
+                        )
+                    )
+                )
+
+        started = self._monotonic()
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._operation_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_operation_lock",
+                ) from exc
+            acquired = True
+            self._raise_if_poisoned()
+            return cast(
+                list[Any],
+                await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        self.conn,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            )
+        finally:
+            if acquired:
+                self._operation_lock.release()
+
+    @asynccontextmanager
+    async def _transcript_reader_access(self) -> AsyncIterator[Any | None]:
+        acquired = False
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            await self._transcript_reader_lock.acquire()
+            acquired = True
+        else:
+            started = self._monotonic()
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._transcript_reader_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_transcript_reader_lock",
+                ) from exc
+            acquired = True
+        try:
+            self._raise_if_poisoned()
+            yield self._transcript_reader
+        finally:
+            if acquired:
+                self._transcript_reader_lock.release()
+
+    async def get_transcript(
+        self, session_id: str, limit: int | None = None, offset: int = 0
+    ) -> list[TranscriptEntry]:
+        async with self._transcript_reader_access() as reader:
+            if reader is not None:
+                rows = await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        reader,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            else:
+                rows = None
+        if rows is None:
+            rows = await self._fetch_transcript_rows_on_writer(
+                session_id,
+                limit,
+                offset,
+            )
+        return await asyncio.to_thread(_decode_transcript_rows, rows)
 
     @_serialized_read
     async def get_canonical_transcript(
@@ -9141,6 +14366,7 @@ class SessionStorage:
         source_session_id: str,
         target_session_id: str,
         target_session_key: str,
+        terminal_outcome_projections: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         """Copy archived compacted transcript rows into a forked session."""
         async with self._write_transaction("copy_compacted_transcript_entries") as conn:
@@ -9199,6 +14425,27 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
+            if terminal_outcome_projections is None:
+                return
+            async with conn.execute(
+                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "WHERE session_id = ?",
+                (target_session_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                context = _json_object_or_none(row["turn_context"])
+                turn_id = turn_id_from_context(context)
+                rebound_context = attach_fork_terminal_outcome_projection(
+                    context,
+                    terminal_outcome_projections.get(turn_id or ""),
+                )
+                if rebound_context == context:
+                    continue
+                await conn.execute(
+                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
+                    (_serialize(rebound_context), row["id"]),
+                )
 
     @_serialized_read
     async def count_transcript_entries(self, session_id: str) -> int:
@@ -9625,7 +14872,7 @@ class SessionStorage:
                 node_placeholders = ", ".join("?" for _ in node_cols)
                 node_updates: list[str] = []
                 for col in node_cols:
-                    if col == "session_key":
+                    if col == "session_key" or col in _SESSION_DEDICATED_WRITER_COLUMNS:
                         continue
                     if col == "epoch":
                         node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")

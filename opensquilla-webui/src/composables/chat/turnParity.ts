@@ -236,6 +236,9 @@ function compareTimeline(
     // folded html would spuriously diverge from the still-stale legacy html
     // during that window. Whole-turn rawText equality (above) plus type+key
     // parity here covers text correctness.
+    if (a.type === 'text' && b.type === 'text' && a.presentation !== b.presentation) {
+      problems.push(`timeline text ${i} presentation diverges`)
+    }
     if (a.type === 'tool-group' && b.type === 'tool-group') {
       if (a.group.groupId !== b.group.groupId) {
         problems.push(`timeline tool-group ${i} groupId diverges`)

@@ -62,12 +62,41 @@ afterEach(() => {
 })
 
 describe('ActivityDisclosure lifecycle transitions', () => {
+  it('renders queued then running as explicit live lifecycle phases', async () => {
+    const state = reactive({ phase: 'Queued' })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: 'working',
+        defaultOpen: true,
+        stepCount: 0,
+        failureCount: 0,
+        phaseLabel: state.phase,
+        elapsedLabel: '0s',
+      }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const label = host.querySelector('.assistant-activity__live-label')
+    expect(label?.textContent).toBe('Queued')
+    expect(host.textContent).not.toContain('Waiting for model')
+
+    state.phase = 'Running'
+    await nextTick()
+    expect(label?.textContent).toBe('Running')
+  })
+
   it('uses AA text tokens and no text shimmer for the live header', () => {
     const rule = cssRule('.assistant-activity__summary')
     expect(rule).toContain('color: var(--text-muted);')
 
     const elapsedRule = cssRule('.assistant-activity__live-elapsed')
     expect(elapsedRule).toContain('color: var(--text-muted);')
+    expect(elapsedRule).toContain('font-size: inherit;')
 
     // The pulsing dot is the single "working" signal: the shimmer treatment
     // (gradient text + keyframes + its reduced-motion undo) must stay gone.
@@ -142,6 +171,116 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
       .toBe('false')
   })
+
+  it('forces a terminal transition closed and allows reopening afterwards', async () => {
+    const state = reactive({ lifecycle: 'working' as 'working' | 'settled' })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: state.lifecycle,
+        defaultOpen: state.lifecycle === 'working',
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: 'message-manual-expansion',
+        continuityKey: 'turn-manual-expansion',
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const liveSummary = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')
+    expect(liveSummary?.getAttribute('aria-expanded')).toBe('true')
+    liveSummary?.click()
+    await nextTick()
+    liveSummary?.click()
+    await nextTick()
+    expect(liveSummary?.getAttribute('aria-expanded')).toBe('true')
+
+    state.lifecycle = 'settled'
+    await nextTick()
+
+    const settledSummary = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(settledSummary?.getAttribute('aria-expanded'))
+      .toBe('false')
+    settledSummary?.click()
+    await nextTick()
+    expect(settledSummary?.getAttribute('aria-expanded'))
+      .toBe('true')
+  })
+
+  it('preserves a terminal manual reopen across same-turn canonical identity reconcile', async () => {
+    const state = reactive({
+      lifecycle: 'working' as 'working' | 'settled',
+      stateKey: 'message-live',
+      continuityKey: 'turn-stable',
+    })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: state.lifecycle,
+        defaultOpen: state.lifecycle === 'working',
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: state.stateKey,
+        continuityKey: state.continuityKey,
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    state.lifecycle = 'settled'
+    await nextTick()
+    const summary = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(summary?.getAttribute('aria-expanded')).toBe('false')
+
+    state.stateKey = 'message-canonical'
+    await nextTick()
+    // Canonical history may replace the optimistic message identity before the
+    // user reopens the finished turn.
+    summary?.click()
+    await nextTick()
+    expect(summary?.getAttribute('aria-expanded')).toBe('true')
+
+    // A canonical-history reconciliation can replace the entire message
+    // component with the earlier optimistic identity. That identity still has
+    // its terminal auto-collapse persisted, so a new component must choose the
+    // newer same-turn continuity write made by the user's explicit reopen.
+    mountedApps.pop()
+    app.unmount()
+    const reconciled = reactive({
+      stateKey: 'message-live',
+      continuityKey: 'turn-stable',
+    })
+    const reconciledApp = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: 'settled',
+        defaultOpen: false,
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: reconciled.stateKey,
+        continuityKey: reconciled.continuityKey,
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(reconciledApp)
+    reconciledApp.use(i18n)
+    reconciledApp.mount(host)
+    await nextTick()
+    const reconciledSummary = host.querySelector<HTMLButtonElement>(
+      '.assistant-activity__summary',
+    )
+    expect(reconciledSummary?.getAttribute('aria-expanded')).toBe('true')
+
+    reconciled.stateKey = 'message-next-turn'
+    reconciled.continuityKey = 'turn-next'
+    await nextTick()
+    expect(reconciledSummary?.getAttribute('aria-expanded')).toBe('false')
+  })
 })
 
 describe('ActivityDisclosure resting affordance', () => {
@@ -169,6 +308,15 @@ describe('ActivityDisclosure resting affordance', () => {
 })
 
 describe('ActivityDisclosure summary label', () => {
+  it('makes the completed outcome larger than its supporting phase rows', () => {
+    expect(cssRule('.assistant-activity--settled > .assistant-activity__summary'))
+      .toContain('font-size: 0.875rem;')
+    expect(activityDisclosureSource).toContain(
+      '.assistant-activity--settled :deep(.assistant-activity-status__row)',
+    )
+    expect(activityDisclosureSource).toContain('font-size: 0.75rem;')
+  })
+
   it('prefers a supplied summaryLabel without surfacing failure metadata', async () => {
     const host = mountDisclosure({
       lifecycle: 'settled',
@@ -245,7 +393,6 @@ describe('ActivityDisclosure live header', () => {
     const body = host.querySelector<HTMLElement>('.assistant-activity__body')
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
     expect(body?.getAttribute('aria-hidden')).toBe('true')
-    expect(body?.classList.contains('is-open')).toBe(false)
     expect(host.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
 
     summary?.click()
@@ -253,7 +400,7 @@ describe('ActivityDisclosure live header', () => {
 
     expect(summary?.getAttribute('aria-expanded')).toBe('true')
     expect(body?.getAttribute('aria-hidden')).toBe('false')
-    expect(body?.classList.contains('is-open')).toBe(true)
+    expect(host.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('true')
   })
 
   it('renders live step count without surfacing failures', async () => {
@@ -354,7 +501,9 @@ describe('ActivityDisclosure expanded boundary', () => {
     expect(bodyRule).toContain('grid-template-rows var(--dur-base)')
     expect(bodyRule).toContain('opacity: 0;')
 
-    const openRule = cssRule('.assistant-activity__body.is-open')
+    const openRule = cssRule(
+      '.assistant-activity[data-share-expanded="true"] > .assistant-activity__body',
+    )
     expect(openRule).toContain('grid-template-rows: 1fr;')
     expect(openRule).toContain('opacity: 1;')
 

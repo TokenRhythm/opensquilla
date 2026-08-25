@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from opensquilla.scheduler.payloads import payload_kind
 from opensquilla.scheduler.types import (
     CronJob,
     DeliveryConfig,
@@ -425,6 +426,7 @@ class DeliveryChain:
         payload = {
             "jobId": job.id,
             "jobName": job.name,
+            "payloadKind": payload_kind(job.payload, job.session_target),
             "success": success,
             "summary": summary,
             "error": error,

@@ -5,6 +5,7 @@
   "onEmpty": "working tree clean",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["status"],
     "argvIncludes": [["status"]]
   },
   "transforms": {
@@ -15,13 +16,12 @@
   "filters": {
     "skipPatterns": [
       "^On branch ",
-      "^Your branch is ",
-      "^and have \\d+ and \\d+ different commits each.*$",
-      "^\\(use \"git .+\" to .+\\)$",
+      "^Your branch is up to date with .+$",
+      "^\\s*\\(use \"git .+\" to .+\\)$",
       "^no changes added to commit.*$",
       "^nothing added to commit but untracked files present.*$",
       "^nothing to commit, working tree clean$",
-      "^use \"git .+\" to .+"
+      "^\\s*use \"git .+\" to .+"
     ]
   },
   "summarize": {

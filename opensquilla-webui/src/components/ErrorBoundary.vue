@@ -54,6 +54,9 @@ import { errorBoundaryMessage, errorBoundaryDetails } from './errorBoundaryDetai
 // i18n instance being present when it has to render.
 const { t } = useI18n({ useScope: 'global' })
 const platform = usePlatform()
+const emit = defineEmits<{
+  'error-captured': [error: unknown]
+}>()
 
 const hasError = ref(false)
 const errorMessage = ref('')
@@ -72,6 +75,7 @@ onErrorCaptured((err: unknown) => {
   errorDetails.value = errorBoundaryDetails(err)
   copied.value = false
   actionError.value = ''
+  emit('error-captured', err)
   console.error('[ErrorBoundary]', errorDetails.value || errorMessage.value || 'Unknown error')
   return false // Prevent error from propagating
 })

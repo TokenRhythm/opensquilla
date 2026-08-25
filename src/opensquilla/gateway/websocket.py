@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -33,8 +34,14 @@ from opensquilla.gateway.protocol import (
     SnapshotInfo,
     make_error_res,
     make_event,
+    project_session_event_for_client,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
+from opensquilla.gateway.rpc.ingress import (
+    RpcIngressValidationError,
+    is_utf8_encodable,
+    validate_rpc_ingress,
+)
 from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 log = structlog.get_logger(__name__)
@@ -70,9 +77,46 @@ _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
-_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"})
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
+# Keep this list side-effect free: the Web UI uses the advertised methods to
+# turn a reconnect-on-timeout fallback into a request-local rejection.
+_CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "agents.list",
+        "artifacts.list",
+        "commands.list_for_surface",
+        "config.get",
+        "models.routing.get",
+        "onboarding.status",
+        "sandbox.run_mode.preference.get",
+        "sessions.list",
+        "usage.status",
+        "workspaces.list",
+    }
+)
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
+    {"meta.drafts.list", "skills.install"}
+).union(
+    _CONCURRENT_OPTIONAL_READ_METHODS
+)
+# Reserve one bounded slot for every method that may legitimately run detached.
+# A fresh WebUI can issue every optional metadata read plus draft recovery before
+# the first responses arrive; keeping this derived from the allowlist prevents a
+# newly advertised read from silently outgrowing the bootstrap budget again.
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = len(_DETACHED_RPC_METHODS)
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
+
+
+def _should_detach_rpc_request(method: str, params: Any) -> bool:
+    if method not in _DETACHED_RPC_METHODS:
+        return False
+    if method != "skills.install":
+        return True
+    if not isinstance(params, dict):
+        return False
+    return any(
+        isinstance(params.get(key), str) and bool(params[key].strip())
+        for key in ("operationId", "operation_id")
+    )
 
 
 @dataclass(slots=True)
@@ -108,6 +152,7 @@ class WsConnection:
     conn_id: str
     ws: WebSocket
     protocol: int = PROTOCOL_VERSION
+    client_caps: frozenset[str] = field(default_factory=frozenset)
     principal: Principal = field(
         default_factory=lambda: Principal(
             role="operator",
@@ -289,6 +334,14 @@ class WsConnection:
     ) -> None:
         if self._closing:
             return
+        projected = project_session_event_for_client(
+            event,
+            payload,
+            client_caps=self.client_caps,
+        )
+        if projected is None:
+            return
+        event, payload = projected
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -733,6 +786,28 @@ class SubscriptionManager:
         self._session_subs: set[str] = set()  # conn_ids subscribed to session lifecycle
         self._message_subs: dict[str, set[str]] = {}  # session_key -> {conn_id}
         self._topic_subs: dict[str, set[str]] = {}  # topic -> {conn_id}
+        self._message_unsubscribe_listener: Any | None = None
+
+    def set_message_unsubscribe_listener(self, listener: Any | None) -> None:
+        """Install a process-local observer for lost message subscriptions."""
+
+        self._message_unsubscribe_listener = listener
+
+    def _notify_message_unsubscribed(self, conn_id: str, session_key: str) -> None:
+        listener = self._message_unsubscribe_listener
+        if listener is None:
+            return
+        try:
+            result = listener(conn_id, session_key)
+            if inspect.isawaitable(result):
+                asyncio.ensure_future(result)
+        except Exception:
+            log.warning(
+                "subscription.message_unsubscribe_listener_failed",
+                conn_id=conn_id,
+                session_key=session_key,
+                exc_info=True,
+            )
 
     # -- session-level (sessions.subscribe / sessions.unsubscribe) --
 
@@ -752,7 +827,12 @@ class SubscriptionManager:
 
     def unsubscribe_messages(self, conn_id: str, session_key: str) -> None:
         if session_key in self._message_subs:
+            removed = conn_id in self._message_subs[session_key]
             self._message_subs[session_key].discard(conn_id)
+            if not self._message_subs[session_key]:
+                del self._message_subs[session_key]
+            if removed:
+                self._notify_message_unsubscribed(conn_id, session_key)
 
     def get_message_subscribers(self, session_key: str) -> set[str]:
         return set(self._message_subs.get(session_key, set()))
@@ -774,8 +854,13 @@ class SubscriptionManager:
     def remove_connection(self, conn_id: str) -> None:
         """Clean up all subscriptions for a disconnected connection."""
         self._session_subs.discard(conn_id)
-        for subs in self._message_subs.values():
-            subs.discard(conn_id)
+        removed_message_sessions: list[str] = []
+        for session_key, subs in list(self._message_subs.items()):
+            if conn_id in subs:
+                subs.discard(conn_id)
+                removed_message_sessions.append(session_key)
+            if not subs:
+                del self._message_subs[session_key]
         empty_topics = []
         for topic, subs in self._topic_subs.items():
             subs.discard(conn_id)
@@ -783,6 +868,8 @@ class SubscriptionManager:
                 empty_topics.append(topic)
         for topic in empty_topics:
             del self._topic_subs[topic]
+        for session_key in removed_message_sessions:
+            self._notify_message_unsubscribed(conn_id, session_key)
 
 
 # Module-level registry shared across connections
@@ -800,11 +887,7 @@ def _is_wire_text(value: str) -> bool:
     into a response frame makes ``model_dump_json`` raise at send time, long
     after the handler ran.
     """
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
+    return is_utf8_encodable(value)
 
 
 def _wire_frame_id(raw_id: Any, fallback: str = "") -> str:
@@ -834,6 +917,7 @@ async def handle_ws_connection(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -847,6 +931,8 @@ async def handle_ws_connection(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
+    artifact_preview_service: Any = None,
 ) -> None:
     """Main WebSocket connection handler."""
     if not websocket_origin_allowed(ws, config):
@@ -897,6 +983,20 @@ async def handle_ws_connection(
     if not isinstance(data, dict):
         await conn.send_res(
             make_error_res("handshake", "INVALID_REQUEST", "Connect frame must be a JSON object")
+        )
+        await conn.close()
+        return
+
+    try:
+        validate_rpc_ingress(data)
+    except RpcIngressValidationError as exc:
+        await conn.send_res(
+            make_error_res(
+                _wire_frame_id(data.get("id"), "handshake"),
+                "INVALID_REQUEST",
+                str(exc),
+                details={"reason": exc.reason},
+            )
         )
         await conn.close()
         return
@@ -976,6 +1076,14 @@ async def handle_ws_connection(
     # Assign principal
     conn.principal = principal
     conn.protocol = negotiated
+    requested_caps = params_raw.get("caps")
+    conn.client_caps = frozenset(
+        capability
+        for capability in (
+            requested_caps[:128] if isinstance(requested_caps, list) else ()
+        )
+        if isinstance(capability, str) and capability and len(capability) <= 128
+    )
 
     # Step 6: Send HelloOk
     hello = HelloOk(
@@ -990,6 +1098,7 @@ async def handle_ws_connection(
         ),
         policy=PolicyInfo(
             concurrent_history_reads=True,
+            concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
                 * 1000
@@ -1043,6 +1152,7 @@ async def handle_ws_connection(
             usage_event_sink,
             meta_run_writer,
             skill_loader,
+            skill_management_state,
             cron_scheduler,
             turn_runner,
             task_runtime,
@@ -1056,6 +1166,8 @@ async def handle_ws_connection(
             memory_retrievers,
             provider_stats=provider_stats,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
+            skill_management_service=skill_management_service,
+            artifact_preview_service=artifact_preview_service,
         )
     except WebSocketDisconnect:
         pass
@@ -1135,6 +1247,7 @@ async def _message_loop(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -1148,6 +1261,8 @@ async def _message_loop(
     memory_retrievers: dict[str, Any] | None = None,
     provider_stats: Any = None,
     prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
+    artifact_preview_service: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -1182,6 +1297,19 @@ async def _message_loop(
         if not isinstance(data, dict):
             await conn.send_res(
                 make_error_res("", "INVALID_REQUEST", "Frame must be a JSON object")
+            )
+            continue
+
+        try:
+            validate_rpc_ingress(data)
+        except RpcIngressValidationError as exc:
+            await conn.send_res(
+                make_error_res(
+                    _wire_frame_id(data.get("id")),
+                    "INVALID_REQUEST",
+                    str(exc),
+                    details={"reason": exc.reason},
+                )
             )
             continue
 
@@ -1237,6 +1365,12 @@ async def _message_loop(
                 usage_event_sink=usage_event_sink,
                 meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
+                skill_management_service=skill_management_service,
+                skill_management_state=(
+                    skill_management_state
+                    if skill_management_state is not None
+                    else {}
+                ),
                 cron_scheduler=cron_scheduler,
                 turn_runner=turn_runner,
                 task_runtime=task_runtime,
@@ -1250,8 +1384,9 @@ async def _message_loop(
                 memory_managers=memory_managers or {},
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
+                artifact_preview_service=artifact_preview_service,
             )
-            if method in _DETACHED_RPC_METHODS:
+            if _should_detach_rpc_request(method, params):
                 if (
                     len(conn._detached_request_tasks)
                     >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
@@ -1260,7 +1395,7 @@ async def _message_loop(
                         make_error_res(
                             req_id,
                             ERROR_UNAVAILABLE,
-                            "Too many optional recovery requests are already running",
+                            "Too many detached requests are already running",
                             retryable=True,
                         )
                     )
@@ -1322,6 +1457,7 @@ async def _dispatch_and_send(
 
 
 def _build_features(dispatcher: RpcDispatcher) -> Any:
+    from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
 
     methods = dispatcher.list_methods()
@@ -1336,5 +1472,6 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
         "health",
         "heartbeat",
         "cron",
+        TURN_COMMITTED_EVENT,
     ]
     return FeaturesInfo(methods=methods, events=events)

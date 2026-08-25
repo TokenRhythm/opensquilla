@@ -77,6 +77,36 @@ Set `OPENSQUILLA_PREVIEW_FORCE_OFFLINE=1` before starting the Desktop app or
 gateway to disable full-network artifact previews as an incident-response
 measure.
 
+The release-gated Desktop PromptAnnotation workflow can bind modification
+instructions to exact elements in supported single-file HTML artifacts. It is
+disabled by default and has narrower format and trust-boundary requirements
+than ordinary preview. Maintainers and operators should use the
+[Prompt-Annotation editing guide](features/prompt-annotation-editing.md) for
+capability checks, safe local verification, rollout, and rollback.
+
+### Workbench resources and editable Documents
+
+The release-gated resource Workbench keeps four lifecycles separate even when
+they share one right-hand panel:
+
+- an attachment is an immutable session input;
+- a Document is an editable identity with a current head, immutable Revisions,
+  and audited ChangeSets;
+- a deliverable is an immutable published snapshot;
+- a preview or EditSession is temporary host state, not stored content.
+
+Previewing an attachment is read-only. Selecting **Edit** explicitly imports a
+copy into a Document; repeated or response-lost requests resolve the same
+durable import receipt. Editing the Document never changes the source
+attachment. Selecting **Publish** fixes one named Revision into a new
+deliverable, so later Document edits cannot alter an already published file.
+
+The initial editable format is a bounded, single-file, NUL-free UTF-8 HTML
+document. Office files remain discoverable and downloadable, but preview and
+edit capabilities stay false with an explicit reason until their format
+adapter and renderer are available. Workspace paths, `file://` URLs, remote
+URLs, and automatic upload promotion are not canonical Document sources.
+
 ## When to Use Artifacts Instead of Chat
 
 Use artifacts for:

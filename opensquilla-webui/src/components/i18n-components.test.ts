@@ -5,6 +5,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
 import { useAppStore } from '@/stores/app'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
+import SettingsLanguageControl from '@/components/settings/SettingsLanguageControl.vue'
 import LanguageSwitcher from '@/components/LanguageSwitcher.vue'
 import {
   TOOL_DETAIL_DISPLAY_STORAGE_KEY,
@@ -59,9 +60,9 @@ describe('SettingsAppearancePanel — Tool details row', () => {
   })
 })
 
-describe('SettingsAppearancePanel — Language row', () => {
+describe('SettingsLanguageControl — General language row', () => {
   it('renders a Language radiogroup with native English / 中文 labels', async () => {
-    const { el } = await mount(SettingsAppearancePanel)
+    const { el } = await mount(SettingsLanguageControl)
     const group = el.querySelector('[data-testid="settings-language-group"]')
     expect(group).toBeTruthy()
     expect(el.querySelector('[data-testid="settings-language-en"]')).toBeTruthy()
@@ -71,9 +72,9 @@ describe('SettingsAppearancePanel — Language row', () => {
   })
 
   it('switching the radio sets the locale, persists it, and reactively localizes the panel', async () => {
-    const { el } = await mount(SettingsAppearancePanel)
+    const { el } = await mount(SettingsLanguageControl)
     const store = useAppStore()
-    expect(el.querySelector('.control-section__title')!.textContent).toContain('Appearance')
+    expect(el.querySelector('.control-row__label')!.textContent).toContain('Language')
 
     const zh = el.querySelector('[data-testid="settings-language-zh-Hans"]') as HTMLInputElement
     zh.checked = true
@@ -84,9 +85,9 @@ describe('SettingsAppearancePanel — Language row', () => {
 
     expect(localStorage.getItem('opensquilla-locale')).toBe('zh-Hans')
     expect(document.documentElement.getAttribute('lang')).toBe('zh-Hans')
-    // section title re-renders in Chinese (reactive t())
+    // The General row re-renders in Chinese (reactive t()).
     await vi.waitFor(() =>
-      expect(el.querySelector('.control-section__title')!.textContent).toContain('外观'))
+      expect(el.querySelector('.control-row__label')!.textContent).toContain('语言'))
   })
 })
 
@@ -118,5 +119,43 @@ describe('LanguageSwitcher — topbar dropdown', () => {
 
     await vi.waitFor(() => expect(trigger.textContent).toContain('中文'))
     expect(trigger.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('closes on Escape and restores focus to the language trigger', async () => {
+    const { el } = await mount(LanguageSwitcher)
+    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
+    trigger.focus()
+    trigger.click()
+    await nextTick()
+    const option = el.querySelector('[data-testid="language-option-en"]') as HTMLButtonElement
+    option.focus()
+    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeTruthy()
+
+    const escape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(escape)
+    await nextTick()
+
+    expect(escape.defaultPrevented).toBe(true)
+    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeNull()
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('closes on outside click without taking focus back from the outside target', async () => {
+    const { el } = await mount(LanguageSwitcher)
+    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
+    trigger.click()
+    await nextTick()
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    outside.click()
+    await nextTick()
+
+    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeNull()
+    expect(document.activeElement).toBe(outside)
   })
 })

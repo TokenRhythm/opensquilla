@@ -10,6 +10,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine import Agent, AgentConfig, ThinkingLevel, ToolResult
+from opensquilla.engine.agent import _REASONING_ONLY_ACT_NOW_DIRECTIVE
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.usage import UsageTracker
 from opensquilla.provider import (
@@ -20,6 +21,7 @@ from opensquilla.provider import (
     ToolInputSchema,
 )
 from opensquilla.provider import DoneEvent as ProviderDone
+from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
@@ -74,6 +76,16 @@ def _large_reasoning_only_done() -> ProviderDone:
         output_tokens=2,
         reasoning_tokens=2,
         reasoning_content="internal",
+    )
+
+
+def _length_capped_reasoning_only_done() -> ProviderDone:
+    return ProviderDone(
+        stop_reason="length",
+        input_tokens=12,
+        output_tokens=1024,
+        reasoning_tokens=1023,
+        reasoning_content="internal reasoning",
     )
 
 
@@ -196,6 +208,11 @@ async def test_reasoning_only_first_turn_retries_without_disabling_thinking() ->
     assert "thinking disabled" not in warning.message
     done = next(event for event in events if event.kind == "done")
     assert done.text == "ok"
+    # Terminal-only reasoning is classified before it crosses the public
+    # presentation boundary, so the discarded attempt must not own the route
+    # card. The first retained visible output comes from the retry.
+    assert done.router_model_call_id == "1.1"
+    assert done.router_iteration == 1
     assert done.input_tokens == 21
     assert done.output_tokens == 6
     assert done.reasoning_tokens == 5
@@ -281,6 +298,62 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
         event for event in logged if event.get("mechanism") == "reasoning_prefill_recovery"
     )
     assert recovery_event["injected_to_model"] is True
+
+
+@pytest.mark.parametrize(
+    ("reasoning_format", "warning_code"),
+    [
+        ("openrouter", "provider_reasoning_prefill_continue"),
+        ("dashscope", "provider_reasoning_continuation"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
+    tmp_path,
+    reasoning_format: str,
+    warning_code: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="test-reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                supports_tools=True,
+                reasoning_format=reasoning_format,
+            ),
+            reasoning_prefill_recovery_mode="recover",
+            runtime_events_path=str(tmp_path / "runtime_events.jsonl"),
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert any(event.kind == "warning" and event.code == warning_code for event in events)
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
 @pytest.mark.asyncio
@@ -756,7 +829,7 @@ async def test_reasoning_only_retry_restores_thinking_after_retry_call() -> None
 
 
 @pytest.mark.asyncio
-async def test_reasoning_only_with_thinking_disabled_surfaces_empty_response() -> None:
+async def test_reasoning_only_with_thinking_disabled_retries_with_act_now() -> None:
     provider = _SequenceProvider(
         [
             [
@@ -767,22 +840,297 @@ async def test_reasoning_only_with_thinking_disabled_surfaces_empty_response() -
                     reasoning_tokens=2,
                     reasoning_content="internal reasoning",
                 )
-            ]
+            ],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(stop_reason="stop", input_tokens=5, output_tokens=1),
+            ],
         ]
     )
     agent = Agent(
         provider=provider,
-        config=AgentConfig(thinking=False, retry_base_backoff_ms=0, retry_max_backoff_ms=0),
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=2048,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert [call["config"].max_tokens for call in provider.calls] == [2048, 2048]
+    assert [call["config"].thinking for call in provider.calls] == [False, False]
+    assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    assert sum(
+        1
+        for event in events
+        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+    ) == 1
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "visible answer"
+    assert done.input_tokens == 9
+    assert done.output_tokens == 3
+    assert done.reasoning_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_length_capped_reasoning_only_retries_when_thinking_disabled() -> None:
+    provider = _SequenceProvider(
+        [
+            [_length_capped_reasoning_only_done()],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(stop_reason="stop", input_tokens=13, output_tokens=2),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=1,
+            provider_id="tokenrhythm",
+            model_id="kimi-k2.6",
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    with structlog.testing.capture_logs() as captured:
+        events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert [call["config"].max_tokens for call in provider.calls] == [1024, 1024]
+    assert [call["config"].thinking for call in provider.calls] == [False, False]
+    assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    warnings = [
+        event
+        for event in events
+        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+    ]
+    assert len(warnings) == 1
+    assert "without changing max_tokens" in warnings[0].message
+    budget_log = next(
+        event
+        for event in captured
+        if event.get("event") == "provider.reasoning_output_budget_exhausted"
+    )
+    assert budget_log["provider"] == "tokenrhythm"
+    assert budget_log["model"] == "kimi-k2.6"
+    assert budget_log["configured_max_tokens"] == 1024
+    assert budget_log["iter_output_tokens"] == 1024
+    assert budget_log["iter_reasoning_tokens"] == 1023
+    assert not {"messages", "image", "api_key"}.intersection(budget_log)
+    assert any(event.kind == "done" and event.text == "visible answer" for event in events)
+    assert not any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_implicit_act_now_is_consumed_when_retry_gets_provider_error() -> None:
+    provider = _SequenceProvider(
+        [
+            [_length_capped_reasoning_only_done()],
+            [ProviderError(message="temporary provider failure", code="503")],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(stop_reason="stop", input_tokens=13, output_tokens=2),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 3
+    assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    assert all(
+        message.content != _REASONING_ONLY_ACT_NOW_DIRECTIVE
+        for message in provider.calls[2]["messages"]
+    )
+    assert any(event.kind == "done" and event.text == "visible answer" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_budget_log_uses_active_provider_identity() -> None:
+    provider = _SequenceProvider(
+        [
+            [_length_capped_reasoning_only_done()],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(stop_reason="stop", input_tokens=13, output_tokens=2),
+            ],
+        ]
+    )
+    provider.active_provider_id = "fallback-provider"
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=1,
+            provider_id="primary-provider",
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    with structlog.testing.capture_logs() as captured:
+        events = [event async for event in agent.run_turn("hello")]
+
+    budget_log = next(
+        event
+        for event in captured
+        if event.get("event") == "provider.reasoning_output_budget_exhausted"
+    )
+    assert budget_log["provider"] == "fallback-provider"
+    assert any(event.kind == "done" and event.text == "visible answer" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_repeated_length_capped_reasoning_only_is_bounded_and_actionable() -> None:
+    provider = _SequenceProvider(
+        [
+            [_length_capped_reasoning_only_done()],
+            [_length_capped_reasoning_only_done()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert sum(
+        1
+        for event in events
+        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+    ) == 1
+    error = next(event for event in events if event.kind == "error")
+    assert error.code == "empty_response"
+    assert "llm.max_tokens" in error.message
+    assert "another model or provider" in error.message
+
+
+@pytest.mark.asyncio
+async def test_implicit_act_now_is_not_carried_to_selector_fallback() -> None:
+    provider = _FallbackSequenceProvider(
+        [
+            [_length_capped_reasoning_only_done()],
+            [_length_capped_reasoning_only_done()],
+            [
+                ProviderText(text="fallback answer"),
+                ProviderDone(stop_reason="stop", input_tokens=14, output_tokens=2),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 3
+    assert provider.fallback_reasons == ["reasoning_only"]
+    assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    assert all(
+        message.content != _REASONING_ONLY_ACT_NOW_DIRECTIVE
+        for message in provider.calls[2]["messages"]
+    )
+    assert any(event.kind == "done" and event.text == "fallback answer" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_explicit_act_now_retries_do_not_carry_directive_to_fallback() -> None:
+    provider = _FallbackSequenceProvider(
+        [
+            [_length_capped_reasoning_only_done()],
+            [_length_capped_reasoning_only_done()],
+            [_length_capped_reasoning_only_done()],
+            [
+                ProviderText(text="fallback answer"),
+                ProviderDone(stop_reason="stop", input_tokens=15, output_tokens=2),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=1,
+            reasoning_only_act_now=True,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 4
+    assert provider.fallback_reasons == ["reasoning_only"]
+    for call in provider.calls[1:3]:
+        assert call["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    assert all(
+        message.content != _REASONING_ONLY_ACT_NOW_DIRECTIVE
+        for message in provider.calls[3]["messages"]
+    )
+    assert any(event.kind == "done" and event.text == "fallback answer" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_length_capped_reasoning_only_respects_zero_retry_budget() -> None:
+    provider = _SequenceProvider([[_length_capped_reasoning_only_done()]])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_tokens=1024,
+            max_provider_retries=0,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
     )
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert len(provider.calls) == 1
-    assert any(event.kind == "error" and event.code == "empty_response" for event in events)
-    done = next(event for event in events if event.kind == "done")
-    assert done.input_tokens == 4
-    assert done.output_tokens == 2
-    assert done.reasoning_tokens == 2
+    assert not any(
+        event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+        for event in events
+    )
+    error = next(event for event in events if event.kind == "error")
+    assert error.code == "empty_response"
+    assert "llm.max_tokens" in error.message
+    assert "another model or provider" in error.message
 
 
 @pytest.mark.asyncio
@@ -871,6 +1219,47 @@ async def test_large_reasoning_only_uses_fallback_before_same_model_retry() -> N
     assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
+@pytest.mark.parametrize("thinking", [False, ThinkingLevel.MEDIUM])
+@pytest.mark.asyncio
+async def test_large_length_capped_reasoning_only_fallback_disables_thinking(
+    thinking: bool | ThinkingLevel,
+) -> None:
+    provider = _FallbackSequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=thinking,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert provider.fallback_reasons == ["reasoning_only"]
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
 @pytest.mark.asyncio
 async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default() -> None:
     provider = _SequenceProvider(
@@ -924,6 +1313,107 @@ async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default()
     assert done.input_tokens == 35_004
     assert done.output_tokens == 3
     assert done.reasoning_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_large_reasoning_only_with_thinking_disabled_uses_act_now_retry() -> None:
+    provider = _SequenceProvider(
+        [
+            [_large_reasoning_only_done()],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=False,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert [call["config"].thinking for call in provider.calls] == [False, False]
+    assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    assert any(
+        event.kind == "warning" and event.code == "provider_large_context_visible_retry"
+        for event in events
+    )
+    assert any(event.kind == "done" and event.text == "visible answer" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="deepseek-v4-flash-0731",
+                )
+            ],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=35_858,
+                    output_tokens=2,
+                    model="deepseek-v4-flash-0731",
+                ),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="deepseek-v4-flash-0731",
+            max_tokens=16_384,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    with structlog.testing.capture_logs() as captured:
+        events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["config"].thinking is False
+    assert provider.calls[0]["config"].thinking_level is None
+    assert provider.calls[0]["config"].max_tokens == 16_384
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert provider.calls[1]["config"].max_tokens == 16_384
+    assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
+    visible_retry = next(
+        event
+        for event in events
+        if event.kind == "warning"
+        and event.code == "provider_reasoning_only_retry"
+    )
+    assert "without changing max_tokens" in visible_retry.message
+    budget_log = next(
+        event
+        for event in captured
+        if event.get("event") == "provider.reasoning_output_budget_exhausted"
+    )
+    assert budget_log["configured_max_tokens"] == 16_384
+    assert budget_log["iter_output_tokens"] == 16_384
+    assert budget_log["iter_reasoning_tokens"] == 16_384
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "visible answer"
 
 
 @pytest.mark.asyncio
@@ -1101,6 +1591,30 @@ async def test_large_empty_response_without_fallback_surfaces_clear_error() -> N
 
 
 @pytest.mark.asyncio
+async def test_large_empty_response_with_attachment_does_not_recommend_uploading_again() -> None:
+    provider = _SequenceProvider(
+        [[ProviderDone(stop_reason="stop", input_tokens=35_000, output_tokens=0)]]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+            metadata={"had_attachments": True},
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    error = next(event for event in events if event.kind == "error")
+    assert error.code == "empty_response"
+    assert "Send the material as an attachment" not in error.message
+    assert "attached material" in error.message
+    assert "split" in error.message.lower()
+
+
+@pytest.mark.asyncio
 async def test_incomplete_tool_stream_errors_without_running_tool() -> None:
     provider = _SequenceProvider(
         [
@@ -1133,7 +1647,7 @@ async def test_incomplete_tool_stream_errors_without_running_tool() -> None:
     events = [event async for event in agent.run_turn("hello")]
 
     assert called is False
-    assert any(event.kind == "tool_use_start" for event in events)
+    assert not any(event.kind == "tool_use_start" for event in events)
     assert any(event.kind == "error" and event.code == "incomplete_tool_stream" for event in events)
     done = next(event for event in events if event.kind == "done")
     assert done.input_tokens == 5
@@ -1515,7 +2029,7 @@ async def test_length_capped_tool_call_is_not_executed() -> None:
     events = [event async for event in agent.run_turn("hello")]
 
     assert called is False
-    assert any(event.kind == "tool_use_start" for event in events)
+    assert not any(event.kind == "tool_use_start" for event in events)
     assert any(
         event.kind == "error" and event.code == "provider_output_truncated"
         for event in events
@@ -1561,6 +2075,8 @@ async def test_discarded_empty_attempt_counts_usage_but_skips_cache_check(
     done = next(event for event in events if event.kind == "done")
     assert done.input_tokens == 7
     assert done.output_tokens == 1
+    assert done.router_model_call_id == "1.1"
+    assert done.router_iteration == 1
     tracked = usage.get("agent:test:empty-retry")
     assert tracked is not None
     assert tracked.input_tokens == 7

@@ -30,6 +30,10 @@ from opensquilla.artifacts import (
     collect_artifact_bundle,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.session.plans import (
+    PLAN_STEP_TERMINAL_STATUSES,
+    PlanRunConflictError,
+)
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
@@ -39,6 +43,7 @@ from opensquilla.tools.types import (
     ToolContext,
     ToolError,
     current_tool_context,
+    is_goal_owned_main_default_turn,
 )
 
 _MAX_MISSING_FILE_CANDIDATES = 5
@@ -131,10 +136,24 @@ def _llm_artifact_payload(
 
 
 def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
-    final_response = (
-        "Do not run more tools for this deliverable unless the user explicitly "
-        "asked for another file or a specific verification step. Send the final response now."
-    )
+    if is_goal_owned_main_default_turn(ctx):
+        final_response = (
+            "Do not call publish_artifact again for this unchanged file. Follow the "
+            "Active Goal instructions: re-evaluate the entire objective and continue "
+            "any remaining work with the ordinary tools available for this turn. "
+            "update_goal_progress remains optional; use it only when a concise current-state "
+            "view helps, and replace that view when reality changes rather than treating it "
+            "as fixed phases or turn boundaries. Call "
+            "update_goal only when the entire objective is complete or genuinely blocked. "
+            "If a terminal Goal update already succeeded in this tool batch, run no more "
+            "tools and give one concise final summary."
+        )
+    else:
+        final_response = (
+            "Do not run more tools for this deliverable unless the user explicitly "
+            "asked for another file or a specific verification step. Send the final "
+            "response now."
+        )
     if _should_expose_local_path(ctx):
         prefix = (
             "This file is already registered for the current surface in this turn. "
@@ -148,6 +167,11 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             + f"the generated file on this machine. {final_response}"
         )
     if already_published:
+        if is_goal_owned_main_default_turn(ctx):
+            return (
+                "This file is already registered for the current surface in this turn. "
+                + final_response
+            )
         return (
             "This file is already registered for the current surface in this turn. "
             "Do not call publish_artifact again for the same file; just confirm it is ready. "
@@ -196,12 +220,95 @@ def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
     )
 
 
-async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
-    """Keep artifact delivery behind the authoritative final checkpoint."""
+def _plan_run_allows_delivery(ctx: ToolContext, run: Any) -> bool:
+    """Return whether the current task may deliver from this PlanRun state."""
+
+    status = str(getattr(run, "status", "") or "")
+    if status == "completed":
+        return True
+    if status != "running":
+        return False
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
+    return (
+        bool(task_id)
+        and active_task_id == task_id
+        and _plan_run_steps_ready_for_delivery(run)
+    )
+
+
+def _plan_run_final_step_ready_for_publish(run: Any) -> str | None:
+    """Return the sole unfinished current step that publication can finalize."""
+
+    current_step_id = str(getattr(run, "current_step_id", "") or "")
+    if not current_step_id:
+        return None
+    step_states = list(getattr(run, "step_states", []) or [])
+    current_matches = [
+        state
+        for state in step_states
+        if isinstance(state, dict)
+        and str(state.get("step_id") or "") == current_step_id
+    ]
+    if len(current_matches) != 1:
+        return None
+    if str(current_matches[0].get("status") or "") != "in_progress":
+        return None
+    if any(
+        not isinstance(state, dict)
+        or (
+            str(state.get("step_id") or "") != current_step_id
+            and str(state.get("status") or "") not in PLAN_STEP_TERMINAL_STATUSES
+        )
+        for state in step_states
+    ):
+        return None
+    return current_step_id
+
+
+async def _checkpoint_final_plan_step_for_publish(
+    ctx: ToolContext,
+    run: Any,
+) -> Any:
+    """Atomically enter delivery when publish is the final step operation."""
+
+    step_id = _plan_run_final_step_ready_for_publish(run)
+    if step_id is None:
+        return run
+    storage = getattr(ctx, "plan_storage", None)
+    if storage is None:
+        return run
+    checkpoint_plan_run = getattr(storage, "checkpoint_plan_run", None)
+    if not callable(checkpoint_plan_run):
+        return run
+    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    try:
+        return await checkpoint_plan_run(
+            run_id,
+            expected_state_revision=int(getattr(run, "state_revision", 0)),
+            step_id=step_id,
+            step_status="completed",
+            next_step_id=None,
+            expected_active_task_id=task_id,
+        )
+    except PlanRunConflictError:
+        refreshed = await storage.get_plan_run(run_id)
+        if refreshed is not None and _plan_run_allows_delivery(ctx, refreshed):
+            return refreshed
+        raise RetryableToolInputError(
+            "publish_artifact was not executed because the attached PlanRun "
+            "changed while entering artifact delivery. Retry publish_artifact "
+            "with the current PlanRun state."
+        ) from None
+
+
+async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> Any | None:
+    """Validate delivery state and return a final step to checkpoint if needed."""
 
     run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
     if not run_id:
-        return
+        return None
     storage = getattr(ctx, "plan_storage", None)
     get_plan_run = getattr(storage, "get_plan_run", None)
     if not callable(get_plan_run):
@@ -212,8 +319,8 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
     status = str(getattr(run, "status", "") or "")
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
-    if status == "completed":
-        return
+    if _plan_run_allows_delivery(ctx, run):
+        return None
     if status == "running":
         if not task_id or active_task_id != task_id:
             raise ToolError(
@@ -221,7 +328,9 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
                 "owns the attached PlanRun."
             )
         if _plan_run_steps_ready_for_delivery(run):
-            return
+            return None
+        if _plan_run_final_step_ready_for_publish(run) is not None:
+            return run
     current_step_id = str(getattr(run, "current_step_id", "") or "")
     current_detail = (
         f" The current step is {current_step_id}."
@@ -249,6 +358,8 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
     description=(
         "Register an existing workspace file as a generated artifact for the current surface. "
         "Only files inside the active workspace are allowed. "
+        "For exactly one file, including self-contained HTML, set bundle='none' and omit "
+        "bundle_root. bundle_root is valid only with bundle='directory'. "
         "The active surface handles download chips or native channel delivery; do not include "
         "any URL in your reply — just confirm the file is ready."
     ),
@@ -269,15 +380,18 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
             "type": "string",
             "enum": ["auto", "directory", "none"],
             "description": (
-                "Static webpage packaging mode. auto follows literal local dependencies "
-                "for HTML, directory snapshots bundle_root, and none publishes one file. "
-                "Defaults to auto."
+                "Static webpage packaging mode. Use none for exactly one file, including "
+                "self-contained HTML, and omit bundle_root. Use auto to follow statically "
+                "discoverable local dependencies for an HTML entrypoint, also without "
+                "bundle_root. Use directory to snapshot a dedicated workspace subdirectory; "
+                "directory requires bundle_root. Defaults to auto."
             ),
         },
         "bundle_root": {
             "type": "string",
             "description": (
-                "Dedicated workspace subdirectory to snapshot when bundle=directory."
+                "Required only when bundle=directory: a dedicated workspace subdirectory "
+                "containing path. Invalid when bundle is auto or none; omit it in those modes."
             ),
         },
     },
@@ -291,10 +405,15 @@ async def publish_artifact(
     bundle: str = "auto",
     bundle_root: str | None = None,
 ) -> str:
+    # Some provider adapters materialize omitted optional strings as blank values.
+    # Treat those wire-equivalent values as absent without accepting a real root in
+    # modes where it is forbidden.
+    if bundle_root is not None and not bundle_root.strip():
+        bundle_root = None
     ctx = current_tool_context.get()
     if ctx is None:
         raise ToolError("publish_artifact requires tool context")
-    await _require_plan_run_ready_for_publish(ctx)
+    final_step_to_checkpoint = await _require_plan_run_ready_for_publish(ctx)
     if not ctx.workspace_dir:
         raise ToolError("publish_artifact requires an active workspace")
     if not ctx.artifact_media_root:
@@ -405,6 +524,17 @@ async def publish_artifact(
             for item in bundle_manifest.files
             if item.path == bundle_manifest.entrypoint
         )
+    if final_step_to_checkpoint is not None:
+        checkpointed_run = await _checkpoint_final_plan_step_for_publish(
+            ctx,
+            final_step_to_checkpoint,
+        )
+        if not _plan_run_steps_ready_for_delivery(checkpointed_run):
+            raise RetryableToolInputError(
+                "publish_artifact was not executed because the attached PlanRun "
+                "could not enter artifact delivery. Retry after checkpointing the "
+                "current final step."
+            )
     store = ArtifactStore(ctx.artifact_media_root)
     for published in reversed(ctx.published_artifacts):
         if published.get("sha256") != target_sha256:

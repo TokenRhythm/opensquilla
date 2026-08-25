@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { effectScope } from 'vue'
 
+import i18n, { loadLocaleMessages, type LocaleCode } from '@/i18n'
 import { useUsageData } from './useUsageData'
 import { requestUsageSnapshot } from './useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
@@ -96,6 +97,7 @@ async function flushMicrotasks() {
 let scopes: Array<ReturnType<typeof effectScope>> = []
 
 beforeEach(() => {
+  i18n.global.locale.value = 'en'
   localStorage.setItem(RANGE_KEY, '7')
   vi.mocked(requestUsageSnapshot).mockReset()
 })
@@ -103,6 +105,7 @@ beforeEach(() => {
 afterEach(() => {
   scopes.forEach(scope => scope.stop())
   scopes = []
+  i18n.global.locale.value = 'en'
   localStorage.clear()
 })
 
@@ -169,5 +172,48 @@ describe('useUsageData range selection under concurrent refreshes', () => {
     expect(localStorage.getItem(RANGE_KEY)).toBe('7')
     // The cached 7d snapshot is still rendered, so no page-level error.
     expect(api.usageError.value).toBeNull()
+  })
+})
+
+describe('useUsageData model labels', () => {
+  const localizedModelCounts: ReadonlyArray<{
+    locale: LocaleCode
+    expected: string
+  }> = [
+    { locale: 'en', expected: '2 models' },
+    { locale: 'zh-Hans', expected: '2 个模型' },
+    { locale: 'ja', expected: '2 モデル' },
+    { locale: 'fr', expected: '2 modèles' },
+    { locale: 'de', expected: '2 Modelle' },
+    { locale: 'es', expected: '2 modelos' },
+  ]
+
+  it.each(localizedModelCounts)(
+    'describes multiple models neutrally in $locale',
+    async ({ locale, expected }) => {
+      await loadLocaleMessages(locale)
+      i18n.global.locale.value = locale
+      const { api, scope } = mountUsageData()
+      scopes.push(scope)
+
+      const label = api.modelDisplayLabel({
+        modelBreakdown: [
+          { model: 'provider/primary-model' },
+          { model: 'provider/helper-model' },
+        ],
+      })
+
+      expect(label).toBe(expected)
+      expect(label).not.toMatch(/auto|自动|自動/i)
+    },
+  )
+
+  it('keeps the model name for a single-model breakdown', () => {
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+
+    expect(api.modelDisplayLabel({
+      modelBreakdown: [{ model: 'provider/only-model' }],
+    })).toBe('provider/only-model')
   })
 })

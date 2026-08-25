@@ -325,6 +325,37 @@ describe('SetupProviderPanel — configured provider management', () => {
     },
   ]
 
+  it('bounds a long configured-provider list and expands it inside a scroll region', async () => {
+    const manyProviders = Array.from({ length: 12 }, (_, index) => ({
+      ...configured[0],
+      providerId: `provider-${index + 1}`,
+      label: `Provider ${index + 1}`,
+      active: index === 0,
+    }))
+    const { app, el } = await mountPanel({ configuredProviders: manyProviders })
+    const list = el.querySelector<HTMLElement>('[data-testid="configured-provider-list"]')!
+    const toggle = el.querySelector<HTMLButtonElement>('.setup-provider-list__toggle')!
+
+    expect(list.querySelectorAll('.setup-provider-card')).toHaveLength(3)
+    expect(list.classList.contains('is-expanded')).toBe(false)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(toggle.textContent).toContain('12')
+
+    toggle.click()
+    await nextTick()
+
+    expect(list.querySelectorAll('.setup-provider-card')).toHaveLength(12)
+    expect(list.classList.contains('is-expanded')).toBe(true)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+
+    const source = readFileSync('src/components/setup/SetupProviderPanel.vue', 'utf8')
+    expect(source).toContain('max-height: min(28rem, 52vh)')
+    expect(source).toContain('overflow-y: auto')
+    expect(source).toContain('scrollbar-gutter: stable')
+
+    app.unmount()
+  })
+
   it('shows the default-on accessible image offer only inside the OpenRouter editor', async () => {
     const onUpdateImageGenerationOptIn = vi.fn()
     const { app, el, panelState } = await mountPanel({

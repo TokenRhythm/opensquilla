@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from opensquilla.provider.compat_policy import effective_reasoning_format
 from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import ProviderConfig, _build_provider
@@ -92,6 +93,8 @@ def _chat_url(base_url: str) -> str:
 def _provider_thinking_payload(
     provider: str,
     *,
+    model: str,
+    base_url: str,
     enabled: bool,
     budget: int,
 ) -> dict[str, Any]:
@@ -107,7 +110,21 @@ def _provider_thinking_payload(
         if enabled:
             payload["reasoning_effort"] = "high"
         return payload
-    if provider in {"moonshot", "volcengine", "zhipu"}:
+    if provider == "zhipu":
+        caps = ModelCatalog().get_capabilities(
+            model,
+            provider_name=provider,
+            base_url=base_url,
+        )
+        dialect = effective_reasoning_format(
+            get_provider_spec(provider).compat,
+            caps.reasoning_format,
+            base_url,
+        )
+        if dialect != "zai":
+            return {}
+        return {"thinking": {"type": "enabled" if enabled else "disabled"}}
+    if provider in {"moonshot", "volcengine"}:
         return {"thinking": {"type": "enabled" if enabled else "disabled"}}
     return {}
 
@@ -152,7 +169,13 @@ async def _direct_case(
             }
         ],
         "max_tokens": max_tokens,
-        **_provider_thinking_payload(provider, enabled=enabled, budget=thinking_budget),
+        **_provider_thinking_payload(
+            provider,
+            model=model,
+            base_url=base_url,
+            enabled=enabled,
+            budget=thinking_budget,
+        ),
     }
     start = time.perf_counter()
     try:

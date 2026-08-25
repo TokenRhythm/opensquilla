@@ -327,14 +327,6 @@ async function refresh() {
 .usage-bar-row__fill--output {
   background: var(--chart-2);
 }
-.usage-bar-row__cap {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--text);
-  opacity: 0.3;
-}
 .usage-bar-row__value {
   font-size: var(--fs-xs);
   color: var(--text-muted);

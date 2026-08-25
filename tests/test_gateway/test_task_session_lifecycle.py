@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -9,8 +10,10 @@ import pytest
 
 from opensquilla.gateway.boot import _make_task_session_lifecycle_listener
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+from opensquilla.gateway.rpc_sessions import _active_task_summary
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
+    SessionTaskSnapshot,
     TaskLifecycleEvent,
     apply_task_lifecycle_to_session,
     session_status_for_task_status,
@@ -112,6 +115,36 @@ def test_sessions_changed_payload_has_shared_schema_fields() -> None:
         "reason": "turn_complete",
         "run_status": "idle",
     }
+
+
+def test_live_snapshot_matches_running_first_hydration_projection() -> None:
+    session_key = "agent-1::sess-1"
+    snapshot = SessionTaskSnapshot(
+        running_task_id="task-running",
+        queued_task_ids=("task-newer-queued",),
+    )
+    hydrated = _active_task_summary(
+        [
+            AgentTaskRecord(
+                task_id="task-running",
+                session_key=session_key,
+                status=AgentTaskStatus.RUNNING,
+                created_at=1000,
+            ),
+            AgentTaskRecord(
+                task_id="task-newer-queued",
+                session_key=session_key,
+                status=AgentTaskStatus.QUEUED,
+                created_at=2000,
+            ),
+        ]
+    )
+
+    assert hydrated is not None
+    assert {
+        "task_id": hydrated["task_id"],
+        "status": hydrated["status"],
+    } == snapshot.active_task
 
 
 def _make_runtime(
@@ -304,6 +337,141 @@ async def test_boot_lifecycle_listener_skips_subagent_tasks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_projection_waits_for_authoritative_task_persistence() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-terminal-write-failed",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="goal",
+            terminal_reason="completed",
+            terminal_persisted=False,
+        )
+    )
+
+    assert manager.finish_calls == []
+    assert manager.update_calls == []
+    assert events == []
+    assert session.status == SessionStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_terminal_handoff_keeps_session_queued_without_idle_projection() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="default",
+            terminal_reason="completed",
+            continuation_task_id="task-next",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=("task-next",),
+            ),
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert session.ended_at is None
+    assert session.runtime_ms is None
+    assert manager.update_calls == [
+        (
+            session.session_key,
+            {
+                "status": SessionStatus.RUNNING,
+                "ended_at": None,
+                "runtime_ms": None,
+            },
+        )
+    ]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_terminal",
+                "status": "running",
+                "run_status": "queued",
+                "last_task": {
+                    "task_id": "task-old",
+                    "status": "succeeded",
+                    "terminal_reason": "completed",
+                },
+                "active_task": {"task_id": "task-next", "status": "queued"},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_durable_continuation_projects_queued_when_not_runtime_active() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old",
+            task_status=AgentTaskStatus.ABANDONED,
+            run_kind="default",
+            terminal_reason="shutdown_timeout",
+            continuation_task_id="task-durable-next",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=(),
+            ),
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert events[0][2]["status"] == "running"
+    assert events[0][2]["run_status"] == "queued"
+    assert events[0][2]["active_task"] == {
+        "task_id": "task-durable-next",
+        "status": "queued",
+    }
+    assert events[0][2]["run_status"] == "queued"
+
+
+@pytest.mark.asyncio
 async def test_task_running_broadcasts_change_for_already_running_session() -> None:
     session = _make_session(status=SessionStatus.RUNNING)
     manager = _SessionManager(session)
@@ -324,6 +492,10 @@ async def test_task_running_broadcasts_change_for_already_running_session() -> N
             task_id="task-active",
             task_status=AgentTaskStatus.RUNNING,
             run_kind="default",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id="task-active",
+                queued_task_ids=(),
+            ),
         )
     )
 
@@ -364,6 +536,10 @@ async def test_task_queued_broadcasts_change_for_waiting_session() -> None:
             task_id="task-waiting",
             task_status=AgentTaskStatus.QUEUED,
             run_kind="default",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=("task-waiting",),
+            ),
         )
     )
 
@@ -381,6 +557,285 @@ async def test_task_queued_broadcasts_change_for_waiting_session() -> None:
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_running_task_wins_when_followup_queues_and_terminal_hands_off() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+    run_count = 0
+
+    async def _controlled_handler(_run: Any) -> None:
+        nonlocal run_count
+        run_count += 1
+        if run_count == 1:
+            first_started.set()
+            await release_first.wait()
+            return
+        second_started.set()
+        await release_second.wait()
+
+    runtime = _make_runtime(
+        _controlled_handler,
+        session_manager=manager,
+        events=events,
+    )
+    first = await runtime.enqueue(_make_envelope(), "first")
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+    # Cancellation intent must not let a queued follower take foreground
+    # ownership before the running task reaches its terminal boundary.
+    async with runtime._state_lock:
+        runtime._tasks[first.task_id].cancel_requested = True
+    snapshot = await runtime.session_task_snapshot(session.session_key)
+    assert snapshot.running_task_id == first.task_id
+    assert snapshot.cancel_requested_task_ids == (first.task_id,)
+    async with runtime._state_lock:
+        runtime._tasks[first.task_id].cancel_requested = False
+
+    second = await runtime.enqueue(_make_envelope(), "second")
+    snapshot = await runtime.session_task_snapshot(session.session_key)
+    assert snapshot == SessionTaskSnapshot(
+        running_task_id=first.task_id,
+        queued_task_ids=(second.task_id,),
+    )
+
+    second_queued_change = next(
+        payload
+        for _, event_name, payload in events
+        if event_name == "sessions.changed"
+        and payload.get("reason") == "task_queued"
+        and payload.get("changed_task", {}).get("task_id") == second.task_id
+    )
+    assert second_queued_change["run_status"] == "running"
+    assert second_queued_change["active_task"] == {
+        "task_id": first.task_id,
+        "status": "running",
+    }
+    assert second_queued_change["changed_task"] == {
+        "task_id": second.task_id,
+        "status": "queued",
+    }
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=2.0)
+
+    first_terminal_change = next(
+        payload
+        for _, event_name, payload in events
+        if event_name == "sessions.changed"
+        and payload.get("reason") == "task_terminal"
+        and payload.get("last_task", {}).get("task_id") == first.task_id
+    )
+    assert first_terminal_change["status"] == "running"
+    assert first_terminal_change["run_status"] == "queued"
+    assert first_terminal_change["active_task"] == {
+        "task_id": second.task_id,
+        "status": "queued",
+    }
+
+    # A delayed terminal callback is projected against current state. Once B
+    # is running it must not regress to queued merely because A's callback is
+    # delivered again.
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id=first.task_id,
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="default",
+            terminal_reason="completed",
+        )
+    )
+    delayed_terminal_change = events[-1][2]
+    assert delayed_terminal_change["run_status"] == "running"
+    assert delayed_terminal_change["active_task"] == {
+        "task_id": second.task_id,
+        "status": "running",
+    }
+
+    release_second.set()
+    await runtime.wait(first.task_id, timeout=2.0)
+    await runtime.wait(second.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_delayed_queued_callback_uses_current_running_snapshot() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _controlled_handler(_run: Any) -> None:
+        started.set()
+        await release.wait()
+
+    runtime = _make_runtime(
+        _controlled_handler,
+        session_manager=manager,
+        events=events,
+    )
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id=handle.task_id,
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+        )
+    )
+
+    assert events[-1] == (
+        session.session_key,
+        "sessions.changed",
+        {
+            "schema_version": 1,
+            "key": session.session_key,
+            "reason": "task_queued",
+            "run_status": "running",
+            "active_task": {"task_id": handle.task_id, "status": "running"},
+        },
+    )
+
+    release.set()
+    await runtime.wait(handle.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_delayed_queued_callback_cannot_resurrect_terminal_task() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id="task-already-terminal",
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=(),
+            ),
+        )
+    )
+
+    assert manager.update_calls == [(session.session_key, {})]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_queued",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_projection_fails_safe_when_runtime_snapshot_fails() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    async def _handler(_run: Any) -> None:
+        return None
+
+    async def _snapshot_failure(*_args: Any, **_kwargs: Any) -> SessionTaskSnapshot:
+        raise RuntimeError("snapshot unavailable")
+
+    runtime = TaskRuntime(
+        storage=_make_task_storage(),
+        turn_handler=_handler,
+        event_emitter=_emit,
+        lifecycle_listener=_make_task_session_lifecycle_listener(
+            session_manager=manager,
+            event_emitter=_emit,
+        ),
+    )
+    runtime.session_task_snapshot = _snapshot_failure  # type: ignore[method-assign]
+
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id="task-changed",
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+        )
+    )
+
+    assert manager.update_calls == [(session.session_key, {})]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_queued",
+                "changed_task": {"task_id": "task-changed", "status": "queued"},
+            },
+        )
+    ]
+
+    # A can reach its terminal callback after B has acquired the same-session
+    # execution lock.  If the state-locked snapshot fails here, A's terminal
+    # status must not overwrite B's still-running session lifecycle.
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old-running-owner",
+            task_status=AgentTaskStatus.CANCELLED,
+            run_kind="default",
+            terminal_reason="cancelled",
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert manager.update_calls == [
+        (session.session_key, {}),
+        (session.session_key, {}),
+    ]
+    assert events[-1] == (
+        session.session_key,
+        "sessions.changed",
+        {
+            "schema_version": 1,
+            "key": session.session_key,
+            "reason": "task_terminal",
+            "changed_task": {
+                "task_id": "task-old-running-owner",
+                "status": "cancelled",
+                "terminal_reason": "cancelled",
+                "terminal_message": "The task was cancelled before it finished.",
+            },
+        },
+    )
 
 
 @pytest.mark.asyncio

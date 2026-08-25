@@ -63,6 +63,24 @@ describe('relativeTime', () => {
     const seedSeconds = Math.floor(now / 1000) - 120
     expect(relativeTime(seedSeconds, now)).toBe('2m ago')
   })
+
+  it('delegates bucket labels and counts to an injected translator', () => {
+    const calls: Array<[string, Record<string, string | number> | undefined]> = []
+    const t: (key: string, named?: Record<string, string | number>) => string = (key, named) => {
+      calls.push([key, named])
+      return `rendered:${key}`
+    }
+    expect(relativeTime(now - 5_000, now, t)).toBe('rendered:chat.time.justNow')
+    expect(relativeTime(now - 5 * 60_000, now, t)).toBe('rendered:chat.time.minutesAgo')
+    expect(relativeTime(now - 2 * 3_600_000, now, t)).toBe('rendered:chat.time.hoursAgo')
+    expect(relativeTime(now - 86_400_000, now, t)).toBe('')
+    expect(relativeTime(null, now, t)).toBe('')
+    expect(calls).toEqual([
+      ['chat.time.justNow', undefined],
+      ['chat.time.minutesAgo', { n: 5 }],
+      ['chat.time.hoursAgo', { n: 2 }],
+    ])
+  })
 })
 
 describe('localizedRelativeTime', () => {

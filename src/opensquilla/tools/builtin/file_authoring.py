@@ -328,6 +328,7 @@ async def _published_response(
     },
     required=["rows"],
     sandbox=SandboxToolDescriptor.artifact(kind="artifact.create_csv"),
+    allow_string_item_schema_projection=True,
 )
 async def create_csv(rows: list[list[Any]], name: str | None = None) -> str:
     output = io.StringIO(newline="")

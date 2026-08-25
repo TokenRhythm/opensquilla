@@ -539,6 +539,24 @@ test("model strategy picker is modal and submits one control command", () => {
   });
 });
 
+test("session routing picker submits the session-scoped command", () => {
+  const { composer, press, sent } = makeHarness();
+  composer.openModelRoutingPicker({
+    current: "router",
+    options: ["direct", "router", "ensemble"],
+    command: "/routing",
+  });
+
+  press({ name: "down" });
+  press({ name: "return" });
+
+  assert.deepEqual(sent.at(-1), {
+    type: "input.submit",
+    text: "/routing ensemble",
+    intent: "control",
+  });
+});
+
 test("model picker starts with Auto and submits the selected session pin", () => {
   const { composer, press, paste, overlayLayer, sent } = makeHarness();
   composer.openModelPicker({

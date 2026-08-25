@@ -5,6 +5,7 @@
   "match": {
     "toolNames": ["exec"],
     "argv0": ["git"],
+    "gitSubcommands": ["grep"],
     "argvIncludes": [["grep"]]
   },
   "transforms": {

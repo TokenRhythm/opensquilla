@@ -94,6 +94,9 @@ async def test_chat_send_fork_before_message_returns_child_without_future_histor
     child_key = res.payload["sessionKey"]
     assert child_key != PARENT_KEY
     assert res.payload["key"] == child_key
+    child = await manager.get_session(child_key)
+    assert child is not None
+    assert child.display_name == "Branch edit (2)"
 
     parent_entries = await manager.get_transcript(PARENT_KEY)
     assert [entry.content for entry in parent_entries] == [

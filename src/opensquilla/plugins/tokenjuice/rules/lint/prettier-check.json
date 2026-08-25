@@ -4,6 +4,8 @@
   "description": "Compact Prettier check output while preserving unformatted files.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["prettier"],
+    "argvIncludesBeforeDoubleDash": [["--check"]],
     "commandIncludes": ["prettier", "--check"]
   },
   "transforms": {

@@ -9,13 +9,16 @@ workspace policy layers stay active; explicit Full run mode is unaffected.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.tools.run_mode import (
     current_run_mode,
+    effective_run_mode_for_context,
     full_host_access_active,
     full_host_access_for_context,
     trusted_sandbox_active,
@@ -67,6 +70,7 @@ def test_disabled_sandbox_grants_full_host_by_default(
     assert current_run_mode() == "safe"
     assert full_host_access_active() is True
     assert full_host_access_for_context(bypass_context) is True
+    assert effective_run_mode_for_context(bypass_context) is RunMode.FULL
 
 
 def test_disabled_sandbox_never_upgrades_guest_to_full_host(
@@ -82,6 +86,62 @@ def test_disabled_sandbox_never_upgrades_guest_to_full_host(
     )
 
     assert full_host_access_for_context(guest) is False
+    assert effective_run_mode_for_context(guest) is RunMode.SAFE
+
+
+def test_effective_mode_reads_persisted_sandbox_run_context(tmp_path: Path) -> None:
+    reset_runtime()
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        run_mode=None,
+        sandbox_run_context=SimpleNamespace(run_mode=RunMode.FULL),
+    )
+
+    assert effective_run_mode_for_context(ctx) is RunMode.FULL
+
+
+def test_effective_mode_reads_session_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reset_runtime()
+    queue = SimpleNamespace(get_run_mode=lambda _session_key: "full")
+    monkeypatch.setattr(
+        "opensquilla.gateway.approval_queue.get_approval_queue",
+        lambda: queue,
+    )
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        session_key="agent:main:legacy-approved",
+    )
+
+    assert effective_run_mode_for_context(ctx) is RunMode.FULL
+
+
+def test_effective_mode_keeps_legacy_safe_session_over_full_runtime_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    queue = SimpleNamespace(get_run_mode=lambda _session_key: "safe")
+    runtime = SimpleNamespace(
+        effective=SimpleNamespace(sandbox_enabled=True),
+        default_run_mode="full",
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.approval_queue.get_approval_queue",
+        lambda: queue,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.get_runtime",
+        lambda: runtime,
+    )
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        session_key="agent:main:legacy-safe",
+    )
+
+    assert effective_run_mode_for_context(ctx) is RunMode.SAFE
+    assert ctx.run_mode == RunMode.SAFE.value
 
 
 def test_guest_context_rejects_even_a_forged_full_run_mode(

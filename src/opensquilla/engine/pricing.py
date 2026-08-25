@@ -120,7 +120,8 @@ class PriceEntry:
 @dataclass(frozen=True)
 class ResolvedModelPrice:
     """A PriceEntry plus which layer decided it (user_override > catalog >
-    live_openrouter > static_table > default; local_free short-circuits)."""
+    live_openrouter > static_table > default; local_free and custom_free
+    short-circuit)."""
 
     entry: PriceEntry
     source: str
@@ -132,7 +133,8 @@ class CostEstimate:
     cache_aware — four-bucket math with known cache rates;
     cache_blind — cache tokens present but a needed rate is unknown, so the
     legacy input*rate formula was used (conservative upper bound);
-    free — zero-priced (local runtime or known-free model)."""
+    free — zero-priced (local runtime, generic custom endpoint, or known-free
+    model)."""
 
     cost_usd: float
     basis: str
@@ -395,6 +397,7 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("meta-llama/llama-4-maverick", PriceEntry(0.15, 0.60)),
     ("mistralai/mistral-large-2512", PriceEntry(0.50, 1.50)),
     ("qwen/qwen3-coder-plus", PriceEntry(0.65, 3.25)),
+    ("qwen/qwen3.7-flash", PriceEntry(0.03, 0.13)),
     ("qwen/qwen3.7-max", PriceEntry(1.25, 3.75)),
     ("x-ai/grok-4.3", PriceEntry(1.25, 2.5)),
     ("z-ai/glm-4.6", PriceEntry(0.43, 1.74)),
@@ -446,9 +449,18 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("gemini-3.1-pro-preview", PriceEntry(2.0, 12.0, cache_read_per_m=0.20)),
     ("claude-haiku-4-5", PriceEntry(1.0, 5.0, cache_read_per_m=0.1, cache_write_per_m=1.25)),
     ("deepseek-v4-flash", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
+    (
+        "deepseek-v4-pro-0813",
+        PriceEntry(
+            1.2903225806451613,
+            3.870967741935484,
+            cache_read_per_m=0.043010752688172046,
+        ),
+    ),
     ("deepseek-v4-pro", PriceEntry(0.435, 0.87, cache_read_per_m=0.003625)),
     ("deepseek-chat", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
     ("deepseek-reasoner", PriceEntry(0.26, 0.38)),
+    ("qwen3.7-flash", PriceEntry(0.03, 0.13)),
     ("qwen3.7-max", PriceEntry(1.25, 3.75)),
     ("qwen3.7-plus", PriceEntry(0.40, 1.60)),
     ("gemini-2.5-flash-lite", PriceEntry(0.10, 0.40)),
@@ -570,6 +582,8 @@ _DEFAULT_PRICING = PriceEntry(3.0, 15.0)
 # pricing table misses the ``ollama/`` free entry and applies the cloud default.
 _LOCAL_FREE_PROVIDERS = frozenset({"ollama", "lm_studio", "ovms", "vllm", "local"})
 
+_CUSTOM_DEFAULT_ZERO_PROVIDERS = frozenset({"custom", "custom_anthropic"})
+
 
 def _lookup_static_price_ex(model_id: str) -> tuple[PriceEntry, bool]:
     """Static-table price plus whether a row actually matched.
@@ -635,6 +649,32 @@ def _catalog_price(model_id: str, provider: str) -> ResolvedModelPrice | None:
     return ResolvedModelPrice(price, source)
 
 
+def _custom_user_override_price(model_id: str, provider: str) -> PriceEntry | None:
+    """Return a complete operator-authored price for a generic custom endpoint.
+
+    ``ModelCatalog.resolve_entry`` merges catalog layers per field, which is
+    correct for metadata but can mix a custom endpoint's user metadata with a
+    same-named OpenRouter model's price. This path intentionally consults only
+    the explicit user price fields.
+    """
+    try:
+        from opensquilla.provider.model_catalog import shared_catalog
+
+        fields = shared_catalog().user_override_price_fields(model_id, provider=provider)
+    except Exception:  # noqa: BLE001 - catalog problems must never break pricing
+        return None
+    input_price = fields.get("input_cost_per_mtok")
+    output_price = fields.get("output_cost_per_mtok")
+    if input_price is None or output_price is None:
+        return None
+    return PriceEntry(
+        input_per_m=input_price,
+        output_per_m=output_price,
+        cache_read_per_m=fields.get("cache_read_cost_per_mtok"),
+        cache_write_per_m=fields.get("cache_write_cost_per_mtok"),
+    )
+
+
 def _cached_or_fetch_live(model_id: str) -> PriceEntry | None:
     """Return a live OpenRouter endpoint price, using the process cache.
 
@@ -668,11 +708,12 @@ def resolve_model_price(model_id: str, provider: str = "") -> ResolvedModelPrice
     """Resolve a model's price and name the layer that decided it.
 
     Authority order: ``local_free`` (short-circuit for local runtimes) >
-    static-table overrides > user/catalog cost data > live OpenRouter endpoint
-    price > static table > ``default``. Live lookup runs only for OpenRouter
-    (or an unqualified provider); first-party provider ids never query the
-    OpenRouter marketplace. If OpenRouter is unreachable, the static table is a
-    fail-open fallback so cost estimation keeps working offline.
+    complete generic-custom user price or ``custom_free`` > static-table
+    overrides > user/catalog cost data > live OpenRouter endpoint price >
+    static table > ``default``. Live lookup runs only for OpenRouter (or an
+    unqualified provider); first-party provider ids never query the OpenRouter
+    marketplace. If OpenRouter is unreachable, the static table is a fail-open
+    fallback so cost estimation keeps working offline.
 
     ``provider`` is the configured provider id. Local runtimes (Ollama, …) are
     free regardless of the model id, which is otherwise unqualified (e.g.
@@ -682,6 +723,11 @@ def resolve_model_price(model_id: str, provider: str = "") -> ResolvedModelPrice
     if prov in _LOCAL_FREE_PROVIDERS:
         return ResolvedModelPrice(PriceEntry(0.0, 0.0, 0.0, 0.0), "local_free")
     model_id = str(model_id or "").strip()
+    if prov in _CUSTOM_DEFAULT_ZERO_PROVIDERS:
+        custom_price = _custom_user_override_price(model_id, prov)
+        if custom_price is not None:
+            return ResolvedModelPrice(custom_price, "user_override")
+        return ResolvedModelPrice(PriceEntry(0.0, 0.0, 0.0, 0.0), "custom_free")
     override = _lookup_price_override(model_id)
     if override is not None:
         return ResolvedModelPrice(override, "static_table")

@@ -97,6 +97,16 @@ ROUTER_PROFILE_KEYS = frozenset({"profileId", "providerId", "label", "tiers"})
 ROUTER_TIER_PAYLOAD_KEYS = frozenset(
     {"provider", "model", "description", "thinkingLevel", "supportsImage"}
 )
+# Deliberate additive execution metadata. These keys are optional because only
+# tiers that opt into fusion need them; clients that predate the addition keep
+# receiving the frozen base shape for every other tier.
+ROUTER_TIER_OPTIONAL_KEYS = frozenset({"ensembleEnabled", "ensembleSelectionMode"})
+
+
+def _assert_router_tier_payload_keys(tier: dict[str, object], context: object) -> None:
+    keys = set(tier)
+    assert ROUTER_TIER_PAYLOAD_KEYS <= keys, context
+    assert keys <= ROUTER_TIER_PAYLOAD_KEYS | ROUTER_TIER_OPTIONAL_KEYS, context
 
 # The canonical text tiers (c0-c3, per router_tiers.py) and the nine tier
 # profiles shipped today. Hardcoded on purpose: dropping a profile or renaming
@@ -163,7 +173,7 @@ def test_provider_catalog_preset_keys_are_frozen() -> None:
             tiers = preset["tiers"]
             assert set(FROZEN_TEXT_TIERS) <= set(tiers), entry["providerId"]
             for tier_name, tier in tiers.items():
-                assert set(tier) == ROUTER_TIER_PAYLOAD_KEYS, (entry["providerId"], tier_name)
+                _assert_router_tier_payload_keys(tier, (entry["providerId"], tier_name))
         # The entry-level defaultModel mirrors the (single) preset's.
         assert entry["defaultModel"] == presets[0]["defaultModel"], entry["providerId"]
 
@@ -223,4 +233,4 @@ def test_router_catalog_profiles_and_tier_payloads_are_frozen() -> None:
         assert set(FROZEN_TEXT_TIERS) <= set(tiers), profile["profileId"]
         assert set(tiers) <= set(FROZEN_TEXT_TIERS) | {"image_model"}, profile["profileId"]
         for tier_name, tier in tiers.items():
-            assert set(tier) == ROUTER_TIER_PAYLOAD_KEYS, (profile["profileId"], tier_name)
+            _assert_router_tier_payload_keys(tier, (profile["profileId"], tier_name))

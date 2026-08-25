@@ -46,6 +46,8 @@ interface ActiveBootstrap {
     resolve: (ready: boolean) => void
   }>
   freshLiveOutageForHistoryRetry: boolean
+  awaitingReplacementConnection: boolean
+  lateReplacementRecoveryUsed: boolean
   history: PhaseRuntime<SessionPhaseResult>
   live: PhaseRuntime<SessionSubscriptionOutcome>
 }
@@ -452,6 +454,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       liveQueueSequence: 0,
       liveQueueWaiters: new Set(),
       freshLiveOutageForHistoryRetry: false,
+      awaitingReplacementConnection: false,
+      lateReplacementRecoveryUsed: false,
       history: historyRuntime(deadlineAt),
       live: liveRuntime(deadlineAt),
     }
@@ -600,6 +604,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         const liveWasReady = livePhase.value === 'ready'
         const liveWillRecover = run.live.running || liveWasReady
         if (liveWillRecover) {
+          run.awaitingReplacementConnection = true
           rearmCriticalQueue(
             run,
             run.includeHistory && run.history.running,
@@ -641,8 +646,66 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     if (!run || run.key !== options.sessionKey.value || run.controller.signal.aborted) {
       return startSessionBootstrap({ includeHistory, force: true })
     }
-    // The phase waiting for this connection owns its retry budget. A terminal
-    // run must not be silently given a third attempt by a late reconnect.
+    const replacementConnected = run.awaitingReplacementConnection
+    run.awaitingReplacementConnection = false
+    if (run.live.running) {
+      const interruptedPhase = run.live
+      const resumeOnReplacement = (outcome?: SessionSubscriptionOutcome) => {
+        const transportFailedAfterConnected = (
+          !replacementConnected
+          && requiresFreshLiveQueue(outcome?.error)
+        )
+        if (
+          (!replacementConnected && !transportFailedAfterConnected)
+          || !isCurrent(run)
+          || run.live !== interruptedPhase
+          || interruptedPhase.running
+          || run.lateReplacementRecoveryUsed
+          || (
+            livePhase.value !== 'connecting'
+            && livePhase.value !== 'degraded'
+          )
+        ) return
+        run.lateReplacementRecoveryUsed = true
+        rearmCriticalQueue(run, false)
+        // This is a continuation of the same outage, not a user-initiated
+        // retry. Grant exactly one attempt on the authenticated socket. The
+        // connected event can win a route-switch race before the new run sees
+        // the matching disconnected event, so the interrupted phase may have
+        // already consumed both of its attempts on the retired generation.
+        // lateReplacementRecoveryUsed prevents later socket churn from
+        // repeatedly extending this recovery window.
+        run.live = {
+          ...liveRuntime(interruptedPhase.deadlineAt),
+          attempts: 1,
+          skipSnapshot: interruptedPhase.skipSnapshot,
+        }
+        run.live.promise = runLivePhase(run)
+      }
+      // The replacement handshake can finish before the interrupted subscribe
+      // observes its cancellation. Resume exactly once after that old phase
+      // settles instead of leaving the UI indefinitely in "connecting".
+      void interruptedPhase.promise.then(
+        resumeOnReplacement,
+        () => resumeOnReplacement(),
+      )
+      return publicRun(run)
+    }
+    if (!run.live.running && livePhase.value === 'degraded') {
+      if (run.lateReplacementRecoveryUsed) return publicRun(run)
+      run.lateReplacementRecoveryUsed = true
+      // A replacement socket is a new recovery opportunity, even when the
+      // previous socket exhausted its bounded subscribe attempts. RpcClient
+      // owns the process-wide 1/2/4/8/15 second connection backoff; once its
+      // handshake succeeds, immediately register this Session on that socket.
+      // Keep an independently terminal history phase intact: restarting the
+      // whole bootstrap here can hide its actionable error behind a fresh
+      // loading state while replacement sockets continue to arrive.
+      rearmCriticalQueue(run, false)
+      resetLivePhaseForManualRetry(run)
+      run.live.promise = runLivePhase(run)
+      return publicRun(run)
+    }
     return publicRun(run)
   }
 

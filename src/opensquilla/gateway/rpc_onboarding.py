@@ -1455,6 +1455,7 @@ async def _ensemble_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             model_options=p.get("modelOptions"),
             candidates=p.get("candidates"),
             min_successful_proposers=p.get("minSuccessfulProposers"),
+            proposer_max_retries=p.get("proposerMaxRetries"),
             all_failed_policy=p.get("allFailedPolicy"),
         )
     # Persist first: if the write fails, the live config is untouched and

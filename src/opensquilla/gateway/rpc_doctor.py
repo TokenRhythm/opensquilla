@@ -229,6 +229,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
             "runtimeValid": True,
             "requireRouterRuntime": False,
             "runtimeErrorKind": None,
+            "routerProviderRoles": {},
         }
 
     router = config.squilla_router
@@ -242,6 +243,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
             "runtimeValid": True,
             "requireRouterRuntime": False,
             "runtimeErrorKind": None,
+            "routerProviderRoles": {},
         }
 
     runtime_valid = True
@@ -267,13 +269,44 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
     active_provider = str(getattr(getattr(config, "llm", None), "provider", "") or "")
     mismatched_tier_providers: dict[str, str] = {}
     tiers = getattr(router, "tiers", {}) or {}
-    if isinstance(tiers, dict) and active_provider.strip():
-        from opensquilla.router_tiers import TierConfig
+    from opensquilla.router_tiers import (
+        TierConfig,
+        effective_ensemble_selection_mode,
+        router_dynamic_tier_members_active,
+        router_tier_provider_roles,
+        tier_provider_role,
+    )
 
+    shared_selection_mode = effective_ensemble_selection_mode(config)
+    ensemble_globally_enabled = bool(
+        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+    )
+    provider_roles = router_tier_provider_roles(
+        tiers if isinstance(tiers, dict) else {},
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers if isinstance(tiers, dict) else {},
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
+    if isinstance(tiers, dict) and active_provider.strip():
         active_l = active_provider.strip().lower()
         for tier_name, tier_value in tiers.items():
             tier = TierConfig.from_value(tier_value)
-            if tier.provider and tier.provider.lower() != active_l:
+            provider_role = tier_provider_role(
+                tier_name,
+                tier_value,
+                shared_selection_mode=shared_selection_mode,
+                router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
+            )
+            if (
+                provider_role in {"direct", "dynamic_member"}
+                and tier.provider
+                and tier.provider.lower() != active_l
+            ):
                 mismatched_tier_providers[str(tier_name)] = tier.provider
 
     return {
@@ -292,6 +325,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
             getattr(router, "tier_provider_mismatch", "route") or "route"
         ),
         "mismatchedTierProviders": mismatched_tier_providers,
+        "routerProviderRoles": provider_roles,
     }
 
 
@@ -328,26 +362,56 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             "activeProvider": "",
             "runtimeStatus": "disabled",
             "configurationReady": None,
+            "configuredAllFailedPolicy": "fallback_single",
+            "effectiveAllFailedPolicy": "fallback_single",
+            "policyDeprecated": False,
+            "tierEnsembleStatuses": {},
         }
 
-    from opensquilla.provider.ensemble import ensemble_runtime_status, static_b5_profile
+    from opensquilla.provider.ensemble import (
+        ensemble_runtime_status,
+        tier_ensemble_runtime_statuses,
+    )
+    from opensquilla.router_tiers import (
+        CUSTOM_B5_SELECTION_MODE,
+        static_b5_profile,
+    )
 
-    payload = {
-        **ensemble_runtime_status(config),
-        "activeProvider": str(getattr(config.llm, "provider", "") or ""),
+    def decorate(runtime: dict[str, Any]) -> dict[str, Any]:
+        decorated = {
+            **runtime,
+            "activeProvider": str(getattr(config.llm, "provider", "") or ""),
+        }
+        static_profile = static_b5_profile(str(decorated["selectionMode"]))
+        if static_profile is not None and decorated["enabled"]:
+            from opensquilla.provider.registry import get_provider_spec
+
+            decorated["memberProvider"] = static_profile.provider_id
+            decorated["apiKeyEnv"] = str(
+                get_provider_spec(static_profile.provider_id).env_key or ""
+            )
+            decorated["credentialAvailable"] = bool(
+                decorated["configurationReady"]
+            )
+        elif decorated["enabled"] and decorated["selectionMode"] == CUSTOM_B5_SELECTION_MODE:
+            decorated["lineupReady"] = bool(decorated["configurationReady"])
+            decorated["lineupBlockedReason"] = str(
+                decorated["blockedReason"] or ""
+            )
+        return decorated
+
+    payload = decorate(ensemble_runtime_status(config))
+    configured_policy = str(
+        getattr(config.llm_ensemble, "all_failed_policy", "fallback_single")
+        or "fallback_single"
+    ).strip()
+    payload.setdefault("configuredAllFailedPolicy", configured_policy)
+    payload.setdefault("effectiveAllFailedPolicy", configured_policy)
+    payload.setdefault("policyDeprecated", False)
+    payload["tierEnsembleStatuses"] = {
+        tier: decorate(runtime)
+        for tier, runtime in tier_ensemble_runtime_statuses(config).items()
     }
-    static_profile = static_b5_profile(str(payload["selectionMode"]))
-    if static_profile is not None and payload["enabled"]:
-        from opensquilla.provider.registry import get_provider_spec
-
-        payload["memberProvider"] = static_profile.provider_id
-        payload["apiKeyEnv"] = str(
-            get_provider_spec(static_profile.provider_id).env_key or ""
-        )
-        payload["credentialAvailable"] = bool(payload["configurationReady"])
-    elif payload["enabled"] and payload["selectionMode"] == "custom_b5":
-        payload["lineupReady"] = bool(payload["configurationReady"])
-        payload["lineupBlockedReason"] = str(payload["blockedReason"] or "")
     return payload
 
 

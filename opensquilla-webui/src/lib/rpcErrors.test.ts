@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach } from 'vitest'
 import i18n, { loadLocaleMessages } from '@/i18n'
-import { localizeRpcError, saveFailedMessage } from '@/lib/rpcErrors'
+import { localizeGoalRpcError, localizeRpcError, saveFailedMessage } from '@/lib/rpcErrors'
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
@@ -41,5 +41,25 @@ describe('saveFailedMessage', () => {
     await loadLocaleMessages('zh-Hans')
     i18n.global.locale.value = 'zh-Hans'
     expect(saveFailedMessage(rpcErr(undefined, 'oops'))).toBe('保存失败: oops')
+  })
+})
+
+describe('localizeGoalRpcError', () => {
+  it('does not expose raw backend conflict text for stable Goal codes', () => {
+    const out = localizeGoalRpcError(rpcErr(
+      'GOAL_BUSY',
+      'The Goal still owns an unsettled task',
+    ))
+
+    expect(out).toBe('The goal state is still settling. Its latest status is shown above.')
+    expect(out).not.toContain('unsettled task')
+  })
+
+  it('localizes stable Goal conflicts in zh-Hans', async () => {
+    await loadLocaleMessages('zh-Hans')
+    i18n.global.locale.value = 'zh-Hans'
+
+    expect(localizeGoalRpcError(rpcErr('GOAL_BUSY', 'raw backend detail')))
+      .toBe('目标状态仍在结算，最新状态已显示在上方。')
   })
 })

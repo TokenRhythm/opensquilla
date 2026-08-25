@@ -7,12 +7,16 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from opensquilla.contracts.turn_execution import (
+    AnswerGenerationResetEvent,
+)
 from opensquilla.execution_status import ExecutionStatus
 from opensquilla.session.compaction_lifecycle import (
     DEFAULT_FLUSH_TRIGGERS,
     normalize_flush_triggers_strict,
 )
 from opensquilla.tool_boundary import ToolCall as ToolCall
+from opensquilla.tool_boundary import ToolEffectOutcome as ToolEffectOutcome
 from opensquilla.tool_boundary import ToolResult as ToolResult
 
 if TYPE_CHECKING:
@@ -48,9 +52,29 @@ class AgentState(StrEnum):
     DONE = "done"
 
 
+class ControlTerminalReason(StrEnum):
+    """Control-owned terminal reasons; none of these are provider failures."""
+
+    CANCEL = "cancel"
+    SHUTDOWN = "shutdown"
+    HARD_DEADLINE = "hard_deadline"
+    PLATFORM_VALIDATION = "platform_validation"
+    PLATFORM_SAFETY = "platform_safety"
+
+
 # ---------------------------------------------------------------------------
 # Agent events
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class ThinkingStartEvent:
+    kind: Literal["thinking_start"] = field(default="thinking_start", init=False)
+    block_id: str = ""
+    block_index: int = 0
+    started_at: int = 0
+    content_kind: Literal["summary", "reasoning"] = "reasoning"
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -58,6 +82,26 @@ class ThinkingEvent:
     kind: Literal["thinking"] = field(default="thinking", init=False)
     text: str = ""
     started_at: int = 0
+    # Optional block identity keeps the existing thinking delta wire contract
+    # compatible while allowing newer clients to preserve provider-call
+    # boundaries. Empty/-1 remain the legacy single-block representation.
+    block_id: str = ""
+    block_index: int = -1
+    generation_epoch: int = 0
+    # Physical provider-call identity for stable presentation ownership.
+    # Additive defaults preserve legacy producers and positional construction.
+    model_call_id: str = ""
+    iteration: int = 0
+
+
+@dataclass
+class ThinkingEndEvent:
+    kind: Literal["thinking_end"] = field(default="thinking_end", init=False)
+    block_id: str = ""
+    block_index: int = 0
+    status: Literal["completed", "interrupted", "error"] = "completed"
+    ended_at: int = 0
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -70,6 +114,11 @@ class TextDeltaEvent:
     # ended up making tool calls — see agent.py. Defaults to "answer" so any
     # producer that does not set it keeps the pre-existing card behavior.
     presentation: Literal["intermediate", "answer"] = "answer"
+    generation_epoch: int = 0
+    # Physical provider-call identity for stable presentation ownership.
+    # Additive defaults preserve legacy producers and positional construction.
+    model_call_id: str = ""
+    iteration: int = 0
 
 
 @dataclass
@@ -79,6 +128,40 @@ class RunHeartbeatEvent:
     elapsed_ms: int = 0
     idle_ms: int = 0
     message: str = ""
+    generation_epoch: int = 0
+
+
+@dataclass
+class ProviderActivityEvent:
+    """Public, provider-neutral progress for long model operations.
+
+    Fields are deliberately closed enums and counters: provider error bodies
+    and failed-leg reasoning must never cross this boundary.
+    """
+
+    kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
+    schema_version: int = 1
+    activity_id: str = ""
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
+        "requesting"
+    )
+    reason: Literal[
+        "initial",
+        "rate_limited",
+        "provider_overloaded",
+        "transport_transient",
+        "reasoning_only",
+        "empty_response",
+        "stream_incomplete",
+        "invalid_response",
+        "context_overflow",
+        "unknown",
+    ] = "initial"
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_after_ms: int = 0
+    started_at: int = 0
+    heartbeat: bool = False
 
 
 @dataclass
@@ -93,6 +176,7 @@ class ToolUseStartEvent:
     # clock every time the component remounts (see issue #329). 0 means
     # "unstamped" — clients fall back to their own clock.
     started_at: int = 0
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -100,6 +184,24 @@ class ToolUseDeltaEvent:
     kind: Literal["tool_use_delta"] = field(default="tool_use_delta", init=False)
     tool_use_id: str = ""
     json_fragment: str = ""
+    generation_epoch: int = 0
+
+
+@dataclass
+class ToolUseEndEvent:
+    """Committed end of one provider tool-call declaration.
+
+    Like start/delta, this event is buffered inside the Agent until the
+    provider call reaches a legal DoneEvent.  ``arguments`` is the validated,
+    authoritative object supplied by the provider boundary.
+    """
+
+    kind: Literal["tool_use_end"] = field(default="tool_use_end", init=False)
+    tool_use_id: str = ""
+    tool_name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    synthetic_from_text: bool = False
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -111,6 +213,8 @@ class ToolResultEvent:
     is_error: bool = False
     arguments: dict[str, Any] | None = None
     execution_status: ExecutionStatus | None = None
+    effect_outcome: ToolEffectOutcome | None = None
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -139,6 +243,7 @@ class ArtifactEvent:
     download_url: str = ""
     store: str = "artifacts"
     has_thumbnail: bool = False
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -157,6 +262,39 @@ class ErrorEvent:
     # Appended last with a default: positional construction elsewhere must not
     # shift (same hazard the DoneEvent comment in this file documents).
     error_id: str = ""
+    # Stable provider taxonomy for terminal consumers.  The provider's raw
+    # ``code`` remains available for diagnostics and wire compatibility.
+    failure_kind: str = ""
+    generation_epoch: int = 0
+    # Optional bounded retry hint for errors that prove no provider dispatch.
+    # Appended for positional-construction compatibility.
+    retry_after_ms: int | None = None
+    # Usage-ledger admission evidence. ``retryable`` describes the transient
+    # error class; these fields separately prove whether replaying the whole
+    # user turn cannot duplicate an earlier provider dispatch or side effect.
+    usage_call_index: int | None = None
+    no_prior_provider_dispatch: bool | None = None
+    replay_safe: bool | None = None
+
+
+@dataclass
+class ControlTerminalEvent:
+    """Public terminal event owned by turn control, not by a provider."""
+
+    kind: Literal["control_terminal"] = field(default="control_terminal", init=False)
+    turn_id: str = ""
+    assistant_message_id: str = ""
+    sequence: int = 0
+    reason: ControlTerminalReason = ControlTerminalReason.CANCEL
+    preserve_completed_tools: bool = True
+    terminal: bool = True
+
+    def __post_init__(self) -> None:
+        self.reason = ControlTerminalReason(self.reason)
+        if not self.preserve_completed_tools:
+            raise ValueError("control terminal events must preserve completed tools")
+        if not self.terminal:
+            raise ValueError("control terminal events must be terminal")
 
 
 @dataclass
@@ -233,6 +371,18 @@ class DoneEvent:
     # Offsets are Unicode codepoint indexes into ``text_snapshot``/``text``.
     # Appended for wire and positional-construction compatibility.
     model_call_segments: list[dict[str, Any]] = field(default_factory=list)
+    # Typed presentation contract for silent replies. Appended so existing
+    # positional DoneEvent construction keeps its historical field order.
+    delivery: Literal["visible", "suppressed"] = "visible"
+    suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
+    # Authoritative document side-effect fact for restricted annotation turns.
+    # Presentation text may be model-generated; this receipt is runtime-owned.
+    document_mutation_outcome: dict[str, Any] | None = None
+    generation_epoch: int = 0
+    # First physical provider call that emitted visible output for the route
+    # plan. Clients use this to keep its route card on the same answer segment.
+    router_model_call_id: str = ""
+    router_iteration: int = 0
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -288,6 +438,9 @@ class RouterDecisionEvent:
     routing_applied: bool = True
     rollout_phase: str = "full"
     context_window: int | None = None
+    # Display-safe, versioned candidate pool from the immutable RoutePlan.
+    # Appended for positional-construction and older consumer compatibility.
+    router_tier_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -308,6 +461,7 @@ class EnsembleProgressEvent:
     output_tokens: int = 0
     cost_usd: float = 0.0
     error: str = ""
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -453,16 +607,22 @@ class CompactionOutcome:
 
 
 AgentEvent = (
-    ThinkingEvent
+    ThinkingStartEvent
+    | ThinkingEvent
+    | ThinkingEndEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
+    | ProviderActivityEvent
     | ToolUseStartEvent
     | ToolUseDeltaEvent
+    | ToolUseEndEvent
     | ToolResultEvent
     | RouterControlReplayEvent
     | ArtifactEvent
     | StateChangeEvent
     | ErrorEvent
+    | AnswerGenerationResetEvent
+    | ControlTerminalEvent
     | DoneEvent
     | CompactionEvent
     | WarningEvent
@@ -578,6 +738,12 @@ class AgentConfig:
     compaction_protected_recent_messages: int = 0
     compaction_total_timeout_seconds: float = 120.0
     compaction_heartbeat_interval_seconds: float = 15.0
+    # Explicit per-turn authority boundary. Restricted turns (currently
+    # PromptAnnotation edits) must never send persisted history to an
+    # auxiliary compaction/flush model before or during the primary request.
+    # The runtime derives this from ToolContext.exclusive_tools; it is not a
+    # user-configurable inference from individual tool names.
+    restricted_turn: bool = False
     # Frozen runtime-only single-deployment chain for auxiliary compaction.
     # Kept opaque here to avoid coupling engine types to session internals.
     compaction_execution_plan: Any | None = field(
@@ -597,6 +763,13 @@ class AgentConfig:
     repair_max_items_per_tick: int = 5
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
+    # Active-deployment tool capability provenance for diagnostics and routing.
+    # Tool authorization remains owned by the projected registry surface and
+    # dispatch/side-effect boundaries; unknown provenance does not remove tools.
+    model_tools_capability_verified: bool = False
+    # Runtime-only tri-state evidence; synthesized capability defaults remain
+    # ``unknown`` instead of becoming an authoritative vision denial.
+    model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
     # Legacy compression knobs remain as compatibility shims for meta_invoke

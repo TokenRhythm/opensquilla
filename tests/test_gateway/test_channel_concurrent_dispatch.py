@@ -128,6 +128,13 @@ def test_compute_channel_cap_env_override(monkeypatch: pytest.MonkeyPatch) -> No
     assert _compute_channel_cap(cfg) == 1
 
 
+def test_compute_channel_cap_missing_runtime_value_uses_desktop_default() -> None:
+    config = MagicMock()
+    config.task_runtime = MagicMock(spec=["channel_inflight_cap"])
+    config.task_runtime.channel_inflight_cap = 16
+    assert _compute_channel_cap(config) == 16
+
+
 # ── _ChannelInFlightSet docstring must mention SEPARATE second-layer semaphore
 
 

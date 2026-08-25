@@ -2,12 +2,16 @@ import { marked, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
 import katex from 'katex'
+import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
+import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
+import { strictStrikethrough } from '@/utils/markdown/strikethrough'
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
 const TIME_PREFIX_RE = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 
-const MARKDOWN_CACHE_MAX = 500
+const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024
+const MARKDOWN_CACHE_MAX_ITEM_BYTES = 256 * 1024
 const MATH_SCAN_RE = /(```[\s\S]*?```|`[^`\n]+?`|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([^)\n]+?\\\)|\$(?![\s\d])(?:\\\$|[^$\n])+?(?<![\s])\$)/g
 const MATH_SENTINEL_RE = /\uE000M(\d+)\uE001/g
 // Highlighting is synchronous inside the streaming render path; past this
@@ -21,6 +25,12 @@ const KATEX_CLASS_RE = /^[A-Za-z][\w-]*$/
 type MathEntry = {
   type: 'inline' | 'display'
   content: string
+}
+
+export interface RenderMarkdownOptions {
+  highlight?: boolean
+  cache?: 'settled' | 'none'
+  math?: 'full' | 'defer'
 }
 
 // Syntax highlighting is the heaviest part of the render and re-runs over the
@@ -39,7 +49,7 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
-marked.use({
+marked.use(strictStrikethrough, {
   renderer: {
     code({ text, lang }: Tokens.Code): string {
       const language = (lang || '').trim().split(/\s+/)[0].toLowerCase()
@@ -204,7 +214,8 @@ function sanitizeMarkdownHtml(rawHtml: string, allowKatex = false): string {
 }
 
 export function useChatTextRendering() {
-  const markdownCache = new Map<string, string>()
+  const markdownCache = new Map<string, { html: string, bytes: number }>()
+  let markdownCacheBytes = 0
 
   function stripDirectiveTags(text: string): string {
     return text.replace(DIRECTIVE_TAG_RE, '').replace(/^\n+/, '')
@@ -220,7 +231,7 @@ export function useChatTextRendering() {
     return typeof text === 'string' ? text.replace(TIME_PREFIX_RE, '') : text
   }
 
-  function renderMarkdown(text: string, opts?: { highlight?: boolean }): string {
+  function renderMarkdown(text: string, opts?: RenderMarkdownOptions): string {
     // Tool-protocol compatibility belongs to the shared backend stream. The UI
     // cannot infer intent from user-visible Markdown: `<tool_calls>` may be
     // documentation inside inline/fenced code, and cutting at that marker loses
@@ -232,15 +243,27 @@ export function useChatTextRendering() {
     // Cache key is namespaced by highlight mode so a plain streaming render is
     // never served where a highlighted one is expected (and vice versa).
     const highlight = opts?.highlight !== false
-    const cacheKey = (highlight ? 'H\n' : 'P\n') + text
-    const cached = markdownCache.get(cacheKey)
-    if (cached !== undefined) return cached
+    const cacheMode = opts?.cache ?? 'settled'
+    const mathMode = opts?.math ?? 'full'
+    const cacheKey = `${highlight ? 'H' : 'P'}${mathMode === 'full' ? 'M' : 'D'}\n${text}`
+    if (cacheMode === 'settled') {
+      const cached = markdownCache.get(cacheKey)
+      if (cached !== undefined) {
+        // Map insertion order is the LRU order. Refresh a hit without changing
+        // the retained-byte accounting.
+        markdownCache.delete(cacheKey)
+        markdownCache.set(cacheKey, cached)
+        return cached.html
+      }
+    }
 
     // Toggle the shared code-highlight flag only across the synchronous parse;
     // try/finally guarantees it is restored even if marked.parse throws, so a
     // later highlighted render can never inherit a stale "plain" flag.
     let rawHtml: string
-    const { text: stashedText, stash } = stashMath(text)
+    const { text: stashedText, stash } = mathMode === 'defer'
+      ? { text, stash: [] as MathEntry[] }
+      : stashMath(text)
     codeHighlightEnabled = highlight
     try {
       rawHtml = marked.parse(stashedText, { async: false, breaks: true }) as string
@@ -252,22 +275,54 @@ export function useChatTextRendering() {
       ? sanitizeMarkdownHtml(restoreMath(sanitizedHtml, stash), true)
       : sanitizedHtml
 
-    if (markdownCache.size >= MARKDOWN_CACHE_MAX) {
-      const firstKey = markdownCache.keys().next().value
-      if (firstKey !== undefined) markdownCache.delete(firstKey)
+    if (cacheMode === 'settled') {
+      // UTF-16 code units are a conservative and deterministic approximation
+      // of retained JS string storage. Count both the key (which embeds the
+      // source) and the sanitized HTML value.
+      const bytes = (cacheKey.length + html.length) * 2
+      if (bytes <= MARKDOWN_CACHE_MAX_ITEM_BYTES) {
+        while (markdownCacheBytes + bytes > MARKDOWN_CACHE_MAX_BYTES) {
+          const firstKey = markdownCache.keys().next().value
+          if (firstKey === undefined) break
+          const evicted = markdownCache.get(firstKey)
+          markdownCache.delete(firstKey)
+          markdownCacheBytes -= evicted?.bytes ?? 0
+        }
+        markdownCache.set(cacheKey, { html, bytes })
+        markdownCacheBytes += bytes
+      }
     }
-    markdownCache.set(cacheKey, html)
     return html
   }
 
-  function sanitizeCopyText(text: string): string {
-    return stripDirectiveTags(
+  function clearMarkdownCache(): void {
+    markdownCache.clear()
+    markdownCacheBytes = 0
+  }
+
+  function markdownCacheStats(): { entries: number, bytes: number } {
+    return { entries: markdownCache.size, bytes: markdownCacheBytes }
+  }
+
+  function sanitizeCopyText(
+    text: string,
+    opts?: {
+      assistantBoundary?: boolean
+      provenance?: AssistantPresentationProvenance
+    },
+  ): string {
+    const sanitized = stripDirectiveTags(
       stripGeneratedArtifactMarkers(stripTimePrefix(String(text || ''))),
-    ).trim()
+    )
+    return (opts?.assistantBoundary === false
+      ? sanitized
+      : sanitizeAssistantPresentationText(sanitized, opts?.provenance)).trim()
   }
 
   return {
     renderMarkdown,
+    clearMarkdownCache,
+    markdownCacheStats,
     sanitizeCopyText,
     stripDirectiveTags,
     stripGeneratedArtifactMarkers,

@@ -59,7 +59,10 @@ from .types import (
     Message,
     ModelCapabilities,
     ModelInfo,
+    ProviderActivityEvent,
+    ProviderAttemptFailure,
     ProviderFinalRequestProjection,
+    ProviderGenerationResetEvent,
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
@@ -131,7 +134,12 @@ __all__ = [
     "ToolUseEndEvent",
     "DoneEvent",
     "ErrorEvent",
+    "ProviderActivityEvent",
     "ProviderHeartbeatEvent",
+    "ProviderGenerationResetEvent",
+    # Internal coordinator contract; it is intentionally excluded from
+    # StreamEvent/public gateway payload unions.
+    "ProviderAttemptFailure",
     "ProviderFinalRequestProjection",
     "ProviderMessageCountProjection",
     "ProviderMessageLimitProof",

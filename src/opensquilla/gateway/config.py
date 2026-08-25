@@ -39,7 +39,23 @@ from opensquilla.provider.credentials import (
 )
 from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
 from opensquilla.router_tiers import (
+    CUSTOM_B5_MAX_PROPOSERS,
+    CUSTOM_B5_MAX_TOTAL_CALLS,
+    CUSTOM_B5_MIN_PROPOSERS,
+    CUSTOM_B5_SELECTION_MODE,
     DEFAULT_TEXT_TIER,
+    ENSEMBLE_CANDIDATE_ROLES,
+    LEGACY_OPENROUTER_MODEL_OPTIONS,
+    ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
+    STATIC_B5_SELECTION_MODE_PROVIDERS,  # noqa: F401 - legacy import surface
+    STATIC_B5_SELECTION_MODES,
+    STATIC_OPENROUTER_B5_SELECTION_MODE,
+    STATIC_TOKENRHYTHM_B5_SELECTION_MODE,  # noqa: F401 - legacy import surface
+    TEXT_TIERS,
+    EnsembleSelectionMode,
+    TierConfig,
+    effective_ensemble_selection_mode,
+    effective_tier_ensemble_selection_modes,
     normalize_text_tier,
     normalize_tier_mapping,
 )
@@ -316,7 +332,7 @@ class PermissionsConfig(BaseModel):
 class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
-    max_concurrency: int = Field(default=4, ge=1)
+    max_concurrency: int = Field(default=8, ge=1)
     max_pending_per_session: int = Field(default=64, ge=1)
     # Per-channel-adapter in-flight semaphore (separate from
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP
@@ -394,7 +410,7 @@ class LlmProviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_LLM_")
 
     provider: str = "tokenrhythm"
-    model: str = "deepseek-v4-pro"
+    model: str = "deepseek-v4-pro-0813"
     api_key: str = ""
     api_key_env: str = ""
     base_url: str = "https://tokenrhythm.studio/v1"
@@ -446,17 +462,6 @@ class LlmProviderConfig(BaseSettings):
         return self
 
 
-LEGACY_OPENROUTER_MODEL_OPTIONS = [
-    "deepseek/deepseek-v4-pro",
-    "z-ai/glm-5.2",
-    "qwen/qwen3.7-plus",
-    "deepseek/deepseek-v4-flash",
-    "qwen/qwen3.7-max",
-    "moonshotai/kimi-k2.6",
-    "moonshotai/kimi-k2.7-code",
-    "minimax/minimax-m3",
-]
-
 # Backward-compatible alias for older imports. New configs do not use these as
 # defaults; they are only recognized as the old OpenRouter preset payload.
 DEFAULT_LLM_ENSEMBLE_MODEL_OPTIONS = LEGACY_OPENROUTER_MODEL_OPTIONS
@@ -467,25 +472,10 @@ def _default_llm_ensemble_model_options() -> list[str]:
     return []
 
 
-# Candidate roles for the custom B5 lineup. Proposer roles are advisory
-# labels surfaced in the UI and the decision trace; "aggregator" is
-# structural — it marks the single member that fuses drafts and produces
-# the final answer. Empty string = unassigned (runs as a proposer).
-LLM_ENSEMBLE_CANDIDATE_ROLES = (
-    "",
-    "primary",
-    "contrast",
-    "fast_check",
-    "critic",
-    "aggregator",
-)
-
-# custom_b5 lineup bounds. The proposer cap covers total per-turn proposer
-# calls; the aggregator adds one more. See the ensemble builder for how the
-# lineup maps onto the shared B5 fusion defaults.
-CUSTOM_B5_MIN_PROPOSERS = 2
-CUSTOM_B5_MAX_PROPOSERS = 6
-CUSTOM_B5_MAX_TOTAL_CALLS = 8
+# Candidate roles for the custom B5 lineup. "proposer" drafts independently;
+# "aggregator" fuses those drafts and produces the final answer.
+# Backward-compatible symbol for callers that imported the old gateway table.
+LLM_ENSEMBLE_CANDIDATE_ROLES = ENSEMBLE_CANDIDATE_ROLES
 
 
 class LlmEnsembleCandidateConfig(BaseModel):
@@ -493,10 +483,10 @@ class LlmEnsembleCandidateConfig(BaseModel):
     model: str
     source: Literal["custom", "legacy_model_options"] = "custom"
     enabled: bool = True
-    # Advisory role label; unknown values coerce to "" (unassigned) instead of
-    # failing validation so a hand-edited config never blocks gateway boot.
+    # Released advisory aliases and unknown values coerce to "proposer"
+    # instead of failing validation, so old or hand-edited configs still boot.
     # Strict role/lineup checks live on the RPC save path (upsert mutation).
-    role: str = ""
+    role: str = "proposer"
     # Per-candidate thinking level override: off|minimal|low|medium|high|xhigh.
     # Coerced to "" (inherit from turn config) on invalid input so a hand-edited
     # config never blocks gateway boot, matching the role field policy above.
@@ -511,7 +501,7 @@ class LlmEnsembleCandidateConfig(BaseModel):
     @classmethod
     def _normalize_role(cls, value: object) -> str:
         normalized = str(value or "").strip().lower()
-        return normalized if normalized in LLM_ENSEMBLE_CANDIDATE_ROLES else ""
+        return normalized if normalized in ENSEMBLE_CANDIDATE_ROLES else "proposer"
 
     @field_validator("thinking_level", mode="before")
     @classmethod
@@ -544,9 +534,10 @@ class LlmEnsembleConfig(BaseSettings):
     # operator explicitly enables the ensemble surface.
     enabled: bool = False
     mode: Literal["b5_fusion"] = "b5_fusion"
-    selection_mode: Literal[
-        "router_dynamic", "static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"
-    ] = "static_openrouter_b5"
+    selection_mode: EnsembleSelectionMode = cast(
+        EnsembleSelectionMode,
+        STATIC_OPENROUTER_B5_SELECTION_MODE,
+    )
     # Expose tool schemas to proposers as advisory vocabulary only. Proposer
     # output is never dispatched; only the aggregator owns an executable tool
     # boundary.
@@ -566,6 +557,10 @@ class LlmEnsembleConfig(BaseSettings):
     candidate_max_chars: int = Field(default=24_000, ge=0)
     proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
+    # Deprecated read-compatibility field. The ensemble runtime intentionally
+    # ignores it and relies on the per-call proposer/aggregator/fixed-provider
+    # idle timeouts instead.
+    total_timeout_seconds: float | None = Field(default=None, ge=0.0)
     shuffle_candidates: bool = True
     record_candidates: bool = False
 
@@ -594,7 +589,7 @@ class LlmEnsembleConfig(BaseSettings):
             )
         if (
             self.selection_mode
-            in {"static_openrouter_b5", "static_tokenrhythm_b5"}
+            in STATIC_B5_SELECTION_MODES
             and self.target_successful_proposers is not None
             and self.target_successful_proposers > 4
         ):
@@ -625,7 +620,7 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.candidates may mark at most one enabled "
                 "candidate with role='aggregator'"
             )
-        if self.selection_mode != "custom_b5":
+        if self.selection_mode != CUSTOM_B5_SELECTION_MODE:
             return self
         proposers = [
             candidate
@@ -665,16 +660,6 @@ class LlmEnsembleConfig(BaseSettings):
         return self
 
 
-STATIC_OPENROUTER_B5_SELECTION_MODE = "static_openrouter_b5"
-STATIC_TOKENRHYTHM_B5_SELECTION_MODE = "static_tokenrhythm_b5"
-# selection_mode → member provider id for the static B5 profiles. Must stay
-# in lockstep with provider.ensemble.STATIC_B5_PROFILES (gateway must not be
-# imported from provider, so a parity test pins the two tables together).
-STATIC_B5_SELECTION_MODE_PROVIDERS: dict[str, str] = {
-    STATIC_OPENROUTER_B5_SELECTION_MODE: "openrouter",
-    STATIC_TOKENRHYTHM_B5_SELECTION_MODE: "tokenrhythm",
-}
-STATIC_B5_SELECTION_MODES = frozenset(STATIC_B5_SELECTION_MODE_PROVIDERS)
 STATIC_OPENROUTER_B5_MIN_AGENT_STREAM_IDLE_TIMEOUT_SECONDS = 1200.0
 STATIC_OPENROUTER_B5_MIN_WEBUI_STREAM_IDLE_GRACE_SECONDS = 1260.0
 
@@ -687,13 +672,29 @@ def _non_negative_float(value: Any, default: float) -> float:
     return max(0.0, parsed)
 
 
-def static_b5_ensemble_enabled(config: Any) -> bool:
+def _configured_static_b5_selection_modes(config: Any) -> tuple[str, ...]:
+    modes: list[str] = []
     ensemble_cfg = getattr(config, "llm_ensemble", None)
-    if ensemble_cfg is None:
-        return False
-    return bool(getattr(ensemble_cfg, "enabled", False)) and (
-        str(getattr(ensemble_cfg, "selection_mode", "") or "") in STATIC_B5_SELECTION_MODES
-    )
+    global_mode = effective_ensemble_selection_mode(config)
+    if bool(getattr(ensemble_cfg, "enabled", False)) and global_mode in STATIC_B5_SELECTION_MODES:
+        modes.append(global_mode)
+
+    router = getattr(config, "squilla_router", None)
+    if bool(getattr(router, "enabled", False)):
+        tier_modes = effective_tier_ensemble_selection_modes(
+            getattr(router, "tiers", None),
+            shared_selection_mode=global_mode,
+        )
+        modes.extend(
+            mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES
+        )
+    return tuple(dict.fromkeys(modes))
+
+
+def static_b5_ensemble_enabled(config: Any) -> bool:
+    """Whether global or tier-managed configuration can run static B5."""
+
+    return bool(_configured_static_b5_selection_modes(config))
 
 
 def static_b5_ensemble_active(config: Any) -> bool:
@@ -706,15 +707,40 @@ def static_b5_ensemble_active(config: Any) -> bool:
     ``provider`` never imports from ``gateway``, so no cycle) and therefore
     cannot disagree with the turn-time wrap guard.
     """
-    if not static_b5_ensemble_enabled(config):
+    selection_modes = _configured_static_b5_selection_modes(config)
+    if not selection_modes:
         return False
     from opensquilla.provider.ensemble import static_b5_credential_available
 
-    selection_mode = str(
-        getattr(getattr(config, "llm_ensemble", None), "selection_mode", "") or ""
+    return any(
+        static_b5_credential_available(
+            config,
+            getattr(config, "llm", None),
+            selection_mode,
+        )
+        for selection_mode in selection_modes
     )
+
+
+def _global_static_b5_ensemble_active(config: Any) -> bool:
+    """Whether the global ensemble surface will run a static-B5 profile.
+
+    Tier-managed fusion only affects turns routed to that tier, so it must not
+    inflate the gateway-wide stream-idle budget for every other request.
+    """
+
+    ensemble_cfg = getattr(config, "llm_ensemble", None)
+    selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+    if not bool(getattr(ensemble_cfg, "enabled", False)):
+        return False
+    if selection_mode not in STATIC_B5_SELECTION_MODES:
+        return False
+    from opensquilla.provider.ensemble import static_b5_credential_available
+
     return static_b5_credential_available(
-        config, getattr(config, "llm", None), selection_mode
+        config,
+        getattr(config, "llm", None),
+        selection_mode,
     )
 
 
@@ -723,7 +749,7 @@ def effective_agent_stream_idle_timeout_seconds(config: Any) -> float:
         getattr(config, "agent_stream_idle_timeout_seconds", 600.0),
         600.0,
     )
-    if static_b5_ensemble_active(config):
+    if _global_static_b5_ensemble_active(config):
         value = max(value, STATIC_OPENROUTER_B5_MIN_AGENT_STREAM_IDLE_TIMEOUT_SECONDS)
     return value
 
@@ -733,7 +759,7 @@ def effective_webui_stream_idle_grace_seconds(config: Any) -> float:
         getattr(config, "webui_stream_idle_grace_seconds", 630.0),
         630.0,
     )
-    if static_b5_ensemble_active(config):
+    if _global_static_b5_ensemble_active(config):
         server_idle = effective_agent_stream_idle_timeout_seconds(config)
         value = max(
             value,
@@ -1338,6 +1364,29 @@ class SquillaRouterConfig(BaseSettings):
         next_values["tiers"] = merged
         return next_values
 
+    @model_validator(mode="after")
+    def _validate_tier_ensemble_selection_modes(self) -> SquillaRouterConfig:
+        allowed = ", ".join(sorted(ROUTER_TIER_ENSEMBLE_SELECTION_MODES))
+        for tier_name in TEXT_TIERS:
+            raw_tier = self.tiers.get(tier_name) if isinstance(self.tiers, dict) else None
+            if isinstance(raw_tier, dict):
+                raw_enabled = raw_tier.get(
+                    "ensemble_enabled",
+                    raw_tier.get("ensembleEnabled"),
+                )
+                if raw_enabled is not None and not isinstance(raw_enabled, bool):
+                    raise ValueError(
+                        f"squilla_router.tiers.{tier_name}.ensemble_enabled "
+                        "must be a boolean"
+                    )
+            selection_mode = TierConfig.from_value(raw_tier).ensemble_selection_mode
+            if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
+                raise ValueError(
+                    f"squilla_router.tiers.{tier_name}.ensemble_selection_mode "
+                    f"must be one of: {allowed}"
+                )
+        return self
+
 
 # Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
 # (``from __future__ import annotations`` makes it a string). Without this the
@@ -1417,9 +1466,10 @@ class SessionNamingConfig(BaseSettings):
     """LLM-generated session titles (auto-naming).
 
     After the first user message, a one-shot LLM call summarizes it into a short
-    title written to SessionNode.derived_title. Model selection mirrors compaction
-    but defaults to the router's default text tier rather than the session model:
-    ``model`` (explicit) > ``tier`` model > squilla_router.default_tier model.
+    title written to SessionNode.derived_title. Explicit ``model`` and ``tier``
+    settings override the mode-specific default: direct routing follows the
+    resolved session/provider model, while Router and Ensemble use the router's
+    default text tier.
     """
 
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_NAMING_")
@@ -1428,8 +1478,8 @@ class SessionNamingConfig(BaseSettings):
     # Surfaces eligible for auto-naming. webchat/cli are chat; channel covers
     # inbound channel conversations. cron/subagent intentionally excluded.
     surfaces: list[str] = Field(default_factory=lambda: ["webchat", "cli", "channel"])
-    tier: str | None = None  # None = use squilla_router.default_tier
-    model: str | None = None  # None = use the resolved tier's model
+    tier: str | None = None  # None = use the routing mode's default target
+    model: str | None = None  # None = use the explicit tier or mode default
     timeout_seconds: float = 30.0
     max_chars: int = Field(default=48, ge=8)
     language: str = "auto"  # follow the conversation language
@@ -1726,6 +1776,11 @@ class DingTalkChannelEntry(ConfiguredChannelEntry):
     type: Literal["dingtalk"] = "dingtalk"
     client_id: str
     client_secret: str
+    # Existing stream-only entries predate native artifact delivery, so these
+    # stay safely defaulted. The onboarding catalog requires robot_code for
+    # newly created entries while legacy TOML continues to load unchanged.
+    robot_code: str = ""
+    cool_app_code: str = ""
 
 
 class WeComChannelEntry(ConfiguredChannelEntry):
@@ -2247,6 +2302,27 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
         return values
 
 
+class GoalConfig(BaseSettings):
+    """Guardrails for session-level Goal execution.
+
+    TOML section ``[goal]``; keys mirror the field names (snake_case).
+    Automatic execution is enabled by default, with a fail-closed operator
+    switch and bounded per-resume execution windows.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_GOAL_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    execution_enabled: bool = True
+    max_turns: int = Field(default=50, ge=1, le=500)
+    # Accumulated running time only. Queued, paused, and process downtime are
+    # deliberately excluded from this limit.
+    runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2309,6 +2385,7 @@ class GatewayConfig(BaseSettings):
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    goal: GoalConfig = Field(default_factory=GoalConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
@@ -2564,7 +2641,8 @@ class GatewayConfig(BaseSettings):
         has_custom_tiers = (
             "tiers" in fields_set and getattr(router, "tiers", {}) != _default_tiers()
         )
-        if "tier_profile" in fields_set or has_custom_tiers:
+        follows_primary_preset = getattr(router, "preset_binding", None) == "follow_primary"
+        if "tier_profile" in fields_set or (has_custom_tiers and not follows_primary_preset):
             return self
         payload = router.model_dump(mode="python")
         if curated_inline_preset is None:

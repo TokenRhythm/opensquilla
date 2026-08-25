@@ -91,7 +91,7 @@ async def _run_complete(
         metadata = provider_metadata(provider)
         stream = account_provider_stream(
             lambda: chat(messages, config=config),
-            provider=metadata.provider_name or metadata.provider_kind,
+            provider=metadata.provider_id or metadata.provider_name or metadata.provider_kind,
             model=metadata.model,
         )
         close_stream = stream

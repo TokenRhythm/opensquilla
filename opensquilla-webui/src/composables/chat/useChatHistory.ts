@@ -11,6 +11,7 @@ import type {
   ChatHistoryResponse,
 } from '@/types/rpc'
 import type { StatusPart } from '@/types/parts'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
 import {
   historyWindowsOverlap,
@@ -24,6 +25,7 @@ import {
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
@@ -36,7 +38,14 @@ import {
 } from '@/composables/chat/sessionBootstrapContract'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import {
+  activityReasoningBlocks,
+  activitySnapshotMatchesMessage,
+} from '@/utils/chat/activitySnapshot'
+import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
+import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
+import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
 
 type RpcClient = {
   policy?: Record<string, unknown> | null
@@ -59,6 +68,13 @@ function historyTerminationActions(rpc: RpcClient) {
   return {
     timeoutAction: action,
     abortAction: action,
+  }
+}
+
+function nonReconnectingHistoryActions() {
+  return {
+    timeoutAction: 'reject' as const,
+    abortAction: 'reject' as const,
   }
 }
 
@@ -88,15 +104,37 @@ function historyContextText(value: unknown, key: string): string | undefined {
   return typeof raw === 'string' && raw ? raw : undefined
 }
 
+function historyTurnPresentationProvenance(value: unknown): {
+  inputMode?: string
+  runKind?: string
+} {
+  const explicitInputMode = historyContextText(value, 'input_mode')
+    ?? historyContextText(value, 'inputMode')
+  const explicitRunKind = historyContextText(value, 'run_kind')
+    ?? historyContextText(value, 'runKind')
+  const isLegacyGoalContinuation = historyContextText(value, 'intent') === 'goal_continuation'
+  return {
+    inputMode: explicitInputMode
+      ?? (isLegacyGoalContinuation ? 'system_event' : undefined),
+    runKind: explicitRunKind
+      ?? (isLegacyGoalContinuation ? 'goal' : undefined),
+  }
+}
+
 function historyHasSteerEvidence(value: unknown): boolean {
   const disposition = historyContextText(value, 'disposition')
   const intent = historyContextText(value, 'intent')
-  return intent === 'steer'
-    || disposition === 'steering'
+  // Current gateways persist an intent for both primary sends and Steers.
+  // Treat that explicit value as authoritative: primary sends also carry a
+  // client_request_id, so transport identity alone cannot prove Steer UX.
+  if (intent) return intent === 'steer'
+  // Older gateways omitted intent. Preserve their Steer rows using fields
+  // that are specific to same-turn admission/application rather than IDs
+  // shared by every durable user input.
+  return disposition === 'steering'
     || disposition === 'promoted'
-    || disposition === 'cancelled'
-    || disposition === 'rejected'
-    || Boolean(historyContextText(value, 'client_request_id'))
+    || Boolean(historyContextText(value, 'promoted_turn_id'))
+    || Boolean(historyContextText(value, 'promoted_from_turn_id'))
     || Boolean(historyContextText(value, 'model_call_id'))
     || historyContextInteger(value, 'applied_iteration') !== undefined
 }
@@ -124,11 +162,17 @@ function historyDispositionRevision(value: unknown): number | undefined {
 
 function historyContextInteger(value: unknown, key: string): number | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const number = Number((value as Record<string, unknown>)[key])
+  const raw = (value as Record<string, unknown>)[key]
+  if (typeof raw !== 'number' && typeof raw !== 'string') return undefined
+  if (typeof raw === 'string' && !raw.trim()) return undefined
+  const number = Number(raw)
   return Number.isInteger(number) && number >= 0 ? number : undefined
 }
 
-function historyActivityMarkers(value: unknown): StatusPart[] {
+function historyActivityMarkers(
+  value: unknown,
+  suppressedCompactionIds: ReadonlySet<string> = new Set(),
+): StatusPart[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return []
   const markers = (value as Record<string, unknown>).activity_markers
   if (!Array.isArray(markers)) return []
@@ -137,7 +181,7 @@ function historyActivityMarkers(value: unknown): StatusPart[] {
     const data = marker as Record<string, unknown>
     if (data.kind !== 'context_compaction') return []
     const id = String(data.id || '').trim()
-    if (!id) return []
+    if (!id || suppressedCompactionIds.has(id)) return []
     const rawStatus = String(data.status || 'completed').toLowerCase()
     const state = rawStatus === 'completed'
       ? 'completed'
@@ -168,9 +212,10 @@ function summaryCount(value: unknown): number | undefined {
   return Number.isInteger(count) && count >= 0 ? count : undefined
 }
 
-function manualCompactionMessage(summary: ChatCompactionSummary): ChatMessage | null {
-  if (String(summary.trigger_reason || '').trim().toLowerCase() !== 'manual') return null
-
+function compactionSummaryMessage(
+  summary: ChatCompactionSummary,
+  canonicalComplete: boolean | null,
+): ChatMessage | null {
   const summaryId = summaryStableValue(summary.id)
   const compactionId = summaryStableValue(summary.compaction_id)
   const compactionIndex = summaryStableValue(summary.compaction_index)
@@ -192,21 +237,33 @@ function manualCompactionMessage(summary: ChatCompactionSummary): ChatMessage | 
     maintenance: {
       kind: 'context_compaction',
       compactionId: compactionId || identity,
-      source: 'manual',
+      source: String(summary.trigger_reason || '').trim().toLowerCase() === 'manual'
+        ? 'manual'
+        : 'automatic',
       state: 'completed',
       durability: 'durable',
       removedCount: summaryCount(summary.removed_count),
       keptCount: summaryCount(summary.kept_count),
+      historyArchived: true,
+      canonicalComplete,
     },
   }
 }
 
-function manualCompactionMessages(data: ChatHistoryResponse): ChatMessage[] {
+function compactionSummaryMessages(data: ChatHistoryResponse): ChatMessage[] {
   const summaries = data.compaction_summaries ?? data.compactionSummaries ?? []
+  const completeness = data.canonical_complete ?? data.canonicalComplete
+  const canonicalComplete = typeof completeness === 'boolean' ? completeness : null
   return summaries.flatMap((summary) => {
-    const message = manualCompactionMessage(summary)
+    const message = compactionSummaryMessage(summary, canonicalComplete)
     return message ? [message] : []
   })
+}
+
+function summaryCompactionIds(data: ChatHistoryResponse): Set<string> {
+  return new Set(
+    compactionSummaryMessages(data).map(message => message.maintenance!.compactionId),
+  )
 }
 
 function isHistoryMaintenance(message: ChatMessage): boolean {
@@ -243,7 +300,29 @@ function mergeHistoryMaintenance(
   messages: ChatMessage[],
   maintenance: ChatMessage[],
 ): ChatMessage[] {
-  const canonical = messages.filter(message => !isHistoryMaintenance(message))
+  const candidates = [
+    ...messages.filter(isHistoryMaintenance),
+    ...maintenance,
+  ]
+  const archivedCompactionIds = new Set(
+    candidates.flatMap(message =>
+      message.maintenance?.historyArchived
+        ? [message.maintenance.compactionId.trim()]
+        : [],
+    ),
+  )
+  const canonical = messages
+    .filter(message => !isHistoryMaintenance(message))
+    .map((message) => {
+      const statusHistory = message.statusHistory?.filter(entry =>
+        !(entry.category === 'maintenance'
+          && entry.id
+          && archivedCompactionIds.has(entry.id)),
+      )
+      return statusHistory?.length === message.statusHistory?.length
+        ? message
+        : { ...message, statusHistory }
+    })
   const embeddedCompactionIds = new Set(
     canonical.flatMap(message =>
       (message.statusHistory ?? []).flatMap(entry =>
@@ -252,10 +331,6 @@ function mergeHistoryMaintenance(
     ),
   )
   const maintenanceByCompactionId = new Map<string, ChatMessage>()
-  const candidates = [
-    ...messages.filter(isHistoryMaintenance),
-    ...maintenance,
-  ]
   for (const message of candidates) {
     if (!isHistoryMaintenance(message)) continue
     const compactionId = message.maintenance!.compactionId.trim()
@@ -300,17 +375,269 @@ function attachHistoryTurnOutcomes(
   messages: ChatMessage[],
   data: ChatHistoryResponse,
 ): ChatMessage[] {
-  const byTurnId = new Map(
+  const outcomes =
     (data.turn_outcomes || [])
       .map(normalizeTurnOutcome)
       .filter(outcome => outcome !== undefined)
-      .map(outcome => [outcome.turnId, outcome] as const),
-  )
+  const byTurnId = new Map(outcomes.map(outcome => [outcome.turnId, outcome] as const))
   if (byTurnId.size === 0) return messages
-  return messages.map(message => {
+  const enriched = messages.map(message => {
     const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
-    return outcome ? { ...message, turnOutcome: outcome } : message
+    if (!outcome) return message
+    const activitySnapshot = message.role === 'assistant'
+      ? outcome.activitySnapshot
+      : undefined
+    const snapshotReasoningBlocks = activitySnapshot?.complete
+      ? activityReasoningBlocks(activitySnapshot, message.reasoning?.text ?? '')
+      : undefined
+    const activitySnapshotComplete = Boolean(
+      activitySnapshot?.complete
+      && snapshotReasoningBlocks !== undefined
+      && activitySnapshotMatchesMessage(activitySnapshot, message),
+    )
+    const acceptedActivitySnapshot = activitySnapshot
+      ? activitySnapshotComplete
+        ? activitySnapshot
+        : { ...activitySnapshot, complete: false }
+      : undefined
+    const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
+    const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass))
+      && message.role === 'system'
+      && message.text.trimStart().startsWith('Error:')
+    return {
+      ...message,
+      ...(durableLocalizedError
+        ? {
+            role: 'error',
+            text: localizedChatErrorMessage(
+              outcome.errorClass,
+              outcome.terminalMessage || message.text,
+              outcome.replaySafe === true,
+            ),
+            errorCode: outcome.errorClass,
+            terminalNotice: true,
+          }
+        : {}),
+      ...(message.role === 'assistant' && acceptedActivitySnapshot
+        ? {
+            activitySnapshot: acceptedActivitySnapshot,
+            activitySnapshotIncomplete: !activitySnapshotComplete,
+            ...(activitySnapshotComplete
+              ? {
+                  statusHistory: (outcome.statusHistory || []).map(entry => ({ ...entry })),
+                  reasoningBlocks: snapshotReasoningBlocks?.map(block => ({ ...block })),
+                }
+              : {}),
+          }
+        : message.role === 'assistant' && outcome.statusHistory?.length
+        ? {
+            statusHistory: [
+              ...(message.statusHistory || []),
+              ...outcome.statusHistory.filter(entry =>
+                !(message.statusHistory || []).some(existing =>
+                  existing.action === entry.action && existing.at === entry.at,
+                ),
+              ),
+            ].map(entry => ({ ...entry })),
+          }
+        : {}),
+      turnOutcome: outcome,
+    }
   })
+
+  // A pre-provider barrier may fail before an assistant transcript row exists.
+  // Materialize one status-only assistant row from the terminal task snapshot
+  // so refresh and reconnect show the completed route/activity trace.
+  for (const outcome of outcomes) {
+    if (!isUsageAccountingBarrier(outcome.errorClass) || !outcome.statusHistory?.length) continue
+    if (enriched.some(message => message.turnId === outcome.turnId && message.role === 'assistant')) continue
+    const turnIndexes = enriched.flatMap((message, index) =>
+      message.turnId === outcome.turnId ? [index] : [],
+    )
+    if (!turnIndexes.length) continue
+    const firstTerminalIndex = turnIndexes.find(index => enriched[index]?.role === 'error')
+    const insertionIndex = firstTerminalIndex ?? Math.max(...turnIndexes) + 1
+    enriched.splice(insertionIndex, 0, {
+      role: 'assistant',
+      text: '',
+      ts: outcome.finishedAt ?? null,
+      turnId: outcome.turnId,
+      turnOutcome: outcome,
+      statusHistory: outcome.statusHistory.map(entry => ({ ...entry })),
+      messageId: `terminal-activity:${outcome.taskId || outcome.turnId}`,
+      restoredFromHistory: true,
+    })
+  }
+
+  // The task outcome is the durable authority for a pre-provider usage
+  // barrier. Transcript error rows are best-effort and may be absent from a
+  // compacted or paginated window, so materialize the retry card whenever the
+  // outcome has no matching terminal row in this page.
+  for (const outcome of outcomes) {
+    if (
+      !isUsageAccountingBarrier(outcome.errorClass)
+      && !isImageInputUnsupported(outcome.errorClass)
+    ) continue
+    if (enriched.some(message =>
+      message.turnId === outcome.turnId && message.role === 'error',
+    )) continue
+    const turnIndexes = enriched.flatMap((message, index) =>
+      message.turnId === outcome.turnId ? [index] : [],
+    )
+    if (!turnIndexes.length) continue
+    enriched.splice(Math.max(...turnIndexes) + 1, 0, {
+      role: 'error',
+      text: localizedChatErrorMessage(
+        outcome.errorClass,
+        outcome.terminalMessage || '',
+        outcome.replaySafe === true,
+      ),
+      ts: outcome.finishedAt ?? null,
+      turnId: outcome.turnId,
+      turnOutcome: outcome,
+      messageId: `terminal-error:${outcome.taskId || outcome.turnId}`,
+      restoredFromHistory: true,
+      errorCode: outcome.errorClass,
+      terminalNotice: true,
+    })
+  }
+  return enriched
+}
+
+function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage[] {
+  const durableErrorTurns = new Set(
+    messages
+      .filter(message =>
+        message.role === 'error'
+        && Boolean(message.turnId)
+        && (
+          isUsageAccountingBarrier(message.errorCode)
+          || isImageInputUnsupported(message.errorCode)
+        )
+        && !message.messageId?.startsWith('terminal-error:'),
+      )
+      .map(message => message.turnId!),
+  )
+  const seenSynthetic = new Set<string>()
+  return messages.filter(message => {
+    if (
+      message.role !== 'error'
+      || !message.turnId
+      || !(
+        isUsageAccountingBarrier(message.errorCode)
+        || isImageInputUnsupported(message.errorCode)
+      )
+      || !message.messageId?.startsWith('terminal-error:')
+    ) return true
+    if (durableErrorTurns.has(message.turnId)) return false
+    if (seenSynthetic.has(message.messageId)) return false
+    seenSynthetic.add(message.messageId)
+    return true
+  })
+}
+
+type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
+
+function acceptedEnsembleMode(message: ChatMessage): AcceptedEnsembleMode | null {
+  if (message.role !== 'router' || !message.routerDecision) return null
+  const raw = String(
+    message.routerDecision.accepted_routing_mode
+    || message.routerDecision.acceptedRoutingMode
+    || '',
+  ).trim().toLowerCase()
+  return raw === 'ensemble' || raw === 'llm_ensemble' ? raw : null
+}
+
+function exactMessageTurnId(message: ChatMessage): string {
+  return String(message.turnId || '').trim()
+}
+
+/**
+ * A live router strip is a presentation row rather than a transcript row, so
+ * terminal canonical history can legitimately replace the rest of its turn
+ * without returning that strip. Preserve an accepted ensemble strip only when
+ * the same refresh independently proves the exact server turn id still exists.
+ * Never use transcript position, text, or a neighbouring turn as a fallback.
+ */
+function preserveAcceptedEnsembleRouterRows(
+  previous: ChatMessage[],
+  reconciled: ChatMessage[],
+  authoritative: ChatMessage[],
+): ChatMessage[] {
+  const authoritativeTurnIds = new Set(
+    authoritative.map(exactMessageTurnId).filter(Boolean),
+  )
+  if (authoritativeTurnIds.size === 0) return reconciled
+
+  const acceptedByTurn = new Map<
+    string,
+    { message: ChatMessage; mode: AcceptedEnsembleMode }
+  >()
+  for (const message of previous) {
+    const turnId = exactMessageTurnId(message)
+    const mode = acceptedEnsembleMode(message)
+    if (!turnId || !mode || !authoritativeTurnIds.has(turnId)) continue
+    // Router events update one same-turn strip in place. If a compatibility
+    // client left more than one row behind, the newest row is the richest one.
+    acceptedByTurn.set(turnId, { message, mode })
+  }
+  if (acceptedByTurn.size === 0) return reconciled
+
+  const merged = reconciled.slice()
+  for (const [turnId, accepted] of acceptedByTurn) {
+    let existingRouterIndex = -1
+    for (let index = 0; index < merged.length; index++) {
+      const candidate = merged[index]
+      if (candidate?.role === 'router' && exactMessageTurnId(candidate) === turnId) {
+        existingRouterIndex = index
+      }
+    }
+
+    const acceptedDecision = {
+      ...accepted.message.routerDecision,
+      accepted_routing_mode: accepted.mode,
+    }
+    if (existingRouterIndex >= 0) {
+      const canonical = merged[existingRouterIndex]!
+      merged[existingRouterIndex] = {
+        ...accepted.message,
+        ...canonical,
+        routerDecision: {
+          ...acceptedDecision,
+          ...canonical.routerDecision,
+          accepted_routing_mode: accepted.mode,
+        },
+        ensemble: canonical.ensemble ?? accepted.message.ensemble,
+        routerState: canonical.routerState ?? accepted.message.routerState,
+        routerSettled: canonical.routerSettled ?? accepted.message.routerSettled ?? true,
+        restoredFromHistory: true,
+      }
+      continue
+    }
+
+    const preserved: ChatMessage = {
+      ...accepted.message,
+      turnId,
+      routerDecision: acceptedDecision,
+      routerSettled: accepted.message.routerSettled ?? true,
+      restoredFromHistory: true,
+    }
+    const firstUserIndex = merged.findIndex(message =>
+      message.role === 'user' && exactMessageTurnId(message) === turnId,
+    )
+    const firstAssistantIndex = merged.findIndex(message =>
+      message.role === 'assistant' && exactMessageTurnId(message) === turnId,
+    )
+    const firstTurnIndex = merged.findIndex(message => exactMessageTurnId(message) === turnId)
+    const insertAt = firstUserIndex >= 0
+      && (firstAssistantIndex < 0 || firstUserIndex < firstAssistantIndex)
+      ? firstUserIndex + 1
+      : firstAssistantIndex >= 0
+        ? firstAssistantIndex
+        : firstTurnIndex >= 0 ? firstTurnIndex : merged.length
+    merged.splice(insertAt, 0, preserved)
+  }
+  return merged
 }
 
 export interface UseChatHistoryOptions {
@@ -322,6 +649,8 @@ export interface UseChatHistoryOptions {
   lastHeaderDay: Ref<string>
   preserveLiveTail?: Ref<boolean>
   autoScroll?: Ref<boolean>
+  /** Invalidates deferred anchor work when the reused chat viewport changes session. */
+  scrollEpoch?: Ref<number>
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
 }
@@ -346,6 +675,7 @@ interface HistoryLoadParams {
   prepend?: boolean
   bridgeRetry?: boolean
   retry?: boolean
+  nonReconnecting?: boolean
 }
 
 type FailedHistoryRequest =
@@ -365,8 +695,14 @@ const MAX_FORWARD_BRIDGE_PAGES = 2
 export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
   let historyRequestSeq = 0
+  let preserveLocalTailGeneration = 0
+  let acknowledgedPreserveLocalTailGeneration = 0
   let historySyncPending = false
-  let historySessionKey = ''
+  let historySyncTimerNonReconnecting = false
+  let historySyncPendingNonReconnecting = false
+  // Exposed read-only by convention so session hand-offs can distinguish the
+  // prior session's terminal `ready` state from the new session's first load.
+  const historySessionKey = ref('')
   let hasLoadedEarlier = false
   let loadEarlierPending = false
   let failedHistoryRequest: FailedHistoryRequest | null = null
@@ -399,16 +735,25 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     stop()
   }
 
-  function scheduleHistorySync() {
+  function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean) {
+    if (nonReconnecting && advanceGeneration) preserveLocalTailGeneration += 1
+    historySyncTimerNonReconnecting ||= nonReconnecting
     if (historySyncTimer) clearTimeout(historySyncTimer)
     historySyncTimer = setTimeout(() => {
       historySyncTimer = null
+      const timerNonReconnecting = historySyncTimerNonReconnecting
+      historySyncTimerNonReconnecting = false
       if (historyState.value.loading) {
         historySyncPending = true
+        historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
       }
-      void loadHistory()
+      void loadHistory({ nonReconnecting: timerNonReconnecting })
     }, 50)
+  }
+
+  function scheduleHistorySync(preserveLocalTail = false) {
+    armHistorySync(preserveLocalTail, true)
   }
 
   function flushPendingHistorySync() {
@@ -419,16 +764,28 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       return
     }
     if (!historySyncPending) return
+    const pendingNonReconnecting = historySyncPendingNonReconnecting
     historySyncPending = false
-    scheduleHistorySync()
+    historySyncPendingNonReconnecting = false
+    armHistorySync(pendingNonReconnecting, false)
   }
 
-  function mapHistoryMessage(msg: ChatHistoryMessage): ChatMessage {
+  function mapHistoryMessage(
+    msg: ChatHistoryMessage,
+    suppressedCompactionIds: ReadonlySet<string> = new Set(),
+  ): ChatMessage {
     // History rows carry the turn's reasoning text but not the measured
     // thinking duration; live turn records re-fill seconds after sync.
-    const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
+    const rawReasoningText = typeof msg.reasoning_content === 'string'
+      ? msg.reasoning_content
+      : ''
+    // v2 reasoning entries address the canonical transcript in UTF-16 units.
+    // Use trim only to decide whether the field is empty; never shift a valid
+    // snapshot's offsets by rewriting its leading or trailing whitespace.
+    const reasoningText = rawReasoningText.trim() ? rawReasoningText : ''
     const messageId = msg.message_id || msg.id || ''
     const steerContext = historyHasSteerEvidence(msg.turn_context)
+    const turnProvenance = historyTurnPresentationProvenance(msg.turn_context)
     return {
       role: msg.role || 'assistant',
       text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
@@ -440,10 +797,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       planRevisions: planRevisionsFromToolSegments(msg.tool_calls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments(msg.attachments, { messageId }),
+      promptAnnotations: (msg.promptAnnotations || msg.prompt_annotations || [])
+        .map(normalizePromptAnnotationSnapshot)
+        .filter((item): item is PromptAnnotationSnapshot => item !== null)
+        .sort((left, right) => left.sentOrder - right.sentOrder),
       provenanceKind: msg.provenance_kind || '',
       provenanceSourceSessionKey: msg.provenance_source_session_key || '',
       provenanceSourceTool: msg.provenance_source_tool || '',
       turnId: historyTurnId(msg.turn_context),
+      turnInputMode: turnProvenance.inputMode,
+      turnRunKind: turnProvenance.runKind,
       inputDisposition: historyInputDisposition(msg.turn_context),
       inputDispositionRevision: historyDispositionRevision(msg.turn_context),
       steerClientRequestId: steerContext
@@ -466,7 +829,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       input: msg.input || msg.input_tokens || undefined,
       output: msg.output || msg.output_tokens || undefined,
       statusHistory: msg.role === 'assistant'
-        ? historyActivityMarkers(msg.turn_context)
+        ? historyActivityMarkers(msg.turn_context, suppressedCompactionIds)
         : undefined,
       messageId,
       restoredFromHistory: true,
@@ -523,10 +886,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function resetForSession(key: string): boolean {
-    if (historySessionKey === key) return false
+    if (historySessionKey.value === key) return false
     cancelAnchorStabilization()
-    const crossedSession = Boolean(historySessionKey)
-    historySessionKey = key
+    const crossedSession = Boolean(historySessionKey.value)
+    if (crossedSession) {
+      acknowledgedPreserveLocalTailGeneration = preserveLocalTailGeneration
+    }
+    historySessionKey.value = key
     hasLoadedEarlier = false
     loadEarlierPending = false
     failedHistoryRequest = null
@@ -551,13 +917,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   function callHistory<T>(
     request: Record<string, unknown>,
     bootstrap: SessionBootstrapPhaseContext,
+    nonReconnecting = false,
   ): Promise<T> {
     const callOptions = {
       ...phaseCallOptions(bootstrap, 'chat.history'),
       // History is background content. A slow read may fail independently,
       // without recycling a Gateway that advertises concurrent reads. Legacy
       // serial Gateways still need a fresh connection to escape a stuck read.
-      ...historyTerminationActions(options.rpc),
+      ...(nonReconnecting
+        ? nonReconnectingHistoryActions()
+        : historyTerminationActions(options.rpc)),
       onSent: (socketGeneration: number) => {
         bootstrap.markHistoryRequestSent?.(socketGeneration)
       },
@@ -576,8 +945,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
+    const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
     cancelAnchorStabilization()
+    const historyStateBeforeLoad = historyState.value
+    const failedHistoryRequestBeforeLoad = failedHistoryRequest
+    const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
+    const nonReconnecting = Boolean(params.nonReconnecting)
     const requestSeq = ++historyRequestSeq
     let bridgeAttempted = Boolean(params.bridgeRetry)
     const isInitialLoad = !params.prepend
@@ -585,24 +959,36 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         historyState.value.initialLoadStatus === 'pending'
         || historyState.value.initialLoadStatus === 'error'
       )
-    historyState.value = {
-      ...historyState.value,
-      loading: true,
-      // Only explicit backward pagination owns the sentinel. Forward
-      // catch-up/bridge recovery is a session-recovery concern and must not
-      // impersonate "load earlier" progress or failure.
-      loadingEarlier: Boolean(params.prepend),
-      retrying: Boolean(params.retry && !params.prepend),
-      initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
-      loadEarlierError: false,
-      recoveryError: params.prepend ? historyState.value.recoveryError : false,
+    if (!nonReconnecting) {
+      historyState.value = {
+        ...historyState.value,
+        loading: true,
+        // Only explicit backward pagination owns the sentinel. Forward
+        // catch-up/bridge recovery is a session-recovery concern and must not
+        // impersonate "load earlier" progress or failure.
+        loadingEarlier: Boolean(params.prepend),
+        retrying: Boolean(params.retry && !params.prepend),
+        initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
+        loadEarlierError: false,
+        recoveryError: params.prepend ? historyState.value.recoveryError : false,
+      }
     }
-    const isCurrentRequest = () => key === options.sessionKey.value && requestSeq === historyRequestSeq
+    const isCurrentRequest = () => (
+      key === options.sessionKey.value
+      && requestSeq === historyRequestSeq
+      && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
+    )
+    const restoreSilentBackgroundState = () => {
+      failedHistoryRequest = failedHistoryRequestBeforeLoad
+      historyState.value = historyStateBeforeLoad
+    }
     try {
       await options.rpc.waitForConnection(
         phaseTimeoutMs(bootstrap, 'chat.history'),
         bootstrap.signal,
-        historyTerminationActions(options.rpc),
+        nonReconnecting
+          ? nonReconnectingHistoryActions()
+          : historyTerminationActions(options.rpc),
       )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
@@ -625,11 +1011,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         includeSummaries: true,
       }
       if (params.before != null) request.before = params.before
-      const data = await callHistory<ChatHistoryResponse>(request, bootstrap)
+      const data = await callHistory<ChatHistoryResponse>(request, bootstrap, nonReconnecting)
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
       const msgs = data.messages || []
       const canonicalAvailable = data.canonical_available ?? data.canonicalAvailable
       if (canonicalAvailable === false) {
+        if (nonReconnecting) {
+          restoreSilentBackgroundState()
+          return { ok: false }
+        }
         failedHistoryRequest = hasLoadedEarlier && !params.prepend
           ? { kind: 'bridge', key }
           : {
@@ -654,11 +1044,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      let mapped = attachHistoryTurnOutcomes(msgs.map(mapHistoryMessage), data)
+      const summaryIds = summaryCompactionIds(data)
+      let mapped = attachHistoryTurnOutcomes(
+        msgs.map(message => mapHistoryMessage(message, summaryIds)),
+        data,
+      )
       const previousMessages = crossedSession ? [] : options.messages.value
       const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
       const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
-      const maintenanceMessages = manualCompactionMessages(data)
+      const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
       let bridgeContinuationNeeded = false
       const needsForwardBridge = canonicalAvailable !== false
@@ -707,10 +1101,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               includeSummaries: true,
             },
             bootstrap,
+            nonReconnecting,
           )
           if (!isCurrentRequest()) return { ok: false, cancelled: true }
           const bridgeAvailable = bridgeData.canonical_available ?? bridgeData.canonicalAvailable
           if (bridgeAvailable === false) {
+            if (nonReconnecting) {
+              restoreSilentBackgroundState()
+              return { ok: false }
+            }
             historyState.value = {
               ...historyState.value,
               canonicalAvailable: false,
@@ -726,10 +1125,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
 
           const page = attachHistoryTurnOutcomes(
-            (bridgeData.messages || []).map(mapHistoryMessage),
+            (bridgeData.messages || []).map(message =>
+              mapHistoryMessage(message, summaryCompactionIds(bridgeData)),
+            ),
             bridgeData,
           )
-          maintenanceMessages.push(...manualCompactionMessages(bridgeData))
+          maintenanceMessages.push(...compactionSummaryMessages(bridgeData))
           for (const message of page) {
             const keyValue = messageKey(message)
             if (bridgedKeys.has(keyValue)) continue
@@ -798,7 +1199,22 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         hasLoadedEarlier = true
         loadedEarlierCursors.add(String(params.before))
       }
-      const preserveLiveTail = !crossedSession && Boolean(options.preserveLiveTail?.value)
+      const preserveLiveTail = !crossedSession && (
+        Boolean(options.preserveLiveTail?.value)
+        || preserveLocalTailGeneration > acknowledgedPreserveLocalTailGeneration
+      )
+
+      const acknowledgePreservedLocalTail = () => {
+        if (
+          !crossedSession
+          && !params.prepend
+          && canonicalAvailable !== false
+          && requestPreserveLocalTailGeneration > acknowledgedPreserveLocalTailGeneration
+          && requestPreserveLocalTailGeneration === preserveLocalTailGeneration
+        ) {
+          acknowledgedPreserveLocalTailGeneration = requestPreserveLocalTailGeneration
+        }
+      }
 
       if (msgs.length === 0 && !params.prepend) {
         const transcript = preserveLiveTail
@@ -814,6 +1230,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           options.lastHeaderRole.value = ''
           options.lastHeaderDay.value = ''
         }
+        acknowledgePreservedLocalTail()
         flushPendingHistorySync()
         return { ok: true }
       }
@@ -824,10 +1241,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
-          rehomePromotedSteerRows([
-            ...mapped.filter(msg => !existing.has(messageKey(msg))),
-            ...previousTranscript,
-          ]),
+          rehomePromotedSteerRows(
+            dedupeSyntheticUsageBarrierErrors([
+              ...mapped.filter(msg => !existing.has(messageKey(msg))),
+              ...previousTranscript,
+            ]),
+          ),
         )
         options.messages.value = mergeHistoryMaintenance(
           transcript,
@@ -841,9 +1260,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         } else {
           nextMessages = refreshedWindow
         }
+        nextMessages = preserveAcceptedEnsembleRouterRows(
+          previousTranscript,
+          nextMessages,
+          mapped,
+        )
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            reconcileClientTerminalNotices(previousTranscript, nextMessages),
+            dedupeSyntheticUsageBarrierErrors(
+              reconcileClientTerminalNotices(previousTranscript, nextMessages),
+            ),
           ),
         )
         options.messages.value = mergeHistoryMaintenance(
@@ -857,18 +1283,23 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       if (params.prepend) {
         await nextTick()
+        if (!isCurrentRequest()) return { ok: false, cancelled: true }
         if (prependAnchor) {
           restoreMessageAnchor(prependAnchor)
           stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
             isCurrent: () => options.sessionKey.value === key
-              && historySessionKey === key
-              && historyRequestSeq === requestSeq,
+              && historySessionKey.value === key
+              && historyRequestSeq === requestSeq
+              && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
+              && options.threadRef?.value === prependContainer,
           })
         } else if (prependContainer) {
-          prependContainer.scrollTop += Math.max(
-            0,
-            prependContainer.scrollHeight - prependFallbackHeight,
-          )
+          applyProgrammaticScroll(prependContainer, () => {
+            prependContainer.scrollTop += Math.max(
+              0,
+              prependContainer.scrollHeight - prependFallbackHeight,
+            )
+          })
         }
       } else if (options.autoScroll?.value ?? true) {
         await nextTick()
@@ -879,11 +1310,23 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       // and the existing timer/session cleanup makes the continuation yielding
       // and cancellable rather than one unbounded request or DOM update.
       if (bridgeContinuationNeeded) historySyncPending = true
+      if (bridgeContinuationNeeded) {
+        historySyncPendingNonReconnecting ||= nonReconnecting
+      }
+      if (!bridgeContinuationNeeded) acknowledgePreservedLocalTail()
       flushPendingHistorySync()
       return { ok: true }
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
+        if (nonReconnecting) {
+          restoreSilentBackgroundState()
+          return {
+            ok: false,
+            error,
+            cancelled: bootstrap.signal.aborted || isRpcAbort(error),
+          }
+        }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
         failedHistoryRequest = bridgeAttempted
           ? { kind: 'bridge', key }
@@ -932,6 +1375,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           if (!historyState.value.loadingEarlier) loadEarlierPending = true
         } else {
           historySyncPending = true
+          historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
         }
         // Never report a deduplicated request as a successful bootstrap.
         // The caller observes the real terminal result of the in-flight read.
@@ -1015,7 +1459,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       clearTimeout(historySyncTimer)
       historySyncTimer = null
     }
+    historySyncTimerNonReconnecting = false
     historySyncPending = false
+    historySyncPendingNonReconnecting = false
     loadEarlierPending = false
     cancelAnchorStabilization()
     historyState.value = {
@@ -1034,6 +1480,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   return {
+    historySessionKey,
     historyState,
     loadHistory,
     loadEarlierHistory,

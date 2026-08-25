@@ -1,15 +1,18 @@
 [
   {
+    "generation_epoch": null,
     "text": "Checking now.",
     "type": "TextDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "get_weather",
     "tool_use_id": "call_test_000",
     "type": "ToolUseStartEvent"
   },
   {
+    "generation_epoch": null,
     "json_fragment": "{\"city\": \"Paris\"}",
     "tool_use_id": "call_test_000",
     "type": "ToolUseDeltaEvent"
@@ -18,6 +21,7 @@
     "arguments": {
       "city": "Paris"
     },
+    "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "get_weather",
     "tool_use_id": "call_test_000",
@@ -29,6 +33,7 @@
     "cached_tokens": 4,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 30,
     "model": "gpt-test-1",
     "model_usage_breakdown": [],

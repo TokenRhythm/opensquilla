@@ -18,6 +18,11 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
 }
 
 const VIDEO_EXTENSIONS = new Set(['m4v', 'mov', 'mp4', 'ogv', 'webm'])
+const OFFICE_EXTENSIONS = new Set([
+  'doc', 'docm', 'docx', 'dot', 'dotm', 'dotx', 'odt', 'ott', 'rtf',
+  'csv', 'fods', 'ods', 'ots', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx',
+  'odp', 'otp', 'pot', 'potm', 'potx', 'pps', 'ppsm', 'ppsx', 'ppt', 'pptm', 'pptx',
+])
 
 export function artifactMime(artifact: ArtifactPayload): string {
   return artifact?.mime
@@ -34,6 +39,10 @@ export function artifactExtension(name: string): string {
   const idx = trimmed.lastIndexOf('.')
   if (idx < 0 || idx === trimmed.length - 1) return ''
   return trimmed.slice(idx + 1)
+}
+
+export function isOfficeArtifact(artifact: ArtifactPayload): boolean {
+  return OFFICE_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
 }
 
 export function isVideoArtifact(artifact: ArtifactPayload): boolean {
@@ -137,6 +146,21 @@ export interface ArtifactUrlOptions {
   includeSessionKey?: boolean
 }
 
+function artifactUrlsShareOrigin(candidate: URL, base: URL): boolean {
+  if (candidate.origin !== 'null' || base.origin !== 'null') {
+    return candidate.origin === base.origin
+  }
+  return candidate.protocol === 'opensquilla-app:'
+    && base.protocol === 'opensquilla-app:'
+    && candidate.hostname === 'desktop'
+    && base.hostname === 'desktop'
+    && candidate.port === base.port
+    && !candidate.username
+    && !candidate.password
+    && !base.username
+    && !base.password
+}
+
 export function artifactDownloadUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,
@@ -148,7 +172,7 @@ export function artifactDownloadUrl(
   try {
     const url = new URL(raw, baseOrigin)
     const base = new URL(baseOrigin)
-    const sameOrigin = url.origin === base.origin
+    const sameOrigin = artifactUrlsShareOrigin(url, base)
     if (sameOrigin) {
       url.searchParams.delete('token')
       url.searchParams.delete('sessionKey')

@@ -74,6 +74,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "scratch_verify_mirror_active",
     ]
     legacy_tail_start = field_names.index(legacy_runtime_tail[0])
+    assert legacy_tail_start == 64
     assert (
         field_names[legacy_tail_start : legacy_tail_start + len(legacy_runtime_tail)]
         == legacy_runtime_tail
@@ -90,4 +91,21 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "user_input_provider",
         "plan_revision",
         "plan_run",
+        "goal_run",
+        "goal_context",
+        "goal_service",
+        "artifact_context",
+        "artifact_session",
+        "desktop_artifact_bridge",
+        "artifact_event_emitter",
+        "generated_artifact_adopter",
+        "exclusive_tools",
+        "artifact_mutation_attempt_controller",
+        "turn_cleanup_callbacks",
+        "tool_result_retrieval_available",
+        "parent_session_key",
+        "parent_task_id",
+        "artifact_candidate_loop_controller",
+        "artifact_preview_service",
+        "tool_result_media",
     ]

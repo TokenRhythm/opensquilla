@@ -342,6 +342,11 @@ def test_oversized_subagent_task_uses_content_addressed_reference(tmp_path) -> N
             content="unused",
         )
 
+    setattr(
+        tool_handler,
+        "_opensquilla_available_tools",
+        frozenset({"retrieve_tool_result"}),
+    )
     parent = Agent(
         provider=_ModelProvider("parent-model"),
         config=AgentConfig(
@@ -382,6 +387,24 @@ def test_oversized_subagent_task_uses_content_addressed_reference(tmp_path) -> N
     )
     assert stored.content == task
     assert any(tool.name == "retrieve_tool_result" for tool in child.tool_definitions)
+    assert child._tool_context is not None
+    assert getattr(child._raw_tool_handler, "_opensquilla_available_tools") == frozenset(
+        {"retrieve_tool_result"}
+    )
+    assert child.config.tool_result_store_dir == child._tool_context.tool_result_store_dir
+    assert (
+        child.config.tool_result_store_session_id
+        == child._tool_context.tool_result_store_session_id
+    )
+    assert child.config.tool_result_store_session_key == child._tool_context.session_key
+    assert child.config.tool_result_store_agent_id == child._tool_context.agent_id
+    assert child._tool_result_store_scope() == (
+        child._tool_context.tool_result_store_session_id,
+        child._tool_context.session_key,
+        child._tool_context.agent_id,
+    )
+    assert child._tool_context.tool_result_retrieval_available is True
+    assert child._tool_result_recovery_available() is True
 
 
 def test_oversized_subagent_task_rejects_without_reference_path() -> None:

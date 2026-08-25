@@ -1,9 +1,11 @@
 [
   {
+    "generation_epoch": null,
     "text": "Synthetic reasoning.",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": "OK",
     "type": "TextDeltaEvent"
   },
@@ -21,6 +23,7 @@
     "cached_tokens": 5,
     "cost_source": "provider_billed",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 13,
     "model": "deepseek-v4-flash",
     "model_usage_breakdown": [],

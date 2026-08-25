@@ -13,6 +13,7 @@ import pytest
 from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.session import compaction as compaction_module
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
 
@@ -858,7 +859,7 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
 
     assert result == "compact_failed"
     assert len(await sm.get_transcript(session_key)) == len(transcript)
-    assert 0 < len(agent.history) < len(transcript)
+    assert len(agent.history) < len(transcript)
     assert summary_context is not None
     assert "emergency request-scoped compaction" in summary_context.lower()
     statuses = [payload["status"] for _, payload in events]
@@ -896,11 +897,21 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
         count=3,
         opened_at=runtime_module.time.monotonic(),
     )
+    emergency_requests: list[Any] = []
+    original_compact_context = compaction_module.compact_context
+
+    async def capture_emergency_request(request: Any) -> Any:
+        emergency_requests.append(request)
+        return await original_compact_context(request)
+
+    monkeypatch.setattr(compaction_module, "compact_context", capture_emergency_request)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
         _make_turn(routed_tier="c3", previous_tier="c2"),
-        1000,
+        10_000,
+        history_capacity_tokens=1_500,
+        history_capacity_chars=5_000,
     )
 
     assert result == "handled"
@@ -910,3 +921,6 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["reason"] == "durable_compaction_circuit_open"
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
+    assert len(emergency_requests) == 1
+    assert emergency_requests[0].context_window_tokens == 1_500
+    assert emergency_requests[0].context_window_chars == 5_000

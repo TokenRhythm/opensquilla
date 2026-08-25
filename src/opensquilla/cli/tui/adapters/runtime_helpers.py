@@ -164,6 +164,13 @@ def classify_chat_input(
     surface: Surface = Surface.CLI_GATEWAY,
 ) -> TuiInputKind:
     """Classify chat input without leaking slash policy into the runtime."""
+    parts = user_input.lstrip().lower().split(maxsplit=1)
+    if (
+        parts[0:1] == ["/routing"]
+        and len(parts) == 2
+        and parts[1].strip() in {"direct", "router", "ensemble"}
+    ):
+        return TuiInputKind.COMMAND_REQUIRES_QUEUE_EMPTY
     return map_slash_category(classify(user_input, surface=surface))
 
 

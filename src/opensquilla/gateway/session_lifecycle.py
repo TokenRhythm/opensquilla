@@ -24,6 +24,28 @@ TERMINAL_SESSION_STATUSES = frozenset(
 
 
 @dataclass(frozen=True)
+class SessionTaskSnapshot:
+    """Authoritative in-memory foreground work for one session.
+
+    ``running_task_id`` is deliberately independent from cancellation intent:
+    a task remains the foreground owner until its terminal lifecycle boundary.
+    Queued task ids retain TaskRuntime admission order.
+    """
+
+    running_task_id: str | None
+    queued_task_ids: tuple[str, ...]
+    cancel_requested_task_ids: tuple[str, ...] = ()
+
+    @property
+    def active_task(self) -> dict[str, str] | None:
+        if self.running_task_id is not None:
+            return {"task_id": self.running_task_id, "status": "running"}
+        if self.queued_task_ids:
+            return {"task_id": self.queued_task_ids[0], "status": "queued"}
+        return None
+
+
+@dataclass(frozen=True)
 class TaskLifecycleEvent:
     phase: Literal["queued", "running", "terminal"]
     session_key: str
@@ -33,6 +55,16 @@ class TaskLifecycleEvent:
     terminal_reason: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    # False only when TaskRuntime had to fall back to an in-memory terminal
+    # projection because the authoritative AgentTask update failed.
+    terminal_persisted: bool = True
+    # Durable queued owner created while settling accepted steer input. The
+    # predecessor is terminal, but the session itself must remain active.
+    continuation_task_id: str | None = None
+    # Current TaskRuntime projection captured under its state lock. ``None``
+    # means the projection could not be obtained; consumers must then avoid
+    # publishing an inferred active owner or run status.
+    task_snapshot: SessionTaskSnapshot | None = None
 
 
 TaskLifecycleListener = Callable[[TaskLifecycleEvent], Awaitable[None]]
@@ -66,6 +98,13 @@ async def apply_task_lifecycle_to_session(
     activity changed.
     """
 
+    # A terminal lifecycle callback can be emitted after TaskRuntime failed
+    # to persist the authoritative AgentTask terminal row. Projecting that
+    # in-memory fallback onto the session would make the session look done
+    # while recovery still has to abandon the task and pause any owning Goal.
+    if event.phase == "terminal" and not event.terminal_persisted:
+        return False
+
     get_session = getattr(session_manager, "get_session", None)
     if not callable(get_session):
         return False
@@ -76,11 +115,49 @@ async def apply_task_lifecycle_to_session(
     if node is None:
         return False
 
+    snapshot = event.task_snapshot
+    active_task = snapshot.active_task if snapshot is not None else None
+
+    if snapshot is None:
+        # The lifecycle callback identifies only the task that changed.  It
+        # cannot prove that no successor is already queued or running.  In
+        # particular, TaskRuntime releases the per-session execution lock
+        # before an old task's terminal callback is delivered, so projecting
+        # that terminal without a snapshot can overwrite the live successor's
+        # session row.  Preserve recency, but leave the session lifecycle for
+        # hydration/the next authoritative snapshot to reconcile.
+        if getattr(node, "status", None) in TERMINAL_SESSION_STATUSES:
+            return False
+        update = getattr(session_manager, "update", None)
+        if not callable(update):
+            return False
+        try:
+            await update(event.session_key)
+        except Exception:
+            return False
+        return True
+
     if event.phase in {"queued", "running"}:
         update = getattr(session_manager, "update", None)
         if not callable(update):
             return False
-        if event.phase == "queued":
+        # A lifecycle callback can arrive after the changed task has already
+        # advanced (or terminalized). Use the current snapshot rather than the
+        # callback phase so a late queued/running notification cannot demote or
+        # reactivate the session.
+        if snapshot is not None and active_task is None:
+            try:
+                await update(event.session_key)
+            except Exception:
+                return False
+            return True
+        if active_task is not None and active_task["status"] == "queued":
+            try:
+                await update(event.session_key)
+            except Exception:
+                return False
+            return True
+        if event.phase == "queued" and snapshot is None:
             try:
                 await update(event.session_key)
             except Exception:
@@ -116,6 +193,17 @@ async def apply_task_lifecycle_to_session(
     update = getattr(session_manager, "update", None)
     if not callable(update):
         return False
+    if active_task is not None or event.continuation_task_id:
+        try:
+            await update(
+                event.session_key,
+                status=SessionStatus.RUNNING,
+                ended_at=None,
+                runtime_ms=None,
+            )
+        except Exception:
+            return False
+        return True
     now = _now_ms()
     started_at = getattr(node, "started_at", None)
     runtime_ms = None

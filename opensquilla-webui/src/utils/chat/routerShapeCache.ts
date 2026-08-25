@@ -82,6 +82,9 @@ function asTierConfigRecord(value: unknown): Record<string, ChatRouterTierConfig
       model: typeof val.model === 'string' ? val.model : '',
       supportsImage: val.supportsImage === true,
       imageOnly: val.imageOnly === true,
+      ...(typeof val.ensembleEnabled === 'boolean'
+        ? { ensembleEnabled: val.ensembleEnabled }
+        : {}),
     }
   }
   return out

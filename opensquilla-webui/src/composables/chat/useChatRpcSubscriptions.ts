@@ -1,14 +1,17 @@
 import type {
+  AnswerGenerationResetPayload,
   ArtifactPayload,
   CompactionPayload,
   CronResultPayload,
   EnsembleProgressPayload,
   InputDispositionPayload,
+  ProviderActivityPayload,
   RouterDecisionPayload,
   SessionEventPayload,
   SubagentCompletionPayload,
   TextDeltaPayload,
   ToolDeltaPayload,
+  ToolEndPayload,
   ToolResultPayload,
   ToolUsePayload,
   WarningPayload,
@@ -20,13 +23,16 @@ type RpcSubscriptionClient = {
 }
 
 export type ChatRpcSubscriptionHandlers = {
+  onAnswerGenerationReset: (payload: AnswerGenerationResetPayload) => void
   onTextDelta: (payload: TextDeltaPayload) => void
   onToolUseStart: (payload: ToolUsePayload) => void
   onToolUseDelta: (payload: ToolDeltaPayload) => void
+  onToolUseEnd: (payload: ToolEndPayload) => void
   onToolResult: (payload: ToolResultPayload) => void
   onArtifact: (payload: ArtifactPayload) => void
   onStateChange: (payload: SessionEventPayload) => void
   onRunHeartbeat: (payload: SessionEventPayload) => void
+  onProviderActivity: (payload: ProviderActivityPayload) => void
   onCompaction: (payload: CompactionPayload, meta: unknown) => void
   onWarning: (payload: WarningPayload) => void
   onInputDisposition: (payload: InputDispositionPayload) => void
@@ -56,13 +62,16 @@ export function useChatRpcSubscriptions(
   function subscribe(): () => void {
     unsubscribe()
     unsubs = [
+      rpc.on('session.event.answer_generation_reset', handlers.onAnswerGenerationReset),
       rpc.on('session.event.text_delta', handlers.onTextDelta),
       rpc.on('session.event.tool_use_start', handlers.onToolUseStart),
       rpc.on('session.event.tool_use_delta', handlers.onToolUseDelta),
+      rpc.on('session.event.tool_use_end', handlers.onToolUseEnd),
       rpc.on('session.event.tool_result', handlers.onToolResult),
       rpc.on('session.event.artifact', handlers.onArtifact),
       rpc.on('session.event.state_change', handlers.onStateChange),
       rpc.on('session.event.run_heartbeat', handlers.onRunHeartbeat),
+      rpc.on('session.event.provider_activity', handlers.onProviderActivity),
       rpc.on('session.event.compaction', handlers.onCompaction),
       rpc.on('session.event.warning', handlers.onWarning),
       rpc.on('session.event.input_disposition', handlers.onInputDisposition),

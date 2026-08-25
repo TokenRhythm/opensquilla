@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = (
@@ -260,6 +260,22 @@ def test_validated_image_mime_rejects_placeholder_and_pixel_bomb(
     Image.new("RGB", (64, 64), color=(0, 0, 0)).save(compressed, format="PNG")
     with pytest.raises(RuntimeError, match="invalid_image_payload"):
         mod._validated_image_mime(compressed.getvalue())
+
+
+def test_validated_image_mime_maps_pillow_index_error_to_invalid_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _module()
+    payload = io.BytesIO()
+    Image.new("RGB", (64, 64), color=(24, 48, 96)).save(payload, format="PNG")
+
+    def fail_verify(_image: object) -> None:
+        raise IndexError("synthetic truncated PNG chunk")
+
+    monkeypatch.setattr(PngImagePlugin.PngImageFile, "verify", fail_verify)
+
+    with pytest.raises(RuntimeError, match="invalid_image_payload"):
+        mod._validated_image_mime(payload.getvalue())
 
 
 @pytest.mark.parametrize(

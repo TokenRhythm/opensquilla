@@ -7,14 +7,26 @@ import type { Ref } from 'vue'
  */
 export function createHistoryNavigationScrollLock(autoScroll: Ref<boolean>) {
   let locked = false
+  let interrupted = false
 
   return {
     start() {
       locked = true
+      interrupted = false
       autoScroll.value = false
     },
+    interrupt() {
+      if (!locked) return false
+      const firstInterruption = !interrupted
+      interrupted = true
+      autoScroll.value = false
+      return firstInterruption
+    },
     finish() {
+      const wasInterrupted = interrupted
       locked = false
+      interrupted = false
+      return wasInterrupted
     },
     updateFromScroll(bottomGap: number) {
       if (!locked) autoScroll.value = bottomGap < 60

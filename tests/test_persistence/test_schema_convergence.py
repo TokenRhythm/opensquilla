@@ -36,6 +36,8 @@ TABLES = (
     "meta_launch_discard_tombstones",
     "plan_revisions",
     "plan_runs",
+    "session_goals",
+    "goal_command_receipts",
 )
 
 # Synthetic approximation of the oldest supported on-disk shape. It is the

@@ -80,6 +80,19 @@ class _BusySink(_RecordingSink):
         raise UsageAccountingBusyError("ledger remained busy")
 
 
+class _BusyOnSecondCallSink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        if call.call_index == 2:
+            raise UsageAccountingBusyError("ledger remained busy")
+
+
+class _InternalFailureSink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        raise RuntimeError("usage accounting internal failure")
+
+
 class _DoneProvider:
     provider_name = "fake"
 
@@ -389,6 +402,28 @@ async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallbac
     assert sink.started == []
     assert sink.finalized == []
     assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_selector_does_not_project_usage_accounting_error_as_provider_failure() -> None:
+    sink = _InternalFailureSink()
+    primary = _PhysicalLegProvider(
+        "openai",
+        [ProviderText(text="must not run"), ProviderDone(model="primary-model")],
+    )
+    fallback = _PhysicalLegProvider(
+        "anthropic",
+        [ProviderText(text="must not run"), ProviderDone(model="fallback-model")],
+    )
+    wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
+    scope = UsageAccountingScope(sink=sink, context=_context())
+
+    with bind_usage_accounting_scope(scope):
+        with pytest.raises(RuntimeError, match="usage accounting internal failure"):
+            _ = [event async for event in wrapper.chat([])]
+
+    assert primary.calls == 0
+    assert fallback.calls == 0
 
 
 @pytest.mark.asyncio
@@ -736,6 +771,128 @@ def _tokenrhythm_receipt(*, usd_nanos: int) -> ProviderBillingReceipt:
     )
 
 
+def _usd_receipt(
+    *,
+    status: str,
+    amount_nanos: int | None,
+    usd_nanos: int | None,
+) -> ProviderBillingReceipt:
+    return ProviderBillingReceipt(
+        currency="USD",
+        status=status,  # type: ignore[arg-type]
+        amount_nanos=amount_nanos,
+        usd_equivalent_nanos=usd_nanos,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_overrides", "expected_billed_nanos", "expected_source"),
+    [
+        ({"billed_cost": 0.25, "cost_source": "provider_billed"}, 250_000_000, "provider_billed"),
+        ({"billed_cost": 0.25, "cost_source": "openrouter_usage"}, 250_000_000, "provider_billed"),
+        ({"billed_cost": 0.25}, 250_000_000, "provider_billed"),
+        (
+            {"billed_cost_usd": 0.25, "cost_source": "provider_billed"},
+            250_000_000,
+            "provider_billed",
+        ),
+        (
+            {"billedCost": 0.25, "costSource": "provider_billed"},
+            250_000_000,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.05,
+                "billing_receipt": _usd_receipt(
+                    status="confirmed",
+                    amount_nanos=300_000_000,
+                    usd_nanos=300_000_000,
+                ),
+            },
+            300_000_000,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.0,
+                "billing_receipt": _usd_receipt(
+                    status="confirmed",
+                    amount_nanos=0,
+                    usd_nanos=0,
+                ),
+            },
+            0,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.25,
+                "cost_source": "provider_billed",
+                "billing_receipt": _usd_receipt(
+                    status="pending",
+                    amount_nanos=250_000_000,
+                    usd_nanos=None,
+                ),
+            },
+            0,
+            "unavailable",
+        ),
+        ({"billed_cost": 0.0, "cost_source": "free"}, 0, "free"),
+    ],
+    ids=[
+        "provider-billed",
+        "openrouter-usage",
+        "legacy-positive-bill",
+        "billed-cost-usd-alias",
+        "camel-case-aliases",
+        "confirmed-authoritative-amount",
+        "confirmed-zero",
+        "pending",
+        "explicit-free",
+    ],
+)
+def test_receipt_only_normalization_uses_canonical_billed_semantics_without_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+    row_overrides: dict[str, Any],
+    expected_billed_nanos: int,
+    expected_source: str,
+) -> None:
+    def fail_if_pricing_is_resolved(model: str, provider: str) -> ResolvedModelPrice:
+        raise AssertionError(f"unexpected price resolution for {provider}/{model}")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_accounting.resolve_model_price",
+        fail_if_pricing_is_resolved,
+    )
+    row = {
+        "provider": "fake",
+        "model": "model-a",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        **row_overrides,
+    }
+    result = normalize_provider_usage(
+        ProviderError(
+            message="failed after usage",
+            code="500",
+            model_usage_breakdown=[row],
+        ),
+        default_provider="fake",
+        default_model="model-a",
+        completed_at_ms=1234,
+        resolve_estimates=False,
+    )
+
+    assert result.billed_cost_nanos == expected_billed_nanos
+    assert result.estimated_cost_nanos == 0
+    assert result.cost_source == expected_source
+    assert result.items[0].billed_cost_nanos == expected_billed_nanos
+    assert result.items[0].estimated_cost_nanos == 0
+    assert result.items[0].cost_source == expected_source
+
+
 def test_tokenrhythm_single_done_reconciles_native_receipt_and_all_token_buckets() -> None:
     receipt = _tokenrhythm_receipt(usd_nanos=2_000)
     event = ProviderDone(
@@ -779,8 +936,8 @@ def test_tokenrhythm_inline_router_c0_c3_reconciles_each_physical_request() -> N
     assert preset is not None
     tiers = preset.tier_defaults()
     expected_models = {
-        "c0": "deepseek-v4-flash",
-        "c1": "deepseek-v4-pro",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
         "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
     }
@@ -1269,7 +1426,14 @@ async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -
 
     events = [event async for event in wrapper.chat([])]
 
-    assert [getattr(event, "kind", "") for event in events] == ["text_delta", "done"]
+    assert [getattr(event, "kind", "") for event in events] == [
+        "provider_activity",
+        "text_delta",
+        "done",
+    ]
+    assert (events[0].phase, events[0].reason) == ("fallback", "rate_limited")
+    assert events[0].retry_attempt == 1
+    assert events[0].started_at > 0
     assert primary.calls == fallback.calls == 1
 
 
@@ -1380,7 +1544,42 @@ async def test_turn_runner_preserves_retryable_ledger_start_error_code(
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
     assert errors[0].code == expected_code
+    assert errors[0].usage_call_index == 1
+    assert errors[0].no_prior_provider_dispatch is True
+    assert errors[0].replay_safe is True
     assert provider.calls == 0
     outcome = outcome_from_error(code=expected_code)
     assert outcome.kind == "blocked"
     assert outcome.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_second_provider_call_barrier_is_retryable_but_not_replay_safe() -> None:
+    sink = _BusyOnSecondCallSink()
+    provider = _SequenceProvider(
+        [
+            [ProviderDone(input_tokens=2, output_tokens=0)],
+            [ProviderText(text="must not dispatch"), ProviderDone()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+    )
+
+    with pytest.raises(UsageAccountingBusyError) as caught:
+        async for _ in agent.run_turn("hello"):
+            pass
+
+    assert provider.calls == 1
+    assert [call.call_index for call in sink.started] == [1, 2]
+    assert caught.value.usage_call_index == 2
+    assert caught.value.no_prior_provider_dispatch is False
+    assert caught.value.replay_safe is False

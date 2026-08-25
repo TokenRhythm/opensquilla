@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <base href="/" />
+    <title>OpenSquilla</title>
+    <meta name="description" content="OpenSquilla Desktop" />
+    <link rel="icon" type="image/png" href="./opensquilla-mark.png" />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('opensquilla-theme')
+          var legacy = { nord: 'arctic', phosphor: 'crt-green' }
+          if (t && legacy[t]) t = legacy[t]
+          if (!t || t === 'system') {
+            t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+          }
+          document.documentElement.setAttribute('data-theme', t)
+        } catch (e) {}
+      })()
+    </script>
+    <style>
+      #desktop-runtime-banner {
+        position: fixed;
+        z-index: 2147483647;
+        left: 50%;
+        top: 12px;
+        transform: translateX(-50%);
+        max-width: min(760px, calc(100vw - 32px));
+        padding: 9px 12px;
+        border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+        border-radius: 10px;
+        background: Canvas;
+        color: CanvasText;
+        box-shadow: 0 8px 30px rgb(0 0 0 / 16%);
+        font: 13px/1.4 system-ui, -apple-system, sans-serif;
+      }
+      #desktop-runtime-banner[data-state='error'] { border-color: #d64b4b; }
+      #desktop-runtime-banner button { margin-left: 8px; }
+    </style>
+    <script type="module" src="/src/desktop-runtime-banner.ts"></script>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <div id="desktop-runtime-banner" role="status" aria-live="polite">
+      <span id="desktop-runtime-message">Preparing the local runtime…</span>
+      <button id="desktop-runtime-retry" type="button" hidden>Retry</button>
+      <button id="desktop-runtime-log" type="button" hidden>Show log</button>
+    </div>
+    <div id="app"></div>
+    <div id="opensquilla-data" data-base-path="/" style="display:none"></div>
+  </body>
+</html>

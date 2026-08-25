@@ -18,7 +18,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from opensquilla.gateway.task_runtime import TaskQueueFullError
+from opensquilla.gateway.task_runtime import (
+    TaskQueueFullError,
+    TaskRuntimeShuttingDownError,
+)
 
 # ── Minimal fakes ────────────────────────────────────────────────────────────
 
@@ -116,7 +119,7 @@ async def _dispatch_one(
                 attachments=[],
                 config=None,
             )
-    except TaskQueueFullError:
+    except (TaskQueueFullError, TaskRuntimeShuttingDownError):
         return False
     return True
 
@@ -138,6 +141,21 @@ async def test_ac1_1_no_append_on_queue_full() -> None:
         f"append_message was called {len(sm.append_calls)} time(s) "
         "even though enqueue raised TaskQueueFullError"
     )
+
+
+@pytest.mark.asyncio
+async def test_no_append_when_runtime_is_shutting_down() -> None:
+    sm = _FakeSessionManager()
+    tr = _FakeTurnRunner()
+    runtime = MagicMock()
+    runtime.enqueue = AsyncMock(
+        side_effect=TaskRuntimeShuttingDownError(session_key="s:test")
+    )
+
+    success = await _dispatch_one(sm, tr, "s:test", runtime)
+
+    assert success is False
+    assert sm.append_calls == []
 
 
 # ── cross-thread concurrent test, 50 loops, random.shuffle ─────────────────

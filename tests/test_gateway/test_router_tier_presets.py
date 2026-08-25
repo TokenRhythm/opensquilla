@@ -251,8 +251,8 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     tiers = cfg.squilla_router.tiers
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
-        "c0": "deepseek-v4-flash",
-        "c1": "deepseek-v4-pro",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
         "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
@@ -260,6 +260,8 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     for name, tier in tiers.items():
         assert tier["provider"] == "tokenrhythm"
         assert tier["model"] == expected_models[name]
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in tiers["c3"]
 
 
 # --- H4: downgrade chokepoint at to_toml_dict --------------------------------

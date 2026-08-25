@@ -295,6 +295,39 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.modelRoutingMode.value).toBe('off')
   })
 
+  it('applies canonical image admission and preserves old-Gateway defaults', async () => {
+    const blocked = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'direct',
+        image_input: {
+          admission: 'blocked',
+          reason: 'model_vision_unsupported',
+        },
+      }],
+    })
+    await blocked.api.loadFeatureToggles()
+    expect(blocked.api.imageInputAdmission.value).toBe('blocked')
+    expect(blocked.api.imageInputAdmissionReason.value).toBe('model_vision_unsupported')
+
+    const legacyDirect = createHarness({
+      configGetResults: [{ llm_ensemble: { enabled: false } }],
+      routingGetResults: [{ mode: 'direct' }],
+    })
+    await legacyDirect.api.loadFeatureToggles()
+    expect(legacyDirect.api.imageInputAdmission.value).toBe('unknown')
+
+    const legacyEnsemble = createHarness({
+      configGetResults: [{ llm_ensemble: { enabled: true } }],
+      routingGetResults: [{ mode: 'ensemble' }],
+    })
+    await legacyEnsemble.api.loadFeatureToggles()
+    expect(legacyEnsemble.api.imageInputAdmission.value).toBe('blocked')
+    expect(legacyEnsemble.api.imageInputAdmissionReason.value).toBe(
+      'ensemble_mode_unsupported',
+    )
+  })
+
   it('applies Gateway routing changes live and unsubscribes on cleanup', async () => {
     vi.stubGlobal('document', {
       visibilityState: 'visible',
@@ -312,10 +345,19 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.modelRoutingMode.value).toBe('llm_ensemble')
     expect(api.llmEnsembleSelectionMode.value).toBe('router_dynamic')
 
+    emit('models.routing.changed', {
+      mode: 'router',
+      image_input: {
+        admission: 'allowed',
+        reason: 'router_image_route_available',
+      },
+    })
+    expect(api.imageInputAdmission.value).toBe('allowed')
+
     cleanup()
     expect(rpc.on).toHaveBeenCalledWith('models.routing.changed', expect.any(Function))
     emit('models.routing.changed', { mode: 'direct' })
-    expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
   })
 
   it.each([
@@ -334,6 +376,35 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.modelRoutingMode.value).toBe(mode)
     expect(api.routerEnabled.value).toBe(routerActive)
     expect(api.llmEnsembleEnabled.value).toBe(ensembleActive)
+  })
+
+  it('maps tier-scoped ensemble execution independently from the global mode', async () => {
+    const { api } = createHarness({
+      configGetResults: [{
+        squilla_router: {
+          enabled: true,
+          rollout_phase: 'full',
+          tiers: {
+            c2: {
+              model: 'z-ai/glm-5.2',
+              ensemble_selection_mode: 'router_dynamic',
+            },
+            c3: {
+              model: 'anthropic/claude-opus-4.8',
+              ensemble_enabled: false,
+              ensemble_selection_mode: 'router_dynamic',
+            },
+          },
+        },
+        llm_ensemble: { enabled: false },
+      }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.routerTierConfigs.value.c2?.ensembleEnabled).toBe(true)
+    expect(api.routerTierConfigs.value.c3?.ensembleEnabled).toBe(false)
   })
 
   it.each<[ModelRoutingMode, string]>([

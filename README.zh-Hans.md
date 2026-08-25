@@ -30,7 +30,11 @@
 
 ## 最新动态
 
-- 📢 **2026-07-03** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)**（预览版）已发布，随 OpenSquilla **0.5.0 Preview 1** 一同放出。报告详细介绍了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮。
+- 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)。如何引用 OpenSquilla 请见[引用](#引用)。
+
+- 📢 **2026-08-21** —— 技术报告的 PDF 版本现已收录在本仓库中：[English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
+
+- 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型集成路由如何超越 Fable 5**。
 
 ---
 
@@ -43,7 +47,7 @@ OpenSquilla 是一个高效利用 Token 的微内核 AI Agent。本地模型路�
 Ollama、DeepSeek、Gemini、Qwen/DashScope 等 20 多个 LLM 提供商，无需改动你的代码或
 配置结构。
 
-OpenSquilla 0.5.2 是当前正式发布版本。
+OpenSquilla 0.5.4 是当前正式发布版本。
 
 如需面向任务的产品文档，请从
 [OpenSquilla 产品指南](README.product.md)或[文档索引](docs/README.md)开始。
@@ -59,8 +63,8 @@ OpenSquilla 可运行于 Windows、macOS 和 Linux。请选择与你的使用场
 发布版安装命令使用 GitHub 上已发布的 release 资源。Python wheel 安装使用带版本号的 wheel
 文件名，因为安装器会校验嵌入在 wheel 文件名中的版本号。
 
-对于 0.5.2 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
-`OpenSquilla-0.5.2-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.2-win-x64.exe`。
+对于 0.5.4 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
+`OpenSquilla-0.5.4-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.4-win-x64.exe`。
 
 | 安装方式 | 适合人群 | 何时使用 |
 | --- | --- | --- |
@@ -100,10 +104,10 @@ PowerShell 安装器会通过 `winget` 自动装好它；而**终端快速安装
 
 ### 桌面安装包
 
-0.5.2 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
+0.5.4 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
 
-- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-mac-arm64.dmg>
-- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-win-x64.exe>
+- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 中国大陆下载可直接使用 OSS 的固定安装包链接：
 
@@ -146,7 +150,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. 安装 OpenSquilla**——所有平台命令相同。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 这会从 release URL 安装 OpenSquilla wheel，再由 `uv` 下载所选 extra 所声明的依赖。
@@ -167,7 +171,7 @@ opensquilla gateway run
 > PATH 设置命令。
 
 如需完全锁定版本的安装，请使用带版本号的 wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl`。
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -710,3 +714,23 @@ OpenSquilla 的灵感来自
 
 [行为准则](CODE_OF_CONDUCT.md) · [安全](SECURITY.md) ·
 [支持](SUPPORT.md) · [许可证](LICENSE)（Apache-2.0）
+
+---
+
+## 引用
+
+如果你在研究中使用了 OpenSquilla，请引用我们的技术报告：
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

@@ -20,6 +20,15 @@ from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.commands import Surface
 
 
+@pytest.mark.parametrize("surface", [Surface.CLI_GATEWAY, Surface.CLI_STANDALONE])
+def test_routing_mutation_waits_only_for_local_queue(surface: Surface) -> None:
+    assert (
+        classify_chat_input("/routing ensemble", surface=surface)
+        is TuiInputKind.COMMAND_REQUIRES_QUEUE_EMPTY
+    )
+    assert classify_chat_input("/routing", surface=surface) is TuiInputKind.CONTROL
+
+
 class _FakeSurface:
     def __init__(
         self,
@@ -1382,6 +1391,227 @@ async def test_runtime_rejects_require_idle_command_while_turn_is_running() -> N
     release_turn.set()
     await inputs.put(None)
     await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_gateway_routing_does_not_overtake_typed_ahead_input() -> None:
+    inputs: asyncio.Queue[Any] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    state = TuiRuntimeState()
+    dispatched: list[str] = []
+    notices: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _dispatch(user_input: str) -> bool:
+        dispatched.append(user_input)
+        if user_input == "first":
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    task = asyncio.create_task(
+        run_tui_runtime(
+            dispatch=_dispatch,
+            surface_factory=_surface_factory(surface),
+            config=_runtime_config(
+                concurrent_input_during_turn=True,
+                classify_input=lambda text: classify_chat_input(
+                    text,
+                    surface=Surface.CLI_GATEWAY,
+                ),
+                state=state,
+            ),
+            hooks=_runtime_hooks(notice=notices.append),
+        )
+    )
+
+    await inputs.put("first")
+    await first_started.wait()
+    await inputs.put(TuiSubmittedInput("second", intent="queue"))
+    await _wait_until(lambda: state.pending_items == ("second",))
+    await inputs.put("/routing ensemble")
+    await _wait_until(
+        lambda: "/routing ensemble" in dispatched
+        or any("requires an empty input queue" in notice for notice in notices)
+    )
+
+    assert "/routing ensemble" not in dispatched
+    assert any("requires an empty input queue" in notice for notice in notices)
+
+    release_first.set()
+    await _wait_until(lambda: "second" in dispatched)
+    await inputs.put(None)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_standalone_routing_does_not_overtake_pending_ambiguous_steer() -> None:
+    inputs: asyncio.Queue[Any] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    state = TuiRuntimeState()
+    dispatched: list[str] = []
+    notices: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    steer_calls = 0
+
+    async def _dispatch(user_input: str) -> bool:
+        dispatched.append(user_input)
+        if user_input == "first":
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    async def _ambiguous(_text: str) -> bool:
+        nonlocal steer_calls
+        steer_calls += 1
+        if steer_calls < 3:
+            raise ConnectionError("reply lost after request write")
+        return True
+
+    task = asyncio.create_task(
+        run_tui_runtime(
+            dispatch=_dispatch,
+            surface_factory=_surface_factory(surface),
+            config=_runtime_config(
+                concurrent_input_during_turn=True,
+                classify_input=lambda text: classify_chat_input(
+                    text,
+                    surface=Surface.CLI_STANDALONE,
+                ),
+                state=state,
+            ),
+            hooks=_runtime_hooks(
+                notice=notices.append,
+                on_steer_active_turn=_ambiguous,
+            ),
+        )
+    )
+
+    await inputs.put("first")
+    await first_started.wait()
+    await inputs.put(
+        TuiSubmittedInput(
+            "maybe already accepted",
+            intent="steer",
+            client_message_id="client-ambiguous-routing",
+        )
+    )
+    await _wait_until(lambda: state.pending_items == ("maybe already accepted",))
+    release_first.set()
+    await _wait_until(lambda: steer_calls == 2)
+    assert state.has_active_turn is False
+    assert state.pending_items == ("maybe already accepted",)
+
+    await inputs.put("/routing ensemble")
+    await _wait_until(
+        lambda: "/routing ensemble" in dispatched
+        or any("requires an empty input queue" in notice for notice in notices)
+    )
+
+    assert "/routing ensemble" not in dispatched
+    assert any("requires an empty input queue" in notice for notice in notices)
+
+    await inputs.put(None)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface_kind", [Surface.CLI_GATEWAY, Surface.CLI_STANDALONE])
+async def test_routing_mutation_dispatches_during_active_turn_with_empty_queue(
+    surface_kind: Surface,
+) -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    state = TuiRuntimeState()
+    dispatched: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _dispatch(user_input: str) -> bool:
+        dispatched.append(user_input)
+        if user_input == "first":
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    task = asyncio.create_task(
+        run_tui_runtime(
+            dispatch=_dispatch,
+            surface_factory=_surface_factory(surface),
+            config=_runtime_config(
+                concurrent_input_during_turn=True,
+                classify_input=lambda text: classify_chat_input(
+                    text,
+                    surface=surface_kind,
+                ),
+                state=state,
+            ),
+            hooks=_runtime_hooks(),
+        )
+    )
+
+    await inputs.put("first")
+    await first_started.wait()
+    assert state.pending_size == 0
+    await inputs.put("/routing ensemble")
+    await _wait_until(lambda: "/routing ensemble" in dispatched)
+
+    release_first.set()
+    await inputs.put(None)
+    await asyncio.wait_for(task, timeout=2.0)
+    assert dispatched == ["first", "/routing ensemble"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface_kind", [Surface.CLI_GATEWAY, Surface.CLI_STANDALONE])
+async def test_routing_query_dispatches_with_active_and_pending_input(
+    surface_kind: Surface,
+) -> None:
+    inputs: asyncio.Queue[Any] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    state = TuiRuntimeState()
+    dispatched: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _dispatch(user_input: str) -> bool:
+        dispatched.append(user_input)
+        if user_input == "first":
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    task = asyncio.create_task(
+        run_tui_runtime(
+            dispatch=_dispatch,
+            surface_factory=_surface_factory(surface),
+            config=_runtime_config(
+                concurrent_input_during_turn=True,
+                classify_input=lambda text: classify_chat_input(
+                    text,
+                    surface=surface_kind,
+                ),
+                state=state,
+            ),
+            hooks=_runtime_hooks(),
+        )
+    )
+
+    await inputs.put("first")
+    await first_started.wait()
+    await inputs.put(TuiSubmittedInput("second", intent="queue"))
+    await _wait_until(lambda: state.pending_items == ("second",))
+    await inputs.put("/routing")
+    await _wait_until(lambda: "/routing" in dispatched)
+
+    assert state.pending_items == ("second",)
+    release_first.set()
+    await _wait_until(lambda: "second" in dispatched)
+    await inputs.put(None)
+    await asyncio.wait_for(task, timeout=2.0)
+    assert dispatched == ["first", "/routing", "second"]
 
 
 @pytest.mark.asyncio
