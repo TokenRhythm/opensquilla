@@ -35,6 +35,18 @@ function failedCall(): ChatToolCallRenderItem {
   }
 }
 
+function failedDocumentWriterCall(name = 'document_apply'): ChatToolCallRenderItem {
+  return {
+    ...failedCall(),
+    toolId: `failed-${name}`,
+    renderKey: `failed-${name}`,
+    name,
+    displayName: 'Apply document change',
+    result: 'Proposal validation failed',
+    resultPreview: 'Proposal validation failed',
+  }
+}
+
 function successfulCall(toolId: string, name: string): ChatToolCallRenderItem {
   return {
     ...failedCall(),
@@ -517,7 +529,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.msg-meta-popover')?.textContent).not.toContain('$0')
   })
 
-  it('keeps the ensemble summary but hides exact zero cost for unknown-only legacy usage', async () => {
+  it('keeps numeric ensemble costs without adding an unknown-usage display state', async () => {
     const meta = usageMeta({
       input: 0,
       output: 0,
@@ -562,9 +574,9 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
     const popover = el.querySelector<HTMLElement>('.msg-meta-popover')
     expect(popover?.textContent).toContain('ensemble-review')
-    expect(popover?.textContent).toContain('exact usage total unavailable')
-    expect(popover?.textContent).not.toContain('$0')
-    expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('—')
+    expect(popover?.textContent).not.toContain('exact usage total unavailable')
+    expect(popover?.textContent).toContain('$0')
+    expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('$0')
   })
 
   it('adds compact usage without reordering a canonical-less legacy timeline', async () => {
@@ -1057,6 +1069,46 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.tool-row--error')).toBeNull()
   })
 
+  it.each(['document_apply', 'document_patch'])(
+    'keeps a failed %s page update visible and uses the unified successful summary',
+    async (writerName) => {
+      const failedWriter = failedDocumentWriterCall(writerName)
+      const failedApply = timelineGroup(failedWriter)
+      if (failedApply.type !== 'tool-group') throw new Error('expected tool group')
+      failedApply.group.isError = true
+      failedApply.group.status = 'error'
+      const successfulApply = timelineGroup(successfulCall('applied-document', writerName))
+      const el = mountMessage(baseMessage({
+        timelineItems: [failedApply, successfulApply],
+        toolCalls: [failedWriter, successfulCall('applied-document', writerName)],
+        parts: [],
+        statusHistory: [],
+        turnOutcome: {
+          turnId: 'turn-document-apply',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+            corrected: true,
+            proposalAttempts: 2,
+          },
+        },
+      }))
+      await nextTick()
+
+      const activity = el.querySelector<HTMLElement>('.assistant-activity')
+      expect(
+        activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'),
+      ).toBe('false')
+      expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
+        .toContain('Page updated')
+      expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
+        .not.toMatch(/receipt|reconciliation|revision|document_(?:apply|patch)/i)
+      expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
+      expect(activity?.textContent).not.toContain('Proposal validation failed')
+    },
+  )
+
   it('hides restored failures whose error state only survived on the group', async () => {
     const staleFailure = timelineGroup(successfulCall('stale-failure', 'execute_code'))
     if (staleFailure.type !== 'tool-group') throw new Error('expected tool group')
@@ -1072,6 +1124,23 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.assistant-activity')).toBeNull()
     expect(el.querySelector('.tool-row')).toBeNull()
     expect(el.textContent).not.toContain('Failed')
+  })
+
+  it('keeps a restored document writer failure with a canonical operation key', async () => {
+    const restoredFailure = timelineGroup(successfulCall('restored-writer', 'document_patch'))
+    if (restoredFailure.type !== 'tool-group') throw new Error('expected tool group')
+    restoredFailure.group.operationKey = 'document.update'
+    restoredFailure.group.isError = true
+    restoredFailure.group.status = 'error'
+    const el = mountMessage(baseMessage({
+      timelineItems: [restoredFailure],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity')).not.toBeNull()
+    expect(el.textContent).toContain('Failed')
   })
 
   it('keeps successful calls while removing failed calls from a mixed group', async () => {

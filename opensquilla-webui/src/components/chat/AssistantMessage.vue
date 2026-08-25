@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="0"
+          :failure-count="documentWriterFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -50,6 +50,36 @@
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
+          <UnifiedAssistantActivityTimeline
+            v-if="hasUnifiedActivityOrder"
+            :projection="visibleActivityProjection"
+            :timeline-items="visibleActivityItems"
+            :reasoning-blocks="reasoningBlocks"
+            :reasoning-pace-bursts="reasoningRevealPending"
+            :state-scope="toolStateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+            @reveal-complete="completeTerminalReasoningReveal"
+            @toggle-group="$emit('toggleToolGroup', $event)"
+            @toggle-item="$emit('toggleToolItem', $event)"
+            @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
+          >
+            <template #interrupt="{ part }">
+              <InterruptPart
+                v-if="part.resolution"
+                :part="part"
+                timeline
+                @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
+                @extend="id => $emit('extendInterrupt', id)"
+                @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+                @clarify-dismiss="$emit('clarifyDismiss')"
+              />
+            </template>
+          </UnifiedAssistantActivityTimeline>
+          <template v-else>
           <AssistantActivityTimeline
             v-if="hasBeforeReasoningActivity"
             :projection="visibleActivityProjection"
@@ -109,6 +139,14 @@
               />
             </template>
           </AssistantActivityTimeline>
+          </template>
+          <p
+            v-if="message.activitySnapshotIncomplete"
+            class="assistant-activity-incomplete"
+            role="status"
+          >
+            {{ t('chat.activity.recordIncomplete') }}
+          </p>
         </ActivityDisclosure>
         <div
           v-if="activityProjection.answerPart && !hasPlan"
@@ -284,10 +322,7 @@
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.ensemble') }}</span>
                   <span class="msg-meta-popover__value">{{ ensembleSummary }}</span>
                 </div>
-                <div
-                  v-if="message.meta.ensemble.costUsd || message.meta.costUsd || !usageIncomplete"
-                  class="msg-meta-popover__row"
-                >
+                <div class="msg-meta-popover__row">
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
                   <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.ensemble.costUsd || message.meta.costUsd) }}</span>
                 </div>
@@ -298,13 +333,15 @@
                 <div class="msg-meta-popover__models" :aria-label="t('chat.msgMeta.ensembleModelsAria')">
                   <div
                     v-for="member in message.meta.ensemble.models"
-                    :key="`${member.role}:${member.provider}:${member.model}`"
+                    :key="`${member.role}:${member.provider}:${member.model}:${member.sampleIndex || 0}`"
                     class="msg-meta-popover__model"
                   >
-                    <span class="msg-meta-popover__model-role">{{ ensembleRole(member.role, member.label) }}</span>
+                    <span class="msg-meta-popover__model-role">
+                      {{ ensembleMemberRoleLabel(member.role) }} <span aria-hidden="true">·</span>
+                    </span>
                     <span class="msg-meta-popover__model-name" :title="member.model">{{ member.modelShort }}</span>
                     <span class="msg-meta-popover__model-cost">
-                      {{ member.costUsd || !usageIncomplete ? fmtUsd(member.costUsd) : '—' }}
+                      {{ fmtUsd(member.costUsd) }}
                     </span>
                   </div>
                 </div>
@@ -402,6 +439,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
+import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import SourcesRow from '@/components/chat/SourcesRow.vue'
@@ -418,6 +456,10 @@ import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
+import {
+  isDocumentAgentToolName,
+  isDocumentWriterToolName,
+} from '@/utils/chat/toolDisplay'
 import {
   hasIncompleteUsageCoverage,
   usageCoverageText,
@@ -449,6 +491,7 @@ import {
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 import {
   isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
@@ -697,11 +740,8 @@ const hasMetaDetails = computed(() => {
   )
 })
 
-const usageIncomplete = computed(() => (
-  props.message.meta ? hasIncompleteUsageCoverage(props.message.meta) : false
-))
 const usageCoverageDetail = computed(() => (
-  props.message.meta
+  props.message.meta && !props.message.meta.ensemble
     ? usageCoverageText(
         props.message.meta,
         (key, named) => String(named ? t(key, named) : t(key)),
@@ -811,7 +851,9 @@ const activityProjection = computed(() =>
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
-      endedAt: epochMilliseconds(props.message.ts),
+      endedAt: epochMilliseconds(
+        props.message.turnOutcome?.finishedAt ?? props.message.ts,
+      ),
     },
   ),
 )
@@ -821,6 +863,8 @@ function withoutFailedActivity(
 ): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
+    const documentAgentGroup = item.group.operationKey.startsWith('document.')
+      || isDocumentAgentToolName(item.group.operationKey)
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
     )
@@ -830,24 +874,38 @@ function withoutFailedActivity(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
+      && !documentAgentGroup
     ) {
       return []
     }
+    const groupLevelWriterError = documentAgentGroup
+      && (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
     const calls = item.group.calls.filter(
-      call => !call.isError
-        && call.status !== 'error'
-        && !createdSessionCallIds.value.has(call.toolId),
-    )
+      call => (
+        (
+          (!call.isError && call.status !== 'error')
+          || isDocumentAgentToolName(call.name)
+        )
+        && !createdSessionCallIds.value.has(call.toolId)
+      ),
+    ).map(call => groupLevelWriterError
+      ? { ...call, isError: true, status: 'error' as const }
+      : call)
     if (calls.length === 0) return []
     const isRunning = calls.some(call => call.isRunning)
+    const isError = calls.some(call => call.isError || call.status === 'error')
+      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
         ...item.group,
         calls,
         isRunning,
-        isError: false,
-        status: isRunning
+        isError,
+        status: isError
+          ? 'error'
+          : isRunning
           ? ''
           : calls.every(call => call.status === 'success')
             ? 'success'
@@ -872,7 +930,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    !cluster.isFailure
+    (!cluster.isFailure || cluster.calls.some(call => isDocumentAgentToolName(call.name)))
     && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
@@ -884,6 +942,20 @@ const visibleActivityProjection = computed(() => ({
   activityClusters: visibleActivityClusters.value,
   statusSteps: visibleActivityStatusSteps.value,
 }))
+function validActivityOrder(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+const hasUnifiedActivityOrder = computed(() => {
+  const orders = [
+    ...visibleActivityStatusSteps.value.map(step => step.activityOrder),
+    ...reasoningBlocks.value.map(block => block.activityOrder),
+    ...visibleActivityItems.value.map(item => (
+      item.activityOrder
+      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
+    )),
+  ]
+  return orders.length > 0 && orders.every(validActivityOrder)
+})
 const hasBeforeReasoningActivity = computed(() =>
   visibleActivityStatusSteps.value.some(isBeforeReasoningActivityStatusStep),
 )
@@ -898,8 +970,22 @@ const hasActivity = computed(() =>
   || visibleActivityStatusSteps.value.length > 0,
 )
 const showActivityDisclosure = computed(() =>
-  activityProjection.value.canSeparateActivity
-  && hasActivity.value,
+  (activityProjection.value.canSeparateActivity && hasActivity.value)
+  || props.message.activitySnapshotIncomplete === true,
+)
+
+const documentWriterFailureCount = computed(() =>
+  visibleActivityItems.value.reduce((count, item) => {
+    if (item.type !== 'tool-group') return count
+    return count + item.group.calls.filter(call =>
+      isDocumentWriterToolName(call.name)
+      && (call.isError || call.status === 'error'),
+    ).length
+  }, 0),
+)
+
+const documentMutationOutcome = computed(() =>
+  props.message.turnOutcome?.documentMutationOutcome,
 )
 
 const activityStepCount = computed(() => Math.max(
@@ -1055,6 +1141,26 @@ function withMaintenanceSummary(label: string): string {
 }
 
 const activitySummaryLabel = computed(() => {
+  const mutationStatus = documentMutationOutcome.value?.status
+  const mutationSummaryKey = mutationStatus === 'applied'
+    ? 'applied'
+    : mutationStatus === 'ambiguous'
+      ? 'ambiguous'
+      : mutationStatus
+        ? 'not_applied'
+        : ''
+  if (mutationSummaryKey) {
+    return withMaintenanceSummary([
+      String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
+  if (documentWriterFailureCount.value > 0) {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',
@@ -1100,16 +1206,15 @@ function fmtUsd(value: number): string {
   return `$${n.toFixed(6).replace(/\.?0+$/, '')}`
 }
 
-function ensembleRole(role: string, label: string): string {
-  const normalized = String(role || '').replace(/_/g, ' ')
-  if (normalized === 'proposer') return 'proposer'
-  if (normalized === 'aggregator') return 'aggregator'
-  if (normalized === 'fallback single') return 'fallback'
-  return label || normalized || 'member'
-}
 </script>
 
 <style scoped>
+.assistant-activity-incomplete {
+  margin: 0.375rem 0 0;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 0.75rem;
+}
+
 .msg-ai-main > :deep(.approval-card),
 .msg-ai-main > :deep(.clarify-card) {
   width: 100%;

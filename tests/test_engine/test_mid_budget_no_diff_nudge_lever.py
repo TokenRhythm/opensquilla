@@ -17,11 +17,13 @@ import re
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.git_runtime import GitRunState
 from opensquilla.provider import (
     ChatConfig,
     Message,
@@ -358,6 +360,28 @@ def test_evidence_check_uses_config_workspace_for_contextless_agent(
         _lever_config(workspace_dir=str(repo)),
     )
 
+    assert agent._workspace_has_source_change_evidence() is True
+
+
+def test_evidence_check_treats_git_unavailable_as_unknown_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _init_repo(tmp_path / "workspace")
+    agent = _echo_agent(
+        _SequenceProvider([_final_text()]),
+        _lever_config(),
+        tool_context=_workspace_ctx(repo),
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.run_git",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=False,
+            state=GitRunState.UNAVAILABLE,
+        ),
+    )
+
+    assert agent._workspace_tracked_diff_paths_for_nudge() is None
     assert agent._workspace_has_source_change_evidence() is True
 
 

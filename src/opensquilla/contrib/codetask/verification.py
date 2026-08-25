@@ -44,6 +44,7 @@ from opensquilla.contrib.codetask.types import (
     RegressionResult,
     TaskState,
 )
+from opensquilla.git_runtime import GitRunState, run_git
 
 logger = logging.getLogger(__name__)
 
@@ -475,10 +476,37 @@ _BASH_KIND_WSL = "wsl"
 _BASH_KIND_UNUSABLE = "unusable"
 # Exit code the probe script reserves for "real bash, but Linux userland".
 _BASH_PROBE_WSL_EXIT = 42
-# Process-level cache: bash location is stable for the gateway's lifetime.
-# Tuple form (resolved, path) so a cached "not found" doesn't keep re-probing.
+# Process-level cache keyed by the candidate inventory. Installing/removing a
+# Runtime Pack changes that inventory, so CodeTask can adopt it without a
+# Gateway restart while stable calls still avoid repeated probes.
 _BASH_RESOLVED: bool = False
 _BASH_CACHED: str | None = None
+_BASH_CANDIDATE_FINGERPRINT: tuple[str, ...] | None = None
+
+
+def _runtime_pack_precedes_host() -> bool:
+    try:
+        from opensquilla.run_mode import RunMode, normalize_run_mode
+        from opensquilla.tools.run_mode import current_run_mode
+
+        mode = current_run_mode()
+        return mode is not None and normalize_run_mode(mode) is not RunMode.FULL
+    except (ImportError, RuntimeError, ValueError):
+        return False
+
+
+def _runtime_pack_bash_binary() -> str | None:
+    try:
+        from opensquilla.runtime_packs import resolve_component_binary
+        from opensquilla.sandbox.integration import active_sandbox_policy
+
+        policy = active_sandbox_policy().runtimes
+        if not policy.enabled or not policy.git_bash:
+            return None
+        path = resolve_component_binary("gitBash", "bash", allow_host=False)
+        return str(path) if path is not None else None
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _windows_bash_candidates() -> list[str]:
@@ -501,6 +529,10 @@ def _windows_bash_candidates() -> list[str]:
             return
         seen.add(key)
         out.append(p)
+
+    managed_bash = _runtime_pack_bash_binary()
+    if _runtime_pack_precedes_host():
+        _add(managed_bash)
 
     _add(os.environ.get("OPENSQUILLA_BASH"))
 
@@ -531,6 +563,8 @@ def _windows_bash_candidates() -> list[str]:
             cand = os.path.join(base, rel)
             if os.path.isfile(cand):
                 _add(cand)
+    if not _runtime_pack_precedes_host():
+        _add(managed_bash)
     return out
 
 
@@ -595,15 +629,18 @@ def _resolve_bash() -> str | None:
     """
     if os.name != "nt":
         return shutil.which("bash")
-    global _BASH_RESOLVED, _BASH_CACHED
-    if _BASH_RESOLVED:
+    global _BASH_CANDIDATE_FINGERPRINT, _BASH_RESOLVED, _BASH_CACHED
+    candidates = _windows_bash_candidates()
+    fingerprint = tuple(os.path.normcase(os.path.abspath(path)) for path in candidates)
+    if _BASH_RESOLVED and fingerprint == _BASH_CANDIDATE_FINGERPRINT:
         return _BASH_CACHED
     wsl_fallback: str | None = None
-    for cand in _windows_bash_candidates():
+    for cand in candidates:
         kind = _probe_bash_kind(cand)
         if kind == _BASH_KIND_NATIVE:
             _BASH_CACHED = cand
             _BASH_RESOLVED = True
+            _BASH_CANDIDATE_FINGERPRINT = fingerprint
             return cand
         if kind == _BASH_KIND_WSL and wsl_fallback is None:
             wsl_fallback = cand
@@ -618,14 +655,16 @@ def _resolve_bash() -> str | None:
         )
     _BASH_CACHED = wsl_fallback
     _BASH_RESOLVED = True
+    _BASH_CANDIDATE_FINGERPRINT = fingerprint
     return _BASH_CACHED
 
 
 def _reset_bash_cache() -> None:
     """Test helper: drop the memoized bash resolution."""
-    global _BASH_RESOLVED, _BASH_CACHED
+    global _BASH_CANDIDATE_FINGERPRINT, _BASH_RESOLVED, _BASH_CACHED
     _BASH_RESOLVED = False
     _BASH_CACHED = None
+    _BASH_CANDIDATE_FINGERPRINT = None
 
 
 def _repo_venv_python_candidates(repo: Path) -> tuple[Path, ...]:
@@ -753,33 +792,32 @@ class _BaseWorktree:
         import shutil
 
         tmp = Path(tempfile.mkdtemp(prefix="codetask-base-"))
-        try:
-            r = subprocess.run(
-                ["git", "worktree", "add", "--detach", str(tmp), self.base_commit],
-                cwd=str(self.repo),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        result = run_git(
+            ["worktree", "add", "--detach", str(tmp), self.base_commit],
+            cwd=self.repo,
+            timeout=120,
+        )
+        if result.state is GitRunState.UNAVAILABLE:
             shutil.rmtree(tmp, ignore_errors=True)
-            raise _WorktreeError(str(exc)) from exc
-        if r.returncode != 0:
+            reason = result.capability.reason or result.stderr_text.strip()
+            raise _WorktreeError(f"Git is unavailable ({reason or 'git_unavailable'})")
+        if result.state is GitRunState.TIMED_OUT:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise _WorktreeError("git worktree add timed out after 120s")
+        if not result.ok:
             # Do not leak the mkdtemp dir when the worktree was never added
             # (codex review #9).
             shutil.rmtree(tmp, ignore_errors=True)
-            raise _WorktreeError((r.stderr or "").strip()[-200:])
+            detail = result.stderr_text.strip() or result.state.value
+            raise _WorktreeError(detail[-200:])
         self._dir = tmp
         return tmp
 
     def __exit__(self, *exc) -> None:
         if self._dir is not None:
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(self._dir)],
-                cwd=str(self.repo),
-                capture_output=True,
+            run_git(
+                ["worktree", "remove", "--force", str(self._dir)],
+                cwd=self.repo,
                 timeout=60,
             )
 

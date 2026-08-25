@@ -30,7 +30,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
 import structlog
 
@@ -287,6 +287,11 @@ class _StreamState:
 
     # Moved INTO stage scope (declared inline before the stage extraction).
     current_text_parts: list[str] = field(default_factory=list)
+    # Presentation for ``current_text_parts``. Persisted text segments carry
+    # this additive field so history reloads can distinguish user-visible work
+    # narration from the terminal answer. ``answer`` is the compatibility
+    # default for legacy producers and rows that predate the field.
+    current_text_presentation: Literal["intermediate", "answer"] = "answer"
     error_message: str | None = None
     pending_error_event: ErrorEvent | None = None
     done_event: DoneEvent | None = None
@@ -480,6 +485,44 @@ def _normalize_cumulative_text_delta(text: str, state: _StreamState) -> str:
     return text
 
 
+def _normalize_text_presentation(value: object) -> Literal["intermediate", "answer"]:
+    """Normalize optional or legacy presentation values to the answer default."""
+
+    return "intermediate" if value == "intermediate" else "answer"
+
+
+def _flush_current_text_segment(state: _StreamState) -> None:
+    """Persist the current text run without losing its presentation metadata."""
+
+    if not state.current_text_parts:
+        return
+    state.turn_segments.append(
+        {
+            "type": "text",
+            "text": "".join(state.current_text_parts),
+            "presentation": state.current_text_presentation,
+        }
+    )
+    state.current_text_parts[:] = []
+
+
+def _append_current_text(
+    state: _StreamState,
+    text: str,
+    *,
+    presentation: object,
+) -> None:
+    """Append text while keeping unlike presentation runs as separate segments."""
+
+    if not text:
+        return
+    normalized = _normalize_text_presentation(presentation)
+    if state.current_text_parts and state.current_text_presentation != normalized:
+        _flush_current_text_segment(state)
+    state.current_text_presentation = normalized
+    state.current_text_parts.append(text)
+
+
 class _TextDeltaHandler:
     """Accumulate streamed text deltas into the final-text and current-text buffers."""
 
@@ -491,7 +534,11 @@ class _TextDeltaHandler:
         canonical_delta = _normalize_cumulative_text_delta(event.text, state)
         if canonical_delta:
             state.final_text_parts.append(canonical_delta)
-            state.current_text_parts.append(canonical_delta)
+            _append_current_text(
+                state,
+                canonical_delta,
+                presentation=event.presentation,
+            )
         return replace(event, text=canonical_delta)
 
 class _ToolUseStartHandler:
@@ -502,11 +549,7 @@ class _ToolUseStartHandler:
         event: ToolUseStartEvent,
         state: _StreamState,
     ) -> ToolUseStartEvent:
-        if state.current_text_parts:
-            state.turn_segments.append(
-                {"type": "text", "text": "".join(state.current_text_parts)}
-            )
-            state.current_text_parts[:] = []
+        _flush_current_text_segment(state)
         state.turn_segments.append(
             {
                 "type": "tool_use",
@@ -702,6 +745,7 @@ class _WarningHandler:
         if accumulated_text.endswith(current_text):
             state.final_text_parts[:] = [accumulated_text[: -len(current_text)]]
         state.current_text_parts[:] = []
+        state.current_text_presentation = "answer"
 
 @dataclass
 class _DonePrePublish:
@@ -1165,22 +1209,29 @@ def _reconcile_done_text_snapshot(
 
         suffix = done_text[len(accumulated_text) :]
         state.final_text_parts.append(suffix)
-        state.current_text_parts.append(suffix)
-        return done_text, _TextDeltaEvent(text=suffix)
+        _append_current_text(state, suffix, presentation="answer")
+        return done_text, _TextDeltaEvent(text=suffix, presentation="answer")
 
     # The terminal aggregate is a complete Agent-owned snapshot. A mismatch means
     # streamed text was intentionally superseded (retry, recovery, or a producer
     # that emitted a cumulative final value). Keep non-text segments so tool
     # execution history is never erased, but collapse text to one canonical value.
+    if state.current_text_parts and state.current_text_presentation == "intermediate":
+        _flush_current_text_segment(state)
     state.final_text_parts[:] = [done_text] if done_text else []
     state.turn_segments[:] = [
         segment
         for segment in state.turn_segments
-        if not (isinstance(segment, dict) and segment.get("type") == "text")
+        if not (
+            isinstance(segment, dict)
+            and segment.get("type") == "text"
+            and _normalize_text_presentation(segment.get("presentation")) == "answer"
+        )
     ]
     state.current_text_parts[:] = (
         [done_text] if done_text and state.turn_segments else []
     )
+    state.current_text_presentation = "answer"
     return done_text, None
 
 
@@ -1202,6 +1253,7 @@ def _silent_reply_state_projection(
             {
                 "type": "text",
                 "text": current_text,
+                "presentation": state.current_text_presentation,
                 _CURRENT_SILENT_REPLY_TEXT_MARKER: True,
             }
         )
@@ -1236,14 +1288,19 @@ def _apply_silent_reply_normalization_to_state(
 
     turn_segments: list[dict[str, Any]] = []
     normalized_current = ""
+    normalized_current_presentation: Literal["intermediate", "answer"] = "answer"
     for raw_segment in projection.normalization.segments:
         segment = dict(raw_segment)
         if segment.pop(_CURRENT_SILENT_REPLY_TEXT_MARKER, False):
             normalized_current += str(segment.get("text") or "")
+            normalized_current_presentation = _normalize_text_presentation(
+                segment.get("presentation")
+            )
             continue
         turn_segments.append(segment)
     state.turn_segments[:] = turn_segments
     state.current_text_parts[:] = [normalized_current] if normalized_current else []
+    state.current_text_presentation = normalized_current_presentation
     state.final_text_parts[:] = (
         [projection.canonical_text] if projection.canonical_text else []
     )
@@ -1276,7 +1333,7 @@ def _append_done_notice_delta(
     separator = "\n\n" if accumulated_text.strip() else ""
     notice_delta = separator + notice
     state.final_text_parts.append(notice_delta)
-    state.current_text_parts.append(notice_delta)
+    _append_current_text(state, notice_delta, presentation="answer")
     final_text = "".join(state.final_text_parts)
     event = replace(
         event,
@@ -1286,7 +1343,7 @@ def _append_done_notice_delta(
         suppression_reason=None,
     )
     state.done_event = event
-    return event, _TextDeltaEvent(text=notice_delta)
+    return event, _TextDeltaEvent(text=notice_delta, presentation="answer")
 
 
 def _is_completed_meta_invoke(event: ToolResultEvent) -> bool:
@@ -1668,6 +1725,33 @@ class StreamConsumerStage:
             compaction_hooks=compaction_hooks,
         )
 
+    async def _adopt_generated_artifact(
+        self,
+        event: ArtifactEvent,
+        tool_context: Any | None,
+    ) -> None:
+        """Best-effort canonicalization before an artifact becomes public.
+
+        The artifact has already been recorded in the shared turn state before
+        this hook runs, so cancellation or adoption failure can never orphan a
+        successfully published deliverable from transcript persistence.
+        """
+
+        adopter = getattr(tool_context, "generated_artifact_adopter", None)
+        if not callable(adopter):
+            return
+        try:
+            await adopter(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - artifact delivery must survive adoption
+            log.warning(
+                "generated_artifact_adoption_failed",
+                artifact_id=str(getattr(event, "id", "") or ""),
+                mime=str(getattr(event, "mime", "") or ""),
+                error_type=type(exc).__name__,
+            )
+
     async def run(
         self,
         inp: StreamConsumerStageInput,
@@ -1846,6 +1930,7 @@ class StreamConsumerStage:
                 )
             elif isinstance(event, ArtifactEvent):
                 transformed = self._artifact_handler.handle(event, state)
+                await self._adopt_generated_artifact(event, inp.tool_context)
             elif isinstance(event, ErrorEvent):
                 transformed = self._error_handler.handle(event, state)
                 if (
@@ -2063,6 +2148,12 @@ class StreamConsumerStage:
                 transformed, extra_yields = self._done_handler.post_publish(
                     pre, publish_result, inp, state
                 )
+                for extra_event in extra_yields:
+                    if isinstance(extra_event, ArtifactEvent):
+                        await self._adopt_generated_artifact(
+                            extra_event,
+                            inp.tool_context,
+                        )
                 if buffer_system_event_text:
                     # Text deltas generated by reconciliation/notices are
                     # replaced with one canonical terminal answer.  Non-text

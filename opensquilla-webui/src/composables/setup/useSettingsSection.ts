@@ -6,10 +6,31 @@ import {
 } from '@/composables/setup/settingsSections'
 
 const DEFAULT_SECTION: SettingsSectionId = 'provider'
-const SECTION_ALIASES: Record<string, SettingsSectionId> = {
-  router: 'modelStrategy',
-  ensemble: 'modelStrategy',
-  chatModel: 'provider',
+export interface SettingsSectionAlias {
+  section: SettingsSectionId
+  hash?: string
+}
+
+const SECTION_ALIASES: Record<string, SettingsSectionAlias> = {
+  connection: { section: 'gateway', hash: '#connection' },
+  runtime: { section: 'gateway', hash: '#runtime' },
+  behavior: { section: 'general' },
+  appearance: { section: 'interface' },
+  keyboard: { section: 'shortcuts' },
+  privacy: { section: 'securityPrivacy', hash: '#privacy' },
+  sandbox: { section: 'securityPrivacy', hash: '#sandbox' },
+  router: { section: 'modelStrategy' },
+  ensemble: { section: 'modelStrategy' },
+  chatModel: { section: 'provider' },
+  // Profile import used to be a child route below the Memory overview. Keep
+  // old bookmarks working while canonicalizing them to the first-level
+  // Memory & Export destination.
+  profileImport: { section: 'memory' },
+}
+
+export function settingsSectionAliasFor(value: unknown): SettingsSectionAlias | null {
+  if (typeof value !== 'string') return null
+  return SECTION_ALIASES[value] || null
 }
 
 function sectionIdFor(value: unknown): SettingsSectionId | null {
@@ -18,7 +39,7 @@ function sectionIdFor(value: unknown): SettingsSectionId | null {
   if (canonical) return canonical.id
   const nested = NESTED_SETTINGS_SECTION_IDS.find(id => id === value)
   if (nested) return nested
-  return SECTION_ALIASES[value] || null
+  return settingsSectionAliasFor(value)?.section || null
 }
 
 export function sectionFromRouteParam(param: unknown): SettingsSectionId {

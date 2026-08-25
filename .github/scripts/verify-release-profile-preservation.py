@@ -15,6 +15,12 @@ LONG_SESSION_KEY = "agent:main:webchat:release-recovery-long-session"
 LONG_SESSION_ID = "release-recovery-long-session"
 LONG_SESSION_MESSAGE_COUNT = 320
 _LONG_SESSION_BASE_TIMESTAMP_MS = 1_700_000_000_000
+_RUNTIME_PACK_SENTINEL = b"synthetic retained Runtime Pack payload\n"
+_SYSTEM_TOOL_SENTINELS = {
+    "python": b"synthetic external Python sentinel\n",
+    "node": b"synthetic external Node.js sentinel\n",
+    "git": b"synthetic external Git sentinel\n",
+}
 
 # Frozen at the v0.5.0rc3 session/transcript shape. Do not replace this with
 # current runtime DDL: the release gate must prove the candidate migrates and
@@ -189,7 +195,38 @@ def _long_history_message(label: str, index: int) -> str:
     return f"Synthetic retained history message {index:04d} ({label})"
 
 
-def seed_profile(home: Path, label: str) -> None:
+def _runtime_pack_sentinel_path(home: Path) -> Path:
+    return (
+        home
+        / "state"
+        / "runtime-packs"
+        / "v1"
+        / "packages"
+        / "preservation-sentinel"
+        / "payload.bin"
+    )
+
+
+def _external_sentinel_paths(external_root: Path) -> dict[str, Path]:
+    return {
+        component: external_root / component / f"{component}-sentinel.bin"
+        for component in _SYSTEM_TOOL_SENTINELS
+    }
+
+
+def _write_new_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.write(payload)
+
+
+def _verify_exact_bytes(path: Path, expected: bytes, label: str) -> None:
+    actual = path.read_bytes()
+    if actual != expected:
+        raise AssertionError(f"{label} changed while installing or uninstalling Desktop")
+
+
+def seed_profile(home: Path, label: str, *, external_root: Path | None = None) -> None:
     """Create a synthetic RC3-shaped profile without replacing any file."""
 
     home = home.resolve()
@@ -207,6 +244,10 @@ def seed_profile(home: Path, label: str) -> None:
     for name, expected in _workspace_files(label).items():
         (workspace / name).write_text(expected, encoding="utf-8", newline="")
     (home / "config.toml").write_text(_config_text(home, label), encoding="utf-8", newline="")
+    _write_new_bytes(_runtime_pack_sentinel_path(home), _RUNTIME_PACK_SENTINEL)
+    if external_root is not None:
+        for component, path in _external_sentinel_paths(external_root.resolve()).items():
+            _write_new_bytes(path, _SYSTEM_TOOL_SENTINELS[component])
 
     with sqlite3.connect(state / "sessions.db") as connection:
         connection.executescript(_RC3_SESSION_SCHEMA)
@@ -274,7 +315,13 @@ def seed_profile(home: Path, label: str) -> None:
             raise RuntimeError(f"seeded sessions.db failed PRAGMA quick_check: {result!r}")
 
 
-def verify_profile(home: Path, label: str, *, runtime_migrated: bool = False) -> None:
+def verify_profile(
+    home: Path,
+    label: str,
+    *,
+    runtime_migrated: bool = False,
+    external_root: Path | None = None,
+) -> None:
     """Verify exact fixture bytes and a read-only SQLite integrity probe."""
 
     home = home.resolve()
@@ -292,6 +339,19 @@ def verify_profile(home: Path, label: str, *, runtime_migrated: bool = False) ->
     if actual_config != expected_config:
         phase = "after expected runtime migration" if runtime_migrated else "during installation"
         raise AssertionError(f"config.toml changed unexpectedly {phase}")
+
+    _verify_exact_bytes(
+        _runtime_pack_sentinel_path(home),
+        _RUNTIME_PACK_SENTINEL,
+        "configured-state Runtime Pack sentinel",
+    )
+    if external_root is not None:
+        for component, path in _external_sentinel_paths(external_root.resolve()).items():
+            _verify_exact_bytes(
+                path,
+                _SYSTEM_TOOL_SENTINELS[component],
+                f"external system {component} sentinel",
+            )
 
     database = state / "sessions.db"
     with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
@@ -369,6 +429,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("operation", choices=("seed", "verify", "verify-runtime"))
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--label", type=_validated_label, required=True)
+    parser.add_argument("--external-root", type=Path)
     return parser
 
 
@@ -376,11 +437,16 @@ def main() -> int:
     args = _parser().parse_args()
     try:
         if args.operation == "seed":
-            seed_profile(args.home, args.label)
+            seed_profile(args.home, args.label, external_root=args.external_root)
             print(f"profile preservation fixture seeded: {args.home}")
         else:
             runtime_migrated = args.operation == "verify-runtime"
-            verify_profile(args.home, args.label, runtime_migrated=runtime_migrated)
+            verify_profile(
+                args.home,
+                args.label,
+                runtime_migrated=runtime_migrated,
+                external_root=args.external_root,
+            )
             suffix = " after runtime migration" if runtime_migrated else ""
             print(f"profile preservation verified{suffix}: {args.home}")
     except (

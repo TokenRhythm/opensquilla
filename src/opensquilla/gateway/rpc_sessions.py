@@ -7,13 +7,14 @@ import base64
 import contextlib
 import inspect
 import json
-import os
 import re
 import sqlite3
 import threading
 import time
 import uuid
 import weakref
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -45,6 +46,11 @@ from opensquilla.engine.steps.router_decision_record import (
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.artifact_product_errors import (
+    ArtifactProductErrorCode,
+    artifact_product_error,
+    logged_artifact_product_error,
+)
 from opensquilla.gateway.compaction_target import (
     build_gateway_consumer_admission,
     effective_session_model,
@@ -172,6 +178,7 @@ from opensquilla.session.storage import (
     PendingChatInputNotFoundError,
     PlanImplementationSessionBusyError,
     SessionListCursor,
+    SessionRoutingConflictError,
     SessionStorage,
     StaleEpochError,
     StorageBusyError,
@@ -189,6 +196,8 @@ from opensquilla.session.terminal_reply import (
 )
 
 _d = get_dispatcher()
+
+_SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 _PENDING_INPUT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
@@ -225,6 +234,77 @@ _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
 
 
+def _prompt_annotation_source_only_context(context: Any) -> Any:
+    """Downgrade a PromptAnnotation turn when candidate preview is unavailable.
+
+    The autonomous ten-tool surface requires a live protocol-v4 Desktop
+    bridge: without it a writer could stage a DRAFT but could never obtain a
+    verification receipt or finish it.  Use the established source-only
+    compatibility surface instead of exposing a dead-end candidate loop.  The
+    source writer remains durable and the prompt explicitly tells the model
+    not to claim a preview verification it could not perform.
+    """
+
+    from opensquilla.gateway.artifact_contexts import (
+        PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+    )
+    from opensquilla.prompt_annotations import render_active_prompt_annotation_context
+
+    snapshots = getattr(context, "snapshots", ())
+    return replace(
+        context,
+        tool_names=PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+        request_context_prompt=(
+            render_active_prompt_annotation_context(
+                snapshots,
+                autonomous_loop=False,
+            )
+            or context.request_context_prompt
+        ),
+    )
+
+
+def _desktop_artifact_bridge_supports_candidate_loop(capabilities: Any) -> bool:
+    """Return whether the active Desktop surface can complete a candidate loop.
+
+    Protocol version alone is not enough: the v4 contract is also used for
+    non-HTML/office surfaces and for a shell whose active preview is still
+    loading.  Exposing the ten-tool contract in those states would create a
+    DRAFT that can be staged but can never obtain a verification receipt or
+    restore the canonical preview.  Require the capabilities that are stable
+    before the first candidate is bound; ``browserAct`` is intentionally not
+    required because the native surface enables it only after binding the
+    opaque candidate handle.
+    """
+
+    if capabilities is None:
+        return False
+    if isinstance(capabilities, Mapping):
+        version = capabilities.get("version")
+
+        def _flag(*names: str) -> bool:
+            return any(capabilities.get(name) is True for name in names)
+
+    else:
+        version = getattr(capabilities, "version", None)
+
+        def _flag(*names: str) -> bool:
+            return any(getattr(capabilities, name, None) is True for name in names)
+
+    values = (
+        _flag("available"),
+        _flag("browserInspect", "browser_inspect"),
+        _flag("bindCandidatePreview", "bind_candidate_preview"),
+        _flag("restoreCanonicalPreview", "restore_canonical_preview"),
+    )
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version >= 4
+        and all(values)
+    )
+
+
 def _emit_steer_metric(disposition: str, **labels: Any) -> None:
     log.info(
         "steer_inputs_total",
@@ -236,6 +316,10 @@ def _emit_steer_metric(disposition: str, **labels: Any) -> None:
 
 
 if TYPE_CHECKING:
+    from opensquilla.gateway.artifact_contexts import (
+        BoundDocumentContext,
+        BoundPromptAnnotationContext,
+    )
     from opensquilla.gateway.task_runtime import TaskRuntime
 
 _ALLOWED_MEDIA_TYPES = _attachment_ingest.ALLOWED_MEDIA_TYPES
@@ -245,6 +329,13 @@ _MAX_TEXT_ATTACHMENT_BYTES = _attachment_ingest.TEXT_ATTACHMENT_BYTES
 _MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
 _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
+_ARTIFACT_STATE_EVENT_FIELDS = (
+    "artifactEventSeq",
+    "documentId",
+    "revisionId",
+    "changeSetId",
+    "action",
+)
 
 
 def _coerce_positive_int(value: object, *, default: int) -> int:
@@ -265,6 +356,47 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     return name in params or any(
         param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
     )
+
+
+def _artifact_state_event_emitter(
+    ctx: RpcContext,
+    session_key: str,
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """Bind a metadata-only ArtifactSession event sink to this RPC connection."""
+
+    from opensquilla.gateway.event_bridge import EventBridge
+    from opensquilla.gateway.websocket import get_registry
+
+    bridge = EventBridge(ctx.subscription_manager, get_registry())
+
+    async def emit(payload: dict[str, Any]) -> None:
+        sequence = payload.get("artifactEventSeq")
+        document_id = payload.get("documentId")
+        action = payload.get("action")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 1
+            or not isinstance(document_id, str)
+            or not document_id
+            or not isinstance(action, str)
+            or not action
+        ):
+            raise ValueError("invalid artifact state event metadata")
+        for field_name in ("revisionId", "changeSetId"):
+            value = payload.get(field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError("invalid artifact state event identifier")
+        safe_payload = {
+            field_name: payload.get(field_name)
+            for field_name in _ARTIFACT_STATE_EVENT_FIELDS
+        }
+        # Dual-publish while existing clients still subscribe to the artifact
+        # event name. Both notifications carry the same metadata-only payload.
+        await bridge.emit(session_key, "session.event.artifact_state", safe_payload)
+        await bridge.emit(session_key, "document.state_changed", safe_payload)
+
+    return emit
 
 
 def _build_session_flush_correlation(
@@ -714,12 +846,34 @@ def _guest_profile_for_principal(
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
         runtime_roots: tuple[Path, ...] = ()
         runtime_path: tuple[Path, ...] = ()
-        if os.name != "nt":
-            from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+        try:
+            from opensquilla.runtime_packs import (
+                RuntimePackResolver,
+                get_runtime_pack_service,
+            )
+            from opensquilla.sandbox.policy_store import SandboxPolicyStore
 
-            resolver = bundled_runtime_resolver()
-            runtime_roots = resolver.runtime_roots() if resolver is not None else ()
-            runtime_path = resolver.bundled_path() if resolver is not None else ()
+            runtime_policy = SandboxPolicyStore(Path(state_dir) / "sessions.db").read().runtimes
+            service = get_runtime_pack_service(state_dir)
+            if service.management_supported:
+                resolver = RuntimePackResolver(service)
+                runtime_roots = resolver.runtime_roots(runtime_policy)
+                runtime_path = resolver.managed_path(runtime_policy)
+            else:
+                from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+                legacy = bundled_runtime_resolver()
+                runtime_roots = (
+                    legacy.runtime_roots(runtime_policy) if legacy is not None else ()
+                )
+                runtime_path = (
+                    legacy.bundled_path(runtime_policy) if legacy is not None else ()
+                )
+        except (OSError, RuntimeError, ValueError):
+            # Guest remains strictly managed with an empty PATH. Runtime state
+            # corruption must not make session creation or Gateway boot fail.
+            runtime_roots = ()
+            runtime_path = ()
         return GuestProfileFactory.create(
             task_id,
             state_dir=state_dir,
@@ -1166,12 +1320,14 @@ async def _cancel_task_owned_auxiliary_work(
     session_key: str,
     task_id: str,
     deadline_at_monotonic: float,
+    process_state_dir: str | Path | None = None,
 ) -> int:
     """Stop task-owned completion delivery and registered background processes."""
 
     from opensquilla.gateway.subagent_announce import (
         cancel_background_completion_for_task,
     )
+    from opensquilla.process_tree import cancel_persisted_processes_for_task
     from opensquilla.tools.builtin.shell import cancel_background_processes_for_task
 
     completion_task = asyncio.create_task(
@@ -1179,6 +1335,9 @@ async def _cancel_task_owned_auxiliary_work(
     )
     process_task = asyncio.create_task(
         cancel_background_processes_for_task(session_key, task_id)
+    )
+    persisted_process_task = asyncio.create_task(
+        cancel_persisted_processes_for_task(process_state_dir, session_key, task_id)
     )
     cancelled_completions = await _await_abort_operation(
         completion_task,
@@ -1192,7 +1351,17 @@ async def _cancel_task_owned_auxiliary_work(
         operation="cancel_task_background_processes",
         default=0,
     )
-    return int(cancelled_completions) + int(cancelled_processes)
+    cancelled_persisted_processes = await _await_abort_background_task(
+        persisted_process_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_persisted_processes",
+        default=0,
+    )
+    return (
+        int(cancelled_completions)
+        + int(cancelled_processes)
+        + int(cancelled_persisted_processes)
+    )
 
 
 async def _cancel_task_owned_descendants(
@@ -1203,6 +1372,7 @@ async def _cancel_task_owned_descendants(
     source: str,
     reason: str,
     deadline_at_monotonic: float,
+    process_state_dir: str | Path | None = None,
 ) -> int:
     """Cancel active subagent descendants proven to belong to one exact task."""
 
@@ -1282,6 +1452,7 @@ async def _cancel_task_owned_descendants(
                         session_key=session_key,
                         task_id=task_id,
                         deadline_at_monotonic=deadline_at_monotonic,
+                        process_state_dir=process_state_dir,
                     )
                 )
             )
@@ -1474,8 +1645,12 @@ def _first_dict_value(*values: Any) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_memory_capture_controls(params: dict[str, Any]) -> dict[str, Any]:
-    """Normalize RPC/chat memory-capture controls onto snake_case fields."""
+def _normalize_memory_capture_controls(
+    params: dict[str, Any],
+    *,
+    trusted_run_kind: str | None = None,
+) -> dict[str, Any]:
+    """Normalize user capture controls without trusting a public run-kind label."""
 
     source_hint = params.get("_source")
     if not isinstance(source_hint, dict):
@@ -1508,14 +1683,16 @@ def _normalize_memory_capture_controls(params: dict[str, Any]) -> dict[str, Any]
     elif input_provenance is not None and "kind" not in input_provenance and provenance_kind:
         input_provenance["kind"] = str(provenance_kind)
 
-    run_kind = params.get("run_kind", params.get("runKind"))
-    if run_kind is None:
-        run_kind = source_hint.get("run_kind", source_hint.get("runKind"))
-
     return {
         "no_memory_capture": bool(no_memory_capture),
         "input_provenance": input_provenance,
-        "run_kind": str(run_kind) if run_kind is not None and str(run_kind) else None,
+        # Public WebSocket params, including `_source`, are caller-controlled.
+        # Only an in-process caller can supply this keyword-only override.
+        "run_kind": (
+            str(trusted_run_kind)
+            if trusted_run_kind is not None and str(trusted_run_kind)
+            else None
+        ),
     }
 
 
@@ -1882,6 +2059,8 @@ def _task_summary(row: Any) -> dict[str, Any]:
         steer_capability = details.get("steer_capability")
         if isinstance(steer_capability, dict):
             summary["steer_capability"] = dict(steer_capability)
+        if isinstance(details.get("cancellation_requested"), dict):
+            summary["cancel_requested"] = True
     finished_at = getattr(row, "finished_at", None)
     if finished_at is not None:
         summary["finished_at"] = finished_at
@@ -2086,6 +2265,12 @@ async def _overlay_runtime_task_snapshot(
                 and task_id not in queued_task_ids
             ):
                 queued_task_ids.append(task_id)
+    raw_cancel_requested_ids = getattr(snapshot, "cancel_requested_task_ids", ())
+    cancel_requested_task_ids = {
+        value.strip()
+        for value in raw_cancel_requested_ids
+        if isinstance(value, str) and value.strip()
+    }
 
     active_task_id = running_task_id or (queued_task_ids[0] if queued_task_ids else None)
     durable_active = task_state.get("active_task")
@@ -2135,6 +2320,8 @@ async def _overlay_runtime_task_snapshot(
         if active_task is None:
             active_task = {"task_id": active_task_id}
         active_task["status"] = active_status
+        if active_task_id in cancel_requested_task_ids:
+            active_task["cancel_requested"] = True
 
     task_state["active_task"] = active_task
     task_state["queued_task_ids"] = queued_task_ids
@@ -3163,12 +3350,76 @@ def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
     return f"{caller_kind}:{channel_kind}:{principal_role}"[:256]
 
 
+async def _load_followup_annotation_focus(
+    storage: SessionStorage,
+    *,
+    session_id: str,
+    document_id: str,
+) -> str | None:
+    """Return a short read-only focus for the current document follow-up.
+
+    This is intentionally derived from the accepted transcript envelope rather
+    than reusing an annotation authority.  The current document context still
+    performs the normal owner, session, head, and CAS checks below.
+    """
+
+    try:
+        get_transcript = getattr(storage, "get_canonical_transcript", None)
+        if not callable(get_transcript):
+            get_transcript = storage.get_transcript
+        entries = await get_transcript(session_id)
+        from opensquilla.prompt_annotations import (
+            prompt_annotations_from_transcript_envelope,
+            render_followup_prompt_annotation_focus,
+        )
+
+        user_entries: list[tuple[int, Any, tuple[dict[str, Any], ...]]] = []
+        for index, entry in enumerate(entries):
+            if getattr(entry, "role", None) != "user":
+                continue
+            snapshots = prompt_annotations_from_transcript_envelope(
+                getattr(entry, "content", None)
+            )
+            if snapshots:
+                user_entries.append((index, entry, snapshots))
+        if not user_entries:
+            return None
+
+        annotation_index, _entry, snapshots = user_entries[-1]
+        matching = tuple(
+            snapshot
+            for snapshot in snapshots
+            if isinstance(snapshot.get("document"), Mapping)
+            and snapshot["document"].get("id") == document_id
+        )
+        if not matching:
+            return None
+
+        later_user_turns = sum(
+            1
+            for entry in entries[annotation_index + 1 :]
+            if getattr(entry, "role", None) == "user"
+        )
+        if later_user_turns > 1:
+            return None
+        return render_followup_prompt_annotation_focus(matching)
+    except Exception:  # noqa: BLE001 - context continuity must fail open.
+        log.debug(
+            "sessions.followup_annotation_focus_unavailable",
+            session_id=session_id,
+            document_id=document_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _accepted_turn_response(
     result: TurnAcceptanceResult,
     *,
     client_request_id: str,
     storage: SessionStorage,
     turn_context: dict[str, Any] | None = None,
+    accepted_prompt_annotation_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     payload = accepted_turn_payload(result, client_request_id=client_request_id)
     receipt = result.receipt
@@ -3176,6 +3427,50 @@ async def _accepted_turn_response(
     payload["user_message_id"] = receipt.message_id
     if receipt.task_id is not None:
         payload["turn_id"] = receipt.task_id
+    normalized_annotation_ids = [
+        item.strip()
+        for item in accepted_prompt_annotation_ids
+        if isinstance(item, str) and item.strip()
+    ]
+    # A pending-input dispatch can be replayed after the staged row has been
+    # consumed.  That replay only has the ingress receipt, not the original
+    # RPC payload, so it cannot pass promptAnnotationIds directly.  Recover
+    # the immutable ids from the accepted user transcript envelope; otherwise
+    # the renderer keeps the local draft and sends it again on the next
+    # annotation turn, where preflight correctly rejects the already-SENT row.
+    if not normalized_annotation_ids and result.replayed:
+        try:
+            get_entry = getattr(storage, "get_canonical_transcript_entry", None)
+            if callable(get_entry):
+                accepted_entry = await get_entry(receipt.session_id, receipt.message_id)
+            else:
+                get_transcript = getattr(storage, "get_canonical_transcript", None)
+                if not callable(get_transcript):
+                    get_transcript = storage.get_transcript
+                entries = await get_transcript(receipt.session_id)
+                accepted_entry = next(
+                    (entry for entry in entries if entry.message_id == receipt.message_id),
+                    None,
+                )
+            content = getattr(accepted_entry, "content", None)
+            from opensquilla.prompt_annotations import (
+                prompt_annotations_from_transcript_envelope,
+            )
+
+            normalized_annotation_ids = [
+                str(snapshot["annotationId"])
+                for snapshot in prompt_annotations_from_transcript_envelope(content)
+                if isinstance(snapshot.get("annotationId"), str)
+                and snapshot["annotationId"].strip()
+            ]
+        except Exception:  # noqa: BLE001 - replay response must remain deliverable.
+            log.exception(
+                "sessions.send.accepted_annotation_recovery_failed",
+                session_id=receipt.session_id,
+                message_id=receipt.message_id,
+            )
+    if normalized_annotation_ids:
+        payload["acceptedPromptAnnotationIds"] = normalized_annotation_ids
 
     def _apply_identity_context(context: dict[str, Any]) -> None:
         stable_turn_id = context.get("turn_id")
@@ -3272,8 +3567,49 @@ async def _accepted_turn_response(
     return payload
 
 
+class _IngressTurnAuthorityScope:
+    """Own newly acquired turn authorities until runtime admission succeeds."""
+
+    def __init__(self) -> None:
+        self.authorities: list[Any] = []
+
+    def register(self, authority: Any) -> None:
+        self.authorities.append(authority)
+
+    async def close_untransferred(self) -> None:
+        for authority in tuple(self.authorities):
+            if getattr(authority, "ingress_owned", False) is not True:
+                continue
+            try:
+                await authority.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - preserve the ingress outcome
+                log.warning("sessions.send.turn_authority_cleanup_failed", exc_info=True)
+
+
+_INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = ContextVar(
+    "opensquilla_ingress_turn_authority_scope",
+    default=None,
+)
+
+
 @_d.method("sessions.send", scope="operator.write")
 async def _handle_sessions_send_impl(
+    params: dict | None,
+    ctx: RpcContext,
+    **kwargs: Any,
+) -> dict:
+    scope = _IngressTurnAuthorityScope()
+    token = _INGRESS_TURN_AUTHORITY_SCOPE.set(scope)
+    try:
+        return await _handle_sessions_send_impl_inner(params, ctx, **kwargs)
+    finally:
+        _INGRESS_TURN_AUTHORITY_SCOPE.reset(token)
+        await scope.close_untransferred()
+
+
+async def _handle_sessions_send_impl_inner(
     params: dict | None,
     ctx: RpcContext,
     *,
@@ -3285,6 +3621,7 @@ async def _handle_sessions_send_impl(
     required_collaboration_mode: str | None = None,
     required_collaboration_revision: int | None = None,
     initial_collaboration_mode: str | None = None,
+    initial_routing_mode: str | None = None,
     expected_collaboration_revision: int | None = None,
     expected_active_plan_revision_id: str | None = None,
     require_idle_for_current_plan_implementation: bool = False,
@@ -3292,6 +3629,8 @@ async def _handle_sessions_send_impl(
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
+    _prompt_annotation_acceptance_retries: int = 1,
+    trusted_run_kind: str | None = None,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
@@ -3299,6 +3638,104 @@ async def _handle_sessions_send_impl(
 
     message_text: str = params["message"]
     source_hint = _normalize_session_send_source_hint(params)
+    raw_prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
+    )
+    if raw_prompt_annotation_ids is None:
+        prompt_annotation_ids: tuple[str, ...] = ()
+    else:
+        if not isinstance(raw_prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if len(raw_prompt_annotation_ids) > 16:
+            raise ValueError("params.promptAnnotationIds supports at most 16 items")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_prompt_annotation_ids
+        ):
+            raise ValueError(
+                "params.promptAnnotationIds must contain non-empty strings"
+            )
+        prompt_annotation_ids = tuple(item.strip() for item in raw_prompt_annotation_ids)
+        if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain unique ids")
+    if (
+        "documentContext" in params
+        and "document_context" in params
+        and params["documentContext"] != params["document_context"]
+    ):
+        raise ValueError("Conflicting documentContext aliases")
+    raw_document_context = params.get(
+        "documentContext",
+        params.get("document_context"),
+    )
+    document_context_request: dict[str, str] | None = None
+    if raw_document_context is not None:
+        if not isinstance(raw_document_context, dict):
+            raise ValueError("params.documentContext must be an object")
+        allowed_document_context_keys = {
+            "documentId",
+            "document_id",
+            "headRevisionId",
+            "head_revision_id",
+        }
+        if not set(raw_document_context) <= allowed_document_context_keys:
+            raise ValueError(
+                "params.documentContext accepts only documentId and headRevisionId"
+            )
+        if (
+            "documentId" in raw_document_context
+            and "document_id" in raw_document_context
+            and raw_document_context["documentId"] != raw_document_context["document_id"]
+        ):
+            raise ValueError("Conflicting documentId aliases")
+        if (
+            "headRevisionId" in raw_document_context
+            and "head_revision_id" in raw_document_context
+            and raw_document_context["headRevisionId"]
+            != raw_document_context["head_revision_id"]
+        ):
+            raise ValueError("Conflicting headRevisionId aliases")
+        raw_document_id = raw_document_context.get(
+            "documentId",
+            raw_document_context.get("document_id"),
+        )
+        raw_head_revision_id = raw_document_context.get(
+            "headRevisionId",
+            raw_document_context.get("head_revision_id"),
+        )
+        if (
+            not isinstance(raw_document_id, str)
+            or not raw_document_id.strip()
+            or not isinstance(raw_head_revision_id, str)
+            or not raw_head_revision_id.strip()
+        ):
+            raise ValueError(
+                "params.documentContext requires non-empty documentId and headRevisionId"
+            )
+        document_context_request = {
+            "documentId": raw_document_id.strip(),
+            "headRevisionId": raw_head_revision_id.strip(),
+        }
+    if prompt_annotation_ids and document_context_request is not None:
+        raise RpcHandlerError(
+            "DOCUMENT_CONTEXT_CONFLICT",
+            "A normal document context cannot be combined with prompt annotations.",
+            retryable=False,
+            accepted=False,
+        )
+    if prompt_annotation_ids or document_context_request is not None:
+        if source_hint.get("caller_kind") != "web" or not ctx.principal.is_owner:
+            raise RpcHandlerError(
+                (
+                    "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN"
+                    if prompt_annotation_ids
+                    else "DOCUMENT_CONTEXT_FORBIDDEN"
+                ),
+                "Document editing requires an interactive owner Web session.",
+                retryable=False,
+                accepted=False,
+            )
     requested_client_message_id = _optional_string_param(
         params, "client_message_id", "clientMessageId"
     ) or _optional_string_param(source_hint, "client_message_id", "clientMessageId")
@@ -3333,6 +3770,26 @@ async def _handle_sessions_send_impl(
     )
     if fork_before_message_id is not None and session_intent is not SessionIntent.CONTINUE:
         raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
+    if (prompt_annotation_ids or document_context_request is not None) and (
+        session_intent is not SessionIntent.CONTINUE or fork_before_message_id is not None
+    ):
+        raise artifact_product_error(
+            ArtifactProductErrorCode.INVALID_REQUEST,
+            retryable=False,
+        )
+    param_initial_routing_mode = _optional_string_param(
+        params,
+        "initialRoutingMode",
+        "initial_routing_mode",
+    )
+    if (
+        initial_routing_mode is not None
+        and param_initial_routing_mode is not None
+        and initial_routing_mode != param_initial_routing_mode
+    ):
+        raise ValueError("initialRoutingMode does not match initial_routing_mode")
+    if initial_routing_mode is None:
+        initial_routing_mode = param_initial_routing_mode
     raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
     workspace_id: str | None = None
     if raw_workspace_id is not None:
@@ -3414,6 +3871,18 @@ async def _handle_sessions_send_impl(
         required_collaboration_revision = (
             1 if initial_collaboration_mode == "plan" else 0
         )
+    if initial_routing_mode is not None:
+        if initial_routing_mode not in _SESSION_ROUTING_MODES:
+            raise ValueError("initialRoutingMode must be direct, router, or ensemble")
+        if session_intent is not SessionIntent.NEW_CHAT:
+            raise ValueError("initialRoutingMode requires new_chat intent")
+        if fork_before_message_id is not None:
+            raise ValueError("initialRoutingMode cannot be combined with a transcript fork")
+        # Validate the activation plan before accepting a first message. This
+        # is read-only and rejects an Ensemble that cannot be built today.
+        from opensquilla.gateway.model_routing import model_routing_patches
+
+        model_routing_patches(ctx.config, initial_routing_mode)
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -3423,11 +3892,20 @@ async def _handle_sessions_send_impl(
         raise KeyError("No session storage available")
     storage = cast(SessionStorage, storage_candidate)
 
+    effective_fingerprint_params = dict(fingerprint_params or params)
+    if raw_prompt_annotation_ids is not None:
+        effective_fingerprint_params.pop("prompt_annotation_ids", None)
+        effective_fingerprint_params["promptAnnotationIds"] = list(prompt_annotation_ids)
+    if raw_document_context is not None:
+        effective_fingerprint_params.pop("document_context", None)
+        effective_fingerprint_params["documentContext"] = dict(
+            document_context_request or {}
+        )
     ingress_identity = request_identity(
         params,
         request_session_key=key,
         source_scope=_turn_source_scope(source_hint, ctx),
-        fingerprint_params=fingerprint_params,
+        fingerprint_params=effective_fingerprint_params,
     )
     get_ingress_receipt = getattr(storage, "replay_turn_ingress_receipt", None)
     if not callable(get_ingress_receipt):
@@ -3473,6 +3951,7 @@ async def _handle_sessions_send_impl(
                 previous_acceptance,
                 client_request_id=ingress_identity.client_request_id,
                 storage=storage,
+                accepted_prompt_annotation_ids=prompt_annotation_ids,
             )
             if initial_collaboration_mode is not None:
                 replay_response["acceptedCollaboration"] = {
@@ -3486,7 +3965,79 @@ async def _handle_sessions_send_impl(
                     replay_response["collaboration"] = (
                         _plan_collaboration_snapshot(current_session)
                     )
+            if initial_routing_mode is not None:
+                replay_response["acceptedRouting"] = {
+                    "mode": initial_routing_mode,
+                }
+                replay_response["routing"] = await _resolve_session_routing_snapshot(
+                    ctx,
+                    previous_acceptance.receipt.accepted_session_key,
+                )
             return replay_response
+
+    if prompt_annotation_ids or document_context_request is not None:
+        existing_annotation_session = await storage.get_session(key)
+        existing_collaboration_mode = str(
+            getattr(existing_annotation_session, "collaboration_mode", "default") or "default"
+        ).strip().lower()
+        if (
+            plan_revision_id is not None
+            or plan_context_revision_id is not None
+            or required_collaboration_mode == "plan"
+            or initial_collaboration_mode == "plan"
+            or existing_collaboration_mode == "plan"
+        ):
+            raise RpcHandlerError(
+                (
+                    "ARTIFACT_PROMPT_ANNOTATIONS_PLAN_UNSUPPORTED"
+                    if prompt_annotation_ids
+                    else "DOCUMENT_CONTEXT_PLAN_UNSUPPORTED"
+                ),
+                "Document editing must be sent from the normal execution mode, not Plan.",
+                retryable=False,
+                accepted=False,
+            )
+        if _is_remote_web_guest(ctx.principal, source_hint):
+            raise RpcHandlerError(
+                (
+                    "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN"
+                    if prompt_annotation_ids
+                    else "DOCUMENT_CONTEXT_FORBIDDEN"
+                ),
+                "Document editing requires a locally proven owner.",
+                retryable=False,
+                accepted=False,
+            )
+
+    if prompt_annotation_ids and combined_attachments:
+        # The first annotation release binds only source-backed DOM anchors.
+        # Keep idempotent receipts replayable across upgrades, then reject every
+        # new mixed annotation/attachment request before ingest or provider work.
+        raise RpcHandlerError(
+            "PROMPT_ANNOTATION_ATTACHMENTS_UNSUPPORTED",
+            "Prompt annotations cannot be sent with file or image attachments.",
+            retryable=False,
+            accepted=False,
+        )
+
+    artifact_turn_context: BoundDocumentContext | BoundPromptAnnotationContext | None = None
+    artifact_session_service = None
+    artifact_event_emitter = None
+    prompt_annotation_rows: tuple[Any, ...] = ()
+    prepared_prompt_annotation_targets: tuple[Any, ...] = ()
+    prompt_annotation_snapshots: tuple[dict[str, Any], ...] = ()
+    from opensquilla.artifact_session import (
+        ArtifactConflictError as ArtifactPromptAnnotationConflictError,
+    )
+    from opensquilla.artifact_session import (
+        ArtifactNotFoundError as ArtifactPromptAnnotationNotFoundError,
+    )
+    from opensquilla.artifact_session import (
+        ArtifactSessionService,
+    )
+    from opensquilla.artifact_session import (
+        ArtifactValidationError as ArtifactPromptAnnotationValidationError,
+    )
 
     if require_idle_for_current_plan_implementation:
         pending_user_inputs = getattr(ctx.task_runtime, "pending_user_inputs", None)
@@ -3525,6 +4076,19 @@ async def _handle_sessions_send_impl(
             owner=ctx.principal.is_owner,
         )
 
+    def _preaccept_storage_busy_error(exc: StorageBusyError) -> RpcHandlerError:
+        return RpcHandlerError(
+            "STORAGE_BUSY",
+            "Session storage is temporarily busy. Retry this send.",
+            details={
+                "operation": exc.operation,
+                "waited_ms": exc.waited_ms,
+            },
+            retryable=True,
+            retry_after_ms=exc.retry_after_ms,
+            accepted=False,
+        )
+
     selected_workspace = None
     workspace_guard = None
     if workspace_id is not None:
@@ -3560,6 +4124,8 @@ async def _handle_sessions_send_impl(
                 source="project_workspace",
             ).to_origin_payload()
         }
+    if initial_routing_mode is not None:
+        create_kwargs["model_routing_mode"] = initial_routing_mode
     supports_prepared_acceptance = all(
         callable(value)
         for value in (
@@ -3575,9 +4141,11 @@ async def _handle_sessions_send_impl(
         and callable(getattr(task_runtime_candidate, "activate", None))
         and callable(getattr(task_runtime_candidate, "abort_reservation", None))
     )
-    if initial_collaboration_mode is not None and not supports_task_runtime_activation:
+    if (
+        initial_collaboration_mode is not None or initial_routing_mode is not None
+    ) and not supports_task_runtime_activation:
         raise RpcUnavailableError(
-            "Initial collaboration mode requires atomic turn acceptance"
+            "Initial session controls require atomic turn acceptance"
         )
 
     async def _prepare_or_apply_intent() -> tuple[Any, Any | None]:
@@ -3606,18 +4174,21 @@ async def _handle_sessions_send_impl(
         return existing_session, None
 
     intent_lock = get_session_lock(ctx.turn_runner, key)
-    if intent_lock is None:
-        session, atomic_intent_plan = await _prepare_or_apply_intent()
-    else:
-        async with intent_lock:
+    try:
+        if intent_lock is None:
             session, atomic_intent_plan = await _prepare_or_apply_intent()
+        else:
+            async with intent_lock:
+                session, atomic_intent_plan = await _prepare_or_apply_intent()
+    except StorageBusyError as exc:
+        raise _preaccept_storage_busy_error(exc) from exc
 
-    if initial_collaboration_mode is not None and (
+    if (initial_collaboration_mode is not None or initial_routing_mode is not None) and (
         atomic_intent_plan is None
         or getattr(atomic_intent_plan, "action", None) != "create"
     ):
         raise ValueError(
-            "Initial collaboration mode requires atomic session creation"
+            "Initial session controls require atomic session creation"
         )
 
     if fork_before_message_id is not None:
@@ -3640,11 +4211,14 @@ async def _handle_sessions_send_impl(
                 )
 
             parent_lock = get_session_lock(ctx.turn_runner, parent_key)
-            if parent_lock is None:
-                atomic_intent_plan = await _prepare_prefix_intent()
-            else:
-                async with parent_lock:
+            try:
+                if parent_lock is None:
                     atomic_intent_plan = await _prepare_prefix_intent()
+                else:
+                    async with parent_lock:
+                        atomic_intent_plan = await _prepare_prefix_intent()
+            except StorageBusyError as exc:
+                raise _preaccept_storage_busy_error(exc) from exc
             session = atomic_intent_plan.node
             key = child_key
         else:
@@ -3684,6 +4258,325 @@ async def _handle_sessions_send_impl(
         if isinstance(canonical_session_id, str) and canonical_session_id
         else key.split(":")[-1] or key
     )
+    if prompt_annotation_ids:
+        from opensquilla.artifact_session import (
+            ActorKind,
+            PreparedPromptAnnotationTarget,
+        )
+        from opensquilla.artifact_session.html_anchors import remap_html_anchor
+        from opensquilla.artifacts import ArtifactError, ArtifactStore
+        from opensquilla.gateway.artifact_contexts import (
+            PROMPT_ANNOTATION_TOOL_NAMES,
+            BoundPromptAnnotationContext,
+            BoundPromptAnnotationTarget,
+        )
+        from opensquilla.prompt_annotations import (
+            PromptAnnotationSnapshotError,
+            normalize_prompt_annotation_snapshots,
+            render_active_prompt_annotation_context,
+        )
+
+        try:
+            artifact_session_service = await ArtifactSessionService.from_session_storage(
+                storage
+            )
+            prompt_annotation_rows = await artifact_session_service.preflight_prompt_annotations(
+                annotation_ids=prompt_annotation_ids,
+                session_key=key,
+                session_id=session_id,
+                session_epoch=int(getattr(session, "epoch", 0) or 0),
+                require_current_head=False,
+            )
+            annotation_document = await artifact_session_service.get_document(
+                prompt_annotation_rows[0].document_id
+            )
+            annotation_revision = await artifact_session_service.get_revision(
+                annotation_document.head_revision_id
+            )
+            annotation_anchors = tuple(
+                [
+                    await artifact_session_service.get_anchor(annotation.anchor_id)
+                    for annotation in prompt_annotation_rows
+                ]
+            )
+            store = ArtifactStore(media_root)
+            source_cache: dict[str, str] = {}
+
+            async def _revision_source(revision: Any) -> str:
+                cached = source_cache.get(revision.revision_id)
+                if cached is not None:
+                    return cached
+                try:
+                    supports_editing = await asyncio.to_thread(
+                        store.supports_single_file_editing,
+                        revision.artifact_id,
+                        session_id=session_id,
+                    )
+                    if not supports_editing:
+                        raise ArtifactPromptAnnotationValidationError(
+                            "prompt annotations require one editable HTML file"
+                        )
+                    ref, path = await asyncio.to_thread(
+                        store.resolve_for_download,
+                        revision.artifact_id,
+                        session_id=session_id,
+                    )
+                    payload = await asyncio.to_thread(path.read_bytes)
+                except (ArtifactError, OSError, ValueError) as exc:
+                    raise ArtifactPromptAnnotationValidationError(
+                        "the annotated page is temporarily unavailable"
+                    ) from exc
+                if (
+                    ref.session_key != key
+                    or ref.sha256 != revision.artifact_sha256
+                    or ref.size != revision.byte_size
+                    or len(payload) != ref.size
+                ):
+                    raise ArtifactPromptAnnotationValidationError(
+                        "the annotated page failed integrity validation"
+                    )
+                try:
+                    source = payload.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ArtifactPromptAnnotationValidationError(
+                        "prompt annotations require UTF-8 HTML"
+                    ) from exc
+                source_cache[revision.revision_id] = source
+                return source
+
+            current_source = await _revision_source(annotation_revision)
+            raw_snapshots: list[dict[str, Any]] = []
+            prepared_targets: list[PreparedPromptAnnotationTarget] = []
+            bound_targets: list[BoundPromptAnnotationTarget] = []
+            principal_actor_id = getattr(ctx.principal, "token_public_id", None)
+            actor_id = (
+                principal_actor_id
+                if isinstance(principal_actor_id, str) and principal_actor_id
+                else "local-owner"
+            )
+            for order, (annotation, anchor) in enumerate(
+                zip(prompt_annotation_rows, annotation_anchors, strict=True)
+            ):
+                old_revision = await artifact_session_service.get_revision(
+                    annotation.revision_id
+                )
+                if old_revision.document_id != annotation_document.document_id:
+                    raise ArtifactPromptAnnotationConflictError(
+                        "prompt annotation revision belongs to another document"
+                    )
+                try:
+                    resolution = remap_html_anchor(
+                        old_source=await _revision_source(old_revision),
+                        current_source=current_source,
+                        anchor=anchor,
+                    )
+                except ValueError as exc:
+                    raise ArtifactPromptAnnotationValidationError(
+                        "the annotation target could not be normalized"
+                    ) from exc
+                locator = dict(resolution.locator)
+                tag_name = locator.get("tag_name") or locator.get("tagName")
+                if not isinstance(tag_name, str) or not tag_name.strip():
+                    raise ArtifactPromptAnnotationConflictError(
+                        "prompt annotation anchor lost its element tag"
+                    )
+                new_anchor_id = artifact_session_service.allocate_id("anchor")
+                prepared_targets.append(
+                    PreparedPromptAnnotationTarget(
+                        expected_annotation=annotation,
+                        previous_anchor_id=anchor.anchor_id,
+                        anchor_id=new_anchor_id,
+                        audit_event_id=artifact_session_service.allocate_id("audit"),
+                        revision_id=annotation_revision.revision_id,
+                        kind=resolution.kind,
+                        locator=locator,
+                        quote=resolution.quote,
+                        context=dict(resolution.context),
+                        state=resolution.state,
+                        actor_kind=ActorKind.USER,
+                        actor_id=actor_id,
+                    )
+                )
+                bound_targets.append(
+                    BoundPromptAnnotationTarget(
+                        annotation_id=annotation.annotation_id,
+                        anchor_id=new_anchor_id,
+                        status=resolution.status,
+                        reason=resolution.reason,
+                        tag_name=tag_name.lower(),
+                        target_kind=resolution.target_kind,
+                        target_text=resolution.target_text,
+                    )
+                )
+                raw_snapshots.append(
+                    {
+                        "version": 1,
+                        "annotationId": annotation.annotation_id,
+                        "order": order,
+                        "body": annotation.body,
+                        "targetStatus": resolution.status,
+                        "targetReason": resolution.reason,
+                        "targetKind": resolution.target_kind,
+                        "targetText": resolution.target_text,
+                        "document": {
+                            "id": annotation_document.document_id,
+                            "name": annotation_document.name,
+                            "kind": annotation_document.kind.value,
+                        },
+                        "revision": {
+                            "id": annotation_revision.revision_id,
+                            "generation": annotation_revision.generation,
+                            "sha256": annotation_revision.artifact_sha256,
+                        },
+                        "anchor": {
+                            "id": new_anchor_id,
+                            "kind": resolution.kind.value,
+                            "tagName": tag_name.lower(),
+                            "locator": locator,
+                            "quote": resolution.quote,
+                        },
+                    }
+                )
+            prompt_annotation_snapshots = normalize_prompt_annotation_snapshots(
+                raw_snapshots
+            )
+            request_context_prompt = render_active_prompt_annotation_context(
+                prompt_annotation_snapshots
+            )
+            if request_context_prompt is None:
+                raise ArtifactPromptAnnotationValidationError(
+                    "prompt annotation context is empty"
+                )
+            operation_class = (
+                "selection_edit" if len(prompt_annotation_rows) == 1 else "structural_edit"
+            )
+            artifact_turn_context = BoundPromptAnnotationContext(
+                session_key=key,
+                session_id=session_id,
+                document_id=annotation_document.document_id,
+                revision_id=annotation_revision.revision_id,
+                targets=tuple(bound_targets),
+                snapshots=prompt_annotation_snapshots,
+                artifact_format="html",
+                tool_names=PROMPT_ANNOTATION_TOOL_NAMES,
+                operation_class=operation_class,
+                request_context_prompt=request_context_prompt,
+            )
+            prepared_prompt_annotation_targets = tuple(prepared_targets)
+            artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
+        except ArtifactPromptAnnotationNotFoundError as exc:
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+                exc,
+                operation="prompt_annotations.prepare",
+                retryable=True,
+                session_key=key,
+            ) from exc
+        except ArtifactPromptAnnotationConflictError as exc:
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_BUSY,
+                exc,
+                operation="prompt_annotations.prepare",
+                retryable=True,
+                session_key=key,
+            ) from exc
+        except (ArtifactPromptAnnotationValidationError, PromptAnnotationSnapshotError) as exc:
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+                exc,
+                operation="prompt_annotations.prepare",
+                retryable=False,
+                session_key=key,
+            ) from exc
+    elif document_context_request is not None:
+        from opensquilla.gateway.artifact_contexts import (
+            DOCUMENT_CONTEXT_TOOL_NAMES,
+            BoundDocumentContext,
+        )
+
+        try:
+            artifact_session_service = await ArtifactSessionService.from_session_storage(
+                storage
+            )
+            current_head = await artifact_session_service.get_document_head(
+                document_context_request["documentId"],
+            )
+            document = current_head.document
+            revision = current_head.revision
+            if (
+                document.session_key != key
+                or document.session_id != session_id
+                or document.head_revision_id != revision.revision_id
+                or revision.document_id != document.document_id
+            ):
+                raise ArtifactPromptAnnotationConflictError(
+                    "document context is not the current head for this session"
+                )
+            kind_value = getattr(document.kind, "value", document.kind)
+            media_type = revision.media_type.split(";", 1)[0].strip().lower()
+            if (
+                kind_value != "html"
+                and media_type not in {"text/html", "application/xhtml+xml"}
+                and Path(revision.filename).suffix.lower() not in {".html", ".htm", ".xhtml"}
+            ):
+                raise RpcHandlerError(
+                    ArtifactProductErrorCode.RESOURCE_UNSUPPORTED.value,
+                    "This file cannot be edited here.",
+                    retryable=False,
+                    accepted=False,
+                )
+            followup_focus = await _load_followup_annotation_focus(
+                storage,
+                session_id=session_id,
+                document_id=document.document_id,
+            )
+            base_document_context_prompt = (
+                "<active_document_context>\n"
+                "The currently opened HTML document is bound to this turn. If the user asks "
+                "to inspect or modify the open page, use the bound document tools, not "
+                "workspace file tools. The first source read MUST be document_read with "
+                "view=source and no cursor, or cursor=\"\" only when the provider adapter "
+                "requires that field. Never invent a non-empty cursor: only pass the exact "
+                "nextCursor returned by the preceding document_read response when hasMore "
+                "is true. To modify the open page, call document_patch with the sha256 "
+                "returned by document_read and exact, unique expectedText from the returned "
+                "source. write_file, edit_file, and apply_patch operate on workspace files; "
+                "they do not update this Document and MUST NOT substitute for document_patch. "
+                "Those workspace mutators are unavailable while this Document is bound; do "
+                "not attempt to call them.\n"
+                "</active_document_context>"
+            )
+            artifact_turn_context = BoundDocumentContext(
+                session_key=key,
+                session_id=session_id,
+                document_id=document.document_id,
+                revision_id=revision.revision_id,
+                artifact_format="html",
+                tool_names=DOCUMENT_CONTEXT_TOOL_NAMES,
+                operation_class="document_edit",
+                request_context_prompt="\n\n".join(
+                    part
+                    for part in (base_document_context_prompt, followup_focus)
+                    if part
+                ),
+            )
+            artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
+        except ArtifactPromptAnnotationNotFoundError as exc:
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                exc,
+                operation="document_context.bind",
+                retryable=True,
+                session_key=key,
+            ) from exc
+        except ArtifactPromptAnnotationConflictError as exc:
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                exc,
+                operation="document_context.bind",
+                retryable=False,
+                session_key=key,
+            ) from exc
     plan_run: PlanRunRecord | None = None
     plan_revision_to_create: PlanRevisionRecord | None = None
     selected_plan_revision_id = plan_revision_id
@@ -3783,7 +4676,15 @@ async def _handle_sessions_send_impl(
                 retryable=False,
                 accepted=False,
             )
-    generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
+    # PromptAnnotation turns are a bounded artifact mutation protocol, including
+    # when the annotation batch is the session's first transcript entry.  An
+    # auxiliary naming request would escape that turn's provider-call budget and
+    # strict tool boundary, so annotation ingress must never arm auto-naming.
+    generate_title = (
+        False
+        if prompt_annotation_ids
+        else await _should_auto_title(ctx, storage, session, key, session_id)
+    )
     disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
     opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
     if pending_input_id is not None:
@@ -4141,11 +5042,140 @@ async def _handle_sessions_send_impl(
                 state_dir=ctx.config.state_dir,
             )
         )
+    if artifact_turn_context is not None and artifact_session_service is not None:
+        route_envelope.runtime_services["artifact_context"] = artifact_turn_context
+        route_envelope.runtime_services["artifact_session"] = artifact_session_service
+        route_envelope.runtime_services["artifact_event_emitter"] = artifact_event_emitter
+        preview_service = getattr(ctx, "artifact_preview_service", None)
+        if preview_service is not None:
+            route_envelope.runtime_services["artifact_preview_service"] = preview_service
+        from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
+
+        if (
+            isinstance(artifact_turn_context, BoundPromptAnnotationContext)
+            and
+            route_envelope.source_kind.value == "web"
+            and route_envelope.interaction_mode.value == "interactive"
+            and ctx.principal.is_owner
+            and not guest_safe
+        ):
+            from opensquilla.gateway.desktop_artifact_bridge import (
+                TurnAuthorityCleanup,
+                get_desktop_artifact_bridge_client,
+            )
+
+            try:
+                desktop_artifact_bridge = get_desktop_artifact_bridge_client()
+            except ValueError:
+                # An incomplete or non-loopback Desktop environment must never
+                # turn into ambient bridge authority. Artifact source editing
+                # remains available and native-surface operations fail closed.
+                log.warning("artifact.desktop_bridge_environment_rejected")
+                desktop_artifact_bridge = None
+            if desktop_artifact_bridge is not None:
+                # Negotiate before route construction so a legacy, unavailable,
+                # or non-HTML shell receives the source-only five-tool contract.
+                # Protocol version alone is insufficient: without an active
+                # v4 browser inspect surface plus candidate bind/restore, the
+                # ten-tool loop could stage a draft that can never be committed.
+                # Keep the useful durable source-writer compatibility path
+                # rather than exposing a candidate that can only be discarded.
+                turn_authority_cleanup = None
+                try:
+                    bound_desktop_artifact_bridge = await desktop_artifact_bridge.acquire_binding()
+                    turn_authority_cleanup = (
+                        TurnAuthorityCleanup(bound_desktop_artifact_bridge.aclose)
+                        if bound_desktop_artifact_bridge is not None
+                        else None
+                    )
+                    authority_scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
+                    if turn_authority_cleanup is not None and authority_scope is not None:
+                        authority_scope.register(turn_authority_cleanup)
+                    bridge_capabilities = (
+                        await bound_desktop_artifact_bridge.capabilities()
+                        if bound_desktop_artifact_bridge is not None
+                        else None
+                    )
+                except Exception:  # noqa: BLE001 - preserve unavailable bridge semantics
+                    bound_desktop_artifact_bridge = None
+                    bridge_capabilities = None
+                if (
+                    not _desktop_artifact_bridge_supports_candidate_loop(
+                        bridge_capabilities
+                    )
+                    or turn_authority_cleanup is None
+                ):
+                    if turn_authority_cleanup is not None:
+                        await turn_authority_cleanup.aclose()
+                    artifact_turn_context = _prompt_annotation_source_only_context(
+                        artifact_turn_context
+                    )
+                else:
+                    route_envelope.runtime_services["desktop_artifact_bridge"] = (
+                        bound_desktop_artifact_bridge
+                    )
+                    route_envelope.runtime_services["turn_authority_cleanup"] = (
+                        turn_authority_cleanup
+                    )
+                    route_envelope.runtime_services.setdefault(
+                        "turn_cleanup_callbacks", []
+                    ).append(turn_authority_cleanup.aclose)
+            else:
+                # A browser-less web client must not receive the autonomous
+                # writer/finish contract.  It can still use the durable
+                # source-only editor, while the v4 Electron client gets the
+                # full candidate-preview loop above.
+                artifact_turn_context = _prompt_annotation_source_only_context(
+                    artifact_turn_context
+                )
+            # The initial runtime-service entry is made before bridge
+            # negotiation.  Replace it after any downgrade so routing creates
+            # the matching legacy mutation controller, not a dead candidate
+            # controller.
+            route_envelope.runtime_services["artifact_context"] = artifact_turn_context
+    if (
+        route_envelope.source_kind.value == "web"
+        and route_envelope.interaction_mode.value == "interactive"
+        and ctx.principal.is_owner
+        and not guest_safe
+    ):
+        try:
+            from opensquilla.artifacts import ArtifactStore
+            from opensquilla.gateway.generated_artifact_adoption import (
+                GeneratedArtifactAdopter,
+            )
+
+            if artifact_session_service is None:
+                artifact_session_service = (
+                    await ArtifactSessionService.from_session_storage(storage)
+                )
+            route_envelope.runtime_services["generated_artifact_adopter"] = (
+                GeneratedArtifactAdopter(
+                    service=artifact_session_service,
+                    store=ArtifactStore(media_root),
+                    session_key=key,
+                    session_id=session_id,
+                    event_emitter=(
+                        artifact_event_emitter
+                        if callable(artifact_event_emitter)
+                        else _artifact_state_event_emitter(ctx, key)
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - adoption is a recoverable enhancement
+            log.warning(
+                "generated_artifact_adopter_unavailable",
+                session_key=key,
+                error_type=type(exc).__name__,
+            )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
 
-    capture_controls = _normalize_memory_capture_controls(params)
+    capture_controls = _normalize_memory_capture_controls(
+        params,
+        trusted_run_kind=trusted_run_kind,
+    )
     input_provenance = capture_controls["input_provenance"]
     if input_provenance is not None:
         input_provenance = dict(input_provenance)
@@ -4203,6 +5233,11 @@ async def _handle_sessions_send_impl(
             "client_request_id": ingress_identity.client_request_id,
             "client_message_id": client_message_id,
             "surface_id": surface_id,
+            # The direct RPC execution path constructs ToolContext before a
+            # TaskRuntime record exists. Keep the durable turn identity in the
+            # envelope so PromptAnnotation candidate loops never fall back to
+            # the legacy one-shot writer merely because task metadata is late.
+            "task_id": turn_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
             **(
@@ -4528,6 +5563,10 @@ async def _handle_sessions_send_impl(
         )
         _emit_steer_metric("legacy_interrupt_requested", session_key=key)
     runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
+    if prompt_annotation_ids or document_context_request is not None:
+        # One accepted annotation batch owns one distinct turn and one
+        # ChangeSet. It must never be merged into or interrupt another turn.
+        runtime_mode = "followup"
     if durable_meta_control is not None:
         # A control must begin a fresh pipeline turn and must not interrupt
         # another accepted control. Collect could lose the pipeline marker;
@@ -4558,15 +5597,32 @@ async def _handle_sessions_send_impl(
         raise RpcUnavailableError(
             "Plan implementation requires atomic TaskRuntime acceptance"
         )
-    if initial_collaboration_mode is not None and not atomic_runtime_acceptance:
+    if (
+        initial_collaboration_mode is not None or initial_routing_mode is not None
+    ) and not atomic_runtime_acceptance:
         raise RpcUnavailableError(
-            "Initial collaboration mode requires atomic TaskRuntime acceptance"
+            "Initial session controls require atomic TaskRuntime acceptance"
         )
 
     if durable_meta_control is not None and not atomic_runtime_acceptance:
         raise RpcHandlerError(
             "META_CONTROL_DURABILITY_UNAVAILABLE",
             "This MetaSkill control requires durable task ingress; retry after Gateway recovery",
+            retryable=True,
+            accepted=False,
+        )
+
+    if prompt_annotation_ids and not atomic_runtime_acceptance:
+        raise RpcHandlerError(
+            "PROMPT_ANNOTATION_DURABILITY_UNAVAILABLE",
+            "Prompt annotations require atomic task acceptance; retry after Gateway recovery.",
+            retryable=True,
+            accepted=False,
+        )
+    if document_context_request is not None and not atomic_runtime_acceptance:
+        raise RpcHandlerError(
+            "DOCUMENT_CONTEXT_DURABILITY_UNAVAILABLE",
+            "Document editing requires atomic task acceptance; retry after Gateway recovery.",
             retryable=True,
             accepted=False,
         )
@@ -4581,7 +5637,7 @@ async def _handle_sessions_send_impl(
 
     if prepared_acceptance:
         persist_content = message_text
-        if raw_attachments or display_text is not None:
+        if raw_attachments or display_text is not None or prompt_annotation_snapshots:
             from opensquilla.gateway.transcripts import (
                 build_transcript_attachment_envelope,
             )
@@ -4598,6 +5654,7 @@ async def _handle_sessions_send_impl(
                 media_root=media_root,
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
+                prompt_annotations=prompt_annotation_snapshots,
             )
 
         assert callable(prepare_message)
@@ -4611,6 +5668,7 @@ async def _handle_sessions_send_impl(
         if (
             not raw_attachments
             and display_text is None
+            and not prompt_annotation_snapshots
             and isinstance(persisted_entry.content, str)
         ):
             message_text = persisted_entry.content
@@ -4737,6 +5795,8 @@ async def _handle_sessions_send_impl(
                     require_idle_for_current_plan_implementation
                 ),
                 goal_mutation=goal_claim_mutation,
+                prepared_prompt_annotation_targets=prepared_prompt_annotation_targets,
+                prompt_annotation_turn_id=(turn_id if prompt_annotation_rows else None),
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
                 pending_input_revision=pending_input_revision,
@@ -4815,6 +5875,20 @@ async def _handle_sessions_send_impl(
                 accepted_run_mode_override=accepted_run_mode_override,
             )
             try:
+                if atomic_intent_plan.action in {"create", "fork"}:
+                    from opensquilla.gateway.session_model_routing import (
+                        capture_prepared_session_model_routing_config,
+                    )
+
+                    await atomic_task_runtime.freeze_acceptance(
+                        reservation,
+                        accepted_config=capture_prepared_session_model_routing_config(
+                            ctx.config,
+                            atomic_intent_plan.node,
+                        ),
+                    )
+                else:
+                    await atomic_task_runtime.freeze_acceptance(reservation)
                 acceptance = await _accept_task_record(reservation.task_record)
             except BaseException:
                 await atomic_task_runtime.abort_reservation(reservation)
@@ -4919,6 +5993,66 @@ async def _handle_sessions_send_impl(
             acceptance = await complete_durable_ingress(
                 _commit_with_session_admission()
             )
+        except (
+            ArtifactPromptAnnotationConflictError,
+            ArtifactPromptAnnotationNotFoundError,
+        ) as exc:
+            _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
+            if prompt_annotation_ids and _prompt_annotation_acceptance_retries > 0:
+                log.info(
+                    "prompt_annotations.accept_head_race_retry",
+                    session_key=key,
+                    attempts_remaining=_prompt_annotation_acceptance_retries,
+                )
+                authority_scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
+                if authority_scope is not None:
+                    await authority_scope.close_untransferred()
+                    authority_scope.authorities.clear()
+                return cast(
+                    dict[Any, Any],
+                    await _handle_sessions_send_impl(
+                        params,
+                        ctx,
+                        fingerprint_params=fingerprint_params,
+                        plan_revision_id=plan_revision_id,
+                        plan_context_revision_id=plan_context_revision_id,
+                        plan_run_driver_kind=plan_run_driver_kind,
+                        plan_run_driver_id=plan_run_driver_id,
+                        required_collaboration_mode=required_collaboration_mode,
+                        required_collaboration_revision=required_collaboration_revision,
+                        initial_collaboration_mode=initial_collaboration_mode,
+                        expected_collaboration_revision=expected_collaboration_revision,
+                        expected_active_plan_revision_id=expected_active_plan_revision_id,
+                        require_idle_for_current_plan_implementation=(
+                            require_idle_for_current_plan_implementation
+                        ),
+                        atomic_collaboration_mode_update=atomic_collaboration_mode_update,
+                        pending_input_id=pending_input_id,
+                        pending_input_fingerprint=pending_input_fingerprint,
+                        pending_input_revision=pending_input_revision,
+                        _prompt_annotation_acceptance_retries=(
+                            _prompt_annotation_acceptance_retries - 1
+                        ),
+                    ),
+                )
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_CHANGED,
+                exc,
+                operation="prompt_annotations.accept",
+                retryable=True,
+                session_key=key,
+            ) from exc
+        except ArtifactPromptAnnotationValidationError as exc:
+            _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+                exc,
+                operation="prompt_annotations.accept",
+                retryable=False,
+                session_key=key,
+            ) from exc
         except TaskRuntimeShuttingDownError as exc:
             _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
@@ -5188,7 +6322,7 @@ async def _handle_sessions_send_impl(
                     await upload_store.evict(file_uuid)
                 except Exception:  # noqa: BLE001 - eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", file_uuid[:8])
-        if not acceptance.replayed:
+        if not acceptance.replayed and generate_title:
             try:
                 _schedule_auto_title(
                     ctx,
@@ -5209,6 +6343,7 @@ async def _handle_sessions_send_impl(
             client_request_id=ingress_identity.client_request_id,
             storage=storage,
             turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
+            accepted_prompt_annotation_ids=prompt_annotation_ids,
         )
         if initial_collaboration_mode is not None:
             accepted_collaboration = {
@@ -5238,6 +6373,9 @@ async def _handle_sessions_send_impl(
                         "sessions.send.initial_collaboration_emit_failed",
                         session_key=key,
                     )
+        if initial_routing_mode is not None:
+            response["acceptedRouting"] = {"mode": initial_routing_mode}
+            response["routing"] = await _resolve_session_routing_snapshot(ctx, key)
         return response
 
     if prepared_acceptance:
@@ -5292,7 +6430,23 @@ async def _handle_sessions_send_impl(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
+            turn_authority = route_envelope.runtime_services.get(
+                "turn_authority_cleanup"
+            )
+            try:
+                direct_registry.register(
+                    key,
+                    task,
+                    terminal_cleanup=(
+                        turn_authority.aclose if turn_authority is not None else None
+                    ),
+                )
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            if turn_authority is not None:
+                turn_authority.handoff()
             return acceptance
 
         try:
@@ -5433,23 +6587,25 @@ async def _handle_sessions_send_impl(
                             "uploads.evict_failed_post_turn uuid=%s",
                             file_uuid[:8],
                         )
-            try:
-                _schedule_auto_title(
-                    ctx,
-                    key,
-                    semantic_message_text or message_text,
-                    enabled=generate_title,
-                )
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.exception(
-                    "sessions.send.post_accept_title_failed",
-                    session_key=key,
-                )
+            if generate_title:
+                try:
+                    _schedule_auto_title(
+                        ctx,
+                        key,
+                        semantic_message_text or message_text,
+                        enabled=generate_title,
+                    )
+                except Exception:  # noqa: BLE001 - turn is already accepted.
+                    log.exception(
+                        "sessions.send.post_accept_title_failed",
+                        session_key=key,
+                    )
         return await _accepted_turn_response(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
             storage=storage,
             turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
+            accepted_prompt_annotation_ids=prompt_annotation_ids,
         )
 
     # 1. Persist user message to transcript (include attachment metadata).
@@ -5525,7 +6681,23 @@ async def _handle_sessions_send_impl(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
+            turn_authority = route_envelope.runtime_services.get(
+                "turn_authority_cleanup"
+            )
+            try:
+                direct_registry.register(
+                    key,
+                    task,
+                    terminal_cleanup=(
+                        turn_authority.aclose if turn_authority is not None else None
+                    ),
+                )
+            except BaseException:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            if turn_authority is not None:
+                turn_authority.handoff()
 
         await _emit_to_subscribers(
             ctx,
@@ -5549,12 +6721,13 @@ async def _handle_sessions_send_impl(
                     await _store.evict(_u)
                 except Exception:  # noqa: BLE001 — eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        _schedule_auto_title(
-            ctx,
-            key,
-            semantic_message_text or message_text,
-            enabled=generate_title,
-        )
+        if generate_title:
+            _schedule_auto_title(
+                ctx,
+                key,
+                semantic_message_text or message_text,
+                enabled=generate_title,
+            )
         return {
             "status": "accepted",
             "key": key,
@@ -5772,14 +6945,15 @@ async def _handle_sessions_send_impl(
                     await _store.evict(_u)
                 except Exception:  # noqa: BLE001 — eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        _schedule_auto_title(
-            ctx,
-            key,
-            semantic_message_text or message_text,
-            enabled=generate_title,
-            session_id=session_id,
-            root_turn_id=turn_id,
-        )
+        if generate_title:
+            _schedule_auto_title(
+                ctx,
+                key,
+                semantic_message_text or message_text,
+                enabled=generate_title,
+                session_id=session_id,
+                root_turn_id=turn_id,
+            )
         await _emit_to_subscribers(
             ctx,
             key,
@@ -5817,6 +6991,7 @@ async def _handle_sessions_send(
     required_collaboration_mode: str | None = None,
     required_collaboration_revision: int | None = None,
     initial_collaboration_mode: str | None = None,
+    initial_routing_mode: str | None = None,
     expected_collaboration_revision: int | None = None,
     expected_active_plan_revision_id: str | None = None,
     require_idle_for_current_plan_implementation: bool = False,
@@ -5824,6 +6999,7 @@ async def _handle_sessions_send(
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
+    trusted_run_kind: str | None = None,
     _explicit_ingress_intent_registered: bool = False,
 ) -> dict:
     """Register explicit intent before any asynchronous send preparation.
@@ -5851,6 +7027,7 @@ async def _handle_sessions_send(
                 required_collaboration_mode=required_collaboration_mode,
                 required_collaboration_revision=required_collaboration_revision,
                 initial_collaboration_mode=initial_collaboration_mode,
+                initial_routing_mode=initial_routing_mode,
                 expected_collaboration_revision=expected_collaboration_revision,
                 expected_active_plan_revision_id=expected_active_plan_revision_id,
                 require_idle_for_current_plan_implementation=(
@@ -5860,6 +7037,7 @@ async def _handle_sessions_send(
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
                 pending_input_revision=pending_input_revision,
+                trusted_run_kind=trusted_run_kind,
             ),
         )
 
@@ -5930,6 +7108,14 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
         result["displayText"] = display_text
     if payload.get("confirmedPlainText") is True:
         result["confirmedPlainText"] = True
+    prompt_annotation_ids = payload.get("promptAnnotationIds")
+    if isinstance(prompt_annotation_ids, list) and prompt_annotation_ids:
+        result["promptAnnotationIds"] = [
+            item for item in prompt_annotation_ids if isinstance(item, str)
+        ][:16]
+    initial_routing_mode = payload.get("initialRoutingMode")
+    if isinstance(initial_routing_mode, str):
+        result["initialRoutingMode"] = initial_routing_mode
     return result
 
 
@@ -5993,6 +7179,28 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     if not isinstance(attachments, list):
         raise ValueError("params.attachments must be an array")
 
+    raw_prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
+    )
+    if raw_prompt_annotation_ids is None:
+        prompt_annotation_ids: list[str] = []
+    else:
+        if not isinstance(raw_prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if len(raw_prompt_annotation_ids) > 16:
+            raise ValueError("params.promptAnnotationIds supports at most 16 items")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_prompt_annotation_ids
+        ):
+            raise ValueError(
+                "params.promptAnnotationIds must contain non-empty strings"
+            )
+        prompt_annotation_ids = [item.strip() for item in raw_prompt_annotation_ids]
+        if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain unique ids")
+
     payload: dict[str, Any] = {
         "key": key,
         "message": message,
@@ -6014,6 +7222,7 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         (("intent",), "intent"),
         (("workspaceId", "workspace_id"), "workspaceId"),
         (("collaborationMode", "collaboration_mode"), "collaborationMode"),
+        (("initialRoutingMode", "initial_routing_mode"), "initialRoutingMode"),
     ):
         value = _optional_string_param(params, *source_names)
         if value is not None:
@@ -6022,6 +7231,12 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         payload["displayText"] = display_text
     if confirmed_plain_text:
         payload["confirmedPlainText"] = True
+    if prompt_annotation_ids:
+        # Keep the immutable annotation batch in the staged payload.  A
+        # response-loss replay may no longer have the original chat.send
+        # params, and dropping these ids would leave the renderer's drafts
+        # unacknowledged after the first successful turn.
+        payload["promptAnnotationIds"] = prompt_annotation_ids
     return payload
 
 
@@ -6190,6 +7405,17 @@ async def _handle_pending_inputs_enqueue(
         "pending_input_id",
     )
     raw_payload = _pending_input_send_payload(params, key=key)
+    if raw_payload.get("initialRoutingMode") is not None:
+        # A staged input is owned by an already-durable session, while an
+        # initial routing mode is valid only in the transaction that creates a
+        # new session.  Reject this impossible combination before writing a
+        # queue row that could never be dispatched successfully.
+        raise RpcHandlerError(
+            "PENDING_INITIAL_ROUTING_UNSUPPORTED",
+            "Send a new chat's initialRoutingMode with its first chat.send request.",
+            retryable=False,
+            accepted=False,
+        )
     source_scope = _turn_source_scope(
         cast(dict[str, Any], raw_payload["_source"]),
         ctx,
@@ -7745,6 +8971,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         return {"aborted": False, "key": key}
 
     requested_task_id = _optional_string_param(params, "task_id", "taskId")
+    process_state_dir = getattr(getattr(ctx, "config", None), "state_dir", None)
     abort_scope = _optional_string_param(params, "scope")
     task_scoped = bool(abort_scope and abort_scope.lower() == "task")
     if task_scoped and requested_task_id is None:
@@ -7796,6 +9023,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 session_key=key,
                 task_id=requested_task_id,
                 deadline_at_monotonic=cleanup_deadline,
+                process_state_dir=process_state_dir,
             )
         )
         exact_descendant_cleanup = asyncio.create_task(
@@ -7806,6 +9034,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 source=exact_cancel_source,
                 reason="user_abort",
                 deadline_at_monotonic=cleanup_deadline,
+                process_state_dir=process_state_dir,
             )
         )
         for cleanup_task in (
@@ -7860,6 +9089,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         from opensquilla.gateway.subagent_announce import (
             cancel_background_completion_for_session,
         )
+        from opensquilla.process_tree import cancel_persisted_processes_for_session
 
         if requested_task_id is not None:
             assert exact_runtime_cleanup is not None
@@ -7890,6 +9120,22 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     "key": key,
                     "reason": "task_scope_unsupported",
                 }
+            if cancelled_result is exact_cancel_unknown:
+                return {
+                    "aborted": False,
+                    "key": key,
+                    # The request may already have crossed TaskRuntime's
+                    # cancellation boundary.  Do not claim the task is
+                    # terminal; the client must reconcile and retry the same
+                    # exact identity.
+                    "reason": "task_cancel_unknown",
+                }
+            if int(cancelled_result) > 0:
+                # The exact runtime cancellation boundary is authoritative.
+                # Auxiliary and descendant cleanup started alongside it and
+                # continues under its own deadline; do not make Stop wait for
+                # those safety drains or for the task's terminal event.
+                return {"aborted": True, "key": key}
             cancelled_auxiliary = int(
                 await _await_abort_background_task(
                     exact_auxiliary_cleanup,
@@ -7906,28 +9152,11 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     default=0,
                 )
             )
-            if cancelled_result is exact_cancel_unknown:
-                return {
-                    "aborted": False,
-                    "key": key,
-                    # The request may already have crossed TaskRuntime's
-                    # cancellation boundary.  Do not claim the task is
-                    # terminal; the client must reconcile and retry the same
-                    # exact identity.
-                    "reason": "task_cancel_unknown",
-                }
             cancelled_count = (
                 int(cancelled_result)
                 + cancelled_auxiliary
                 + cancelled_descendants
             )
-            if int(cancelled_result) > 0:
-                await _drain_cancelled_task_runtime(
-                    task_runtime,
-                    session_key=key,
-                    task_ids=(requested_task_id,),
-                    deadline_at_monotonic=abort_deadline,
-                )
             reason = "task_not_active"
             if cancelled_count <= 0:
                 # Classification is diagnostic only.  The exact cancel above
@@ -7993,6 +9222,15 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                         cancel_background_completion_for_session(session_key),
                         deadline_at_monotonic=abort_deadline,
                         operation="cancel_background_completion",
+                        default=0,
+                    )
+                    cancelled_groups += await _await_abort_operation(
+                        cancel_persisted_processes_for_session(
+                            process_state_dir,
+                            session_key,
+                        ),
+                        deadline_at_monotonic=abort_deadline,
+                        operation="cancel_persisted_session_processes",
                         default=0,
                     )
                 active_task_ids = await _await_abort_operation(
@@ -9894,22 +11132,32 @@ async def _build_sessions_messages_subscription_payload(
         )
     replayed_count = 0
     if subscribed and replay.events:
+        from opensquilla.gateway.protocol import project_session_event_for_client
         from opensquilla.gateway.websocket import get_registry
 
         conn = get_registry().get(ctx.conn_id)
         if conn is not None:
+            client_caps: frozenset[str] = getattr(conn, "client_caps", frozenset())
             replay_deadline = (
                 asyncio.get_running_loop().time()
                 + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
             )
             for event in replay.events:
+                projected = project_session_event_for_client(
+                    event.event_name,
+                    event.payload,
+                    client_caps=client_caps,
+                )
+                if projected is None:
+                    continue
+                event_name, event_payload = projected
                 remaining = replay_deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise TimeoutError("Session replay send budget exhausted")
                 async with asyncio.timeout(remaining):
                     await conn.send_event(
-                        event.event_name,
-                        event.payload,
+                        event_name,
+                        event_payload,
                         meta={"replayed": True},
                     )
                 replayed_count += 1
@@ -9952,6 +11200,7 @@ def _deferred_sessions_messages_metadata() -> dict[str, Any]:
         "run_mode_lock",
         "pendingUserInputs",
         "collaboration",
+        "routing",
         "currentPlan",
         "activePlanRun",
         "goal",
@@ -9966,6 +11215,7 @@ def _deferred_sessions_messages_metadata() -> dict[str, Any]:
         "run_mode_lock": {"locked": True, "source": "deferred"},
         "pendingUserInputs": [],
         "collaboration": None,
+        "routing": None,
         "currentPlan": None,
         "activePlanRun": None,
         "goal": None,
@@ -10029,6 +11279,7 @@ async def _hydrate_sessions_messages_metadata(
             await candidate if inspect.isawaitable(candidate) else candidate
         )
     collaboration: dict[str, Any] | None = None
+    routing = await _resolve_session_routing_snapshot(ctx, key)
     current_plan_payload: dict[str, Any] | None = None
     active_plan_run_payload: dict[str, Any] | None = None
     goal_payload: dict[str, Any] | None = None
@@ -10096,6 +11347,7 @@ async def _hydrate_sessions_messages_metadata(
         ),
         "pendingUserInputs": pending_user_inputs,
         "collaboration": collaboration,
+        "routing": routing,
         "currentPlan": current_plan_payload,
         "activePlanRun": active_plan_run_payload,
         "goal": goal_payload,
@@ -10157,14 +11409,15 @@ async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContex
     snapshot = get_session_streams().live_snapshot(key)
     connection = get_registry().get(ctx.conn_id)
     client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
-    projected_events = [
-        project_session_event_for_client(
+    projected_events = []
+    for event in snapshot.events:
+        projected = project_session_event_for_client(
             event.event_name,
             event.payload,
             client_caps=client_caps,
         )
-        for event in snapshot.events
-    ]
+        if projected is not None:
+            projected_events.append(projected)
     projected_terminal = any(
         event_payload.get("terminal") is True
         for _event_name, event_payload in projected_events
@@ -10318,6 +11571,80 @@ def _plan_collaboration_snapshot(
     }
 
 
+def _session_routing_snapshot(
+    value: Any,
+    *,
+    applies_to: str = "next_accepted_turn",
+) -> dict[str, Any]:
+    """Normalize the storage/manager routing result for public RPCs."""
+
+    if isinstance(value, dict):
+        raw_mode = value.get("mode")
+        revision = value.get("revision", 0)
+        source = value.get("source", "session")
+        initialized = value.get("initialized", False)
+    else:
+        raw_mode = getattr(value, "mode", None)
+        revision = getattr(value, "revision", 0)
+        source = getattr(value, "source", "session")
+        initialized = getattr(value, "initialized", False)
+    mode = str(raw_mode or "direct").strip().lower()
+    if mode not in _SESSION_ROUTING_MODES:
+        mode = "direct"
+    return {
+        "mode": mode,
+        "revision": max(0, int(revision or 0)),
+        "source": str(source or "session"),
+        "initialized": bool(initialized),
+        "appliesTo": applies_to,
+    }
+
+
+def _global_session_routing_snapshot(ctx: RpcContext) -> dict[str, Any]:
+    """Return the current global default for a not-yet-created session."""
+
+    from opensquilla.gateway.model_routing import model_routing_snapshot
+
+    mode = str(model_routing_snapshot(ctx.config).get("mode") or "direct")
+    return _session_routing_snapshot(
+        {
+            "mode": mode,
+            "revision": 0,
+            "source": "global",
+            "initialized": False,
+        }
+    )
+
+
+async def _resolve_session_routing_snapshot(
+    ctx: RpcContext,
+    key: str,
+) -> dict[str, Any]:
+    """Resolve one durable row; draft keys expose their global creation default."""
+
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    fallback = _global_session_routing_snapshot(ctx)["mode"]
+    getter = getattr(manager, "get_session_routing", None)
+    try:
+        if callable(getter):
+            return _session_routing_snapshot(
+                await getter(key, fallback_mode=fallback)
+            )
+        storage = get_session_storage(manager)
+        resolver = getattr(storage, "resolve_model_routing_mode", None)
+        if callable(resolver):
+            return _session_routing_snapshot(await resolver(key, fallback))
+    except KeyError:
+        # This is a new-chat draft, not a durable inherited value. The first
+        # accepted turn writes its `initialRoutingMode` or this global value.
+        return _global_session_routing_snapshot(ctx)
+    # Mixed-version/in-memory session services can still provide the global
+    # default until their durable resolver is available.
+    return _global_session_routing_snapshot(ctx)
+
+
 async def _goal_owned_plan_run_for_revision(
     storage: Any,
     revision_id: str,
@@ -10347,6 +11674,118 @@ async def _handle_plans_capabilities(
         "initialModeOnSend": True,
         "atomicInitialMode": True,
     }
+
+
+@_d.method("sessions.routing.get", scope="operator.read")
+async def _handle_sessions_routing_get(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Return a session's effective routing strategy and CAS generation."""
+
+    key = _require_plan_session_key(params)
+    snapshot = await _resolve_session_routing_snapshot(ctx, key)
+    return {
+        "key": key,
+        "sessionKey": key,
+        **snapshot,
+        "routing": snapshot,
+    }
+
+
+@_d.method("sessions.routing.set", scope="operator.write")
+async def _handle_sessions_routing_set(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _explicit_ingress_intent_registered: bool = False,
+) -> dict[str, Any]:
+    """CAS-update a durable session mode before the next admitted turn."""
+
+    key = _require_plan_session_key(params)
+    runtime = getattr(ctx, "task_runtime", None)
+    register = getattr(runtime, "explicit_ingress_intent", None)
+    if not _explicit_ingress_intent_registered and callable(register):
+        async with register(key):
+            return cast(
+                dict[str, Any],
+                await _handle_sessions_routing_set(
+                    params,
+                    ctx,
+                    _explicit_ingress_intent_registered=True,
+                ),
+            )
+    mode = _optional_string_param(params, "mode")
+    if mode not in _SESSION_ROUTING_MODES:
+        raise ValueError("params.mode must be direct, router, or ensemble")
+    expected_revision = (params or {}).get(
+        "expectedRevision",
+        (params or {}).get("expected_revision"),
+    )
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 0
+    ):
+        raise ValueError("params.expectedRevision must be a non-negative integer")
+    # Reuse the global control's activation planner as validation only. It
+    # catches an unbuildable Ensemble lineup without changing shared config.
+    from opensquilla.gateway.model_routing import model_routing_patches
+
+    model_routing_patches(ctx.config, mode)
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    setter = getattr(manager, "set_session_routing", None)
+    storage = get_session_storage(manager)
+    if not callable(setter):
+        setter = getattr(storage, "set_model_routing_mode", None)
+    if not callable(setter):
+        raise RpcUnavailableError("Session routing storage is not configured")
+
+    async def _commit() -> dict[str, Any]:
+        try:
+            return _session_routing_snapshot(
+                await setter(key, mode, expected_revision=expected_revision)
+            )
+        except KeyError as exc:
+            raise RpcHandlerError(
+                "SESSION_NOT_FOUND",
+                "Set a new chat's initialRoutingMode with its first message instead.",
+                retryable=False,
+                accepted=False,
+            ) from exc
+
+    try:
+        collector = getattr(runtime, "collect_admission", None)
+        if callable(collector):
+            async with collector(key):
+                snapshot = await _commit()
+        else:
+            lock = get_session_lock(ctx.turn_runner, key)
+            if lock is None:
+                snapshot = await _commit()
+            else:
+                async with lock:
+                    snapshot = await _commit()
+    except SessionRoutingConflictError as exc:
+        latest = await _resolve_session_routing_snapshot(ctx, key)
+        raise RpcHandlerError(
+            "SESSION_ROUTING_CHANGED",
+            str(exc),
+            details={"routing": latest},
+            retryable=True,
+            accepted=False,
+        ) from exc
+
+    event = {
+        "key": key,
+        "sessionKey": key,
+        "routing": snapshot,
+        **snapshot,
+    }
+    await _emit_to_subscribers(ctx, key, "sessions.routing.changed", event)
+    return event
 
 
 @_d.method("plans.setMode", scope="operator.write")
@@ -11043,7 +12482,18 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             workspace = (
                 str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
             )
-    from opensquilla.gateway.model_routing import model_routing_snapshot
+    from opensquilla.gateway.model_routing import (
+        capture_model_routing_config,
+        model_routing_snapshot,
+    )
+
+    routing = await _resolve_session_routing_snapshot(ctx, session_key)
+    effective_routing_config = capture_model_routing_config(
+        ctx.config,
+        session_mode=routing["mode"],
+        session_routing_revision=routing["revision"],
+        session_routing_source=routing["source"],
+    )
 
     metadata: dict[str, Any] = {
         "session_key": session_key,
@@ -11088,8 +12538,9 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "running_count": running_count,
         },
         "runtime": {
-            "model_routing": model_routing_snapshot(ctx.config),
+            "model_routing": model_routing_snapshot(effective_routing_config),
         },
+        "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),
         "currentPlan": (
             plan_revision_snapshot(current_plan, current=True)

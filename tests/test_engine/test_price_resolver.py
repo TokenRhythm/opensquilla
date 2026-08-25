@@ -13,6 +13,126 @@ def test_local_provider_resolves_free(monkeypatch: pytest.MonkeyPatch) -> None:
     assert r.entry.input_per_m == 0.0 and r.entry.cache_read_per_m == 0.0
 
 
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+@pytest.mark.parametrize("model_id", ["unknown-custom-model", "gpt-4.1"])
+def test_generic_custom_provider_defaults_to_zero_price(
+    monkeypatch: pytest.MonkeyPatch, provider: str, model_id: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    resolved = resolve_model_price(model_id, provider=provider)
+
+    assert resolved.source == "custom_free"
+    assert resolved.entry == PriceEntry(0.0, 0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_generic_custom_provider_ignores_warmed_openrouter_catalog_price(
+    monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {
+                "id": "vendor/warm-priced-model",
+                "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+            }
+        ]
+    )
+    set_shared_catalog(catalog)
+    try:
+        resolved = resolve_model_price("vendor/warm-priced-model", provider=provider)
+    finally:
+        set_shared_catalog(None)
+
+    assert resolved.source == "custom_free"
+    assert resolved.entry == PriceEntry(0.0, 0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_generic_custom_provider_uses_complete_user_price_override(
+    monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            f"{provider}/vendor/priced-model": {
+                "input_cost_per_mtok": 1.25,
+                "output_cost_per_mtok": 2.5,
+                "cache_read_cost_per_mtok": 0.125,
+                "cache_write_cost_per_mtok": 3.125,
+            }
+        }
+    )
+    set_shared_catalog(catalog)
+    try:
+        resolved = resolve_model_price("vendor/priced-model", provider=provider)
+    finally:
+        set_shared_catalog(None)
+
+    assert resolved.source == "user_override"
+    assert resolved.entry == PriceEntry(1.25, 2.5, 0.125, 3.125)
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_generic_custom_provider_honors_explicit_zero_price_override(
+    monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            f"{provider}/vendor/zero-priced-model": {
+                "input_cost_per_mtok": 0.0,
+                "output_cost_per_mtok": 0.0,
+            }
+        }
+    )
+    set_shared_catalog(catalog)
+    try:
+        resolved = resolve_model_price("vendor/zero-priced-model", provider=provider)
+    finally:
+        set_shared_catalog(None)
+
+    assert resolved.source == "user_override"
+    assert resolved.entry == PriceEntry(0.0, 0.0)
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"context_window": 131_072},
+        {"input_cost_per_mtok": 1.0},
+        {"output_cost_per_mtok": 2.0},
+    ],
+)
+def test_generic_custom_provider_ignores_incomplete_user_price_override(
+    monkeypatch: pytest.MonkeyPatch, provider: str, fields: dict[str, float | int]
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {
+                "id": "vendor/warm-priced-model",
+                "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+            }
+        ]
+    )
+    catalog.set_user_overrides({f"{provider}/vendor/warm-priced-model": fields})
+    set_shared_catalog(catalog)
+    try:
+        resolved = resolve_model_price("vendor/warm-priced-model", provider=provider)
+    finally:
+        set_shared_catalog(None)
+
+    assert resolved.source == "custom_free"
+    assert resolved.entry == PriceEntry(0.0, 0.0, 0.0, 0.0)
+
+
 def test_user_catalog_override_wins_over_static(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
     catalog = ModelCatalog()

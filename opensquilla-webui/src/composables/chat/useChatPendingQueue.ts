@@ -22,6 +22,16 @@ import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
+const MAX_PROMPT_ANNOTATION_IDS = 16
+
+function normalizePromptAnnotationIds(
+  ids: unknown,
+): string[] {
+  return (Array.isArray(ids) ? ids : [])
+    .map(value => String(value || '').trim())
+    .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
+    .slice(0, MAX_PROMPT_ANNOTATION_IDS)
+}
 
 type PendingReorderMode = 'local' | 'server'
 
@@ -94,6 +104,7 @@ export interface PendingQueueOwnerContext {
 
 export interface PendingQueuePayload {
   text: string
+  promptAnnotationIds?: readonly string[]
   attachments?: Attachment[]
   intent?: string | null
   confirmedPlainText?: boolean
@@ -255,6 +266,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       clientRequestId: item.pendingClientRequestId!,
       clientMessageId: item.pendingClientMessageId!,
       text: item.text,
+      ...(item.promptAnnotationIds?.length
+        ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
+        : {}),
       attachments: (item.attachments || []).map(attachment => ({ ...attachment })),
       intent: item.intent,
       ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -289,6 +303,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return {
       pendingUiId: record.pendingInputId,
       text: record.text,
+      ...(normalizePromptAnnotationIds(record.promptAnnotationIds).length
+        ? { promptAnnotationIds: normalizePromptAnnotationIds(record.promptAnnotationIds) }
+        : {}),
       attachments: record.attachments.map(attachment => ({ ...attachment })),
       intent: record.intent,
       ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -522,6 +539,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 clientMessageId: item.pendingClientMessageId,
                 message: providerMessage || 'Describe these attachments',
                 attachments: sendable.map(serializeSendableAttachment),
+                ...(item.promptAnnotationIds?.length
+                  ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
+                  : {}),
                 ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
                 ...(sendable.length > 0 || literalSlashEscape
                   ? { displayText: queuedText }
@@ -736,6 +756,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               : String(serverItem.message || ''),
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
+            ...(normalizePromptAnnotationIds(
+              serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
+            ).length
+              ? {
+                  promptAnnotationIds: normalizePromptAnnotationIds(
+                    serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
+                  ),
+                }
+              : {}),
             ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
             ownerSessionKey: sessionKey,
             pendingInputId,
@@ -756,6 +785,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           // transport response was lost. Replace the WAL's File/base64/upload
           // snapshot with safe server-owned metadata before marking it staged.
           item.attachments = serverAttachments
+        }
+        const serverPromptAnnotationIds = normalizePromptAnnotationIds(
+          serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
+        )
+        if (serverPromptAnnotationIds.length > 0) {
+          item.promptAnnotationIds = serverPromptAnnotationIds
         }
         item.pendingRequestFingerprint = String(
           serverItem.requestFingerprint || serverItem.request_fingerprint || '',
@@ -855,9 +890,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return false
     }
     const ownerRequestId = resolveOwnerRequestId(owner)
+    const promptAnnotationIds = normalizePromptAnnotationIds(payload.promptAnnotationIds)
     const item: ChatPendingItem = {
       pendingUiId: createClientRequestId(),
       text: payload.text,
+      ...(promptAnnotationIds.length ? { promptAnnotationIds } : {}),
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -898,7 +935,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function enqueuePendingInput(
     text: string,
     owner?: PendingQueueOwner,
-    enqueueOptions?: { confirmedPlainText?: boolean },
+    enqueueOptions?: {
+      confirmedPlainText?: boolean
+      promptAnnotationIds?: readonly string[]
+    },
   ): boolean | Promise<boolean> {
     if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
     const composerText = options.inputText.value
@@ -906,6 +946,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const composerIntent = options.pendingSessionIntent.value
     const queued = enqueuePendingPayload({
       text,
+      ...(enqueueOptions?.promptAnnotationIds?.length
+        ? { promptAnnotationIds: enqueueOptions.promptAnnotationIds }
+        : {}),
       attachments: options.pendingAttachments.value,
       intent: composerIntent,
       ...(enqueueOptions?.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -1474,6 +1517,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
+      // Annotation IDs refer to durable drafts owned by the annotation store.
+      // This queue only has the IDs, not enough snapshot data to reconstruct
+      // those drafts in the composer. Never turn such a queued batch into a
+      // plain-text edit and silently drop its annotation context.
+      || item.promptAnnotationIds?.length
       || item.pendingPersistenceState === 'saving'
       || item.pendingPersistenceState === 'cancelling'
       || hasUneditablePendingAttachments(item)

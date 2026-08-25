@@ -5,10 +5,30 @@ import subprocess
 import pytest
 
 from opensquilla.contrib.codetask import workspace
+from opensquilla.git_runtime import (
+    GitCapability,
+    GitCapabilityState,
+    GitRunResult,
+    GitRunState,
+)
 
 
 def _git(args, cwd):
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+
+
+def _git_unavailable_result() -> GitRunResult:
+    capability = GitCapability(
+        state=GitCapabilityState.UNAVAILABLE,
+        reason="git_not_found",
+    )
+    return GitRunResult(
+        state=GitRunState.UNAVAILABLE,
+        returncode=None,
+        stdout=b"",
+        stderr=b"git_not_found",
+        capability=capability,
+    )
 
 
 @pytest.fixture
@@ -44,6 +64,36 @@ def test_prepare_clones_and_branches(monkeypatch, tmp_path, source_repo):
     assert prepared.base_commit
     # Source repo is never mutated (we cloned).
     assert (source_repo / "mod.py").exists()
+
+
+@pytest.mark.parametrize("operation", ["scratch", "clone"])
+def test_prepare_fails_fast_when_safe_git_is_unavailable(
+    monkeypatch,
+    tmp_path,
+    operation,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_CODETASK_RUNS_DIR", str(tmp_path / "runs"))
+    calls: list[tuple[tuple[str, ...], object, bool]] = []
+
+    def unavailable(args, *, cwd=None, allow_user_interaction=False, **_kwargs):
+        calls.append((tuple(args), cwd, allow_user_interaction))
+        return _git_unavailable_result()
+
+    monkeypatch.setattr(workspace, "run_git", unavailable)
+
+    with pytest.raises(workspace.WorkspaceError, match="code-task requires Git"):
+        if operation == "scratch":
+            workspace.prepare_scratch_repo("missing-git", slug="demo")
+        else:
+            workspace.prepare_repo(
+                "missing-git",
+                "https://example.invalid/repository.git",
+                slug="demo",
+            )
+
+    assert calls
+    assert calls[0][0][0] == ("init" if operation == "scratch" else "clone")
+    assert calls[0][2] is True
 
 
 def test_build_artifacts_excluded_from_change(monkeypatch, tmp_path, source_repo):

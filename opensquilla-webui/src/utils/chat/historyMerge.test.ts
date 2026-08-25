@@ -166,6 +166,28 @@ describe('mergeLiveOnlyFields', () => {
     expect(mergeLiveOnlyFields(msg({ interrupted: true }), msg({ interrupted: false })).interrupted).toBe(false)
   })
 
+  it('keeps the ordered local timeline and matching calls for an older server row', () => {
+    const timeline = [
+      { type: 'text', raw: 'Working note.', presentation: 'intermediate' as const },
+      { type: 'tool-group', groupId: 'stream:tool-group:file.read:0' },
+      { type: 'text', raw: 'Final answer.', presentation: 'answer' as const },
+    ]
+    const toolCalls = [{
+      id: 'tool-1',
+      name: 'read_file',
+      groupId: 'stream:tool-group:file.read:0',
+      result: 'ok',
+    }]
+
+    const merged = mergeLiveOnlyFields(
+      msg({ timeline, tool_calls: toolCalls }),
+      msg({ timeline: [], tool_calls: [{ id: 'server-tool', name: 'read_file' }] }),
+    )
+
+    expect(merged.timeline).toEqual(timeline)
+    expect(merged.tool_calls).toEqual(toolCalls)
+  })
+
   it('does not let stale history regress a terminal steer disposition', () => {
     const merged = mergeLiveOnlyFields(
       msg({

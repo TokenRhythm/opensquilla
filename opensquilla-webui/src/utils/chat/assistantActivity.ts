@@ -128,6 +128,8 @@ export interface AssistantActivityStatusStep {
   key: string
   label: AssistantActivityCodeDescriptor<AssistantActivityStatusCode>
   at: number
+  activityOrder?: number
+  endedAt?: number
   isCurrent: boolean
   id?: string
   category?: 'phase' | 'maintenance'
@@ -207,6 +209,19 @@ interface ActivitySemantic {
   footprintKind: 'web' | 'file' | 'command' | 'artifact' | 'memory' | 'tool'
 }
 
+const INTERNAL_MUTATION_PRESENTATION_MARKERS = [
+  'theuserinstructions',
+  'userinstructions',
+  'documentmutationoutcome',
+  'responseinstruction',
+  'responselocale',
+]
+
+function containsInternalMutationPresentation(text: string): boolean {
+  const compact = text.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  return INTERNAL_MUTATION_PRESENTATION_MARKERS.some(marker => compact.includes(marker))
+}
+
 const LIFECYCLE_CODES: Record<AssistantActivityLifecycle, AssistantActivityLifecycleCode> = {
   working: 'chat.activity.lifecycle.working',
   answering: 'chat.activity.lifecycle.answering',
@@ -231,6 +246,12 @@ const FILE_INSPECT_TOOLS = new Set([
   'list_directory',
   'glob_search',
   'grep_search',
+  'document_inspect',
+  'document_read',
+  'document_locate',
+  'document_browser_inspect',
+  'document_browser_screenshot',
+  'document_browser_reload',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -240,6 +261,10 @@ const FILE_CHANGE_TOOLS = new Set([
   'edit_file',
   'edit_source',
   'apply_patch',
+  'document_apply',
+  'document_patch',
+  'document_browser_act',
+  'document_finish',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',
@@ -504,22 +529,40 @@ function terminalTimelineAnswerCandidate(
     break
   }
 
-  if (index < 0 || timeline[index]?.type !== 'text') return null
+  const terminalItem = timeline[index]
+  if (
+    index < 0
+    || !terminalItem
+    || terminalItem.type !== 'text'
+    || terminalItem.presentation === 'intermediate'
+  ) return null
 
   const indexes = new Set<number>()
   const chunks: string[] = []
   while (index >= 0) {
     const item = timeline[index]
-    if (!item || item.type !== 'text') break
+    if (!item || item.type !== 'text' || item.presentation === 'intermediate') break
     if (typeof item.rawText !== 'string') return null
     indexes.add(index)
     chunks.unshift(item.rawText)
     index -= 1
   }
+  // A gateway-owned intermediate marker is an explicit semantic boundary.
+  // It is stronger than the legacy adjacency heuristic and keeps immediately
+  // preceding work narration inside Activity even when no tool separates it
+  // from the final answer span.
+  const boundaryItem = timeline[index]
+  const crossedPresentationBoundary = index >= 0
+    && boundaryItem?.type === 'text'
+    && boundaryItem.presentation === 'intermediate'
   const crossedOrdinaryToolBoundary = index >= 0
     && timeline[index]?.type === 'tool-group'
     && !isSuccessfulAnswerTransparentControlGroup(timeline[index])
-  if (!crossedControlBoundary && !crossedOrdinaryToolBoundary) return null
+  if (
+    !crossedControlBoundary
+    && !crossedOrdinaryToolBoundary
+    && !crossedPresentationBoundary
+  ) return null
 
   const compact = chunks.join('')
   if (!compact.trim()) return null
@@ -973,6 +1016,8 @@ function projectStatusSteps(
         key: `activity-maintenance:${entry.id || stableHash(`${entry.at}`)}`,
         label,
         at: entry.at,
+        activityOrder: entry.activityOrder,
+        endedAt: entry.endedAt,
         isCurrent: entry.state === 'running',
         id: entry.id,
         category: 'maintenance',
@@ -991,11 +1036,20 @@ function projectStatusSteps(
       continue
     }
     const previous = steps[steps.length - 1]
-    if (previous?.label.code === label.code) continue
+    // Legacy history has no authoritative order and keeps the old consecutive
+    // label de-duplication. Ordered live/v2 records keep distinct occurrences:
+    // a tool or narration can sit between equal phase labels even though it is
+    // not represented in this status-only projection.
+    if (
+      previous?.label.code === label.code
+      && previous.activityOrder === entry.activityOrder
+    ) continue
     steps.push({
       key: `activity-status:${stableHash(`${entry.action}\u001f${entry.at}`)}`,
       label,
       at: entry.at,
+      activityOrder: entry.activityOrder,
+      endedAt: entry.endedAt,
       isCurrent: false,
       category: 'phase',
     })
@@ -1012,7 +1066,10 @@ function projectStatusSteps(
   const phaseSteps = mergedSteps.filter(step => step.category !== 'maintenance')
   for (const [index, step] of phaseSteps.entries()) {
     const nextAt = phaseSteps[index + 1]?.at
-    const boundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const derivedBoundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const boundary = Number.isFinite(step.endedAt) && Number(step.endedAt) >= step.at
+      ? Number(step.endedAt)
+      : derivedBoundary
     if (!Number.isFinite(boundary) || boundary < step.at) continue
     step.durationSeconds = Math.max(0, Math.floor((boundary - step.at) / 1000))
   }
@@ -1102,11 +1159,27 @@ export function projectAssistantActivity(
   fallbackToolItems: ChatStreamTimelineItem[] = [],
   options: ProjectAssistantActivityOptions = {},
 ): AssistantActivityProjection {
-  const timeline = message.timelineItems?.length
+  const sourceTimeline = message.timelineItems?.length
     ? message.timelineItems
     : fallbackToolItems
+  const mutationPresentationText = [
+    String(message.text || ''),
+    ...sourceTimeline.flatMap(item =>
+      item.type === 'text' && typeof item.rawText === 'string' ? [item.rawText] : [],
+    ),
+  ].join('\n')
+  const hideInternalMutationPresentation = Boolean(
+    message.turnOutcome?.documentMutationOutcome
+    && containsInternalMutationPresentation(mutationPresentationText),
+  )
+  const timeline = hideInternalMutationPresentation
+    ? sourceTimeline.filter(item => item.type !== 'text')
+    : sourceTimeline
+  const presentationMessage = hideInternalMutationPresentation
+    ? { ...message, text: '' }
+    : message
   const lifecycle = options.lifecycle ?? 'settled'
-  const answerResolution = resolveAssistantAnswer(message, timeline, lifecycle)
+  const answerResolution = resolveAssistantAnswer(presentationMessage, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
   const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText

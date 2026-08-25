@@ -64,7 +64,7 @@ function projectedRunState(
   }
 }
 
-function makeHarness() {
+function makeHarness({ supportsTurnCommitted = false } = {}) {
   const stream = makeStream()
   const messages: Ref<ChatMessage[]> = ref([])
   const activeStreamTaskId = ref('task-A')
@@ -122,6 +122,7 @@ function makeHarness() {
     handleRouterControlReplay: vi.fn(),
     showCompactionToast: vi.fn(),
     showWarningToast: vi.fn(),
+    supportsTurnCommitted: () => supportsTurnCommitted,
     scheduleHistorySync: vi.fn(),
     schedulePendingDrainAfterTerminal: vi.fn(),
     popAllPendingIntoComposer: vi.fn(() => false),
@@ -135,6 +136,24 @@ function makeHarness() {
 }
 
 describe('task ownership event races', () => {
+  it('drops stopped-task text deltas while retaining terminal ownership', () => {
+    const { api, stream, taskOwnership, scope } = makeHarness()
+    expect(taskOwnership.beginStop()).toBe('task-A')
+
+    api.handlers.onTextDelta({
+      task_id: 'task-A',
+      session_key: SESSION,
+      stream_seq: 1,
+      text: 'late provider text',
+    })
+
+    expect(stream.appendDelta).not.toHaveBeenCalled()
+    expect(stream.resetStreamIdleTimer).toHaveBeenCalled()
+    expect(taskOwnership.runningTaskId.value).toBe('task-A')
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('task-A')
+    scope.stop()
+  })
+
   it.each([
     ['session.event.done', { reason: 'completed', text: 'answer A' }, undefined],
     ['task.failed', { terminal_message: 'A failed' }, undefined],
@@ -462,6 +481,39 @@ describe('task ownership event races', () => {
     scope.stop()
   })
 
+  it('preserves the accepted router identity when a successor is replayed', () => {
+    const { api, options, activeStreamTaskId, scope } = makeHarness()
+
+    api.handlers.onTaskQueued({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onRouterDecision({
+      task_id: 'task-B',
+      session_key: SESSION,
+      turn_id: 'turn-B',
+      stream_seq: 10,
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    })
+
+    expect(options.queueRouterDecision).not.toHaveBeenCalled()
+
+    api.handlers.onAny('session.event.done', {
+      task_id: 'task-A',
+      session_key: SESSION,
+      stream_seq: 11,
+      reason: 'completed',
+      text: 'complete A answer',
+    })
+
+    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(options.queueRouterDecision).toHaveBeenCalledOnce()
+    const [payload, identityStreamSeq] = vi.mocked(options.queueRouterDecision).mock.calls[0]!
+    expect(payload).not.toHaveProperty('stream_seq')
+    expect(identityStreamSeq).toBe(10)
+    scope.stop()
+  })
+
   it('accepts a queued-only Stop terminal despite an empty render owner', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     taskOwnership.noteTerminal('task-A')
@@ -595,6 +647,58 @@ describe('task ownership event races', () => {
     expect(activeStreamTaskId.value).toBe('task-A')
     expect(stream.endStreaming).not.toHaveBeenCalled()
     expect(options.applySessionRunState).not.toHaveBeenCalled()
+    scope.stop()
+  })
+
+  it('settles a late A commit without ending or idling running B', () => {
+    const {
+      api,
+      options,
+      stream,
+      activeStreamTaskId,
+      taskOwnership,
+      scope,
+    } = makeHarness({ supportsTurnCommitted: true })
+
+    api.handlers.onAny('session.event.done', {
+      task_id: 'task-A',
+      turn_id: 'turn-A',
+      session_key: SESSION,
+      stream_seq: 1,
+      reason: 'completed',
+      text: 'answer A',
+    })
+    api.handlers.onTaskRunning({
+      task_id: 'task-B',
+      session_key: SESSION,
+    })
+
+    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(taskOwnership.runningTaskId.value).toBe('task-B')
+    vi.mocked(stream.endStreaming).mockClear()
+    vi.mocked(options.applySessionRunState).mockClear()
+    vi.mocked(options.scheduleHistorySync).mockClear()
+    const noteTerminal = vi.spyOn(taskOwnership, 'noteTerminal')
+
+    api.handlers.onAny('session.event.turn_committed', {
+      schema_version: 1,
+      task_id: 'task-A',
+      turn_id: 'turn-A',
+      session_key: SESSION,
+      stream_seq: 2,
+      status: 'succeeded',
+      terminal_reason: 'completed',
+      finished_at: 123,
+    })
+
+    expect(api.awaitingCommitTaskIds.value).toEqual(new Set())
+    expect(noteTerminal).toHaveBeenCalledWith('task-A', false)
+    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(taskOwnership.runningTaskId.value).toBe('task-B')
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(options.applySessionRunState).not.toHaveBeenCalled()
+    expect(options.scheduleHistorySync).toHaveBeenCalledOnce()
+    expect(options.scheduleHistorySync).toHaveBeenCalledWith(true)
     scope.stop()
   })
 })

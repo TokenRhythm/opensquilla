@@ -893,6 +893,27 @@ class GatewayClient:
         result = await self._call("models.routing.set", {"mode": mode})
         return result if isinstance(result, dict) else {}
 
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        result = await self._call("sessions.routing.get", {"sessionKey": key})
+        return result if isinstance(result, dict) else {}
+
+    async def set_session_routing(
+        self,
+        key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        result = await self._call(
+            "sessions.routing.set",
+            {
+                "sessionKey": key,
+                "mode": mode,
+                "expectedRevision": expected_revision,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
     async def usage_status(self) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("usage.status", {}))
 

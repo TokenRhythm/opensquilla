@@ -205,6 +205,21 @@ compatibility. Declare the endpoint's real window under
 `[models.custom_anthropic."<model>"]`; this is important for both remote
 gateways and local servers with larger windows.
 
+`custom` and `custom_anthropic` default to a zero token-cost estimate. This
+does not mean a remote service, GPU, or other infrastructure is free. To
+estimate a paid endpoint, set both input and output prices for its exact
+provider/model override; cache-read and cache-write prices remain optional:
+
+```toml
+[models.custom."vendor-model"]
+input_cost_per_mtok = 0.5
+output_cost_per_mtok = 2.0
+```
+
+If either main price is omitted, the generic custom endpoint remains at the
+zero-price default and does not inherit a same-named marketplace model's
+price.
+
 The current custom-provider boundary is intentionally explicit:
 
 - protocol selection is available through the two fixed provider ids;
@@ -380,7 +395,7 @@ carries a `basis` label:
 | --- | --- |
 | `cache_aware` | All buckets present in the call have a known rate; the four-bucket math ran. |
 | `cache_blind` | The call used cache tokens but a needed cache rate is unknown, so OpenSquilla fell back to pricing every input token (cache or fresh) at the plain input rate. This is a conservative upper bound, not the real charge — expect it to overstate cost on cache-heavy sessions. |
-| `free` | The model or runtime is zero-priced (see local runtimes below). |
+| `free` | The model or runtime is zero-priced, including generic custom endpoints without complete price overrides. |
 
 ### Price Resolution Order
 
@@ -389,15 +404,19 @@ these layers, first match wins:
 
 1. **Local runtime** — `ollama`, `lm_studio`, `ovms`, `vllm`, and `local` are
    always free, regardless of model id.
-2. **User override** — `[models.<provider_id>."<model_id>"]` in your config
+2. **Generic custom endpoint** — `custom` and `custom_anthropic` use a
+   complete explicit input/output price override when present; otherwise they
+   resolve to zero with `priceSource="custom_free"` and stop before catalog,
+   live, static, or default cloud pricing.
+3. **User override** — `[models.<provider_id>."<model_id>"]` in your config
    (see [`configuration.md`](configuration.md) and `opensquilla.toml.example`).
-3. **Model catalog** — the vendored models.dev snapshot, including per-model
+4. **Model catalog** — the vendored models.dev snapshot, including per-model
    cache-read/cache-write rates where upstream publishes them.
-4. **Live OpenRouter endpoint price** — looked up only when the provider is
+5. **Live OpenRouter endpoint price** — looked up only when the provider is
    `openrouter` or unset (first-party provider ids never query the OpenRouter
    marketplace); falls back to the static table if OpenRouter is unreachable.
-5. **Static table** — a built-in pricing table bundled with OpenSquilla.
-6. **Default** — `$3` / `$15` per million input/output tokens when nothing
+6. **Static table** — a built-in pricing table bundled with OpenSquilla.
+7. **Default** — `$3` / `$15` per million input/output tokens when nothing
    else matched.
 
 If OpenSquilla is estimating a model at the wrong price, add an override
@@ -411,8 +430,10 @@ cache_read_cost_per_mtok = 0.05  # USD per million cached-prompt-read tokens
 cache_write_cost_per_mtok = 0.6  # USD per million cached-prompt-write tokens
 ```
 
-Quote model ids that contain dots or slashes. All four fields are optional —
-set only the ones you need to correct. `config.set`/`patch`/`apply` and
+Quote model ids that contain dots or slashes. For ordinary provider overrides,
+all four fields are optional. For `custom` and `custom_anthropic`, set
+`input_cost_per_mtok` and `output_cost_per_mtok` together to enable a nonzero
+estimate; cache rates remain optional. `config.set`/`patch`/`apply` and
 `opensquilla gateway reload` hot-apply these overrides; see
 `opensquilla.toml.example` for more examples including self-hosted `vllm` and
 `custom` endpoints.
@@ -427,15 +448,15 @@ exposed dual-cased as `cost_source`):
 | `provider_billed` | The full cost came from a real provider-reported bill. |
 | `opensquilla_estimate` | No billed cost was available; the figure is a local estimate. |
 | `mixed` | The same model had both billed and unbilled calls in the aggregated row — the total is billed cost plus an estimate for the rest, not a pure bill. |
-| `unavailable` | No pricing table entry and no billed cost, so no dollar figure could be produced. |
+| `unavailable` | No billed cost or positive local estimate is available. |
 
 Rows also carry two additive fields: `estimateBasis` (the `cache_aware` /
 `cache_blind` / `free` label above, present only when part of the row was
 estimated) and `priceSource` (which resolver layer priced it — `user_override`,
-`catalog`, `live_openrouter`, `static_table`, `default`, or `local_free`). The
-Web UI's by-model usage cards show a small source chip for `costSource` and,
-when the underlying basis is `cache_blind`, a hint that the figure is an
-upper bound rather than the real cache-discounted cost.
+`catalog`, `live_openrouter`, `static_table`, `default`, `local_free`, or
+`custom_free`). The Web UI's by-model usage cards show a small source chip for
+`costSource` and, when the underlying basis is `cache_blind`, a hint that the
+figure is an upper bound rather than the real cache-discounted cost.
 
 ### Which Providers Yield Billed vs. Estimated Cost
 
@@ -445,7 +466,7 @@ upper bound rather than the real cache-discounted cost.
 | Cache-aware estimate possible | `anthropic`, `deepseek`, `minimax` (Anthropic-shaped), ensemble members |
 | Cache-read-aware estimate only (no cache-write rate) | `openai`, `openai_responses`, `azure`, `gemini`, `openai_codex` |
 | Cache-blind estimate (falls back to plain input-rate pricing when cache tokens appear) | other OpenAI-compatible provider kinds |
-| Free | local runtimes (`ollama`, `lm_studio`, `ovms`, `vllm`, `local`) |
+| Zero-priced estimate | local runtimes (`ollama`, `lm_studio`, `ovms`, `vllm`, `local`) and `custom` / `custom_anthropic` without complete input/output price overrides |
 | Subscription (no invoice to compare against) | coding-plan/subscription provider kinds — treat any reported figure as an estimate, not a bill |
 
 Use `opensquilla providers status --probe-models` and `opensquilla cost
@@ -461,9 +482,12 @@ Two per-turn agent budgets exist and behave differently:
   do not rely on it alone outside `openrouter`.
 - `max_turn_cost_usd` gates on the same accumulator used everywhere else in
   this section: billed cost when the provider reports it, otherwise the
-  cache-aware/cache-blind estimate. It works on every provider. When it trips,
-  the error (`turn_cost_budget_exceeded`) states whether the total was billed,
-  estimated, or mixed.
+  cache-aware/cache-blind estimate. It can trip only when a call has billed
+  cost or a nonzero local estimate. A generic custom endpoint without complete
+  input/output price overrides resolves to zero, so configure both rates before
+  relying on this gate for a paid custom endpoint. When it trips, the error
+  (`turn_cost_budget_exceeded`) states whether the total was billed, estimated,
+  or mixed.
 
 SquillaRouter's session budget gate (`[squilla_router.budget]`, see
 [`features/squilla-router.md`](features/squilla-router.md)) logs a

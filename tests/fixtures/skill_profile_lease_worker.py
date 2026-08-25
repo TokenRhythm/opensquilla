@@ -81,14 +81,12 @@ class _OfflineSource(SkillSource):
         return SkillMeta(name=identifier, source_id=self.source_id)
 
 
-def _hold_profile_lease(profile_home: Path, ready: Path, release: Path) -> None:
+def _hold_profile_lease(profile_home: Path, ready: Path) -> None:
     with ProfileOperationLock(profile_home):
         ready.write_text("ready", encoding="utf-8")
-        deadline = time.monotonic() + 15.0
-        while not release.exists():
-            if time.monotonic() >= deadline:
-                os._exit(_HOLDER_TIMEOUT_EXIT_CODE)
-            time.sleep(0.01)
+        # The parent owns the write end. A deliberate close releases the lease,
+        # and an abnormal parent exit produces EOF without a fixture deadline.
+        sys.stdin.buffer.read(1)
 
 
 def _offline_install(
@@ -175,7 +173,7 @@ def _probe_unleased_build_services(
 def main() -> None:
     mode = sys.argv[1]
     if mode == "hold":
-        _hold_profile_lease(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
+        _hold_profile_lease(Path(sys.argv[2]), Path(sys.argv[3]))
         return
     if mode == "install":
         _offline_install(

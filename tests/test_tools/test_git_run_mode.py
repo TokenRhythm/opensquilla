@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.git_runtime import GitCapability, GitCapabilityState
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
@@ -20,6 +21,26 @@ class _FakeProcess:
 
     async def communicate(self) -> tuple[bytes, None]:
         return b"## main\n", None
+
+
+class _NotRepositoryProcess(_FakeProcess):
+    returncode = 128
+
+    async def communicate(self) -> tuple[bytes, None]:
+        return b"fatal: not a git repository (or any parent directory): .git\n", None
+
+
+@pytest.fixture(autouse=True)
+def _resolved_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        git,
+        "resolve_git_capability",
+        lambda **_kwargs: GitCapability(
+            state=GitCapabilityState.AVAILABLE,
+            executable=Path("/resolved/git"),
+            source="test",
+        ),
+    )
 
 
 def test_read_only_git_diff_disables_repository_controlled_helpers() -> None:
@@ -37,11 +58,65 @@ def test_read_only_git_diff_disables_repository_controlled_helpers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_git_unavailable_is_reported_without_launching_a_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        git,
+        "resolve_git_capability",
+        lambda **_kwargs: GitCapability(
+            state=GitCapabilityState.UNAVAILABLE,
+            reason="git_not_found",
+        ),
+    )
+    monkeypatch.setattr(
+        git,
+        "create_owned_subprocess_exec",
+        lambda *_args, **_kwargs: pytest.fail("unavailable Git must not be launched"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^GIT_UNAVAILABLE:"):
+        await git._run_git("status")
+
+
+@pytest.mark.asyncio
+async def test_git_non_repository_failure_has_stable_error_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_runtime()
+
+    async def fake_create_subprocess_exec(
+        *args: str, **kwargs: Any
+    ) -> _NotRepositoryProcess:
+        del args, kwargs
+        return _NotRepositoryProcess()
+
+    monkeypatch.setattr(git, "create_owned_subprocess_exec", fake_create_subprocess_exec)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            workspace_dir=str(tmp_path),
+            run_mode="full",
+            session_key="agent:main:test",
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match=r"^GIT_NOT_REPOSITORY:"):
+            await git.git_status()
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+
+@pytest.mark.asyncio
 async def test_git_status_run_mode_full_uses_host_subprocess(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reset_runtime()
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    monkeypatch.setenv("GCM_INTERACTIVE", "Always")
     calls: list[dict[str, Any]] = []
 
     async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
@@ -64,16 +139,22 @@ async def test_git_status_run_mode_full_uses_host_subprocess(
         reset_runtime()
 
     assert result == "## main\n"
-    assert calls == [
-        {
-            "args": ("git", "status", "--short", "--branch"),
-            "kwargs": {
-                "stdout": git.asyncio.subprocess.PIPE,
-                "stderr": git.asyncio.subprocess.STDOUT,
-                "cwd": str(tmp_path),
-            },
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0]["args"] == (
+        str(Path("/resolved/git")),
+        "status",
+        "--short",
+        "--branch",
+    )
+    kwargs = calls[0]["kwargs"]
+    assert kwargs["stdout"] is git.asyncio.subprocess.PIPE
+    assert kwargs["stderr"] is git.asyncio.subprocess.STDOUT
+    assert kwargs["cwd"] == str(tmp_path)
+    environment = kwargs["env"]
+    assert environment["LC_ALL"] == "C"
+    assert environment["LANG"] == "C"
+    assert environment["GIT_TERMINAL_PROMPT"] == "1"
+    assert environment["GCM_INTERACTIVE"] == "Always"
 
 
 @pytest.mark.asyncio
@@ -121,8 +202,9 @@ async def test_git_uses_runtime_read_only_profile_and_read_only_mounts(
     assert request.policy.workspace_rw is False
     assert request.policy.tmp_writable is False
     assert all(mount.mode == "ro" for mount in request.policy.mounts)
+    assert request.env == {"LC_ALL": "C", "LANG": "C"}
     assert request.argv[:4] == (
-        "git",
+        str(Path("/resolved/git")),
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",

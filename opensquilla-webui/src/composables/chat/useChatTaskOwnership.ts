@@ -28,6 +28,10 @@ function taskStatus(task: ChatRunTask | null | undefined): string {
   return normalizedStatus(task?.status)
 }
 
+function taskCancelRequested(task: ChatRunTask | null | undefined): boolean {
+  return task?.cancel_requested === true || task?.cancelRequested === true
+}
+
 function taskList(source: ChatRunStatusSource | null | undefined): ChatRunTask[] {
   if (!source || typeof source !== 'object') return []
   const value = (source as ChatRunStatusSource & { tasks?: unknown }).tasks
@@ -242,6 +246,10 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
     runningTaskId.value = nextRunningTaskId
     queuedTaskIds.value = new Set(nextQueuedTaskIds)
     hydrationResolved.value = true
+    const snapshotStopTaskId = taskCancelRequested(activeTask)
+      ? chatTaskId(activeTask)
+      : ''
+    if (snapshotStopTaskId) stopRequestedTaskId.value = snapshotStopTaskId
     const stoppedTask = stopRequestedTaskId.value
       ? tasks.find(task => chatTaskId(task) === stopRequestedTaskId.value)
       : null

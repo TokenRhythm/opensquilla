@@ -15,6 +15,9 @@ import pytest
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.session_model_routing import (
+    capture_accepted_model_routing_config,
+)
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
@@ -152,6 +155,21 @@ async def test_chat_send_fork_atomically_accepts_child_prefix_message_task_and_r
 ) -> None:
     async with _open_fork_stack(tmp_path / "sessions.db") as stack:
         fork_before_message_id = await _seed_parent(stack)
+        await stack.manager.set_session_routing(
+            PARENT_KEY,
+            "router",
+            expected_revision=0,
+        )
+
+        async def production_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                stack.context.config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = production_provider
 
         response = await get_dispatcher().dispatch(
             "rpc-fork-success",
@@ -178,6 +196,8 @@ async def test_chat_send_fork_atomically_accepts_child_prefix_message_task_and_r
         assert child.parent_session_key == PARENT_KEY
         assert child.forked_from_parent is True
         assert child.display_name == "Atomic fork parent (2)"
+        assert child.model_routing_mode == "router"
+        assert child.model_routing_revision == 0
         child_entries = await stack.manager.get_transcript(child_key)
         assert [entry.content for entry in child_entries] == ["A marker", "B edited"]
         assert child_entries[0].turn_context == {
@@ -208,6 +228,8 @@ async def test_chat_send_fork_atomically_accepts_child_prefix_message_task_and_r
         assert task.session_key == child_key
         assert task.details["persisted_user_message_id"] == child_entries[-1].message_id
         assert task.details["fresh_user_session"] is False
+        assert task.details["accepted_model_routing"]["effective_mode"] == "router"
+        assert task.details["accepted_model_routing"]["session_revision"] == 0
         receipt = await stack.storage.get_turn_ingress_receipt(
             source_scope="web:webchat:operator",
             request_session_key=PARENT_KEY,

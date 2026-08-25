@@ -1,9 +1,16 @@
 # OpenSquilla Electron Desktop Shell
 
-This package is the macOS desktop shell for the existing OpenSquilla Control UI.
-It does not rewrite the Vue frontend. The Electron main process configures a
-desktop credential, starts a local gateway, and loads the backend-served
-`/control/` app.
+This package is the macOS, Windows, and Linux desktop shell for the existing
+OpenSquilla Vue UI. It does not rewrite the frontend. Electron loads a local
+Desktop renderer first, then starts the Gateway as a background runtime and
+publishes a typed connection descriptor when it is ready. A Gateway failure
+disables runtime-backed features but does not take down the application window.
+
+The browser `/control/` entry remains available. Desktop packages keep one
+verified Vue artifact at `runtime/gateway/control-ui-dist`; Electron loads it
+locally and the bundled Gateway serves that same copy to browser clients. The
+artifact is removed from the frozen Python subtree after PyInstaller staging so
+the new startup model does not duplicate the UI or inflate the installer.
 
 ## Development Flow
 
@@ -55,8 +62,9 @@ cd desktop/electron
 npm run dist:local
 ```
 
-This builds the Vue Control UI, bundles the gateway with PyInstaller, and emits
-desktop artifacts for the current platform under `dist/desktop-electron/`.
+This builds the shared Vue browser/Desktop artifact, bundles the gateway with
+PyInstaller, removes its staged duplicate UI copy, and emits desktop artifacts
+for the current platform under `dist/desktop-electron/`.
 
 For a faster rebuild after the runtime already exists:
 
@@ -82,8 +90,9 @@ current policy.
 
 ## Current Scope
 
-- Reuses `opensquilla-webui` and the Python gateway exactly as they run in the
-  browser.
+- Reuses `opensquilla-webui` for both the local Desktop entry and browser
+  `/control/` entry.
+- Loads the local renderer before waiting for Gateway `/readyz`.
 - Starts a bundled `runtime/gateway/opensquilla-gateway` in packaged builds.
 - Falls back to `uv run opensquilla gateway run --listen 127.0.0.1 --port <port>`
   during development when no bundled runtime exists.

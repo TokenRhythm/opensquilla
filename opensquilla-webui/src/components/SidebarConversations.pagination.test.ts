@@ -96,4 +96,46 @@ describe('SidebarConversations pagination', () => {
     expect(root.textContent).not.toContain('No matches')
     expect(loadMore).toHaveBeenCalled()
   })
+
+  it('loads only when the real scroll position reaches the bottom threshold', async () => {
+    i18n.global.locale.value = 'en'
+    const loadMore = vi.fn()
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const Root = defineComponent(() => () => h(SidebarConversations, {
+      sections: [{ family: 'chats', label: 'Tasks', rows: [taskRow('agent:main:webchat:one', 'main')] }],
+      error: false,
+      loading: false,
+      loadingMore: false,
+      loadMoreError: false,
+      hasMore: true,
+      currentKey: '',
+      contractDebugEnabled: false,
+      searchHint: 'Ctrl+K',
+      onLoadMore: loadMore,
+    }))
+    const app = createApp(Root)
+    app.use(i18n)
+    app.mount(root)
+    mounted.push(app)
+    await nextTick()
+    await nextTick()
+
+    const list = root.querySelector<HTMLElement>('.sidebar-history-list')!
+    Object.defineProperties(list, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 200 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    })
+    loadMore.mockClear()
+
+    list.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(loadMore).not.toHaveBeenCalled()
+
+    list.scrollTop = 640
+    list.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(loadMore).toHaveBeenCalledTimes(1)
+  })
 })

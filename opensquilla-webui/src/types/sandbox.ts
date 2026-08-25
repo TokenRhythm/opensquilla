@@ -89,6 +89,67 @@ export interface SandboxRuntimeVersion {
   available: boolean
 }
 
+export type SandboxRuntimeComponentId = 'python' | 'node' | 'gitBash'
+export type SandboxRuntimeAvailability = 'unsupported' | 'missing' | 'ready' | 'corrupt'
+export type SandboxRuntimeOperationState =
+  | 'queued'
+  | 'downloading'
+  | 'verifying'
+  | 'extracting'
+  | 'probing'
+  | 'activating'
+  | 'cancelling'
+  | 'removing'
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+  | 'interrupted'
+export type SandboxRuntimeSource = 'oss' | 'github'
+
+export interface SandboxRuntimeError {
+  code?: string
+  message: string
+  retryable?: boolean
+  source?: SandboxRuntimeSource | null
+}
+
+export interface SandboxRuntimeOperation {
+  operationId: string
+  componentId: SandboxRuntimeComponentId
+  kind: 'install' | 'remove'
+  state: SandboxRuntimeOperationState
+  source: SandboxRuntimeSource | null
+  downloadedBytes: number
+  totalBytes: number | null
+  progressPercent: number
+  startedAtMs: number
+  updatedAtMs: number
+  error: SandboxRuntimeError | null
+}
+
+export interface SandboxRuntimeComponentStatus {
+  componentId: SandboxRuntimeComponentId
+  availability: SandboxRuntimeAvailability
+  catalogVersion: string | null
+  activeVersion: string | null
+  installedBytes: number | null
+  removable: boolean
+  resumeAvailable: boolean
+  resumeBytes: number
+  operation: SandboxRuntimeOperation | null
+  lastError: SandboxRuntimeError | null
+}
+
+export interface SandboxRuntimePackStatus {
+  schemaVersion: 1
+  managementSupported: boolean
+  target: string | null
+  catalogVersion: string | null
+  sourceOrder: SandboxRuntimeSource[]
+  components: SandboxRuntimeComponentStatus[]
+  nextPollAfterMs: number
+}
+
 export interface SandboxPolicyDefaults {
   builtinDenyWritePaths: string[]
   runtimeTarget: string | null

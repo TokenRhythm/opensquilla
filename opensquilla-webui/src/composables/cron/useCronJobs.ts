@@ -33,6 +33,7 @@ export function useCronJobs() {
     if (!d) return []
     return Array.isArray(d) ? d : (d.jobs || [])
   })
+  const hasLoaded = computed(() => cronData.value !== null)
 
   let tickInterval: ReturnType<typeof setInterval> | null = null
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
@@ -194,6 +195,7 @@ export function useCronJobs() {
 
   return {
     jobs,
+    hasLoaded,
     loading,
     error,
     searchText,

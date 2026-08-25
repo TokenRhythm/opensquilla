@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick, reactive, type App } from 'vue'
 import i18n from '@/i18n'
 import ChatComposer from './ChatComposer.vue'
+import ChatComposerModelRouting from './ChatComposerModelRouting.vue'
 
 function pointerDown(target: EventTarget) {
   target.dispatchEvent(new Event('pointerdown', { bubbles: true, composed: true }))
@@ -18,13 +19,14 @@ async function mountComposer(overrides: Record<string, unknown> = {}) {
     busySendMode: 'queue',
     hasSendContent: false,
     isStreaming: false,
+    canStop: false,
     isNewLanding: false,
     placeholder: 'Send a message',
     sendButtonTitle: 'Send',
     runMode: 'safe',
     allowedRunModes: ['safe', 'full'],
-    modelRoutingMode: 'off',
-    modelRoutingSettingsBusy: false,
+    sessionRoutingMode: 'off',
+    sessionRoutingBusy: false,
     routerVisualEffectsEnabled: true,
     codingModeEnabled: false,
     codingModeSettingsBusy: false,
@@ -64,6 +66,35 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it('keeps the focused routing option mounted while a mutation is busy', async () => {
+    const setMode = vi.fn()
+    const props = reactive({
+      modelRoutingMode: 'squilla_router',
+      busy: false,
+      onSetSessionRoutingMode: setMode,
+    })
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp({ render: () => h(ChatComposerModelRouting, props as any) })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const selected = el.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+    expect(selected).toBeTruthy()
+    selected?.focus()
+    props.busy = true
+    await nextTick()
+
+    expect(selected?.disabled).toBe(false)
+    expect(selected?.getAttribute('aria-disabled')).toBe('true')
+    expect(document.activeElement).toBe(selected)
+    selected?.click()
+    expect(setMode).not.toHaveBeenCalled()
+
+    app.unmount()
+  })
+
   it('keeps floating visuals opt-in for non-ChatView consumers', async () => {
     const { app, el } = await mountComposer()
     const root = el.querySelector('.chat-composer')
@@ -185,7 +216,7 @@ describe('ChatComposer popovers', () => {
   })
 
   it.each([
-    ['Model routing', '.composer-model-routing'],
+    ["This chat's model routing", '.composer-model-routing'],
     ['Execution mode', '.composer-run-mode'],
   ])('closes %s on outside pointerdown', async (label, selector) => {
     const { app, el } = await mountComposer()
@@ -217,13 +248,30 @@ describe('ChatComposer popovers', () => {
 
     await clickButton(el, 'More')
     expectPopover(el, '.chat-more-actions-menu', true)
-    await clickButton(el, 'Model routing')
+    await clickButton(el, "This chat's model routing")
     expectPopover(el, '.chat-more-actions-menu', false)
     expectPopover(el, '.composer-model-routing', true)
     await clickButton(el, 'Execution mode')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
 
+    app.unmount()
+  })
+
+  it('keeps routing choices read-only while a Goal is materializing', async () => {
+    const setMode = vi.fn()
+    const { app, el } = await mountComposer({
+      sessionRoutingControlBlocked: true,
+      onSetSessionRoutingMode: setMode,
+    })
+
+    await clickButton(el, "This chat's model routing")
+    const option = el.querySelector<HTMLButtonElement>('[role="radio"]')
+    expect(option?.getAttribute('aria-disabled')).toBe('true')
+    option?.click()
+    await nextTick()
+
+    expect(setMode).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -235,13 +283,14 @@ describe('ChatComposer popovers', () => {
       busySendMode: 'queue',
       hasSendContent: false,
       isStreaming: false,
+      canStop: false,
       isNewLanding: false,
       placeholder: 'Send a message',
       sendButtonTitle: 'Send',
       runMode: 'safe',
       allowedRunModes: ['safe', 'full'],
-      modelRoutingMode: 'off',
-      modelRoutingSettingsBusy: false,
+      sessionRoutingMode: 'off',
+      sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
       codingModeEnabled: false,
       codingModeSettingsBusy: false,
@@ -262,7 +311,7 @@ describe('ChatComposer popovers', () => {
     const popovers = [
       ['Add', '.composer-add-menu'],
       ['More', '.chat-more-actions-menu'],
-      ['Model routing', '.composer-model-routing'],
+      ["This chat's model routing", '.composer-model-routing'],
       ['Execution mode', '.composer-run-mode'],
     ] as const
     for (const [label, selector] of popovers) {
@@ -324,8 +373,8 @@ describe('ChatComposer popovers', () => {
       sendButtonTitle: 'Send',
       runMode: 'safe',
       allowedRunModes: ['safe', 'full'],
-      modelRoutingMode: 'off',
-      modelRoutingSettingsBusy: false,
+      sessionRoutingMode: 'off',
+      sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
       codingModeEnabled: false,
       codingModeSettingsBusy: false,

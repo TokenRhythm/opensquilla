@@ -41,6 +41,7 @@ log = structlog.get_logger("opensquilla.tools.dispatch")
 _PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
     {"approval_required", "approval_pending"}
 )
+_MAX_TERMINAL_RESPONSE_CHARS = 2_000
 
 
 _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
@@ -51,6 +52,33 @@ _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
 
 def _registered_terminates_turn(registered: Any) -> bool:
     return bool(getattr(getattr(registered, "spec", None), "terminates_turn", False))
+
+
+def _registered_terminal_response_text(
+    registered: Any,
+    content: Any,
+    *,
+    is_error: bool,
+) -> str | None:
+    """Extract one bounded completion receipt from an opted-in terminal tool."""
+
+    spec = getattr(registered, "spec", None)
+    field = str(getattr(spec, "terminal_response_field", "") or "").strip()
+    if is_error or not field or not _registered_terminates_turn(registered):
+        return None
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(field)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > _MAX_TERMINAL_RESPONSE_CHARS:
+        return None
+    return text
 
 
 def _plan_checkpoint_terminates_turn(tool_name: str, content: Any) -> bool:
@@ -431,6 +459,15 @@ async def finalize(
         # rather than inventing a handle the model cannot use.
         if budgeted.changed and execution_status is not None:
             execution_status = mark_execution_status_truncated(execution_status)
+    terminates_turn = (
+        (_registered_terminates_turn(registered) and not is_error)
+        or _plan_checkpoint_terminates_turn(call.tool_name, content)
+        or _user_input_terminates_turn(call.tool_name, content)
+        or (
+            call.tool_name == "router_control"
+            and router_control_payload_terminates_turn(content)
+        )
+    )
     return ToolResult(
         tool_use_id=call.tool_use_id,
         tool_name=call.tool_name,
@@ -438,13 +475,14 @@ async def finalize(
         is_error=is_error,
         artifacts=artifacts,
         execution_status=execution_status,
-        terminates_turn=(
-            (_registered_terminates_turn(registered) and not is_error)
-            or _plan_checkpoint_terminates_turn(call.tool_name, content)
-            or _user_input_terminates_turn(call.tool_name, content)
-            or (
-                call.tool_name == "router_control"
-                and router_control_payload_terminates_turn(content)
+        terminates_turn=terminates_turn,
+        terminal_response_text=(
+            _registered_terminal_response_text(
+                registered,
+                content,
+                is_error=is_error,
             )
+            if terminates_turn
+            else None
         ),
     )

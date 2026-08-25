@@ -177,6 +177,7 @@ import {
   artifactSizeLabel,
   artifactThumbnailUrl,
   canPreview,
+  isOfficeArtifact,
 } from '@/utils/chat/artifacts'
 
 const props = defineProps<{
@@ -222,6 +223,7 @@ const webOwnerCanNativeOpen = computed(() => {
 })
 
 function artifactCanOpen(artifact: ArtifactPayload): boolean {
+  if (props.preferWorkbench && isOfficeArtifact(artifact)) return true
   if (!canPreview(artifact)) return false
   if (props.preferWorkbench) return true
   if (!isActiveDocumentArtifactCandidate(artifact)) return true
@@ -330,7 +332,8 @@ async function openFile(artifact: ArtifactPayload) {
       mime: fetched.blob.type || String(artifact.mime || ''),
     })
     if (!result.ok) {
-      pushToast(result.message || t('chat.toast.artifactOpenFailed'), { tone: 'danger' })
+      if (result.message) console.warn('[artifact] Native open failed:', result.message)
+      pushToast(t('chat.toast.artifactOpenFailed'), { tone: 'danger' })
     }
     return
   }

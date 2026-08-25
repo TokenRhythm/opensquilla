@@ -13,10 +13,16 @@ from opensquilla.engine.steps.skills_filter import filter_skills
 from opensquilla.engine.steps.vision_followup_gate import apply_vision_followup_gate
 
 try:
-    from opensquilla.engine.steps.squilla_router import apply_squilla_router
+    from opensquilla.engine.steps.squilla_router import (
+        apply_squilla_router,
+        finalize_squilla_router_capacity,
+    )
 except ImportError:
 
     async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
+        return ctx
+
+    async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
         return ctx
 
 
@@ -26,6 +32,7 @@ __all__ = [
     "apply_vision_followup_gate",
     "enforce_coding_mode",
     "filter_skills",
+    "finalize_squilla_router_capacity",
     "inject_platform_hint",
     "inject_subagent_grounding",
     "meta_command_launch",

@@ -1245,7 +1245,7 @@ export function createComposer(deps) {
       borderStyle: "rounded",
       borderColor: THEME.brandAccent,
       backgroundColor: THEME.overlayBg,
-      title: " model strategy ",
+      title: ` ${modelRoutingPicker.title} `,
       titleAlignment: "left",
       flexDirection: "column",
       paddingLeft: 1,
@@ -1292,11 +1292,14 @@ export function createComposer(deps) {
       .filter((item) => Object.hasOwn(MODEL_ROUTING_LABELS, item));
     const canonical = options.length ? [...new Set(options)] : ["direct", "router", "ensemble"];
     const current = String(message?.current ?? modelRoutingState.current ?? "direct");
+    const command = message?.command === "/routing" ? "/routing" : null;
     modelRoutingPicker = {
       active: true,
       options: canonical,
       current,
       selected: Math.max(0, canonical.indexOf(current)),
+      command,
+      title: command ? "session model routing" : "model strategy",
     };
     renderModelRoutingPicker();
     renderer.requestRender?.();
@@ -1314,10 +1317,13 @@ export function createComposer(deps) {
       rerenderInputRegion();
     } else if (result.action === "confirm") {
       const mode = modelRoutingPicker.options[result.selected] ?? "direct";
+      const pickerCommand = modelRoutingPicker.command;
       closeModelRoutingPicker();
-      const command = mode === "ensemble"
-        ? "/ensemble on"
-        : mode === "router" ? "/router on" : "/router off";
+      const command = pickerCommand
+        ? `${pickerCommand} ${mode}`
+        : mode === "ensemble"
+          ? "/ensemble on"
+          : mode === "router" ? "/router on" : "/router off";
       sendHostMessage({ type: "input.submit", text: command, intent: "control" });
       rerenderInputRegion();
     }

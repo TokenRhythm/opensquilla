@@ -2,7 +2,7 @@ import { computed, ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { ChatRouterTierConfig } from '@/types/chat'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import type { ImageInputAdmission, ModelRoutingMode } from '@/types/modelRouting'
 import { normalizeModelRoutingMode } from '@/types/modelRouting'
 import { normalizeRouterTier, sortRouterTiers } from '@/utils/chat/routerTiers'
 import { encodeRouterShape, decodeRouterShape } from '@/utils/chat/routerShapeCache'
@@ -69,6 +69,10 @@ interface ChatFeatureConfig {
 interface ModelRoutingSnapshot {
   mode?: 'direct' | 'router' | 'ensemble'
   selection_mode?: string
+  image_input?: {
+    admission?: 'allowed' | 'blocked' | 'unknown'
+    reason?: string
+  }
 }
 
 const ROUTER_SHAPE_KEY = 'opensquilla.router.shape'
@@ -87,6 +91,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const llmEnsembleSelectionMode = ref('')
   const llmEnsembleSettingsBusy = ref(false)
   const modelRoutingSettingsBusy = ref(false)
+  const imageInputAdmission = ref<ImageInputAdmission>('unknown')
+  const imageInputAdmissionReason = ref('capability_unknown')
+  let hasCanonicalImageAdmission = false
   const routerSlots = ref<string[]>([])
   const routerModels = ref<Record<string, string>>({})
   const routerTierConfigs = ref<Record<string, ChatRouterTierConfig>>({})
@@ -108,6 +115,22 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     if (typeof snapshot.selection_mode === 'string') {
       llmEnsembleSelectionMode.value = snapshot.selection_mode
     }
+    const admission = snapshot.image_input?.admission
+    if (admission === 'allowed' || admission === 'blocked' || admission === 'unknown') {
+      hasCanonicalImageAdmission = true
+      imageInputAdmission.value = admission
+      imageInputAdmissionReason.value = String(
+        snapshot.image_input?.reason || 'capability_unknown',
+      )
+    } else if (mode === 'ensemble') {
+      hasCanonicalImageAdmission = false
+      imageInputAdmission.value = 'blocked'
+      imageInputAdmissionReason.value = 'ensemble_mode_unsupported'
+    } else {
+      hasCanonicalImageAdmission = false
+      imageInputAdmission.value = 'unknown'
+      imageInputAdmissionReason.value = 'capability_unknown'
+    }
     return true
   }
 
@@ -123,6 +146,12 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     codingModeEnabled.value = cfg?.skills?.coding_mode === true
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
+    if (!hasCanonicalImageAdmission) {
+      imageInputAdmission.value = ensembleEnabled ? 'blocked' : 'unknown'
+      imageInputAdmissionReason.value = ensembleEnabled
+        ? 'ensemble_mode_unsupported'
+        : 'capability_unknown'
+    }
     routerVisualMode.value = normalizeRouterVisualMode(router.visual_mode)
     const tiers = router.tiers
     const tierKeys: string[] = []
@@ -332,6 +361,8 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     routerSettingsBusy,
     modelRoutingMode,
     modelRoutingSettingsBusy,
+    imageInputAdmission,
+    imageInputAdmissionReason,
     codingModeEnabled,
     codingModeSettingsBusy,
     llmEnsembleEnabled,

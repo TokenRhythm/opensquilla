@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 
 import {
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
@@ -235,6 +236,26 @@ async function runPendingSpawnAdmissionCase() {
   assert.equal(published, false)
 }
 
+async function runSlowColdStartReadinessCase() {
+  const clock = fakeClock()
+  let probes = 0
+  const result = await waitForGatewayReadiness({
+    probe: async () => {
+      probes += 1
+      return clock.now() >= 60_000
+    },
+    primaryTimeoutMs: 45_000,
+    lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
+    pollIntervalMs: 500,
+    ...clock,
+  })
+
+  assert.deepEqual(result, { status: 'ready', late: true })
+  assert.equal(DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS, 120_000)
+  assert.equal(clock.now(), 60_000, 'a healthy cold start must survive the former deadline')
+  assert.ok(probes > 1)
+}
+
 await runStoppingSetOnlyCase()
 await runCurrentPlusStoppingCase()
 await runLatePublishedChildCase()
@@ -247,5 +268,6 @@ await runReadinessExitCase()
 await runReadinessExitDuringSuccessfulProbeCase()
 await runProbeCrossesDeadlineCase()
 await runNeverResolvingProbeCase()
+await runSlowColdStartReadinessCase()
 
 console.log('desktop gateway lifecycle tests passed')

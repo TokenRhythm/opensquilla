@@ -17,6 +17,7 @@ from opensquilla.channels.types import (
 )
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentConfig, DoneEvent
+from opensquilla.gateway import boot as boot_module
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
     _gateway_home,
@@ -303,12 +304,20 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         events.append("build_services")
         raise RuntimeError("service construction failed")
 
+    async def reconcile(_state_dir: object) -> int:
+        events.append("reconcile_process_owners")
+        return 0
+
     monkeypatch.setattr(
         boot,
         "_start_background_install_telemetry",
         lambda config: events.append("install_telemetry"),
     )
     monkeypatch.setattr(boot, "build_services", fail_build_services)
+    monkeypatch.setattr(
+        "opensquilla.process_tree.reconcile_persisted_processes",
+        reconcile,
+    )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
@@ -330,7 +339,12 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         with pytest.raises(RuntimeError, match="service construction failed"):
             await boot.start_gateway_server(config=config, run=False)
 
-        assert events == ["acquire", "build_services", "release"]
+        assert events == [
+            "acquire",
+            "reconcile_process_owners",
+            "build_services",
+            "release",
+        ]
 
     asyncio.run(run_case())
 
@@ -843,6 +857,28 @@ def test_build_task_runtime_run_kwargs_forwards_exact_assistant_sink() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert kwargs["assistant_message_sink"] is sink
+
+
+def test_build_task_runtime_run_kwargs_forwards_document_mutation_outcome_sink() -> None:
+    def sink(_outcome: dict[str, Any]) -> None:
+        return None
+
+    run = SimpleNamespace(
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="msg-123",
+        document_mutation_outcome_sink=sink,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["document_mutation_outcome_sink"] is sink
 
 
 def test_gateway_stream_timeout_config_defaults_remain_serializable() -> None:
@@ -2548,10 +2584,19 @@ def test_workspace_state_mismatch_emits_warning(
         "OPENSQUILLA_GATEWAY_CONFIG_PATH",
         str(tmp_path / "gateway-3" / "config.toml"),
     )
-    monkeypatch.setattr(
-        "opensquilla.gateway.boot.log.warning",
-        lambda event, **kwargs: warnings.append({"event": event, **kwargs}),
-    )
+    real_log = boot_module.log
+
+    class _WarningLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            warnings.append({"event": event, **kwargs})
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_log, name)
+
+    # Replace the module logger as a whole.  Patching a method on
+    # BoundLoggerLazyProxy freezes an ephemeral bound logger during teardown,
+    # which makes later capture_logs() assertions observe the wrong processor.
+    monkeypatch.setattr(boot_module, "log", _WarningLog())
     config = GatewayConfig(
         state_dir=str(tmp_path / "gateway-3" / "state"),
         workspace_dir=str(tmp_path / "gateway-1" / "workspace"),
@@ -3087,6 +3132,8 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
         semantic_message=None,
         stream_event_sink=None,
     )
+    run.envelope.metadata["parent_session_key"] = "synthetic-parent-session"
+    run.envelope.metadata["parent_task_id"] = "synthetic-parent-task"
     runner = RecordingTurnRunner()
 
     await dispatch_task_runtime_turn(
@@ -3099,6 +3146,8 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
 
     tool_context = runner.calls[0]["tool_context"]
     assert tool_context.task_id == "task-1"
+    assert tool_context.parent_session_key == "synthetic-parent-session"
+    assert tool_context.parent_task_id == "synthetic-parent-task"
     assert tool_context.is_owner is True
     assert tool_context.run_mode == "full"
     assert tool_context.elevated == "full"

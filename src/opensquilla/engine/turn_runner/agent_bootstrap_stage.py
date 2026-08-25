@@ -20,7 +20,7 @@ future AgentConfig-validation early-yield branch.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from opensquilla.engine.route_plan import pin_route_plan
@@ -396,6 +396,11 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
+    # True only when the active deployment's tools flag came from an
+    # authoritative catalog/host layer. Unknown capability provenance remains
+    # diagnostic and does not remove the runtime-authorized tool surface.
+    tools_capability_verified: bool = False
+    vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Raw positive global ``llm.context_window_tokens`` value, or zero when
     # unset. This is deliberately distinct from ``context_window`` because a
     # per-model override may win for the current deployment while the global
@@ -816,6 +821,26 @@ class AgentBootstrapStage:
                 inp.resolved_model,
                 inp.active_provider_id,
             )
+        artifact_executor_capabilities = getattr(
+            inp.provider,
+            "artifact_tool_executor_capabilities",
+            None,
+        )
+        if artifact_executor_capabilities is not None:
+            # A strict Artifact Ensemble grants tools only to its Aggregator.
+            # The configured single-model selector is merely the inherited
+            # deployment context and must not supply its capabilities.
+            catalog = replace(
+                catalog,
+                capabilities=artifact_executor_capabilities,
+                tools_capability_verified=bool(
+                    getattr(
+                        inp.provider,
+                        "artifact_tools_capability_verified",
+                        False,
+                    )
+                ),
+            )
 
         # Capacity diagnostics contain resolved numeric limits only. They are
         # safe for turn metadata and make catalog-vs-provider failures
@@ -837,8 +862,16 @@ class AgentBootstrapStage:
             tuple[str, str],
             tuple[int, int, ModelCapabilities | None],
         ] = {}
+        active_artifact_tools_verified = bool(
+            catalog.tools_capability_verified
+            and catalog.capabilities is not None
+            and getattr(catalog.capabilities, "supports_tools", False)
+        )
         private_fallback_limits: list[
             tuple[Any, int, int, ModelCapabilities | None]
+        ] = []
+        private_fallback_vision_support: list[
+            tuple[Any, Literal["supported", "unsupported", "unknown"]]
         ] = []
         fallback_deployment_configs = getattr(
             inp.provider,
@@ -878,6 +911,9 @@ class AgentBootstrapStage:
                         effective_max_tokens,
                         fallback_catalog.capabilities,
                     )
+                )
+                private_fallback_vision_support.append(
+                    (deployment, fallback_catalog.vision_support)
                 )
                 fallback_capabilities.setdefault(
                     (fallback_provider, fallback_model),
@@ -930,6 +966,15 @@ class AgentBootstrapStage:
         )
         if callable(configure_private_fallback_limits):
             configure_private_fallback_limits(private_fallback_limits)
+        configure_private_fallback_vision_support = getattr(
+            inp.provider,
+            "configure_fallback_deployment_vision_support",
+            None,
+        )
+        if callable(configure_private_fallback_vision_support):
+            configure_private_fallback_vision_support(
+                private_fallback_vision_support
+            )
         configure_fallback_limits = getattr(
             inp.provider,
             "configure_fallback_limits",
@@ -1026,8 +1071,14 @@ class AgentBootstrapStage:
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
             compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
+            restricted_turn=bool(
+                inp.tool_context is not None
+                and getattr(inp.tool_context, "exclusive_tools", None) is not None
+            ),
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
+            model_tools_capability_verified=active_artifact_tools_verified,
+            model_vision_support=catalog.vision_support,
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(aux.tool_result_projection_max_inline_chars),
             tool_result_fresh_diagnostic_policy_enabled=(

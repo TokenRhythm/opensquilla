@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 from collections import Counter
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.safety.secret_redaction import redact_secret_text
 
 _MAX_TOOL_EVENTS = 2000
@@ -136,7 +136,9 @@ class PatchEvidenceLedger:
         git_snapshot = self._git_snapshot()
         read_files = _unique_file_records(read_records)
         changed_files = _unique_file_records(write_records)
-        diff_paths = git_snapshot.get("diff_paths", [])
+        raw_diff_paths = git_snapshot.get("diff_paths")
+        diff_paths = raw_diff_paths if isinstance(raw_diff_paths, list) else []
+        git_diff_observed = bool(git_snapshot.get("diff_observed"))
         path_signal_counts: Counter[str] = Counter()
         for rel_path in set(read_files) | set(changed_files) | set(diff_paths):
             for signal in _path_signals(rel_path):
@@ -170,6 +172,8 @@ class PatchEvidenceLedger:
             },
             "read_files": read_files,
             "changed_files": changed_files,
+            "git_state": git_snapshot.get("git_state"),
+            "git_diff_observed": git_diff_observed,
             "diff_paths": diff_paths,
             "git_status_porcelain": git_snapshot.get("status_porcelain"),
             "verification_commands": self.verification_commands,
@@ -187,16 +191,39 @@ class PatchEvidenceLedger:
 
     def _git_snapshot(self) -> dict[str, Any]:
         if self.workspace_dir is None:
-            return {"diff_paths": [], "status_porcelain": None}
-        status = _run_git(self.workspace_dir, "status", "--porcelain=v1", "--untracked-files=all")
-        diff = _run_git(self.workspace_dir, "diff", "--name-only")
-        staged = _run_git(self.workspace_dir, "diff", "--cached", "--name-only")
+            return {
+                "git_state": GitRunState.NOT_REPOSITORY.value,
+                "diff_observed": False,
+                "diff_paths": [],
+                "status_porcelain": None,
+            }
+        results = []
+        for args in (
+            ("status", "--porcelain=v1", "--untracked-files=all"),
+            ("diff", "--name-only"),
+            ("diff", "--cached", "--name-only"),
+        ):
+            result = run_git(args, cwd=self.workspace_dir, timeout=2.0)
+            if not result.ok:
+                return {
+                    "git_state": result.state.value,
+                    "diff_observed": False,
+                    "diff_paths": [],
+                    "status_porcelain": None,
+                }
+            results.append(result)
+        status_result, diff_result, staged_result = results
+        status = status_result.stdout_text
+        diff = diff_result.stdout_text
+        staged = staged_result.stdout_text
         paths = (
             _paths_from_name_only(diff)
             | _paths_from_name_only(staged)
             | _paths_from_status(status)
         )
         return {
+            "git_state": GitRunState.OK.value,
+            "diff_observed": True,
             "diff_paths": sorted(paths),
             "status_porcelain": status,
         }
@@ -242,24 +269,6 @@ class PatchEvidenceLedger:
                     }
                 )
         return candidates
-
-
-def _run_git(workspace: Path, *args: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(workspace), *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=2.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
 
 
 def _summarize_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

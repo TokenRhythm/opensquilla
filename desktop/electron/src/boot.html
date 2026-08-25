@@ -169,6 +169,7 @@
     }
 
     .status-line {
+      --boot-progress: 0%;
       height: 5px;
       overflow: hidden;
       border-radius: 999px;
@@ -176,20 +177,18 @@
     }
 
     .status-line::before {
-      animation: progress 1.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
-      background: linear-gradient(90deg, transparent, var(--accent) 28%, var(--accent) 72%, transparent);
+      background: var(--accent);
       content: "";
       display: block;
       height: 100%;
-      width: 46%;
+      width: var(--boot-progress);
       border-radius: inherit;
     }
 
-    /* On a startup failure the splash is paused, not working — freeze every
-       indeterminate animation so it doesn't contradict the paused state. */
+    /* The bar is determinate and therefore freezes naturally on failure. Dim
+       the completed portion while the active startup attempt is paused. */
     body.errored .status-line::before {
-      animation: none;
-      opacity: 0.2;
+      opacity: 0.45;
     }
 
     body.errored .loader::before,
@@ -202,6 +201,20 @@
       display: flex;
       justify-content: space-between;
       gap: 18px;
+    }
+
+    .status-metrics {
+      align-items: center;
+      display: flex;
+      flex: 0 0 auto;
+      gap: 10px;
+    }
+
+    .progress-count {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
     }
 
     .phase {
@@ -448,12 +461,6 @@
       box-shadow: 0 6px 18px -10px var(--accent);
     }
 
-    @keyframes progress {
-      0% { transform: translateX(-115%); opacity: 0.35; }
-      28%, 68% { opacity: 1; }
-      100% { transform: translateX(250%); opacity: 0.35; }
-    }
-
     @keyframes loader-segment {
       0%, 12.5% {
         background: var(--accent);
@@ -520,11 +527,22 @@
         <p class="subtitle" data-i18n="subtitle">Starting the desktop control surface.</p>
       </section>
 
-      <section class="status" aria-live="polite">
-        <div class="status-line" aria-hidden="true"></div>
+      <section class="status">
+        <div
+          class="status-line"
+          id="startupProgress"
+          role="progressbar"
+          aria-labelledby="phase"
+          aria-valuemin="0"
+          aria-valuemax="4"
+          aria-valuenow="0"
+        ></div>
         <div class="status-copy">
-          <span class="phase" id="phase" data-i18n="phaseDefault">Preparing desktop profile</span>
-          <span class="timer" id="timer">00.0s</span>
+          <span class="phase" id="phase" data-i18n="phaseDefault" role="status" aria-live="polite" aria-atomic="true">Preparing desktop profile</span>
+          <span class="status-metrics" aria-hidden="true">
+            <span class="progress-count" id="progressCount">0/4</span>
+            <span class="timer" id="timer" aria-hidden="true">00.0s</span>
+          </span>
         </div>
         <div class="steps" aria-hidden="true">
           <span class="step active" data-step="profile" data-i18n="stepProfile">Profile</span>
@@ -538,6 +556,7 @@
         <p id="errorMessage" data-i18n="errorDefault">The gateway did not finish starting.</p>
         <div class="actions">
           <button id="revealLog" type="button" data-i18n="revealLog">Reveal log</button>
+          <button id="openKeychain" type="button" data-i18n="openKeychain" hidden>Open Keychain Access</button>
           <button id="resetSetup" type="button" data-i18n="resetSetup">Reset setup</button>
           <button id="quit" type="button" data-i18n="quit">Quit</button>
           <button id="retry" class="primary" type="button" data-i18n="retry">Retry</button>
@@ -599,7 +618,8 @@
         errorTitle: 'Startup needs attention',
         errorDefault: 'The gateway did not finish starting.',
         profileInUse: 'The previous Gateway has not exited. Wait for it to finish, or quit every OpenSquilla app or terminal using this profile, then try again. If it will not exit, restart the computer. Do not delete profile lock files.',
-        revealLog: 'Reveal log', resetSetup: 'Reset setup', quit: 'Quit', retry: 'Retry',
+        revealLog: 'Reveal log', openKeychain: 'Open Keychain Access', resetSetup: 'Reset setup', quit: 'Quit', retry: 'Retry',
+        keychainUnavailable: 'OpenSquilla cannot read the macOS Keychain. Unlock the login keychain, then click Retry. If the credential cannot be recovered, choose Reset setup and enter the API key again.',
         startupPaused: 'Startup paused',
         resetConfirm: 'Reset desktop setup? This clears the saved provider credential and reopens onboarding. Your workspace path, identity, memory, and chat history are kept.',
         resetPhase: 'Resetting desktop setup',
@@ -623,7 +643,8 @@
         errorTitle: '启动需要处理',
         errorDefault: '网关未能完成启动。',
         profileInUse: '上一个网关尚未退出。请等待其结束，或退出所有正在使用此配置的 OpenSquilla 应用和终端后重试；若仍无法退出，请重启电脑。不要删除配置锁文件。',
-        revealLog: '显示日志', resetSetup: '重新配置', quit: '退出', retry: '重试',
+        revealLog: '显示日志', openKeychain: '打开钥匙串访问', resetSetup: '重新配置', quit: '退出', retry: '重试',
+        keychainUnavailable: 'OpenSquilla 无法读取 macOS 钥匙串。请解锁 login 钥匙串，然后点击“重试”。如果凭据无法恢复，可选择“重新配置”并重新输入 API Key。',
         startupPaused: '启动已暂停',
         resetConfirm: '要重置桌面设置吗？这会清除已保存的提供商凭据并重新进入引导。工作区路径、身份、记忆和聊天记录都会保留。',
         resetPhase: '正在重置桌面设置',
@@ -647,7 +668,8 @@
         errorTitle: '起動の確認が必要です',
         errorDefault: 'ゲートウェイの起動が完了しませんでした。',
         profileInUse: '前のゲートウェイがまだ終了していません。終了を待つか、このプロファイルを使用しているすべての OpenSquilla アプリとターミナルを終了してから再試行してください。終了しない場合はコンピューターを再起動してください。プロファイルのロックファイルは削除しないでください。',
-        revealLog: 'ログを表示', resetSetup: '設定をリセット', quit: '終了', retry: '再試行',
+        revealLog: 'ログを表示', openKeychain: 'キーチェーンアクセスを開く', resetSetup: '設定をリセット', quit: '終了', retry: '再試行',
+        keychainUnavailable: 'OpenSquilla は macOS キーチェーンを読み取れません。login キーチェーンのロックを解除してから再試行してください。復元できない場合は設定をリセットして API キーを再入力してください。',
         startupPaused: '起動を一時停止しました',
         resetConfirm: 'デスクトップ設定をリセットしますか？保存済みのプロバイダー認証情報を消去してオンボーディングを再開します。ワークスペースのパス、ID、メモリ、チャット履歴は保持されます。',
         resetPhase: 'デスクトップ設定をリセットしています',
@@ -671,7 +693,8 @@
         errorTitle: 'Le démarrage nécessite votre attention',
         errorDefault: 'La passerelle n\'a pas terminé son démarrage.',
         profileInUse: 'La passerelle précédente n’est pas terminée. Attendez sa fermeture, ou quittez toutes les applications et tous les terminaux OpenSquilla utilisant ce profil, puis réessayez. Si elle ne se ferme pas, redémarrez l’ordinateur. Ne supprimez pas les fichiers de verrouillage du profil.',
-        revealLog: 'Afficher le journal', resetSetup: 'Réinitialiser', quit: 'Quitter', retry: 'Réessayer',
+        revealLog: 'Afficher le journal', openKeychain: 'Ouvrir Trousseaux d’accès', resetSetup: 'Réinitialiser', quit: 'Quitter', retry: 'Réessayer',
+        keychainUnavailable: 'OpenSquilla ne peut pas lire le trousseau macOS. Déverrouillez le trousseau login, puis réessayez. Si l’identifiant ne peut pas être récupéré, réinitialisez la configuration et saisissez à nouveau la clé API.',
         startupPaused: 'Démarrage en pause',
         resetConfirm: 'Réinitialiser la configuration du bureau ? Cela efface les identifiants du fournisseur et relance l’onboarding. Le chemin de l’espace de travail, l’identité, la mémoire et l’historique des discussions sont conservés.',
         resetPhase: 'Réinitialisation de la configuration du bureau',
@@ -695,7 +718,8 @@
         errorTitle: 'Der Start erfordert Ihre Aufmerksamkeit',
         errorDefault: 'Das Gateway hat den Start nicht abgeschlossen.',
         profileInUse: 'Das vorherige Gateway wurde noch nicht beendet. Warten Sie, bis es beendet ist, oder schließen Sie alle OpenSquilla-Apps und -Terminals, die dieses Profil verwenden, und versuchen Sie es erneut. Falls es nicht beendet wird, starten Sie den Computer neu. Löschen Sie keine Profilsperrdateien.',
-        revealLog: 'Protokoll anzeigen', resetSetup: 'Zurücksetzen', quit: 'Beenden', retry: 'Wiederholen',
+        revealLog: 'Protokoll anzeigen', openKeychain: 'Schlüsselbundverwaltung öffnen', resetSetup: 'Zurücksetzen', quit: 'Beenden', retry: 'Wiederholen',
+        keychainUnavailable: 'OpenSquilla kann den macOS-Schlüsselbund nicht lesen. Entsperren Sie den Schlüsselbund „login“ und versuchen Sie es erneut. Wenn die Zugangsdaten nicht wiederhergestellt werden können, setzen Sie die Einrichtung zurück und geben Sie den API-Schlüssel erneut ein.',
         startupPaused: 'Start angehalten',
         resetConfirm: 'Desktop-Einrichtung zurücksetzen? Die gespeicherten Anbieter-Zugangsdaten werden gelöscht und das Onboarding wird neu geöffnet. Arbeitsbereichspfad, Identität, Speicher und Chatverlauf bleiben erhalten.',
         resetPhase: 'Desktop-Einrichtung wird zurückgesetzt',
@@ -719,7 +743,8 @@
         errorTitle: 'El inicio necesita atención',
         errorDefault: 'La pasarela no terminó de iniciarse.',
         profileInUse: 'La pasarela anterior aún no ha terminado. Espera a que se cierre o sal de todas las aplicaciones y terminales de OpenSquilla que usen este perfil y vuelve a intentarlo. Si no se cierra, reinicia el equipo. No elimines los archivos de bloqueo del perfil.',
-        revealLog: 'Mostrar registro', resetSetup: 'Restablecer', quit: 'Salir', retry: 'Reintentar',
+        revealLog: 'Mostrar registro', openKeychain: 'Abrir Acceso a Llaveros', resetSetup: 'Restablecer', quit: 'Salir', retry: 'Reintentar',
+        keychainUnavailable: 'OpenSquilla no puede leer el llavero de macOS. Desbloquea el llavero login y vuelve a intentarlo. Si no se puede recuperar la credencial, restablece la configuración y vuelve a introducir la clave API.',
         startupPaused: 'Inicio en pausa',
         resetConfirm: '¿Restablecer la configuración de escritorio? Esto borra la credencial del proveedor y vuelve a abrir la configuración inicial. Se conservan la ruta del espacio de trabajo, la identidad, la memoria y el historial de chat.',
         resetPhase: 'Restableciendo configuración de escritorio',
@@ -738,11 +763,25 @@
     };
     let msg = MESSAGES.en;
 
-    const started = performance.now();
+    let phaseStartedAt = performance.now();
+    let phaseStatusIdentity = '';
+    const BOOT_PROGRESS_MAX = 4;
+    const bootProgressByPhase = Object.freeze({
+      profile: 0,
+      'gateway-start': 1,
+      'gateway-health': 2,
+      control: 3,
+      ready: 4,
+    });
+    let completedBootMilestones = 0;
+    let resetBootProgressOnNextStatus = false;
     const phase = document.getElementById('phase');
     const timer = document.getElementById('timer');
+    const startupProgress = document.getElementById('startupProgress');
+    const progressCount = document.getElementById('progressCount');
     const errorPanel = document.getElementById('errorPanel');
     const errorMessage = document.getElementById('errorMessage');
+    const openKeychainButton = document.getElementById('openKeychain');
     const recoveryPanel = document.getElementById('recoveryPanel');
     const recoveryTitle = document.getElementById('recoveryTitle');
     const recoveryIntro = document.getElementById('recoveryIntro');
@@ -794,27 +833,62 @@
       }
     }
 
+    function renderBootProgress() {
+      const value = Math.max(0, Math.min(BOOT_PROGRESS_MAX, completedBootMilestones));
+      startupProgress.style.setProperty('--boot-progress', `${(value / BOOT_PROGRESS_MAX) * 100}%`);
+      startupProgress.setAttribute('aria-valuenow', String(value));
+      progressCount.textContent = `${value}/${BOOT_PROGRESS_MAX}`;
+    }
+
     function applyStatus(payload) {
       const phaseId = payload && payload.phaseId ? String(payload.phaseId) : 'profile';
+      if (resetBootProgressOnNextStatus) {
+        completedBootMilestones = 0;
+        resetBootProgressOnNextStatus = false;
+        renderBootProgress();
+      }
+      const reportedProgress = bootProgressByPhase[phaseId];
+      if (Number.isInteger(reportedProgress)) {
+        completedBootMilestones = Math.max(completedBootMilestones, reportedProgress);
+        renderBootProgress();
+      }
+      const statusAt = payload && payload.at ? String(payload.at) : '';
+      const statusIdentity = phaseId + '\u0000' + statusAt;
+      if (statusIdentity !== phaseStatusIdentity) {
+        phaseStatusIdentity = statusIdentity;
+        const statusAtMs = Date.parse(statusAt);
+        const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0;
+        // Anchor once from the main-process wall-clock timestamp, then use the
+        // renderer's monotonic clock. Invalid or future timestamps start at zero.
+        phaseStartedAt = performance.now() - Math.max(0, wallAgeMs);
+        updateTimer();
+      }
       // The label is already localized by the main process; fall back to the
       // local default phase string only when no label was provided.
       phase.textContent = payload && payload.label ? String(payload.label) : msg.phaseDefault;
       errorPanel.classList.remove('visible');
+      openKeychainButton.hidden = true;
       recoveryPanel.classList.remove('visible');
       document.body.classList.remove('recovering');
-      // Leaving the error state: resume the sweep and the elapsed timer.
+      // Leaving the error state: resume the elapsed timer. The determinate
+      // progress bar advances only when a real milestone is reported.
       document.body.classList.remove('errored');
       if (!timerInterval) timerInterval = setInterval(updateTimer, 100);
-      setStepState(stepMap[phaseId] || 'profile', phaseId === 'ready');
+      const activeStep = stepMap[phaseId];
+      if (activeStep) setStepState(activeStep, phaseId === 'ready');
     }
 
     function applyError(payload) {
       const rawMessage = payload && payload.message ? String(payload.message) : msg.errorDefault;
-      const message = rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')
-        ? msg.profileInUse
-        : rawMessage;
+      const keychainUnavailable = payload && payload.code === 'keychain_unavailable';
+      const message = keychainUnavailable
+        ? msg.keychainUnavailable
+        : rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')
+          ? msg.profileInUse
+          : rawMessage;
       phase.textContent = msg.startupPaused;
       errorMessage.textContent = message;
+      openKeychainButton.hidden = !keychainUnavailable;
       errorPanel.classList.add('visible');
       recoveryPanel.classList.remove('visible');
       document.body.classList.remove('recovering');
@@ -822,6 +896,7 @@
       // the .errored class), and drop the active step highlight so a failed phase
       // is not shown as still running.
       document.body.classList.add('errored');
+      resetBootProgressOnNextStatus = true;
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       for (const step of Object.values(steps)) {
         if (step) step.classList.remove('active');
@@ -840,6 +915,7 @@
 
       const wasVisible = recoveryPanel.classList.contains('visible');
       document.body.classList.add('recovering', 'errored');
+      resetBootProgressOnNextStatus = true;
       errorPanel.classList.remove('visible');
       recoveryPanel.classList.add('visible');
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
@@ -957,7 +1033,10 @@
       try {
         const result = await resumeStartup();
         if (result && result.ok === false) {
-          applyError({ message: result.error || msg.errorDefault });
+          applyError({
+            message: result.error || msg.errorDefault,
+            code: result.code,
+          });
         }
         return result;
       } catch (error) {
@@ -971,7 +1050,7 @@
     }
 
     function updateTimer() {
-      timer.textContent = `${((performance.now() - started) / 1000).toFixed(1).padStart(4, '0')}s`;
+      timer.textContent = `${((performance.now() - phaseStartedAt) / 1000).toFixed(1).padStart(4, '0')}s`;
     }
     let timerInterval = setInterval(updateTimer, 100);
 
@@ -993,6 +1072,15 @@
       document.getElementById('retry').addEventListener('click', () => retryStartup());
       document.getElementById('recoveryRetry').addEventListener('click', () => retryStartup());
       document.getElementById('revealLog').addEventListener('click', () => api.revealGatewayLog());
+      openKeychainButton.addEventListener('click', async () => {
+        openKeychainButton.disabled = true;
+        try {
+          const opened = await api.openKeychainAccess();
+          if (!opened) errorMessage.textContent = msg.keychainUnavailable;
+        } finally {
+          openKeychainButton.disabled = false;
+        }
+      });
       document.getElementById('quit').addEventListener('click', () => api.quitApp());
       const resetButton = document.getElementById('resetSetup');
       if (typeof api.resetDesktopSettings === 'function') {

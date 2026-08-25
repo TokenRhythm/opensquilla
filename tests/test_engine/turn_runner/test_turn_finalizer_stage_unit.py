@@ -368,6 +368,8 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
         routed_tier="c2",
         routing_applied=False,
         rollout_phase="observe",
+        router_model_call_id="1.0",
+        router_iteration=1,
         model_call_segments=[
             {
                 "model_call_id": "2.0",
@@ -392,6 +394,8 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
     assert recs["transcript_append"].calls[0]["turn_usage"]["routed_tier"] == "c2"
     assert recs["transcript_append"].calls[0]["turn_usage"]["routing_applied"] is False
     assert recs["transcript_append"].calls[0]["turn_usage"]["rollout_phase"] == "observe"
+    assert recs["transcript_append"].calls[0]["turn_usage"]["router_model_call_id"] == "1.0"
+    assert recs["transcript_append"].calls[0]["turn_usage"]["router_iteration"] == 1
     assert recs["transcript_append"].calls[0]["turn_usage"]["model_call_segments"] == [
         {
             "model_call_id": "2.0",

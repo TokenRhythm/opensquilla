@@ -50,7 +50,14 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :is-streaming="isStreaming"
           :is-goal-source="isGoalSource(messages[entry.index])"
+          :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
+          :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
+          :workbench-resource-edit-enabled="workbenchResourceEditEnabled === true"
+          :workbench-attachment-resources="workbenchAttachmentResources"
           @edit="$emit('editMessage', $event)"
+          @edit-attachment="$emit('editAttachment', $event)"
+          @preview-attachment="$emit('previewAttachment', $event)"
+          @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
         <CompactionEvent
@@ -150,7 +157,10 @@ import {
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -183,6 +193,10 @@ const props = defineProps<{
   sessionKey?: string
   authToken?: string
   workbenchEnabled?: boolean
+  workbenchResourcePreviewEnabled?: boolean
+  workbenchResourceEditEnabled?: boolean
+  workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
+  canReusePromptAnnotations?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
@@ -191,6 +205,8 @@ const props = defineProps<{
   goalElapsed?: string
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
+  /** Session/render epoch used to invalidate deferred scroll corrections. */
+  scrollEpoch?: number
   /** Preview/export paths can force a complete, canonical DOM. */
   virtualizationDisabled?: boolean
   /** Current search match or another externally owned focus target. */
@@ -201,6 +217,9 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
+  editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
     settle?: (accepted: boolean) => void,
@@ -265,6 +284,18 @@ let viewportFrame = 0
 let pendingAnchorAdjustment = 0
 let anchorAdjustmentScheduled = false
 let liveEdgePinScheduled = false
+let deferredScrollGeneration = 0
+
+function currentScrollEpoch(): number {
+  return props.scrollEpoch ?? 0
+}
+
+function resetDeferredScrollWork() {
+  deferredScrollGeneration += 1
+  pendingAnchorAdjustment = 0
+  anchorAdjustmentScheduled = false
+  liveEdgePinScheduled = false
+}
 
 function readVirtualizationPreference(): boolean {
   if (typeof window === 'undefined') return true
@@ -396,15 +427,22 @@ function scheduleViewportMeasure() {
 function queueAnchorAdjustment(delta: number) {
   const container = props.scrollContainer
   if (!container || Math.abs(delta) < 0.5) return
+  const epoch = currentScrollEpoch()
+  const sessionKey = props.sessionKey
+  const generation = deferredScrollGeneration
   pendingAnchorAdjustment += delta
   if (anchorAdjustmentScheduled) return
   anchorAdjustmentScheduled = true
   void nextTick(() => {
+    if (deferredScrollGeneration !== generation) return
     anchorAdjustmentScheduled = false
     const adjustment = pendingAnchorAdjustment
     pendingAnchorAdjustment = 0
     if (!props.scrollContainer || props.scrollContainer !== container) return
-    container.scrollTop += adjustment
+    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
+    applyProgrammaticScroll(container, () => {
+      container.scrollTop += adjustment
+    })
     scheduleViewportMeasure()
   })
 }
@@ -412,11 +450,18 @@ function queueAnchorAdjustment(delta: number) {
 function queueLiveEdgePin() {
   const container = props.scrollContainer
   if (!container || liveEdgePinScheduled) return
+  const epoch = currentScrollEpoch()
+  const sessionKey = props.sessionKey
+  const generation = deferredScrollGeneration
   liveEdgePinScheduled = true
   void nextTick(() => {
+    if (deferredScrollGeneration !== generation) return
     liveEdgePinScheduled = false
     if (!props.followLiveEdge || props.scrollContainer !== container) return
-    container.scrollTop = container.scrollHeight
+    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
+    applyProgrammaticScroll(container, () => {
+      container.scrollTop = container.scrollHeight
+    })
     scheduleViewportMeasure()
   })
 }
@@ -526,7 +571,15 @@ function attachContainer(container: HTMLElement | null | undefined) {
   container.addEventListener('focusin', onContainerFocusIn)
   container.addEventListener('focusout', onContainerFocusOut)
   if (typeof ResizeObserver !== 'undefined') {
-    viewportResizeObserver = new ResizeObserver(scheduleViewportMeasure)
+    viewportResizeObserver = new ResizeObserver(entries => {
+      scheduleViewportMeasure()
+      // A container-height change has no new stream event to trigger the
+      // ordinary bottom pin. Keep a reader already following the live edge at
+      // the true bottom; historical readers retain their existing anchor.
+      if (props.followLiveEdge && entries.some(entry => entry.target === container)) {
+        queueLiveEdgePin()
+      }
+    })
     viewportResizeObserver.observe(container)
     if (listRootRef.value) viewportResizeObserver.observe(listRootRef.value)
   }
@@ -609,13 +662,18 @@ watch(virtualizationEnabled, () => {
     scheduleViewportMeasure()
   })
 })
-watch(() => props.sessionKey, () => {
-  measuredSizes.clear()
-  ensuredMessageKeys.value = new Set()
-  focusedMessageKey.value = null
-  measurementVersion.value += 1
-  void nextTick(scheduleViewportMeasure)
-})
+watch(
+  [() => props.sessionKey, () => props.scrollEpoch],
+  () => {
+    resetDeferredScrollWork()
+    measuredSizes.clear()
+    ensuredMessageKeys.value = new Set()
+    focusedMessageKey.value = null
+    measurementVersion.value += 1
+    void nextTick(scheduleViewportMeasure)
+  },
+  { flush: 'sync' },
+)
 watch(() => windowRows.value.map(row => row.key), nextKeys => {
   const retained = new Set(nextKeys)
   for (const key of measuredSizes.keys()) {

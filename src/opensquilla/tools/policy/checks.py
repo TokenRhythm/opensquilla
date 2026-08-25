@@ -211,6 +211,39 @@ class PrivateMemoryScopePolicy:
         return PolicyDecision(allowed=True)
 
 # ---------------------------------------------------------------------------
+# Exclusive tool ceiling
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExclusiveToolCeilingPolicy:
+    """Reject tools outside a turn's non-widenable capability ceiling."""
+
+    name: str = "exclusive_tool_ceiling"
+
+    def evaluate(self, d: DispatchInput) -> PolicyDecision:
+        ctx = d.ctx
+        if (
+            ctx is None
+            or ctx.exclusive_tools is None
+            or d.tool_call.tool_name in ctx.exclusive_tools
+        ):
+            return PolicyDecision(allowed=True)
+        envelope = _denial_envelope(
+            d.tool_call,
+            exc=PermissionError("tool outside exclusive ceiling"),
+            error_class_override="PolicyDenied",
+            user_message_override="Tool unavailable for this restricted turn.",
+        )
+        log_event = _block_log_event(
+            d.tool_call,
+            ctx,
+            event="dispatch.defense_in_depth_block",
+            reason="exclusive_ceiling",
+        )
+        return PolicyDecision(allowed=False, envelope=envelope, log_event=log_event)
+
+
+# ---------------------------------------------------------------------------
 # Allow list
 # ---------------------------------------------------------------------------
 

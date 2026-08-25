@@ -576,7 +576,7 @@ def _entry_tokens(entry: dict[str, Any]) -> int:
     return estimate_entry_model_replay_tokens(entry)
 
 
-def _profile_protected_recent_messages(cfg: CompactionConfig) -> int:
+def effective_protected_recent_messages(cfg: CompactionConfig) -> int:
     configured = max(0, int(getattr(cfg, "protected_recent_messages", 0) or 0))
     if configured:
         return configured
@@ -591,7 +591,7 @@ def _apply_protected_tail(
     cut: int,
     cfg: CompactionConfig,
 ) -> int:
-    protected_recent = _profile_protected_recent_messages(cfg)
+    protected_recent = effective_protected_recent_messages(cfg)
     protected_start = (
         max(0, len(entries) - protected_recent)
         if protected_recent > 0
@@ -807,7 +807,7 @@ def _compaction_quality_report(
     trigger: CompactionTrigger = "token_budget",
     replaces_previous_summary: bool = False,
 ) -> dict[str, Any]:
-    protected_recent = _profile_protected_recent_messages(cfg)
+    protected_recent = effective_protected_recent_messages(cfg)
     protected_tail_preserved = True
     if protected_recent > 0:
         protected_tail = entries[-protected_recent:]
@@ -2022,7 +2022,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             kept = entries
         else:
             skip_reason = "no_safe_turn_boundary"
-            if _profile_protected_recent_messages(cfg) > 0:
+            if effective_protected_recent_messages(cfg) > 0:
                 skip_reason = "protected_tail_exhausts_compaction_window"
             return CompactionResult(
                 summary="",

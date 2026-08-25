@@ -17,12 +17,13 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import structlog
 
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.contracts.turn_execution import (
+    EnsembleContinuationSnapshot,
     ProviderAdmissionError,
     RecoveryContext,
     StickyExecutionRole,
@@ -61,13 +62,13 @@ from .model_catalog import resolve_effective_context_window, shared_catalog
 from .protocol import (
     LLMProvider,
     ProviderMetadata,
+    count_provider_image_blocks,
     project_provider_final_request,
     project_provider_message_count,
 )
 from .selector import ModelSelector, ProviderConfig, SelectorConfig
 from .types import (
     ChatConfig,
-    ContentBlockImage,
     ContentBlockToolResult,
     DoneEvent,
     EnsembleProgressEvent,
@@ -827,21 +828,115 @@ def _openrouter_static_capabilities(model: str) -> ModelCapabilities | None:
     return None
 
 
-def _member_model_capabilities(member: EnsembleMemberConfig) -> ModelCapabilities:
+def _member_catalog_capabilities(
+    member: EnsembleMemberConfig,
+    *,
+    model_catalog: Any | None = None,
+) -> ModelCapabilities | None:
+    """Resolve one member's catalog facts without applying static fallbacks."""
+
     cfg = member.provider_config
     provider = cfg.provider.strip().lower()
+    try:
+        catalog = model_catalog if model_catalog is not None else shared_catalog()
+        deployment_capabilities = getattr(
+            catalog,
+            "resolve_deployment_capabilities",
+            None,
+        )
+        if callable(deployment_capabilities):
+            resolved = deployment_capabilities(
+                cfg.model,
+                provider=provider,
+                api_key=cfg.api_key,
+                base_url=cfg.base_url,
+            )
+        else:
+            resolved = catalog.get_capabilities(
+                cfg.model,
+                provider_name=provider,
+                base_url=cfg.base_url,
+            )
+        # Keep the existing duck-typed catalog seam: embedders may return a
+        # capability-shaped object instead of the concrete dataclass.
+        return cast(ModelCapabilities, resolved) if resolved is not None else None
+    except Exception:
+        return None
+
+
+def _member_model_capabilities(
+    member: EnsembleMemberConfig,
+    *,
+    model_catalog: Any | None = None,
+) -> ModelCapabilities:
+    cfg = member.provider_config
+    provider = cfg.provider.strip().lower()
+    catalog_caps = _member_catalog_capabilities(
+        member,
+        model_catalog=model_catalog,
+    )
+    if provider == "openrouter":
+        static_caps = _openrouter_static_capabilities(cfg.model)
+        # Static OpenRouter prefixes are a compatibility fallback for models
+        # whose catalog is incomplete. An explicit catalog denial is stronger
+        # and must reach artifact admission unchanged.
+        if (
+            static_caps is not None
+            and catalog_caps is not None
+            and getattr(catalog_caps, "supports_tools", None) is False
+        ):
+            return catalog_caps
+        if static_caps is not None:
+            return static_caps
+    return catalog_caps or ModelCapabilities()
+
+
+def _member_tools_capability_is_verified(
+    member: EnsembleMemberConfig,
+    *,
+    model_catalog: Any | None = None,
+) -> bool:
+    """Return true only for an authoritative, tool-capable member model."""
+
+    cfg = member.provider_config
+    provider = cfg.provider.strip().lower()
+    catalog_caps = _member_catalog_capabilities(
+        member,
+        model_catalog=model_catalog,
+    )
+    # A catalog's explicit false is authoritative even when a static
+    # OpenRouter prefix would otherwise imply tool support.
+    if (
+        catalog_caps is not None
+        and getattr(catalog_caps, "supports_tools", None) is False
+    ):
+        return False
     if provider == "openrouter":
         static_caps = _openrouter_static_capabilities(cfg.model)
         if static_caps is not None:
-            return static_caps
+            return bool(static_caps.supports_tools)
     try:
-        return shared_catalog().get_capabilities(
+        catalog = model_catalog if model_catalog is not None else shared_catalog()
+        verifier = getattr(
+            catalog,
+            "deployment_tool_capability_is_verified",
+            None,
+        )
+        if not callable(verifier) or not verifier(
             cfg.model,
-            provider_name=provider,
+            provider=provider,
+            api_key=cfg.api_key,
             base_url=cfg.base_url,
+        ):
+            return False
+        return bool(
+            _member_model_capabilities(
+                member,
+                model_catalog=catalog,
+            ).supports_tools
         )
     except Exception:
-        return ModelCapabilities()
+        return False
 
 
 def _member_max_tokens(member: EnsembleMemberConfig) -> int:
@@ -864,6 +959,15 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
         str(cfg.provider or "").strip().lower(),
         str(cfg.model or "").strip().lower(),
         str(cfg.base_url or "").strip().rstrip("/").lower(),
+    )
+
+
+def _proposer_provider_config(member: EnsembleMemberConfig) -> ProviderConfig:
+    """Return the provider boundary used by every proposer-side operation."""
+
+    return replace(
+        member.provider_config,
+        replay_provider_state=False,
     )
 
 
@@ -1298,6 +1402,8 @@ class EnsembleProvider:
         | None = None,
         _fallback_request_budget_member: EnsembleMemberConfig | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
+        _artifact_tool_executor_capabilities: ModelCapabilities | None = None,
+        _artifact_tool_executor_capability_verified: bool = False,
         _provider_state_replay_activation_targets: Sequence[Any] | None = None,
     ) -> None:
         self.profile_name = profile_name
@@ -1353,14 +1459,20 @@ class EnsembleProvider:
         )
         self._fallback_request_budget_member = _fallback_request_budget_member
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
+        self.artifact_tool_executor_capabilities = (
+            _artifact_tool_executor_capabilities
+        )
+        self.artifact_tools_capability_verified = bool(
+            _artifact_tool_executor_capabilities is not None
+            and _artifact_tool_executor_capability_verified
+        )
         self._provider_state_replay_activation_targets = list(
             _provider_state_replay_activation_targets or []
         )
-        # This state is intentionally owned by the provider instance created
-        # for one Agent turn.  Agent tool continuations reuse that instance, so
-        # a fixed takeover stays on the same provider/model and cannot re-enter
-        # proposers.  If a future runtime rebuilds providers between logical
-        # calls, move this boundary into TurnExecutionContext.
+        # These fields are a fast path for an unchanged wrapper. The turn
+        # context also owns an immutable continuation snapshot, so a router
+        # replay can rebuild this wrapper without replaying proposers or losing
+        # prior physical usage rows.
         self._fixed_provider = fallback_provider
         self._fixed_takeover_active = False
         self._fixed_takeover_role = ""
@@ -1895,6 +2007,71 @@ class EnsembleProvider:
         return tuple(cls._immutable_candidate(candidate) for candidate in candidates)
 
     @staticmethod
+    def _materialize_snapshot_value(value: Any) -> Any:
+        """Turn a frozen contract snapshot back into provider-owned values."""
+
+        if isinstance(value, Mapping):
+            return {
+                key: EnsembleProvider._materialize_snapshot_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(
+                EnsembleProvider._materialize_snapshot_value(item)
+                for item in value
+            )
+        if isinstance(value, frozenset):
+            return frozenset(
+                EnsembleProvider._materialize_snapshot_value(item)
+                for item in value
+            )
+        return copy.deepcopy(value)
+
+    def _record_continuation_snapshot(
+        self,
+        execution_context: TurnExecutionContext | None,
+        *,
+        successful_drafts: Sequence[_CandidateResult],
+        candidate_bundle: Sequence[_CandidateResult],
+        all_candidates: Sequence[_CandidateResult],
+        base_messages: Sequence[Message],
+        prior_rows: Sequence[Mapping[str, Any]],
+        missing_cost_entries: int,
+        trace: Mapping[str, Any],
+    ) -> None:
+        """Persist the complete physical receipt before exposing tool Done.
+
+        Provider wrappers can be rebuilt between tool rounds.  The turn
+        context therefore owns the continuation receipt; instance fields are
+        only a fast path for an unchanged wrapper.
+        """
+
+        if execution_context is None:
+            return
+        trace_copy = copy.deepcopy(dict(trace))
+        final_request = trace_copy.get("final_request")
+        request_started = bool(
+            isinstance(final_request, Mapping)
+            and final_request.get("request_started") is True
+        )
+        execution_context.record_ensemble_continuation_snapshot(
+            EnsembleContinuationSnapshot(
+                role=execution_context.current_role(),
+                successful_drafts=self._immutable_candidates(
+                    tuple(candidate for candidate in all_candidates if candidate.ok)
+                ),
+                candidate_bundle=tuple(self._immutable_candidates(candidate_bundle)),
+                all_candidates=tuple(self._immutable_candidates(all_candidates)),
+                base_messages=tuple(copy.deepcopy(message) for message in base_messages),
+                prior_rows=tuple(copy.deepcopy(row) for row in prior_rows),
+                missing_cost_entries=missing_cost_entries,
+                ensemble_trace=trace_copy,
+                physical_request_count=int(trace_copy.get("llm_request_count") or 0),
+                request_started=request_started,
+            )
+        )
+
+    @staticmethod
     def _candidate_from_recovery_snapshot(
         item: Any,
         fallback_index: int,
@@ -1930,13 +2107,53 @@ class EnsembleProvider:
     ) -> None:
         """Restore role state when a provider wrapper is rebuilt mid-turn."""
 
+        snapshot = execution_context.ensemble_continuation_snapshot
+        snapshot_drafts = (
+            snapshot.successful_drafts
+            if snapshot is not None
+            else execution_context.successful_drafts
+        )
         recovered = tuple(
             candidate
-            for index, item in enumerate(execution_context.successful_drafts)
+            for index, item in enumerate(snapshot_drafts)
             if (
                 candidate := self._candidate_from_recovery_snapshot(item, index)
             )
             is not None
+        )
+        snapshot_bundle = tuple(
+            self._candidate_from_recovery_snapshot(item, index)
+            for index, item in enumerate(
+                snapshot.candidate_bundle if snapshot is not None else ()
+            )
+        )
+        candidate_bundle = tuple(item for item in snapshot_bundle if item is not None)
+        snapshot_all = tuple(
+            self._candidate_from_recovery_snapshot(item, index)
+            for index, item in enumerate(
+                snapshot.all_candidates if snapshot is not None else ()
+            )
+        )
+        all_candidates = tuple(item for item in snapshot_all if item is not None)
+        materialized_snapshot_messages = tuple(
+            self._materialize_snapshot_value(item)
+            for item in (snapshot.base_messages if snapshot is not None else ())
+        )
+        snapshot_messages = tuple(
+            item for item in materialized_snapshot_messages if isinstance(item, Message)
+        )
+        prior_rows = tuple(
+            self._materialize_snapshot_value(item)
+            for item in (snapshot.prior_rows if snapshot is not None else ())
+            if isinstance(item, Mapping)
+        )
+        prior_trace = (
+            self._materialize_snapshot_value(snapshot.ensemble_trace)
+            if snapshot is not None
+            else None
+        )
+        prior_missing_count = (
+            snapshot.missing_cost_entries if snapshot is not None else 0
         )
         role = execution_context.current_role()
         recovery = execution_context.recovery_context
@@ -1955,18 +2172,28 @@ class EnsembleProvider:
                 if role is StickyExecutionRole.FIXED_AGGREGATOR
                 else "fixed_direct"
             )
-            self._fixed_candidate_bundle = recovered
-            self._fixed_all_candidates = recovered
-            self._fixed_base_messages = recovered_conversation or tuple(messages)
+            self._fixed_candidate_bundle = candidate_bundle or recovered
+            self._fixed_all_candidates = all_candidates or recovered
+            self._fixed_base_messages = (
+                snapshot_messages or recovered_conversation or tuple(messages)
+            )
+            if snapshot is not None:
+                self._fixed_prior_rows = prior_rows
+                self._fixed_prior_missing_count = prior_missing_count
+                self._fixed_trace = prior_trace or None
             return
         if (
             role is StickyExecutionRole.PRIMARY_AGGREGATOR
             and execution_context.primary_logical_call_index >= 0
         ):
             self._primary_takeover_active = True
-            self._primary_candidate_bundle = recovered
-            self._primary_all_candidates = recovered
-            self._primary_base_messages = tuple(messages)
+            self._primary_candidate_bundle = candidate_bundle or recovered
+            self._primary_all_candidates = all_candidates or recovered
+            self._primary_base_messages = snapshot_messages or tuple(messages)
+            if snapshot is not None:
+                self._primary_prior_rows = prior_rows
+                self._primary_prior_missing_count = prior_missing_count
+                self._primary_trace = prior_trace or None
             if self.aggregator.ready:
                 with contextlib.suppress(Exception):
                     self._primary_provider = _build_provider(
@@ -1999,25 +2226,12 @@ class EnsembleProvider:
     def validate_chat_request(self, messages: list[Message]) -> ErrorEvent | None:
         """Reject typed image input before any ensemble leg can start."""
 
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            for block in message.content:
-                if isinstance(block, ContentBlockImage):
-                    return ErrorEvent(
-                        message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-                        code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-                    )
-                if not isinstance(block, ContentBlockToolResult):
-                    continue
-                if isinstance(block.content, list) and any(
-                    isinstance(item, ContentBlockImage) for item in block.content
-                ):
-                    return ErrorEvent(
-                        message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-                        code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-                    )
-        return None
+        if count_provider_image_blocks(messages) <= 0:
+            return None
+        return ErrorEvent(
+            message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
+            code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         models: list[ModelInfo] = []
@@ -2084,7 +2298,7 @@ class EnsembleProvider:
                 role="proposer",
             ).model_copy(update=proposer_updates)
             _require_projection(
-                _build_provider(member.provider_config),
+                _build_provider(_proposer_provider_config(member)),
                 member_config,
                 synthetic_messages=additional_messages,
             )
@@ -2829,7 +3043,11 @@ class EnsembleProvider:
                     ),
                 )
             return result
-        provider = _build_provider(member.provider_config)
+        # Proposers consume the visible conversation as independent candidate
+        # generators. Provider-private continuity state (reasoning_content,
+        # thinking blocks, thought signatures) belongs to the model that
+        # minted it and must not be replayed into any proposer physical call.
+        provider = _build_provider(_proposer_provider_config(member))
         text_parts: list[str] = []
         got_done = False
 
@@ -3388,7 +3606,6 @@ class EnsembleProvider:
                             "aggregator_finish",
                             usage=aggregator_usage,
                         )
-                        yield done_event
                         if attempt_had_tool:
                             self._primary_takeover_active = True
                             self._primary_provider = provider
@@ -3406,6 +3623,17 @@ class EnsembleProvider:
                             self._primary_prior_missing_count = (
                                 done_event.usage_missing_count
                             )
+                            self._record_continuation_snapshot(
+                                execution_context,
+                                successful_drafts=all_candidates,
+                                candidate_bundle=candidate_bundle,
+                                all_candidates=all_candidates,
+                                base_messages=original_messages,
+                                prior_rows=done_event.model_usage_breakdown,
+                                missing_cost_entries=done_event.usage_missing_count,
+                                trace=trace,
+                            )
+                        yield done_event
                         return
                     elif isinstance(event, ErrorEvent):
                         safe_event = replace(
@@ -3613,7 +3841,7 @@ class EnsembleProvider:
         config: ChatConfig | None,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        """Continue a tool-producing primary without replaying proposers."""
+        """Continue the primary aggregator after a tool call without replaying proposers."""
 
         provider = self._primary_provider
         bundle = self._primary_candidate_bundle
@@ -3691,7 +3919,7 @@ class EnsembleProvider:
             successful_count=sum(candidate.ok for candidate in all_candidates),
             fallback_used=False,
             fallback_reason="",
-            final_request_role="primary_aggregator",
+            final_request_role="aggregator",
             selected_candidates=selected,
             final_request_member=self.aggregator,
             final_request_config=primary_config,
@@ -3722,7 +3950,9 @@ class EnsembleProvider:
             prior_rows=list(self._primary_prior_rows),
             prior_missing_count=self._primary_prior_missing_count,
             trace=trace,
-            aggregator_role="primary_aggregator",
+            # ``primary_aggregator`` is only an execution-ledger phase, not
+            # another public ensemble member or request role.
+            aggregator_role="aggregator",
         ):
             yield event
 
@@ -3852,6 +4082,7 @@ class EnsembleProvider:
 
             attempt_started = time.monotonic()
             text_parts: list[str] = []
+            attempt_had_tool = False
             attempt_buffer_bytes = 0
             retry_error: ErrorEvent | None = None
             retry_reason = ""
@@ -3950,6 +4181,17 @@ class EnsembleProvider:
                                 for item in rows
                                 if item.get("usage_receipt_missing")
                             )
+                            if attempt_had_tool:
+                                self._record_continuation_snapshot(
+                                    execution_context,
+                                    successful_drafts=self._fixed_all_candidates,
+                                    candidate_bundle=self._fixed_candidate_bundle,
+                                    all_candidates=self._fixed_all_candidates,
+                                    base_messages=self._fixed_base_messages,
+                                    prior_rows=rows,
+                                    missing_cost_entries=self._fixed_prior_missing_count,
+                                    trace=trace,
+                                )
                         yield replace(
                             event,
                             input_tokens=_summed_int(rows, "input_tokens"),
@@ -4014,6 +4256,11 @@ class EnsembleProvider:
                     if isinstance(event, TextDeltaEvent):
                         if event.text:
                             text_parts.append(event.text)
+                    elif isinstance(
+                        event,
+                        (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent),
+                    ):
+                        attempt_had_tool = True
                     yield event
             except ProviderAdmissionError:
                 raise
@@ -5942,7 +6189,8 @@ def _custom_b5_candidates(config: Any) -> list[_CustomB5Candidate]:
         model = str(getattr(entry, "model", "") or "").strip()
         if not provider or not model:
             continue
-        role = str(getattr(entry, "role", "") or "").strip().lower()
+        raw_role = str(getattr(entry, "role", "") or "").strip().lower()
+        role = "aggregator" if raw_role == "aggregator" else "proposer"
         identity = (provider, model)
         # The aggregator row may legitimately duplicate a proposer row
         # (same model both drafts and fuses); proposer rows dedupe.
@@ -5973,8 +6221,9 @@ def _build_custom_b5_members(
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build the explicit user-authored lineup.
 
-    Every enabled candidate without role='aggregator' runs as a proposer;
-    the single 'aggregator' row fuses. When no aggregator row exists the
+    Every enabled candidate with role='proposer' drafts independently; the
+    single 'aggregator' row fuses. Legacy role aliases normalize to proposer.
+    When no aggregator row exists the
     lineup falls back to the currently routed model — the same model the
     user would have gotten without the ensemble — so a proposer-only config
     still runs instead of erroring at turn time.
@@ -5995,7 +6244,7 @@ def _build_custom_b5_members(
             ),
             config=config,
             inherited=inherited_provider_config,
-            label=row.role or f"proposer_{index + 1}",
+            label=f"proposer_{index + 1}",
             credential_pool_acquirer=credential_pool_acquirer,
             session_key=session_key,
         )
@@ -6028,7 +6277,7 @@ def _build_custom_b5_members(
         "profile": CUSTOM_B5_SELECTION_MODE,
         "proposer_count": len(proposers),
         "proposers": [
-            {"provider": row.provider, "model": row.model, "role": row.role or ""}
+            {"provider": row.provider, "model": row.model, "role": "proposer"}
             for row in proposer_rows
         ],
         "aggregator": {
@@ -6630,6 +6879,7 @@ def build_ensemble_provider_from_config(
     _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
     _session_key: str = "",
     _fallback_selector: Any | None = None,
+    _artifact_mutation: bool = False,
     _selection_mode_override: str | None = None,
     _plan_provider_config: ProviderConfig | None = None,
     _dynamic_baseline_provider_config: ProviderConfig | None = None,
@@ -6673,6 +6923,25 @@ def build_ensemble_provider_from_config(
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
+    artifact_tool_executor_capabilities: ModelCapabilities | None = None
+    artifact_tool_executor_capability_verified = False
+    if _artifact_mutation:
+        if not aggregator.ready:
+            raise ValueError(
+                "artifact_ensemble_unavailable:aggregator_not_ready"
+            )
+        artifact_tool_executor_capabilities = _member_model_capabilities(
+            aggregator,
+            model_catalog=_model_catalog,
+        )
+        if artifact_tool_executor_capabilities.supports_tools is False:
+            raise ValueError(
+                "artifact_ensemble_unavailable:aggregator_tools_unsupported"
+            )
+        artifact_tool_executor_capability_verified = _member_tools_capability_is_verified(
+            aggregator,
+            model_catalog=_model_catalog,
+        )
     is_custom_b5 = selection_mode == CUSTOM_B5_SELECTION_MODE
     # Static and custom lineups share the fixed-lineup quorum/shuffle family.
     # Packaged static profiles additionally use tighter per-call timeouts.
@@ -6830,30 +7099,49 @@ def build_ensemble_provider_from_config(
         if _enable_member_request_budget_rebinding
         else {}
     )
+    effective_all_failed_policy = cast(
+        Literal["fallback_single", "error"],
+        (
+            "error"
+            if _artifact_mutation
+            else getattr(ensemble_cfg, "all_failed_policy", "fallback_single")
+        ),
+    )
+    effective_proposer_tools = (
+        False
+        if _artifact_mutation
+        else bool(getattr(ensemble_cfg, "proposer_tools", False))
+    )
+    if _artifact_mutation:
+        selection_plan["artifact_execution_policy"] = "aggregator_only"
     return EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
         aggregator=aggregator,
-        fallback_provider=fallback_provider,
+        fallback_provider=None if _artifact_mutation else fallback_provider,
         fallback_provider_name=inherited_provider_config.provider,
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
         min_successful_proposers=min_successful_proposers,
         target_successful_proposers=target_successful_proposers,
         proposer_max_retries=proposer_max_retries,
+        all_failed_policy=effective_all_failed_policy,
         configured_proposer_max_retries=configured_proposer_max_retries,
-        all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
         candidate_max_chars=int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0),
         shuffle_candidates=shuffle_candidates,
         record_candidates=bool(getattr(ensemble_cfg, "record_candidates", False)),
-        proposer_tools=bool(getattr(ensemble_cfg, "proposer_tools", False)),
+        proposer_tools=effective_proposer_tools,
         quorum_grace_seconds=quorum_grace_seconds,
         selection_plan=selection_plan,
         _member_request_budget_bindings=request_budget_bindings,
         _fallback_request_budget_member=fallback_request_budget_member,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
+        _artifact_tool_executor_capabilities=artifact_tool_executor_capabilities,
+        _artifact_tool_executor_capability_verified=(
+            artifact_tool_executor_capability_verified
+        ),
         _provider_state_replay_activation_targets=(
             deferred_replay_activation_targets
         ),

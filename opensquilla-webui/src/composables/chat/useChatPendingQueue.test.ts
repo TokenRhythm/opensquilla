@@ -1100,6 +1100,25 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('does not edit a queued annotation batch into plain text', async () => {
+    const { inputText, queue } = makeQueue()
+    await expect(queue.enqueuePendingPayload({
+      text: 'apply the second selected edit',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    })).resolves.toBe(true)
+    const itemId = pendingUiId(queue, 0)
+    inputText.value = 'keep the current composer draft'
+
+    expect(queue.editPendingItem(itemId)).toBe(false)
+    expect(queue.pendingQueue.value).toHaveLength(1)
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: 'apply the second selected edit',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    })
+    expect(inputText.value).toBe('keep the current composer draft')
+    queue.cleanup()
+  })
+
   it('hydrates a cancelling WAL as cancel-only without restoring the server row', async () => {
     const { wal } = memoryWal([{
       schemaVersion: 1,
@@ -1455,6 +1474,120 @@ describe('useChatPendingQueue delivery state', () => {
     queue.switchPendingQueue('agent:main:webchat:test')
     expect(queue.pendingQueue.value).toEqual([])
     queue.cleanup()
+  })
+
+  it('never rehydrates or auto-dispatches an accepted steer after repeated session returns', async () => {
+    vi.useFakeTimers()
+    const sessionA = 'agent:main:webchat:A'
+    const sessionB = 'agent:main:webchat:B'
+    const record: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-consumed-steer',
+      sessionKey: sessionB,
+      clientRequestId: 'request-consumed-steer',
+      clientMessageId: 'message-consumed-steer',
+      text: 'consume this steer once',
+      attachments: [],
+      intent: null,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:consumed-steer',
+      serverRevision: 1,
+      position: 0,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal, records } = memoryWal([record])
+    let serverRows: Array<Record<string, unknown>> = [{
+      pendingInputId: record.pendingInputId,
+      clientRequestId: record.clientRequestId,
+      clientMessageId: record.clientMessageId,
+      requestFingerprint: record.requestFingerprint,
+      message: record.text,
+      attachments: [],
+      position: record.position,
+      revision: record.serverRevision,
+    }]
+    const listedSessionKeys: string[] = []
+    const rpcCall = vi.fn(async (
+      method: string,
+      params?: Record<string, unknown>,
+    ): Promise<unknown> => {
+      if (method !== 'sessions.pending_inputs.list') {
+        throw new Error(`unexpected method: ${method}`)
+      }
+      const key = String(params?.key || '')
+      listedSessionKeys.push(key)
+      return {
+        items: key === sessionB ? structuredClone(serverRows) : [],
+      }
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+        rpcCall(method, params) as Promise<T>
+      ),
+    }
+    const sessionKey = ref(sessionB)
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const { queue } = makeQueue(
+      dispatchPendingItem,
+      () => false,
+      undefined,
+      undefined,
+      {
+        sessionKey,
+        pendingInputWal: wal,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        connectionState: ref('connected'),
+      },
+    )
+
+    const returnToBAndSignalReady = async () => {
+      const previousBLists = listedSessionKeys.filter(key => key === sessionB).length
+      queue.switchPendingQueue(sessionB)
+      sessionKey.value = sessionB
+      await vi.waitFor(() => {
+        expect(listedSessionKeys.filter(key => key === sessionB).length)
+          .toBeGreaterThan(previousBLists)
+      })
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+
+      // This is the same drain signal ChatView emits when livePhase becomes ready.
+      queue.schedulePendingDrainAfterTerminal()
+      queue.flushDeferredPendingDrain()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(queue.pendingQueue.value).toEqual([])
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+    }
+
+    try {
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+      const steering = queue.beginPendingDelivery(pendingUiId(queue, 0))
+      expect(steering).not.toBeNull()
+
+      // The server consumes the durable row atomically with accepting the steer.
+      serverRows = []
+      queue.switchPendingQueue(sessionA)
+      sessionKey.value = sessionA
+      queue.settlePendingDelivery(steering!, 'accepted')
+      await nextTick()
+      await vi.waitFor(() => expect(records.size).toBe(0))
+
+      await returnToBAndSignalReady()
+      queue.switchPendingQueue(sessionA)
+      sessionKey.value = sessionA
+      await nextTick()
+      await returnToBAndSignalReady()
+
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
   })
 
   it('parks an in-flight steer with its source session and exact request snapshot', () => {

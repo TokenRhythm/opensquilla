@@ -2,6 +2,7 @@ import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
   ChatMessage,
+  ChatModelCallSegment,
   ChatRunStatus,
   ChatRunStatusSource,
   ChatStreamSegment,
@@ -37,6 +38,10 @@ import {
 } from '@/utils/chat/toolDisplay'
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
 import { reconcileTextSnapshot } from '@/utils/chat/foldTurn'
+import {
+  normalizeModelCallSegments,
+  splitTextByModelCallSegments,
+} from '@/utils/chat/modelCallSegments'
 import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
 import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
@@ -119,6 +124,11 @@ export interface StreamTaskClockSnapshot {
   startedAt?: number | string | null
 }
 
+export interface ChatStreamModelCallIdentity {
+  modelCallId: string
+  iteration: number
+}
+
 function normalizedTaskStartedAt(value: unknown): number | null {
   if (typeof value !== 'number' && typeof value !== 'string') return null
   if (typeof value === 'string' && !value.trim()) return null
@@ -149,6 +159,22 @@ export function useChatStream(options: UseChatStreamOptions) {
   let checkpointedAcrossToolBoundary = false
   let activeStreamTurnId = ''
   let activeAssistantMessageId = ''
+  let activeModelCallId = ''
+  let activeModelCallIteration = 0
+  let streamCheckpointSeq = 0
+  const streamCheckpoints: Array<{
+    message: ChatMessage | null
+    insertIndex: number
+    turnId: string
+    boundaryKey: string
+    messageClientId: string
+    rawText: string
+    applied: boolean
+    modelCallId: string
+    iteration: number
+    predecessorModelCallId: string
+    predecessorIteration: number
+  }> = []
   const streamBubble = ref(false)
   const streamShowHeader = ref(false)
 
@@ -249,6 +275,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   })
   const {
     appendFrame,
+    setAcceptedActivityOrder,
     checkpointText,
     finalizeToolInputs,
     peekRawText,
@@ -329,6 +356,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   const reasoningPresentationPending = ref(false)
 
   function resetStreamState() {
+    acceptedActivityStartedAt = 0
     streamRaw.value = ''
     streamSegments.value = []
     streamToolCalls.value = []
@@ -336,6 +364,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     toolTimes.value = new Map()
     reasoningCharsSinceFlush = 0
     reasoningPresentationPending.value = false
+    activeModelCallId = ''
+    activeModelCallIteration = 0
+    streamCheckpointSeq = 0
+    streamCheckpoints.length = 0
     // Clear the live-turn log alongside the legacy refs so the next turn's fold
     // starts empty. A steer checkpoint deliberately resets only the current
     // visible segment; checkpointedRaw remains available to de-duplicate an
@@ -355,26 +387,36 @@ export function useChatStream(options: UseChatStreamOptions) {
   // `key` identifies the activity phase: the elapsed counter restarts only
   // when the phase changes, so label refinements (e.g. tool arguments
   // streaming in) keep the same running clock.
-  function setStreamActivity(label: string, key = label) {
+  let acceptedActivityStartedAt = 0
+
+  function setAcceptedActivityStartedAt(value: number | undefined) {
+    acceptedActivityStartedAt = (
+      typeof value === 'number' && Number.isFinite(value) && value > 0
+        ? value
+        : 0
+    )
+  }
+
+  function setStreamActivity(label: string, key = label, recordActivity = true) {
     noteStreamSignal()
     const current = streamActivity.value
     let isNewPhase = false
     if (current.key === key) {
       if (!current.startedAt) {
-        streamActivity.value = { label, key, startedAt: Date.now() }
+        streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
         isNewPhase = true
       } else if (current.label !== label) {
         streamActivity.value = { label, key, startedAt: current.startedAt }
       }
     } else {
-      streamActivity.value = { label, key, startedAt: Date.now() }
+      streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
       isNewPhase = true
     }
     // Record each accepted phase transition into the append-only log so the
     // finished turn can show the activity timeline. Gated on the reducer like
     // every other frame; OFF mode appends nothing and the history stays empty.
     // Label-only refinements (same key) emit nothing — only a real phase change.
-    if (isNewPhase && useReducer.value) {
+    if (isNewPhase && recordActivity && useReducer.value) {
       const committed = streamActivity.value
       appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt })
       // TurnAccumulator is intentionally non-reactive. A provider phase can be
@@ -387,6 +429,10 @@ export function useChatStream(options: UseChatStreamOptions) {
         streamActivityTick.value++
       }, 1000)
     }
+  }
+
+  function recordActivityPhase(label: string, key = label) {
+    setStreamActivity(label, key, true)
   }
 
   function recordCompactionActivity(payload: CompactionPayload) {
@@ -654,23 +700,41 @@ export function useChatStream(options: UseChatStreamOptions) {
     publishTurnLog()
   }
 
-  function checkpointForUserMessage(turnId: string) {
+  function checkpointForUserMessage(turnId: string, boundaryKey = '') {
     if (!isStreaming.value || !streamBubble.value) return
+    const existing = boundaryKey
+      ? streamCheckpoints.find(checkpoint =>
+          boundaryKeysEquivalent(checkpoint.boundaryKey, boundaryKey),
+        )
+      : undefined
+    if (existing) {
+      existing.turnId = turnId || existing.turnId
+      existing.insertIndex = boundaryMessageIndex(boundaryKey)
+      setCheckpointText(existing, existing.rawText)
+      return
+    }
     activeStreamTurnId = turnId || activeStreamTurnId
 
     clearRenderTimer()
-    const cleanedText = options.stripDirectiveTags(
-      options.stripGeneratedArtifactMarkers(currentStreamRaw()),
-    ).trim()
-    if (cleanedText) {
-      options.messages.value.push({
-        role: 'assistant',
-        text: cleanedText,
-        ts: new Date().toISOString(),
-        turnId,
-        timeline: [{ type: 'text', raw: cleanedText }],
-      })
+    const rawText = currentStreamRaw()
+    const checkpoint: typeof streamCheckpoints[number] = {
+      message: null,
+      insertIndex: boundaryMessageIndex(boundaryKey),
+      turnId,
+      boundaryKey,
+      messageClientId: `live-steer-checkpoint:${boundaryKey || streamCheckpointSeq++}`,
+      rawText,
+      applied: false,
+      modelCallId: '',
+      iteration: 0,
+      predecessorModelCallId: activeModelCallId,
+      predecessorIteration: activeModelCallIteration,
     }
+    streamCheckpoints.push(checkpoint)
+    // Reconnect/session restoration may retain the optimistic checkpoint row
+    // while resetLiveTurnState clears only its in-memory lifecycle record.
+    // Adopt that stable row instead of inserting a duplicate.
+    setCheckpointText(checkpoint, rawText)
 
     checkpointedAcrossToolBoundary = checkpointedAcrossToolBoundary || Boolean(
       streamToolCalls.value.length
@@ -689,6 +753,151 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamIdleTimer()
   }
 
+  function acknowledgeSteerBoundary(
+    boundaryKey: string,
+    modelCallId = '',
+    iteration = 0,
+  ) {
+    const checkpoint = boundaryKey
+      ? streamCheckpoints.find(candidate =>
+          !candidate.applied && boundaryKeysEquivalent(candidate.boundaryKey, boundaryKey),
+        )
+      : streamCheckpoints.find(candidate => !candidate.applied)
+    if (!checkpoint) return
+    checkpoint.applied = true
+    if (modelCallId) checkpoint.modelCallId = modelCallId
+    checkpoint.iteration = iteration
+  }
+
+  function boundaryMessageIndex(boundaryKey: string): number {
+    if (!boundaryKey) return options.messages.value.length
+    const userIndex = options.messages.value.findIndex(message =>
+      message.role === 'user'
+      && (
+        message.clientId === boundaryKey
+        || message.messageId === boundaryKey
+        || message.steerClientMessageId === boundaryKey
+        || message.steerClientRequestId === boundaryKey
+      ),
+    )
+    return userIndex >= 0 ? userIndex : options.messages.value.length
+  }
+
+  function boundaryKeysEquivalent(left: string, right: string): boolean {
+    if (!left || !right) return false
+    if (left === right) return true
+    const leftIndex = boundaryMessageIndex(left)
+    const rightIndex = boundaryMessageIndex(right)
+    return leftIndex < options.messages.value.length && leftIndex === rightIndex
+  }
+
+  function checkpointMessageInsertIndex(checkpoint: typeof streamCheckpoints[number]): number {
+    const userIndex = boundaryMessageIndex(checkpoint.boundaryKey)
+    if (userIndex < options.messages.value.length) return userIndex
+    return Math.min(checkpoint.insertIndex, options.messages.value.length)
+  }
+
+  function setCheckpointText(
+    checkpoint: typeof streamCheckpoints[number],
+    rawText: string,
+  ) {
+    const cleanedText = options.stripDirectiveTags(
+      options.stripGeneratedArtifactMarkers(rawText),
+    ).trim()
+    let currentIndex = checkpoint.message
+      ? options.messages.value.indexOf(checkpoint.message)
+      : -1
+    if (currentIndex < 0) {
+      currentIndex = options.messages.value.findIndex(message =>
+        message.role === 'assistant'
+        && message.clientId === checkpoint.messageClientId,
+      )
+    }
+    if (!cleanedText) {
+      if (currentIndex >= 0) options.messages.value.splice(currentIndex, 1)
+      checkpoint.message = null
+      return
+    }
+    const timeline: ChatTimelineSegment[] = [{ type: 'text', raw: cleanedText }]
+    if (currentIndex >= 0) {
+      const current = options.messages.value[currentIndex]!
+      current.text = cleanedText
+      current.timeline = timeline
+      const desiredIndex = checkpointMessageInsertIndex(checkpoint)
+      const moveTo = desiredIndex > currentIndex ? desiredIndex - 1 : desiredIndex
+      if (moveTo !== currentIndex) {
+        options.messages.value.splice(currentIndex, 1)
+        options.messages.value.splice(moveTo, 0, current)
+      }
+      checkpoint.message = current
+      return
+    }
+    const insertIndex = checkpointMessageInsertIndex(checkpoint)
+    options.messages.value.splice(insertIndex, 0, {
+      role: 'assistant',
+      text: cleanedText,
+      ts: new Date().toISOString(),
+      clientId: checkpoint.messageClientId,
+      turnId: checkpoint.turnId,
+      timeline,
+    })
+    checkpoint.message = options.messages.value[insertIndex]!
+  }
+
+  function checkpointForModelCall(
+    identity: ChatStreamModelCallIdentity | undefined,
+  ): typeof streamCheckpoints[number] | undefined {
+    const modelCallId = identity?.modelCallId.trim() || ''
+    const iteration = Number.isInteger(identity?.iteration) && (identity?.iteration || 0) > 0
+      ? identity!.iteration
+      : 0
+    if (modelCallId || iteration) {
+      const predecessor = streamCheckpoints.find(candidate => (
+        modelCallId
+        && candidate.predecessorModelCallId
+        && candidate.predecessorModelCallId === modelCallId
+      ) || (
+        !modelCallId
+        && iteration > 0
+        && candidate.predecessorIteration === iteration
+      ))
+      if (predecessor) return predecessor
+      if (iteration > 0) {
+        const laterBoundary = streamCheckpoints.find(candidate =>
+          candidate.applied
+          && candidate.iteration > 0
+          && iteration < candidate.iteration,
+        )
+        if (laterBoundary) return laterBoundary
+      }
+    }
+    return streamCheckpoints.find(candidate => !candidate.applied)
+  }
+
+  function appendDeltaBeforeSteer(
+    text: string,
+    identity: ChatStreamModelCallIdentity | undefined,
+  ): boolean {
+    const checkpoint = checkpointForModelCall(identity)
+    if (!checkpoint) return false
+
+    let deltaText = typeof text === 'string' ? text : ''
+    if (checkpoint.rawText && deltaText === checkpoint.rawText) return true
+    if (checkpoint.rawText && deltaText.startsWith(checkpoint.rawText)) {
+      deltaText = deltaText.slice(checkpoint.rawText.length)
+    } else if (checkpointedRaw && deltaText.startsWith(checkpointedRaw)) {
+      deltaText = deltaText.slice(checkpointedRaw.length)
+    }
+    if (!deltaText) return true
+
+    checkpoint.rawText += deltaText
+    checkpointedRaw += deltaText
+    setCheckpointText(checkpoint, checkpoint.rawText)
+    noteStreamSignal()
+    scheduleRender()
+    return true
+  }
+
   function resetStreamForRouterReplay() {
     resetStreamState()
     streamToolGroupSeq = 0
@@ -699,6 +908,11 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function resetLiveTurnState() {
+    // Session switches can happen while a render frame or fallback timer is
+    // waiting to flush the previous live turn. Cancel it before clearing the
+    // stream state so the old session cannot request a scroll in the next
+    // session's reused transcript element.
+    clearRenderTimer()
     hideThinkingIndicator()
     clearStreamActivity()
     clearStreamIdleTimer()
@@ -808,12 +1022,22 @@ export function useChatStream(options: UseChatStreamOptions) {
   function appendDelta(
     text: string,
     presentation: 'intermediate' | 'answer' = 'answer',
+    identity?: ChatStreamModelCallIdentity,
   ) {
     if (options.aborted.value) return
+    if (appendDeltaBeforeSteer(text, identity)) return
     const deltaText = normalizeIncomingTextDelta(text)
     if (!deltaText) return
     if (!isStreaming.value) startStreaming()
-    setStreamActivity('Writing reply', `write:${streamRound.value}`)
+    const modelCallId = identity?.modelCallId.trim() || ''
+    const iteration = Number.isInteger(identity?.iteration) && (identity?.iteration || 0) > 0
+      ? identity!.iteration
+      : 0
+    if (modelCallId || iteration) {
+      activeModelCallId = modelCallId
+      activeModelCallIteration = iteration
+    }
+    recordActivityPhase('Writing reply', `write:${streamRound.value}`)
     if (useReducer.value !== true) streamRaw.value += deltaText
 
     if (useReducer.value !== true) {
@@ -1281,7 +1505,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       .flatMap((seg): ChatTimelineSegment[] => {
         if (seg.type === 'text') {
           const raw = String(seg.raw || '')
-          return raw ? [{ type: 'text', raw }] : []
+          return raw ? [{ type: 'text', raw, presentation: seg.presentation }] : []
         }
         if (seg.type === 'tool-group') {
           return [{
@@ -1292,7 +1516,9 @@ export function useChatStream(options: UseChatStreamOptions) {
         }
         return []
       })
-    if (segments.length === 0 && fallbackText) return [{ type: 'text', raw: fallbackText }]
+    if (segments.length === 0 && fallbackText) {
+      return [{ type: 'text', raw: fallbackText, presentation: 'answer' }]
+    }
     return segments
   }
 
@@ -1314,6 +1540,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     approvalId: string
     data: InterruptApprovalData | InterruptClarifyData
     at: number
+    activityOrder?: number
   }) {
     noteStreamSignal()
     if (useReducer.value) appendFrame({ kind: 'interrupt', ...input })
@@ -1334,15 +1561,66 @@ export function useChatStream(options: UseChatStreamOptions) {
     isStreaming.value = true
   }
 
-  function reconcileFinalText(finalText: string | null | undefined) {
+  function reconcileCheckpointedText(
+    finalText: string,
+    modelCallSegments: ChatModelCallSegment[] | null | undefined,
+  ): string | null {
+    if (streamCheckpoints.length === 0) return null
+    const chunks = splitTextByModelCallSegments(finalText, modelCallSegments)
+    if (!chunks) return null
+    const normalized = normalizeModelCallSegments(
+      modelCallSegments,
+      Array.from(finalText).length,
+    )
+    const checkpointTexts = streamCheckpoints.map(() => '')
+    const hasAppliedIdentities = streamCheckpoints.every(checkpoint => checkpoint.modelCallId)
+    if (hasAppliedIdentities) {
+      let checkpointIndex = 0
+      for (let segmentIndex = 0; segmentIndex < normalized.length; segmentIndex++) {
+        const segment = normalized[segmentIndex]!
+        const groupStart = checkpointIndex
+        while (
+          checkpointIndex < streamCheckpoints.length
+          && streamCheckpoints[checkpointIndex]!.modelCallId === segment.modelCallId
+        ) {
+          checkpointIndex++
+        }
+        if (checkpointIndex === groupStart) return null
+        checkpointTexts[groupStart] = chunks[segmentIndex] || ''
+      }
+      if (checkpointIndex !== streamCheckpoints.length) return null
+    } else {
+      // Compatibility with gateways that predate applied model-call identity.
+      if (
+        streamCheckpoints.some(checkpoint => checkpoint.modelCallId)
+        || chunks.length !== streamCheckpoints.length + 1
+      ) return null
+      streamCheckpoints.forEach((_checkpoint, index) => {
+        checkpointTexts[index] = chunks[index] || ''
+      })
+    }
+    streamCheckpoints.forEach((checkpoint, index) => {
+      checkpoint.rawText = checkpointTexts[index] || ''
+      setCheckpointText(checkpoint, checkpoint.rawText)
+    })
+    return chunks[chunks.length - 1]!
+  }
+
+  function reconcileFinalText(
+    finalText: string | null | undefined,
+    modelCallSegments?: ChatModelCallSegment[] | null,
+  ) {
     // null/undefined means the terminal event carried no authoritative text
     // snapshot, so streamed deltas remain canonical. Empty string is distinct:
     // it intentionally clears stale text while preserving tool history.
     if (finalText == null) return
 
-    const segmentFinalText = checkpointedRaw && finalText.startsWith(checkpointedRaw)
-      ? finalText.slice(checkpointedRaw.length)
-      : finalText
+    const boundaryTail = reconcileCheckpointedText(finalText, modelCallSegments)
+    const segmentFinalText = boundaryTail != null
+      ? boundaryTail
+      : checkpointedRaw && finalText.startsWith(checkpointedRaw)
+        ? finalText.slice(checkpointedRaw.length)
+        : finalText
     if (useReducer.value === true) {
       const changed = currentStreamRaw() !== segmentFinalText
       appendFrame({ kind: 'final-text', text: segmentFinalText })
@@ -1424,6 +1702,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     reconcileStreamTaskClock,
     endStreaming,
     checkpointForUserMessage,
+    acknowledgeSteerBoundary,
     resetStreamForRouterReplay,
     resetLiveTurnState,
     resetAnswerGeneration,
@@ -1436,6 +1715,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendToolResult,
     appendArtifact,
     appendInterruptFrame,
+    recordActivityPhase,
+    setAcceptedActivityStartedAt,
     ensureInterruptBubble,
     reconcileFinalText,
     resetStreamIdleTimer,
@@ -1455,6 +1736,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // (which own the thinking ref) append their frame; assertLiveParity is run
     // from a DEV watchEffect; foldedTurn is the fold output (not rendered yet).
     appendFrame,
+    setAcceptedActivityOrder,
     noteReasoningPresentationDelta,
     completeReasoningPresentation,
     useReducer,

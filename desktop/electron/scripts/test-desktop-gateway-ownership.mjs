@@ -14,6 +14,7 @@ import {
   DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL,
   canonicalDesktopGatewayIdentityPayload,
   canonicalDesktopGatewayShutdownPayload,
+  desktopGatewayAuthToken,
   desktopGatewayIdentityProof,
   desktopGatewayOwnershipMatchesLaunch,
   desktopGatewayOwnershipRecordPath,
@@ -69,6 +70,11 @@ assert.equal(
   desktopGatewayIdentityProof(nonce, unsignedIdentity),
   '67f44cb9dd44df65360c36f5ab7090bcbd30a11c710b8131b960e3ed1f33e0cb',
   'the Electron proof must remain byte-identical to Python\'s golden vector',
+)
+assert.equal(
+  desktopGatewayAuthToken(nonce),
+  'fe0aa74bf86e4f81f2e752de1f4fd6c40441fa83e53289825d3051c414f15e2c',
+  'the renderer credential must remain byte-identical to Python\'s derivation',
 )
 assert.equal(
   canonicalDesktopGatewayShutdownPayload(record, challenge),

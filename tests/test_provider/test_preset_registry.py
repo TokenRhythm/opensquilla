@@ -148,16 +148,16 @@ def test_tokenrhythm_curated_ladder() -> None:
     assert preset is not None
     assert preset.synthesized is False
     assert preset.persistable is False
-    assert preset.default_model == "deepseek-v4-flash-0731"
+    assert preset.default_model == "deepseek-v4-pro-0813"
     assert not hasattr(preset, "default_ensemble_selection_mode")
     assert (
         recommended_ensemble_selection_mode_for_provider(preset.provider_id)
         == "static_tokenrhythm_b5"
     )
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }
@@ -173,6 +173,8 @@ def test_tokenrhythm_curated_ladder() -> None:
         preset.default_model,
         *(entry["model"] for entry in tiers.values()),
     })
+    assert tiers["c0"]["supports_image"] is False
+    assert tiers["c2"]["supports_image"] is False
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True
     assert tiers["c3"]["ensemble_enabled"] is True

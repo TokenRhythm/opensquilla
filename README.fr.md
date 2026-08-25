@@ -30,7 +30,11 @@
 
 ## Actualités
 
-- 📢 **2026-07-03** — Notre rapport technique **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)** (préversion) est disponible, publié en même temps qu'OpenSquilla **0.5.0 Preview 1**. Il détaille comment le routeur natif du harness transforme le trafic quotidien des agents en un volant d'inertie de données qui s'améliore de lui-même.
+- 📢 **2026-08-22** — La version anglaise de notre rapport technique est désormais disponible sur aiXiv : [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). Voir [Citation](#citation) pour savoir comment citer OpenSquilla.
+
+- 📢 **2026-08-21** — Les versions PDF de notre rapport technique sont désormais disponibles dans ce dépôt : [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
+
+- 📢 **2026-07-14** — Notre rapport technique **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** est désormais disponible sur arXiv. Il montre comment le routeur natif du harness transforme le trafic quotidien des agents en un volant d'inertie de données qui s'améliore de lui-même, et comment **le routage d'ensemble multi-modèles surpasse Fable 5**.
 
 ---
 
@@ -49,7 +53,7 @@ enfichable dialogue avec TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, Dee
 Qwen/DashScope et plus de 20 autres fournisseurs de LLM, sans aucun changement dans
 votre code ni dans votre schéma de configuration.
 
-OpenSquilla 0.5.3 est la version stable actuelle.
+OpenSquilla 0.5.4 est la version stable actuelle.
 
 Pour une documentation produit orientée tâches, commencez par le
 [Guide produit OpenSquilla](README.product.md) ou par l'[index de la
@@ -74,9 +78,9 @@ GitHub publiées. Les installations de wheel Python utilisent des noms de fichie
 wheel versionnés, car les installateurs valident la version intégrée au nom de
 fichier du wheel.
 
-Pour un usage bureau en 0.5.3, préférez les installateurs de bureau empaquetés issus de la
-Release GitHub : `OpenSquilla-0.5.3-mac-arm64.dmg` sous macOS et
-`OpenSquilla-0.5.3-win-x64.exe` sous Windows.
+Pour un usage bureau en 0.5.4, préférez les installateurs de bureau empaquetés issus de la
+Release GitHub : `OpenSquilla-0.5.4-mac-arm64.dmg` sous macOS et
+`OpenSquilla-0.5.4-win-x64.exe` sous Windows.
 
 | Voie | Public | Quand l'utiliser |
 | --- | --- | --- |
@@ -125,11 +129,11 @@ Liens d'installation : [Git](https://git-scm.com/downloads) ·
 
 ### Installateurs de bureau
 
-Les installateurs de bureau 0.5.3 empaquettent la console de contrôle Vue et
+Les installateurs de bureau 0.5.4 empaquettent la console de contrôle Vue et
 l'environnement d'exécution de la passerelle dans une enveloppe Electron.
 
-- macOS Apple Silicon : <https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/OpenSquilla-0.5.3-mac-arm64.dmg>
-- Windows x64 : <https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/OpenSquilla-0.5.3-win-x64.exe>
+- macOS Apple Silicon : <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64 : <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 Pour des téléchargements plus rapides depuis la Chine continentale, utilisez les alias de téléchargement direct OSS :
 - macOS Apple Silicon : <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -178,7 +182,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Installer OpenSquilla** — la même commande sur toutes les plateformes.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 Cela installe le wheel OpenSquilla depuis l'URL de release, puis laisse `uv`
@@ -203,7 +207,7 @@ opensquilla gateway run
 > nouveau terminal, ou réexécutez la ligne PATH de l'étape 1.
 
 Pour une installation entièrement épinglée, utilisez l'URL de wheel versionnée :
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl`.
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
@@ -841,3 +845,23 @@ compétences et travail sur le runtime central. Consultez
 
 [Code de conduite](CODE_OF_CONDUCT.md) · [Sécurité](SECURITY.md) ·
 [Support](SUPPORT.md) · [Licence](LICENSE) (Apache-2.0)
+
+---
+
+## Citation
+
+Si vous utilisez OpenSquilla dans vos travaux de recherche, merci de citer notre rapport technique :
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

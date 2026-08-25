@@ -385,6 +385,11 @@ function cancelFrame(frame: number) {
 
 function elementNeedsAnchorRemeasure(element: Element): boolean {
   if (!lastAnchorElement || element === lastAnchorElement) return true
+  // The minimap observes direct thread children. When the list root contains
+  // the current last prompt, its own late height change must invalidate the
+  // cached anchor even though document position reports the anchor as a
+  // descendant rather than a following sibling.
+  if (element.contains(lastAnchorElement)) return true
   return Boolean(element.compareDocumentPosition(lastAnchorElement) & Node.DOCUMENT_POSITION_FOLLOWING)
 }
 
@@ -563,9 +568,16 @@ function finishNavigation() {
 }
 
 function cancelNavigation() {
+  const container = navigationContainer
+  const shouldCancelSmoothScroll = navigationPending && Boolean(container)
   navigationGeneration += 1
   settleNavigation(false)
+  if (shouldCancelSmoothScroll && container) {
+    container.scrollTo({ top: container.scrollTop, behavior: 'auto' })
+  }
 }
+
+defineExpose({ cancelNavigation })
 
 function armNavigationEnd(container: HTMLElement, smooth: boolean) {
   navigationPending = true
@@ -591,11 +603,21 @@ async function navigateTo(index: number, focusTarget = false) {
     closeHoverPreview()
     focusedIndex.value = null
   }
+  // Open the lifecycle before awaiting a virtualized row. Session changes,
+  // unmounts, or reader input during that await must still emit navigateEnd
+  // and invalidate the eventual continuation.
+  navigationPending = true
   emit('navigate', index)
   activeIndex.value = index
-  const anchor = anchorElements().get(turn.key)
-    || await props.ensureMessageVisible?.(turn.sourceIndex)
-    || null
+  let anchor = anchorElements().get(turn.key) || null
+  if (!anchor) {
+    try {
+      anchor = await props.ensureMessageVisible?.(turn.sourceIndex) || null
+    } catch {
+      if (generation === navigationGeneration) settleNavigation(false)
+      return
+    }
+  }
   if (generation !== navigationGeneration) {
     props.releaseEnsuredMessage?.(turn.sourceIndex)
     return
@@ -606,7 +628,7 @@ async function navigateTo(index: number, focusTarget = false) {
     : props.messageOffset?.(turn.sourceIndex)
   if (anchorTop === null || anchorTop === undefined || !Number.isFinite(anchorTop)) {
     props.releaseEnsuredMessage?.(turn.sourceIndex)
-    emit('navigateEnd')
+    settleNavigation(false)
     return
   }
   const targetTop = Math.min(
@@ -626,7 +648,7 @@ async function navigateTo(index: number, focusTarget = false) {
   if (distance <= ARRIVAL_TOLERANCE_PX) {
     if (anchor) showArrivalHighlight(anchor)
     props.releaseEnsuredMessage?.(turn.sourceIndex)
-    emit('navigateEnd')
+    settleNavigation(false)
     return
   }
   navigationTarget = anchor

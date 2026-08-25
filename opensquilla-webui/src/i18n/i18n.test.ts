@@ -289,18 +289,19 @@ describe('catalog parity', () => {
 
   it('explains the Ensemble image limit with actionable routing choices', () => {
     const locales = [
-      { messages: en, imagePattern: /image input/i },
-      { messages: zhHans, imagePattern: /图片输入/ },
-      { messages: de, imagePattern: /Bildeingaben/i },
-      { messages: es, imagePattern: /im[aá]gen/i },
-      { messages: fr, imagePattern: /images en entrée/i },
-      { messages: ja, imagePattern: /画像入力/ },
+      { messages: en, imagePattern: /image input/i, unsupportedImagePattern: /image input/i },
+      { messages: zhHans, imagePattern: /图片输入/, unsupportedImagePattern: /图片输入/ },
+      { messages: de, imagePattern: /Bildeingaben/i, unsupportedImagePattern: /Bilder/i },
+      { messages: es, imagePattern: /im[aá]gen/i, unsupportedImagePattern: /imágenes/i },
+      { messages: fr, imagePattern: /images en entrée/i, unsupportedImagePattern: /images/i },
+      { messages: ja, imagePattern: /画像入力/, unsupportedImagePattern: /画像/ },
     ]
 
-    for (const { messages, imagePattern } of locales) {
+    for (const { messages, imagePattern, unsupportedImagePattern } of locales) {
       const composer = messages.chat.composer
       expect(composer.modelRoutingEnsembleDesc).toMatch(imagePattern)
       expect(composer.ensembleImageUnsupported).toMatch(imagePattern)
+      expect(composer.imageInputUnsupported).toMatch(unsupportedImagePattern)
       expect(composer.ensembleImageUnsupported).toContain(composer.modelRouting)
       expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingSquillaRouter)
       expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingOff)
@@ -310,8 +311,13 @@ describe('catalog parity', () => {
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)
+    const intentionalEnglishTerms = new Set(['chat.routerFx.ensembleTokens'])
     const leaked = Object.keys(enFlat).filter(
-      (k) => typeof zhFlat[k] === 'string' && zhFlat[k] === enFlat[k] && /[A-Za-z]/.test(zhFlat[k] as string),
+      (k) =>
+        typeof zhFlat[k] === 'string'
+        && zhFlat[k] === enFlat[k]
+        && /[A-Za-z]/.test(zhFlat[k] as string)
+        && !intentionalEnglishTerms.has(k),
     )
     expect(leaked).toEqual([])
   })
@@ -327,7 +333,6 @@ describe('catalog parity', () => {
       'chat.routeFeedback.',
     ]
     const ensembleKeys = new Set([
-      'settings.rail.ensemble',
       'setup.provider.activateEnsembleOnPreserved',
       'setup.provider.routingDesc',
       'setup.toast.ensembleSaved',
@@ -343,12 +348,10 @@ describe('catalog parity', () => {
 
     expect(deprecated).toEqual([])
     expect({
-      rail: zhHans.settings.rail.ensemble,
       setup: zhHans.setup.router.summaryEnsemble,
       composer: zhHans.chat.composer.modelRoutingEnsemble,
       runtime: zhHans.chat.routerFx.ensembleSelecting,
     }).toEqual({
-      rail: '模型融合',
       setup: 'AI 智能融合路由',
       composer: 'AI 智能融合路由',
       runtime: 'AI 智能融合路由 · 正在选择候选',

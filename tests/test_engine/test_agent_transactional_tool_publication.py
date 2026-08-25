@@ -336,6 +336,12 @@ async def test_terminal_generation_reset_carries_usage_without_second_terminal()
     }
     provider = _ScriptedProvider(
         [
+            _tool_stream(
+                terminal=ProviderDone(
+                    stop_reason="tool_use",
+                    ensemble_trace={"llm_request_count": 3},
+                )
+            ),
             [
                 ProviderText(text="partial fixed answer", generation_epoch=0),
                 ProviderGenerationResetEvent(
@@ -347,9 +353,9 @@ async def test_terminal_generation_reset_carries_usage_without_second_terminal()
                     terminal_error_message="unauthorized",
                     terminal_error_code="401",
                     model_usage_breakdown=[usage_row],
-                    ensemble_trace={"llm_request_count": 1},
+                    ensemble_trace={"llm_request_count": 4},
                 ),
-            ]
+            ],
         ]
     )
     context = TurnExecutionContext.create(
@@ -360,13 +366,23 @@ async def test_terminal_generation_reset_carries_usage_without_second_terminal()
         )
     )
     usage = UsageTracker()
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="recorded",
+        )
+
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_iterations=1,
+            max_iterations=2,
             max_provider_retries=0,
             provider_id="openrouter",
         ),
+        tool_definitions=[_record_definition()],
+        tool_handler=tool_handler,
         execution_context=context,
         usage_tracker=usage,
         session_key="agent:main:terminal-reset",
@@ -389,8 +405,10 @@ async def test_terminal_generation_reset_carries_usage_without_second_terminal()
     assert accounting_done.input_tokens == 4
     assert accounting_done.output_tokens == 2
     assert accounting_done.generation_epoch == terminal_reset.new_generation_epoch
+    assert accounting_done.ensemble_trace is not None
+    assert accounting_done.ensemble_trace["llm_request_count"] == 4
     tracked = usage.get("agent:main:terminal-reset")
     assert tracked is not None
     assert tracked.input_tokens == 4
     assert tracked.output_tokens == 2
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2

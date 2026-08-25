@@ -471,6 +471,24 @@ async def test_config_patch_safe_accepts_privacy_network_observability_toggle(tm
     assert persisted["privacy"]["disable_network_observability"] is True
 
 
+async def test_config_patch_safe_accepts_memory_auto_capture_toggle(tmp_path) -> None:
+    cfg = GatewayConfig(config_path=str(tmp_path / "config.toml"))
+    ctx = SimpleNamespace(config=cfg)
+
+    res = await _handle_config_patch_safe(
+        {"patches": {"memory.auto_capture_enabled": False}},
+        ctx,
+    )
+
+    assert res["patched"] == ["memory.auto_capture_enabled"]
+    assert res["restartRequired"] is False
+    assert res["restartSections"] == []
+    assert res["liveApplied"] == ["memory"]
+    assert ctx.config.memory.auto_capture_enabled is False
+    persisted = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert persisted["memory"]["auto_capture_enabled"] is False
+
+
 async def test_config_patch_safe_accepts_llm_ensemble_toggle(tmp_path) -> None:
     cfg = GatewayConfig(config_path=str(tmp_path / "config.toml"))
     ctx = SimpleNamespace(config=cfg)

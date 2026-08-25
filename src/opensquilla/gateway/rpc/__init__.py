@@ -52,6 +52,7 @@ __all__ = [
 # METHOD_NOT_FOUND.
 import opensquilla.gateway.rpc_agents  # noqa: E402, F401
 import opensquilla.gateway.rpc_approvals  # noqa: E402, F401
+import opensquilla.gateway.rpc_artifact_editing  # noqa: E402, F401
 import opensquilla.gateway.rpc_artifacts  # noqa: E402, F401
 import opensquilla.gateway.rpc_channels  # noqa: E402, F401
 import opensquilla.gateway.rpc_chat  # noqa: E402, F401
@@ -80,6 +81,7 @@ import opensquilla.gateway.rpc_system  # noqa: E402, F401
 import opensquilla.gateway.rpc_tools  # noqa: E402, F401
 import opensquilla.gateway.rpc_usage  # noqa: E402, F401
 import opensquilla.gateway.rpc_wizard  # noqa: E402, F401
+import opensquilla.gateway.rpc_workbench_resources  # noqa: E402, F401
 import opensquilla.gateway.rpc_workspaces  # noqa: E402, F401
 
 # Fail fast if any registered handler disagrees with ``gateway.scopes``.

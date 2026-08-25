@@ -251,9 +251,9 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     tiers = cfg.squilla_router.tiers
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }

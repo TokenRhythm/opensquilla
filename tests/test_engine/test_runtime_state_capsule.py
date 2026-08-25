@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.runtime_state_capsule import (
@@ -13,6 +16,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _runtime_state_capsule_mode_from_env,
 )
 from opensquilla.engine.types import AgentConfig
+from opensquilla.git_runtime import GitRunState
 from opensquilla.provider.types import Message
 from opensquilla.tools.mutation_receipts import (
     fingerprint_file,
@@ -96,6 +100,38 @@ def test_runtime_state_capsule_message_is_stable_json(tmp_path: Path) -> None:
     payload = json.loads(message.removeprefix(prefix))
     assert payload["schema"] == "runtime_state_capsule_v1"
     assert payload["workspace"]["source_diff"] is False
+
+
+def test_runtime_state_capsule_marks_git_unknown_without_false_blocking_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = ToolContext(workspace_dir=str(tmp_path), workspace_epoch=1)
+    ctx.workspace_mutation_receipts.append(
+        {
+            "relative_path": "src/app.py",
+            "classification": "source",
+            "changed": True,
+            "workspace_epoch": 1,
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime_state_capsule.run_git",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=False,
+            state=GitRunState.UNAVAILABLE,
+            stdout=b"",
+        ),
+    )
+
+    capsule = build_runtime_state_capsule(workspace=tmp_path, tool_context=ctx)
+
+    assert capsule["workspace"]["git_state"] == "unavailable"
+    assert capsule["workspace"]["diff_observed"] is False
+    assert capsule["workspace"]["diff"] is False
+    assert capsule["workspace"]["diff_paths"] == []
+    assert capsule["finalization"]["source_diff_present"] is False
+    assert capsule["finalization"]["blocking_facts"] == []
 
 
 def test_agent_runtime_state_capsule_injection_is_opt_in(tmp_path: Path) -> None:

@@ -893,7 +893,11 @@ onUnmounted(() => {
 <template>
   <section class="memory-import" data-testid="settings-memory-panel">
     <header class="memory-import__head">
-      <h3 class="memory-import__title">{{ t('settings.memoryImport.title') }}</h3>
+      <h3
+        class="memory-import__title"
+        data-testid="memory-import-heading"
+        tabindex="-1"
+      >{{ t('settings.memoryImport.title') }}</h3>
       <p class="memory-import__description">{{ t('settings.memoryImport.description') }}</p>
     </header>
 

@@ -7,6 +7,9 @@
     <div
       ref="bodyElement"
       class="thinking-block__body"
+      role="region"
+      tabindex="0"
+      :aria-label="summary"
       @scroll.passive="onBodyScroll"
     >{{ part.text }}</div>
   </section>
@@ -30,6 +33,9 @@
     <div
       ref="bodyElement"
       class="thinking-fold__body"
+      role="region"
+      tabindex="0"
+      :aria-label="summary"
       @scroll.passive="onBodyScroll"
     >{{ part.text }}</div>
   </details>

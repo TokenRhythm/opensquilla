@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import runpy
 from typing import Any
+
+import pytest
 
 GATE_MODULE: dict[str, Any] = runpy.run_path(
     ".github/scripts/check_ci_results.py", run_name="check_ci_results"
@@ -28,6 +31,7 @@ def _base_env() -> dict[str, str]:
         "RESULT_WINDOWS_FULL": "skipped",
         "RESULT_MACOS_RECOVERY": "skipped",
         "RESULT_DESKTOP_RECOVERY_E2E": "skipped",
+        "RESULT_WEBUI_CHAT_RECOVERY": "skipped",
         "RESULT_RELEASE": "skipped",
         "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS": "skipped",
     }
@@ -114,6 +118,7 @@ def test_ci_result_gate_accepts_windows_full_in_place_of_duplicate_smoke() -> No
     env["RESULT_WINDOWS_FULL"] = "success"
     env["RESULT_MACOS_RECOVERY"] = "success"
     env["RESULT_DESKTOP_RECOVERY_E2E"] = "success"
+    env["RESULT_WEBUI_CHAT_RECOVERY"] = "success"
 
     assert check_ci_results(env) == []
 
@@ -177,7 +182,7 @@ def test_ci_result_gate_requires_verified_frontend_for_wheel_builds() -> None:
 
     errors = check_ci_results(env)
 
-    assert any("Frontend build, tests, and artifact" in error for error in errors)
+    assert any("Frontend tests and package validation" in error for error in errors)
 
 
 def test_ci_result_gate_requires_real_toolchain_artifacts_when_classified() -> None:
@@ -288,6 +293,7 @@ def test_ci_result_gate_uses_focused_browser_checks_for_frontend_changes() -> No
     env["RESULT_FRONTEND"] = "success"
     env["RESULT_UBUNTU"] = "success"
     env["RESULT_WINDOWS_SMOKE"] = "success"
+    env["RESULT_WEBUI_CHAT_RECOVERY"] = "success"
 
     assert check_ci_results(env) == []
 
@@ -311,3 +317,48 @@ def test_ci_result_gate_rejects_inconsistent_full_and_platform_flags() -> None:
 
     assert any("release_changed=true" in error for error in check_ci_results(incomplete_full))
     assert any("Platform-sensitive" in error for error in check_ci_results(unsafe_platform))
+
+
+def test_ci_result_gate_uses_planner_suites_instead_of_legacy_matrix_flags() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("runtime_changed")] = "true"
+    env[_flag_env("python_changed")] = "true"
+    env[_flag_env("platform_sensitive_changed")] = "true"
+    env[_flag_env("windows_full_required")] = "true"
+    env["REQUIRED_SUITES"] = json.dumps(
+        ["python-targeted", "readme-locale", "workflow-lint"]
+    )
+    env["RESULT_UBUNTU"] = "success"
+
+    assert check_ci_results(env) == []
+
+
+def test_ci_result_gate_requires_planner_selected_browser_recovery() -> None:
+    env = _base_env()
+    env["REQUIRED_SUITES"] = json.dumps(
+        ["readme-locale", "webui-chat-recovery", "workflow-lint"]
+    )
+
+    errors = check_ci_results(env)
+
+    assert any("WebUI chat recovery browser contracts" in error for error in errors)
+    env["RESULT_WEBUI_CHAT_RECOVERY"] = "success"
+    assert check_ci_results(env) == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("not-json", "valid JSON"),
+        (json.dumps(["unknown-suite"]), "unknown suites"),
+        (json.dumps(["workflow-lint", "workflow-lint"]), "duplicate-free"),
+    ],
+)
+def test_ci_result_gate_rejects_invalid_planner_suite_contract(
+    raw: str, message: str
+) -> None:
+    env = _base_env()
+    env["REQUIRED_SUITES"] = raw
+
+    assert any(message in error for error in check_ci_results(env))

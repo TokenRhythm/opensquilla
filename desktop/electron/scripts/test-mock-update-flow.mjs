@@ -122,8 +122,15 @@ try {
   const page = await app.firstWindow({ timeout: 60_000 })
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
   await waitFor(
-    async () => page.url().includes('/control/chat'),
-    'Control UI to load on Chat',
+    async () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'Desktop renderer to load on Chat',
+    60_000,
+  )
+  await waitFor(
+    async () => (await page.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'Desktop Gateway readiness',
     60_000,
   )
 
@@ -180,7 +187,7 @@ try {
 
   await delay(500)
   assert.equal(page.isClosed(), false, 'mock install should not quit the app')
-  assert.match(await page.title(), /OpenSquilla/, 'Control UI should remain available after mock install')
+  assert.match(await page.title(), /OpenSquilla/, 'Desktop renderer should remain available after mock install')
 
   if (process.platform === 'darwin') {
     const labelsAfterClick = await menuLabels(app)

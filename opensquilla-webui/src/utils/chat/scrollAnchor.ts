@@ -1,3 +1,5 @@
+import { applyProgrammaticScroll } from './scrollMutation'
+
 export interface MessageScrollAnchor {
   container: HTMLElement
   element: HTMLElement
@@ -71,7 +73,11 @@ export function restoreMessageAnchor(anchor: MessageScrollAnchor | null): boolea
   const nextOffset = element.getBoundingClientRect().top
     - anchor.container.getBoundingClientRect().top
   const delta = nextOffset - anchor.offsetTop
-  if (delta) anchor.container.scrollTop += delta
+  if (delta) {
+    applyProgrammaticScroll(anchor.container, () => {
+      anchor.container.scrollTop += delta
+    })
+  }
   anchor.expectedScrollTop = anchor.container.scrollTop
   anchor.element = element
   return true
@@ -108,7 +114,11 @@ export function restoreElementScrollAnchor(
   const nextOffset = replacement.getBoundingClientRect().top
     - anchor.container.getBoundingClientRect().top
   const delta = nextOffset - anchor.offsetTop
-  if (Math.abs(delta) >= 0.5) anchor.container.scrollTop += delta
+  if (Math.abs(delta) >= 0.5) {
+    applyProgrammaticScroll(anchor.container, () => {
+      anchor.container.scrollTop += delta
+    })
+  }
   return true
 }
 
@@ -271,7 +281,11 @@ export function restoreTextScrollAnchor(
   const nextOffset = range.getBoundingClientRect().top
     - anchor.container.getBoundingClientRect().top
   const delta = nextOffset - anchor.offsetTop
-  if (Math.abs(delta) >= 0.5) anchor.container.scrollTop += delta
+  if (Math.abs(delta) >= 0.5) {
+    applyProgrammaticScroll(anchor.container, () => {
+      anchor.container.scrollTop += delta
+    })
+  }
   return true
 }
 

@@ -268,6 +268,39 @@ def test_model_catalog_adapter_resolves_exact_tokenrhythm_deployment() -> None:
     assert fallback.context_window == 64_000
 
 
+def test_model_catalog_adapter_verifies_official_tokenrhythm_glm_5_2_tools() -> None:
+    from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    llm = SimpleNamespace(
+        provider="tokenrhythm",
+        base_url="https://tokenrhythm.studio/v1",
+        max_tokens=16_384,
+        context_window_tokens=0,
+        provider_request_proof_max_chars=0,
+        temperature=None,
+        top_p=None,
+    )
+    adapter = _TurnRunnerModelCatalogAdapter(
+        _catalog_runner(llm=llm, model_catalog=ModelCatalog())
+    )
+    deployment = ProviderConfig(
+        provider="tokenrhythm",
+        model="glm-5.2",
+        api_key="synthetic-fixed-tokenrhythm-key",
+        base_url="https://tokenrhythm.studio/v1",
+    )
+
+    resolved = adapter.lookup_deployment(
+        deployment,
+        include_global_overrides=True,
+    )
+
+    assert resolved.capabilities is not None
+    assert resolved.capabilities.supports_tools is True
+    assert resolved.tools_capability_verified is True
+
+
 def test_model_catalog_adapter_does_not_hard_cap_unknown_fallback() -> None:
     from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
     from opensquilla.provider.model_catalog import ModelCatalog

@@ -78,6 +78,31 @@ describe('useChatTaskOwnership', () => {
     expect([...ownership.queuedTaskIds.value]).toEqual(['task-newest', 'task-oldest'])
   })
 
+  it('restores stopping from an additive active-task snapshot', () => {
+    const ownership = useChatTaskOwnership(false)
+
+    ownership.applySnapshot({
+      run_status: 'running',
+      active_task: {
+        task_id: 'task-stopping',
+        status: 'running',
+        cancel_requested: true,
+      },
+      tasks: [{ task_id: 'task-stopping', status: 'running', cancel_requested: true }],
+    } as never, true)
+
+    expect(ownership.runningTaskId.value).toBe('task-stopping')
+    expect(ownership.stopRequestedTaskId.value).toBe('task-stopping')
+
+    ownership.applySnapshot({
+      run_status: 'cancelled',
+      active_task: null,
+      last_task: { task_id: 'task-stopping', status: 'cancelled' },
+      tasks: [{ task_id: 'task-stopping', status: 'cancelled' }],
+    } as never, true)
+    expect(ownership.stopRequestedTaskId.value).toBe('')
+  })
+
   it('uses the authoritative queued foreground first after reconnect', () => {
     const ownership = useChatTaskOwnership(false)
 

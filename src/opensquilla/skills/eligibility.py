@@ -53,6 +53,18 @@ def _has_bin(name: str, ctx: EligibilityContext) -> bool:
     )
     result = False
     if safe_name:
+        if name.casefold() == "git":
+            try:
+                from opensquilla.git_runtime import resolve_git_capability
+
+                result = resolve_git_capability().available
+            except Exception:
+                # The system Git path may be an unusable platform shim. Treat
+                # capability-resolution failures as missing rather than
+                # advertising a skill that cannot run.
+                result = False
+            ctx.has_bin_cache[name] = result
+            return result
         # Keep the long-standing system lookup seam (and system PATH priority)
         # before consulting validated OpenSquilla activation receipts.
         result = shutil.which(name) is not None

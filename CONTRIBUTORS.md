@@ -26,6 +26,29 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.4
+
+The 0.5.4 release records new human contributor work after the 0.5.3 stable
+release. Commit links are included when an integration pull request preserved
+an original author whose GitHub identity was verified from the commit API.
+
+| Contributor | 0.5.4 contribution | Evidence |
+| --- | --- | --- |
+| [@AmirF194](https://github.com/AmirF194) | Restricted Zhipu reasoning-dialect behavior to the official API root. | [`ac33132e`](https://github.com/opensquilla/opensquilla/commit/ac33132e584bc45f1a1d4d126cc4d394fd8df8f3), [#1193](https://github.com/opensquilla/opensquilla/pull/1193) |
+| [@Kiuyor](https://github.com/Kiuyor) | Restored pasted Composer input when stale Windows IME state prevented Vue model synchronization. | [`c2bc8e57`](https://github.com/opensquilla/opensquilla/commit/c2bc8e57392539f5cf35a9d13de463792f383e07), [#1185](https://github.com/opensquilla/opensquilla/pull/1185) |
+| [@Liu-RK](https://github.com/Liu-RK) | Improved public release hygiene by removing obsolete generated upgrade artifacts. | [#1267](https://github.com/opensquilla/opensquilla/pull/1267) |
+| [@LiuXinchen1997](https://github.com/LiuXinchen1997) | Added the tier-level routing foundation incorporated into resilient C3 multi-model fusion. | [`b855538b`](https://github.com/opensquilla/opensquilla/pull/1199/commits/b855538bd0ddc30dcdff948882e363823f6d3114), [#1199](https://github.com/opensquilla/opensquilla/pull/1199) |
+| [@Sanjays2402](https://github.com/Sanjays2402) | Made the first session search query include already-existing sessions. | [#1214](https://github.com/opensquilla/opensquilla/pull/1214) |
+| [@ab2ence](https://github.com/ab2ence) | Added resilient C3 fusion and transactional Ensemble fallback, isolated provider-private state, enabled verified Qwen prompt caching, corrected zero-ledger display and continuation usage, and refined sidebar interactions. | [#1199](https://github.com/opensquilla/opensquilla/pull/1199), [#1226](https://github.com/opensquilla/opensquilla/pull/1226), [#1254](https://github.com/opensquilla/opensquilla/pull/1254), [#1270](https://github.com/opensquilla/opensquilla/pull/1270), [#1299](https://github.com/opensquilla/opensquilla/pull/1299), [#1300](https://github.com/opensquilla/opensquilla/pull/1300) |
+| [@freeaccount-create](https://github.com/freeaccount-create) | Made the `create_csv` tool schema compatible with Gemini. | [#1264](https://github.com/opensquilla/opensquilla/pull/1264) |
+| [@jiaoqingrui](https://github.com/jiaoqingrui) | Used the clearer token label in Ensemble traces. | [#1350](https://github.com/opensquilla/opensquilla/pull/1350) |
+| [@kriptoburak](https://github.com/kriptoburak) | Verified Skill digests through catalog paths. | [#1367](https://github.com/opensquilla/opensquilla/pull/1367) |
+| [@lifelmy](https://github.com/lifelmy) | Preserved routed per-model cost breakdowns in the CLI. | [#1215](https://github.com/opensquilla/opensquilla/pull/1215) |
+| [@lihongguang-0014](https://github.com/lihongguang-0014) | Improved chat continuity, streaming and steering recovery, attachment routing and workspace materialization, Desktop startup, task process ownership, session pagination, provider handling, and CLI reliability. | [#1179](https://github.com/opensquilla/opensquilla/pull/1179), [#1190](https://github.com/opensquilla/opensquilla/pull/1190), [#1195](https://github.com/opensquilla/opensquilla/pull/1195), [#1196](https://github.com/opensquilla/opensquilla/pull/1196), [#1252](https://github.com/opensquilla/opensquilla/pull/1252), [#1269](https://github.com/opensquilla/opensquilla/pull/1269), [#1303](https://github.com/opensquilla/opensquilla/pull/1303), [#1305](https://github.com/opensquilla/opensquilla/pull/1305), [#1307](https://github.com/opensquilla/opensquilla/pull/1307), [#1336](https://github.com/opensquilla/opensquilla/pull/1336), [#1342](https://github.com/opensquilla/opensquilla/pull/1342), [#1344](https://github.com/opensquilla/opensquilla/pull/1344), [#1355](https://github.com/opensquilla/opensquilla/pull/1355) |
+| [@openvictory](https://github.com/openvictory) | Added the English and Chinese technical report PDFs and announced them in the project READMEs. | [#1351](https://github.com/opensquilla/opensquilla/pull/1351) |
+| [@shixi-li](https://github.com/shixi-li) | Fixed Ensemble aggregator timeout fallback behavior. | [`7cc10609`](https://github.com/opensquilla/opensquilla/commit/7cc106093a2e9f24ccb2da977bbdcb1f64160e6e), [#1184](https://github.com/opensquilla/opensquilla/pull/1184) |
+| [@xfjsssq](https://github.com/xfjsssq) | Allowed unknown slash-prefixed text to be sent as a normal message. | [#1176](https://github.com/opensquilla/opensquilla/pull/1176) |
+
 ## OpenSquilla 0.5.3
 
 The 0.5.3 maintenance release records new human contributor work after the

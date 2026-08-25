@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import shlex
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.git_runtime import run_git
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.types import ToolContext, current_tool_context
 from opensquilla.tools.write_tracking import (
@@ -452,19 +452,10 @@ def _freeze_exemption_diff(
     argv = ["git", "diff", "HEAD"]
     if parsed.targets and not parsed.whole_worktree:
         argv.extend(["--", *parsed.targets])
-    try:
-        result = subprocess.run(
-            argv,
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = run_git(argv[1:], cwd=workspace, timeout=5.0)
+    if not result.ok:
         return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
+    return result.stdout_text
 
 
 def _emit_freeze_exemption_event(

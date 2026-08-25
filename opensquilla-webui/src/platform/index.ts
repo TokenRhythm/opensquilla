@@ -23,6 +23,7 @@ export type {
   ArtifactOpenRequest,
   CliInvocation,
   DesktopMainWindowCloseBehavior,
+  DesktopGatewayConnection,
   DesktopPreferences,
   DesktopSettings,
   DesktopSettingsPayload,

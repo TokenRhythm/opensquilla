@@ -9,6 +9,16 @@ from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    AnchorKind,
+    ArtifactBlobRef,
+    ArtifactConflictError,
+    ArtifactKind,
+    ArtifactSessionService,
+    PromptAnnotationStatus,
+)
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
@@ -113,6 +123,133 @@ async def _receipt_rows(storage: SessionStorage) -> list[dict[str, Any]]:
     ) as cur:
         rows = await cur.fetchall()
     return [dict(row) for row in rows]
+
+
+async def _prompt_annotation_draft(storage: SessionStorage):
+    service = await ArtifactSessionService.from_session_storage(storage)
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        name="page.html",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id="artifact-html-1",
+            sha256="a" * 64,
+            filename="page.html",
+            media_type="text/html",
+            byte_size=13,
+        ),
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    anchor = await service.create_anchor(
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        kind=AnchorKind.DOM_SOURCE,
+        locator={"start_offset": 0, "start_tag_end_offset": 6, "tag_name": "main"},
+        quote="<main>",
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    draft = await service.create_prompt_annotation(
+        annotation_id="annotation-acceptance-1",
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        session_epoch=0,
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        anchor_id=anchor.anchor_id,
+        body="Make this concise.",
+    )
+    return service, draft
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_consumes_prompt_annotation_with_message_and_receipt(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        service, draft = await _prompt_annotation_draft(storage)
+
+        accepted = await storage.accept_turn(
+            _entry("annotation-message"),
+            expected_epoch=0,
+            updated_at=300,
+            task_record=_task("annotation-turn", updated_at=300),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="annotation-request",
+            request_fingerprint="sha256:annotation-request",
+            expected_prompt_annotations=(draft,),
+            prompt_annotation_turn_id="annotation-turn",
+        )
+
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert accepted.replayed is False
+        assert sent.status is PromptAnnotationStatus.SENT
+        assert sent.sent_message_id == "annotation-message"
+        assert sent.sent_turn_id == "annotation-turn"
+        assert [item.message_id for item in await storage.get_transcript(SESSION_ID)] == [
+            "annotation-message"
+        ]
+
+        replay = await storage.accept_turn(
+            _entry("annotation-message"),
+            expected_epoch=0,
+            updated_at=301,
+            task_record=_task("annotation-turn", updated_at=301),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="annotation-request",
+            request_fingerprint="sha256:annotation-request",
+            expected_prompt_annotations=(draft,),
+            prompt_annotation_turn_id="annotation-turn",
+        )
+        assert replay.replayed is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_annotation_cas_failure_rolls_back_all_ingress_writes(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        service, draft = await _prompt_annotation_draft(storage)
+        updated = await service.update_prompt_annotation(
+            annotation_id=draft.annotation_id,
+            expected_state_revision=draft.state_revision,
+            body="Changed after preflight.",
+        )
+
+        with pytest.raises(ArtifactConflictError, match="changed after preflight"):
+            await storage.accept_turn(
+                _entry("rejected-annotation-message"),
+                expected_epoch=0,
+                updated_at=300,
+                task_record=_task("rejected-annotation-turn", updated_at=300),
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="rejected-annotation-request",
+                request_fingerprint="sha256:rejected-annotation-request",
+                expected_prompt_annotations=(draft,),
+                prompt_annotation_turn_id="rejected-annotation-turn",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("rejected-annotation-turn") is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="rejected-annotation-request",
+        ) is None
+        still_draft = await service.get_prompt_annotation(updated.annotation_id)
+        assert still_draft.status is PromptAnnotationStatus.DRAFT
+        assert still_draft.body == "Changed after preflight."
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -224,8 +361,24 @@ async def test_reset_epoch_invalidates_staged_and_fences_recent_accepted_control
 @pytest.mark.asyncio
 async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    artifact_service: ArtifactSessionService | None = None
     try:
         await storage.upsert_session(_session())
+        artifact_service = await ArtifactSessionService.from_session_storage(storage)
+        await artifact_service.create_document(
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            name="old working draft",
+            kind=ArtifactKind.HTML,
+            initial_artifact=ArtifactBlobRef(
+                artifact_id="art-old-working-draft",
+                sha256="a" * 64,
+                filename="draft.html",
+                media_type="text/html",
+                byte_size=10,
+            ),
+            actor=Actor(ActorKind.USER, "user-1"),
+        )
         staged, _ = await storage.stage_meta_control_intent(
             session_key=SESSION_KEY,
             control_kind="manual",
@@ -281,6 +434,13 @@ async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> N
         assert rotated is not None
         assert rotated.session_id == reset_node.session_id
         assert rotated.epoch == 1
+        assert (
+            await artifact_service.list_documents(
+                session_key=SESSION_KEY,
+                session_id=SESSION_ID,
+            )
+            == ()
+        )
         with pytest.raises(MetaLaunchDraftDiscardedError):
             await storage.stage_meta_launch_draft(
                 session_key=SESSION_KEY,
@@ -289,6 +449,8 @@ async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> N
                 launch_text="/meta meta-paper-write -- stale collision with reset ingress",
             )
     finally:
+        if artifact_service is not None:
+            await artifact_service.close()
         await storage.close()
 
 

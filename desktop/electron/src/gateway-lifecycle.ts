@@ -23,6 +23,8 @@ export type GatewayReadinessWaitResult =
   | { status: 'exited'; message: string }
   | { status: 'timeout' }
 
+export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000
+
 /**
  * Wait for a spawned Gateway without turning the first readiness deadline into
  * an irreversible failure. The late window remains bounded, and child exit is

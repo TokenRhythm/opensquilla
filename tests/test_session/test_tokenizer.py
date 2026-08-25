@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 
 from opensquilla import token_estimation
 from opensquilla.session import tokenizer
+from opensquilla.session.compaction import estimate_entry_model_replay_tokens
 
 
 class _SizedTokens:
@@ -35,7 +37,8 @@ class _FakeEncoding:
 
 
 class _RecordingEncoding:
-    def __init__(self) -> None:
+    def __init__(self, chars_per_token: int = 10) -> None:
+        self._chars_per_token = chars_per_token
         self.calls: list[tuple[int, tuple[Any, ...]]] = []
 
     def encode(
@@ -45,7 +48,9 @@ class _RecordingEncoding:
         disallowed_special: tuple[Any, ...],
     ) -> _SizedTokens:
         self.calls.append((len(text), disallowed_special))
-        return _SizedTokens((len(text) + 9) // 10)
+        return _SizedTokens(
+            (len(text) + self._chars_per_token - 1) // self._chars_per_token
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +109,7 @@ def test_estimate_tokens_never_returns_zero(monkeypatch: pytest.MonkeyPatch) -> 
     assert tokenizer.estimate_tokens("a") == 1
 
 
-def test_large_text_uses_bounded_tokenizer_chunks(
+def test_large_text_keeps_legacy_tokenizer_chunk_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     encoding = _RecordingEncoding()
@@ -116,6 +121,132 @@ def test_large_text_uses_bounded_tokenizer_chunks(
     assert all(disallowed_special == () for _, disallowed_special in encoding.calls)
     assert count == 10_000 + 10_000 + 5_001
     assert source == "tiktoken_cl100k_base_chunked"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x" * 200_000,
+        "模型" * 100_000,
+        "🦑é" * 100_000,
+    ],
+    ids=["long-repeated-ascii", "long-repeated-cjk", "long-repeated-unicode"],
+)
+def test_attachment_long_repeated_text_uses_bounded_tokenizer_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+) -> None:
+    encoding = _RecordingEncoding(chars_per_token=1)
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
+
+    count = token_estimation.estimate_attachment_text_tokens(text)
+
+    expected_chunk_sizes = [
+        min(
+            token_estimation._ATTACHMENT_TOKENIZER_CHUNK_CHARS,
+            len(text) - offset,
+        )
+        for offset in range(
+            0,
+            len(text),
+            token_estimation._ATTACHMENT_TOKENIZER_CHUNK_CHARS,
+        )
+    ]
+    assert [size for size, _ in encoding.calls] == expected_chunk_sizes
+    assert max(expected_chunk_sizes) == 16_384
+    assert all(disallowed_special == () for _, disallowed_special in encoding.calls)
+    raw_chunk_tokens = sum(expected_chunk_sizes)
+    expected_boundary_reserve = (
+        (len(expected_chunk_sizes) - 1)
+        * token_estimation._ATTACHMENT_TOKENIZER_CHUNK_BOUNDARY_RESERVE_TOKENS
+    )
+    assert count == raw_chunk_tokens + expected_boundary_reserve
+
+
+def test_attachment_chunk_boundary_does_not_change_legacy_estimator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoding = _RecordingEncoding(chars_per_token=1)
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
+
+    attachment_at_boundary = token_estimation.estimate_attachment_text_tokens(
+        "x" * 16_384
+    )
+    attachment_after_boundary = token_estimation.estimate_attachment_text_tokens(
+        "x" * 16_385
+    )
+    assert attachment_at_boundary == 16_384
+    assert attachment_after_boundary == 16_386
+    assert [size for size, _ in encoding.calls] == [16_384, 16_384, 1]
+
+    encoding.calls.clear()
+    legacy_at_boundary = tokenizer.estimate_tokens("x" * 16_384)
+    legacy_after_boundary = tokenizer.estimate_tokens("x" * 16_385)
+    assert legacy_at_boundary == 16_384
+    assert legacy_after_boundary == 16_385
+    assert [size for size, _ in encoding.calls] == [16_384, 16_385]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "z" * 20_000,
+        "模型压缩容量边界" * 2_500,
+        "🦑éΩ模型a\u0301" * 2_500,
+    ],
+    ids=["repeated-ascii", "repeated-cjk", "repeated-unicode"],
+)
+def test_attachment_chunked_estimate_is_not_below_monolithic_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+) -> None:
+    tiktoken = pytest.importorskip("tiktoken")
+    encoding = tiktoken.get_encoding("cl100k_base")
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
+
+    monolithic = len(encoding.encode(text, disallowed_special=()))
+    estimated = token_estimation.estimate_attachment_text_tokens(text)
+
+    assert estimated >= monolithic
+
+
+def test_concurrent_long_estimates_are_bounded_and_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoding = _RecordingEncoding(chars_per_token=1)
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
+    texts = [
+        "x" * 200_000,
+        "z" * 200_000,
+        "模型" * 100_000,
+        "🦑é" * 100_000,
+    ]
+
+    with ThreadPoolExecutor(max_workers=len(texts)) as executor:
+        first = list(
+            executor.map(token_estimation.estimate_attachment_text_tokens, texts)
+        )
+        second = list(
+            executor.map(token_estimation.estimate_attachment_text_tokens, texts)
+        )
+
+    assert first == second
+    assert encoding.calls
+    assert max(size for size, _ in encoding.calls) <= 16_384
+
+
+def test_history_compaction_keeps_legacy_estimator_at_attachment_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoding = _RecordingEncoding(chars_per_token=1)
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
+
+    estimated = estimate_entry_model_replay_tokens(
+        {"role": "user", "content": "x" * 16_385}
+    )
+
+    assert estimated == 16_385
+    assert [size for size, _ in encoding.calls] == [16_385]
 
 
 def test_unicode_fallback_uses_utf8_density_instead_of_chars_div_four(

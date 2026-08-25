@@ -6,6 +6,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-08-25
+
+### Added
+
+- Electron Desktop includes a beta for editing single-file HTML attachments and
+  deliverables. It provides preview, source, version, and change views plus
+  Agent-assisted candidate edits that users review before committing. Other
+  document formats and project-wide editing are not included.
+- Optional Python, Node.js, and Windows Git Bash Runtime Packs can be downloaded
+  from Sandbox settings through an immutable catalog. Downloads support resume,
+  cancellation, source fallback, integrity verification, removal, and cache
+  discard without modifying system-installed runtimes.
+- Each chat can now keep its own Direct, Router, or Ensemble strategy while the
+  global strategy remains the default for new chats. C3 can use the shared
+  multi-model fusion plan with resilient fixed-model fallback and independent
+  image routing.
+- The OpenSquilla technical report is available in English and Chinese PDF
+  editions, with the English edition also published on aiXiv.
+
+### Changed
+
+- Fresh and managed TokenRhythm configurations now use DeepSeek V4 Flash 0731
+  for C0, DeepSeek V4 Pro 0813 as the direct and C1 default, Kimi K2.7 Code for
+  C2, and GLM 5.2 B5 fusion for C3. Existing custom inline tiers are not
+  migrated, and the mixed-family preset continues to leave thinking levels
+  unset.
+- Settings now use ten stable destinations, including combined Security &
+  Privacy controls and a first-level Memory page. Existing Settings deep links
+  continue through compatibility aliases.
+- Desktop installers are slimmer because optional developer runtimes are no
+  longer bundled. The Gateway and control console remain included, and users
+  can install only the Runtime Packs they need.
+
+### Fixed
+
+- Desktop startup now shows monotonic, milestone-based progress without
+  estimating remaining time or changing recovery and Gateway startup behavior.
+- Stop now acknowledges immediately for provider and ordinary tool work while
+  safely settling in-flight filesystem mutations before publishing a terminal
+  turn. Late provider or tool results are discarded, timed-out writes retain
+  their timeout outcome, and committed file changes are recorded before the
+  next turn can run.
+- Chat recovery now preserves activity order, router panels, live steering,
+  pending input, long-session scrolling, and durable turn commits across
+  reconnects and session switches. Large and image attachments use complete
+  routing capacity, and current-turn images are available to workspace tools.
+- Desktop and Gateway startup, process-tree cancellation, Windows Safe shell
+  execution, Windows installer progress, macOS Keychain recovery, CLI failure
+  exits, Skill catalog verification, prompt caching, usage accounting, and
+  provider fallback behavior are more reliable across supported platforms.
+
+### Security
+
+- The HTML editing beta uses isolated preview surfaces, opaque mutation grants,
+  atomic revisions, and capability-gated document tools. Older or incomplete
+  Desktop bridges fail closed, while existing attachments and deliverables
+  remain readable and immutable.
+- Runtime Pack downloads are restricted to pinned sources and verified by exact
+  size and SHA-256 before safe extraction and activation. Failures remain local
+  to the requested component and do not block Gateway startup.
+
 ## [0.5.3] - 2026-08-13
 
 ### Added

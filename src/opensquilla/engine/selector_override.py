@@ -33,18 +33,37 @@ def _metadata_nonnegative_int(turn_metadata: dict[str, Any], key: str) -> int:
 
 
 def _large_context_capacity_required(turn_metadata: dict[str, Any]) -> bool:
-    return bool(turn_metadata.get("large_context_floor_min_tier")) and (
+    complete_request = bool(turn_metadata.get("large_context_capacity_required")) and (
+        _metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_request_input_tokens",
+        )
+        > 0
+    )
+    legacy_floor = bool(turn_metadata.get("large_context_floor_min_tier")) and (
         _metadata_nonnegative_int(
             turn_metadata,
             "large_context_material_tokens",
         )
         > 0
     )
+    return complete_request or legacy_floor
+
+
+def _bounded_fallback_chain_required(turn_metadata: dict[str, Any]) -> bool:
+    # A bare floor marker historically selected the bounded selector API even
+    # in light test/compatibility adapters that carried no admission metrics.
+    return _large_context_capacity_required(turn_metadata) or bool(
+        turn_metadata.get("large_context_floor_min_tier")
+    )
 
 
 def _provider_config_has_request_capacity(
     config: Any,
     turn_metadata: dict[str, Any],
+    *,
+    provider: str = "",
+    model: str = "",
 ) -> bool:
     """Validate one final physical deployment against the routed material."""
 
@@ -59,11 +78,21 @@ def _provider_config_has_request_capacity(
     if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool):
         thinking_budget = MAX_THINKING_BUDGET_TOKENS
     return model_has_request_capacity(
-        provider=str(getattr(config, "provider", "") or "").strip(),
-        model=str(getattr(config, "model", "") or "").strip(),
+        provider=(
+            str(getattr(config, "provider", "") or "").strip()
+            or str(provider or "").strip()
+        ),
+        model=(
+            str(getattr(config, "model", "") or "").strip()
+            or str(model or "").strip()
+        ),
         material_tokens=_metadata_nonnegative_int(
             turn_metadata,
             "large_context_material_tokens",
+        ),
+        request_input_tokens=_metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_request_input_tokens",
         ),
         thinking_budget_tokens=max(0, thinking_budget),
         context_window_override_tokens=_metadata_nonnegative_int(
@@ -89,14 +118,25 @@ def _require_provider_config_capacity(
     turn_metadata: dict[str, Any],
     *,
     reason: str,
+    provider: str = "",
+    model: str = "",
 ) -> None:
-    if _provider_config_has_request_capacity(config, turn_metadata):
+    if _provider_config_has_request_capacity(
+        config,
+        turn_metadata,
+        provider=provider,
+        model=model,
+    ):
         return
-    from opensquilla.engine.capacity_admission import LargeContextCapacityError
+    from opensquilla.engine.capacity_admission import (
+        CAPACITY_CONFIGURATION_HINT,
+        LargeContextCapacityError,
+    )
 
     turn_metadata["large_context_capacity_blocked"] = True
-    turn_metadata["large_context_capacity_block_reason"] = reason
-    raise LargeContextCapacityError(reason)
+    actionable_reason = f"{reason} {CAPACITY_CONFIGURATION_HINT}"
+    turn_metadata["large_context_capacity_block_reason"] = actionable_reason
+    raise LargeContextCapacityError(actionable_reason)
 
 
 def _materialize_fallback_configs(
@@ -531,21 +571,32 @@ def apply_model_override(
                 "capacity for this attachment request."
             ),
         )
-        bounded_provider_override = getattr(
-            selector,
-            "override_provider_config_with_bounded_fallbacks",
-            None,
-        )
-        if (
-            turn_metadata.get("large_context_floor_min_tier")
-            and callable(bounded_provider_override)
-        ):
-            bounded_provider_override(
-                tier_provider_config,
-                _capacity_approved_configured_fallbacks(selector, turn_metadata),
-            )
+        if turn_metadata.get("router_fallback_strict") is True:
+            try:
+                selector.override_provider_config(
+                    tier_provider_config,
+                    preserve_existing_tail=False,
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "selector does not support strict artifact fallback isolation"
+                ) from exc
         else:
-            selector.override_provider_config(tier_provider_config)
+            bounded_provider_override = getattr(
+                selector,
+                "override_provider_config_with_bounded_fallbacks",
+                None,
+            )
+            if (
+                _bounded_fallback_chain_required(turn_metadata)
+                and callable(bounded_provider_override)
+            ):
+                bounded_provider_override(
+                    tier_provider_config,
+                    _capacity_approved_configured_fallbacks(selector, turn_metadata),
+                )
+            else:
+                selector.override_provider_config(tier_provider_config)
         turn_metadata["routed_provider_applied"] = tier_provider_config.provider
         turn_metadata["provider_state_replay_disabled"] = "cross_provider_route"
         _disable_selector_provider_state_replay(selector, turn_metadata)
@@ -628,9 +679,24 @@ def apply_model_override(
         "override_model_with_bounded_fallback_chain",
         None,
     )
-    if turn_metadata.get("large_context_floor_min_tier") and callable(
-        override_with_bounded_fallback_chain
+    bounded_fallbacks_required = _bounded_fallback_chain_required(turn_metadata)
+    if (
+        turn_metadata.get("router_fallback_strict") is True
+        and callable(override_with_fallback_chain)
+        and isinstance(router_fallback_chain, list)
     ):
+        try:
+            override_with_fallback_chain(
+                model,
+                router_fallback_chain,
+                preserve_existing_tail=False,
+            )
+        except TypeError:
+            # Compatibility for third-party selector shims that implement
+            # the older two-argument hook. A strict Artifact turn must not
+            # silently retain their unknown fallback tail.
+            selector.override_model(model)
+    elif bounded_fallbacks_required and callable(override_with_bounded_fallback_chain):
         approved_router_fallbacks = _capacity_approved_fallback_entries(
             selector,
             router_fallback_chain if isinstance(router_fallback_chain, list) else [],
@@ -645,6 +711,11 @@ def apply_model_override(
             approved_router_fallbacks,
             approved_configured_fallbacks,
         )
+    elif bounded_fallbacks_required:
+        # Compatibility selectors may predate the bounded-chain API. Keep the
+        # proven head executable, but never hand an opaque selector fallbacks
+        # whose physical deployment capacities cannot be audited.
+        selector.override_model(model)
     elif callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
         override_with_fallback_chain(model, router_fallback_chain)
     else:
@@ -652,6 +723,8 @@ def apply_model_override(
     _require_provider_config_capacity(
         getattr(selector, "current_config", None),
         turn_metadata,
+        provider=active_provider or routed_provider,
+        model=model,
         reason=(
             "The final model deployment does not have proven capacity for this "
             "attachment request."

@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway import boot as boot_module
 from opensquilla.gateway.boot import _warn_legacy_home_detected
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.migration import legacy_detect
@@ -26,10 +27,17 @@ from opensquilla.migration.legacy_detect import LegacyHomeCandidate
 
 def _capture_warnings(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        "opensquilla.gateway.boot.log.warning",
-        lambda event, **kwargs: warnings.append({"event": event, **kwargs}),
-    )
+
+    real_log = boot_module.log
+
+    class _WarningLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            warnings.append({"event": event, **kwargs})
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(boot_module, "log", _WarningLog())
     return warnings
 
 

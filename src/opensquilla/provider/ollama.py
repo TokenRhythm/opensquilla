@@ -40,6 +40,7 @@ from .types import (
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
+    ToolUseStartEvent,
 )
 
 log = structlog.get_logger(__name__)
@@ -147,14 +148,19 @@ def _build_ollama_messages(
             tool_messages.append(tool_message)
 
     out: list[dict[str, Any]] = []
+    main: dict[str, Any] | None = None
     if text_parts or tool_calls or images:
-        main: dict[str, Any] = {"role": msg.role, "content": " ".join(text_parts)}
+        main = {"role": msg.role, "content": " ".join(text_parts)}
         if tool_calls:
             main["tool_calls"] = tool_calls
         if images:
             main["images"] = images
-        out.append(main)
+    # Tool results must immediately follow the assistant call.  If the same
+    # logical message also carries a screenshot, send the pixels in a trailing
+    # user message rather than attaching them to the ``role=tool`` payload.
     out.extend(tool_messages)
+    if main is not None:
+        out.append(main)
     return out
 
 
@@ -367,6 +373,7 @@ class OllamaProvider:
         tools_acc = ToolStreamAccumulator()
         prepared_tool_events: list[StreamEvent] = []
         prepared_tool_calls: list[dict[str, Any]] = []
+        recognized_tool_starts: list[ToolUseStartEvent] = []
         candidate_call_key = 0
         saw_done = False
 
@@ -486,6 +493,8 @@ class OllamaProvider:
                             else:
                                 message = "Ollama stream contained malformed tool calls"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                         for tc in raw_tool_calls:
@@ -505,6 +514,8 @@ class OllamaProvider:
                                     continue
                                 message = "Ollama stream contained a malformed tool call"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             fn = tc.get("function", {})
@@ -524,6 +535,8 @@ class OllamaProvider:
                                     continue
                                 message = "Ollama stream contained a malformed tool function"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             raw_tool_id = tc.get("id")
@@ -555,6 +568,8 @@ class OllamaProvider:
                             ):
                                 message = "Ollama stream contained an invalid tool call id"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             key = tools_acc.next_int_key()
@@ -566,13 +581,36 @@ class OllamaProvider:
                             tool_name = fn.get("name", "")
                             arguments = fn.get("arguments", {})
                             try:
+                                start_events = tools_acc.start(
+                                    key,
+                                    tool_use_id=tool_use_id,
+                                    tool_name=tool_name,
+                                )
+                            except ToolStreamProtocolError as exc:
+                                message = (
+                                    "Ollama response contained an invalid tool lifecycle"
+                                )
+                                trace.record_error(
+                                    code="incomplete_tool_call",
+                                    message=message,
+                                    metadata={"reason": exc.reason, "phase": "stream"},
+                                )
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
+                                yield ErrorEvent(
+                                    message=message,
+                                    code="incomplete_tool_call",
+                                )
+                                return
+                            recognized_tool_starts.extend(
+                                event
+                                for event in start_events
+                                if isinstance(event, ToolUseStartEvent)
+                            )
+                            try:
                                 arguments_json = json.dumps(arguments, allow_nan=False)
                                 call_events = [
-                                    *tools_acc.start(
-                                        key,
-                                        tool_use_id=tool_use_id,
-                                        tool_name=tool_name,
-                                    ),
+                                    *start_events,
                                     *tools_acc.append(key, arguments_json),
                                     *tools_acc.finish_with_arguments(key, arguments),
                                 ]
@@ -596,6 +634,8 @@ class OllamaProvider:
                                     message=message,
                                     metadata={"reason": reason, "phase": "stream"},
                                 )
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(
                                     message=message,
                                     code="incomplete_tool_call",

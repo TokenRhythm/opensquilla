@@ -16,7 +16,6 @@ import math
 import os
 import re
 import stat
-import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -37,6 +36,14 @@ from opensquilla.engine.cache_break_monitor import (
     check_response_for_cache_break,
     notify_compaction,
     record_prompt_state,
+)
+from opensquilla.engine.cancellation import (
+    STOP_CANCEL_GRACE_SECONDS,
+    TIMEOUT_CANCEL_GRACE_SECONDS,
+    CancellationPolicy,
+    cancel_task,
+    cancel_tasks,
+    defer_async_cleanup,
 )
 from opensquilla.engine.elevation_triage import RuleAssessment, local_elevation_assessment
 from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep
@@ -63,6 +70,7 @@ from opensquilla.engine.history import (
     limit_turns,
     reconstruct_messages_from_entry,
     repair_tool_pairing,
+    strip_historical_tool_pairs,
 )
 from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
 from opensquilla.engine.post_write_convergence import (
@@ -154,6 +162,7 @@ from opensquilla.execution_status import (
     normalize_execution_status,
     runtime_execution_status,
 )
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.observability.turn_call_log import TurnCallLogger
 from opensquilla.persistence.meta_run_writer import replay_inputs_are_modified
 from opensquilla.provider import (
@@ -194,10 +203,14 @@ from opensquilla.provider.correlation_context import bind_provider_request_corre
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
+    IMAGE_INPUT_UNSUPPORTED_CODE,
+    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+    count_provider_image_blocks,
+    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
-    validate_provider_chat_request,
+    validate_provider_chat_admission,
 )
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
@@ -305,6 +318,7 @@ from .types import (
     ThinkingLevel,
     ThinkingStartEvent,
     ToolCall,
+    ToolEffectOutcome,
     ToolResult,
     ToolResultEvent,
     ToolUseDeltaEvent,
@@ -323,6 +337,68 @@ _TURN_OBJECTIVE_REMINDER_ENV = "OPENSQUILLA_TURN_OBJECTIVE_REMINDER"
 _TURN_OBJECTIVE_REMINDER_ON = {"on", "1", "true", "yes"}
 _TURN_OBJECTIVE_REMINDER_OFF = {"off", "0", "false", "no"}
 _TURN_OBJECTIVE_REMINDER_TRIM_PREFIX = "trim:"
+
+# Candidate writers are intentionally non-durable until ``document_finish``.
+# The turn generator yields its DoneEvent before ``run_turn``'s outer finally
+# gets a chance to reject an abandoned draft, so a terminal outcome must not
+# expose the intermediate ``candidate_staged``/verification statuses.  Keep
+# this projection local to the engine boundary; the durable mutation ledger
+# remains the source of truth for committed/ambiguous receipts.
+_OPEN_CANDIDATE_STATUSES = frozenset(
+    {"candidate_staged", "verification_passed", "verification_failed"}
+)
+_TERMINAL_CANDIDATE_OUTCOME_STATUSES = frozenset({"applied", "discarded", "ambiguous"})
+
+
+def _normalize_uncommitted_candidate_outcome(
+    outcome: Mapping[str, Any] | None,
+    controller: Any | None,
+) -> dict[str, Any] | None:
+    """Project an abandoned candidate to a truthful public turn outcome.
+
+    Candidate bytes are rejected by the outer turn cleanup when a model never
+    calls ``document_finish``.  Since that cleanup runs after the generator's
+    final event, normalize the event before it is emitted.  Already durable
+    or restart-recoverable statuses are preserved exactly.
+    """
+
+    state = getattr(controller, "state", None)
+    state_status = str(getattr(state, "status", "") or "")
+    if (
+        state_status not in _OPEN_CANDIDATE_STATUSES
+        or not getattr(state, "candidate_sha256", None)
+    ):
+        return None if outcome is None else dict(outcome)
+    current = str((outcome or {}).get("status", "") or "")
+    if current in _TERMINAL_CANDIDATE_OUTCOME_STATUSES:
+        return None if outcome is None else dict(outcome)
+    normalized = dict(outcome or {})
+    durable_finish_unresolved = bool(
+        getattr(controller, "discard_blocked_by_other_finish", False)
+        or getattr(controller, "_mutation_attempt_id", None)
+        or getattr(controller, "_mutation_attempt_tool_use_id", None)
+    )
+    if durable_finish_unresolved:
+        normalized.update(
+            {
+                "version": 1,
+                "status": "ambiguous",
+                "phase": "commit",
+                "retryPolicy": "reconcile",
+                "code": "document_finish_commit_ambiguous",
+            }
+        )
+        return normalized
+    normalized.update(
+        {
+            "version": 1,
+            "status": "not_applied",
+            "phase": "commit",
+            "retryPolicy": "new_turn",
+            "code": "document_candidate_discarded_on_turn_close",
+        }
+    )
+    return normalized
 
 
 def _resolve_turn_objective_reminder() -> tuple[bool, int]:
@@ -364,20 +440,6 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
-UNSUPPORTED_IMAGE_INPUT_REPLY = (
-    "当前选择的模型暂不支持查看图片，因此无法分析你上传的图片。"
-    "请切换到支持图片的模型，或将图片中的文字和关键信息粘贴到消息中后重试。"
-)
-
-
-def model_explicitly_lacks_vision(capabilities: Any) -> bool:
-    """Return true only when capability data explicitly denies vision."""
-
-    return capabilities is not None and not bool(
-        getattr(capabilities, "supports_vision", False)
-    )
-
-
 _TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
 _TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
     "[Runtime recovery]\n"
@@ -1222,6 +1284,14 @@ _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
 _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_projection:"
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
+_PROMPT_ANNOTATION_WRITER_TOOLS = frozenset({"document_apply", "document_patch"})
+_DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS = 8_192
+_DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS = 256
+_DOCUMENT_MUTATION_FINALIZATION_SYSTEM = (
+    "You are OpenSquilla. No tools are available for this response. "
+    "State the supplied authoritative document outcome concisely in the requested language. "
+    "Do not mention internal protocols, capabilities, identifiers, source text, or paths."
+)
 _AGGREGATE_TOOL_RESULT_MAX_SHARE = 0.25
 # Below this size a duplicate tool result is not worth eliding: the dedup stub
 # itself costs ~200 chars, so tiny repeated payloads would grow, not shrink.
@@ -2417,6 +2487,10 @@ class _IterationStreamTimeoutError(TimeoutError):
 class _RaisedProviderBoundaryError(RuntimeError):
     """Content-free marker for an exception raised by provider call/iteration."""
 
+    def __init__(self, *, timeout: bool) -> None:
+        super().__init__("provider boundary failed")
+        self.timeout = timeout
+
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
 
@@ -2650,6 +2724,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         output_json_schema=chat_cfg.output_json_schema,
         output_json_schema_strict=chat_cfg.output_json_schema_strict,
         model_capabilities=chat_cfg.model_capabilities,
+        model_vision_support=chat_cfg.model_vision_support,
         thinking_level=ThinkingLevel.OFF,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
         context_window_tokens_global_override=(
@@ -2925,6 +3000,11 @@ class Agent:
             )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
+        # Set only after a restricted PromptAnnotation provider emits the
+        # writer identity. This is an ephemeral proposal observation; durable
+        # state begins only after document_apply validates and reserves commit.
+        self._active_artifact_writer_intent_id: str | None = None
+        self._artifact_writer_rejected_proposal_digests: set[str] = set()
         # Test-only offline failure seam. ``None`` on every production path,
         # so the provider chat call below stays byte-identical to before when
         # it is unset; a test passes an explicit FailureInjector to script the
@@ -3003,6 +3083,9 @@ class Agent:
             tuple[str, str, str, str, str, str], ToolResultRecord
         ] = {}
         self._patch_evidence_ledger: PatchEvidenceLedger | None = None
+        self._runtime_git_state = GitRunState.OK
+        self._runtime_git_skip_states_recorded: set[GitRunState] = set()
+        self._submit_review_git_state = GitRunState.OK
         if self.config.patch_evidence_ledger_path:
             self._patch_evidence_ledger = PatchEvidenceLedger(
                 path=self.config.patch_evidence_ledger_path,
@@ -3043,6 +3126,15 @@ class Agent:
             return ErrorEvent(
                 message="Context compaction did not reduce the provider request.",
                 code="compaction_not_smaller",
+            )
+        if reason == "restricted_turn_compaction_disabled":
+            return ErrorEvent(
+                message=(
+                    "The restricted artifact request is too large. Durable session "
+                    "history was not changed or sent to an auxiliary model; retry "
+                    "with fewer annotations or a larger-context model."
+                ),
+                code="provider_request_too_large",
             )
         if reason in {
             "provider_native_overflow_after_admission",
@@ -3291,8 +3383,11 @@ class Agent:
                     supports_reasoning=bool(
                         getattr(resolved_capabilities, "supports_reasoning", False)
                     ),
-                    supports_tools=bool(
-                        getattr(resolved_capabilities, "supports_tools", True)
+                    # Capability metadata is advisory.  Unknown/unverified
+                    # values must keep the authorized tool surface; only an
+                    # explicit false is a denial.
+                    supports_tools=(
+                        getattr(resolved_capabilities, "supports_tools", None) is not False
                     ),
                     supports_streaming=bool(
                         getattr(resolved_capabilities, "supports_streaming", True)
@@ -3358,6 +3453,7 @@ class Agent:
             model_capabilities=(
                 resolved_capabilities
             ),
+            model_vision_support=self.config.model_vision_support,
             thinking_level=(
                 self.config.thinking
                 if isinstance(self.config.thinking, ThinkingLevel)
@@ -3517,6 +3613,8 @@ class Agent:
             history,
             preserve_reasoning_content=preserve_reasoning_content,
         )
+        if self._restricted_tool_boundary_active():
+            history, _restricted_projection = strip_historical_tool_pairs(history)
         history = repair_tool_pairing(history)
         history = drop_reasoning(
             history,
@@ -3576,7 +3674,7 @@ class Agent:
 
         summary_context = (
             format_compaction_summary_context([replay_summary])
-            if replay_summary.strip()
+            if replay_summary.strip() and not self._restricted_tool_boundary_active()
             else None
         )
         existing_context: str | None = self.config.request_context_prompt
@@ -4037,6 +4135,18 @@ class Agent:
             timeout = max(timeout, argument_timeout)
         return timeout
 
+    def _tool_cancellation_policy(self, tool_call: ToolCall) -> CancellationPolicy:
+        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
+        policy = getattr(tool_def, "cancellation_policy", "bounded")
+        return "must_settle" if policy == "must_settle" else "bounded"
+
+    def _tool_effect_observation(self) -> tuple[int, int, int]:
+        return (
+            len(self._workspace_mutation_receipts()),
+            len(self._workspace_write_records()),
+            len(self._scratch_write_records()),
+        )
+
     def _tool_activity_heartbeat_interval(self) -> float:
         raw_interval = self.config.metadata.get("tool_activity_heartbeat_interval", 15.0)
         try:
@@ -4103,7 +4213,39 @@ class Agent:
             **payload,
         )
 
-    def _switch_to_invalid_response_fallback(self, reason: str) -> bool:
+    def _switch_to_invalid_response_fallback(
+        self,
+        reason: str,
+        *,
+        requires_vision: bool = False,
+        requires_tools: bool = False,
+    ) -> bool:
+        if requires_vision or requires_tools:
+            constrained_fallback = getattr(
+                self.provider,
+                "fallback_after_invalid_response_with_capabilities",
+                None,
+            )
+            if not callable(constrained_fallback):
+                return False
+            try:
+                return bool(
+                    constrained_fallback(
+                        reason,
+                        requires_vision=requires_vision,
+                        requires_tools=requires_tools,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - fallback support is optional
+                logger.warning(
+                    "provider.invalid_response_fallback_failed",
+                    session_key=self._session_key,
+                    reason=reason,
+                    requires_vision=requires_vision,
+                    requires_tools=requires_tools,
+                    error=str(exc),
+                )
+                return False
         fallback = getattr(self.provider, "fallback_after_invalid_response", None)
         if not callable(fallback):
             return False
@@ -4118,24 +4260,67 @@ class Agent:
             )
             return False
 
-    def _provider_local_terminal_reply(
+    def _new_reasoning_only_act_now_message(
         self,
-        messages: list[Message],
-        config: ChatConfig,
-    ) -> str | None:
-        local_reply = getattr(self.provider, "local_terminal_reply", None)
-        if not callable(local_reply):
-            return None
-        try:
-            reply = local_reply(messages, config)
-        except Exception as exc:  # noqa: BLE001 - optional preflight must be isolated
-            logger.warning(
-                "provider.local_terminal_reply_failed",
-                session_key=self._session_key,
-                error=str(exc),
-            )
-            return None
-        return reply if isinstance(reply, str) and reply else None
+        *,
+        iteration: int,
+        attempt: int,
+        reasoning_content: str | None,
+        provider_default_reasoning: bool,
+    ) -> Message:
+        message = Message(
+            role="user",
+            content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+        )
+        append_runtime_event(
+            self.config.runtime_events_path,
+            {
+                "feature": "reasoning_only_act_now",
+                "name": "reasoning_only_act_now.injected",
+                "action": "retry_with_act_now_directive",
+                "reason": "provider_reasoning_only",
+                "provider_default_reasoning": provider_default_reasoning,
+                "iteration": iteration,
+                "attempt": attempt,
+                "reasoning_chars": len(reasoning_content or ""),
+                "session_key": self._session_key,
+                "agent_id": (
+                    self.config.tool_result_store_agent_id
+                    or self.config.metadata.get("agent_id")
+                ),
+            },
+        )
+        return message
+
+    def _provider_log_identity(self, observed_provider: str = "") -> str:
+        return (
+            str(getattr(self.provider, "active_provider_id", "") or "").strip()
+            or str(observed_provider or "").strip()
+            or str(self.config.provider_id or "").strip()
+            or str(getattr(self.provider, "provider_name", "") or "").strip()
+            or type(self.provider).__name__
+        )
+
+    def _log_reasoning_output_budget_exhausted(
+        self,
+        *,
+        model: str,
+        observed_provider: str,
+        configured_max_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        reasoning_content: str | None,
+    ) -> None:
+        logger.warning(
+            "provider.reasoning_output_budget_exhausted",
+            session_key=self._session_key,
+            model=model,
+            provider=self._provider_log_identity(observed_provider),
+            configured_max_tokens=configured_max_tokens,
+            iter_output_tokens=output_tokens,
+            iter_reasoning_tokens=reasoning_tokens,
+            reasoning_chars=len(reasoning_content or ""),
+        )
 
     @staticmethod
     def _tool_call_string_arg(
@@ -5760,6 +5945,8 @@ class Agent:
             artifacts=list(guarded_result.artifacts),
             execution_status=guarded_result.execution_status,
             terminates_turn=guarded_result.terminates_turn,
+            effect_outcome=guarded_result.effect_outcome,
+            terminal_response_text=guarded_result.terminal_response_text,
         )
 
     async def _project_tool_result_for_llm(
@@ -5832,6 +6019,8 @@ class Agent:
                     else None
                 ),
                 terminates_turn=result.terminates_turn,
+                effect_outcome=result.effect_outcome,
+                terminal_response_text=result.terminal_response_text,
             )
             self.config.metadata["tool_json_guard_applied"] = True
             self.config.metadata["tool_json_guard_calls"] = (
@@ -6169,6 +6358,8 @@ class Agent:
             artifacts=list(result.artifacts),
             execution_status=result.execution_status,
             terminates_turn=result.terminates_turn,
+            effect_outcome=result.effect_outcome,
+            terminal_response_text=result.terminal_response_text,
         )
 
     async def _canonicalize_tool_result(
@@ -6287,6 +6478,8 @@ class Agent:
                     else None
                 ),
                 terminates_turn=result.terminates_turn,
+                effect_outcome=result.effect_outcome,
+                terminal_response_text=result.terminal_response_text,
             )
         mode = self._tool_result_compression_mode()
         if mode == "off" or not self._tool_result_over_budget(result.content):
@@ -6315,6 +6508,8 @@ class Agent:
                 else None
             ),
             terminates_turn=result.terminates_turn,
+            effect_outcome=result.effect_outcome,
+            terminal_response_text=result.terminal_response_text,
         )
 
     # ------------------------------------------------------------------
@@ -6477,8 +6672,9 @@ class Agent:
             clear_sandbox_approval_denials,
             prune_once_mount_grants,
         )
-
         self._prompt_cache_keepalive_candidate = None
+        self._active_artifact_writer_intent_id = None
+        self._artifact_writer_rejected_proposal_digests.clear()
 
         try:
             if self._session_key:
@@ -6508,10 +6704,74 @@ class Agent:
                 ):
                     yield event
         finally:
+            # A staged candidate is never an implicit commit.  If the turn is
+            # cancelled, times out, or exits without document_finish, reject
+            # the draft before releasing the rest of the turn authorities.
+            candidate_cleanup = asyncio.create_task(
+                self._discard_uncommitted_candidate("turn_closed")
+            )
+            while not candidate_cleanup.done():
+                try:
+                    await asyncio.shield(candidate_cleanup)
+                except asyncio.CancelledError:
+                    # Keep the cleanup task running even when the turn itself
+                    # is cancelled a second time; an uncommitted candidate and
+                    # its opaque preview mapping must not be abandoned merely
+                    # because the provider stopped streaming.
+                    continue
+            try:
+                candidate_cleanup.result()
+            except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
+                logger.warning(
+                    "agent.candidate_loop_cleanup_task_failed",
+                    session_key=self._session_key,
+                    exc_info=True,
+                )
+            writer_cleanup = asyncio.create_task(
+                self._finalize_unresolved_artifact_writer_intent()
+            )
+            writer_cleanup_cancelled = False
+            while not writer_cleanup.done():
+                try:
+                    await asyncio.shield(writer_cleanup)
+                except asyncio.CancelledError:
+                    writer_cleanup_cancelled = True
+            writer_cleanup.result()
+            self._active_artifact_writer_intent_id = None
             self._terminalize_pending_durable_compaction(
                 status="cancelled",
                 reason="turn_closed_before_compaction_install",
             )
+            # Process-local authorities are cleared only after the turn
+            # generator has persisted/streamed its final tool result, but on
+            # every terminal path (including cancellation and provider abort)
+            # before this ToolContext can be reused or discarded.
+            if self._tool_context is not None:
+                # Screenshot bytes are request-scoped evidence.  Drop any
+                # attachment left behind by a cancelled/failed dispatch so a
+                # reused context cannot retain binary data across turns.
+                self._tool_context.tool_result_media.clear()
+                callbacks = tuple(self._tool_context.turn_cleanup_callbacks)
+                self._tool_context.turn_cleanup_callbacks.clear()
+                for callback in callbacks:
+                    try:
+                        result = callback()
+                        if inspect.isawaitable(result):
+                            cleanup_task = asyncio.ensure_future(result)
+                            cleanup_cancelled = False
+                            while not cleanup_task.done():
+                                try:
+                                    await asyncio.shield(cleanup_task)
+                                except asyncio.CancelledError:
+                                    cleanup_cancelled = True
+                            cleanup_task.result()
+                            if cleanup_cancelled:
+                                logger.debug("agent.turn_authority_cleanup_completed_after_cancel")
+                    except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
+                        logger.warning(
+                            "agent.turn_authority_cleanup_failed",
+                            exc_info=True,
+                        )
             approval_cleanup = asyncio.create_task(
                 clear_approval_run_context_deltas_for_tool_context(
                     self._tool_context,
@@ -6525,6 +6785,8 @@ class Agent:
                     cleanup_wait_cancelled = True
             approval_cleanup.result()
             if cleanup_wait_cancelled:
+                raise asyncio.CancelledError
+            if writer_cleanup_cancelled:
                 raise asyncio.CancelledError
 
     async def _turn_generator(
@@ -6622,25 +6884,36 @@ class Agent:
             _ = terminates  # always terminates today; reserved for future
             return
 
-        current_turn_image_count = self._count_image_blocks(extra_messages or [])
-        if current_turn_image_count > 0 and model_explicitly_lacks_vision(
-            self.config.model_capabilities
-        ):
+        current_turn_image_count = count_provider_image_blocks(extra_messages or [])
+        forced_image_rejection = str(
+            self.config.metadata.get("image_input_forced_rejection_reason") or ""
+        ).strip()
+        image_admission_error = image_input_admission_error(
+            extra_messages or [],
+            vision_support=(
+                "unsupported"
+                if forced_image_rejection
+                else self.config.model_vision_support
+            ),
+        )
+        if forced_image_rejection or image_admission_error is not None:
+            image_input_reason = forced_image_rejection or "model_vision_unsupported"
             self.config.metadata["image_input_mode"] = "rejected"
-            self.config.metadata["image_input_reason"] = "vision_unsupported"
+            self.config.metadata["image_input_reason"] = image_input_reason
             self.config.metadata["image_input_count"] = current_turn_image_count
+            self.config.metadata["image_input_stage"] = "primary"
             self._write_turn_call_log(
                 "image_input_preflight",
-                action="terminal_reply",
-                reason="vision_unsupported",
+                action="reject",
+                reason=image_input_reason,
                 model=self.config.model_id or "",
                 image_count=current_turn_image_count,
             )
-            async for ev in self._emit_terminal_text(
-                UNSUPPORTED_IMAGE_INPUT_REPLY,
-                iterations=0,
-            ):
-                yield ev
+            yield self._transition(AgentState.ERROR)
+            yield ErrorEvent(
+                message=IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+                code=IMAGE_INPUT_UNSUPPORTED_CODE,
+            )
             return
 
         # Use the system prompt from config (wired by gateway via identity.prompt)
@@ -6688,6 +6961,12 @@ class Agent:
             preserve_reasoning_content=preserve_reasoning_content,
             recoverable_references=recoverable_references,
         )
+        restricted_history_projection = None
+        if self._restricted_tool_boundary_active():
+            (
+                sanitized_history,
+                restricted_history_projection,
+            ) = strip_historical_tool_pairs(sanitized_history)
         sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
             sanitized_history,
@@ -6709,6 +6988,11 @@ class Agent:
             sanitized_history,
             sanitize=sanitize_result,
             historical_projection=historical_projection_result.__dict__,
+            restricted_history_projection=(
+                restricted_history_projection.__dict__
+                if restricted_history_projection is not None
+                else None
+            ),
         )
         history = limit_turns(sanitized_history, self.config.max_history_turns)
         history = repair_tool_pairing(history)
@@ -6897,10 +7181,32 @@ class Agent:
         turn_model_usage_breakdown: list[dict[str, Any]] = []
         last_ensemble_trace: dict[str, Any] | None = None
         turn_ensemble_request_count = 0
+        ensemble_continuation_request_count: int | None = None
+        ensemble_continuation_provider: object | None = None
+
+        def _merge_ensemble_request_count(
+            trace: dict[str, Any],
+            continuation_baseline: int | None,
+        ) -> int:
+            nonlocal last_ensemble_trace, turn_ensemble_request_count
+
+            last_ensemble_trace = dict(trace)
+            reported_count = _usage_int(trace.get("llm_request_count") or 0)
+            if continuation_baseline is None:
+                turn_ensemble_request_count += reported_count
+            else:
+                turn_ensemble_request_count += max(
+                    0,
+                    reported_count - continuation_baseline,
+                )
+            return reported_count
+
         terminal_error: ErrorEvent | None = None
         terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
+        router_model_call_id = ""
+        router_iteration = 0
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -6913,6 +7219,149 @@ class Agent:
         max_iterations_deadline_extension_logged = False
         post_write_convergence_finalization_pending = False
         post_write_convergence_finalization_message: Message | None = None
+        document_mutation_finalization_pending = False
+        document_mutation_finalization_attempted = False
+        document_mutation_finalization_message: Message | None = None
+        document_mutation_outcome: dict[str, Any] | None = None
+        # A prompt annotation is ordinary request context until the provider
+        # actually starts ``document_apply``.  Keeping this separate from the
+        # presence of a writer controller prevents read/answer-only turns from
+        # manufacturing a mutation outcome or spending a second provider call
+        # on the mutation-only finalizer.
+        document_mutation_attempted = False
+        candidate_loop_nudges = 0
+
+        def _document_mutation_response_locale() -> str:
+            configured = str(
+                self.config.metadata.get("locale")
+                or self.config.metadata.get("language")
+                or "en"
+            ).strip()
+            if not re.fullmatch(
+                r"[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*",
+                configured,
+            ):
+                configured = "en"
+            language_samples = [str(self._current_turn_message or "")]
+            artifact_context = getattr(self._tool_context, "artifact_context", None)
+            snapshots = getattr(artifact_context, "snapshots", ())
+            if isinstance(snapshots, (list, tuple)):
+                language_samples.extend(
+                    str(snapshot.get("body") or "")
+                    for snapshot in snapshots[:16]
+                    if isinstance(snapshot, Mapping)
+                )
+            combined = "\n".join(language_samples)
+            if re.search(r"[\u3040-\u30ff]", combined):
+                return "ja"
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", combined):
+                return "zh-Hans"
+            return configured
+
+        def _document_mutation_finalization_request() -> list[Message]:
+            raw_outcome = dict(document_mutation_outcome or {})
+            if not raw_outcome:
+                raw_outcome = {
+                    "version": 1,
+                    "status": "not_attempted",
+                    "phase": "proposal",
+                    "retryPolicy": "new_turn",
+                    "code": "document_mutation_not_proposed",
+                }
+            requested_locale = _document_mutation_response_locale()
+            payload = {
+                "language": requested_locale,
+                "status": str(raw_outcome.get("status") or "not_attempted"),
+            }
+            return [
+                Message(
+                    role="user",
+                    content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                )
+            ]
+
+        def _document_mutation_fallback_text() -> str:
+            outcome = document_mutation_outcome or {}
+            status = str(outcome.get("status") or "not_attempted")
+            locale = _document_mutation_response_locale().lower()
+            language = re.split(r"[-_]", locale, maxsplit=1)[0]
+            translations = {
+                "en": {
+                    "applied": "The document changes were applied.",
+                    "discarded": "The document changes were discarded; the page was not updated.",
+                    "conflict": "The document changed; refresh it before trying again.",
+                    "ambiguous": (
+                        "The change result is uncertain; refresh and verify the version."
+                    ),
+                    "not_applied": "The document changes were not applied.",
+                    "not_attempted": "No document change was made.",
+                },
+                "zh": {
+                    "applied": "文档修改已成功应用。",
+                    "discarded": "文档修改已放弃，页面未更新。",
+                    "conflict": "文档已发生变化，请刷新后重试。",
+                    "ambiguous": "修改结果暂时无法确认，请刷新并核对版本。",
+                    "not_applied": "文档修改未能应用。",
+                    "not_attempted": "本次没有修改文档。",
+                },
+                "de": {
+                    "applied": "Die Dokumentänderungen wurden angewendet.",
+                    "discarded": (
+                        "Die Dokumentänderungen wurden verworfen; die Seite wurde nicht "
+                        "aktualisiert."
+                    ),
+                    "conflict": (
+                        "Das Dokument wurde geändert; aktualisieren Sie es vor einem "
+                        "neuen Versuch."
+                    ),
+                    "ambiguous": (
+                        "Das Änderungsergebnis ist ungewiss; aktualisieren Sie die "
+                        "Ansicht und prüfen Sie die Version."
+                    ),
+                    "not_applied": "Die Dokumentänderungen wurden nicht angewendet.",
+                    "not_attempted": "Das Dokument wurde nicht geändert.",
+                },
+                "es": {
+                    "applied": "Se aplicaron los cambios del documento.",
+                    "discarded": (
+                        "Se descartaron los cambios del documento; la página no se "
+                        "actualizó."
+                    ),
+                    "conflict": (
+                        "El documento cambió; actualízalo antes de volver a intentarlo."
+                    ),
+                    "ambiguous": (
+                        "El resultado del cambio es incierto; actualiza y verifica la versión."
+                    ),
+                    "not_applied": "No se aplicaron los cambios del documento.",
+                    "not_attempted": "No se modificó el documento.",
+                },
+                "fr": {
+                    "applied": "Les modifications du document ont été appliquées.",
+                    "discarded": (
+                        "Les modifications du document ont été abandonnées ; la page "
+                        "n’a pas été mise à jour."
+                    ),
+                    "conflict": (
+                        "Le document a changé ; actualisez-le avant de réessayer."
+                    ),
+                    "ambiguous": (
+                        "Le résultat est incertain ; actualisez et vérifiez la version."
+                    ),
+                    "not_applied": "Les modifications du document n’ont pas été appliquées.",
+                    "not_attempted": "Le document n’a pas été modifié.",
+                },
+                "ja": {
+                    "applied": "文書の変更を適用しました。",
+                    "discarded": "文書の変更を破棄しました。ページは更新されていません。",
+                    "conflict": "文書が変更されています。更新してから再試行してください。",
+                    "ambiguous": "変更結果を確認できません。更新して版を確認してください。",
+                    "not_applied": "文書の変更は適用されませんでした。",
+                    "not_attempted": "文書は変更されませんでした。",
+                },
+            }
+            messages = translations.get(language, translations["en"])
+            return messages.get(status, messages["not_attempted"])
         placeholder_offense_iterations = 0
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
@@ -7080,6 +7529,16 @@ class Agent:
         # and per-tool execution budget.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
+        document_mutation_summary_deadline: float | None = None
+        document_mutation_summary_deadline_candidate: float | None = None
+        if _total_deadline is not None and self._artifact_mutation_turn_active():
+            summary_reserve_seconds = min(
+                15.0,
+                max(1.0, float(self.config.timeout) * 0.1),
+            )
+            document_mutation_summary_deadline_candidate = (
+                _total_deadline - summary_reserve_seconds
+            )
 
         # Endgame git freeze: once remaining wall clock drops below the margin,
         # the shell tools block workspace-reverting git commands outright so
@@ -7174,9 +7633,61 @@ class Agent:
                 )
             return True
 
-        tools_supported = True
-        if self.config.model_capabilities is not None:
-            tools_supported = bool(getattr(self.config.model_capabilities, "supports_tools", True))
+        configured_capabilities = self.config.model_capabilities
+        tools_supported = bool(
+            configured_capabilities is None
+            or getattr(configured_capabilities, "supports_tools", None) is not False
+        )
+        artifact_tools_verified = bool(
+            self.config.model_tools_capability_verified
+            and configured_capabilities is not None
+            and getattr(configured_capabilities, "supports_tools", False)
+        )
+        artifact_operation = str(metadata.get("artifact_operation_class") or "").strip()
+        artifact_requires_tools = artifact_operation in {
+            "selection_edit",
+            "structural_edit",
+            "conflict_recovery",
+        }
+        if (
+            artifact_requires_tools
+            and self.tool_definitions
+            and tools_supported
+            and not artifact_tools_verified
+        ):
+            # Capability provenance is routing metadata, not tool authority.
+            # Unknown deployments keep the agent's already-authorized tool
+            # surface; dispatch, grants, and commit validation remain the
+            # side-effect boundary.
+            self._write_turn_call_log(
+                "turn_policy_decision",
+                action="allow_tools",
+                reason="artifact_model_tools_capability_unknown",
+                code="artifact_model_tools_capability_unknown",
+                artifact_operation_class=artifact_operation,
+            )
+        if (
+            artifact_requires_tools
+            and self.tool_definitions
+            and not tools_supported
+        ):
+            self._write_turn_call_log(
+                "turn_policy_decision",
+                action="reject",
+                reason="artifact_model_tools_unsupported",
+                code="artifact_model_tools_unsupported",
+                artifact_operation_class=artifact_operation,
+            )
+            terminal_error = ErrorEvent(
+                message=(
+                    "The selected model explicitly does not support tool calling, so the "
+                    "artifact was left unchanged. Choose a tool-capable model and retry."
+                ),
+                code="artifact_model_tools_unsupported",
+            )
+            yield self._transition(AgentState.ERROR)
+            yield terminal_error
+            return
         provider_tool_definitions = self.tool_definitions or None
         if not tools_supported:
             provider_tool_definitions = None
@@ -7269,8 +7780,8 @@ class Agent:
                 capabilities = self.config.model_capabilities
                 return (
                     max(0, int(self.config.context_window_tokens or 0)),
-                    bool(
-                        getattr(capabilities, "supports_tools", True)
+                    (
+                        getattr(capabilities, "supports_tools", None) is not False
                         if capabilities is not None
                         else True
                     ),
@@ -7323,7 +7834,11 @@ class Agent:
                 context_window = 0
             return (
                 context_window,
-                capabilities.get("supports_tools") is True,
+                # Capability discovery is advisory.  Unknown/unverified
+                # candidates must retain the tool surface; only an explicit
+                # ``False`` is a safe reason to steer a continuation away
+                # from tools.
+                capabilities.get("supports_tools") is not False,
                 capabilities.get("supports_vision") is True,
                 leg_kind,
             )
@@ -7708,7 +8223,43 @@ class Agent:
                         max_iterations_guidance = (
                             "Set AgentConfig.max_iterations=0 for unlimited tasks."
                         )
-                    if not max_iterations_finalization_attempted:
+                    if (
+                        self._artifact_mutation_turn_active()
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        if not document_mutation_finalization_pending:
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            if not prior_outcome or prior_outcome.get("retryPolicy") == "same_turn":
+                                document_mutation_outcome = {
+                                    "version": 1,
+                                    "status": str(
+                                        prior_outcome.get("status") or "not_attempted"
+                                    ),
+                                    "phase": str(prior_outcome.get("phase") or "proposal"),
+                                    "retryPolicy": "new_turn",
+                                    "code": "document_mutation_iteration_budget_exhausted",
+                                }
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document proposal budget is closed. Do not call "
+                                    "tools. Summarize only the authoritative mutation outcome."
+                                ),
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="document_outcome_finalize",
+                            reason="max_iterations",
+                            code="document_mutation_iteration_budget_exhausted",
+                            iteration=iterations,
+                            max_iterations=self.config.max_iterations,
+                            max_iterations_source=max_iterations_source,
+                        )
+                    elif not max_iterations_finalization_attempted:
                         max_iterations_finalization_attempted = True
                         max_iterations_finalization_pending = True
                         max_iterations_finalization_message = Message(
@@ -7752,6 +8303,32 @@ class Agent:
                 # Check total turn deadline (if configured)
                 if _total_deadline is not None and _loop.time() > _total_deadline:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                if (
+                    document_mutation_summary_deadline is not None
+                    and document_mutation_attempted
+                    and _loop.time() >= document_mutation_summary_deadline
+                    and not document_mutation_finalization_pending
+                    and not document_mutation_finalization_attempted
+                ):
+                    prior_outcome = dict(document_mutation_outcome or {})
+                    if not prior_outcome or prior_outcome.get("retryPolicy") == "same_turn":
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": str(prior_outcome.get("status") or "not_attempted"),
+                            "phase": str(prior_outcome.get("phase") or "proposal"),
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_time_budget_exhausted",
+                        }
+                    document_mutation_finalization_pending = True
+                    document_mutation_finalization_message = Message(
+                        role="user",
+                        content=(
+                            "The document turn time budget is closing. Do not call tools. "
+                            "Summarize only the authoritative mutation outcome."
+                        ),
+                    )
+                    final_text_parts.clear()
+                    applied_model_call_boundaries.clear()
 
                 # Pre-deadline wrap-up: arm once when remaining wall clock drops
                 # below the configured margin. The directive is spliced into
@@ -7871,6 +8448,9 @@ class Agent:
                 iter_reasoning_content: str | None = None
                 iter_thinking_signature: str | None = None
                 provider_error: ProviderErrorEvent | None = None
+                guarded_writer_intent_id: str | None = None
+                guarded_writer_stream_failure: str | None = None
+                guarded_writer_ids: list[str] = []
 
                 _retry_attempt = 0
                 _call_attempt = 0
@@ -7902,6 +8482,9 @@ class Agent:
                     if self._execution_context is not None:
                         self._execution_context.drop_pending_tool_buffers("provider_retry")
                     seen_tool_use_ids: set[str] = set()
+                    guarded_writer_intent_id = None
+                    guarded_writer_stream_failure = None
+                    guarded_writer_ids = []
                     # Plain assistant text streams live as the answer the moment it
                     # arrives. text_presentation_decided flips to True once a tool
                     # appears this call, after which later text is tagged as
@@ -7941,6 +8524,38 @@ class Agent:
                         return event
 
                     call_started_at = time.monotonic()
+                    max_llm_calls = self._positive_int(
+                        getattr(self.config, "max_turn_llm_calls", 0)
+                    )
+                    if (
+                        self._artifact_mutation_turn_active()
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_pending
+                        and not document_mutation_finalization_attempted
+                        and max_llm_calls is not None
+                        and turn_llm_calls + 1 >= max_llm_calls
+                    ):
+                        # Once mutation intent exists, reserve the final
+                        # ordinary provider-call slot for a tool-free summary.
+                        # If intent first appears in that last ordinary call,
+                        # the admission gate below still permits exactly one
+                        # mutation-only finalizer beyond the ordinary cap.
+                        document_mutation_finalization_pending = True
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": "not_attempted",
+                            "phase": "proposal",
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_finalization_budget_reserved",
+                        }
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document mutation tool budget is now closed. "
+                                "Do not call tools. Summarize the observed mutation outcome "
+                                "for the user in their language."
+                            ),
+                        )
                     provider_tools_for_call = (
                         None
                         if (
@@ -7948,6 +8563,7 @@ class Agent:
                             or goal_terminal_final_response_pending
                             or max_iterations_finalization_pending
                             or post_write_convergence_finalization_pending
+                            or document_mutation_finalization_pending
                         )
                         else provider_tool_definitions
                     )
@@ -7971,6 +8587,7 @@ class Agent:
                         and not goal_terminal_final_response_pending
                         and not max_iterations_finalization_pending
                         and not post_write_convergence_finalization_pending
+                        and not document_mutation_finalization_pending
                     )
                     ignored_post_delivery_tool_use = False
                     if message_count_request_view is not None:
@@ -7993,11 +8610,17 @@ class Agent:
                         active_protected_turn_start_index = current_turn_start_index
 
                     request_suffix_messages: list[Message] = []
+                    reasoning_only_act_now_for_call: Message | None = None
                     if goal_terminal_final_response_pending:
                         # The terminal Goal ToolResult is sufficient context for
                         # one ordinary summary. Do not splice work/recovery
                         # directives after the durable terminal decision.
                         request_suffix_messages = []
+                    elif (
+                        document_mutation_finalization_pending
+                        and document_mutation_finalization_message is not None
+                    ):
+                        request_suffix_messages = [document_mutation_finalization_message]
                     elif (
                         post_write_convergence_finalization_pending
                         and post_write_convergence_finalization_message is not None
@@ -8017,6 +8640,7 @@ class Agent:
                         # request. Withheld on an assistant tail for the same
                         # reasoning-prefill reason as below.
                         request_suffix_messages = [reasoning_only_act_now_message]
+                        reasoning_only_act_now_for_call = reasoning_only_act_now_message
                     elif deadline_wrapup_message is not None and (
                         not turn_messages or turn_messages[-1].role != "assistant"
                     ):
@@ -8063,21 +8687,30 @@ class Agent:
                         call_retrieval_available
                     )
                     try:
-                        (
-                            request_messages,
-                            request_sanitize_result,
-                        ) = await self._provider_request_messages_with_sanitize_async(
-                            request_turn_messages,
-                            request_context_message=request_context_message,
-                            request_context_insert_index=(
-                                active_request_context_insert_index
-                            ),
-                            runtime_context_message=runtime_context_message,
-                            runtime_context_insert_index=(
-                                active_runtime_context_insert_index
-                            ),
-                            turn_objective_message=turn_objective_message,
-                        )
+                        if (
+                            document_mutation_finalization_pending
+                            and not goal_terminal_final_response_pending
+                        ):
+                            # Outcome-only request view: never replay this turn's
+                            # source pages, grants, runtime paths, or tool pairs into
+                            # the final response call.
+                            request_messages, request_sanitize_result = (
+                                sanitize_session_messages(
+                                    _document_mutation_finalization_request()
+                                )
+                            )
+                        else:
+                            (
+                                request_messages,
+                                request_sanitize_result,
+                            ) = await self._provider_request_messages_with_sanitize_async(
+                                request_turn_messages,
+                                request_context_message=request_context_message,
+                                request_context_insert_index=active_request_context_insert_index,
+                                runtime_context_message=runtime_context_message,
+                                runtime_context_insert_index=active_runtime_context_insert_index,
+                                turn_objective_message=turn_objective_message,
+                            )
                     except Exception as exc:
                         if not goal_terminal_final_response_pending:
                             raise
@@ -8099,31 +8732,10 @@ class Agent:
                         self._provider_call_tool_result_retrieval_available = (
                             previous_call_retrieval
                         )
-                    local_terminal_reply = self._provider_local_terminal_reply(
-                        request_messages,
-                        chat_cfg,
-                    )
-                    if local_terminal_reply is not None:
-                        assistant_text_parts = [local_terminal_reply]
-                        attempt_user_visible_emitted = True
-                        _got_done_event = True
-                        provider_done_for_log = ProviderDoneEvent(
-                            stop_reason="end_turn",
-                            input_tokens=0,
-                            output_tokens=0,
-                            model=self.config.model_id or "",
-                        )
-                        self._write_turn_call_log(
-                            "provider_local_terminal_reply",
-                            reason=self.config.metadata.get("image_input_reason", ""),
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield TextDeltaEvent(text=local_terminal_reply)
-                        break
-                    validation_error = validate_provider_chat_request(
+                    validation_error = validate_provider_chat_admission(
                         self.provider,
                         request_messages,
+                        chat_cfg,
                     )
                     if validation_error is not None:
                         terminal_error = ErrorEvent(
@@ -8142,6 +8754,39 @@ class Agent:
                             terminal_error = None
                             yield TextDeltaEvent(text=response_text)
                         else:
+                            if terminal_error.code == IMAGE_INPUT_UNSUPPORTED_CODE:
+                                exact_image_count = count_provider_image_blocks(
+                                    request_messages
+                                )
+                                self.config.metadata["image_input_mode"] = "rejected"
+                                self.config.metadata.setdefault(
+                                    "image_input_reason",
+                                    "model_vision_unsupported",
+                                )
+                                self.config.metadata["image_input_count"] = (
+                                    exact_image_count
+                                )
+                                self.config.metadata.setdefault(
+                                    "image_input_stage",
+                                    "primary",
+                                )
+                                self._write_turn_call_log(
+                                    "image_input_preflight",
+                                    action="reject",
+                                    reason=str(
+                                        self.config.metadata.get("image_input_reason")
+                                        or "model_vision_unsupported"
+                                    ),
+                                    stage=str(
+                                        self.config.metadata.get("image_input_stage")
+                                        or "primary"
+                                    ),
+                                    image_count=int(
+                                        self.config.metadata.get("image_input_count") or 0
+                                    ),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
                             self._write_turn_call_log(
                                 "turn_policy_decision",
                                 action="stop",
@@ -8227,7 +8872,33 @@ class Agent:
                         sanitize=request_sanitize_result,
                     )
 
-                    terminal_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    reserved_document_finalizer = bool(
+                        document_mutation_finalization_pending
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    )
+                    # The reserved call is outside the ordinary call budget
+                    # only when document_apply first appeared in its last
+                    # available call. ``document_mutation_finalization_attempted``
+                    # closes this exception before provider I/O, so it cannot
+                    # admit a retry or a second summary.
+                    next_call_budget_error = _turn_llm_call_budget_error(
+                        turn_llm_calls + 1
+                    )
+                    terminal_error = (
+                        None if reserved_document_finalizer else next_call_budget_error
+                    )
+                    if reserved_document_finalizer and next_call_budget_error is not None:
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="document_outcome_finalize",
+                            reason="reserved_finalization_call",
+                            code="document_mutation_finalization_reserved",
+                            sent_llm_calls=turn_llm_calls,
+                            admitted_llm_call=turn_llm_calls + 1,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
                     if terminal_error is not None:
                         self._write_turn_call_log(
                             "turn_policy_decision",
@@ -8277,6 +8948,42 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
+                    if (
+                        self._artifact_mutation_turn_active()
+                        and document_mutation_attempted
+                    ):
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "max_tokens": max(
+                                    1,
+                                    min(
+                                        int(call_chat_cfg.max_tokens),
+                                        _DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS,
+                                    ),
+                                ),
+                            }
+                        )
+                    if document_mutation_finalization_pending:
+                        # The finalizer is an outcome-only presentation call,
+                        # not another planning step. Keep both its prompt and
+                        # output budget independent from the restricted tool
+                        # turn so no capability names or long reasoning stream
+                        # can leak into this one-shot request.
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "max_tokens": max(
+                                    1,
+                                    min(
+                                        int(call_chat_cfg.max_tokens),
+                                        _DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS,
+                                    ),
+                                ),
+                                "system": _DOCUMENT_MUTATION_FINALIZATION_SYSTEM,
+                                "thinking": False,
+                                "thinking_level": None,
+                                "tool_choice": None,
+                            }
+                        )
                     if goal_terminal_final_response_pending:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={"tool_choice": None}
@@ -8422,6 +9129,32 @@ class Agent:
                         call_id=call_id,
                         tools_supported=tools_supported_for_call,
                     )
+                    if document_mutation_finalization_pending:
+                        document_mutation_finalization_attempted = True
+                    ensemble_request_count_baseline: int | None = None
+                    if ensemble_continuation_provider is self.provider:
+                        ensemble_request_count_baseline = (
+                            ensemble_continuation_request_count
+                        )
+                    ensemble_continuation_request_count = None
+                    ensemble_continuation_provider = None
+                    if (
+                        ensemble_request_count_baseline is None
+                        and self._execution_context is not None
+                        and getattr(
+                            self.provider, "execution_context_aware", False
+                        )
+                    ):
+                        continuation_snapshot = (
+                            self._execution_context.ensemble_continuation_snapshot
+                        )
+                        if (
+                            continuation_snapshot is not None
+                            and continuation_snapshot.request_started
+                        ):
+                            ensemble_request_count_baseline = (
+                                continuation_snapshot.physical_request_count
+                            )
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -8518,12 +9251,14 @@ class Agent:
                                 )
                         except (asyncio.CancelledError, UsageAccountingUnavailableError):
                             raise
-                        except Exception:  # noqa: BLE001 - provider boundary
+                        except Exception as exc:  # noqa: BLE001 - provider boundary
                             # Never retain upstream prose on the exception that
                             # crosses into the agent loop.  The original
                             # exception is deliberately not chained because SDK
                             # messages may contain response bodies or secrets.
-                            raise _RaisedProviderBoundaryError from None
+                            raise _RaisedProviderBoundaryError(
+                                timeout=isinstance(exc, TimeoutError)
+                            ) from None
                         raw_stream = guard_provider_text_stream(raw_stream)
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event
@@ -8532,19 +9267,40 @@ class Agent:
                             else None
                         )
 
-                        def _pending_install_stream_deadline() -> float | None:
+                        def _active_stream_deadline() -> float | None:
                             pending_event = self._pending_durable_compaction_event
-                            return (
+                            pending_deadline = (
                                 pending_event.compaction_deadline_at_monotonic
                                 if pending_event is not None
                                 else None
                             )
+                            mutation_deadline = (
+                                document_mutation_summary_deadline
+                                if document_mutation_attempted
+                                and not document_mutation_finalization_pending
+                                and not document_mutation_finalization_attempted
+                                else None
+                            )
+                            deadlines = [
+                                deadline
+                                for deadline in (pending_deadline, mutation_deadline)
+                                if deadline is not None
+                            ]
+                            return min(deadlines) if deadlines else None
 
+                        provider_stream_deadline = _total_deadline
+                        if (
+                            document_mutation_summary_deadline is not None
+                            and document_mutation_attempted
+                            and not document_mutation_finalization_pending
+                            and not document_mutation_finalization_attempted
+                        ):
+                            provider_stream_deadline = document_mutation_summary_deadline
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
-                            total_deadline=_total_deadline,
-                            deadline_provider=_pending_install_stream_deadline,
+                            total_deadline=provider_stream_deadline,
+                            deadline_provider=_active_stream_deadline,
                         ):
                             if isinstance(raw_ev, ProviderGenerationResetEvent):
                                 if (
@@ -8704,12 +9460,11 @@ class Agent:
                                         last_actual_provider = last_item.provider
                                         last_actual_model = last_item.model
                                     if isinstance(raw_ev.ensemble_trace, dict):
-                                        last_ensemble_trace = dict(raw_ev.ensemble_trace)
-                                        turn_ensemble_request_count += _usage_int(
-                                            raw_ev.ensemble_trace.get(
-                                                "llm_request_count"
+                                        ensemble_request_count_baseline = (
+                                            _merge_ensemble_request_count(
+                                                raw_ev.ensemble_trace,
+                                                ensemble_request_count_baseline,
                                             )
-                                            or 0
                                         )
                                     provider_error_for_log = ProviderErrorEvent(
                                         message=(
@@ -8840,14 +9595,27 @@ class Agent:
                                 )
 
                             elif isinstance(raw_ev, ProviderTextDelta):
+                                if raw_ev.text and not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if raw_ev.text:
                                     reasoning_end = _finish_reasoning_block("completed")
                                     if reasoning_end is not None:
                                         yield reasoning_end
                                 assistant_text_parts.append(raw_ev.text)
-                                if raw_ev.text:
+                                buffer_document_finalizer = bool(
+                                    document_mutation_finalization_pending
+                                    and document_mutation_finalization_attempted
+                                )
+                                if raw_ev.text and not buffer_document_finalizer:
                                     attempt_user_visible_emitted = True
                                     attempt_irreversible_output_emitted = True
+                                if buffer_document_finalizer:
+                                    # A mutation finalizer is an untrusted presentation
+                                    # call. Hold its complete response behind the runtime
+                                    # boundary; only the authoritative localized outcome
+                                    # below may reach clients or transcript history.
+                                    continue
                                 if text_presentation_decided:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
@@ -8855,6 +9623,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="intermediate",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
                                 else:
                                     # No tool has appeared yet. Stream the text live,
@@ -8871,6 +9641,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="answer",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
@@ -8880,6 +9652,9 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if not raw_ev.text:
                                     continue
+                                if not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if not reasoning_block_id:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
                                     active_reasoning_block_index = reasoning_block_index
@@ -8927,6 +9702,8 @@ class Agent:
                                     block_id=reasoning_block_id,
                                     block_index=active_reasoning_block_index,
                                     generation_epoch=generation_epoch,
+                                    model_call_id=call_id,
+                                    iteration=iterations,
                                 )
                                 if (
                                     wrapup_margin_seconds > 0
@@ -9137,6 +9914,7 @@ class Agent:
                                         or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
+                                        or document_mutation_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
@@ -9161,6 +9939,32 @@ class Agent:
                                     pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
+                                writer_reservation = (
+                                    await self._reserve_artifact_writer_intent(
+                                        tool_use_id=raw_ev.tool_use_id,
+                                        tool_name=raw_ev.tool_name,
+                                    )
+                                )
+                                if writer_reservation is not None:
+                                    document_mutation_attempted = True
+                                    document_mutation_summary_deadline = (
+                                        document_mutation_summary_deadline_candidate
+                                    )
+                                    if writer_reservation == "rejected":
+                                        if guarded_writer_ids:
+                                            # Keep consuming the response so the
+                                            # complete same-response writer batch
+                                            # can be rejected before dispatch.
+                                            guarded_writer_stream_failure = (
+                                                "parallel_document_writers"
+                                            )
+                                        else:
+                                            guarded_writer_stream_failure = (
+                                                "writer_intent_rejected"
+                                            )
+                                    else:
+                                        guarded_writer_intent_id = raw_ev.tool_use_id
+                                    guarded_writer_ids.append(raw_ev.tool_use_id)
                                 seen_tool_use_ids.add(raw_ev.tool_use_id)
                                 # A tool follows, so any further text this call is
                                 # intermediate narration between tools, not the answer.
@@ -9262,6 +10066,7 @@ class Agent:
                                         or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
+                                        or document_mutation_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
@@ -9596,10 +10401,17 @@ class Agent:
                                         )
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
-                                    last_ensemble_trace = dict(ensemble_trace)
-                                    turn_ensemble_request_count += _usage_int(
-                                        ensemble_trace.get("llm_request_count") or 0
+                                    ensemble_request_count_baseline = (
+                                        _merge_ensemble_request_count(
+                                            ensemble_trace,
+                                            ensemble_request_count_baseline,
+                                        )
                                     )
+                                    if tool_calls:
+                                        ensemble_continuation_request_count = (
+                                            ensemble_request_count_baseline
+                                        )
+                                        ensemble_continuation_provider = self.provider
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
@@ -9786,6 +10598,49 @@ class Agent:
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
+                        if document_mutation_finalization_pending:
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
+                        if (
+                            self._artifact_mutation_turn_active()
+                            and document_mutation_attempted
+                            and not document_mutation_finalization_attempted
+                        ):
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out",
+                            )
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": "not_attempted",
+                                "phase": "proposal",
+                                "retryPolicy": "new_turn",
+                                "code": "document_mutation_iteration_timeout",
+                            }
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document turn timed out before a commit. Do not call "
+                                    "tools. Summarize only the authoritative mutation outcome."
+                                ),
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            break
                         yield self._transition(AgentState.ERROR)
                         terminal_error = ErrorEvent(
                             message=(
@@ -9798,6 +10653,10 @@ class Agent:
                         break
                     except asyncio.CancelledError:
                         usage_unknown_reason = "cancelled"
+                        await self._fail_artifact_writer_intent(
+                            guarded_writer_intent_id,
+                            failure_code="writer_stream_cancelled",
+                        )
                         raise
                     except TimeoutError as exc:
                         reasoning_end = _finish_reasoning_block("error")
@@ -9841,10 +10700,122 @@ class Agent:
                             )
                             yield terminal_error
                             break
+                        mutation_summary_timeout = (
+                            document_mutation_summary_deadline is not None
+                            and document_mutation_attempted
+                            and enforced_stream_deadline
+                            == document_mutation_summary_deadline
+                            and not document_mutation_finalization_pending
+                            and not document_mutation_finalization_attempted
+                        )
+                        if mutation_summary_timeout:
+                            usage_unknown_reason = "document_mutation_summary_reserve"
+                            _notify_call_outcome(
+                                ok=False,
+                                failure_kind="document_mutation_summary_reserve",
+                            )
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out",
+                            )
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": "document_mutation_time_budget_exhausted",
+                            }
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document turn time budget is closing. Do not call "
+                                    "tools. Summarize only the authoritative mutation outcome."
+                                ),
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            break
+                        if (
+                            enforced_stream_deadline is None
+                            and self._artifact_mutation_turn_active()
+                            and document_mutation_attempted
+                        ):
+                            # Provider adapters may surface their own socket/read
+                            # timeout as a bare TimeoutError.  Only timeouts minted
+                            # by _stream_provider_events_with_deadline carry the
+                            # absolute-deadline marker above; an unmarked timeout
+                            # is a provider failure, not proof that the turn's
+                            # global time budget expired.
+                            usage_unknown_reason = "provider_timeout"
+                            _notify_call_outcome(ok=False, failure_kind="provider_timeout")
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out",
+                            )
+                            if document_mutation_finalization_pending:
+                                response_text = _document_mutation_fallback_text()
+                                assistant_text_parts[:] = [response_text]
+                                provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                                _got_done_event = True
+                                _got_error = False
+                                document_mutation_finalization_pending = False
+                                yield TextDeltaEvent(text=response_text)
+                                yield WarningEvent(
+                                    code="document_mutation_finalization_degraded",
+                                    message=(
+                                        "The document outcome was preserved, but its generated "
+                                        "summary used a deterministic localized fallback."
+                                    ),
+                                )
+                                break
+                            if not document_mutation_finalization_attempted:
+                                prior_outcome = dict(document_mutation_outcome or {})
+                                document_mutation_outcome = {
+                                    "version": 1,
+                                    "status": str(
+                                        prior_outcome.get("status") or "not_attempted"
+                                    ),
+                                    "phase": str(
+                                        prior_outcome.get("phase") or "proposal"
+                                    ),
+                                    "retryPolicy": "new_turn",
+                                    "code": "document_mutation_provider_timeout",
+                                }
+                                for detail_key in ("corrected", "proposalAttempts"):
+                                    if detail_key in prior_outcome:
+                                        document_mutation_outcome[detail_key] = prior_outcome[
+                                            detail_key
+                                        ]
+                                document_mutation_finalization_pending = True
+                                document_mutation_finalization_message = Message(
+                                    role="user",
+                                    content=(
+                                        "The document provider timed out. Do not call tools. "
+                                        "Summarize only the authoritative mutation outcome."
+                                    ),
+                                )
+                                final_text_parts.clear()
+                                applied_model_call_boundaries.clear()
+                                yield WarningEvent(
+                                    code="document_mutation_provider_timeout",
+                                    message=(
+                                        "The provider timed out before the document turn "
+                                        "completed; the authoritative outcome was preserved."
+                                    ),
+                                )
+                                break
                         # Total-deadline timeout raised by the stream wrapper:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
                         _notify_call_outcome(ok=False, failure_kind="total_timeout")
+                        await self._fail_artifact_writer_intent(
+                            guarded_writer_intent_id,
+                            failure_code="writer_stream_timed_out",
+                        )
                         if goal_terminal_final_response_pending:
                             response_text = _goal_terminal_final_response_text()
                             assistant_text_parts.append(response_text)
@@ -9901,7 +10872,7 @@ class Agent:
                             )
                         )
                         raise
-                    except _RaisedProviderBoundaryError:
+                    except _RaisedProviderBoundaryError as exc:
                         # Some SDKs raise from call creation or async iteration
                         # instead of yielding a ProviderErrorEvent.  Only those
                         # two provider-boundary operations are wrapped in this
@@ -9930,6 +10901,73 @@ class Agent:
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
+                        if document_mutation_finalization_pending:
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
+                        if (
+                            self._artifact_mutation_turn_active()
+                            and document_mutation_attempted
+                            and not document_mutation_finalization_attempted
+                        ):
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out"
+                                if exc.timeout
+                                else "writer_stream_failed",
+                            )
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            outcome_code = (
+                                "document_mutation_provider_timeout"
+                                if exc.timeout
+                                else "document_mutation_provider_exception"
+                            )
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": outcome_code,
+                            }
+                            for detail_key in ("corrected", "proposalAttempts"):
+                                if detail_key in prior_outcome:
+                                    document_mutation_outcome[detail_key] = prior_outcome[
+                                        detail_key
+                                    ]
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document provider timed out. Do not call tools. "
+                                    if exc.timeout
+                                    else "The document provider stopped unexpectedly. "
+                                )
+                                + "Summarize only the authoritative mutation outcome.",
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            yield WarningEvent(
+                                code=outcome_code,
+                                message=(
+                                    "The provider failed before the document turn completed; "
+                                    "the authoritative outcome was preserved."
+                                ),
+                            )
+                            break
                         provider_error = ProviderErrorEvent(
                             message=(
                                 "The connection to the model provider ended before "
@@ -9954,6 +10992,17 @@ class Agent:
                                 usage_call,
                                 usage_unknown_reason,
                             )
+                        if (
+                            reasoning_only_act_now_for_call is not None
+                            and not bool(
+                                getattr(
+                                    self.config,
+                                    "reasoning_only_act_now",
+                                    False,
+                                )
+                            )
+                        ):
+                            reasoning_only_act_now_message = None
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     _notify_call_outcome(
@@ -10066,6 +11115,40 @@ class Agent:
                         if goal_terminal_final_response_pending
                         else _turn_budget_error()
                     )
+                    if (
+                        terminal_error is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        # The provider has already started document_apply, but
+                        # its complete ToolCall has not crossed dispatch yet.
+                        # Defer token/cost enforcement through that dispatch so
+                        # the authoritative tool outcome can be finalized. The
+                        # post-tool gate below closes the tool loop and admits
+                        # only the reserved tools-disabled summary.
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="defer_budget_to_document_outcome",
+                            reason=terminal_error.message,
+                            code=terminal_error.code,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
+                        terminal_error = None
+                    if (
+                        terminal_error is not None
+                        and document_mutation_finalization_pending
+                        and document_mutation_finalization_attempted
+                    ):
+                        # The final tools-disabled call was admitted from the
+                        # reserved global slot. A token/cost observation made
+                        # after that call cannot discard its authoritative
+                        # summary; report the overage as degraded telemetry.
+                        yield WarningEvent(
+                            code="document_mutation_finalization_budget_exhausted",
+                            message=terminal_error.message,
+                        )
+                        terminal_error = None
                     if terminal_error is not None:
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
@@ -10124,9 +11207,9 @@ class Agent:
                                 and request_turn_messages[-1] is deadline_wrapup_message
                             )
                             or (
-                                reasoning_only_act_now_message is not None
+                                reasoning_only_act_now_for_call is not None
                                 and request_turn_messages[-1]
-                                is reasoning_only_act_now_message
+                                is reasoning_only_act_now_for_call
                             )
                         )
                     ):
@@ -10178,6 +11261,58 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
+                    guarded_writer_completed = bool(
+                        guarded_writer_intent_id
+                        and any(
+                            tool_call.tool_use_id == guarded_writer_intent_id
+                            and tool_call.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
+                            for tool_call in tool_calls
+                        )
+                    )
+                    if (
+                        guarded_writer_stream_failure != "parallel_document_writers"
+                        and guarded_writer_stream_failure is not None
+                    ) or (
+                        guarded_writer_intent_id is not None
+                        and (
+                            _got_error
+                            or not _got_done_event
+                            or not guarded_writer_completed
+                            or attempt_classification.kind is not _ProviderAttemptKind.OK
+                        )
+                    ):
+                        await self._fail_artifact_writer_intent(
+                            guarded_writer_intent_id,
+                            failure_code=(
+                                guarded_writer_stream_failure
+                                or "writer_arguments_incomplete"
+                            ),
+                        )
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": "not_attempted",
+                            "phase": "proposal",
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_proposal_incomplete",
+                        }
+                        document_mutation_finalization_pending = True
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document mutation proposal was incomplete. "
+                                "Do not call tools. Summarize the authoritative outcome."
+                            ),
+                        )
+                        final_text_parts.clear()
+                        applied_model_call_boundaries.clear()
+                        yield WarningEvent(
+                            message=(
+                                "The provider stream ended before a complete document "
+                                "mutation proposal was available."
+                            ),
+                            code="document_mutation_proposal_incomplete",
+                        )
+                        break
                     if (
                         attempt_classification.kind != _ProviderAttemptKind.OK
                         # An engine-chosen preempt truncated the stream; the
@@ -10220,11 +11355,37 @@ class Agent:
                                 code=attempt_classification.kind.value,
                             )
                             break
+                        if (
+                            document_mutation_finalization_pending
+                            and document_mutation_finalization_attempted
+                        ):
+                            # Outcome finalization is deliberately one-shot.  An
+                            # empty, truncated, reasoning-only, or otherwise
+                            # invalid finalizer response must not enter the generic
+                            # provider retry/fallback machinery and create a third
+                            # model call.
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             classification=attempt_classification.kind.value,
                             iteration=iterations,
                             call_attempt=_call_attempt,
@@ -10237,7 +11398,6 @@ class Agent:
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
-
                         large_context_invalid = _is_large_context_invalid_response(
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
@@ -10457,10 +11617,15 @@ class Agent:
                             if (
                                 not _invalid_response_fallback_done
                                 and self._switch_to_invalid_response_fallback(
-                                    attempt_classification.kind.value
+                                    attempt_classification.kind.value,
+                                    requires_vision=(
+                                        self._count_image_blocks(request_messages) > 0
+                                    ),
+                                    requires_tools=bool(provider_tools_for_call),
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                reasoning_only_act_now_message = None
                                 fallback_reason = _provider_activity_reason_for_attempt(
                                     attempt_classification.kind
                                 )
@@ -10485,17 +11650,33 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                                and (
-                                    thinking_enabled
-                                    or (attempt_classification.stop_reason or "").lower()
-                                    == "length"
-                                )
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
+                                if (
+                                    (
+                                        not thinking_enabled
+                                        or bool(
+                                            getattr(
+                                                self.config,
+                                                "reasoning_only_act_now",
+                                                False,
+                                            )
+                                        )
+                                    )
+                                    and reasoning_only_act_now_message is None
+                                ):
+                                    reasoning_only_act_now_message = (
+                                        self._new_reasoning_only_act_now_message(
+                                            iteration=iterations,
+                                            attempt=_call_attempt,
+                                            reasoning_content=iter_reasoning_content,
+                                            provider_default_reasoning=not thinking_enabled,
+                                        )
+                                    )
                                 disable_thinking = (
                                     (attempt_classification.stop_reason or "").lower()
                                     == "length"
@@ -10514,7 +11695,9 @@ class Agent:
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
                                     model=last_actual_model or self.config.model_id or "",
-                                    provider=type(self.provider).__name__,
+                                    provider=self._provider_log_identity(
+                                        last_actual_provider
+                                    ),
                                     classification=attempt_classification.kind.value,
                                     iteration=iterations,
                                     call_attempt=_call_attempt,
@@ -10529,19 +11712,60 @@ class Agent:
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
                                     thinking_disabled=disable_thinking,
-                                )
-                                yield WarningEvent(
-                                    code="provider_large_context_visible_retry",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content for a large input; "
-                                        + (
-                                            "retrying once with thinking disabled."
-                                            if disable_thinking
-                                            else "retrying once to request visible content."
-                                        )
+                                    configured_max_tokens=max(
+                                        0,
+                                        int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
                                     ),
                                 )
+                                reasoning_output_budget_exhausted = (
+                                    attempt_classification.stop_reason or ""
+                                ).lower() == "length"
+                                if reasoning_output_budget_exhausted:
+                                    self._log_reasoning_output_budget_exhausted(
+                                        model=(
+                                            last_actual_model
+                                            or self.config.model_id
+                                            or ""
+                                        ),
+                                        observed_provider=last_actual_provider,
+                                        configured_max_tokens=max(
+                                            0,
+                                            int(
+                                                getattr(
+                                                    call_chat_cfg,
+                                                    "max_tokens",
+                                                    0,
+                                                )
+                                                or 0
+                                            ),
+                                        ),
+                                        output_tokens=iter_output_tokens,
+                                        reasoning_tokens=iter_reasoning_tokens,
+                                        reasoning_content=iter_reasoning_content,
+                                    )
+                                    yield WarningEvent(
+                                        code="provider_reasoning_only_retry",
+                                        message=(
+                                            "The provider used the configured output budget "
+                                            "for reasoning without returning visible content; "
+                                            "retrying once without changing max_tokens."
+                                        ),
+                                    )
+                                else:
+                                    yield WarningEvent(
+                                        code="provider_large_context_visible_retry",
+                                        message=(
+                                            "The provider returned reasoning without visible "
+                                            "content for a large input; "
+                                            + (
+                                                "retrying once with thinking disabled."
+                                                if disable_thinking
+                                                else (
+                                                    "retrying once to request visible content."
+                                                )
+                                            )
+                                        ),
+                                    )
                                 next_provider_activity_reason = "reasoning_only"
                                 yield ProviderActivityEvent(
                                     activity_id=provider_activity_id,
@@ -10559,21 +11783,38 @@ class Agent:
                                 continue
 
                             yield self._transition(AgentState.ERROR)
-                            if self.config.metadata.get("had_attachments"):
+                            if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                                if (attempt_classification.stop_reason or "").lower() == "length":
+                                    large_context_message = (
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning a visible answer. Increase "
+                                        "llm.max_tokens or choose another model or provider."
+                                    )
+                                else:
+                                    large_context_message = (
+                                        "The provider returned reasoning without a visible "
+                                        "answer. Try again or choose another model or provider."
+                                    )
+                            elif self.config.metadata.get("had_attachments"):
                                 recovery_guidance = (
                                     "Split, summarize, or shorten the attached material, "
                                     "or use a stronger model."
+                                )
+                                large_context_message = (
+                                    "Provider returned no visible response for a large input. "
+                                    + recovery_guidance
                                 )
                             else:
                                 recovery_guidance = (
                                     "Send the material as an attachment, summarize or "
                                     "shorten the prompt, or use a stronger model."
                                 )
-                            terminal_error = ErrorEvent(
-                                message=(
+                                large_context_message = (
                                     "Provider returned no visible response for a large input. "
                                     + recovery_guidance
-                                ),
+                                )
+                            terminal_error = ErrorEvent(
+                                message=large_context_message,
                                 code="empty_response",
                             )
                             yield terminal_error
@@ -10581,7 +11822,6 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                            and thinking_enabled
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.REASONING_ONLY,
                                 _attempt_retries_used,
@@ -10589,44 +11829,51 @@ class Agent:
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                             if (
-                                bool(
-                                    getattr(
-                                        self.config, "reasoning_only_act_now", False
+                                (
+                                    not thinking_enabled
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_act_now",
+                                            False,
+                                        )
                                     )
                                 )
                                 and reasoning_only_act_now_message is None
                             ):
-                                # Today's bare retry re-sends the identical
-                                # request; the model that just answered it with
-                                # reasoning only usually does so again. Splice
-                                # in an explicit act-now instruction so the
-                                # retry differs where it matters.
-                                reasoning_only_act_now_message = Message(
-                                    role="user",
-                                    content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+                                reasoning_only_act_now_message = (
+                                    self._new_reasoning_only_act_now_message(
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                        reasoning_content=iter_reasoning_content,
+                                        provider_default_reasoning=not thinking_enabled,
+                                    )
                                 )
-                                append_runtime_event(
-                                    self.config.runtime_events_path,
-                                    {
-                                        "feature": "reasoning_only_act_now",
-                                        "name": "reasoning_only_act_now.injected",
-                                        "action": "retry_with_act_now_directive",
-                                        "reason": "provider_reasoning_only",
-                                        "iteration": iterations,
-                                        "attempt": _call_attempt,
-                                        "reasoning_chars": len(
-                                            iter_reasoning_content or ""
-                                        ),
-                                        "session_key": self._session_key,
-                                        "agent_id": (
-                                            self.config.tool_result_store_agent_id
-                                            or self.config.metadata.get("agent_id")
-                                        ),
-                                    },
+                            disable_thinking = bool(
+                                thinking_enabled
+                                and getattr(
+                                    self.config,
+                                    "reasoning_only_thinking_fallback",
+                                    False,
                                 )
-                            if getattr(
-                                self.config, "reasoning_only_thinking_fallback", False
-                            ):
+                            )
+                            reasoning_output_budget_exhausted = (
+                                attempt_classification.stop_reason or ""
+                            ).lower() == "length"
+                            if reasoning_output_budget_exhausted:
+                                configured_max_tokens = max(
+                                    0,
+                                    int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                                )
+                                self._log_reasoning_output_budget_exhausted(
+                                    model=last_actual_model or self.config.model_id or "",
+                                    observed_provider=last_actual_provider,
+                                    configured_max_tokens=configured_max_tokens,
+                                    output_tokens=iter_output_tokens,
+                                    reasoning_tokens=iter_reasoning_tokens,
+                                    reasoning_content=iter_reasoning_content,
+                                )
+                            if disable_thinking:
                                 _thinking_fallback_done = True
                                 _disable_thinking_for_next_provider_call = True
                                 yield WarningEvent(
@@ -10634,6 +11881,15 @@ class Agent:
                                     message=(
                                         "The provider returned reasoning without visible "
                                         "content; retrying once with thinking disabled."
+                                    ),
+                                )
+                            elif reasoning_output_budget_exhausted:
+                                yield WarningEvent(
+                                    code="provider_reasoning_only_retry",
+                                    message=(
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning visible content; retrying "
+                                        "once without changing max_tokens."
                                     ),
                                 )
                             else:
@@ -10811,10 +12067,15 @@ class Agent:
                             }
                             and not _invalid_response_fallback_done
                             and self._switch_to_invalid_response_fallback(
-                                attempt_classification.kind.value
+                                attempt_classification.kind.value,
+                                requires_vision=(
+                                    self._count_image_blocks(request_messages) > 0
+                                ),
+                                requires_tools=bool(provider_tools_for_call),
                             )
                         ):
                             _invalid_response_fallback_done = True
+                            reasoning_only_act_now_message = None
                             fallback_reason = _provider_activity_reason_for_attempt(
                                 attempt_classification.kind
                             )
@@ -10887,7 +12148,7 @@ class Agent:
                             "provider.empty_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             iteration=iterations,
                             retry_attempt=_call_attempt,
                             post_tool_turn=post_tool_turn,
@@ -10897,6 +12158,10 @@ class Agent:
                             iter_output_tokens=iter_output_tokens,
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
+                            configured_max_tokens=max(
+                                0,
+                                int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                            ),
                         )
                         self._record_tool_loop_runtime_event(
                             reason="provider_empty_response_terminal",
@@ -10912,8 +12177,22 @@ class Agent:
                             reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
+                        if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                            if (attempt_classification.stop_reason or "").lower() == "length":
+                                terminal_message = (
+                                    "The provider used the configured output budget for "
+                                    "reasoning without returning a visible answer. Increase "
+                                    "llm.max_tokens or choose another model or provider."
+                                )
+                            else:
+                                terminal_message = (
+                                    "The provider returned reasoning without a visible answer. "
+                                    "Try again or choose another model or provider."
+                                )
+                        else:
+                            terminal_message = "Provider returned an empty response"
                         terminal_error = ErrorEvent(
-                            message="Provider returned an empty response",
+                            message=terminal_message,
                             code="empty_response",
                         )
                         yield terminal_error
@@ -11159,6 +12438,25 @@ class Agent:
                                     provider_error.code,
                                 ),
                                 code=safe_provider_error_code,
+                            )
+                            break
+                        if document_mutation_finalization_pending:
+                            # Preserve the authoritative side-effect fact when
+                            # the one reserved summary call fails. The fallback
+                            # is localized presentation, not a mutation verdict.
+                            response_text = _document_mutation_fallback_text()
+                            assistant_text_parts[:] = [response_text]
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            document_mutation_finalization_pending = False
+                            yield TextDeltaEvent(text=response_text)
+                            yield WarningEvent(
+                                code="document_mutation_finalization_degraded",
+                                message=(
+                                    "The document outcome was preserved, but its generated "
+                                    "summary used a deterministic localized fallback."
+                                ),
                             )
                             break
                         if max_iterations_finalization_pending:
@@ -12125,6 +13423,22 @@ class Agent:
                             provider_error.code != "provider_retry_after_deadline"
                             and _fallback.should_retry(kind, _retry_attempt)
                         )
+                        if (
+                            should_retry
+                            and self._artifact_mutation_turn_active()
+                            and document_mutation_attempted
+                        ):
+                            # Restricted document turns reserve exactly one provider call
+                            # after a terminal outcome for the tools-disabled summary. A
+                            # generic provider retry here would consume that boundary and
+                            # produce an extra tool-enabled request before finalization.
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="document_mutation_finalization_reserved",
+                                kind=kind.value,
+                                provider=getattr(self.provider, "provider_name", ""),
+                            )
+                            should_retry = False
                         retry_failed_call_safe = (
                             getattr(
                                 self.provider,
@@ -12142,19 +13456,62 @@ class Agent:
                             )
                             should_retry = False
                         if not should_retry:
-                            yield self._transition(AgentState.ERROR)
-                            terminal_error = ErrorEvent(
-                                message=_safe_provider_terminal_message(
-                                    failure_kind,
-                                    provider_error.code,
-                                ),
-                                code=safe_provider_failure_code(
-                                    provider_error.code,
-                                    failure_kind.value,
-                                ),
-                                failure_kind=failure_kind.value,
-                            )
-                            yield terminal_error
+                            if (
+                                self._artifact_mutation_turn_active()
+                                and document_mutation_attempted
+                                and not document_mutation_finalization_attempted
+                            ):
+                                if (
+                                    document_mutation_outcome is None
+                                    or document_mutation_outcome.get("retryPolicy") == "same_turn"
+                                ):
+                                    prior_outcome = dict(document_mutation_outcome or {})
+                                    document_mutation_outcome = {
+                                        "version": 1,
+                                        "status": str(
+                                            prior_outcome.get("status") or "not_attempted"
+                                        ),
+                                        "phase": str(prior_outcome.get("phase") or "proposal"),
+                                        "retryPolicy": "new_turn",
+                                        "code": "document_mutation_provider_failed",
+                                    }
+                                    for detail_key in ("corrected", "proposalAttempts"):
+                                        if detail_key in prior_outcome:
+                                            document_mutation_outcome[detail_key] = prior_outcome[
+                                                detail_key
+                                            ]
+                                document_mutation_finalization_pending = True
+                                document_mutation_finalization_message = Message(
+                                    role="user",
+                                    content=(
+                                        "The document turn could not continue. Do not call "
+                                        "tools. Summarize only the authoritative mutation "
+                                        "outcome."
+                                    ),
+                                )
+                                final_text_parts.clear()
+                                applied_model_call_boundaries.clear()
+                                yield WarningEvent(
+                                    code="document_mutation_provider_failed",
+                                    message=(
+                                        "The provider failed before the document turn "
+                                        "completed; the no-change outcome was preserved."
+                                    ),
+                                )
+                            else:
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=_safe_provider_terminal_message(
+                                        failure_kind,
+                                        provider_error.code,
+                                    ),
+                                    code=safe_provider_failure_code(
+                                        provider_error.code,
+                                        failure_kind.value,
+                                    ),
+                                    failure_kind=failure_kind.value,
+                                )
+                                yield terminal_error
                             break
                         local_delay = backoff_sleep(
                             _retry_attempt,
@@ -12174,7 +13531,8 @@ class Agent:
                         )
                         if resolved_retry_delay is None or retry_exceeds_deadline:
                             if self._switch_to_invalid_response_fallback(
-                                failure_kind.value
+                                failure_kind.value,
+                                requires_tools=bool(provider_tools_for_call),
                             ):
                                 next_provider_activity_reason = reason
                                 yield ProviderActivityEvent(
@@ -12239,9 +13597,51 @@ class Agent:
                         _call_attempt += 1
 
                 if terminal_error is not None:
-                    break
+                    if (
+                        self._artifact_mutation_turn_active()
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": (
+                                str(document_mutation_outcome.get("status"))
+                                if document_mutation_outcome is not None
+                                else "not_attempted"
+                            ),
+                            "phase": (
+                                str(document_mutation_outcome.get("phase"))
+                                if document_mutation_outcome is not None
+                                else "proposal"
+                            ),
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_provider_terminal",
+                        }
+                        document_mutation_finalization_pending = True
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document turn stopped before completion. Do not call "
+                                "tools. Summarize only the authoritative mutation outcome."
+                            ),
+                        )
+                        final_text_parts.clear()
+                        applied_model_call_boundaries.clear()
+                        terminal_error = None
+                    else:
+                        break
                 if artifact_delivery_degraded_final_response:
                     break
+                if (
+                    document_mutation_finalization_pending
+                    and not document_mutation_finalization_attempted
+                    and not tool_calls
+                ):
+                    # A guarded writer stream ended before dispatch. Skip the
+                    # generic incomplete-response terminalizer and spend the
+                    # reserved next global call on the outcome-only summary.
+                    yield self._transition(AgentState.THINKING)
+                    continue
 
                 response_text = "".join(assistant_text_parts)
                 final_stop_reason = (
@@ -12367,6 +13767,30 @@ class Agent:
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = assembled_text
+                if (
+                    document_mutation_finalization_pending
+                    and document_mutation_finalization_attempted
+                ):
+                    from opensquilla.engine.silent_reply import normalize_silent_reply
+
+                    if normalize_silent_reply(
+                        assembled_text,
+                        run_kind="human",
+                    ).suppressed:
+                        yield WarningEvent(
+                            code="document_mutation_finalization_degraded",
+                            message=(
+                                "The document outcome was preserved, but its generated "
+                                "summary used a deterministic localized fallback."
+                            ),
+                        )
+                    visible_text = _document_mutation_fallback_text()
+                    assistant_text_parts[:] = [visible_text]
+                    yield TextDeltaEvent(
+                        text=visible_text,
+                        presentation="answer",
+                        generation_epoch=generation_epoch,
+                    )
                 if text_only_tool_recovery_pending:
                     text_only_mode = getattr(
                         self.config,
@@ -12415,10 +13839,137 @@ class Agent:
 
                 preflight_tool_results: dict[str, ToolResult] = {}
                 terminal_projection_preflight_error = False
+                writer_calls = [
+                    tc
+                    for tc in tool_calls
+                    if tc.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
+                ]
+                candidate_controller = getattr(
+                    self._tool_context,
+                    "artifact_candidate_loop_controller",
+                    None,
+                )
+                finish_calls = [
+                    tc for tc in tool_calls if tc.tool_name == "document_finish"
+                ]
+                browser_calls = [
+                    tc
+                    for tc in tool_calls
+                    if tc.tool_name.startswith("document_browser_")
+                ]
+                # A finish decision is a lifecycle boundary, never another
+                # sibling operation in the same provider response.  Reject
+                # the complete batch before any handler runs so a writer
+                # cannot stage a candidate while finish(discard/commit) is
+                # being evaluated against the pre-write state.
+                candidate_batch_conflict = bool(
+                    candidate_controller is not None
+                    and (
+                        len(finish_calls) > 1
+                        or (
+                            finish_calls
+                            and (writer_calls or browser_calls)
+                        )
+                        or (writer_calls and browser_calls)
+                    )
+                )
+                if candidate_controller is not None and (
+                    writer_calls or candidate_batch_conflict
+                ):
+                    # Preflight rejection happens before dispatch installs the
+                    # tool contextvar. Invalidate any prior browser receipt
+                    # here as well, so a blocked writer batch cannot be
+                    # followed by a commit using stale evidence.
+                    if self._tool_context is not None:
+                        setattr(self._tool_context, "_artifact_browser_verification_token", None)
+                        setattr(self._tool_context, "_artifact_browser_verification_sha256", None)
+                    invalidate = getattr(
+                        candidate_controller,
+                        "invalidate_verification",
+                        None,
+                    )
+                    if callable(invalidate):
+                        try:
+                            await invalidate(reason="writer_preflight")
+                        except Exception:  # noqa: BLE001 - stale candidate fails closed
+                            pass
+                rejected_writer_calls = writer_calls if len(writer_calls) > 1 else []
+                rejected_loop_calls = (
+                    [*writer_calls, *finish_calls, *browser_calls]
+                    if candidate_batch_conflict
+                    else rejected_writer_calls
+                )
+                seen_rejected_ids: set[str] = set()
+                for rejected_call in rejected_loop_calls:
+                    if rejected_call.tool_use_id in seen_rejected_ids:
+                        continue
+                    seen_rejected_ids.add(rejected_call.tool_use_id)
+                    rejection_reason: str = (
+                        "document_finish_must_be_alone"
+                        if finish_calls
+                        else "writer_and_browser_must_be_sequential"
+                        if writer_calls and browser_calls
+                        else "parallel_document_writers"
+                    )
+                    if rejected_call.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS:
+                        batch_result = ToolResult(
+                            tool_use_id=rejected_call.tool_use_id,
+                            tool_name=rejected_call.tool_name,
+                            content=json.dumps(
+                                {
+                                    "status": "error",
+                                    "reason": rejection_reason,
+                                    "retry_allowed": True,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "error",
+                                reason=rejection_reason,
+                            ),
+                        )
+                        preflight_tool_results[rejected_call.tool_use_id] = (
+                            await self._reject_artifact_writer_preflight(
+                                rejected_call,
+                                batch_result,
+                                failure_code=rejection_reason,
+                                force_finalize=(
+                                    not candidate_batch_conflict
+                                    and len(writer_calls) > 1
+                                ),
+                            )
+                        )
+                        continue
+                    preflight_tool_results[rejected_call.tool_use_id] = ToolResult(
+                        tool_use_id=rejected_call.tool_use_id,
+                        tool_name=rejected_call.tool_name,
+                        content=json.dumps(
+                            {
+                                "status": "error",
+                                "reason": rejection_reason,
+                                "retry_allowed": True,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        is_error=True,
+                        execution_status=runtime_execution_status(
+                            "error",
+                            reason=rejection_reason,
+                        ),
+                    )
                 resolved_tool_calls: list[ToolCall] = []
                 for tc in tool_calls:
+                    if tc.tool_use_id in preflight_tool_results:
+                        resolved_tool_calls.append(tc)
+                        continue
                     resolved = self._rehydrate_projected_tool_arguments(tc)
                     if isinstance(resolved, ToolResult):
+                        resolved = await self._reject_artifact_writer_preflight(
+                            tc,
+                            resolved,
+                            failure_code="writer_provider_context_arguments",
+                        )
                         preflight_tool_results[tc.tool_use_id] = resolved
                         if self._is_provider_context_projection_reuse_result(resolved):
                             terminal_projection_preflight_error = True
@@ -12612,6 +14163,64 @@ class Agent:
                         goal_terminal_final_response_pending = False
                         goal_terminal_final_status = None
                         break
+                    if (
+                        document_mutation_finalization_pending
+                        and document_mutation_finalization_attempted
+                    ):
+                        document_mutation_finalization_pending = False
+                        break
+                    if document_mutation_finalization_pending:
+                        yield self._transition(AgentState.THINKING)
+                        continue
+                    if document_mutation_finalization_attempted:
+                        break
+                    candidate_controller = getattr(
+                        self._tool_context,
+                        "artifact_candidate_loop_controller",
+                        None,
+                    )
+                    candidate_state = getattr(candidate_controller, "state", None)
+                    if (
+                        candidate_controller is not None
+                        and str(getattr(candidate_state, "status", ""))
+                        in {"candidate_staged", "verification_passed", "verification_failed"}
+                        and getattr(candidate_state, "candidate_sha256", None)
+                    ):
+                        # A natural-language stop cannot silently publish a
+                        # draft.  Keep the autonomous loop alive and let the
+                        # model choose another verification/repair action or
+                        # explicitly call document_finish(discard).  Global
+                        # deadline/cost/call guards remain authoritative.
+                        candidate_loop_nudges += 1
+                        if visible_text and final_text_parts:
+                            final_text_parts.pop()
+                        turn_messages.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "A document candidate is still staged and has not been "
+                                    "committed. Continue inspecting or repairing it, then "
+                                    "call document_finish(commit) only after fresh preview "
+                                    "verification, or call document_finish(discard). Do not "
+                                    "claim that the page is updated yet."
+                                ),
+                            )
+                        )
+                        self._write_turn_call_log(
+                            "document_candidate_loop_nudge",
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                            nudge_count=candidate_loop_nudges,
+                        )
+                        yield WarningEvent(
+                            code="document_candidate_requires_finish",
+                            message=(
+                                "A staged document candidate requires verification and an "
+                                "explicit commit or discard decision."
+                            ),
+                        )
+                        yield self._transition(AgentState.THINKING)
+                        continue
                     if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
                         # Keep the assistant output already emitted above, then
@@ -12832,10 +14441,14 @@ class Agent:
                         and not post_write_convergence_finalization_pending
                     ):
                         gate_status = await self._workspace_git_status_porcelain()
-                        gate_observation = finalize_evidence_tracker.build_observation(
-                            has_workspace_diff=bool(gate_status and gate_status.strip()),
+                        gate_observation = (
+                            finalize_evidence_tracker.build_observation(
+                                has_workspace_diff=bool(gate_status.strip()),
+                            )
+                            if gate_status is not None
+                            else None
                         )
-                        if gate_observation.should_challenge:
+                        if gate_observation is not None and gate_observation.should_challenge:
                             submit_review_red_detected = True
                             gate_key = finalize_evidence_gate_key(gate_observation)
                             # Never spend the run's last LLM call or deadline
@@ -13169,14 +14782,23 @@ class Agent:
                         ) is None and (
                             _total_deadline is None or _loop.time() < _total_deadline
                         )
-                        (
-                            implicit_file_index,
-                            implicit_diff_text,
-                        ) = await self._workspace_submit_review_capture()
-                        implicit_diff_empty = not (
-                            implicit_file_index.strip() or implicit_diff_text.strip()
-                        )
-                        if submit_review_should_fire_implicit(
+                        implicit_capture = await self._workspace_submit_review_capture()
+                        if implicit_capture is None:
+                            self._record_runtime_event(
+                                "submit_review.skipped",
+                                feature="submit_review",
+                                reason="git_observation_unavailable",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=False,
+                                git_state=self._submit_review_git_state.value,
+                            )
+                        else:
+                            implicit_file_index, implicit_diff_text = implicit_capture
+                            implicit_diff_empty = not (
+                                implicit_file_index.strip() or implicit_diff_text.strip()
+                            )
+                        if implicit_capture is not None and submit_review_should_fire_implicit(
                             submit_review_state,
                             enabled=submit_review_enabled,
                             diff_empty=implicit_diff_empty,
@@ -13312,7 +14934,7 @@ class Agent:
                     _get_tool_concurrency_policy,
                 )
 
-                tool_result_blocks: list[ContentBlockToolResult] = []
+                tool_result_blocks: list[Any] = []
                 executed_results: list[ToolResult] = []
                 turn_yielded = False
 
@@ -13320,6 +14942,8 @@ class Agent:
                 results_by_id: dict[str, ToolResult] = {}
                 executed_tool_calls_by_id: dict[str, ToolCall] = {}
                 path_patch_snapshots_by_id: dict[str, ToolCall] = {}
+                tool_effect_observations_by_id: dict[str, tuple[int, int, int]] = {}
+                tool_cancellation_grace_by_id: dict[str, float] = {}
 
                 def _cap_timeout_by_deadlines(timeout: float) -> float:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
@@ -13354,6 +14978,14 @@ class Agent:
                             arguments=execution_arguments,
                         )
                     executed_tool_calls_by_id[tc.tool_use_id] = execution_tc
+                    cancellation_policy = self._tool_cancellation_policy(execution_tc)
+                    tool_cancellation_grace_by_id.setdefault(
+                        tc.tool_use_id,
+                        STOP_CANCEL_GRACE_SECONDS,
+                    )
+                    tool_effect_observations_by_id[tc.tool_use_id] = (
+                        self._tool_effect_observation()
+                    )
                     tool_timeout = _cap_timeout_by_deadlines(
                         self._tool_execution_timeout(execution_tc)
                     )
@@ -13427,22 +15059,86 @@ class Agent:
                     elif preflight_result is not None:
                         res = preflight_result
                     else:
+                        execution_task: asyncio.Task[ToolResult] | None = None
+                        cancellation_started = False
                         try:
                             turn_irreversible_effect_started = True
-                            res = await asyncio.wait_for(
-                                self._execute_tool(execution_tc), timeout=tool_timeout
+                            execution_task = asyncio.create_task(
+                                self._execute_tool(execution_tc)
                             )
+                            done, _pending = await asyncio.wait(
+                                {execution_task},
+                                timeout=tool_timeout,
+                            )
+                            if done:
+                                res = execution_task.result()
+                            else:
+                                cancellation_started = True
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS,
+                                )
+                                settlement_note = ""
+                                if (
+                                    cancellation_policy == "must_settle"
+                                    and self._tool_effect_observation()
+                                    != tool_effect_observations_by_id[tc.tool_use_id]
+                                ):
+                                    settlement_note = (
+                                        " The filesystem operation exceeded its deadline, "
+                                        "but its effects settled and were recorded before "
+                                        "the turn ended."
+                                    )
+                                res = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=(
+                                        f"Tool '{tc.tool_name}' timed out after "
+                                        f"{tool_timeout}s.{settlement_note}"
+                                    ),
+                                    is_error=True,
+                                    execution_status=runtime_execution_status(
+                                        "timeout",
+                                        reason="runtime_timeout",
+                                        timed_out=True,
+                                    ),
+                                )
+                        except asyncio.CancelledError:
+                            if (
+                                execution_task is not None
+                                and not execution_task.done()
+                                and not cancellation_started
+                            ):
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=tool_cancellation_grace_by_id.get(
+                                        tc.tool_use_id,
+                                        STOP_CANCEL_GRACE_SECONDS,
+                                    ),
+                                )
+                            raise
                         except TimeoutError:
+                            # A TimeoutError raised by the tool itself remains a
+                            # runtime timeout, matching the historical boundary.
                             res = ToolResult(
                                 tool_use_id=tc.tool_use_id,
                                 tool_name=tc.tool_name,
-                                content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
+                                content=f"Tool '{tc.tool_name}' timed out after {tool_timeout}s",
                                 is_error=True,
                                 execution_status=runtime_execution_status(
                                     "timeout",
                                     reason="runtime_timeout",
                                     timed_out=True,
                                 ),
+                            )
+                            res = await self._reject_artifact_writer_preflight(
+                                tc,
+                                res,
+                                failure_code="writer_tool_timed_out",
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
                     self._record_focused_diagnostic_retrieval(execution_tc, res)
@@ -13517,6 +15213,7 @@ class Agent:
                     interval = self._tool_activity_heartbeat_interval()
                     started = time.monotonic()
                     last_event_at = started
+                    cleanup_grace_seconds = TIMEOUT_CANCEL_GRACE_SECONDS
                     try:
                         while pending:
                             remaining = max(0.0, tool_deadline - _loop.time())
@@ -13528,7 +15225,9 @@ class Agent:
                             if remaining <= 0:
                                 for task, tc in list(task_to_tool_call.items()):
                                     if task in pending:
-                                        task.cancel()
+                                        tool_cancellation_grace_by_id[tc.tool_use_id] = (
+                                            TIMEOUT_CANCEL_GRACE_SECONDS
+                                        )
                                         results_by_id[tc.tool_use_id] = ToolResult(
                                             tool_use_id=tc.tool_use_id,
                                             tool_name=tc.tool_name,
@@ -13556,7 +15255,9 @@ class Agent:
                                 ):
                                     for task, tc in list(task_to_tool_call.items()):
                                         if task in pending:
-                                            task.cancel()
+                                            tool_cancellation_grace_by_id[tc.tool_use_id] = (
+                                                TIMEOUT_CANCEL_GRACE_SECONDS
+                                            )
                                             results_by_id[tc.tool_use_id] = ToolResult(
                                                 tool_use_id=tc.tool_use_id,
                                                 tool_name=tc.tool_name,
@@ -13610,13 +15311,51 @@ class Agent:
                                         ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
+                    except (asyncio.CancelledError, GeneratorExit):
+                        cleanup_grace_seconds = STOP_CANCEL_GRACE_SECONDS
+                        raise
                     finally:
-                        for task in pending:
-                            if not task.done():
-                                task.cancel()
-                        for task in pending:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
+                        cleanup_tasks = {
+                            task: self._tool_cancellation_policy(
+                                task_to_tool_call[task]
+                            )
+                            for task in pending
+                        }
+                        try:
+                            await cancel_tasks(
+                                cleanup_tasks,
+                                operation="agent_tool_batch",
+                                grace_seconds=cleanup_grace_seconds,
+                            )
+                        finally:
+                            for task in pending:
+                                tc = task_to_tool_call[task]
+                                result = results_by_id.get(tc.tool_use_id)
+                                if (
+                                    result is None
+                                    or self._tool_cancellation_policy(tc)
+                                    != "must_settle"
+                                    or result.execution_status is None
+                                    or result.execution_status.get("status") != "timeout"
+                                ):
+                                    continue
+                                before = tool_effect_observations_by_id.get(
+                                    tc.tool_use_id
+                                )
+                                if (
+                                    before is not None
+                                    and self._tool_effect_observation() != before
+                                    and "effects settled" not in result.content
+                                ):
+                                    results_by_id[tc.tool_use_id] = replace(
+                                        result,
+                                        content=(
+                                            f"{result.content}. The filesystem operation "
+                                            "exceeded its deadline, but its effects "
+                                            "settled and were recorded before the turn "
+                                            "ended."
+                                        ),
+                                    )
 
                 # Dispatch preserving original order: accumulate consecutive
                 # concurrent/keyed tools into a batch and flush before each
@@ -13775,10 +15514,37 @@ class Agent:
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
-                        (
-                            submit_file_index,
-                            submit_diff_text,
-                        ) = await self._workspace_submit_review_capture()
+                        submit_capture = await self._workspace_submit_review_capture()
+                        if submit_capture is None:
+                            unavailable_payload = self._submit_review_git_unavailable_payload(
+                                self._submit_review_git_state
+                            )
+                            submit_result = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name="submit",
+                                content=json.dumps(unavailable_payload, ensure_ascii=False),
+                                is_error=True,
+                                execution_status=runtime_execution_status(
+                                    "error",
+                                    reason=str(unavailable_payload["code"]).lower(),
+                                ),
+                                terminates_turn=True,
+                            )
+                            results_by_id[tc.tool_use_id] = submit_result
+                            dispatch_boundary = submit_result
+                            self._record_runtime_event(
+                                "submit_review.explicit_unavailable",
+                                feature="submit_review",
+                                reason="git_observation_unavailable",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=False,
+                                git_state=self._submit_review_git_state.value,
+                                code=unavailable_payload["code"],
+                                terminates_turn=True,
+                            )
+                            continue
+                        submit_file_index, submit_diff_text = submit_capture
                         submit_diff_empty = not (
                             submit_file_index.strip() or submit_diff_text.strip()
                         )
@@ -13970,6 +15736,7 @@ class Agent:
                             is_error=projected_pending.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_pending.execution_status,
+                            effect_outcome=projected_pending.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
                         try:
@@ -14005,6 +15772,7 @@ class Agent:
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
+                            effect_outcome=projected_result.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
                         deferred_user_input_handled = True
@@ -14037,6 +15805,7 @@ class Agent:
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
                             approval_wait_started = _loop.time()
@@ -14121,6 +15890,7 @@ class Agent:
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
                                 # Only a deliberate human refusal is terminal. An
@@ -14151,6 +15921,7 @@ class Agent:
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
                                 replay_event = router_control_replay_event_from_payload(
@@ -14166,6 +15937,7 @@ class Agent:
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
+                            effect_outcome=projected_result.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
                         replay_event = router_control_replay_event_from_payload(
@@ -14176,8 +15948,80 @@ class Agent:
                     executed_results.append(result)
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
-                    if self._is_turn_yield_result(result) or result.terminates_turn:
+                    effect_outcome = result.effect_outcome
+                    if effect_outcome is not None:
+                        raw_mutation_outcome = effect_outcome.safe_details.get(
+                            "documentMutationOutcome"
+                        )
+                        if isinstance(raw_mutation_outcome, dict):
+                            document_mutation_outcome = dict(raw_mutation_outcome)
+                        if effect_outcome.loop_action == "finalize_without_tools":
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document side-effect boundary is closed. "
+                                    "Do not call tools. Give one concise final response in "
+                                    "the user's language based only on the sanitized mutation "
+                                    "outcome supplied by the runtime."
+                                ),
+                            )
+                            # Text emitted before a write result is provisional
+                            # narration. The next actual tools-disabled provider
+                            # response is the only authoritative final answer.
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                        elif effect_outcome.loop_action == "stop":
+                            turn_yielded = True
+                    elif self._is_turn_yield_result(result) or result.terminates_turn:
                         turn_yielded = True
+                    # Browser screenshots are kept out of the JSON tool text.
+                    # Promote only the authenticated, turn-local attachment
+                    # produced for this exact tool call.  A model with an
+                    # explicitly text-only capability still receives the
+                    # bounded screenshot metadata, but not an image block;
+                    # DOM/console/browser actions remain usable in that mode.
+                    media_context = self._tool_context or current_tool_context.get()
+                    media_by_call = (
+                        getattr(media_context, "tool_result_media", None)
+                        if media_context is not None
+                        else None
+                    )
+                    raw_media = (
+                        media_by_call.pop(tc.tool_use_id, [])
+                        if isinstance(media_by_call, dict)
+                        else []
+                    )
+                    vision_capabilities = getattr(self.config, "model_capabilities", None)
+                    vision_enabled = (
+                        self.config.model_vision_support == "supported"
+                        or getattr(vision_capabilities, "supports_vision", False) is True
+                    )
+                    provider_name = str(
+                        getattr(self.provider, "provider_name", "") or ""
+                    ).casefold()
+                    if provider_name == "ensemble":
+                        vision_enabled = False
+                    image_blocks: list[ContentBlockImage] = []
+                    if vision_enabled and isinstance(raw_media, list):
+                        for item in raw_media[:1]:
+                            if not isinstance(item, dict):
+                                continue
+                            mime = item.get("mime")
+                            data = item.get("data")
+                            if mime != "image/png" or not isinstance(data, str):
+                                continue
+                            # The bridge already enforces the byte limit; keep
+                            # a second encoded-size guard at this boundary so
+                            # a compromised test double cannot inflate context.
+                            if not 1 <= len(data) <= 16 * 1024 * 1024:
+                                continue
+                            image_blocks.append(
+                                ContentBlockImage(
+                                    media_type="image/png",
+                                    data=data,
+                                )
+                            )
                     tool_result_blocks.append(
                         ContentBlockToolResult(
                             tool_use_id=projected_result.tool_use_id,
@@ -14186,6 +16030,7 @@ class Agent:
                             execution_status=projected_result.execution_status,
                         )
                     )
+                    tool_result_blocks.extend(image_blocks)
 
                 terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
                 if terminal_artifacts:
@@ -14361,12 +16206,38 @@ class Agent:
                 ):
                     recent_failure_anchor_summaries.append(failure_anchor_summary)
                     recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
-                runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-                runtime_diff_fingerprint = (
-                    self._workspace_diff_fingerprint_for_runtime_event()
+                runtime_diff_paths: list[str] | None = None
+                runtime_diff_fingerprint: str | None = None
+                if (
+                    runtime_diagnostics is not None
+                    or post_write_convergence_tracker is not None
+                ):
+                    self._runtime_git_state = GitRunState.OK
+                    runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
+                    if runtime_diff_paths is not None:
+                        runtime_diff_fingerprint = (
+                            self._workspace_diff_fingerprint_for_runtime_event()
+                        )
+                runtime_git_observed = bool(
+                    runtime_diff_paths is not None
+                    and self._runtime_git_state is GitRunState.OK
                 )
+                if (
+                    (runtime_diagnostics is not None or post_write_convergence_tracker is not None)
+                    and not runtime_git_observed
+                ):
+                    self._record_runtime_git_observation_skip(
+                        consumers=(
+                            "runtime_diagnostics",
+                            "post_write_convergence",
+                        )
+                    )
                 runtime_diagnostic_events: list[dict[str, Any]] = []
-                if runtime_diagnostics is not None:
+                if (
+                    runtime_diagnostics is not None
+                    and runtime_git_observed
+                    and runtime_diff_paths is not None
+                ):
                     for runtime_event in runtime_diagnostics.observe_tool_results(
                         iteration=iterations,
                         provider_call_count=turn_llm_calls,
@@ -14385,6 +16256,8 @@ class Agent:
                 if (
                     accepted_goal_terminal_status is None
                     and post_write_convergence_tracker is not None
+                    and runtime_git_observed
+                    and runtime_diff_paths is not None
                 ):
                     continued_activity_after_verification = bool(
                         (
@@ -14646,6 +16519,41 @@ class Agent:
                 )
                 if terminal_error is None:
                     terminal_error = budget_error
+                if (
+                    terminal_error is not None
+                    and self._artifact_mutation_turn_active()
+                    and document_mutation_attempted
+                    and not document_mutation_finalization_attempted
+                ):
+                    if not document_mutation_finalization_pending:
+                        document_mutation_outcome = {
+                            "version": 1,
+                            "status": (
+                                str(document_mutation_outcome.get("status"))
+                                if document_mutation_outcome is not None
+                                else "not_attempted"
+                            ),
+                            "phase": (
+                                str(document_mutation_outcome.get("phase"))
+                                if document_mutation_outcome is not None
+                                else "proposal"
+                            ),
+                            "retryPolicy": "new_turn",
+                            "code": "document_mutation_budget_exhausted",
+                        }
+                    document_mutation_finalization_pending = True
+                    document_mutation_finalization_message = Message(
+                        role="user",
+                        content=(
+                            "The global turn budget is closed. Do not call tools. "
+                            "Summarize the authoritative document mutation outcome."
+                        ),
+                    )
+                    yield WarningEvent(
+                        code="document_mutation_budget_exhausted",
+                        message=terminal_error.message,
+                    )
+                    terminal_error = None
                 if terminal_error is not None:
                     if artifact_delivery_final_response_pending:
                         yield _finish_artifact_delivery_degraded(
@@ -14677,6 +16585,49 @@ class Agent:
                     accepted_goal_terminal_status is None
                     and _loop.time() > tool_deadline
                 ):
+                    if (
+                        self._artifact_mutation_turn_active()
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        prior_outcome = dict(document_mutation_outcome or {})
+                        if (
+                            not document_mutation_finalization_pending
+                            or prior_outcome.get("retryPolicy") == "same_turn"
+                        ):
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": "document_mutation_iteration_timeout",
+                            }
+                            for detail_key in ("corrected", "proposalAttempts"):
+                                if detail_key in prior_outcome:
+                                    document_mutation_outcome[detail_key] = prior_outcome[
+                                        detail_key
+                                    ]
+                        document_mutation_finalization_pending = True
+                        document_mutation_finalization_message = Message(
+                            role="user",
+                            content=(
+                                "The document iteration ended after tool execution. Do not "
+                                "call tools. Summarize only the authoritative mutation outcome."
+                            ),
+                        )
+                        final_text_parts.clear()
+                        applied_model_call_boundaries.clear()
+                        yield WarningEvent(
+                            code="document_mutation_iteration_timeout",
+                            message=(
+                                "The document iteration deadline was reached; the authoritative "
+                                "mutation outcome was preserved for finalization."
+                            ),
+                        )
+                        yield self._transition(AgentState.THINKING)
+                        continue
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -14910,6 +16861,30 @@ class Agent:
                     reason=f"Agent turn timed out after {self.config.timeout}s",
                     code="agent_runtime_timeout",
                 )
+            elif (
+                self._artifact_mutation_turn_active()
+                and document_mutation_attempted
+            ):
+                if document_mutation_outcome is None:
+                    document_mutation_outcome = {
+                        "version": 1,
+                        "status": "not_attempted",
+                        "phase": "proposal",
+                        "retryPolicy": "new_turn",
+                        "code": "document_mutation_time_budget_exhausted",
+                    }
+                document_mutation_finalization_pending = False
+                response_text = _document_mutation_fallback_text()
+                final_text_parts[:] = [response_text]
+                applied_model_call_boundaries.clear()
+                yield TextDeltaEvent(text=response_text)
+                yield WarningEvent(
+                    code="document_mutation_finalization_degraded",
+                    message=(
+                        "The document outcome was preserved after the turn deadline, "
+                        "using a deterministic localized fallback."
+                    ),
+                )
             else:
                 # Total turn deadline exceeded (raised by manual check above)
                 yield self._transition(AgentState.ERROR)
@@ -14926,6 +16901,137 @@ class Agent:
             turn_messages = [
                 item for item in turn_messages if item is not staged_pending_input_message
             ]
+
+        if (
+            self._artifact_mutation_turn_active()
+            and document_mutation_attempted
+        ):
+            if document_mutation_outcome is None:
+                document_mutation_outcome = {
+                    "version": 1,
+                    "status": "not_attempted",
+                    "phase": "proposal",
+                    "retryPolicy": "new_turn",
+                    "code": "document_mutation_not_proposed",
+                }
+            current_final_text = "".join(final_text_parts)
+            candidate_controller = getattr(
+                self._tool_context or current_tool_context.get(),
+                "artifact_candidate_loop_controller",
+                None,
+            )
+            candidate_state = getattr(candidate_controller, "state", None)
+            candidate_status = str(getattr(candidate_state, "status", "") or "")
+            candidate_is_open = bool(
+                candidate_controller is not None
+                and candidate_status in {"open", *_OPEN_CANDIDATE_STATUSES}
+            )
+            candidate_terminal_without_commit = bool(
+                candidate_controller is not None
+                and candidate_status in {"discarded", "ambiguous"}
+            )
+            if candidate_is_open:
+                # ``run_turn`` emits DoneEvent before its outer cleanup rejects
+                # an abandoned draft. Project every still-open candidate to a
+                # terminal, truthful outcome here; otherwise a provider's
+                # earlier "updated" narration could survive as the public
+                # answer even though no durable revision exists.
+                normalized_candidate_outcome = (
+                    _normalize_uncommitted_candidate_outcome(
+                        document_mutation_outcome,
+                        candidate_controller,
+                    )
+                )
+                normalized_status = str(
+                    (normalized_candidate_outcome or {}).get("status") or ""
+                )
+                if normalized_status not in _TERMINAL_CANDIDATE_OUTCOME_STATUSES:
+                    unresolved_finish = bool(
+                        getattr(
+                            candidate_controller,
+                            "discard_blocked_by_other_finish",
+                            False,
+                        )
+                        or getattr(candidate_controller, "_mutation_attempt_id", None)
+                        or getattr(
+                            candidate_controller,
+                            "_mutation_attempt_tool_use_id",
+                            None,
+                        )
+                    )
+                    normalized_candidate_outcome = {
+                        "version": 1,
+                        "status": "ambiguous" if unresolved_finish else "not_applied",
+                        "phase": "commit",
+                        "retryPolicy": "reconcile" if unresolved_finish else "new_turn",
+                        "code": (
+                            "document_finish_commit_ambiguous"
+                            if unresolved_finish
+                            else "document_candidate_discarded_on_turn_close"
+                        ),
+                    }
+                    document_mutation_outcome = normalized_candidate_outcome
+                    current_final_text = _document_mutation_fallback_text()
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(text=current_final_text)
+                    yield WarningEvent(
+                        code="document_candidate_final_text_normalized",
+                        message=(
+                            "The staged candidate was not durably committed; the final "
+                            "text was replaced with the authoritative outcome."
+                        ),
+                    )
+            candidate_outcome_status = str(
+                (document_mutation_outcome or {}).get("status") or ""
+            )
+            if (
+                (candidate_is_open or candidate_terminal_without_commit)
+                and candidate_outcome_status != "applied"
+            ):
+                authoritative_final_text = _document_mutation_fallback_text()
+                if current_final_text != authoritative_final_text:
+                    current_final_text = authoritative_final_text
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(text=current_final_text)
+                    yield WarningEvent(
+                        code="document_candidate_final_text_normalized",
+                        message=(
+                            "The document candidate has no confirmed commit; the final "
+                            "text was replaced with the authoritative outcome."
+                        ),
+                    )
+            if document_mutation_finalization_attempted:
+                from opensquilla.engine.silent_reply import normalize_silent_reply
+
+                silent_finalizer = normalize_silent_reply(
+                    current_final_text,
+                    run_kind="human",
+                )
+                if silent_finalizer.suppressed:
+                    # The shared TurnRunner withholds a short sentinel prefix
+                    # until Done. Replace the terminal snapshot without
+                    # emitting another text delta so the held control token is
+                    # discarded rather than combined with the fallback.
+                    current_final_text = _document_mutation_fallback_text()
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield WarningEvent(
+                        code="document_mutation_finalization_degraded",
+                        message=(
+                            "The document outcome was preserved, but its generated "
+                            "summary used a deterministic localized fallback."
+                        ),
+                    )
+            # The model may explain the outcome but cannot redefine it. Append
+            # one runtime-owned, localized fact as the final sentence for CLI
+            # and non-card channels, without exposing receipt identifiers.
+            fact_footer = _document_mutation_fallback_text()
+            if not current_final_text.rstrip().endswith(fact_footer):
+                fact_delta = ("\n\n" if current_final_text.strip() else "") + fact_footer
+                final_text_parts.append(fact_delta)
+                yield TextDeltaEvent(text=fact_delta)
 
         if terminal_error is None:
             # Persist successful turns into in-memory history. Error turns are
@@ -15181,16 +17287,32 @@ class Agent:
             provider_call_count=turn_llm_calls,
         )
         if runtime_diagnostics is not None and terminal_error is not None:
+            self._runtime_git_state = GitRunState.OK
             runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-            for runtime_event in runtime_diagnostics.observe_finish_error(
-                iteration=iterations,
-                provider_call_count=turn_llm_calls,
-                error_code=terminal_error.code,
-                changed_files=self._relative_paths_from_records(self._workspace_write_records()),
-                diff_paths=runtime_diff_paths,
-                diff_fingerprint=self._workspace_diff_fingerprint_for_runtime_event(),
+            runtime_diff_fingerprint = (
+                self._workspace_diff_fingerprint_for_runtime_event()
+                if runtime_diff_paths is not None
+                else None
+            )
+            if (
+                runtime_diff_paths is not None
+                and self._runtime_git_state is GitRunState.OK
             ):
-                append_runtime_event(self.config.runtime_events_path, runtime_event)
+                for runtime_event in runtime_diagnostics.observe_finish_error(
+                    iteration=iterations,
+                    provider_call_count=turn_llm_calls,
+                    error_code=terminal_error.code,
+                    changed_files=self._relative_paths_from_records(
+                        self._workspace_write_records()
+                    ),
+                    diff_paths=runtime_diff_paths,
+                    diff_fingerprint=runtime_diff_fingerprint,
+                ):
+                    append_runtime_event(self.config.runtime_events_path, runtime_event)
+            else:
+                self._record_runtime_git_observation_skip(
+                    consumers=("runtime_diagnostics_finish",)
+                )
         if bool(getattr(self.config, "final_diff_salvage", False)):
             # Last engine-controlled moment before the runner collects the
             # patch from the worktree: if prior source writes ended in an
@@ -15299,6 +17421,14 @@ class Agent:
                 *turn_model_usage_breakdown,
             ]
         )
+        # ``run_turn`` rejects an uncommitted candidate in its outer finally,
+        # which runs after this generator has emitted DoneEvent.  Normalize the
+        # public outcome first so a candidate that the model abandoned or that
+        # hit a global guard cannot be rendered as a successful/staged update.
+        document_mutation_outcome = _normalize_uncommitted_candidate_outcome(
+            document_mutation_outcome,
+            getattr(self._tool_context, "artifact_candidate_loop_controller", None),
+        )
         has_usage = bool(
             done_input_tokens
             or done_output_tokens
@@ -15310,7 +17440,7 @@ class Agent:
             or missing_cost_entries
             or total_provider_billed_entries
         )
-        if terminal_error is None or has_usage:
+        if terminal_error is None or has_usage or document_mutation_outcome is not None:
             final_text = "".join(final_text_parts)
             total_codepoints = len(final_text)
             model_call_segments = [
@@ -15350,7 +17480,14 @@ class Agent:
                 message_output_tokens=message_output_tokens,
                 missing_cost_entries=missing_cost_entries,
                 model_call_segments=model_call_segments,
+                document_mutation_outcome=(
+                    dict(document_mutation_outcome)
+                    if document_mutation_outcome is not None
+                    else None
+                ),
                 generation_epoch=generation_epoch,
+                router_model_call_id=router_model_call_id,
+                router_iteration=router_iteration,
             )
             yield done_event
         # Reset for next turn
@@ -15443,7 +17580,11 @@ class Agent:
                 return True
             if getattr(ctx, "source_diff_candidates", []) or []:
                 return True
-        return bool(self._workspace_tracked_diff_paths_for_nudge())
+        paths = self._workspace_tracked_diff_paths_for_nudge()
+        # Unknown Git state must not manufacture a "no progress" nudge. Treat
+        # it conservatively as possible source evidence and let the turn keep
+        # its normal course without spending another model call.
+        return True if paths is None else bool(paths)
 
     def _workspace_source_fix_beyond_instrumentation(self) -> bool:
         """Whether the tracked diff contains more than diagnostic output.
@@ -15456,6 +17597,8 @@ class Agent:
         """
 
         paths = self._workspace_tracked_diff_paths_for_nudge()
+        if paths is None:
+            return True
         if not paths:
             return False
         ctx = self._tool_context
@@ -15465,26 +17608,19 @@ class Agent:
         if not raw_workspace:
             return True
         workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace_dir), "diff", "HEAD", "--", *paths],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
+        result = run_git(
+            ["diff", "HEAD", "--", *paths],
+            cwd=workspace_dir,
+            timeout=5.0,
+        )
+        if not result.ok:
             return True
-        if result.returncode != 0:
-            return True
-        patch = result.stdout or ""
+        patch = result.stdout_text
         if not patch.strip():
             return False
         return not is_instrumentation_only_patch(patch)
 
-    def _workspace_tracked_diff_paths_for_nudge(self) -> list[str]:
+    def _workspace_tracked_diff_paths_for_nudge(self) -> list[str] | None:
         ctx = self._tool_context
         raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
         if not raw_workspace:
@@ -15494,24 +17630,21 @@ class Agent:
         workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
         if not workspace_dir.exists():
             return []
-        ignored_paths = self._workspace_gitlink_paths(workspace_dir) | (
-            self._workspace_internal_diagnostic_paths(workspace_dir)
+        self._runtime_git_state = GitRunState.OK
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+            workspace_dir
         )
+        if ignored_state is not GitRunState.OK:
+            self._runtime_git_state = ignored_state
+            return None
+        ignored_paths |= self._workspace_internal_diagnostic_paths(workspace_dir)
         paths: set[str] = set()
         for args in (("diff", "--name-only"), ("diff", "--cached", "--name-only")):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
+            for line in result.stdout_text.splitlines():
                 text = line.strip()
                 if text:
                     normalized = _normalize_workspace_relative_path(text)
@@ -15645,6 +17778,8 @@ class Agent:
 
     def _final_diff_contract_observation(self) -> FinalDiffContractObservation | None:
         diff_paths = self._workspace_diff_paths_for_final_diff_contract()
+        if diff_paths is None:
+            return None
         known_scratch_paths = [
             path for path in diff_paths if self._workspace_relative_path_targets_scratch(path)
         ]
@@ -15745,13 +17880,21 @@ class Agent:
         workspace = self._workspace_dir_for_status()
         if workspace is None:
             return []
-        if self._workspace_diff_paths_for_final_diff_contract(include_untracked=False):
+        tracked_diff_paths = self._workspace_diff_paths_for_final_diff_contract(
+            include_untracked=False
+        )
+        if tracked_diff_paths is None:
+            return []
+        if tracked_diff_paths:
             # A tracked path still carries a live diff: the run ends with a
             # non-empty scored patch the agent chose to keep, and candidates
             # for clean paths are exactly the edits it deliberately reverted.
             # Resurrecting those here would corrupt a healthy final diff.
             return []
-        live_diff_paths = set(self._workspace_diff_paths_for_final_diff_contract())
+        current_diff_paths = self._workspace_diff_paths_for_final_diff_contract()
+        if current_diff_paths is None:
+            return []
+        live_diff_paths = set(current_diff_paths)
         deadline = time.monotonic() + self._FINAL_DIFF_SALVAGE_TIME_BUDGET_SECONDS
         applied: list[dict[str, Any]] = []
         handled_paths: set[str] = set()
@@ -15841,24 +17984,17 @@ class Agent:
         *,
         check_only: bool,
     ) -> bool:
-        args = ["git", "-C", str(workspace), "apply"]
+        args = ["apply"]
         if check_only:
             args.append("--check")
         args.append("-")
-        try:
-            result = subprocess.run(
-                args,
-                input=patch,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return result.returncode == 0
+        result = run_git(
+            args,
+            cwd=workspace,
+            timeout=10.0,
+            input_bytes=patch.encode("utf-8"),
+        )
+        return result.ok
 
     def _record_final_diff_salvage_event(
         self,
@@ -15962,19 +18098,21 @@ class Agent:
         return mirror_root.as_posix() in command
 
     @staticmethod
-    def _git_head_blob(workspace: Path, relative_path: str) -> bytes | None:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace), "show", f"HEAD:{relative_path}"],
-                capture_output=True,
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode != 0:
-            return None
-        return result.stdout
+    def _git_head_blob(workspace: Path, relative_path: str) -> tuple[bool, bytes | None]:
+        result = run_git(
+            ["show", "--end-of-options", f"HEAD:{relative_path}"],
+            cwd=workspace,
+            timeout=2.0,
+        )
+        if result.ok:
+            return True, result.stdout
+        error_text = result.stderr_text.casefold()
+        if result.state is GitRunState.FAILED and (
+            "does not exist in 'head'" in error_text
+            or "exists on disk, but not in 'head'" in error_text
+        ):
+            return True, None
+        return False, None
 
     def _scratch_verify_mirror_evidence_credit(self, command: str) -> bool:
         """Anti-weakening hash guard for scratch verify-mirror runs.
@@ -15998,6 +18136,7 @@ class Agent:
         workspace = self._workspace_dir_for_status()
         if workspace is None:
             return False
+        repository_verified = False
         checked = 0
         for mirror_file in sorted(mirror_root.rglob("*")):
             if not mirror_file.is_file():
@@ -16022,7 +18161,21 @@ class Agent:
                 if mirror_digest != original_digest:
                     return False
                 continue
-            head_blob = self._git_head_blob(workspace, relative.as_posix())
+            if not repository_verified:
+                repository_check = run_git(
+                    ["rev-parse", "--is-inside-work-tree"],
+                    cwd=workspace,
+                    timeout=2.0,
+                )
+                if not repository_check.ok:
+                    return False
+                repository_verified = True
+            head_observed, head_blob = self._git_head_blob(
+                workspace,
+                relative.as_posix(),
+            )
+            if not head_observed:
+                return False
             if head_blob is None:
                 # Tracked nowhere: a new check file, not a shadowed original.
                 continue
@@ -16035,65 +18188,131 @@ class Agent:
         if workspace is None:
             return None
 
-        def _run_status() -> str | None:
-            try:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(workspace),
-                        "status",
-                        "--porcelain=v1",
-                        "--untracked-files=all",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return None
-            if result.returncode != 0:
-                return None
-            gitlink_paths = self._workspace_gitlink_paths(workspace)
-            return self._filter_ignored_porcelain_status(result.stdout, gitlink_paths)
+        def _run_status() -> tuple[GitRunState, str | None]:
+            result = run_git(
+                ["status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=workspace,
+                timeout=2.0,
+            )
+            if not result.ok:
+                return result.state, None
+            gitlink_state, gitlink_paths = self._workspace_gitlink_paths_observed(
+                workspace
+            )
+            if gitlink_state is not GitRunState.OK:
+                return gitlink_state, None
+            return (
+                GitRunState.OK,
+                self._filter_ignored_porcelain_status(
+                    result.stdout_text,
+                    gitlink_paths,
+                ),
+            )
 
-        return await asyncio.to_thread(_run_status)
+        state, status = await asyncio.to_thread(_run_status)
+        self._runtime_git_state = state
+        return status
 
-    async def _workspace_submit_review_capture(self) -> tuple[str, str]:
+    async def _workspace_submit_review_capture(self) -> tuple[str, str] | None:
         """Capture ``(per-file summary, unified diff)`` for the submit review.
 
         The per-file summary comes from ``git status`` (so untracked scratch
         files appear even though they are absent from ``git diff``); the diff
-        body is ``git diff HEAD`` for tracked changes. Best-effort: any failure
-        yields an empty diff and the review degrades to the summary alone.
+        body is ``git diff HEAD`` for tracked changes. ``None`` means Git could
+        not authoritatively observe the repository and must never be treated as
+        an empty diff.
         """
         workspace = self._workspace_dir_for_status()
         if workspace is None:
-            return "", ""
+            self._submit_review_git_state = GitRunState.NOT_REPOSITORY
+            return None
 
-        def _run_diff() -> str:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace), "diff", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=4.0,
-                    check=False,
+        def _capture() -> tuple[GitRunState, tuple[str, str] | None]:
+            status_result = run_git(
+                ["status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=workspace,
+                timeout=2.0,
+            )
+            if not status_result.ok:
+                return status_result.state, None
+            diff_result = run_git(["diff", "HEAD"], cwd=workspace, timeout=4.0)
+            if diff_result.ok:
+                diff_text = diff_result.stdout_text
+            else:
+                # ``git diff HEAD`` is invalid in a legitimate unborn
+                # repository. Confirm that this is still a repository with a
+                # symbolic, not-yet-created HEAD before falling back to the
+                # two comparisons that do work there. Other failures remain
+                # unknown and must not be presented as a clean review.
+                repository_result = run_git(
+                    ["rev-parse", "--is-inside-work-tree"],
+                    cwd=workspace,
+                    timeout=2.0,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                return ""
-            if result.returncode != 0:
-                return ""
-            return result.stdout
+                if not repository_result.ok:
+                    return repository_result.state, None
+                if repository_result.stdout_text.strip().casefold() != "true":
+                    return GitRunState.NOT_REPOSITORY, None
+                head_result = run_git(
+                    ["rev-parse", "--verify", "HEAD"],
+                    cwd=workspace,
+                    timeout=2.0,
+                )
+                if head_result.ok:
+                    return diff_result.state, None
+                if head_result.state is not GitRunState.FAILED:
+                    return head_result.state, None
+                symbolic_head_result = run_git(
+                    ["symbolic-ref", "--quiet", "HEAD"],
+                    cwd=workspace,
+                    timeout=2.0,
+                )
+                if not symbolic_head_result.ok:
+                    return symbolic_head_result.state, None
+                cached_result = run_git(
+                    ["diff", "--cached"],
+                    cwd=workspace,
+                    timeout=4.0,
+                )
+                if not cached_result.ok:
+                    return cached_result.state, None
+                worktree_result = run_git(["diff"], cwd=workspace, timeout=4.0)
+                if not worktree_result.ok:
+                    return worktree_result.state, None
+                diff_text = cached_result.stdout_text + worktree_result.stdout_text
+            ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+                workspace
+            )
+            if ignored_state is not GitRunState.OK:
+                return ignored_state, None
+            file_index = self._filter_ignored_porcelain_status(
+                status_result.stdout_text,
+                ignored_paths,
+            )
+            return GitRunState.OK, (file_index, diff_text)
 
-        file_index = await self._workspace_git_status_porcelain() or ""
-        diff_text = await asyncio.to_thread(_run_diff)
-        return file_index, diff_text
+        state, capture = await asyncio.to_thread(_capture)
+        self._submit_review_git_state = state
+        return capture
+
+    @staticmethod
+    def _submit_review_git_unavailable_payload(state: GitRunState) -> dict[str, Any]:
+        code = (
+            "GIT_NOT_REPOSITORY"
+            if state is GitRunState.NOT_REPOSITORY
+            else "GIT_UNAVAILABLE"
+        )
+        return {
+            "status": "unavailable",
+            "code": code,
+            "reason": "submit_review_git_unavailable",
+            "git_state": state.value,
+            "retryable": False,
+            "message": (
+                "OpenSquilla could not inspect the workspace diff for submit review; "
+                "the submit request was ended without treating the workspace as clean."
+            ),
+        }
 
     @staticmethod
     def _porcelain_status_code(line: str) -> str:
@@ -16241,51 +18460,46 @@ class Agent:
 
     @staticmethod
     def _workspace_gitlink_paths(workspace_dir: Path) -> set[str]:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace_dir), "ls-files", "-s"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return set()
-        if result.returncode != 0:
-            return set()
+        _state, paths = Agent._workspace_gitlink_paths_observed(workspace_dir)
+        return paths
+
+    @staticmethod
+    def _workspace_gitlink_paths_observed(
+        workspace_dir: Path,
+    ) -> tuple[GitRunState, set[str]]:
+        result = run_git(["ls-files", "-s"], cwd=workspace_dir, timeout=2.0)
+        if not result.ok:
+            return result.state, set()
+        return GitRunState.OK, Agent._gitlink_paths_from_index_output(result.stdout_text)
+
+    @staticmethod
+    def _gitlink_paths_from_index_output(output: str) -> set[str]:
         paths: set[str] = set()
-        for line in (result.stdout or "").splitlines():
+        for line in output.splitlines():
             parts = line.split(None, 3)
             if len(parts) == 4 and parts[0] == "160000":
                 paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
 
     def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
-        ignored = self._workspace_gitlink_paths(workspace_dir)
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(workspace_dir),
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ignored
-        if result.returncode != 0:
-            return ignored
-        for line in (result.stdout or "").splitlines():
+        _state, ignored = self._workspace_ignored_diff_paths_observed(workspace_dir)
+        return ignored
+
+    def _workspace_ignored_diff_paths_observed(
+        self,
+        workspace_dir: Path,
+    ) -> tuple[GitRunState, set[str]]:
+        gitlink_state, ignored = self._workspace_gitlink_paths_observed(workspace_dir)
+        if gitlink_state is not GitRunState.OK:
+            return gitlink_state, set()
+        status_result = run_git(
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=workspace_dir,
+            timeout=2.0,
+        )
+        if not status_result.ok:
+            return status_result.state, set()
+        for line in status_result.stdout_text.splitlines():
             path = self._porcelain_status_path(line)
             if (
                 path
@@ -16293,7 +18507,7 @@ class Agent:
                 and self._is_root_scratch_artifact_path(path)
             ):
                 ignored.add(path)
-        return ignored
+        return GitRunState.OK, ignored
 
     async def _failed_tool_finalization_recovery_details(
         self,
@@ -17105,12 +19319,37 @@ class Agent:
         }
         append_runtime_event(self.config.runtime_events_path, event)
 
+    def _record_runtime_git_observation_skip(
+        self,
+        *,
+        consumers: tuple[str, ...],
+    ) -> None:
+        """Record one internal-only skip for each unavailable Git state."""
+
+        state = self._runtime_git_state
+        if state is GitRunState.OK:
+            state = GitRunState.FAILED
+            self._runtime_git_state = state
+        self.config.metadata["runtime_git_observation_state"] = state.value
+        if state in self._runtime_git_skip_states_recorded:
+            return
+        self._runtime_git_skip_states_recorded.add(state)
+        self._record_runtime_event(
+            "runtime_git_observation.skipped",
+            feature="runtime_git_observation",
+            reason="git_state_unavailable",
+            git_state=state.value,
+            consumers=list(consumers),
+            injected_to_model=False,
+        )
+
     def _record_tool_loop_runtime_event(self, *, reason: str, **details: Any) -> None:
         if self.config.tool_loop_observer_mode != "log":
             return
         iteration = details.get("iteration")
         hint_text_sha256 = details.pop("hint_text_sha256", None)
         trigger_confidence = details.pop("trigger_confidence", "observed_runtime_signal")
+        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
         event = {
             "feature": "runtime_observer",
             "mechanism": "tool_loop_observer",
@@ -17124,7 +19363,9 @@ class Agent:
             "evidence": details,
             "read_files": self._relative_paths_from_records(self._workspace_read_records()),
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
+            "diff_paths": runtime_diff_paths or [],
+            "git_state": self._runtime_git_state.value,
+            "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": hint_text_sha256,
             "trigger_confidence": trigger_confidence,
@@ -17150,6 +19391,7 @@ class Agent:
             **decision.details,
             **details,
         }
+        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
         event = {
             "feature": "runtime_recovery",
             "mechanism": decision.mechanism,
@@ -17166,7 +19408,9 @@ class Agent:
             "evidence": evidence,
             "read_files": self._relative_paths_from_records(self._workspace_read_records()),
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
+            "diff_paths": runtime_diff_paths or [],
+            "git_state": self._runtime_git_state.value,
+            "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": hint_text_sha256,
             "trigger_confidence": "runtime_recovery_gate",
@@ -17190,6 +19434,7 @@ class Agent:
         if event_name is None:
             return
         evidence = dict(decision.details)
+        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
         event = {
             "feature": "post_write_convergence",
             "mechanism": "stable_verified_workspace_diff",
@@ -17206,7 +19451,9 @@ class Agent:
             "evidence": evidence,
             "read_files": self._relative_paths_from_records(self._workspace_read_records()),
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
+            "diff_paths": runtime_diff_paths or [],
+            "git_state": self._runtime_git_state.value,
+            "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": (
                 hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
@@ -17232,30 +19479,29 @@ class Agent:
                 paths.append(normalized)
         return paths
 
-    def _workspace_diff_paths_for_runtime_event(self) -> list[str]:
+    def _workspace_diff_paths_for_runtime_event(self) -> list[str] | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
-            return []
-        ignored_paths = self._workspace_ignored_diff_paths(workspace_dir)
+            self._runtime_git_state = GitRunState.NOT_REPOSITORY
+            return None
+        self._runtime_git_state = GitRunState.OK
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+            workspace_dir
+        )
+        if ignored_state is not GitRunState.OK:
+            self._runtime_git_state = ignored_state
+            return None
         paths: set[str] = set()
         for args in (
             ("diff", "--name-only"),
             ("diff", "--cached", "--name-only"),
             ("status", "--porcelain=v1", "--untracked-files=all"),
         ):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
+            for line in result.stdout_text.splitlines():
                 if args[0] == "status":
                     text = self._porcelain_status_path(line) or ""
                 else:
@@ -17269,13 +19515,16 @@ class Agent:
 
     def _workspace_diff_paths_for_final_diff_contract(
         self, *, include_untracked: bool = True
-    ) -> list[str]:
+    ) -> list[str] | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
             return []
-        ignored_paths = self._workspace_gitlink_paths(workspace_dir) | (
-            self._workspace_internal_diagnostic_paths(workspace_dir)
+        gitlink_state, ignored_paths = self._workspace_gitlink_paths_observed(
+            workspace_dir
         )
+        if gitlink_state is not GitRunState.OK:
+            return None
+        ignored_paths |= self._workspace_internal_diagnostic_paths(workspace_dir)
         commands: tuple[tuple[str, ...], ...] = (
             ("diff", "--name-only"),
             ("diff", "--cached", "--name-only"),
@@ -17284,19 +19533,13 @@ class Agent:
             commands += (("status", "--porcelain=v1", "--untracked-files=all"),)
         paths: set[str] = set()
         for args in commands:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                # An unavailable Git runtime or a non-repository workspace is
+                # not an authoritative clean diff. Callers must skip their
+                # final-diff gates instead of treating it as empty.
+                return None
+            for line in result.stdout_text.splitlines():
                 if args[0] == "status":
                     text = self._porcelain_status_path(line) or ""
                 else:
@@ -17328,9 +19571,10 @@ class Agent:
     def _workspace_diff_fingerprint_for_runtime_event(self) -> str | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
+            self._runtime_git_state = GitRunState.NOT_REPOSITORY
             return None
         diff_paths = self._workspace_diff_paths_for_runtime_event()
-        if not diff_paths:
+        if diff_paths is None or not diff_paths:
             return None
         payload_parts: list[str] = []
         for args in (
@@ -17338,29 +19582,27 @@ class Agent:
             ("diff", "--cached", "--no-ext-diff", "--binary", "--", *diff_paths),
             ("status", "--porcelain=v1", "--untracked-files=all"),
         ):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
             payload_parts.append(f"$ git {' '.join(args)}\n")
-            stdout = result.stdout or ""
+            stdout = result.stdout_text
             if args[0] == "status":
+                ignored_state, ignored_paths = (
+                    self._workspace_ignored_diff_paths_observed(workspace_dir)
+                )
+                if ignored_state is not GitRunState.OK:
+                    self._runtime_git_state = ignored_state
+                    return None
                 stdout = self._filter_gitlink_porcelain_status(
                     stdout,
-                    self._workspace_ignored_diff_paths(workspace_dir),
+                    ignored_paths,
                 )
             payload_parts.append(stdout)
             if result.stderr:
                 payload_parts.append("\n[stderr]\n")
-                payload_parts.append(result.stderr)
+                payload_parts.append(result.stderr_text)
         payload = "\n".join(payload_parts)
         if not payload.strip():
             return None
@@ -17512,18 +19754,21 @@ class Agent:
             stream_iter = stream.__aiter__()
         except (asyncio.CancelledError, UsageAccountingUnavailableError):
             raise
-        except Exception:  # noqa: BLE001 - provider boundary
-            raise _RaisedProviderBoundaryError from None
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
+        close_state = {"deferred": False}
         try:
             async for event in self._stream_provider_events_with_deadline_unclosed(
                 stream_iter,
                 loop=loop,
                 total_deadline=total_deadline,
                 deadline_provider=deadline_provider,
+                close_state=close_state,
             ):
                 yield event
         finally:
-            await self._close_provider_stream(stream_iter)
+            if not close_state["deferred"]:
+                await self._close_provider_stream(stream_iter)
 
     async def _stream_provider_events_with_deadline_unclosed(
         self,
@@ -17532,6 +19777,7 @@ class Agent:
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
         deadline_provider: Callable[[], float | None] | None = None,
+        close_state: dict[str, bool] | None = None,
     ) -> AsyncIterator[Any]:
         while True:
             dynamic_deadline = (
@@ -17547,7 +19793,7 @@ class Agent:
                     else dynamic_deadline
                 )
             # Execution-context-aware composite providers (currently Ensemble)
-            # own streaming inactivity through TurnExecutionContext.  Applying
+            # own streaming inactivity through TurnExecutionContext. Applying
             # the legacy per-iteration read timeout here would create a second,
             # earlier timeout owner and could kill a healthy long fusion run.
             wait_budget: float | None = (
@@ -17571,17 +19817,37 @@ class Agent:
                     total_deadline_limits_wait = True
 
             next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
+
+            async def _cancel_provider_pull(*, grace_seconds: float) -> None:
+                settled = False
+                try:
+                    settled = await cancel_task(
+                        next_event,
+                        policy="bounded",
+                        operation="provider_stream_pull",
+                        grace_seconds=grace_seconds,
+                    )
+                finally:
+                    if (
+                        not settled
+                        and not next_event.done()
+                        and close_state is not None
+                        and not close_state["deferred"]
+                    ):
+                        close_state["deferred"] = True
+                        defer_async_cleanup(
+                            next_event,
+                            lambda: self._close_provider_stream(stream_iter),
+                            operation="provider_stream_deferred_close",
+                        )
+
             try:
                 done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
             except (asyncio.CancelledError, GeneratorExit):
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
+                await _cancel_provider_pull(grace_seconds=STOP_CANCEL_GRACE_SECONDS)
                 raise
             if not done:
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
+                await _cancel_provider_pull(grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS)
                 if total_deadline_limits_wait or (
                     active_deadline is not None
                     and loop.time() >= active_deadline
@@ -17602,11 +19868,12 @@ class Agent:
                 ModelRepetitionLoopError,
             ):
                 raise
-            except Exception:  # noqa: BLE001 - provider boundary
-                # TimeoutError raised *by the provider* is different from the
-                # deadline timeouts raised above by this wrapper.  Project it
-                # through the same content-free provider failure path.
-                raise _RaisedProviderBoundaryError from None
+            except Exception as exc:  # noqa: BLE001 - provider boundary
+                # TimeoutError raised *by the provider* is different from
+                # the deadline timeouts raised above by this wrapper.
+                raise _RaisedProviderBoundaryError(
+                    timeout=isinstance(exc, TimeoutError)
+                ) from None
             yield event
 
     @staticmethod
@@ -17681,6 +19948,8 @@ class Agent:
         return request_messages, sanitize_result
 
     def _runtime_state_capsule_provider_message(self, *, preview: bool = False) -> Message | None:
+        if self._restricted_tool_boundary_active():
+            return None
         mode = str(getattr(self.config, "runtime_state_capsule_mode", "off") or "off")
         if mode not in {"log", "inject"}:
             return None
@@ -18039,6 +20308,12 @@ class Agent:
     ) -> CompactionOutcome | None:
         """Summarize completed live rounds into an ephemeral provider view."""
 
+        if self._restricted_auxiliary_compaction_disabled():
+            self._last_compaction_refusal_reason = (
+                "restricted_turn_compaction_disabled"
+            )
+            return None
+
         boundary = self._live_turn_compaction_boundary(
             messages,
             protected_turn_start_index=protected_turn_start_index,
@@ -18289,6 +20564,12 @@ class Agent:
         ``CompactionEvent``.
         """
 
+        if self._restricted_auxiliary_compaction_disabled():
+            self._last_compaction_refusal_reason = (
+                "restricted_turn_compaction_disabled"
+            )
+            return None, "restricted_turn_compaction_disabled"
+
         limit = int(proof.limit)
         target = limit - self._message_count_headroom(limit)
         if target <= 0:
@@ -18522,6 +20803,694 @@ class Agent:
         ]
         return "\n".join(lines)
 
+    def _restricted_tool_boundary_active(self) -> bool:
+        """Whether this turn has an explicit, non-widenable tool ceiling."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        return bool(
+            self.config.restricted_turn
+            or (ctx is not None and ctx.exclusive_tools is not None)
+        )
+
+    def _restricted_auxiliary_compaction_disabled(self) -> bool:
+        """Whether this turn forbids every auxiliary compaction provider."""
+
+        return self._restricted_tool_boundary_active()
+
+    def _artifact_writer_controller(self) -> Any | None:
+        """Return the single-writer controller for a bound document turn."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        if (
+            ctx is None
+            or ctx.surfaced_tools is None
+            or not (_PROMPT_ANNOTATION_WRITER_TOOLS & ctx.surfaced_tools)
+        ):
+            return None
+        # Autonomous PromptAnnotation turns stage writers in their draft
+        # candidate controller. Do not arm the legacy one-call mutation receipt
+        # controller, which would otherwise reconcile a staged proposal as an
+        # ambiguous durable commit and close the loop prematurely.
+        if getattr(ctx, "artifact_candidate_loop_controller", None) is not None:
+            return None
+        return ctx.artifact_mutation_attempt_controller
+
+    def _artifact_mutation_turn_active(self) -> bool:
+        """Return whether this turn has any document mutation authority.
+
+        The legacy writer controller intentionally stays separate from the
+        candidate-loop controller: the former owns the immediate durable
+        receipt, while the latter owns a DRAFT until ``document_finish``.
+        Budget, timeout, and provider-failure gates need to recognize both
+        authorities so an abandoned candidate cannot fall through to a
+        generic final answer.
+        """
+
+        ctx = self._tool_context or current_tool_context.get()
+        return bool(
+            self._artifact_writer_controller() is not None
+            or getattr(ctx, "artifact_candidate_loop_controller", None) is not None
+        )
+
+    async def _discard_uncommitted_candidate(self, reason: str) -> None:
+        """Reject an open PromptAnnotation draft on every non-commit exit."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        controller = getattr(ctx, "artifact_candidate_loop_controller", None)
+        if controller is None:
+            return
+        # Reconcile before inspecting the in-memory state.  A create/change
+        # set response can be lost after SQLite commits, leaving this process
+        # with ``change_set=None`` even though a durable DRAFT exists.  The
+        # shield lets the read finish during normal turn-finalization without
+        # turning a cleanup probe into a second mutation.
+        reconcile = getattr(controller, "reconcile", None)
+        if callable(reconcile):
+            try:
+                await asyncio.shield(reconcile())
+            except Exception:  # noqa: BLE001 - discard remains best effort
+                logger.warning(
+                    "agent.candidate_loop_reconcile_failed",
+                    session_key=self._session_key,
+                    reason=reason,
+                    exc_info=True,
+                )
+        # A duplicate ``document_finish`` may have reserved the durable
+        # mutation under another tool_use_id.  This turn is not allowed to
+        # reject the shared DRAFT or restore the winner's candidate preview;
+        # leave both intact for the owning call/recovery worker.
+        candidate_state_after_reconcile = getattr(controller, "state", None)
+        candidate_status_after_reconcile = str(
+            getattr(candidate_state_after_reconcile, "status", "") or ""
+        )
+        if bool(getattr(controller, "discard_blocked_by_other_finish", False)) and (
+            candidate_status_after_reconcile not in {"committed", "discarded"}
+        ):
+            logger.info(
+                "agent.candidate_loop_cleanup_deferred_to_finish_owner",
+                session_key=self._session_key,
+                reason=reason,
+            )
+            return
+        # If cancellation happened after the atomic commit but before the
+        # browser tool emitted ``source.patched``, finish cleanup must repair
+        # the notification gap.  The audit row is already durable, so this is
+        # a retryable delivery step and never changes the revision outcome.
+        candidate_state = getattr(controller, "state", None)
+        if str(getattr(candidate_state, "status", "")) == "discarded":
+            # The repository clears candidate columns as part of the reject
+            # CAS.  The controller retains the last blob ref solely for this
+            # physical cleanup; it is safe to retry when a discard response
+            # was lost after SQLite committed.
+            discarded_change_set = getattr(controller, "change_set", None)
+            discarded_status = getattr(discarded_change_set, "status", "")
+            discarded_status = str(
+                getattr(discarded_status, "value", discarded_status) or ""
+            ).lower()
+            candidate_blob = getattr(controller, "candidate_artifact", None)
+            media_root = getattr(ctx, "artifact_media_root", None)
+            session_id = getattr(ctx, "artifact_session_id", None)
+            if (
+                candidate_blob is not None
+                and discarded_status == "rejected"
+                and isinstance(media_root, str)
+                and media_root
+                and isinstance(session_id, str)
+                and session_id
+            ):
+                try:
+                    from opensquilla.artifacts import ArtifactStore
+
+                    await asyncio.to_thread(
+                        ArtifactStore(media_root).delete_ref,
+                        session_id=session_id,
+                        artifact_id=candidate_blob.artifact_id,
+                    )
+                except Exception:  # noqa: BLE001 - orphan cleanup is retryable
+                    logger.warning(
+                        "agent.candidate_discard_blob_cleanup_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+        if (
+            str(getattr(candidate_state, "status", "")) == "committed"
+            and not bool(getattr(ctx, "_artifact_source_patched_emitted", False))
+        ):
+            emitter = getattr(ctx, "artifact_event_emitter", None)
+            service = getattr(ctx, "artifact_session", None)
+            change_set = getattr(controller, "change_set", None)
+            document_id = getattr(candidate_state, "document_id", None)
+            revision_id = getattr(change_set, "applied_revision_id", None)
+            change_set_id = getattr(change_set, "change_set_id", None)
+            exact_audit = getattr(service, "audit_event_for_mutation", None)
+            list_audit = getattr(service, "list_audit_events", None)
+            if callable(emitter) and isinstance(document_id, str):
+                try:
+                    if callable(exact_audit) and isinstance(revision_id, str) and isinstance(
+                        change_set_id, str
+                    ):
+                        latest = await asyncio.shield(
+                            exact_audit(
+                                document_id,
+                                revision_id=revision_id,
+                                change_set_id=change_set_id,
+                            )
+                        )
+                    else:
+                        latest = None
+                        if callable(list_audit):
+                            events = await asyncio.shield(list_audit(document_id))
+                            for event in events:
+                                event_type = getattr(event, "event_type", "")
+                                exact_pair = isinstance(revision_id, str) and isinstance(
+                                    change_set_id, str
+                                )
+                                if not exact_pair and not (
+                                    isinstance(event_type, str)
+                                    and (
+                                        event_type.startswith("revision.")
+                                        or event_type
+                                        in {
+                                            "document.created",
+                                            "document.restored",
+                                            "document.reverted",
+                                            "change_set.applied",
+                                        }
+                                    )
+                                ):
+                                    continue
+                                if (
+                                    isinstance(revision_id, str)
+                                    and event.revision_id != revision_id
+                                ) or (
+                                    isinstance(change_set_id, str)
+                                    and event.change_set_id != change_set_id
+                                ):
+                                    continue
+                                if latest is None or event.sequence > latest.sequence:
+                                    latest = event
+                    if latest is not None:
+                        await asyncio.shield(
+                            emitter(
+                                {
+                                    "artifactEventSeq": latest.sequence,
+                                    "documentId": document_id,
+                                    "revisionId": revision_id,
+                                    "changeSetId": change_set_id,
+                                    "action": "source.patched",
+                                }
+                            )
+                        )
+                        setattr(ctx, "_artifact_source_patched_emitted", True)
+                except Exception:  # noqa: BLE001 - notification is best effort
+                    logger.warning(
+                        "agent.candidate_commit_event_retry_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+        # A cancellation can interrupt finish after the durable commit/reject
+        # but before the bridge restore flags are updated.  Treat an active
+        # binding itself as cleanup work (not only the explicit pending bit),
+        # including terminal ``committed``/``discarded`` controllers.
+        if bool(
+            getattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+            or getattr(ctx, "_artifact_candidate_preview_bound", False)
+            or getattr(controller, "candidate_artifact", None) is not None
+        ):
+            restore = getattr(
+                getattr(ctx, "desktop_artifact_bridge", None),
+                "restore_canonical_preview",
+                None,
+            )
+            restored = False
+            if callable(restore):
+                try:
+                    preview_handle = getattr(controller, "preview_handle", None)
+                    if isinstance(preview_handle, str):
+                        restored = bool(
+                            await asyncio.shield(restore(preview_handle))
+                        )
+                except Exception:  # noqa: BLE001 - a later UI refresh may retry
+                    logger.warning(
+                        "agent.candidate_preview_commit_cleanup_retry_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+            if restored:
+                retire = getattr(
+                    getattr(ctx, "artifact_preview_service", None),
+                    "retire_candidate_preview",
+                    None,
+                )
+                handle = getattr(controller, "preview_handle", None)
+                if callable(retire) and isinstance(handle, str):
+                    try:
+                        retire(handle)
+                    except Exception:  # noqa: BLE001 - bounded best effort
+                        pass
+                setattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+                setattr(ctx, "_artifact_candidate_preview_bound", False)
+                setattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+            elif not callable(restore):
+                # The bridge disappeared between turns; there is no native
+                # handle left that can be retried. Retire the in-memory
+                # mapping rather than keeping cleanup_pending forever.
+                retire = getattr(
+                    getattr(ctx, "artifact_preview_service", None),
+                    "retire_candidate_preview",
+                    None,
+                )
+                handle = getattr(controller, "preview_handle", None)
+                if callable(retire) and isinstance(handle, str):
+                    try:
+                        retire(handle)
+                    except Exception:  # noqa: BLE001 - bounded best effort
+                        pass
+                setattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+                setattr(ctx, "_artifact_candidate_preview_bound", False)
+                setattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+        state = getattr(controller, "state", None)
+        state_status = str(getattr(state, "status", ""))
+        change_set = getattr(controller, "change_set", None)
+        has_open_draft = (
+            state_status == "open"
+            and getattr(change_set, "status", None) == "draft"
+        )
+        if state_status not in {
+            "candidate_staged",
+            "verification_passed",
+            "verification_failed",
+        } and not has_open_draft:
+            return
+        try:
+            from opensquilla.artifact_session import Actor, ActorKind
+
+            actor_id = str(
+                getattr(ctx, "agent_id", "")
+                or self.config.tool_result_store_agent_id
+                or (self.config.metadata or {}).get("agent_id")
+                or ""
+            ).strip()
+            if not actor_id and self._session_key:
+                from opensquilla.session.keys import parse_agent_id
+
+                actor_id = str(parse_agent_id(self._session_key) or "").strip()
+            if not actor_id:
+                return
+            candidate_blob = getattr(controller, "candidate_artifact", None)
+            had_candidate_preview = bool(
+                getattr(controller, "candidate_artifact", None) is not None
+                or getattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+                or getattr(ctx, "_artifact_candidate_preview_bound", False)
+                or getattr(ctx, "_artifact_candidate_preview_cleanup_pending", False)
+            )
+            discard = getattr(controller, "discard", None) or getattr(controller, "reject", None)
+            if callable(discard):
+                discard_actor = Actor(ActorKind.AGENT, actor_id)
+                # The controller performs its own one-shot CAS recovery, but
+                # the outer turn can still observe a response-loss/error after
+                # that bounded pass.  Reconcile once and retry only while the
+                # exact turn remains an open draft; never spin during cleanup.
+                for discard_attempt in range(2):
+                    try:
+                        await discard(actor=discard_actor, reason=reason)
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if bool(
+                            getattr(controller, "discard_blocked_by_other_finish", False)
+                        ):
+                            logger.info(
+                                "agent.candidate_loop_cleanup_deferred_to_finish_owner",
+                                session_key=self._session_key,
+                                reason=reason,
+                            )
+                            return
+                        if discard_attempt != 0:
+                            raise
+                        reconcile = getattr(controller, "reconcile", None)
+                        if not callable(reconcile):
+                            raise
+                        try:
+                            await asyncio.shield(reconcile())
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            raise
+                        refreshed_state = getattr(controller, "state", None)
+                        refreshed_status = str(
+                            getattr(refreshed_state, "status", "") or ""
+                        )
+                        refreshed_change_set = getattr(controller, "change_set", None)
+                        refreshed_open_draft = (
+                            refreshed_status == "open"
+                            and getattr(refreshed_change_set, "status", None) == "draft"
+                        )
+                        if refreshed_status in {"committed", "discarded"}:
+                            break
+                        if refreshed_status not in {
+                            "candidate_staged",
+                            "verification_passed",
+                            "verification_failed",
+                        } and not refreshed_open_draft:
+                            raise
+            # Never delete the physical candidate unless the durable
+            # ChangeSet is confirmed REJECTED.  A discard CAS can race a
+            # commit or remain unresolved after both bounded retries; in
+            # either case the blob may already be the canonical revision (or
+            # still be referenced by a live DRAFT), so deletion would corrupt
+            # the artifact.  The restart cleanup journal handles unresolved
+            # drafts safely on a later pass.
+            final_candidate_state = getattr(controller, "state", None)
+            final_candidate_status = str(
+                getattr(final_candidate_state, "status", "") or ""
+            )
+            final_change_set = getattr(controller, "change_set", None)
+            final_change_set_status = getattr(final_change_set, "status", "")
+            final_change_set_status = str(
+                getattr(final_change_set_status, "value", final_change_set_status)
+                or ""
+            ).lower()
+            confirmed_rejected = (
+                final_candidate_status == "discarded"
+                and final_change_set_status == "rejected"
+            )
+            if candidate_blob is not None and confirmed_rejected:
+                try:
+                    from opensquilla.artifacts import ArtifactStore
+
+                    media_root = getattr(ctx, "artifact_media_root", None)
+                    session_id = getattr(ctx, "artifact_session_id", None)
+                    if isinstance(media_root, str) and media_root and isinstance(session_id, str):
+                        await asyncio.to_thread(
+                            ArtifactStore(media_root).delete_ref,
+                            session_id=session_id,
+                            artifact_id=candidate_blob.artifact_id,
+                        )
+                except Exception:  # noqa: BLE001 - orphan GC remains safe
+                    pass
+            # An empty DRAFT has never been bound to a candidate preview.  Do
+            # not invoke a bridge restore for it; restoring a canonical surface
+            # here could detach another turn's active preview.
+            restore = (
+                getattr(
+                    getattr(ctx, "desktop_artifact_bridge", None),
+                    "restore_canonical_preview",
+                    None,
+                )
+                if candidate_blob is not None or had_candidate_preview
+                else None
+            )
+            restored = False
+            if callable(restore):
+                try:
+                    preview_handle = getattr(controller, "preview_handle", None)
+                    if isinstance(preview_handle, str):
+                        restored = bool(
+                            await asyncio.shield(restore(preview_handle))
+                        )
+                except Exception:  # noqa: BLE001 - fallback retirement still runs
+                    logger.warning(
+                        "agent.candidate_preview_restore_failed",
+                        session_key=self._session_key,
+                        reason=reason,
+                        exc_info=True,
+                    )
+            if not restored:
+                if callable(restore):
+                    # Native restore keeps its opaque handle when Gateway
+                    # release fails. Preserve the mapping and mark cleanup
+                    # pending so a later turn/shutdown retry can complete the
+                    # release; retiring it now would make that retry return
+                    # NOT_FOUND while the native surface still owns the handle.
+                    setattr(ctx, "_artifact_candidate_preview_cleanup_pending", True)
+                    # Keep the binding marker true while the native surface
+                    # still owns the handle; this is a cleanup-pending state,
+                    # not proof that the candidate was detached.
+                    setattr(ctx, "_artifact_candidate_preview_bound", True)
+                else:
+                    # A web/legacy turn may still have registered an opaque
+                    # candidate mapping even though no Desktop bridge is
+                    # bound. Without a restore method there is no native
+                    # handle to reconcile, so retire the mapping directly.
+                    retire = getattr(
+                        getattr(ctx, "artifact_preview_service", None),
+                        "retire_candidate_preview",
+                        None,
+                    )
+                    handle = getattr(controller, "preview_handle", None)
+                    if callable(retire) and isinstance(handle, str):
+                        try:
+                            retire(handle)
+                        except Exception:  # noqa: BLE001 - cleanup remains best effort
+                            pass
+                    setattr(ctx, "_artifact_candidate_preview_registration_attempted", False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - cleanup must not mask the turn outcome
+            logger.warning(
+                "agent.candidate_loop_cleanup_failed",
+                session_key=self._session_key,
+                reason=reason,
+                exc_info=True,
+            )
+
+    async def _reserve_artifact_writer_intent(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> str | None:
+        """Observe a guarded writer at ToolUseStart without durable state."""
+
+        if tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
+            return None
+        ctx = self._tool_context or current_tool_context.get()
+        if (
+            ctx is None
+            or ctx.surfaced_tools is None
+            or tool_name not in ctx.surfaced_tools
+        ):
+            return None
+        # Candidate-loop writers are staged in the turn-scoped draft
+        # controller. They must not be routed through the legacy
+        # ArtifactMutationAttemptController, whose reservation would treat the
+        # first proposal as a durable commit and close the autonomous loop.
+        if getattr(ctx, "artifact_candidate_loop_controller", None) is not None:
+            self._active_artifact_writer_intent_id = None
+            return "candidate"
+        controller = ctx.artifact_mutation_attempt_controller
+        if controller is None:
+            self._write_turn_call_log(
+                "artifact_mutation_intent_rejected",
+                tool_use_id=tool_use_id,
+                reason="mutation_authority_unavailable",
+            )
+            return "rejected"
+        try:
+            observation = await controller.observe_intent(tool_use_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - durable ids/details are not model-visible
+            logger.warning(
+                "agent.artifact_mutation_intent_rejected",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                exc_info=True,
+            )
+            self._write_turn_call_log(
+                "artifact_mutation_intent_rejected",
+                tool_use_id=tool_use_id,
+                reason="mutation_attempt_already_reserved",
+            )
+            return "rejected"
+        created = bool(getattr(observation, "created", False))
+        self._write_turn_call_log(
+            "artifact_mutation_intent_observed" if created else "artifact_mutation_intent_replay",
+            tool_use_id=tool_use_id,
+        )
+        self._active_artifact_writer_intent_id = tool_use_id
+        return "observed" if created else "replay"
+
+    async def _finalize_unresolved_artifact_writer_intent(self) -> None:
+        """Release a pure proposal, or fence a commit interrupted by turn exit."""
+
+        tool_use_id = self._active_artifact_writer_intent_id
+        if not tool_use_id:
+            return
+        controller = self._artifact_writer_controller()
+        if controller is None:
+            return
+        try:
+            if not bool(controller.owns_commit(tool_use_id)):
+                await controller.reject_proposal(tool_use_id)
+                return
+            attempt = await controller.reconcile(tool_use_id)
+            status = getattr(getattr(attempt, "status", None), "value", None)
+            if status == "reserved":
+                await controller.mark_ambiguous(tool_use_id, "writer_turn_closed")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the durable unique row still fences writes
+            logger.warning(
+                "agent.artifact_mutation_turn_close_failed",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                exc_info=True,
+            )
+
+    async def _fail_artifact_writer_intent(
+        self,
+        tool_use_id: str | None,
+        *,
+        failure_code: str,
+    ) -> None:
+        """Release an incomplete pure proposal without creating an attempt."""
+
+        if not tool_use_id:
+            return
+        candidate_context = self._tool_context or current_tool_context.get()
+        candidate_controller = getattr(
+            candidate_context,
+            "artifact_candidate_loop_controller",
+            None,
+        )
+        if candidate_controller is not None:
+            # Candidate writers never reserve a durable mutation attempt. A
+            # provider stream failure still invalidates any prior browser
+            # receipt so a subsequent finish cannot publish stale evidence.
+            invalidate = getattr(candidate_controller, "invalidate_verification", None)
+            if callable(invalidate):
+                try:
+                    await invalidate(reason=failure_code)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - an open/closed candidate is fenced
+                    pass
+            return
+        controller = self._artifact_writer_controller()
+        if controller is None:
+            return
+        try:
+            if bool(controller.owns_commit(tool_use_id)):
+                await controller.mark_ambiguous(tool_use_id, failure_code)
+            else:
+                await controller.reject_proposal(tool_use_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - preserve the original terminal outcome
+            logger.warning(
+                "agent.artifact_mutation_intent_failure_record_failed",
+                session_key=self._session_key,
+                tool_use_id=tool_use_id,
+                failure_code=failure_code,
+                exc_info=True,
+            )
+
+    async def _reject_artifact_writer_preflight(
+        self,
+        tool_call: ToolCall,
+        result: ToolResult,
+        *,
+        failure_code: str,
+        force_finalize: bool = False,
+    ) -> ToolResult:
+        """Return a pure proposal error to the loop without a durable attempt."""
+
+        controller = self._artifact_writer_controller()
+        candidate_context = self._tool_context or current_tool_context.get()
+        candidate_controller = getattr(
+            candidate_context,
+            "artifact_candidate_loop_controller",
+            None,
+        )
+        if (
+            controller is None
+            and candidate_controller is None
+        ) or tool_call.tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
+            return result
+        if candidate_controller is not None:
+            # Candidate-loop writer calls are rejected before dispatch and
+            # therefore have no legacy mutation-attempt proposal to release.
+            # Invalidate any receipt that preceded this conflicting batch so a
+            # later finish cannot commit against stale evidence.
+            invalidate = getattr(candidate_controller, "invalidate_verification", None)
+            if callable(invalidate):
+                try:
+                    await invalidate(reason=failure_code)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - an open/closed candidate is already fenced
+                    pass
+        else:
+            # The guard above establishes that the legacy controller is
+            # present whenever this branch is reached; make that invariant
+            # explicit for static analysis as well as future refactors.
+            assert controller is not None
+            try:
+                await controller.reject_proposal(tool_call.tool_use_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - no durable side effect exists
+                logger.warning(
+                    "agent.artifact_mutation_preflight_rejection_failed",
+                    session_key=self._session_key,
+                    tool_use_id=tool_call.tool_use_id,
+                    exc_info=True,
+                )
+        digest = hashlib.sha256(
+            json.dumps(
+                tool_call.arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        no_progress = digest in self._artifact_writer_rejected_proposal_digests
+        self._artifact_writer_rejected_proposal_digests.add(digest)
+        finalize = force_finalize or no_progress
+        retry_policy = "new_turn" if finalize else "same_turn"
+        outcome_code = (
+            "document_parallel_writers"
+            if force_finalize
+            else "document_proposal_no_progress"
+            if no_progress
+            else failure_code
+        )
+        try:
+            payload = json.loads(result.content)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            payload["retry_allowed"] = not finalize
+            payload["retry_policy"] = retry_policy
+            payload["outcome_code"] = outcome_code
+            result.content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        result.is_error = True
+        result.terminates_turn = False
+        result.terminal_response_text = None
+        result.effect_outcome = ToolEffectOutcome(
+            effect_state="none",
+            retry_policy=retry_policy,
+            loop_action=("finalize_without_tools" if finalize else "continue"),
+            outcome_code=outcome_code,
+            safe_details={
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": "not_attempted",
+                    "phase": "proposal",
+                    "retryPolicy": retry_policy,
+                    "code": outcome_code,
+                }
+            },
+        )
+        return result
+
     @staticmethod
     def _runtime_context_message(runtime_context: str) -> Message:
         return Message(role="user", content=runtime_context)
@@ -18664,6 +21633,8 @@ class Agent:
         return list(cache_breakpoints)
 
     def _skills_context_message(self) -> Message | None:
+        if self._restricted_tool_boundary_active():
+            return None
         prompt = self.config.skills_context_prompt
         if not prompt or not prompt.strip():
             return None
@@ -18916,6 +21887,21 @@ class Agent:
                 runtime_context_insert_index=runtime_context_insert_index,
                 protected_turn_start_index=protected_turn_start_index,
             )
+
+        if self._restricted_auxiliary_compaction_disabled():
+            # Never project canonical PromptAnnotation history into an
+            # auxiliary summarizer. The persisted transcript remains intact;
+            # the caller returns a bounded primary-request overflow error.
+            self._last_compaction_refusal_reason = (
+                "restricted_turn_compaction_disabled"
+            )
+            logger.warning(
+                "compaction.restricted_turn_skipped",
+                estimated_context_tokens=estimated_context_tokens,
+                estimated_context_chars=estimated_context_chars,
+                context_window_tokens=pressure_window_tokens,
+            )
+            return None
 
         durable_window_tokens = max(
             1,

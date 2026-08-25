@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, protocol, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -7,7 +7,7 @@ import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, w
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -23,6 +23,7 @@ import {
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   createDesktopGatewayInstanceNonce,
+  desktopGatewayAuthToken,
   desktopGatewayOwnershipMatchesLaunch,
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
@@ -35,10 +36,16 @@ import {
   DesktopGatewayOwnershipVerificationCoordinator,
 } from './desktop-gateway-ownership-verification.js'
 import {
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from './gateway-lifecycle.js'
+import {
+  OnboardingFlowCoordinator,
+  type CoordinatedOnboardingFlow,
+} from './onboarding-flow-coordinator.js'
+import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
   cleanupSelectorArgs,
@@ -53,6 +60,7 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { SecretDecryptionCache } from './secret-decryption-cache.js'
 import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
   GITHUB_UPDATE_OWNER,
@@ -108,7 +116,19 @@ import {
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
+  type NativeWorkbenchCandidatePreviewBinding,
 } from './native-workbench-surface.js'
+import {
+  parseNativeWorkbenchAnnotationModeRequest,
+  parseNativeWorkbenchAnnotationOverlayCloseRequest,
+  parseNativeWorkbenchAnnotationOverlayShowRequest,
+} from './native-workbench-annotation-contract.js'
+import { DesktopArtifactBridge } from './desktop-artifact-bridge.js'
+import {
+  DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV,
+  DESKTOP_ARTIFACT_BRIDGE_URL_ENV,
+  DesktopArtifactBridgeLoopbackTransport,
+} from './desktop-artifact-bridge-loopback.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
@@ -120,17 +140,42 @@ import { appendDesktopLogRecord } from './desktop-log-file.js'
 import {
   ArtifactPreviewLeaseBroker,
 } from './artifact-preview-lease-broker.js'
+import {
+  normalizeRouterTiers,
+  type RouterTier,
+} from './router-tier-normalization.js'
+import {
+  DESKTOP_RENDERER_ENTRY,
+  DESKTOP_RENDERER_SCHEME,
+  DESKTOP_RENDERER_URL,
+  isDesktopRendererDocumentUrl,
+  isDesktopRendererUrl,
+  resolveDesktopRendererFile,
+  routeDesktopRendererRequest,
+} from './desktop-renderer-protocol.js'
 
-protocol.registerSchemesAsPrivileged([{
-  scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
-  privileges: {
-    standard: true,
-    secure: true,
-    supportFetchAPI: true,
-    corsEnabled: true,
-    stream: true,
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: DESKTOP_RENDERER_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
   },
-}])
+  {
+    scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+])
 
 interface GatewayState {
   url: string
@@ -139,6 +184,18 @@ interface GatewayState {
   status: 'starting' | 'ready' | 'stopped' | 'error'
   logPath: string
   error?: string
+}
+
+interface DesktopGatewayConnection {
+  schemaVersion: 1
+  revision: number
+  status: GatewayState['status']
+  instanceId: string | null
+  profileFingerprint: string
+  httpUrl: string | null
+  wsUrl: string | null
+  authToken: string | null
+  error: string | null
 }
 
 type SecretEncryption = 'safeStorage' | 'plain'
@@ -168,15 +225,6 @@ interface SearchProviderCatalogEntry {
   requiresApiKey: boolean
   note: string
   keyPlaceholder: string
-}
-
-interface RouterTier {
-  provider: string
-  model: string
-  description?: string
-  supportsImage?: boolean
-  imageOnly?: boolean
-  thinkingLevel?: string
 }
 
 interface DesktopConnection {
@@ -227,6 +275,25 @@ interface OnboardingProbeResult {
   failureKind: string
   message: string
   latencyMs: number
+}
+
+type OnboardingSaveErrorCode =
+  | 'onboarding_inactive'
+  | 'save_in_progress'
+  | 'recovery_required'
+  | 'lifecycle_deferred'
+
+type OnboardingSaveResult =
+  | { ok: true }
+  | { ok: false; code: OnboardingSaveErrorCode; error: string }
+
+interface OnboardingFlow extends CoordinatedOnboardingFlow<
+  OnboardingPayload,
+  OnboardingSaveResult
+> {
+  window: BrowserWindow | null
+  resolve: ((credential: DesktopConnection) => void) | null
+  reject: ((error: Error) => void) | null
 }
 
 interface DesktopSettingsPayload extends OnboardingPayload {}
@@ -352,6 +419,19 @@ interface BootStatus {
 interface BootError {
   message: string
   at: string
+  code?: BootErrorCode
+}
+
+type BootErrorCode = 'keychain_unavailable'
+
+class DesktopStartupError extends Error {
+  constructor(
+    readonly code: BootErrorCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'DesktopStartupError'
+  }
 }
 
 interface MacInstallContext {
@@ -438,6 +518,8 @@ let allowGracefulShutdownWhileQuitting = false
 // machine. Synchronous append: lifecycle events are rare, renderer events are
 // rate-limited, and every record must survive an imminent app.exit(). The file
 // sink caps individual records and rotates a bounded backup set.
+const desktopProcessStartedAt = Date.now()
+
 function desktopLog(event: string, detail?: Record<string, unknown>): void {
   try {
     appendDesktopLogRecord(
@@ -468,9 +550,14 @@ function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): strin
 }
 
 let gatewayStartPromise: Promise<GatewayState> | null = null
-let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
-let rejectOnboarding: ((error: Error) => void) | null = null
+let onboardingSaveTelemetryAttempt = 0
+const onboardingFlows = new OnboardingFlowCoordinator<
+  OnboardingPayload,
+  OnboardingSaveResult,
+  OnboardingFlow
+>()
 let secretStorageBackendCache: SecretEncryption | null = null
+const decryptedSecretCache = new SecretDecryptionCache()
 let macCodeSignatureDiagnosticCache: string | null = null
 let bootStatus: BootStatus = {
   phaseId: 'profile',
@@ -495,6 +582,8 @@ const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
+let gatewayConnectionRevision = 0
+let gatewayConnectionInstanceId: string | null = null
 
 function invalidateDesktopOpenFlow(): number {
   desktopOpenFlowRevision += 1
@@ -523,6 +612,54 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
+function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
+  const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
+  const authToken = ready && gatewayState.owned && gatewayProcess
+    ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce ?? null
+    : null
+  return {
+    schemaVersion: 1,
+    revision: gatewayConnectionRevision,
+    status: gatewayState.status,
+    instanceId: gatewayConnectionInstanceId,
+    profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
+    httpUrl: gatewayState.url || null,
+    wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
+    authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
+    error: gatewayState.error || null,
+  }
+}
+
+function publishGatewayConnection(): void {
+  gatewayConnectionRevision += 1
+  const window = currentMainWindow()
+  if (!window || !isDesktopRendererDocumentUrl(window.webContents.getURL())) return
+  window.webContents.send('gateway:connection-changed', desktopGatewayConnectionSnapshot())
+}
+
+interface GatewayConnectionTransition {
+  url?: string
+  port?: number
+  owned?: boolean
+  status?: GatewayState['status']
+  error?: string | null
+  instanceId?: string | null
+}
+
+function transitionGatewayConnection(transition: GatewayConnectionTransition): void {
+  if (transition.url !== undefined) gatewayState.url = transition.url
+  if (transition.port !== undefined) gatewayState.port = transition.port
+  if (transition.owned !== undefined) gatewayState.owned = transition.owned
+  if (transition.status !== undefined) gatewayState.status = transition.status
+  if (transition.error !== undefined) {
+    gatewayState.error = transition.error === null ? undefined : transition.error
+  }
+  if (transition.instanceId !== undefined) {
+    gatewayConnectionInstanceId = transition.instanceId
+  }
+  publishGatewayConnection()
+}
+
 const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
   getOwnedGatewayUrl: () => (
     gatewayState.owned && gatewayState.status === 'ready'
@@ -532,6 +669,10 @@ const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
 })
 
 const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
+  annotationAudit: entry => desktopLog(
+    'native_workbench_annotation_picker_lifecycle',
+    { ...entry },
+  ),
   forceArtifactPreviewsOffline: process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1',
   getPrivilegedGatewayUrl: () => (
     gatewayState.status === 'ready' && gatewayState.url
@@ -539,6 +680,9 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
       : null
   ),
   getWindow: () => currentMainWindow(),
+  resolveCandidatePreview: resolveCandidatePreviewFromGateway,
+  releaseCandidatePreview: releaseCandidatePreviewFromGateway,
+  pinArtifactPreview: grant => artifactPreviewLeaseBroker.pinSurface(grant),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
@@ -551,12 +695,144 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
     if (
       !window
       || !gatewayState.owned
-      || !gatewayState.url
-      || !isCurrentWindowAtControlUi(window, gatewayState.url)
+      || !isCurrentWindowAtDesktopRenderer(window)
     ) return
     window.webContents.send('desktop:workbench:surface-event', event)
   },
 })
+const desktopArtifactBridge = new DesktopArtifactBridge({
+  getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
+  acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
+})
+const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
+  desktopArtifactBridge,
+  {
+    audit: entry => desktopLog(entry.event, {
+      operation: entry.operation,
+      outcome: entry.outcome,
+      code: entry.code,
+      durationMs: entry.durationMs,
+    }),
+  },
+)
+
+async function resolveCandidatePreviewFromGateway(
+  candidateHandle: string,
+  signal: AbortSignal,
+): Promise<NativeWorkbenchCandidatePreviewBinding> {
+  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
+    ? gatewayState.url
+    : null
+  const token = desktopArtifactBridgeLoopback.token()
+  if (!gatewayOrigin || !token) {
+    throw new Error('The Desktop candidate preview service is unavailable.')
+  }
+  const response = await fetch(
+    new URL('/api/v1/desktop-artifact-candidate-preview/resolve', gatewayOrigin),
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ version: 1, candidateHandle }),
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal,
+    },
+  )
+  const contentType = response.headers.get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase()
+  const declaredLength = response.headers.get('content-length')
+  if (
+    contentType !== 'application/json'
+    || (declaredLength !== null && (
+      !/^\d+$/.test(declaredLength)
+      || Number(declaredLength) > 1024 * 1024
+    ))
+  ) throw new Error('The Desktop candidate preview response is invalid.')
+  const text = await response.text()
+  if (!response.ok || text.length > 1024 * 1024) {
+    throw new Error('The Desktop candidate preview service rejected the request.')
+  }
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    throw new Error('The Desktop candidate preview response is invalid.')
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('The Desktop candidate preview response is invalid.')
+  }
+  const value = raw as Record<string, unknown>
+  const launchUrl = value.launch_url
+  const expectedOrigin = value.preview_origin
+  const candidateArtifactId = value.candidate_artifact_id
+  const leaseId = value.lease_id
+  const scopeId = value.scope_id
+  const effectiveMode = value.effective_mode
+  if (
+    typeof launchUrl !== 'string'
+    || typeof expectedOrigin !== 'string'
+    || typeof candidateArtifactId !== 'string'
+    || typeof leaseId !== 'string'
+    || typeof scopeId !== 'string'
+    || scopeId.length === 0
+    || scopeId.length > 512
+    || /[\u0000-\u001f\u007f]/.test(scopeId)
+    // Candidate previews are always rendered in the offline realm. Keep this
+    // check at the Gateway→Electron boundary as well as in the native surface
+    // so a compromised/stale response cannot widen browser-action authority.
+    || effectiveMode !== 'offline'
+    || value.candidate_handle !== candidateHandle
+  ) throw new Error('The Desktop candidate preview response is invalid.')
+  return {
+    candidateHandle,
+    candidateArtifactId,
+    leaseId,
+    launchUrl,
+    expectedOrigin,
+    scopeId,
+    mode: effectiveMode,
+  }
+}
+
+async function releaseCandidatePreviewFromGateway(
+  candidateHandle: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
+    ? gatewayState.url
+    : null
+  const token = desktopArtifactBridgeLoopback.token()
+  // A missing Gateway/bridge identity is not a successful restore.  Native
+  // cleanup callers may intentionally swallow this error during shutdown,
+  // while the interactive discard path must retain the candidate handle and
+  // retry instead of claiming that the canonical preview was restored.
+  if (!gatewayOrigin || !token) {
+    throw new Error('The Desktop candidate preview cleanup service is unavailable.')
+  }
+  const response = await fetch(
+    new URL(
+      `/api/v1/desktop-artifact-candidate-preview/${encodeURIComponent(candidateHandle)}`,
+      gatewayOrigin,
+    ),
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal,
+    },
+  )
+  if (!response.ok) {
+    throw new Error('The Desktop candidate preview cleanup was rejected.')
+  }
+}
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -616,6 +892,11 @@ function desktopChildEnvironment(
   additions: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env }
+  // Never let inherited/stale bridge credentials flow into helper, recovery,
+  // probe, or migration children. startGateway adds its freshly generated
+  // process-lifetime credentials only to the owned Gateway spawn.
+  delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]
+  delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]
   return {
     ...environment,
     ...additions,
@@ -990,6 +1271,120 @@ function bootPagePath(): string {
     : join(packageRoot, 'src', 'boot.html')
 }
 
+function desktopRendererDistPath(): string {
+  return app.isPackaged
+    ? join(packagedRuntimeRoot(), 'gateway', 'control-ui-dist')
+    : join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
+}
+
+function desktopGatewayUnavailableResponse(): Response {
+  return new Response(JSON.stringify({
+    error: 'desktop_gateway_unavailable',
+    status: gatewayState.status,
+    message: gatewayState.error || 'The local runtime is not ready.',
+  }), {
+    status: 503,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  })
+}
+
+async function proxyDesktopRendererRequest(
+  request: Request,
+  pathAndQuery: string,
+): Promise<Response> {
+  if (gatewayState.status !== 'ready' || !gatewayState.url) {
+    return desktopGatewayUnavailableResponse()
+  }
+  const headers = new Headers(request.headers)
+  headers.delete('host')
+  headers.delete('origin')
+  headers.delete('referer')
+  const ownedGatewayNonce = gatewayProcess
+    ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+    : undefined
+  if (gatewayState.owned && ownedGatewayNonce) {
+    headers.delete('x-opensquilla-token')
+    headers.set(
+      'authorization',
+      `Bearer ${desktopGatewayAuthToken(ownedGatewayNonce)}`,
+    )
+  }
+  const method = request.method.toUpperCase()
+  const body = method === 'GET' || method === 'HEAD'
+    ? undefined
+    : new Uint8Array(await request.arrayBuffer())
+  const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
+    method,
+    headers,
+    body,
+    redirect: 'manual',
+    bypassCustomProtocolHandlers: true,
+  })
+  const responseHeaders = new Headers(response.headers)
+  // API bytes are fetch capabilities, not privileged Desktop documents. If a
+  // response is ever interpreted as HTML despite the navigation guards, the
+  // response-level sandbox prevents scripts, framing, and same-origin access.
+  responseHeaders.set(
+    'content-security-policy',
+    "sandbox; default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+  )
+  responseHeaders.set('x-content-type-options', 'nosniff')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders,
+  })
+}
+
+function secureDesktopRendererDocument(response: Response): Response {
+  const headers = new Headers(response.headers)
+  headers.set(
+    'content-security-policy',
+    [
+      "default-src 'self' opensquilla-app://desktop",
+      "base-uri opensquilla-app://desktop",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "script-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "style-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "img-src 'self' opensquilla-app://desktop blob: data: http: https:",
+      "font-src 'self' opensquilla-app://desktop data:",
+      "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
+      "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
+      "frame-src blob: http: https:",
+      "worker-src 'self' opensquilla-app://desktop blob:",
+    ].join('; '),
+  )
+  headers.set('x-content-type-options', 'nosniff')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+async function handleDesktopRendererRequest(request: Request): Promise<Response> {
+  const route = routeDesktopRendererRequest(request.url, request.method)
+  if (route.kind === 'reject') return new Response('Not found', { status: 404 })
+  if (route.kind === 'gateway') return proxyDesktopRendererRequest(request, route.pathAndQuery)
+
+  const assetPath = resolveDesktopRendererFile(desktopRendererDistPath(), route.relativePath)
+  if (!assetPath || !(await pathIsFile(assetPath))) {
+    const detail = route.kind === 'spa'
+      ? `Desktop renderer entry is missing: ${DESKTOP_RENDERER_ENTRY}`
+      : 'Desktop renderer asset was not found.'
+    return new Response(detail, { status: 404 })
+  }
+  const response = await electronNet.fetch(pathToFileURL(assetPath).href, {
+    bypassCustomProtocolHandlers: true,
+  })
+  return route.kind === 'spa' ? secureDesktopRendererDocument(response) : response
+}
+
+function installDesktopRendererProtocol(): void {
+  protocol.handle(DESKTOP_RENDERER_SCHEME, handleDesktopRendererRequest)
+}
+
 function appIconPath(): string {
   // Only icon.icns (macOS) and icon.ico (Windows) ship in assets/ — there is no
   // icon.png, so the previous path resolved to a missing file everywhere. On
@@ -1060,9 +1455,25 @@ function assertSupportedMacInstallLocation(): void {
   if (message) throw new Error(message)
 }
 
+const MAC_KEYCHAIN_ACCESS_PATHS = [
+  '/System/Library/CoreServices/Applications/Keychain Access.app',
+  '/Applications/Utilities/Keychain Access.app',
+] as const
+
+async function openMacKeychainAccess(): Promise<boolean> {
+  if (process.platform !== 'darwin') return false
+  for (const applicationPath of MAC_KEYCHAIN_ACCESS_PATHS) {
+    if (!existsSync(applicationPath)) continue
+    const error = await shell.openPath(applicationPath)
+    if (!error) return true
+  }
+  return false
+}
+
 function sendBootStatus(phaseId: BootPhaseId): void {
   bootStatus = { phaseId, label: desktopT('boot.' + phaseId), at: new Date().toISOString() }
   bootError = null
+  desktopStartupLog('boot_phase', { phaseId })
   mainWindow?.webContents.send('desktop:boot:status', bootStatus)
 }
 
@@ -1070,6 +1481,7 @@ function sendBootError(error: unknown): void {
   bootError = {
     message: error instanceof Error ? error.message : String(error),
     at: new Date().toISOString(),
+    ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
   }
   mainWindow?.webContents.send('desktop:boot:error', bootError)
 }
@@ -1117,7 +1529,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
     id: 'tokenrhythm',
     label: 'TokenRhythm',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-v4-pro-0813',
     baseUrl: 'https://tokenrhythm.studio/v1',
     apiKeyEnv: 'TOKENRHYTHM_API_KEY',
     requiresApiKey: true,
@@ -1490,10 +1902,10 @@ function minimaxRouterProfile(provider: string): Record<string, RouterTier> {
 
 const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
   tokenrhythm: {
-    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash', description: 'Fast DeepSeek route for simple work', supportsImage: false },
-    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro', description: 'Balanced DeepSeek route for normal agent work', supportsImage: false },
-    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi route for harder coding and analysis', supportsImage: false },
-    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest-tier GLM route for deep review and planning', supportsImage: false },
+    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work', supportsImage: false },
+    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work', supportsImage: false },
+    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis', supportsImage: false },
+    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', supportsImage: false, ensembleEnabled: true },
     image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true },
   },
   openrouter: {
@@ -1667,35 +2079,6 @@ function defaultRouterTiers(provider: string, mode: RouterMode): Record<string, 
   return cloneRouterTiers(ROUTER_PROFILES[provider] || ROUTER_PROFILES.openrouter)
 }
 
-function normalizeRouterTiers(raw: unknown, fallback: Record<string, RouterTier>): Record<string, RouterTier> {
-  if (!raw || typeof raw !== 'object') return cloneRouterTiers(fallback)
-  const source = raw as Record<string, unknown>
-  const out = cloneRouterTiers(fallback)
-  for (const [rawName, value] of Object.entries(source)) {
-    if (!value || typeof value !== 'object') continue
-    const name = canonicalTierKey(rawName)
-    // Tier keys are emitted raw into TOML table headers ([squilla_router.tiers.NAME]),
-    // so a key that is not a TOML bare key (spaces, dots, quotes, brackets, newlines)
-    // would produce an unparseable config the gateway rejects on every boot. Drop
-    // such keys and fall back to the profile defaults instead.
-    if (!/^[A-Za-z0-9_-]+$/.test(name)) continue
-    const tier = value as Record<string, unknown>
-    const provider = String(tier.provider || out[name]?.provider || '').trim()
-    const model = String(tier.model || out[name]?.model || '').trim()
-    if (!provider || !model) continue
-    out[name] = {
-      ...out[name],
-      provider,
-      model,
-      description: String(tier.description || out[name]?.description || ''),
-      supportsImage: Boolean(tier.supportsImage ?? tier.supports_image ?? out[name]?.supportsImage),
-      imageOnly: Boolean(tier.imageOnly ?? tier.image_only ?? out[name]?.imageOnly),
-      thinkingLevel: String(tier.thinkingLevel ?? tier.thinking_level ?? out[name]?.thinkingLevel ?? ''),
-    }
-  }
-  return out
-}
-
 function routerDefaultModel(tiers: Record<string, RouterTier>, defaultTier: TextRouterTier): string {
   return tiers[defaultTier]?.model || tiers.c1?.model || tiers.c0?.model || ''
 }
@@ -1747,6 +2130,7 @@ function routerTierTomlLines(name: string, tier: RouterTier): string[] {
   if (tier.supportsImage !== undefined) lines.push(`supports_image = ${tier.supportsImage ? 'true' : 'false'}`)
   if (tier.imageOnly !== undefined) lines.push(`image_only = ${tier.imageOnly ? 'true' : 'false'}`)
   if (tier.thinkingLevel) lines.push(`thinking_level = ${tomlString(tier.thinkingLevel)}`)
+  if (tier.ensembleEnabled !== undefined) lines.push(`ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}`)
   return lines
 }
 
@@ -1785,15 +2169,14 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
   const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
-  const roles = ['primary', 'contrast', 'fast_check', 'critic']
-  const candidates = profile.proposers.flatMap((model, index) => [
+  const candidates = profile.proposers.flatMap(model => [
     '',
     '[[llm_ensemble.candidates]]',
     `provider = ${tomlString(profile.provider)}`,
     `model = ${tomlString(model)}`,
     'source = "custom"',
     'enabled = true',
-    `role = ${tomlString(roles[index] || '')}`,
+    'role = "proposer"',
   ])
   candidates.push(
     '',
@@ -1868,13 +2251,17 @@ function desktopSecretStorageBackend(): SecretEncryption {
   return secretStorageBackendCache
 }
 
+function invalidateSecretStorageBackendCache(): void {
+  secretStorageBackendCache = null
+}
+
 function encryptSecret(secret: string): { value: string; encryption: SecretEncryption } {
   const policyBackend = desktopSecretStoragePolicyBackend()
   const availableBackend = desktopSecretStorageBackend()
   if (policyBackend === 'safeStorage') {
     if (availableBackend !== 'safeStorage') {
       throw new Error(
-        'The OS keychain is unavailable. Unlock it and reopen OpenSquilla before saving credentials.'
+        'The OS keychain is unavailable. Unlock it and try saving credentials again.'
       )
     }
     try {
@@ -1900,9 +2287,40 @@ function decryptSecret(encryptedValue: string | undefined, encryption: SecretEnc
     if (desktopSecretStorageBackend() !== 'safeStorage') {
       throw new Error('Saved desktop credential requires macOS Keychain, but this local build uses plain credential storage.')
     }
-    return safeStorage.decryptString(payload)
+    return decryptedSecretCache.resolve(
+      activeDesktopProfile().home,
+      encryptedValue,
+      encryption,
+      () => safeStorage.decryptString(payload),
+    )
   }
   return payload.toString('utf8')
+}
+
+function rememberDecryptedCredentialSecrets(
+  record: DesktopConnection,
+  apiKey: string,
+  searchApiKey: string,
+  profile = activeDesktopProfile(),
+): void {
+  if (record.encryption !== 'safeStorage') return
+  const profileScope = profile.home
+  if (record.encryptedApiKey && apiKey) {
+    decryptedSecretCache.remember(
+      profileScope,
+      record.encryptedApiKey,
+      record.encryption,
+      apiKey,
+    )
+  }
+  if (record.encryptedSearchApiKey && searchApiKey) {
+    decryptedSecretCache.remember(
+      profileScope,
+      record.encryptedSearchApiKey,
+      record.encryption,
+      searchApiKey,
+    )
+  }
 }
 
 function decryptApiKey(record: DesktopConnection): string {
@@ -2357,6 +2775,12 @@ async function saveDesktopCredential(
       writerReserved,
       configLocale,
     )
+    rememberDecryptedCredentialSecrets(
+      credential,
+      resolvedApiKey,
+      resolvedSearchApiKey,
+      targetProfile,
+    )
     return credential
   } finally {
     finishWriter()
@@ -2408,6 +2832,7 @@ async function saveImportedDesktopCredential(
     throw new Error('A gateway is still serving this profile; stop it before adopting credentials.')
   }
   const credential = buildImportedDesktopCredential(prefill, importTransactionId, apiKeyOverride)
+  const candidateCredential = JSON.stringify(credential, null, 2)
   const finishWriter = writerReserved
     ? () => {}
     : beginDesktopWriterOperation('adopt imported desktop credential')
@@ -2426,7 +2851,7 @@ async function saveImportedDesktopCredential(
         expected_config: importedConfig,
         config: importedConfig,
         expected_credential: expectedCredential,
-        credential: JSON.stringify(credential, null, 2),
+        credential: candidateCredential,
       }),
       true,
     )
@@ -2436,8 +2861,10 @@ async function saveImportedDesktopCredential(
     if (result.outcome === 'recovery_required') {
       throw new Error(`Imported credential was not adopted (${result.stable_code}).`)
     }
-    const readback = await loadDesktopCredential()
+    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
     const expectedKey = apiKeyOverride.trim() || prefill.apiKey.trim()
+    rememberDecryptedCredentialSecrets(credential, expectedKey, '', profile)
+    const readback = await loadDesktopCredential()
     if (
       !readback
       || readback.configAuthority !== 'profile'
@@ -2650,6 +3077,7 @@ async function applyDesktopSettingsPair(
     if (!restartSafe) {
       throw new Error(`Desktop settings were not applied (${result.stable_code}).`)
     }
+    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
     return result
   } finally {
     if (ownedGatewayWasRunning && desktopProfileKey() === targetProfileKey) {
@@ -2739,7 +3167,9 @@ function clearReusableGatewayState(): void {
   gatewayState.owned = false
   gatewayState.status = 'stopped'
   gatewayState.error = undefined
+  gatewayConnectionInstanceId = null
   gatewayProfileKey = null
+  publishGatewayConnection()
 }
 
 interface ArtifactOpenRequest {
@@ -3900,6 +4330,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDirect: 'Direct model is required for Direct single model mode.',
     defaultTierRequiresModel: 'Default router tier requires a model.',
     searchApiKeyRequired: '{label} search API key is required.',
+    savingSetup: 'Saving setup…',
+    setupTakingLonger: 'First-time setup usually takes 10–20 seconds. Please keep this window open.',
     stepLabel: 'Step {n}',
   },
   'zh-Hans': {
@@ -3946,6 +4378,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDirect: '直连单模型模式需要直连模型。',
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
     searchApiKeyRequired: '需要 {label} 搜索 API 密钥。',
+    savingSetup: '正在保存设置…',
+    setupTakingLonger: '首次设置通常需要 10–20 秒，请保持此窗口打开。',
     stepLabel: '步骤 {n}',
   },
   ja: {
@@ -3992,6 +4426,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Smart Router を無効にする場合は直接モデルが必要です。',
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
+    savingSetup: '設定を保存しています…',
+    setupTakingLonger: '初回セットアップには通常10～20秒かかります。このウィンドウを開いたままお待ちください。',
     stepLabel: 'ステップ {n}',
   },
   fr: {
@@ -4038,6 +4474,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Un modèle direct est requis lorsque Smart Router est désactivé.',
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
+    savingSetup: 'Enregistrement…',
+    setupTakingLonger: 'La configuration initiale prend généralement 10 à 20 secondes. Gardez cette fenêtre ouverte.',
     stepLabel: 'Étape {n}',
   },
   de: {
@@ -4084,6 +4522,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Ein direktes Modell ist erforderlich, wenn Smart Router deaktiviert ist.',
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
+    savingSetup: 'Einrichtung wird gespeichert…',
+    setupTakingLonger: 'Die Ersteinrichtung dauert normalerweise 10–20 Sekunden. Lassen Sie dieses Fenster geöffnet.',
     stepLabel: 'Schritt {n}',
   },
   es: {
@@ -4130,6 +4570,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Se requiere un modelo directo cuando Smart Router está desactivado.',
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
+    savingSetup: 'Guardando la configuración…',
+    setupTakingLonger: 'La configuración inicial suele tardar entre 10 y 20 segundos. Mantén esta ventana abierta.',
     stepLabel: 'Paso {n}',
   },
 }
@@ -5626,6 +6068,16 @@ function onboardingHtml(
       border-top: 1px solid var(--line);
       padding-top: 16px;
     }
+    .actions > button { flex: 0 0 auto; }
+    .submit-status {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      text-align: center;
+    }
     button {
       min-height: 36px;
       border: 1px solid transparent;
@@ -5640,6 +6092,10 @@ function onboardingHtml(
     }
     .secondary:hover { color: var(--ink); }
     .primary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
       background: var(--primary);
       border-radius: 8px;
       color: #fff;
@@ -5650,6 +6106,19 @@ function onboardingHtml(
       background: var(--primary-hover);
     }
     .primary:disabled { opacity: 0.55; cursor: not-allowed; }
+    .primary.is-loading::before {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
+      border: 2px solid rgba(255, 255, 255, 0.45);
+      border-top-color: #fff;
+      border-radius: 50%;
+      content: "";
+      animation: onboarding-submit-spin 700ms linear infinite;
+    }
+    @keyframes onboarding-submit-spin {
+      to { transform: rotate(360deg); }
+    }
     .error {
       min-height: 18px;
       color: #b42318;
@@ -5692,6 +6161,9 @@ function onboardingHtml(
         transition-duration: 0.01ms !important;
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
+      }
+      .primary.is-loading::before {
+        animation: none !important;
       }
     }
   </style>
@@ -5784,10 +6256,11 @@ function onboardingHtml(
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
+          <span class="submit-status" id="submitStatus" role="status" aria-live="polite" aria-atomic="true"></span>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
-      <div class="error" id="error" role="alert" aria-live="assertive"></div>
+      <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
     </form>
   </main>
   <script>
@@ -5815,6 +6288,11 @@ function onboardingHtml(
     let searchSectionOpen = false;
     let routerTiers = clone(routerProfiles.openrouter);
     let modelEditorOpen = false;
+    let submitting = false;
+    const SUBMIT_SLOW_FEEDBACK_MS = 8_000;
+    let submitSlowTimer = null;
+    const setupForm = document.getElementById('setup-form');
+    const cardBody = document.querySelector('.card-body');
     const provider = document.getElementById('provider');
     const baseUrl = document.getElementById('baseUrl');
     const model = document.getElementById('model');
@@ -5835,6 +6313,7 @@ function onboardingHtml(
     const searchApiKey = document.getElementById('searchApiKey');
     const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
+    const submitStatus = document.getElementById('submitStatus');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
 	    const searchKeyLabel = document.getElementById('searchKeyLabel');
@@ -5850,6 +6329,26 @@ function onboardingHtml(
     const providerOptions = document.getElementById('providerOptions');
     function clone(value) {
       return JSON.parse(JSON.stringify(value || {}));
+    }
+    function deepFreeze(value) {
+      if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+      Object.values(value).forEach((item) => deepFreeze(item));
+      return Object.freeze(value);
+    }
+    function onboardingPayloadSnapshot() {
+      return deepFreeze({
+        provider: provider.value,
+        apiKey: apiKey.value,
+        baseUrl: baseUrl.value,
+        model: model.value,
+        modelRoutingMode: modelRoutingMode.value,
+        routerMode: routerMode.value,
+        routerDefaultTier: 'c1',
+        routerTiers: clone(routerTiers),
+        searchProvider: searchProvider.value,
+        searchApiKey: searchApiKey.value,
+        locale: activeLocale,
+      });
     }
     function currentProvider() {
       return providers.find((item) => item.id === provider.value) || providers[0];
@@ -6074,6 +6573,33 @@ function onboardingHtml(
       syncProviderDefaults(false);
       syncSearchProviderControls();
     }
+    function clearSubmitSlowTimer() {
+      if (submitSlowTimer !== null) clearTimeout(submitSlowTimer);
+      submitSlowTimer = null;
+    }
+    function setSubmitting(next) {
+      clearSubmitSlowTimer();
+      submitting = Boolean(next);
+      if (submitting) setProviderPickerOpen(false);
+      setupForm.setAttribute('aria-busy', String(submitting));
+      finish.setAttribute('aria-busy', String(submitting));
+      finish.disabled = submitting;
+      finish.classList.toggle('is-loading', submitting);
+      cardBody.inert = submitting;
+      onboardingLocale.disabled = submitting;
+      if (submitting) {
+        finish.textContent = t.savingSetup;
+        submitStatus.textContent = desktopMessage(activeLocale, 'boot.profile');
+        submitSlowTimer = setTimeout(() => {
+          submitSlowTimer = null;
+          if (submitting) submitStatus.textContent = t.setupTakingLonger;
+        }, SUBMIT_SLOW_FEEDBACK_MS);
+      } else {
+        finish.textContent = desktopMessage(activeLocale, 'onboarding.step5.finish');
+        submitStatus.textContent = '';
+      }
+    }
+    window.addEventListener('pagehide', clearSubmitSlowTimer);
 	    onboardingLocale.addEventListener('change', () => {
 	      applyLocale(onboardingLocale.value);
 	    });
@@ -6149,28 +6675,34 @@ function onboardingHtml(
       window.opensquillaDesktop.cancelOnboarding();
     });
     finish.addEventListener('click', async () => {
+      if (submitting) return;
       clearValidationErrors();
       const issue = validateStep();
       if (issue) {
         presentValidationIssue(issue);
         return;
       }
+      const payload = onboardingPayloadSnapshot();
+      setSubmitting(true);
+      let succeeded = false;
       try {
-        await window.opensquillaDesktop.saveOnboarding({
-          provider: provider.value,
-          apiKey: apiKey.value,
-          baseUrl: baseUrl.value,
-          model: model.value,
-          modelRoutingMode: modelRoutingMode.value,
-          routerMode: routerMode.value,
-          routerDefaultTier: 'c1',
-          routerTiers,
-          searchProvider: searchProvider.value,
-          searchApiKey: searchApiKey.value,
-          locale: activeLocale,
-        });
+        const result = await window.opensquillaDesktop.saveOnboarding(payload);
+        if (!result || result.ok !== true) {
+          throw new Error(
+            result && result.error
+              ? String(result.error)
+              : 'OpenSquilla setup could not be saved.',
+          );
+        }
+        succeeded = true;
+        clearSubmitSlowTimer();
       } catch (error) {
         errorBox.textContent = error && error.message ? error.message : String(error);
+      } finally {
+        if (!succeeded) {
+          setSubmitting(false);
+          errorBox.focus({ preventScroll: false });
+        }
       }
     });
     function applyMigrationPrefill(prefill) {
@@ -6200,7 +6732,24 @@ function onboardingHtml(
 </html>`
 }
 
+function abandonOnboardingFlow(
+  flow: OnboardingFlow,
+  error: Error,
+  closeWindow: boolean,
+): void {
+  if (!onboardingFlows.abandon(flow)) return
+  const reject = flow.reject
+  flow.resolve = null
+  flow.reject = null
+  const window = flow.window
+  if (closeWindow && window && !window.isDestroyed()) window.close()
+  reject?.(error)
+}
+
 async function runOnboarding(): Promise<DesktopConnection> {
+  // A detached save retains coordinator ownership until it settles, preventing
+  // Retry from opening a replacement flow that the old completion could affect.
+  await onboardingFlows.waitForAbandonedSave()
   const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
@@ -6215,7 +6764,8 @@ async function runOnboarding(): Promise<DesktopConnection> {
       || Boolean(existing?.encryptedApiKey && existing.encryption === 'safeStorage')
     )
   ) {
-    throw new Error(
+    throw new DesktopStartupError(
+      'keychain_unavailable',
       'OpenSquilla needs the OS keychain to read or safely adopt this credential, '
       + 'but the keychain is currently unavailable. Unlock it and reopen '
       + 'OpenSquilla, or use "Reset setup" to start over.'
@@ -6233,10 +6783,13 @@ async function runOnboarding(): Promise<DesktopConnection> {
   }
 
   return new Promise((resolveCredential, rejectCredential) => {
-    resolveOnboarding = resolveCredential
-    rejectOnboarding = rejectCredential
+    if (onboardingFlows.active) {
+      focusOnboardingWindow()
+      rejectCredential(new Error('OpenSquilla setup is already in progress.'))
+      return
+    }
     const parentWindow = currentMainWindow()
-    onboardingWindow = new BrowserWindow({
+    const window = new BrowserWindow({
       width: 1040,
       height: 820,
       minWidth: 900,
@@ -6256,9 +6809,24 @@ async function runOnboarding(): Promise<DesktopConnection> {
         sandbox: true,
       },
     })
-    installEditingContextMenu(onboardingWindow)
+    const flow: OnboardingFlow = {
+      window,
+      state: 'editing',
+      resolve: resolveCredential,
+      reject: rejectCredential,
+      savePayload: null,
+      savePromise: null,
+    }
+    if (!onboardingFlows.activate(flow)) {
+      window.destroy()
+      focusOnboardingWindow()
+      rejectCredential(new Error('OpenSquilla setup is already in progress.'))
+      return
+    }
+    onboardingWindow = window
+    installEditingContextMenu(window)
 
-    onboardingWindow.webContents.setWindowOpenHandler(({ url }) => {
+    window.webContents.setWindowOpenHandler(({ url }) => {
       if (url === TOKENRHYTHM_REGISTER_URL) {
         void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
@@ -6274,32 +6842,34 @@ async function runOnboarding(): Promise<DesktopConnection> {
         void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
     }
-    onboardingWindow.webContents.on('will-navigate', guardOnboardingNavigation)
-    onboardingWindow.webContents.on('will-redirect', guardOnboardingNavigation)
+    window.webContents.on('will-navigate', guardOnboardingNavigation)
+    window.webContents.on('will-redirect', guardOnboardingNavigation)
     // Rebuild the app menu so View → Reload is disabled while onboarding is open.
     createApplicationMenu()
 
-    onboardingWindow.once('ready-to-show', () => {
-      if (!onboardingWindow || onboardingWindow.isDestroyed()) return
-      onboardingWindow.show()
-      onboardingWindow?.focus()
+    window.once('ready-to-show', () => {
+      if (flow.window !== window || window.isDestroyed() || flow.state === 'abandoned') return
+      window.show()
+      window.focus()
     })
-    onboardingWindow.on('closed', () => {
-      onboardingWindow = null
+    window.on('closed', () => {
+      if (onboardingWindow === window) onboardingWindow = null
+      if (flow.window === window) flow.window = null
       // Re-enable View → Reload now that the wizard is gone.
       createApplicationMenu()
-      if (rejectOnboarding) {
-        const reject = rejectOnboarding
-        resolveOnboarding = null
-        rejectOnboarding = null
-        reject(new Error('OpenSquilla setup was closed.'))
+      if (flow.state !== 'completed' && flow.state !== 'abandoned') {
+        abandonOnboardingFlow(flow, new Error('OpenSquilla setup was closed.'), false)
       }
     })
 
-    onboardingWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
+    window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
       pendingProviderSetup,
     ))}`).catch((error) => {
-      rejectCredential(error instanceof Error ? error : new Error(String(error)))
+      abandonOnboardingFlow(
+        flow,
+        error instanceof Error ? error : new Error(String(error)),
+        true,
+      )
     })
   })
 }
@@ -6347,34 +6917,29 @@ function splitPathValue(value?: string): string[] {
   return (value || '').split(pathDelimiter()).filter(Boolean)
 }
 
-function desktopNodeBinCandidates(): string[] {
-  const candidates = process.platform === 'win32'
+function desktopChildPath(): string {
+  const currentPath = process.env.PATH || process.env.Path || ''
+  const currentParts = splitPathValue(currentPath)
+  // GUI-launched processes can have a sparse PATH. Keep host directories after
+  // the inherited PATH; optional Runtime Packs are resolved inside Gateway per
+  // Safe/Full/Guest policy and are never injected statically by Electron.
+  const hostFallbackParts = process.platform === 'win32'
     ? [
-        join(packagedRuntimeRoot(), 'node'),
         process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'nodejs') : '',
         process.env.ProgramFiles ? join(process.env.ProgramFiles, 'nodejs') : '',
         process.env['ProgramFiles(x86)'] ? join(process.env['ProgramFiles(x86)'], 'nodejs') : '',
       ]
     : [
-        join(packagedRuntimeRoot(), 'node', 'bin'),
         join(app.getPath('home'), '.local', 'bin'),
         join(app.getPath('home'), '.npm-global', 'bin'),
         '/opt/homebrew/bin',
         '/usr/local/bin',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
       ]
-  const seen = new Set<string>()
-  return candidates.filter((candidate) => {
-    if (!candidate || seen.has(candidate) || !existsSync(candidate)) return false
-    seen.add(candidate)
-    return true
-  })
-}
-
-function desktopChildPath(nodeBinCandidates = desktopNodeBinCandidates()): string {
-  const currentPath = process.env.PATH || process.env.Path || ''
-  const currentParts = splitPathValue(currentPath)
-  const systemParts = process.platform === 'win32' ? [] : ['/usr/bin', '/bin', '/usr/sbin', '/sbin']
-  const orderedParts = [...nodeBinCandidates, ...currentParts, ...systemParts]
+  const orderedParts = [...currentParts, ...hostFallbackParts]
   const seen = new Set<string>()
   const merged = orderedParts.filter((part) => {
     if (!part || seen.has(part)) return false
@@ -6522,6 +7087,11 @@ async function probeOnboardingProvider(
 const RECOVERY_PROTOCOL_SCHEMA_VERSION = 1
 const RECOVERY_STDOUT_LIMIT = 2 * 1024 * 1024
 const RECOVERY_COMMAND_TIMEOUT_MS = 60_000
+// Mutating recovery can legitimately scan several profiles, but it must never
+// leave Electron waiting forever (especially while Defender is inspecting a
+// packaged child). Keep this bound separate from the read-only probe budget so
+// a slow repair fails closed without weakening the ordinary inspect timeout.
+const RECOVERY_MUTATING_COMMAND_TIMEOUT_MS = 120_000
 // Mutating recovery commands fail closed with profile_lock_busy the moment
 // another writer holds the profile locks. A short in-CLI wait lets a transient
 // writer (an exiting gateway, a cron tick) finish instead of stranding startup
@@ -6869,6 +7439,8 @@ async function runDesktopProfileConsolidationCli(
   const runtime = await resolveGatewayRuntime()
   const prefix = runtime.args.slice(0, -2)
   return await new Promise((resolveResult, rejectResult) => {
+    const command = commandArgs[0] || 'unknown'
+    const startedAt = Date.now()
     const child = spawn(runtime.command, [
       ...prefix,
       'recovery',
@@ -6884,30 +7456,64 @@ async function runDesktopProfileConsolidationCli(
         PYTHONIOENCODING: 'utf-8:replace',
       }),
     })
+    desktopStartupLog('recovery_child_spawned', {
+      command,
+      pid: child.pid,
+      mutating: true,
+    })
     let stdout = ''
     let oversized = false
     let settled = false
+    let timeout: NodeJS.Timeout | null = null
     const finish = (
       error?: Error,
       result?: DesktopProfileConsolidationResult,
     ) => {
       if (settled) return
       settled = true
+      if (timeout) clearTimeout(timeout)
       if (error) rejectResult(error)
       else resolveResult(result as DesktopProfileConsolidationResult)
     }
+    timeout = setTimeout(() => {
+      desktopStartupLog('recovery_child_timeout', {
+        command,
+        pid: child.pid,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        timeoutMs: RECOVERY_MUTATING_COMMAND_TIMEOUT_MS,
+      })
+      // On Windows ChildProcess.kill() terminates the exact process handle;
+      // do not launch or reuse a Gateway after this fail-closed timeout.
+      child.kill()
+      finish(new Error('Desktop profile consolidation timed out.'))
+    }, RECOVERY_MUTATING_COMMAND_TIMEOUT_MS)
+    timeout.unref()
     child.stdout.on('data', (chunk) => {
       if (oversized) return
       stdout += String(chunk)
       if (stdout.length > RECOVERY_STDOUT_LIMIT) oversized = true
+      if (oversized) child.kill()
     })
     // The protocol result is the only trusted diagnostic surface. stderr can
     // contain local profile paths and is deliberately drained without exposure.
     child.stderr.resume()
-    child.once('error', (error) => finish(
-      error instanceof Error ? error : new Error(String(error)),
-    ))
-    child.once('close', (code) => {
+    child.once('error', (error) => {
+      desktopStartupLog('recovery_child_error', {
+        command,
+        pid: child.pid,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      finish(error instanceof Error ? error : new Error(String(error)))
+    })
+    child.once('close', (code, signal) => {
+      desktopStartupLog('recovery_child_exit', {
+        command,
+        pid: child.pid,
+        code,
+        signal,
+        durationMs: Math.max(0, Date.now() - startedAt),
+      })
       if (oversized) {
         return finish(new Error('Desktop profile consolidation output exceeded its limit.'))
       }
@@ -7031,6 +7637,8 @@ async function runRecoveryCli(
     const runtime = await resolveGatewayRuntime()
     const prefix = runtime.args.slice(0, -2)
     return await new Promise((resolveResult, rejectResult) => {
+      const command = commandArgs[0] || 'unknown'
+      const startedAt = Date.now()
       const child = spawn(runtime.command, [...prefix, 'recovery', ...effectiveArgs], {
         cwd: runtime.cwd,
         windowsHide: true,
@@ -7041,6 +7649,11 @@ async function runRecoveryCli(
           PYTHONUTF8: '1',
           PYTHONIOENCODING: 'utf-8:replace',
         }),
+      })
+      desktopStartupLog('recovery_child_spawned', {
+        command,
+        pid: child.pid,
+        mutating,
       })
       let stdout = ''
       let oversized = false
@@ -7053,13 +7666,20 @@ async function runRecoveryCli(
         if (error) rejectResult(error)
         else resolveResult(result as RecoveryProtocolResult)
       }
-      if (!mutating) {
-        timeout = setTimeout(() => {
-          child.kill()
-          finish(new Error('Recovery command timed out.'))
-        }, RECOVERY_COMMAND_TIMEOUT_MS)
-        timeout.unref()
-      }
+      const timeoutMs = mutating
+        ? RECOVERY_MUTATING_COMMAND_TIMEOUT_MS
+        : RECOVERY_COMMAND_TIMEOUT_MS
+      timeout = setTimeout(() => {
+        desktopStartupLog('recovery_child_timeout', {
+          command,
+          pid: child.pid,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          timeoutMs,
+        })
+        child.kill()
+        finish(new Error('Recovery command timed out.'))
+      }, timeoutMs)
+      timeout.unref()
       child.stdin.once('error', () => {})
       child.stdin.end(stdinPayload ?? '')
       child.stdout.on('data', (chunk) => {
@@ -7067,16 +7687,29 @@ async function runRecoveryCli(
         stdout += String(chunk)
         if (stdout.length > RECOVERY_STDOUT_LIMIT) {
           oversized = true
-          if (!mutating) child.kill()
+          child.kill()
         }
       })
       // The renderer receives only parsed protocol JSON. stderr is drained but
       // never copied into diagnostics because it may contain local details.
       child.stderr.resume()
-      child.once('error', (error) => finish(
-        error instanceof Error ? error : new Error(String(error)),
-      ))
-      child.once('close', (code) => {
+      child.once('error', (error) => {
+        desktopStartupLog('recovery_child_error', {
+          command,
+          pid: child.pid,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          error: error instanceof Error ? error.message : String(error),
+        })
+        finish(error instanceof Error ? error : new Error(String(error)))
+      })
+      child.once('close', (code, signal) => {
+        desktopStartupLog('recovery_child_exit', {
+          command,
+          pid: child.pid,
+          code,
+          signal,
+          durationMs: Math.max(0, Date.now() - startedAt),
+        })
         if (oversized) return finish(new Error('Recovery command output exceeded its limit.'))
         try {
           return finish(undefined, parseRecoveryProtocol(JSON.parse(stdout)))
@@ -7252,6 +7885,8 @@ async function adoptConsolidatedDesktopCredential(
       disposition = 'primary_exists'
     } else {
       let credential: DesktopConnection | null = null
+      let resolvedCredentialApiKey = ''
+      let resolvedCredentialSearchApiKey = ''
       let credentialPhase: 'parse' | 'decrypt' = 'parse'
       try {
         const raw = sourceCredential
@@ -7300,16 +7935,12 @@ async function adoptConsolidatedDesktopCredential(
         // Validate OS-keychain ciphertext before publishing it at the primary path.
         // Unusable historical secrets are skipped so normal onboarding can collect
         // a fresh credential instead of permanently blocking every startup.
-        if (
-          candidateCredential.encryptedApiKey
-          && !decryptApiKey(candidateCredential)
-        ) {
+        resolvedCredentialApiKey = decryptApiKey(candidateCredential)
+        if (candidateCredential.encryptedApiKey && !resolvedCredentialApiKey) {
           throw new Error('provider credential decrypted to an empty value')
         }
-        if (
-          candidateCredential.encryptedSearchApiKey
-          && !decryptSearchApiKey(candidateCredential)
-        ) {
+        resolvedCredentialSearchApiKey = decryptSearchApiKey(candidateCredential)
+        if (candidateCredential.encryptedSearchApiKey && !resolvedCredentialSearchApiKey) {
           throw new Error('search credential decrypted to an empty value')
         }
         // Publish eligibility is assigned only after both safeStorage/plaintext
@@ -7377,9 +8008,20 @@ async function adoptConsolidatedDesktopCredential(
           }
         }
         // Force the normal loader to validate the bytes at their final primary path.
-        if (!await loadDesktopCredential()) {
+        const publishedCredential = await loadDesktopCredential()
+        if (!publishedCredential) {
           throw new Error('The consolidated Desktop credential was not published.')
         }
+        // Publishing replaces the primary credential authority. Drop every
+        // previous-profile/value reference, then retain only the secrets that
+        // were successfully validated for the published ciphertext above.
+        decryptedSecretCache.clear()
+        rememberDecryptedCredentialSecrets(
+          publishedCredential,
+          resolvedCredentialApiKey,
+          resolvedCredentialSearchApiKey,
+          primary,
+        )
         desktopLog('desktop_profile_consolidation_credential_adopted', {
           sourceRecoveryId,
         })
@@ -7612,6 +8254,20 @@ async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   }
 }
 
+async function readinessCheck(url: string, timeoutMs = 1000): Promise<boolean> {
+  try {
+    const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
+    const response = await fetch(`${url}/readyz`, {
+      signal: AbortSignal.timeout(boundedTimeoutMs),
+    })
+    if (!response.ok) return false
+    const payload = await response.json().catch(() => null)
+    return Boolean(payload && payload.ready === true)
+  } catch {
+    return false
+  }
+}
+
 const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000
 const NEWER_CONFIG_DIAGNOSTIC_FIELDS = [
   'llm_ensemble',
@@ -7673,40 +8329,31 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
   )
 }
 
-async function waitForGateway(url: string, earlyExitMessage?: () => string | null): Promise<void> {
+async function waitForGateway(
+  url: string,
+  earlyExitMessage?: () => string | null,
+): Promise<void> {
+  const startedAt = Date.now()
   const result = await waitForGatewayReadiness({
-    probe: (remainingMs) => healthCheck(url, remainingMs),
+    probe: (remainingMs) => readinessCheck(url, remainingMs),
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
-    lateGraceMs: 15_000,
+    lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
     pollIntervalMs: 500,
   })
   if (result.status === 'ready') {
+    desktopStartupLog('gateway_health_ready', {
+      port: gatewayState.port,
+      late: result.late,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    })
     if (result.late) {
       desktopLog('gateway_health_ready_after_primary_deadline', { port: gatewayState.port })
     }
     return
   }
   if (result.status === 'exited') throw new Error(result.message)
-  throw new Error(`Gateway did not become healthy at ${url}`)
-}
-
-async function waitForControlUi(url: string, earlyExitMessage?: () => string | null): Promise<void> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < 45_000) {
-    const earlyExit = earlyExitMessage?.()
-    if (earlyExit) throw new Error(earlyExit)
-    try {
-      const response = await fetch(`${url}/control/`, { signal: AbortSignal.timeout(1500) })
-      if (response.ok) return
-    } catch {
-      // The ASGI socket can become healthy just before static routes are ready.
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 500))
-  }
-  const earlyExit = earlyExitMessage?.()
-  if (earlyExit) throw new Error(earlyExit)
-  throw new Error(`Control UI did not become reachable at ${url}/control/`)
+  throw new Error(`Gateway did not become ready at ${url}`)
 }
 
 function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null): boolean {
@@ -7739,18 +8386,20 @@ async function reuseHealthyGatewayState(
   // resumeOwnedGatewayStartup; a healthy port alone is not ownership proof.
   if (gatewayProcess && gatewayState.owned) return null
 
-  const healthy = await healthCheck(gatewayState.url)
+  const ready = await readinessCheck(gatewayState.url)
   if (!isCurrent()) return null
-  if (healthy) {
+  if (ready) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
     sendBootStatus('control')
+    publishGatewayConnection()
     return gatewayState
   }
 
   if (gatewayProcess && gatewayState.owned && hasGatewayProcessExited(gatewayProcess)) {
     gatewayProcess = null
     gatewayState.status = 'stopped'
+    publishGatewayConnection()
   }
   return null
 }
@@ -7812,11 +8461,10 @@ async function resumeOwnedGatewayStartup(
   sendBootStatus('gateway-health')
   await waitForGateway(url, childExitMessage)
   if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
-  await waitForControlUi(url, childExitMessage)
 
   // Health alone never grants ownership. The same exact child and profile that
-  // entered this resume path must still be current after both asynchronous
-  // probes, otherwise a concurrent restart or profile switch won the race.
+  // entered this resume path must still be current after the asynchronous
+  // readiness probe, otherwise a concurrent restart or profile switch won the race.
   if (
     gatewayProcess !== child
     || hasGatewayProcessExited(child)
@@ -7843,6 +8491,7 @@ async function resumeOwnedGatewayStartup(
   gatewayState.status = 'ready'
   gatewayState.error = undefined
   sendBootStatus('control')
+  publishGatewayConnection()
   return gatewayState
 }
 
@@ -7981,6 +8630,8 @@ async function startGateway(): Promise<GatewayState> {
     }
     gatewayState.status = 'stopped'
     gatewayState.error = undefined
+    gatewayConnectionInstanceId = null
+    publishGatewayConnection()
   }
 
   const activeProfile = activeDesktopProfile()
@@ -7992,16 +8643,23 @@ async function startGateway(): Promise<GatewayState> {
     gatewayState.port = Number(new URL(gatewayState.url).port || 0)
     gatewayState.owned = false
     gatewayProfileKey = desktopProfileKey(activeProfile)
-    const overrideReady = await healthCheck(gatewayState.url)
+    gatewayConnectionInstanceId = randomUUID()
+    gatewayState.status = 'starting'
+    gatewayState.error = undefined
+    publishGatewayConnection()
+    const overrideReady = await readinessCheck(gatewayState.url)
     if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
     gatewayState.status = overrideReady ? 'ready' : 'error'
     if (gatewayState.status !== 'ready') {
+      gatewayState.error = `Configured gateway is not ready: ${gatewayState.url}`
+      publishGatewayConnection()
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
+    publishGatewayConnection()
     return gatewayState
   }
 
-  sendBootStatus('gateway-health')
+  sendBootStatus('profile')
   await recoverVerifiedOrphanGatewayBeforeSpawn()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 
@@ -8024,6 +8682,18 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('gateway-start')
   const runtime = await resolveGatewayRuntime()
 
+  // Start the main-process-only bridge before the final port-selection await.
+  // Its random endpoint and 256-bit token are injected only into this owned
+  // Gateway child below; they are never copied into the renderer environment.
+  let artifactBridgeEnvironment: NodeJS.ProcessEnv = {}
+  try {
+    artifactBridgeEnvironment = await desktopArtifactBridgeLoopback.start()
+  } catch {
+    // The editor transport is additive. If loopback binding is unavailable,
+    // keep the Gateway and download/source workflows usable with every native
+    // capability disabled instead of weakening the transport boundary.
+    desktopLog('desktop_artifact_bridge_transport_unavailable')
+  }
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
   // close writer/lifecycle admission before draining current children; an
@@ -8065,9 +8735,11 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.owned = true
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
+  gatewayState.error = undefined
+  gatewayConnectionInstanceId = randomUUID()
+  publishGatewayConnection()
 
-  const nodeBinCandidates = desktopNodeBinCandidates()
-  const childPath = desktopChildPath(nodeBinCandidates)
+  const childPath = desktopChildPath()
   const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
   const gatewayOwnershipDir = desktopGatewayOwnershipDir(activeProfile)
   const gatewayProfileFingerprint = desktopProfileFingerprint(activeProfile.home)
@@ -8076,9 +8748,10 @@ async function startGateway(): Promise<GatewayState> {
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
     ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
-    OPENSQUILLA_NODE_BIN_DIR: nodeBinCandidates.join(pathDelimiter()),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
+    ...artifactBridgeEnvironment,
+    OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
@@ -8109,6 +8782,7 @@ async function startGateway(): Promise<GatewayState> {
   })
   gatewayProfileKey = desktopProfileKey(activeProfile)
   desktopLog('gateway_spawned', {
+    elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
     profileKind: activeProfile.kind,
     pid: child.pid,
     port,
@@ -8141,6 +8815,7 @@ async function startGateway(): Promise<GatewayState> {
     if (!isCurrentGateway) return
     if (isQuitting) {
       gatewayState.status = 'stopped'
+      publishGatewayConnection()
       return
     }
     gatewayState.status = 'error'
@@ -8149,13 +8824,11 @@ async function startGateway(): Promise<GatewayState> {
     if (portConflictExit && !hasExplicitGatewayPort()) {
       gatewayState.status = 'stopped'
       gatewayState.error = undefined
+      publishGatewayConnection()
       return
     }
     sendBootError(gatewayState.error)
-    // After boot the window is on the gateway-served Control UI, which never
-    // listens for boot:error. Restore the boot splash so the crash message and
-    // the Retry/Reset recovery affordances are visible instead of a dead origin.
-    void restoreMainWindowToBootPage()
+    publishGatewayConnection()
   })
 
   // A failed spawn (uv missing in dev, non-executable bundled binary) emits
@@ -8170,16 +8843,17 @@ async function startGateway(): Promise<GatewayState> {
     childExitMessage = message
     if (isQuitting) {
       gatewayState.status = 'stopped'
+      publishGatewayConnection()
       return
     }
     gatewayState.status = 'error'
     gatewayState.error = message
     sendBootError(message)
+    publishGatewayConnection()
   })
 
   sendBootStatus('gateway-health')
   await waitForGateway(url, () => childExitMessage)
-  await waitForControlUi(url, () => childExitMessage)
   // Guard against adopting a foreign gateway that won the probe→bind race: if our
   // spawned child has already exited, it lost the exclusive bind and the healthy
   // endpoint belongs to someone else (e.g. a CLI `opensquilla gateway run` on the
@@ -8204,6 +8878,8 @@ async function startGateway(): Promise<GatewayState> {
   }
   sendBootStatus('control')
   gatewayState.status = 'ready'
+  gatewayState.error = undefined
+  publishGatewayConnection()
   return gatewayState
 }
 
@@ -8229,54 +8905,15 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
   throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gateway port retry exhausted.'))
 }
 
-async function loadControlUi(window: BrowserWindow, gatewayUrl: string): Promise<void> {
-  const url = `${gatewayUrl}/control/chat/new`
-  let lastError: Error | null = null
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    try {
-      await window.loadURL(url)
-      return
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error))
-      await new Promise((resolveWait) => setTimeout(resolveWait, 500))
-    }
-  }
-  throw lastError ?? new Error(`Failed to load ${url}`)
-}
-
-// The main window is only ever meant to sit on the gateway-served Control UI
-// origin (its /control paths). Anything else — a dropped file:// document, an
-// off-origin redirect — is a foreign navigation and must be blocked. The boot
-// splash is loaded programmatically (loadFile), which does not go through the
-// navigation guard, so it needs no allow-entry here.
+// The normal application renderer has a stable, local origin. Gateway HTTP and
+// WebSocket endpoints are capabilities it connects to after they become ready;
+// they are not the document that owns the Desktop window.
 function isAllowedMainWindowNavigation(targetUrl: string): boolean {
-  if (!gatewayState.url) return false
-  try {
-    const target = new URL(targetUrl)
-    const gateway = new URL(gatewayState.url)
-    return (
-      target.origin === gateway.origin
-      && (target.pathname === '/control' || target.pathname.startsWith('/control/'))
-    )
-  } catch {
-    return false
-  }
+  return isDesktopRendererDocumentUrl(targetUrl)
 }
 
-function isCurrentWindowAtControlUi(window: BrowserWindow, gatewayUrl: string): boolean {
-  const currentUrl = window.webContents.getURL()
-  if (!currentUrl) return false
-
-  try {
-    const current = new URL(currentUrl)
-    const gateway = new URL(gatewayUrl)
-    return (
-      current.origin === gateway.origin
-      && (current.pathname === '/control' || current.pathname.startsWith('/control/'))
-    )
-  } catch {
-    return false
-  }
+function isCurrentWindowAtDesktopRenderer(window: BrowserWindow): boolean {
+  return isDesktopRendererDocumentUrl(window.webContents.getURL())
 }
 
 async function createMainWindow(): Promise<BrowserWindow> {
@@ -8316,6 +8953,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
       desktopLog(entry.event, entry.detail)
     }
   }
+  const releaseRendererOwnedArtifactPreviews = (): void => {
+    void nativeWorkbenchSurfaces.destroyAll()
+    void artifactPreviewLeaseBroker.revokeAll()
+  }
 
   // Forward renderer console errors to desktop.log. The Control UI runs
   // in the renderer, so a purely front-end failure (a thrown error, an unhandled
@@ -8343,6 +8984,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // the reason and exit code gives a first, always-present breadcrumb.
   window.webContents.on('render-process-gone', (_event, details) => {
     flushRendererConsoleSuppression()
+    releaseRendererOwnedArtifactPreviews()
     const entry = buildRendererGoneLogEntry({
       reason: details.reason,
       exitCode: details.exitCode,
@@ -8364,6 +9006,16 @@ async function createMainWindow(): Promise<BrowserWindow> {
     rendererUnresponsiveAt = null
     const entry = buildRendererStateLogEntry('responsive', durationMs)
     desktopLog(entry.event, entry.detail)
+  })
+
+  window.webContents.once('did-finish-load', () => {
+    desktopStartupLog('splash_ready', { url: window.webContents.getURL() })
+  })
+  window.webContents.on('dom-ready', () => {
+    const url = window.webContents.getURL()
+    if (!url.startsWith('file:')) {
+      desktopStartupLog('renderer_interactive', { url })
+    }
   })
 
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -8392,12 +9044,20 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
   window.webContents.on('will-navigate', guardMainWindowNavigation)
   window.webContents.on('will-redirect', guardMainWindowNavigation)
+  window.webContents.on('will-frame-navigate', (details) => {
+    // The renderer never embeds its own privileged origin. In particular, an
+    // API response must not become a same-origin child document that can reach
+    // the parent Desktop bridge.
+    if (!details.isMainFrame && isDesktopRendererUrl(details.url)) {
+      details.preventDefault()
+    }
+  })
   window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
     // Native child views sit above the renderer DOM. A full document change
     // must remove them before boot/recovery/another Control UI can become
     // visible; same-document SPA navigation keeps the Workbench lifecycle in
     // Vue and is intentionally left alone.
-    if (isMainFrame && !isInPlace) void nativeWorkbenchSurfaces.destroyAll()
+    if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()
   })
 
   window.on('close', (event) => handleMainWindowClose(window, event))
@@ -8447,7 +9107,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     if (mainWindow === window) mainWindow = null
   })
 
-  await window.loadFile(bootPagePath())
+  await window.loadURL(DESKTOP_RENDERER_URL)
   return window
 }
 
@@ -8458,6 +9118,9 @@ function currentMainWindow(): BrowserWindow | null {
 function ensureGatewayStarted(): Promise<GatewayState> {
   if (!gatewayStartPromise) {
     sendBootStatus('profile')
+    gatewayState.status = 'starting'
+    gatewayState.error = undefined
+    publishGatewayConnection()
     gatewayStartPromise = startGatewayWithPortRecovery().finally(() => {
       gatewayStartPromise = null
     })
@@ -8465,41 +9128,21 @@ function ensureGatewayStarted(): Promise<GatewayState> {
   return gatewayStartPromise
 }
 
-async function loadControlUiIntoCurrentWindow(
-  gatewayUrl: string,
-  isCurrent: () => boolean,
-): Promise<boolean> {
-  if (!isCurrent()) return false
+async function loadDesktopRendererIntoCurrentWindow(): Promise<void> {
   const window = currentMainWindow()
-  if (!window) return false
-
-  sendBootStatus('control')
-  if (isCurrentWindowAtControlUi(window, gatewayUrl)) {
-    if (!isCurrent()) return false
-    sendBootStatus('ready')
-    return true
-  }
-
-  try {
-    await loadControlUi(window, gatewayUrl)
-  } catch (error) {
-    if (window.isDestroyed()) return false
-    throw error
-  }
-  if (!isCurrent()) return false
-  sendBootStatus('ready')
-  return true
+  if (!window) return
+  if (isCurrentWindowAtDesktopRenderer(window)) return
+  await window.loadURL(DESKTOP_RENDERER_URL)
 }
 
-// Bring the main window back to the boot splash when a gateway failure happens
-// while the window is showing the gateway-served Control UI. The splash owns the
-// boot:error listener plus the Retry/Reset recovery buttons, so this is what
-// turns an otherwise-dead Control UI origin back into a recoverable state.
+// The old boot document is now reserved for profile recovery that must complete
+// before the normal app can safely touch the user's data. Runtime failures stay
+// inside the local Desktop renderer and are shown as a recoverable capability
+// error instead of replacing the whole application.
 async function restoreMainWindowToBootPage(): Promise<void> {
   const window = currentMainWindow()
   if (!window) return
-  // Already on the boot splash (initial boot); its own onBootError handler will
-  // render the error. Only navigate back when the window left for the Control UI.
+  // Already on the recovery document.
   if (window.webContents.getURL().startsWith('file:')) return
   try {
     await window.loadFile(bootPagePath())
@@ -8634,8 +9277,10 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
       // A whole-profile transaction may have committed immediately before the
       // Electron process stopped. The narrow layout receipt is the authority
       // for finishing provider credential reconciliation.
-      await recoverPendingMigrationReconciliation()
-      inspection = await inspectDesktopProfile(active)
+      const reconciliation = await recoverPendingMigrationReconciliation()
+      if (reconciliation.requiresInspection) {
+        inspection = await inspectDesktopProfile(active)
+      }
     } catch (error) {
       desktopLog('migration_reconciliation_startup_failed', {
         error: error instanceof Error ? error.message : 'unknown error',
@@ -8698,6 +9343,10 @@ async function openOrResumeDesktopApp(): Promise<void> {
       try {
         if (await inspectActiveProfileBeforeStartup()) {
           if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
+            // Recovery may temporarily replace the renderer with boot.html. Put
+            // the local application back before any Gateway startup wait so the
+            // shell remains usable while the runtime comes online.
+            await loadDesktopRendererIntoCurrentWindow()
             const reusableGateway = forceOnboardingOnNextStartup
               ? null
               : await reuseHealthyGatewayState(
@@ -8724,10 +9373,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
               )
             )
             if (operationIsCurrent()) {
-              await loadControlUiIntoCurrentWindow(
-                gatewayUrl,
-                operationIsCurrent,
-              )
+              sendBootStatus('ready')
             }
           }
         }
@@ -8737,6 +9383,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (gatewayState.status !== 'ready') {
             gatewayState.status = 'error'
             gatewayState.error = error instanceof Error ? error.message : String(error)
+            publishGatewayConnection()
           }
           desktopLog('desktop_open_failed', {
             profileKind: 'primary',
@@ -8921,6 +9568,10 @@ function stopGateway(): void {
   const url = gatewayState.url
   trackStoppingGatewayProcess(child)
   gatewayProcess = null
+  gatewayState.status = 'stopped'
+  gatewayState.error = undefined
+  gatewayConnectionInstanceId = null
+  publishGatewayConnection()
 
   const hardTerminate = () => {
     hardTerminateGatewayProcess(child)
@@ -10524,6 +11175,12 @@ ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
 ipcMain.handle('gateway:status', () => ({ ...gatewayState }))
+ipcMain.handle('gateway:connection', (event) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    throw new Error('Untrusted Gateway connection request.')
+  }
+  return desktopGatewayConnectionSnapshot()
+})
 ipcMain.handle('gateway:cli-invocation', async () => {
   const runtime = await resolveGatewayRuntime()
   return buildCliInvocation({
@@ -10587,6 +11244,68 @@ ipcMain.handle('desktop:workbench:capabilities', (event) => {
     ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
     : NATIVE_WORKBENCH_CAPABILITIES
 })
+ipcMain.handle('desktop:workbench:artifact:capabilities', (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return desktopArtifactBridge.getCapabilities()
+})
+ipcMain.handle('desktop:workbench:annotation:capabilities', async (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  return await nativeWorkbenchSurfaces.getArtifactAnnotationCapabilities()
+})
+ipcMain.handle('desktop:workbench:annotation:set-mode', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.setArtifactAnnotationMode(
+      parseNativeWorkbenchAnnotationModeRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:show-overlay', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.showArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayShowRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayCloseRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:artifact:capture-selection', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.captureSelection(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:browser-inspect', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.browserInspect(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:browser-act', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.browserAct(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:screenshot', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.screenshot(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:office-flush', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.officeFlush(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:reload-surface', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.reloadSurface(payload)
+})
 ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   return await artifactPreviewLeaseBroker.create(payload)
@@ -10603,16 +11322,19 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   try {
     const request = parseNativeWorkbenchCreateRequest(payload)
-    if (
-      request.kind === 'artifact-preview'
-      && !artifactPreviewLeaseBroker.authorizesSurface(request.payload)
-    ) {
-      return {
-        ok: false,
-        message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+    let activePreviewArtifactId: string | null = null
+    if (request.kind === 'artifact-preview') {
+      activePreviewArtifactId = artifactPreviewLeaseBroker.resolveSurfaceArtifactId(
+        request.payload,
+      )
+      if (!activePreviewArtifactId) {
+        return {
+          ok: false,
+          message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+        }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request)
+    return await nativeWorkbenchSurfaces.createSurface(request, activePreviewArtifactId)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
@@ -10888,6 +11610,9 @@ async function restoreAfterIncompleteCleanup(
   preserveControlUi = false,
 ): Promise<void> {
   isQuitting = false
+  // A partial cleanup may already have replaced or removed credential bytes.
+  // Never carry a pre-cleanup plaintext reference into the recovered profile.
+  decryptedSecretCache.clear()
   clearReusableGatewayState()
   const inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
@@ -10993,6 +11718,7 @@ async function applyApprovedDesktopCleanup(
         refreshed.scope_fingerprint,
         report,
       )
+      decryptedSecretCache.clear()
       shouldQuit = true
       return { ok: true, scheduled: true, report }
     }
@@ -11006,6 +11732,7 @@ async function applyApprovedDesktopCleanup(
       '--json',
     ])
     if (result.outcome === 'complete') {
+      decryptedSecretCache.clear()
       if (report.mode === 'reset-current-settings') {
         transientPendingMigrationProviderSetup = null
         forceOnboardingOnNextStartup = true
@@ -11284,6 +12011,12 @@ interface PendingMigrationProviderSetup extends MigrationProviderPrefill {
   knownReceiptIds: string[]
   committedTransactionId: string
   credentialBackupPath: string
+}
+
+interface PendingMigrationReconciliationResult {
+  observedApplyingMarker: boolean
+  stateModified: boolean
+  requiresInspection: boolean
 }
 
 let transientPendingMigrationProviderSetup: PendingMigrationProviderSetup | null = null
@@ -11748,26 +12481,52 @@ async function reconcileImportedDesktopCredential(
   return { requiresSetup: true }
 }
 
-async function recoverPendingMigrationReconciliation(): Promise<void> {
-  const initial = await readPendingMigrationProviderSetup()
-  if (!initial || initial.phase !== 'applying') return
+async function recoverPendingMigrationReconciliation(): Promise<PendingMigrationReconciliationResult> {
   const finishWriter = beginDesktopWriterOperation('recover imported provider settings')
   try {
+    const initial = await readPendingMigrationProviderSetup()
+    if (!initial || initial.phase !== 'applying') {
+      return {
+        observedApplyingMarker: false,
+        stateModified: false,
+        requiresInspection: false,
+      }
+    }
+    // Once an applying marker is observed, retain the post-recovery inspection
+    // even when the marker turns out to have no matching receipt. The marker is
+    // the durable evidence that the previous startup may have changed profile
+    // state; skipping the refresh would let stale revision/action data continue.
+    const result: PendingMigrationReconciliationResult = {
+      observedApplyingMarker: true,
+      stateModified: false,
+      requiresInspection: true,
+    }
     let pending = await readPendingMigrationProviderSetup()
-    if (!pending || pending.phase !== 'applying') return
+    if (!pending || pending.phase !== 'applying') return result
     const receipt = await findAppliedReceiptForIntent(pending)
     if (!receipt) {
       // Profile inspection has already recovered any unfinished replacement
       // transaction. With no new layout receipt, this attempt never committed.
       await clearPendingMigrationProviderSetup()
-      return
+      result.stateModified = true
+      return result
     }
     pending = await bindMigrationIntentToReceipt(pending, receipt)
+    result.stateModified = true
     pending = await prepareImportedCredentialBackup(pending)
     await reconcileImportedDesktopCredential(pending, true)
+    result.stateModified = true
+    return result
   } finally {
     finishWriter()
   }
+}
+
+function desktopStartupLog(event: string, detail?: Record<string, unknown>): void {
+  desktopLog(event, {
+    elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+    ...detail,
+  })
 }
 
 async function refreshPrimaryRecoveryAfterImportAttempt(): Promise<boolean> {
@@ -12157,6 +12916,7 @@ ipcMain.handle('desktop:migration:run', async (
     // pattern): wait for the child to actually EXIT, bounded by the kill deadline.
     if (gatewayProcess && gatewayState.owned) {
       const child = gatewayProcess
+      const childInstanceId = gatewayConnectionInstanceId
       // We stay alive and await the exit, so let the gateway take its Windows
       // HTTP graceful drain instead of an immediate TerminateProcess.
       allowGracefulShutdownWhileQuitting = true
@@ -12170,19 +12930,26 @@ ipcMain.handle('desktop:migration:run', async (
         // Keep the still-live child visible to the rest of the lifecycle code and
         // refuse both the import and a replacement spawn against the same profile.
         gatewayProcess = child
-        gatewayState.owned = true
-        gatewayState.status = 'error'
-        gatewayState.error = 'The desktop gateway did not exit before the transfer deadline.'
+        transitionGatewayConnection({
+          owned: true,
+          status: 'error',
+          error: 'The desktop gateway did not exit before the transfer deadline.',
+          instanceId: childInstanceId ?? randomUUID(),
+        })
         restartAllowed = false
-        throw new Error(gatewayState.error)
+        throw new Error('The desktop gateway did not exit before the transfer deadline.')
       }
     }
 
     // Refuse while an unmanaged gateway still serves this profile — the import
     // must not race live sessions.db/scheduler.db writers.
     if (gatewayState.url && (await healthCheck(gatewayState.url))) {
-      gatewayState.owned = false
-      gatewayState.status = 'ready'
+      transitionGatewayConnection({
+        owned: false,
+        status: 'ready',
+        error: null,
+        instanceId: randomUUID(),
+      })
       shouldRestart = false
       throw new Error('A gateway is still serving this profile; stop it and retry.')
     }
@@ -12236,6 +13003,10 @@ ipcMain.handle('desktop:migration:run', async (
         )
         if (receipt) {
           migrationApplied = true
+          // The imported target is now authoritative, even if subsequent
+          // credential reconciliation needs onboarding. Discard any plaintext
+          // resolved from the profile that existed before the import.
+          decryptedSecretCache.clear()
           if (!migrationVerified) report = receipt.report
           // Publication of a validated, previously-unseen target receipt is the
           // durable commit authority. The CLI child can lose stdout or exit
@@ -12336,7 +13107,9 @@ ipcMain.handle('desktop:migration:dismiss-last-result', async (event) => (
 function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
   const window = currentMainWindow()
   if (!window || event.sender !== window.webContents) return false
-  const url = event.senderFrame?.url || event.sender.getURL()
+  const senderFrame = event.senderFrame
+  if (!senderFrame || senderFrame !== event.sender.mainFrame) return false
+  const url = senderFrame.url
   try {
     const sender = new URL(url)
     if (sender.protocol === 'file:') {
@@ -12350,11 +13123,14 @@ function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
 
 function trustedMainWindowControlIpc(event: Electron.IpcMainInvokeEvent): boolean {
   const window = currentMainWindow()
-  if (!window || event.sender !== window.webContents || !gatewayState.url) {
-    return false
-  }
+  if (!window || event.sender !== window.webContents) return false
+  const senderFrame = event.senderFrame
+  if (!senderFrame || senderFrame !== event.sender.mainFrame) return false
+  const rawUrl = senderFrame.url
+  if (isDesktopRendererDocumentUrl(rawUrl)) return true
+  if (!gatewayState.url) return false
   try {
-    const sender = new URL(event.senderFrame?.url || event.sender.getURL())
+    const sender = new URL(rawUrl)
     const gateway = new URL(gatewayState.url)
     return sender.origin === gateway.origin
       && (sender.pathname === '/control' || sender.pathname.startsWith('/control/'))
@@ -12367,10 +13143,159 @@ function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
   return gatewayState.owned && trustedMainWindowControlIpc(event)
 }
 
-function trustedOnboardingIpc(event: Electron.IpcMainInvokeEvent): boolean {
-  const window = currentOnboardingWindow()
-  if (!window || event.sender !== window.webContents) return false
-  return (event.senderFrame?.url || event.sender.getURL()).startsWith('data:text/html')
+function trustedOnboardingIpc(
+  event: Electron.IpcMainInvokeEvent,
+  flow = onboardingFlows.active,
+): boolean {
+  const window = flow?.window
+  if (!flow || !onboardingFlows.isCurrent(flow) || !window || window.isDestroyed()) return false
+  if (event.sender !== window.webContents) return false
+  const senderFrame = event.senderFrame
+  return Boolean(
+    senderFrame
+    && senderFrame === event.sender.mainFrame
+    && senderFrame.url.startsWith('data:text/html'),
+  )
+}
+
+function onboardingSaveFailure(
+  code: OnboardingSaveErrorCode,
+  error: string,
+): OnboardingSaveResult {
+  return { ok: false, code, error }
+}
+
+function completeOnboardingFlow(flow: OnboardingFlow, credential: DesktopConnection): boolean {
+  const window = flow.window
+  if (
+    !window
+    || window.isDestroyed()
+    || !onboardingFlows.complete(flow)
+  ) return false
+
+  const resolve = flow.resolve
+  flow.resolve = null
+  flow.reject = null
+  window.close()
+  resolve?.(credential)
+  return true
+}
+
+async function performOnboardingSave(
+  flow: OnboardingFlow,
+  payload: OnboardingPayload,
+): Promise<OnboardingSaveResult> {
+  const telemetry = new OnboardingSaveTelemetry(
+    ++onboardingSaveTelemetryAttempt,
+    app.isPackaged,
+    (event, detail) => desktopLog(event, detail),
+  )
+  try {
+    // Keep the existing writer-admission boundary: lifecycle drains do not need
+    // to wait for an inspect that has not begun a settings write.
+    let recoveryRequired: boolean
+    try {
+      recoveryRequired = await telemetry.stage(
+        'primary_recovery_inspect',
+        () => refreshPrimaryRecoveryAfterImportAttempt(),
+      )
+    } catch (error) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      throw error
+    }
+    if (recoveryRequired) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'recovery_required',
+        'The primary profile requires recovery before setup can write to it.',
+      ))
+    }
+    if (!onboardingFlows.canComplete(flow)) {
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'onboarding_inactive',
+        'OpenSquilla setup is no longer active.',
+      ))
+    }
+
+    let finishWriter: (() => void) | null = null
+    try {
+      finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
+      telemetry.markWriterAdmitted()
+    } catch {
+      if (flow.state === 'saving') flow.state = 'editing'
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'lifecycle_deferred',
+        'OpenSquilla is finishing another profile or lifecycle operation.',
+      ))
+    }
+
+    let credential: DesktopConnection
+    try {
+      // Re-read the marker only after reserving the writer. Credential/config,
+      // locale, and marker removal then converge as one lifecycle operation that
+      // update/quit must drain. Imported .env bytes are deliberately untouched.
+      const pendingMigration = await telemetry.stage(
+        'pending_setup_read',
+        () => readPendingMigrationProviderSetup(),
+      )
+      credential = await telemetry.stage('settings_persist', async () => {
+        // Keychain availability may have changed while the onboarding window
+        // remained open. Re-check it on every save attempt instead of carrying
+        // a transient locked-keychain result across a user unlock.
+        invalidateSecretStorageBackendCache()
+        if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
+          return await saveImportedDesktopCredential(
+            pendingMigration,
+            pendingMigration.committedTransactionId,
+            String(payload.apiKey || ''),
+            true,
+          )
+        }
+        return await saveDesktopCredential(payload, true)
+      })
+      telemetry.markSettingsPersistedConfirmed()
+      await telemetry.stage('local_finalize', async () => {
+        applyDesktopLocaleChoice(payload.locale)
+        await clearPendingMigrationProviderSetup()
+      })
+    } catch (error) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      throw error
+    } finally {
+      finishWriter()
+    }
+
+    return telemetry.stageSync('flow_handoff', () => {
+      if (!onboardingFlows.canComplete(flow)) {
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'onboarding_inactive',
+          'OpenSquilla setup is no longer active.',
+        ))
+      }
+      // Quit deferral deliberately leaves isQuitting=false while it drains writers,
+      // so admission/exit phase are authoritative alongside the boolean latch.
+      if (desktopWriters.closed || isQuitting || appExitPhase !== 'running') {
+        abandonOnboardingFlow(
+          flow,
+          new Error('OpenSquilla setup completed, but startup was deferred by an active lifecycle operation.'),
+          true,
+        )
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'lifecycle_deferred',
+          'Setup was saved; startup was deferred by an active lifecycle operation.',
+        ))
+      }
+      if (!completeOnboardingFlow(flow, credential)) {
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'onboarding_inactive',
+          'OpenSquilla setup is no longer active.',
+        ))
+      }
+      return telemetry.recordReturned({ ok: true })
+    })
+  } finally {
+    telemetry.finish()
+  }
 }
 
 async function withRecoveryOperation<T>(
@@ -12612,6 +13537,11 @@ ipcMain.handle('desktop:boot:state', () => ({
   recovery: recoveryStateSnapshot(),
 }))
 
+ipcMain.handle('desktop:boot:open-keychain', async (event) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Keychain access request.')
+  return await openMacKeychainAccess()
+})
+
 interface BootResumeAuthority {
   child: ChildProcessWithoutNullStreams
   profileKey: string
@@ -12642,7 +13572,8 @@ function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
     && desktopOpenFlowRevision === authority.openFlowRevision
 }
 
-async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
+async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?: BootErrorCode }> {
+  invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
   bootError = null
@@ -12664,10 +13595,9 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
     }
     const authority = pendingStart ? currentBootResumeAuthority() : initialAuthority
     if (!authority || !bootResumeAuthorityIsCurrent(authority)) return { ok: true }
-    await loadControlUiIntoCurrentWindow(
-      gateway.url,
-      () => bootResumeAuthorityIsCurrent(authority),
-    )
+    await loadDesktopRendererIntoCurrentWindow()
+    if (!bootResumeAuthorityIsCurrent(authority)) return { ok: true }
+    sendBootStatus('ready')
     return { ok: true }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -12675,7 +13605,11 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
     // direct resume, an exit handler or a newer quit/reset/restart owns any
     // state after this exact child/profile/revision loses authority.
     if (pendingStart || !initialAuthority || !bootResumeAuthorityIsCurrent(initialAuthority)) {
-      return { ok: false, error: message }
+      return {
+        ok: false,
+        error: message,
+        ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
+      }
     }
     if (gatewayState.status !== 'ready') {
       gatewayState.status = 'error'
@@ -12702,6 +13636,7 @@ ipcMain.handle('desktop:boot:resume', async () => {
   }
 })
 ipcMain.handle('desktop:boot:retry', async () => {
+  invalidateSecretStorageBackendCache()
   // The Control UI "Restart runtime" action intentionally forces a new child.
   // The boot page uses desktop:boot:resume instead so a slow owned child can be
   // accepted after it becomes healthy instead of being torn down first.
@@ -12726,12 +13661,11 @@ ipcMain.handle('desktop:boot:retry', async () => {
       pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
     })
     sendBootError(message)
-    await restoreMainWindowToBootPage()
+    publishGatewayConnection()
     return { ok: false, error: message }
   }
   clearReusableGatewayState()
   bootError = null
-  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
 
   void openOrResumeDesktopApp()
   return { ok: true }
@@ -12752,7 +13686,8 @@ ipcMain.handle('desktop:onboarding:defaults', () => ({
   },
 }))
 ipcMain.handle('desktop:onboarding:probe', async (event, payload: OnboardingProbePayload) => {
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
+  const flow = onboardingFlows.active
+  if (!flow || flow.state !== 'editing' || !trustedOnboardingIpc(event, flow)) {
     return {
       ok: false,
       failureKind: 'unavailable',
@@ -12776,50 +13711,36 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   // same preload bridge is attached to the Control UI window, so without this
   // guard any script on the gateway-served page could rewrite the credential and
   // regenerate config.toml outside onboarding.
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted onboarding is in progress.' }
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
   }
-  if (await refreshPrimaryRecoveryAfterImportAttempt()) {
-    return {
-      ok: false,
-      error: 'The primary profile requires recovery before setup can write to it.',
-    }
+  const requestPayload = payload && typeof payload === 'object' ? payload : {}
+  const request = onboardingFlows.requestSave(
+    flow,
+    requestPayload,
+    () => performOnboardingSave(flow, requestPayload),
+  )
+  if (request.kind === 'conflict') {
+    return onboardingSaveFailure(
+      'save_in_progress',
+      'OpenSquilla is already saving a different setup request.',
+    )
   }
-  let credential: DesktopConnection
-  const finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
-  try {
-    // Re-read the marker only after reserving the writer. Credential/config,
-    // locale, and marker removal then converge as one lifecycle operation that
-    // update/quit must drain. Imported .env bytes are deliberately untouched.
-    const pendingMigration = await readPendingMigrationProviderSetup()
-    if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
-      credential = await saveImportedDesktopCredential(
-        pendingMigration,
-        pendingMigration.committedTransactionId,
-        String(payload.apiKey || ''),
-        true,
-      )
-    } else {
-      credential = await saveDesktopCredential(payload, true)
-    }
-    applyDesktopLocaleChoice(payload.locale)
-    await clearPendingMigrationProviderSetup()
-  } finally {
-    finishWriter()
+  if (request.kind === 'inactive') {
+    return onboardingSaveFailure('onboarding_inactive', 'OpenSquilla setup is no longer active.')
   }
-  const resolve = resolveOnboarding
-  resolveOnboarding = null
-  rejectOnboarding = null
-  onboardingWindow?.close()
-  resolve?.(credential)
-  return { ok: true }
+  return await request.promise
 })
-ipcMain.handle('desktop:onboarding:cancel', () => {
-  const reject = rejectOnboarding
-  resolveOnboarding = null
-  rejectOnboarding = null
-  onboardingWindow?.close()
-  reject?.(new Error('OpenSquilla setup was cancelled.'))
+ipcMain.handle('desktop:onboarding:cancel', (event) => {
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
+  }
+  // An admitted atomic save cannot be cancelled safely. Mark this flow
+  // abandoned so its late completion cannot resolve a replacement onboarding
+  // window; before-quit drains its writer before Electron exits.
+  abandonOnboardingFlow(flow, new Error('OpenSquilla setup was cancelled.'), true)
   // The onboarding "Quit" button routes here; it is a deliberate exit, so quit
   // the app instead of surfacing the cancellation as a boot failure panel.
   app.quit()
@@ -12895,6 +13816,7 @@ app.on('before-quit', (event) => {
     isQuitting = true
     setAppExitPhase('committed', 'Windows session ending')
     destroyWindowsTray()
+    void desktopArtifactBridgeLoopback.close()
     stopGateway()
     return
   }
@@ -12906,6 +13828,7 @@ app.on('before-quit', (event) => {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')
       destroyWindowsTray()
+      void desktopArtifactBridgeLoopback.close()
       return
     }
     event.preventDefault()
@@ -12970,6 +13893,7 @@ app.on('before-quit', (event) => {
       if (exited) {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
         destroyWindowsTray()
+        void desktopArtifactBridgeLoopback.close()
         app.exit(0)
         return
       }
@@ -12995,6 +13919,7 @@ app.on('before-quit', (event) => {
   }
   setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
   destroyWindowsTray()
+  void desktopArtifactBridgeLoopback.close()
   stopGateway()
 })
 
@@ -13019,7 +13944,10 @@ app.on('activate', () => {
   revealDesktopApp()
 })
 
-app.on('will-quit', destroyWindowsTray)
+app.on('will-quit', () => {
+  destroyWindowsTray()
+  void desktopArtifactBridgeLoopback.close()
+})
 
 configureChromiumKeychainPolicy()
 
@@ -13044,7 +13972,10 @@ function acquireSingleInstanceLockWithRetry(): boolean {
   for (;;) {
     attempt += 1
     if (app.requestSingleInstanceLock()) {
-      desktopLog('single_instance_lock_acquired', { attempt })
+      desktopLog('single_instance_lock_acquired', {
+        elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+        attempt,
+      })
       return true
     }
     // A Windows protocol launch targets the current instance and does not need
@@ -13069,7 +14000,11 @@ app.on('open-url', (event, rawUrl) => {
   handleDeepLink(rawUrl, 'open-url')
 })
 
-desktopLog('launch', { platform: process.platform, argv: process.argv.length })
+desktopLog('launch', {
+  elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+  platform: process.platform,
+  argv: process.argv.length,
+})
 const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
 
 if (!gotSingleInstanceLock) {
@@ -13108,6 +14043,7 @@ if (!gotSingleInstanceLock) {
 
   void app.whenReady().then(async () => {
     app.name = 'OpenSquilla'
+    installDesktopRendererProtocol()
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
     createWindowsTray()

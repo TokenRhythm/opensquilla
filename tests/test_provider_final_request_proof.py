@@ -6,7 +6,9 @@ from typing import Any
 
 import httpx
 
+from opensquilla.provider import anthropic as anthropic_module
 from opensquilla.provider import openai as openai_module
+from opensquilla.provider import request_proof as request_proof_module
 from opensquilla.provider.anthropic import AnthropicProvider
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.types import (
@@ -45,6 +47,17 @@ def _anthropic_sse_body(events: list[dict[str, Any]]) -> bytes:
         parts.append(f"event: {event['type']}\n".encode())
         parts.append(f"data: {json.dumps(event)}\n\n".encode())
     return b"".join(parts)
+
+
+def _use_deterministic_token_estimator(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        request_proof_module,
+        "_serialized_token_estimate",
+        lambda serialized_payload: (
+            max(1, (len(serialized_payload) + 3) // 4),
+            "synthetic_tokenizer",
+        ),
+    )
 
 
 def test_openai_final_request_proof_blocks_oversized_send(monkeypatch: Any) -> None:
@@ -387,6 +400,7 @@ def test_openai_final_request_proof_compacts_adapter_payload_with_tools(
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS", "0")
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "0")
+    _use_deterministic_token_estimator(monkeypatch)
     requests: list[httpx.Request] = []
     payloads: list[dict[str, Any]] = []
     proofs: list[dict[str, Any]] = []
@@ -477,6 +491,7 @@ def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS", "0")
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "0")
+    _use_deterministic_token_estimator(monkeypatch)
     requests: list[httpx.Request] = []
     payloads: list[dict[str, Any]] = []
     proofs: list[dict[str, Any]] = []
@@ -513,12 +528,17 @@ def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
         return real_async_client(*args, **kwargs)
 
     monkeypatch.setattr("opensquilla.provider.anthropic.httpx.AsyncClient", patched_async_client)
-    monkeypatch.setattr(
-        "opensquilla.provider.anthropic.log.info",
-        lambda event, **kwargs: (
-            proofs.append(kwargs) if event == "provider.request_proof" else None
-        ),
-    )
+    real_log = anthropic_module.log
+
+    class _ProofLogShim:
+        def info(self, event: str, **kwargs: Any) -> None:
+            if event == "provider.request_proof":
+                proofs.append(kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(anthropic_module, "log", _ProofLogShim())
     provider = AnthropicProvider(api_key="test", model="claude-test")
     messages = [
         Message(

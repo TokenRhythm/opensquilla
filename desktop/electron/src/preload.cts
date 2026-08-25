@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-contextBridge.exposeInMainWorld('opensquillaDesktop', {
+if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
   isDesktopUpdateManaged: () => ipcRenderer.invoke('desktop:update:managed'),
@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   relaunchToUpdate: () => ipcRenderer.invoke('desktop:update:relaunch'),
   dismissUpdate: () => ipcRenderer.invoke('desktop:update:dismiss'),
   getGatewayStatus: () => ipcRenderer.invoke('gateway:status'),
+  getGatewayConnection: () => ipcRenderer.invoke('gateway:connection'),
   getCliInvocation: () => ipcRenderer.invoke('gateway:cli-invocation'),
   revealGatewayLog: () => ipcRenderer.invoke('gateway:reveal-log'),
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
@@ -26,6 +27,39 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),
   getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
+  getArtifactBridgeCapabilities: () => (
+    ipcRenderer.invoke('desktop:workbench:artifact:capabilities')
+  ),
+  getArtifactAnnotationCapabilities: () => (
+    ipcRenderer.invoke('desktop:workbench:annotation:capabilities')
+  ),
+  setArtifactAnnotationMode: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:set-mode', payload)
+  ),
+  showArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:show-overlay', payload)
+  ),
+  closeArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
+  ),
+  captureSelection: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:capture-selection', payload)
+  ),
+  browserInspect: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:browser-inspect', payload)
+  ),
+  browserAct: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:browser-act', payload)
+  ),
+  screenshot: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:screenshot', payload)
+  ),
+  officeFlush: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:office-flush', payload)
+  ),
+  reloadSurface: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:artifact:reload-surface', payload)
+  ),
   createArtifactPreviewLease: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
   ),
@@ -58,6 +92,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
+  openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain'),
   resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
@@ -88,6 +123,11 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:boot:error', listener)
     return () => ipcRenderer.removeListener('desktop:boot:error', listener)
+  },
+  onGatewayConnectionChanged: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
+    ipcRenderer.on('gateway:connection-changed', listener)
+    return () => ipcRenderer.removeListener('gateway:connection-changed', listener)
   },
   onRecoveryState: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)

@@ -635,6 +635,94 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     return value
 
 
+_SINGLE_CHILD_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+
+
+def _complete_itemless_arrays_with_string_items(value: Any) -> Any:
+    """Project itemless schema arrays to Gemini's typed wire format.
+
+    Callers must gate this lossy projection to tools whose values have safe
+    textual wire semantics. Only schema-bearing keywords are traversed, so
+    schema-shaped literal values under ``default``, ``enum``, or ``const``
+    remain unchanged.
+    """
+
+    if not isinstance(value, dict):
+        return value
+
+    rebuilt = dict(value)
+    for key in _SINGLE_CHILD_SCHEMA_KEYWORDS:
+        child = rebuilt.get(key)
+        if isinstance(child, dict):
+            rebuilt[key] = _complete_itemless_arrays_with_string_items(child)
+        elif key == "items" and isinstance(child, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in child
+            ]
+    for key in _SCHEMA_ARRAY_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in children
+            ]
+    for key in _SCHEMA_MAP_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, dict):
+            rebuilt[key] = {
+                name: _complete_itemless_arrays_with_string_items(child)
+                if isinstance(child, dict)
+                else child
+                for name, child in children.items()
+            }
+    dependencies = rebuilt.get("dependencies")
+    if isinstance(dependencies, dict):
+        rebuilt["dependencies"] = {
+            name: _complete_itemless_arrays_with_string_items(child)
+            if isinstance(child, dict)
+            else child
+            for name, child in dependencies.items()
+        }
+
+    declared_type = rebuilt.get("type")
+    is_array = declared_type == "array" or (
+        isinstance(declared_type, list) and "array" in declared_type
+    )
+    if is_array and "items" not in rebuilt:
+        rebuilt["items"] = {"type": "string"}
+    return rebuilt
+
+
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
@@ -1983,6 +2071,20 @@ def _segment_text_tool_events(
                 events.append(TextDeltaEvent(text=segment.text))
             continue
         if isinstance(segment, RejectedTextToolSegment):
+            id_prefix = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text_rejected",
+                TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat_rejected",
+                TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat_rejected",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml_rejected",
+            }[segment.dialect]
+            for tool_name in segment.recognized_tool_names:
+                events.append(
+                    ToolUseStartEvent(
+                        tool_use_id=f"{id_prefix}_{uuid4().hex[:12]}",
+                        tool_name=tool_name,
+                        synthetic_from_text=True,
+                    )
+                )
             continue
         if isinstance(segment, InertDsmlSegment):
             raise AssertionError("inert DSML reached executable event conversion")
@@ -2054,14 +2156,14 @@ def _text_tool_rejection_error(
     cache_shape: Mapping[str, Any],
     trace: LLMTraceRecorder,
 ) -> ErrorEvent | None:
-    """Convert one rejected DSML response into a payload-free terminal error."""
+    """Convert rejected text-tool output into a payload-free terminal error."""
 
     details = _text_tool_rejection_details(segments)
     if details is None:
         return None
     reasons, call_count = details
     log.warning(
-        "provider.deepseek_dsml_tool_call_rejected",
+        "provider.text_tool_call_rejected",
         provider=provider_kind,
         model=model,
         reasons=reasons,
@@ -2069,7 +2171,7 @@ def _text_tool_rejection_error(
     )
     trace.record_error(
         code="incomplete_tool_call",
-        message="Provider returned rejected DeepSeek DSML tool-call text",
+        message="Provider returned rejected text-encoded tool-call output",
         metadata={
             "phase": phase,
             "cache_shape": cache_shape,
@@ -2079,7 +2181,7 @@ def _text_tool_rejection_error(
     )
     return ErrorEvent(
         message=(
-            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            f"{display_name} returned an invalid text-encoded tool call; "
             "no text-encoded tools were executed"
         ),
         code="incomplete_tool_call",
@@ -2092,6 +2194,7 @@ def _synthesize_text_tool_events(
     *,
     provider_kind: str,
     model: str,
+    base_url: str = "",
 ) -> list[ToolUseStartEvent | ToolUseEndEvent]:
     """Compatibility helper backed by the scoped, atomic classifier."""
 
@@ -2099,7 +2202,7 @@ def _synthesize_text_tool_events(
     segments = classify_text_tool_segments(
         full_text,
         tools,
-        dialects=policy.text_tool_profile.dialects_for_model(model),
+        dialects=policy.text_tool_profile.dialects_for_model(model, base_url),
         provider_kind=provider_kind,
         model=model,
     )
@@ -2118,9 +2221,12 @@ def _build_openai_tool(
     tool: ToolDefinition,
     *,
     unsupported_keywords: frozenset[str] = frozenset(),
+    complete_itemless_arrays_with_string_items: bool = False,
 ) -> dict[str, Any]:
     schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
     schema = _strip_tool_schema_keywords(schema, unsupported_keywords)
+    if complete_itemless_arrays_with_string_items:
+        schema = _complete_itemless_arrays_with_string_items(schema)
     return {
         "type": "function",
         "function": {
@@ -2151,6 +2257,7 @@ def _dashscope_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
         return True
     return model_name.startswith(
         (
+            "qwen3.8-max",
             "qwen3.7-max",
             "qwen3.6-max-preview",
             "qwen3.7-plus",
@@ -2166,6 +2273,13 @@ def _dashscope_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
     )
 
 
+def _tokenrhythm_model_supports_explicit_prompt_cache(model: str) -> bool:
+    """Return True only for TokenRhythm models with live cache-control proof."""
+
+    model_name = model.rsplit("/", 1)[-1].strip().lower()
+    return model_name in {"qwen3.7-max", "qwen3.8-max"}
+
+
 def _supports_explicit_prompt_cache(
     provider_kind: str,
     model: str,
@@ -2177,6 +2291,8 @@ def _supports_explicit_prompt_cache(
         return cache_mode == "on" or _openrouter_model_likely_supports_explicit_prompt_cache(model)
     if provider_kind == "dashscope":
         return cache_mode == "on" or _dashscope_model_likely_supports_explicit_prompt_cache(model)
+    if provider_kind == "tokenrhythm":
+        return _tokenrhythm_model_supports_explicit_prompt_cache(model)
     return False
 
 
@@ -2292,7 +2408,7 @@ def _log_provider_cache_usage(
     cache_write_tokens: int,
     cache_shape: Mapping[str, Any],
 ) -> None:
-    if provider_kind != "dashscope":
+    if provider_kind not in {"dashscope", "tokenrhythm"}:
         return
     log.info(
         f"{provider_kind}.prompt_cache_usage",
@@ -2898,8 +3014,10 @@ def _build_openai_messages(
     per tool result, while opensquilla packs multiple tool results into a single
     Message.
 
-    Invariant: tool_result blocks never coexist with text/image blocks in the
-    same Message (agent.py always packs tool results into a dedicated message).
+    Tool results normally arrive in a dedicated message.  The autonomous
+    document loop may additionally place a screenshot image in that message;
+    it is emitted as a trailing user image message because OpenAI-compatible
+    APIs accept only text in a ``role=tool`` payload.
     """
     if isinstance(msg.content, str):
         return [
@@ -2952,8 +3070,14 @@ def _build_openai_messages(
                 }
             )
 
-    # Tool results → one message per result (OpenAI requirement)
+    # Tool results → one message per result (OpenAI requirement).  A browser
+    # screenshot is carried as a separate user image message because the
+    # Chat Completions API accepts only text in a ``role=tool`` payload; doing
+    # this here preserves the tool-call/result pairing while still giving a
+    # vision-capable model the pixels.
     if tool_results:
+        if parts:
+            tool_results.append({"role": "user", "content": parts})
         return tool_results
 
     # Assistant message with tool_calls (preserve text alongside calls)
@@ -3042,7 +3166,9 @@ def _build_openai_wire_messages(
             content_blocks = _build_cache_breakpoint_blocks(
                 cfg.cache_breakpoints,
                 max_cache_markers=(
-                    _DASHSCOPE_MAX_CACHE_MARKERS if provider_kind == "dashscope" else None
+                    _DASHSCOPE_MAX_CACHE_MARKERS
+                    if provider_kind in {"dashscope", "tokenrhythm"}
+                    else None
                 ),
             )
             openai_messages.append({"role": "system", "content": content_blocks})
@@ -3122,7 +3248,11 @@ def _build_openai_wire_messages(
                         (_reasoning_replay_signature(built_message), suppressed_units)
                     )
         openai_messages.extend(built_messages)
-    if provider_kind == "dashscope" and cfg.cache_mode == "on":
+    if (
+        provider_kind in {"dashscope", "tokenrhythm"}
+        and cfg.cache_mode == "on"
+        and explicit_cache_supported
+    ):
         _attach_cache_control_to_latest_text_messages(
             openai_messages,
             max_cache_markers=_DASHSCOPE_MAX_CACHE_MARKERS,
@@ -3432,6 +3562,13 @@ class OpenAIProvider:
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
+                    complete_itemless_arrays_with_string_items=(
+                        tool.allow_string_item_schema_projection
+                        and self._compat.allows_string_item_schema_projection(
+                            tool.name,
+                            self._base_url,
+                        )
+                    ),
                 )
                 for tool in tools
             ]
@@ -3823,7 +3960,10 @@ class OpenAIProvider:
         streamed_thought_signature: str | None = None
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -5085,6 +5225,19 @@ class OpenAIProvider:
                         trace=trace,
                     )
                     if rejection_error is not None:
+                        for event in _segment_text_tool_events(
+                            normalized_segments,
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                        ):
+                            if isinstance(event, ToolUseEndEvent):
+                                raise AssertionError(
+                                    "rejected text tool output produced a completed call"
+                                )
+                            emitted_stream_event = True
+                            if isinstance(event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(event.text)
+                            yield event
                         yield rejection_error
                         return
                     for event in _segment_text_tool_events(
@@ -5753,7 +5906,10 @@ class OpenAIProvider:
         trace_tool_calls: list[dict[str, Any]] = []
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -6018,6 +6174,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message=(
@@ -6047,6 +6206,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message="Provider returned invalid native tool arguments",
@@ -6082,6 +6244,18 @@ class OpenAIProvider:
             trace=trace,
         )
         if rejection_error is not None:
+            for event in _segment_text_tool_events(
+                normalized_segments,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            ):
+                if isinstance(event, ToolUseEndEvent):
+                    raise AssertionError(
+                        "rejected text tool output produced a completed call"
+                    )
+                if isinstance(event, TextDeltaEvent):
+                    visible_assistant_text_parts.append(event.text)
+                yield event
             yield rejection_error
             return
         for event in _segment_text_tool_events(

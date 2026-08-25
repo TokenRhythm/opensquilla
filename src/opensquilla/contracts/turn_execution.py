@@ -164,6 +164,63 @@ class RecoveryContext:
 
 
 @dataclass(frozen=True, slots=True)
+class EnsembleContinuationSnapshot:
+    """Immutable ensemble state needed when a provider wrapper is rebuilt.
+
+    A provider instance is an implementation detail, while the turn context is
+    the authority that survives router-control replay and tool continuations.
+    Keep the complete physical usage receipt here so a rebuilt wrapper cannot
+    silently start its breakdown at the latest aggregator request.
+    """
+
+    role: StickyExecutionRole = StickyExecutionRole.PRIMARY_AGGREGATOR
+    successful_drafts: tuple[Any, ...] = ()
+    candidate_bundle: tuple[Any, ...] = ()
+    all_candidates: tuple[Any, ...] = ()
+    base_messages: tuple[Any, ...] = ()
+    prior_rows: tuple[Any, ...] = ()
+    missing_cost_entries: int = 0
+    ensemble_trace: Mapping[str, Any] = field(default_factory=dict)
+    physical_request_count: int = 0
+    request_started: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role", _role(self.role))
+        for name in (
+            "successful_drafts",
+            "candidate_bundle",
+            "all_candidates",
+            "base_messages",
+            "prior_rows",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, (str, bytes)):
+                raise TypeError(f"{name} must be a collection")
+            object.__setattr__(self, name, tuple(_freeze(item) for item in value))
+        object.__setattr__(
+            self,
+            "missing_cost_entries",
+            max(0, int(self.missing_cost_entries or 0)),
+        )
+        object.__setattr__(
+            self,
+            "ensemble_trace",
+            MappingProxyType(
+                {
+                    str(key): _freeze(item)
+                    for key, item in (self.ensemble_trace or {}).items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "physical_request_count",
+            max(0, int(self.physical_request_count or 0)),
+        )
+        object.__setattr__(self, "request_started", bool(self.request_started))
+
+
+@dataclass(frozen=True, slots=True)
 class CompletedToolRecord:
     """One tool round that crossed the legal Done boundary."""
 
@@ -344,6 +401,7 @@ class TurnExecutionContext:
         self._suppress_selector_fallback = False
         self._successful_drafts: tuple[Any, ...] = ()
         self._recovery_context: RecoveryContext | None = None
+        self._ensemble_continuation_snapshot: EnsembleContinuationSnapshot | None = None
         self._usage_legs: list[UsageExecutionLeg] = []
         self._generation_state = GenerationState(
             last_sequence=identity.turn_start_sequence
@@ -443,6 +501,12 @@ class TurnExecutionContext:
     @property
     def recovery_context(self) -> RecoveryContext | None:
         return self._recovery_context
+
+    @property
+    def ensemble_continuation_snapshot(self) -> EnsembleContinuationSnapshot | None:
+        """Latest complete ensemble receipt for provider reconstruction."""
+
+        return self._ensemble_continuation_snapshot
 
     @property
     def successful_drafts(self) -> tuple[Any, ...]:
@@ -549,6 +613,17 @@ class TurnExecutionContext:
         if isinstance(drafts, (str, bytes)):
             raise TypeError("successful drafts must be a collection")
         self._successful_drafts = tuple(_freeze(item) for item in drafts)
+
+    def record_ensemble_continuation_snapshot(
+        self,
+        snapshot: EnsembleContinuationSnapshot,
+    ) -> None:
+        """Replace the turn-owned ensemble continuation receipt atomically."""
+
+        self._ensure_open()
+        if not isinstance(snapshot, EnsembleContinuationSnapshot):
+            raise TypeError("snapshot must be an EnsembleContinuationSnapshot")
+        self._ensemble_continuation_snapshot = snapshot
 
     def record_usage_leg(self, leg: UsageExecutionLeg) -> None:
         self._ensure_open()

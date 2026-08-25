@@ -45,6 +45,7 @@ function owner(title: string): {
       copyIcon: ref('copy'),
       copyLiveText: ref(''),
       deliverableCount: ref(0),
+      hasNewDeliverable: ref(false),
       shareMode: ref(false),
       shareableMessageCount: ref(1),
     },

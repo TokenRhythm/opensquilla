@@ -11,19 +11,28 @@ class), through a symlink, or through `ln` itself.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from opensquilla.git_runtime import GitRunState
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+from opensquilla.sandbox.types import (
+    DenialReason,
+    DenialResult,
+    SecurityLevel,
+    SuggestedNextStep,
+)
 from opensquilla.tools import write_policy
-from opensquilla.tools.builtin import shell
+from opensquilla.tools.builtin import code_exec, shell
 from opensquilla.tools.builtin.code_exec import execute_code
 from opensquilla.tools.builtin.shell import exec_command
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+from opensquilla.tools.write_tracking import WorkspaceMutationSnapshot
 
 _EFFECT_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT"
 _TRACKED_ONLY_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_TRACKED_ONLY"
@@ -136,6 +145,14 @@ def _effect_events(events: list[dict]) -> list[dict]:
     return [event for event in events if event.get("name") == "effect_enforcement"]
 
 
+def _effect_unavailable_events(events: list[dict]) -> list[dict]:
+    return [
+        event
+        for event in events
+        if event.get("name") == "effect_enforcement_unavailable"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_helper_script_escape_is_reverted_and_denied(effect_context, monkeypatch):
     """Reproduces the observed escape class: argv names no protected path."""
@@ -196,6 +213,194 @@ async def test_effect_mode_off_by_default(effect_context):
     assert "[workspace write deny]" not in result
     assert (workspace / "replacer_test.go").read_text(encoding="utf-8") == "hacked\n"
     assert _effect_events(events) == []
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "effect_mode", "expected_runs", "warning_expected"),
+    [
+        ("safe", "off", 1, False),
+        ("safe", "warn", 1, True),
+        ("safe", "revert", 0, False),
+        ("full", "off", 1, False),
+        ("full", "warn", 1, False),
+        ("full", "revert", 1, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_git_unavailable_effect_mode_matrix_in_safe_and_full(
+    effect_context,
+    monkeypatch: pytest.MonkeyPatch,
+    run_mode: str,
+    effect_mode: str,
+    expected_runs: int,
+    warning_expected: bool,
+) -> None:
+    workspace, _scratch, ctx, events = effect_context
+    ctx.run_mode = run_mode
+    monkeypatch.setenv(_EFFECT_ENV, effect_mode)
+    unavailable = WorkspaceMutationSnapshot(git_state=GitRunState.UNAVAILABLE)
+    monkeypatch.setattr(
+        shell,
+        "snapshot_current_workspace_mutations",
+        lambda: unavailable,
+    )
+    executions: list[str] = []
+
+    async def fake_full_host(*_args: object, **_kwargs: object) -> str:
+        executions.append("full")
+        return "ran\n"
+
+    async def fake_host(*_args: object, **kwargs: object) -> str:
+        executions.append("safe")
+        on_process_started = kwargs.get("on_process_started")
+        if callable(on_process_started):
+            on_process_started()
+        return "exit_code=0\nran\n"
+
+    monkeypatch.setattr(shell, "_run_full_host_shell_command", fake_full_host)
+    monkeypatch.setattr(shell, "_run_host_shell_command", fake_host)
+
+    result = await exec_command("printf ran", workdir=str(workspace))
+
+    assert len(executions) == expected_runs
+    assert ("[workspace write protection unavailable]" in result) is warning_expected
+    if expected_runs == 0:
+        payload = json.loads(result)
+        assert payload["code"] == "WORKSPACE_WRITE_PROTECTION_UNAVAILABLE"
+    assert len(_effect_unavailable_events(events)) == int(warning_expected)
+
+
+@pytest.mark.asyncio
+async def test_shell_preexecution_denial_does_not_claim_postexecution_warning(
+    effect_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, _scratch, ctx, events = effect_context
+    ctx.run_mode = "safe"
+    monkeypatch.setenv(_EFFECT_ENV, "warn")
+    unavailable = WorkspaceMutationSnapshot(git_state=GitRunState.UNAVAILABLE)
+    monkeypatch.setattr(
+        shell,
+        "snapshot_current_workspace_mutations",
+        lambda: unavailable,
+    )
+    monkeypatch.setattr(
+        shell,
+        "_strict_runtime_unavailable_envelope",
+        lambda *_args, **_kwargs: {
+            "status": "error",
+            "reason": "runtime_unavailable",
+        },
+    )
+
+    async def unexpected_execution(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("pre-execution denial must not launch the command")
+
+    monkeypatch.setattr(shell, "_run_host_shell_command", unexpected_execution)
+    monkeypatch.setattr(shell, "_run_full_host_shell_command", unexpected_execution)
+
+    result = await exec_command("printf never", workdir=str(workspace))
+
+    assert json.loads(result)["reason"] == "runtime_unavailable"
+    assert "[workspace write protection unavailable]" not in result
+    assert _effect_unavailable_events(events) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_code_preexecution_denial_does_not_claim_postexecution_warning(
+    effect_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, _scratch, ctx, events = effect_context
+    ctx.run_mode = "safe"
+    monkeypatch.setenv(_EFFECT_ENV, "warn")
+    reset_runtime()
+    unavailable = WorkspaceMutationSnapshot(git_state=GitRunState.UNAVAILABLE)
+    monkeypatch.setattr(
+        code_exec,
+        "snapshot_current_workspace_mutations",
+        lambda: unavailable,
+    )
+
+    denial = DenialResult(
+        reason=DenialReason.POLICY_DENIED,
+        suggested_next_step=SuggestedNextStep.REPLAN,
+        level=SecurityLevel.STANDARD,
+        action_fingerprint="pre-execution-denial",
+        message="denied before execution",
+        retryable=False,
+    )
+
+    async def deny_action(**_kwargs: object) -> tuple[object, object, object]:
+        return denial, object(), object()
+
+    async def unexpected_execution(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("pre-execution denial must not launch Python")
+
+    monkeypatch.setattr(code_exec, "gate_action", deny_action)
+    monkeypatch.setattr(code_exec, "create_owned_subprocess_exec", unexpected_execution)
+
+    result = await execute_code("print('never')")
+
+    assert json.loads(result)["reason"] == DenialReason.POLICY_DENIED.value
+    assert "[workspace write protection unavailable]" not in result
+    assert _effect_unavailable_events(events) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_code_spawn_failure_does_not_claim_postexecution_warning(
+    effect_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, _scratch, ctx, events = effect_context
+    ctx.run_mode = "safe"
+    monkeypatch.setenv(_EFFECT_ENV, "warn")
+    unavailable = WorkspaceMutationSnapshot(git_state=GitRunState.UNAVAILABLE)
+    monkeypatch.setattr(
+        code_exec,
+        "snapshot_current_workspace_mutations",
+        lambda: unavailable,
+    )
+
+    async def fail_before_spawn(*_args: object, **_kwargs: object) -> object:
+        raise OSError("interpreter could not be started")
+
+    monkeypatch.setattr(code_exec, "create_owned_subprocess_exec", fail_before_spawn)
+
+    result = await execute_code("print('never started')")
+
+    payload = json.loads(result)
+    assert payload["exit_code"] == -1
+    assert "interpreter could not be started" in payload["stderr"]
+    assert "[workspace write protection unavailable]" not in result
+    assert _effect_unavailable_events(events) == []
+
+
+@pytest.mark.asyncio
+async def test_shell_spawn_failure_does_not_claim_postexecution_warning(
+    effect_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, _scratch, ctx, events = effect_context
+    ctx.run_mode = "safe"
+    monkeypatch.setenv(_EFFECT_ENV, "warn")
+    unavailable = WorkspaceMutationSnapshot(git_state=GitRunState.UNAVAILABLE)
+    monkeypatch.setattr(
+        shell,
+        "snapshot_current_workspace_mutations",
+        lambda: unavailable,
+    )
+
+    async def fail_before_spawn(*_args: object, **_kwargs: object) -> object:
+        raise OSError("shell could not be started")
+
+    monkeypatch.setattr(shell, "_create_host_shell_subprocess", fail_before_spawn)
+
+    result = await exec_command("printf never", workdir=str(workspace))
+
+    assert result == "[error] shell could not be started"
+    assert "[workspace write protection unavailable]" not in result
+    assert _effect_unavailable_events(events) == []
 
 
 @pytest.mark.asyncio
