@@ -30,6 +30,19 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain("? 'workbench-annotation-mode-status'")
   })
 
+  it('marks the annotation action as beta without changing its accessible label', () => {
+    expect(appWorkbenchSource).toContain(
+      "v-if=\"toolbarItem.id === 'toggle-annotation-mode'\"",
+    )
+    expect(appWorkbenchSource).toContain('class="app-workbench__action-beta"')
+    expect(appWorkbenchSource).toMatch(
+      /app-workbench__action-beta[\s\S]*aria-hidden="true"[\s\S]*>\s*β\s*<\/span>/,
+    )
+    expect(appWorkbenchSource).toMatch(
+      /\.app-workbench__action-beta\s*\{[\s\S]*font-size: 7px;[\s\S]*opacity: 0\.58;/,
+    )
+  })
+
   it('uses the workbench container width and preserves fixed-size toolbar actions', () => {
     expect(appWorkbenchSource).toContain('@container (max-width: 520px)')
     expect(appWorkbenchSource).toMatch(

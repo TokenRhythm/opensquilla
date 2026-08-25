@@ -179,6 +179,16 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
+  /const rearmed = await this\.armAnnotationPicker\([\s\S]*?!rearmed\.ok[\s\S]*?code: 'ANNOTATION_REARM_FAILED'[\s\S]*?surfaceInstanceId: record\.surfaceInstanceId/,
+  'a rejected target must report a stable failure when its one-shot picker cannot rearm',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId \}/,
+  'surface creation must return the exact instance identity used to fence late picker events',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
   /annotationRecordForCleanupRequest\(surfaceId\) \{[\s\S]*?record\.kind === 'artifact-preview'[\s\S]*?isArtifactBridgeProtocolVersion\(record\.version\)[\s\S]*?!record\.disposed/,
   'picker cleanup lookup must remain scoped to an undisposed artifact preview',
 )
@@ -432,6 +442,12 @@ assert.deepEqual(
 )
 const selectionDigest = 'a'.repeat(64)
 const selectionElementProof = 'b'.repeat(64)
+const selectionStableElementProof = 'c'.repeat(64)
+const selectionAncestorClassCommitments = ['d'.repeat(64), 'e'.repeat(64)]
+const selectionProofV2 = {
+  stableElementProofSha256: selectionStableElementProof,
+  ancestorClassCommitments: selectionAncestorClassCommitments,
+}
 const activePreviewArtifactId = 'art-synthetic-preview'
 const selectionPath = JSON.stringify([
   ['', 'html', 1],
@@ -496,6 +512,63 @@ assert.deepEqual(
     elementProofSha256: selectionElementProof,
   },
 )
+assert.deepEqual(
+  parseDesktopArtifactFocusAnnotationRequest({
+    version: 3,
+    activePreviewArtifactId,
+    annotationId: 'annotation_v2',
+    scopeId: 'synthetic:scope',
+    tagName: 'button',
+    elementPath: selectionPath,
+    elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
+  }),
+  {
+    version: 3,
+    activePreviewArtifactId,
+    annotationId: 'annotation_v2',
+    scopeId: 'synthetic:scope',
+    tagName: 'button',
+    elementPath: selectionPath,
+    elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
+  },
+)
+for (const annotationProofV2 of [
+  {
+    ...selectionProofV2,
+    ancestorClassCommitments: [...selectionAncestorClassCommitments].reverse(),
+  },
+  {
+    ...selectionProofV2,
+    ancestorClassCommitments: [selectionAncestorClassCommitments[0], selectionAncestorClassCommitments[0]],
+  },
+  {
+    ...selectionProofV2,
+    ancestorClassCommitments: Array.from(
+      { length: 257 },
+      (_value, index) => index.toString(16).padStart(64, '0'),
+    ),
+  },
+  {
+    ...selectionProofV2,
+    unexpected: true,
+  },
+]) {
+  assert.throws(
+    () => parseDesktopArtifactFocusAnnotationRequest({
+      version: 3,
+      activePreviewArtifactId,
+      annotationId: 'annotation_invalid_v2',
+      scopeId: 'synthetic:scope',
+      tagName: 'button',
+      elementPath: selectionPath,
+      elementProofSha256: selectionElementProof,
+      annotationProofV2,
+    }),
+    /annotation proof-v2 is invalid/,
+  )
+}
 assert.throws(
   () => parseDesktopArtifactResolveAnnotationSelectionRequest({
     version: 3,
@@ -610,6 +683,34 @@ assert.deepEqual(
   { version: 3, surfaceId: 'artifact:v3', annotationId: 'annotation_42' },
 )
 assert.deepEqual(
+  parseNativeWorkbenchAnnotationOverlayCloseRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    annotationId: 'annotation_42',
+    rearm: true,
+  }),
+  { version: 3, surfaceId: 'artifact:v3', annotationId: 'annotation_42', rearm: true },
+)
+assert.throws(
+  () => parseNativeWorkbenchAnnotationOverlayCloseRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    annotationId: 'annotation_42',
+    rearm: false,
+  }),
+  /overlay close request is invalid/,
+)
+assert.throws(
+  () => parseNativeWorkbenchAnnotationOverlayCloseRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    annotationId: 'annotation_42',
+    rearm: true,
+    unexpected: true,
+  }),
+  /overlay close request is invalid/,
+)
+assert.deepEqual(
   parseNativeWorkbenchAnnotationOverlayMessage({
     version: 1,
     type: 'draft-changed',
@@ -638,6 +739,7 @@ assert.deepEqual(
     tagName: 'button',
     elementPath: selectionPath,
     elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
     rect: { x: 1, y: 2, width: 30, height: 20 },
     viewportWidth: 800,
     viewportHeight: 600,
@@ -646,6 +748,7 @@ assert.deepEqual(
     tagName: 'button',
     elementPath: selectionPath,
     elementProofSha256: selectionElementProof,
+    annotationProofV2: selectionProofV2,
     rect: { x: 1, y: 2, width: 30, height: 20 },
     viewportWidth: 800,
     viewportHeight: 600,
@@ -901,6 +1004,7 @@ const controlledBridge = new DesktopArtifactBridge({
   getActiveTarget: () => ({
     isCurrent: () => true,
     capabilities: {
+      annotationProofV2: true,
       captureSelection: true,
       resolveAnnotationSelection: true,
       focusAnnotation: true,
@@ -969,6 +1073,7 @@ assert.deepEqual(controlledBridge.getCapabilities(), {
   captureSelection: true,
   resolveAnnotationSelection: true,
   focusAnnotation: true,
+  annotationProofV2: true,
   browserInspect: false,
   browserAct: false,
   bindCandidatePreview: false,

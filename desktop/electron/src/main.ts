@@ -669,6 +669,10 @@ const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
 })
 
 const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
+  annotationAudit: entry => desktopLog(
+    'native_workbench_annotation_picker_lifecycle',
+    { ...entry },
+  ),
   forceArtifactPreviewsOffline: process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1',
   getPrivilegedGatewayUrl: () => (
     gatewayState.status === 'ready' && gatewayState.url
@@ -11268,10 +11272,10 @@ ipcMain.handle('desktop:workbench:annotation:show-overlay', async (event, payloa
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
 })
-ipcMain.handle('desktop:workbench:annotation:close-overlay', (event, payload: unknown) => {
+ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
   try {
-    return nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
+    return await nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
       parseNativeWorkbenchAnnotationOverlayCloseRequest(payload),
     )
   } catch (error) {

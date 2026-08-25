@@ -225,6 +225,8 @@ export interface NativeWorkbenchSurfaceEvent {
     requestingOrigin?: string
     mediaTypes?: string[]
     action?: string
+    code?: string
+    surfaceInstanceId?: string
     targetUrl?: string
     annotationId?: string
     body?: string

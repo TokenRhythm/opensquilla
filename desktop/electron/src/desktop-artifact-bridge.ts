@@ -59,7 +59,9 @@ type DesktopArtifactBridgeHandler<M extends DesktopArtifactBridgeMethod> = (
 export interface DesktopArtifactBridgeTarget {
   /** Protocol negotiated by the active native surface, when known. */
   protocolVersion?: DesktopArtifactBridgeProtocolVersion
-  capabilities: Partial<Record<DesktopArtifactBridgeMethod, boolean>>
+  capabilities: Partial<Record<DesktopArtifactBridgeMethod, boolean>> & {
+    annotationProofV2?: boolean
+  }
   isCurrent(): boolean
   captureSelection?: DesktopArtifactBridgeHandler<'captureSelection'>
   resolveAnnotationSelection?: DesktopArtifactBridgeHandler<'resolveAnnotationSelection'>
@@ -156,6 +158,7 @@ export class DesktopArtifactBridge {
       captureSelection: this.methodAvailable(target, 'captureSelection'),
       resolveAnnotationSelection: this.methodAvailable(target, 'resolveAnnotationSelection'),
       focusAnnotation: this.methodAvailable(target, 'focusAnnotation'),
+      ...(target.capabilities.annotationProofV2 === true ? { annotationProofV2: true } : {}),
       browserInspect: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'browserInspect'),
       browserAct: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'browserAct'),
       bindCandidatePreview: requestedVersion === DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION && this.methodAvailable(target, 'bindCandidatePreview'),
@@ -245,6 +248,7 @@ export class DesktopArtifactBridge {
       captureSelection: available('captureSelection'),
       resolveAnnotationSelection: available('resolveAnnotationSelection'),
       focusAnnotation: available('focusAnnotation'),
+      ...(target.capabilities.annotationProofV2 === true ? { annotationProofV2: true } : {}),
       browserInspect: available('browserInspect'),
       browserAct: available('browserAct'),
       screenshot: available('screenshot'),

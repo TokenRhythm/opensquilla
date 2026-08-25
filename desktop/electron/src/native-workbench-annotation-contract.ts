@@ -1,4 +1,8 @@
 import {
+  parseDesktopArtifactAnnotationProofV2,
+  type DesktopArtifactAnnotationProofV2,
+} from './desktop-artifact-bridge-contract.js'
+import {
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   parseNativeWorkbenchSurfaceId,
@@ -22,6 +26,7 @@ export interface NativeWorkbenchAnnotationCapabilities {
   picker: boolean
   trustedOverlay: boolean
   overlayCopyVersion?: 1
+  atomicCloseRearm?: true
   reason?: string
 }
 
@@ -56,6 +61,7 @@ export interface NativeWorkbenchAnnotationOverlayCloseRequest {
   version: NativeWorkbenchAnnotationProtocolVersion
   surfaceId: string
   annotationId?: string
+  rearm?: true
 }
 
 export interface NativeWorkbenchAnnotationRect {
@@ -81,6 +87,7 @@ export interface NativeWorkbenchAnnotationSelection {
 
 export interface NativeWorkbenchAnnotationSelectionCandidate
   extends Omit<NativeWorkbenchAnnotationSelection, 'selectionId'> {
+  annotationProofV2?: DesktopArtifactAnnotationProofV2
   viewportWidth: number
   viewportHeight: number
 }
@@ -241,9 +248,12 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
 ): NativeWorkbenchAnnotationOverlayCloseRequest {
   const request = parseExactRequest(
     value,
-    ['version', 'surfaceId', 'annotationId'],
+    ['version', 'surfaceId', 'annotationId', 'rearm'],
     'overlay close',
   )
+  if (request.rearm !== undefined && request.rearm !== true) {
+    throw new Error('The native Workbench annotation overlay close request is invalid.')
+  }
   return {
     version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
@@ -255,6 +265,7 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
             'annotation',
           ),
         }),
+    ...(request.rearm === true ? { rearm: true as const } : {}),
   }
 }
 
@@ -305,6 +316,7 @@ export function parseNativeWorkbenchAnnotationSelection(
       'elementPath',
       'domSha256',
       'elementProofSha256',
+      'annotationProofV2',
       'rect',
       'viewportWidth',
       'viewportHeight',
@@ -336,6 +348,13 @@ export function parseNativeWorkbenchAnnotationSelection(
     elementPath: selection.elementPath,
     ...(selection.domSha256 === undefined ? {} : { domSha256: selection.domSha256 }),
     elementProofSha256: selection.elementProofSha256,
+    ...(selection.annotationProofV2 === undefined
+      ? {}
+      : {
+          annotationProofV2: parseDesktopArtifactAnnotationProofV2(
+            selection.annotationProofV2,
+          ),
+        }),
     rect: {
       x: rect.x as number,
       y: rect.y as number,

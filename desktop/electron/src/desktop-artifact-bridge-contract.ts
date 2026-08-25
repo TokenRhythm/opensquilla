@@ -41,6 +41,8 @@ export interface DesktopArtifactBridgeCapabilities {
   captureSelection: boolean
   resolveAnnotationSelection: boolean
   focusAnnotation: boolean
+  /** Additive proof for runtime-only class additions along the selected element path. */
+  annotationProofV2?: true
   browserInspect: boolean
   /** True only while a v4 offline candidate preview is bound to the surface. */
   browserAct: boolean
@@ -88,6 +90,11 @@ interface DesktopArtifactBridgeRequestBase {
   version: DesktopArtifactBridgeProtocolVersion
 }
 
+export interface DesktopArtifactAnnotationProofV2 {
+  stableElementProofSha256: string
+  ancestorClassCommitments: string[]
+}
+
 export type DesktopArtifactCaptureSelectionRequest = DesktopArtifactBridgeRequestBase
 
 export interface DesktopArtifactResolveAnnotationSelectionRequest
@@ -108,6 +115,7 @@ export interface DesktopArtifactFocusAnnotationRequest
   tagName: string
   elementPath: string
   elementProofSha256: string
+  annotationProofV2?: DesktopArtifactAnnotationProofV2
 }
 
 export type DesktopArtifactBrowserInspectScope =
@@ -245,6 +253,7 @@ export interface DesktopArtifactResolvedAnnotationSelection {
   elementPath: string
   domSha256?: string
   elementProofSha256: string
+  annotationProofV2?: DesktopArtifactAnnotationProofV2
   scopeId: string
   rect: {
     x: number
@@ -455,6 +464,37 @@ function parseActivePreviewArtifactId(value: unknown): string {
   return value
 }
 
+export function parseDesktopArtifactAnnotationProofV2(
+  value: unknown,
+): DesktopArtifactAnnotationProofV2 {
+  const proof = objectRecord(value)
+  const commitments = proof?.ancestorClassCommitments
+  if (
+    !proof
+    || Object.keys(proof).some(key => ![
+      'stableElementProofSha256',
+      'ancestorClassCommitments',
+    ].includes(key))
+    || typeof proof.stableElementProofSha256 !== 'string'
+    || !/^[a-f0-9]{64}$/.test(proof.stableElementProofSha256)
+    || !Array.isArray(commitments)
+    || commitments.length > 256
+    || commitments.some(commitment => (
+      typeof commitment !== 'string'
+      || !/^[a-f0-9]{64}$/.test(commitment)
+    ))
+    || commitments.some((commitment, index) => (
+      index > 0 && commitments[index - 1] >= commitment
+    ))
+  ) {
+    throw new Error('The Desktop artifact annotation proof-v2 is invalid.')
+  }
+  return {
+    stableElementProofSha256: proof.stableElementProofSha256,
+    ancestorClassCommitments: [...commitments],
+  }
+}
+
 export function parseDesktopArtifactCaptureSelectionRequest(
   value: unknown,
 ): DesktopArtifactCaptureSelectionRequest {
@@ -517,6 +557,7 @@ export function parseDesktopArtifactFocusAnnotationRequest(
       'tagName',
       'elementPath',
       'elementProofSha256',
+      'annotationProofV2',
     ],
     'annotation focus',
   )
@@ -544,6 +585,13 @@ export function parseDesktopArtifactFocusAnnotationRequest(
     tagName: request.tagName,
     elementPath: parseAnnotationElementPath(request.elementPath),
     elementProofSha256: request.elementProofSha256,
+    ...(request.annotationProofV2 === undefined
+      ? {}
+      : {
+          annotationProofV2: parseDesktopArtifactAnnotationProofV2(
+            request.annotationProofV2,
+          ),
+        }),
   }
 }
 

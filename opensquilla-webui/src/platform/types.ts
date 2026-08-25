@@ -238,6 +238,7 @@ export interface NativeArtifactAnnotationCapabilities {
   picker?: boolean
   trustedOverlay?: boolean
   overlayCopyVersion?: 1
+  atomicCloseRearm?: true
   reason?: string
 }
 
@@ -270,6 +271,7 @@ export interface NativeArtifactAnnotationOverlayCloseRequest {
   version: 3 | 4
   surfaceId: string
   annotationId?: string
+  rearm?: true
 }
 
 export interface NativeArtifactScreenshotRequest {
@@ -318,6 +320,7 @@ export interface NativeWorkbenchSurfaceResult {
   code?: string
   retryable?: boolean
   message?: string
+  surfaceInstanceId?: string
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -355,6 +358,7 @@ export interface NativeWorkbenchSurfaceEvent {
     canGoForward?: boolean
     action?: string
     code?: string
+    surfaceInstanceId?: string
     message?: string
     path?: string
     reason?: string
