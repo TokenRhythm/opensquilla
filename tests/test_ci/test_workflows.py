@@ -220,6 +220,8 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     )
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in merge_group_case
     assert "git diff --name-only" not in merge_group_case
+    assert "queue_diff_targeted" not in text
+    assert "full_fail_closed" in text
     assert (
         'git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"'
         in text
@@ -242,10 +244,16 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert ".github/scripts/check_ci_results.py" in text
     assert "code_changed" not in text
     assert "workflow_changed" not in text
-    assert text.count(
-        '"${{ github.event_name }}" == "pull_request" || '
-        '"${{ github.event_name }}" == "merge_group"'
-    ) == 3
+    assert "Verify fresh full-nightly health" not in text
+    assert "verify-nightly-health" not in text
+    assert "steps.nightly" not in text
+    assert "nightly_healthy" not in text
+    pull_request_case = text.split("            pull_request)", 1)[1].split(
+        "              ;;", 1
+    )[0]
+    assert "github.event.pull_request.base.sha" in pull_request_case
+    assert "github.event.pull_request.head.sha" in pull_request_case
+    assert "nightly" not in pull_request_case.lower()
 
 
 def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
@@ -266,12 +274,21 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert jobs["queue-attestation"]["outputs"]["combined_smoke_suites"] == (
         "${{ steps.verify.outputs.combined_smoke_suites || '[]' }}"
     )
+    assert not any(
+        name.startswith("nightly_") for name in jobs["queue-attestation"]["outputs"]
+    )
     assert jobs["classify-changes"]["needs"] == "queue-attestation"
     assert jobs["classify-changes"]["outputs"]["planner_full_fallback"] == (
         "${{ steps.plan.outputs.full_fallback }}"
     )
     assert "always()" in jobs["classify-changes"]["if"]
     assert "github.event_name != 'merge_group'" in jobs["classify-changes"]["if"]
+    assert "needs.queue-attestation.result != 'success'" in (
+        jobs["classify-changes"]["if"]
+    )
+    assert not any(
+        name.startswith("nightly_") for name in jobs["classify-changes"]["outputs"]
+    )
     classify_consumers = {
         job_name: job
         for job_name, job in jobs.items()
@@ -303,6 +320,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert jobs["main-canary"]["name"] == (
         "Queue/main installation and offline gateway canary"
     )
+    assert "needs.queue-attestation.result == 'success'" in jobs["main-canary"]["if"]
     assert "test_gateway_silent_reply_process_e2e.py" in str(jobs["main-canary"])
     assert all(
         step.get("name") != "Run overlapping Python domain smoke"
@@ -313,6 +331,93 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         jobs["ci-result"]
     )
     assert "ci-nightly-health-v1" in str(jobs["ci-result"])
+    ci_result_steps = jobs["ci-result"]["steps"]
+    fast_path = next(
+        step
+        for step in ci_result_steps
+        if step.get("name") == "Accept verified queue or main fast path"
+    )
+    setup_python = next(
+        step for step in ci_result_steps if step.get("name") == "Set up Python"
+    )
+    result_gate = next(
+        step
+        for step in ci_result_steps
+        if step.get("name") == "Check required CI results"
+    )
+    for condition in (fast_path["if"], setup_python["if"], result_gate["if"]):
+        assert "needs.queue-attestation.result == 'success'" in condition
+        assert "needs.queue-attestation.outputs.reusable == 'true'" in condition
+    attestation = next(
+        step
+        for step in ci_result_steps
+        if step.get("name") == "Create trusted CI evidence v2"
+    )
+    assert attestation["env"]["QUEUE_RESULT"] == (
+        "${{ needs.queue-attestation.result }}"
+    )
+    assert attestation["env"]["PLANNED_SUCCESSFUL_SUITES"] == (
+        "${{ needs.classify-changes.outputs.required_suites }}"
+    )
+    assert attestation["env"]["PLANNED_FULL_FALLBACK"] == (
+        "${{ needs.classify-changes.outputs.planner_full_fallback }}"
+    )
+    assert '"${QUEUE_RESULT}" == "success"' in attestation["run"]
+    assert '--successful-suites "${PLANNED_SUCCESSFUL_SUITES}"' in attestation["run"]
+    assert '--plan-basis "${plan_basis}"' in attestation["run"]
+    assert ci_result_steps.index(fast_path) < ci_result_steps.index(attestation)
+    assert ci_result_steps.index(result_gate) < ci_result_steps.index(attestation)
+    assert '"${MAIN_CANARY_RESULT}" != "success"' in fast_path["run"]
+    assert "exit 1" in fast_path["run"]
+    assert "always()" not in attestation["if"]
+    assert "failure()" not in attestation["if"]
+    assert "cancelled()" not in attestation["if"]
+
+
+@pytest.mark.parametrize(
+    ("queue_result", "queue_reusable", "canary_result", "expected_code"),
+    (
+        ("success", "true", "success", 0),
+        ("failure", "true", "success", 1),
+        ("success", "false", "success", 1),
+        ("success", "true", "failure", 1),
+        ("success", "true", "cancelled", 1),
+        ("success", "true", "skipped", 1),
+        ("success", "true", "", 1),
+    ),
+)
+def test_ci_queue_fast_path_shell_fails_closed(
+    queue_result: str,
+    queue_reusable: str,
+    canary_result: str,
+    expected_code: int,
+) -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    fast_path = next(
+        step
+        for step in jobs["ci-result"]["steps"]
+        if step.get("name") == "Accept verified queue or main fast path"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "GITHUB_EVENT_NAME": "merge_group",
+            "QUEUE_RESULT": queue_result,
+            "QUEUE_REUSABLE": queue_reusable,
+            "QUEUE_REASON": "synthetic evidence decision",
+            "MAIN_CANARY_RESULT": canary_result,
+        }
+    )
+
+    completed = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", fast_path["run"]],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == expected_code
 
 
 def test_skill_hub_contract_uses_classifier_gate_without_changing_required_names() -> None:

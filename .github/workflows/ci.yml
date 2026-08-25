@@ -45,10 +45,6 @@ jobs:
       source_planner_digest: ${{ steps.verify.outputs.source_planner_digest }}
       source_suite_execution_digests: ${{ steps.verify.outputs.source_suite_execution_digests }}
       combined_smoke_suites: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
-      nightly_healthy: ${{ steps.verify.outputs.nightly_healthy || 'false' }}
-      nightly_reason: ${{ steps.verify.outputs.nightly_reason }}
-      nightly_run_id: ${{ steps.verify.outputs.nightly_run_id }}
-      nightly_age_seconds: ${{ steps.verify.outputs.nightly_age_seconds }}
     steps:
       - name: Validate optimization mode
         id: mode
@@ -100,10 +96,6 @@ jobs:
           QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
           QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
           COMBINED_SMOKE_SUITES: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
-          NIGHTLY_HEALTHY: ${{ steps.verify.outputs.nightly_healthy || 'false' }}
-          NIGHTLY_REASON: ${{ steps.verify.outputs.nightly_reason }}
-          NIGHTLY_RUN_ID: ${{ steps.verify.outputs.nightly_run_id }}
-          NIGHTLY_AGE_SECONDS: ${{ steps.verify.outputs.nightly_age_seconds }}
         shell: bash
         run: |
           {
@@ -116,7 +108,6 @@ jobs:
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
-            echo "- Nightly health: \`${NIGHTLY_HEALTHY}\` (${NIGHTLY_REASON}; run \`${NIGHTLY_RUN_ID}\`, age \`${NIGHTLY_AGE_SECONDS}s\`)"
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
@@ -135,6 +126,7 @@ jobs:
       ${{ always()
           && (github.event_name != 'merge_group'
               || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce'
+              || needs.queue-attestation.result != 'success'
               || needs.queue-attestation.outputs.reusable != 'true')
           && (github.event_name != 'push'
               || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce') }}
@@ -158,8 +150,6 @@ jobs:
       toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
       full_required: ${{ steps.classify.outputs.full_required }}
       pytest_targets: ${{ steps.classify.outputs.pytest_targets }}
-      nightly_healthy: ${{ steps.nightly.outputs.healthy || 'true' }}
-      nightly_reason: ${{ steps.nightly.outputs.reason }}
       required_suites: ${{ steps.plan.outputs.required_suites }}
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
       python_matrix: ${{ steps.plan.outputs.python_matrix }}
@@ -173,17 +163,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Verify fresh full-nightly health
-        id: nightly
-        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .github/scripts/ci_attestation.py verify-nightly-health
-          --repository "${GITHUB_REPOSITORY}"
-          --api-url "${GITHUB_API_URL}"
-          --github-output "${GITHUB_OUTPUT}"
 
       - name: List changed files
         shell: bash
@@ -199,13 +178,7 @@ jobs:
               ;;
           esac
 
-          if [[ ("${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group") \
-                && "${CI_OPTIMIZATION_MODE}" != "legacy" \
-                && "${{ steps.nightly.outputs.healthy || 'false' }}" != "true" ]]; then
-            echo "Fresh full-nightly evidence is unavailable; running the full fail-closed matrix." >&2
-            printf '.ci/run-all\n' > "${changed_files}"
-          else
-            case "${{ github.event_name }}" in
+          case "${{ github.event_name }}" in
             pull_request)
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
@@ -234,8 +207,7 @@ jobs:
             *)
               printf '.ci/run-all\n' > "${changed_files}"
               ;;
-            esac
-          fi
+          esac
 
           echo "Changed files:"
           sed 's/^/  /' "${changed_files}"
@@ -281,18 +253,12 @@ jobs:
 
       - name: Summarize merge-group fallback decision
         if: ${{ github.event_name == 'merge_group' }}
-        env:
-          FULL_REQUIRED: ${{ steps.classify.outputs.full_required }}
         shell: bash
         run: |
-          decision="queue_diff_targeted"
-          if [[ "${FULL_REQUIRED}" == "true" ]]; then
-            decision="full_fail_closed"
-          fi
           {
             echo "## Merge queue fallback"
             echo
-            echo "- Decision: \`${decision}\`"
+            echo "- Decision: \`full_fail_closed\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   workflow-lint:
@@ -1838,6 +1804,7 @@ jobs:
         if: >-
           ${{ (github.event_name == 'merge_group'
                && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+               && needs.queue-attestation.result == 'success'
                && needs.queue-attestation.outputs.reusable == 'true')
               || (github.event_name == 'push'
                   && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce') }}
@@ -1879,6 +1846,7 @@ jobs:
         if: >-
           ${{ !((github.event_name == 'merge_group'
                  && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+                 && needs.queue-attestation.result == 'success'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
                     && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
@@ -1890,6 +1858,7 @@ jobs:
         if: >-
           ${{ !((github.event_name == 'merge_group'
                  && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+                 && needs.queue-attestation.result == 'success'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
                     && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
@@ -1932,6 +1901,7 @@ jobs:
         id: attestation
         if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
         env:
+          QUEUE_RESULT: ${{ needs.queue-attestation.result }}
           QUEUE_REUSABLE: ${{ needs.queue-attestation.outputs.reusable }}
           SOURCE_RUN_ID: ${{ needs.queue-attestation.outputs.source_run_id }}
           SOURCE_ROOT_ISSUED_AT: ${{ needs.queue-attestation.outputs.source_root_issued_at }}
@@ -1939,12 +1909,32 @@ jobs:
           SOURCE_SUCCESSFUL_SUITES: ${{ needs.queue-attestation.outputs.source_successful_suites }}
           SOURCE_PLANNER_DIGEST: ${{ needs.queue-attestation.outputs.source_planner_digest }}
           SOURCE_SUITE_EXECUTION_DIGESTS: ${{ needs.queue-attestation.outputs.source_suite_execution_digests }}
+          PLANNED_SUCCESSFUL_SUITES: ${{ needs.classify-changes.outputs.required_suites }}
+          PLANNED_PLANNER_DIGEST: ${{ needs.classify-changes.outputs.planner_digest }}
+          PLANNED_SUITE_EXECUTION_DIGESTS: ${{ needs.classify-changes.outputs.suite_execution_digests }}
+          PLANNED_PLATFORM_MATRIX: ${{ needs.classify-changes.outputs.platform_matrix }}
+          PLANNED_FULL_FALLBACK: ${{ needs.classify-changes.outputs.planner_full_fallback }}
         shell: bash
         run: |
           set -euo pipefail
+          plan_args=()
+          if [[ -n "${PLANNED_SUCCESSFUL_SUITES}" ]]; then
+            plan_basis="change_set"
+            if [[ "${PLANNED_FULL_FALLBACK}" == "true" ]]; then
+              plan_basis="full_fallback"
+            fi
+            plan_args=(
+              --successful-suites "${PLANNED_SUCCESSFUL_SUITES}"
+              --planner-digest "${PLANNED_PLANNER_DIGEST}"
+              --suite-execution-digests "${PLANNED_SUITE_EXECUTION_DIGESTS}"
+              --platform-matrix "${PLANNED_PLATFORM_MATRIX}"
+              --plan-basis "${plan_basis}"
+            )
+          fi
           source_args=()
           if [[ "${GITHUB_EVENT_NAME}" == "merge_group" \
                 && "${CI_OPTIMIZATION_MODE}" == "enforce" \
+                && "${QUEUE_RESULT}" == "success" \
                 && "${QUEUE_REUSABLE}" == "true" ]]; then
             source_args=(
               --source-run-id "${SOURCE_RUN_ID}"
@@ -1961,6 +1951,7 @@ jobs:
             --optimization-mode "${CI_OPTIMIZATION_MODE}" \
             --output "${RUNNER_TEMP}/ci-attestation.json" \
             --github-output "${GITHUB_OUTPUT}" \
+            "${plan_args[@]}" \
             "${source_args[@]}"
 
       - name: Upload tree-indexed CI evidence v2
