@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-08-25.1-reliability-20260818T121632Z-7d8b1073f8e2",
+  "snapshot_version": "curated-openrouter-step2-2026-08-25.1-reliability-20260818T121632Z-9b49f7314a89",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -9863,6 +9863,9 @@
         "vendor": "qwen",
         "family": "qwen3",
         "status": "enabled",
+        "runtime_hard_filter_reasons": [
+          "lite_mapping_only"
+        ],
         "roles": [
           "proposer",
           "aggregator"
@@ -9985,6 +9988,9 @@
         "vendor": "z-ai",
         "family": "glm-5",
         "status": "enabled",
+        "runtime_hard_filter_reasons": [
+          "lite_mapping_only"
+        ],
         "roles": [
           "proposer",
           "aggregator"
@@ -10107,6 +10113,6 @@
     "window_size": 50,
     "observation_policy": "aef-physical-model-calls-v5",
     "completion_gate": "manual_thresholded_draco_audit",
-    "content_sha256": "7d8b1073f8e2f7b61937b3de22efa69e7055d7af2504601da9baf84afb1973c4"
+    "content_sha256": "9b49f7314a89c3de4235f78f05de5d4b1bc6ef947bebaa3947ef3b20c5e10168"
   }
 }

@@ -1895,6 +1895,9 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         "catalog_verified_at": "2026-08-25",
     }
     assert qwen_flash["runtime"]["thinking"] == "high"
+    assert qwen_flash["registry_facts"]["runtime_hard_filter_reasons"] == [
+        "lite_mapping_only"
+    ]
     assert qwen_flash["online_profile"]["role_reliability"] == {
         "window_size": 50,
         "proposer": {"success": 0, "failure": 0},
@@ -1929,6 +1932,9 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         "catalog_verified_at": "2026-08-25",
     }
     assert glm_53["runtime"]["thinking"] == "max"
+    assert glm_53["registry_facts"]["runtime_hard_filter_reasons"] == [
+        "lite_mapping_only"
+    ]
     assert glm_53["online_profile"]["role_reliability"] == {
         "window_size": 50,
         "proposer": {"success": 0, "failure": 0},
