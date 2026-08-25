@@ -6180,6 +6180,9 @@ class TestSessionsAbort:
         async def cancel_background(_session_key: str) -> int:
             return 0
 
+        async def session_tree_keys(_session_manager: Any, root_key: str) -> tuple[str, ...]:
+            return (root_key,)
+
         async def emit(*_args: Any, **_kwargs: Any) -> None:
             return None
 
@@ -6188,6 +6191,7 @@ class TestSessionsAbort:
             "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
             cancel_background,
         )
+        monkeypatch.setattr(rpc_sessions, "_session_tree_keys", session_tree_keys)
         monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
         # The runtime cancellation intentionally never completes.  The
         # production handler must return on its shared budget, but a strict
