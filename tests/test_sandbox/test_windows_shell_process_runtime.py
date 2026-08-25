@@ -192,6 +192,9 @@ async def test_windows_safe_noop_exec_command_runs_without_sh(
     from opensquilla.sandbox.integration import configure_runtime, reset_runtime
     from opensquilla.tools.builtin import shell
 
+    cache_path = tmp_path / "ModuleAnalysisCache"
+    cache_path.touch()
+    monkeypatch.setenv("PSModuleAnalysisCachePath", str(cache_path))
     _configure_approval_queue(monkeypatch, tmp_path, "auto-approve")
     configure_runtime(
         SandboxSettings(run_mode="safe", backend="noop"),
@@ -208,14 +211,19 @@ async def test_windows_safe_noop_exec_command_runs_without_sh(
     )
     try:
         result = await shell.exec_command(
-            "Write-Output opensquilla-noop-foreground; exit 7",
+            (
+                "Write-Output $env:PSModuleAnalysisCachePath; "
+                "Write-Output opensquilla-noop-foreground; exit 7"
+            ),
             workdir=str(tmp_path),
+            timeout=15,
         )
     finally:
         current_tool_context.reset(token)
         reset_runtime()
         reset_approval_queue()
 
+    assert str(cache_path) in result
     assert "opensquilla-noop-foreground" in result
     assert "exit_code=7" in result
 

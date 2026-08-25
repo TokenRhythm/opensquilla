@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -119,7 +120,8 @@ async def test_noop_backend_forwards_allowlisted_request_env(tmp_path: Path) -> 
 async def test_noop_backend_caller_cancel_stops_process_tree(tmp_path: Path) -> None:
     marker = tmp_path / "noop-descendant-ran"
     child_script = (
-        f"import pathlib, time; time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('ran')"
+        "import pathlib, time; "
+        f"time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('ran')"
     )
     parent_script = (
         "import subprocess, sys, time; "
@@ -144,184 +146,122 @@ async def test_noop_backend_caller_cancel_stops_process_tree(tmp_path: Path) -> 
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    "executable",
+    [
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+    ],
+)
 @pytest.mark.asyncio
-async def test_noop_backend_windows_without_stdin_uses_file_capture(
+async def test_noop_backend_windows_powershell_uses_trusted_host_analysis_cache(
+    executable: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
-    terminations: list[tuple[float, float]] = []
+    host_cache = r"C:\trusted\ModuleAnalysisCache"
+    request_cache = r"C:\request\ModuleAnalysisCache"
 
     class Process:
         pid = 8181
         returncode: int | None = None
 
-        async def wait(self) -> int:
-            stdout_file = captured["stdout"]
-            stderr_file = captured["stderr"]
-            stdout_file.write(b"stdout payload\n")  # type: ignore[union-attr]
-            stderr_file.write(b"stderr payload\n")  # type: ignore[union-attr]
-            self.returncode = 7
-            return 7
-
         async def communicate(self, *, input: bytes | None = None):
-            raise AssertionError("Windows file capture must wait for process completion")
+            assert input is None
+            self.returncode = 0
+            return b"ok\n", b""
 
     class Owner:
         async def terminate(self, *, graceful_timeout: float, kill_timeout: float) -> bool:
-            terminations.append((graceful_timeout, kill_timeout))
             return True
 
     async def fake_spawn(*_argv: str, **kwargs: object) -> Process:
         captured.update(kwargs)
         return Process()
 
-    monkeypatch.setattr(noop_mod, "os", SimpleNamespace(name="nt"))
-    monkeypatch.setattr(noop_mod, "HAS_RESOURCE", False)
-    monkeypatch.setattr(noop_mod, "create_owned_subprocess_exec", fake_spawn)
-    monkeypatch.setattr(noop_mod, "capture_process_tree_owner", lambda *_args, **_kwargs: Owner())
-
-    result = await NoopBackend().run(
-        SandboxRequest(
-            argv=("powershell.exe", "-Command", "exit 7"),
-            cwd=tmp_path,
-            action_kind="shell.exec",
-            policy=_policy(tmp_path),
-        )
-    )
-
-    assert result.returncode == 7
-    assert result.stdout == "stdout payload\n"
-    assert result.stderr == "stderr payload\n"
-    assert result.timed_out is False
-    assert captured["stdin"] is None
-    assert captured["stdout"] is not asyncio.subprocess.PIPE
-    assert captured["stderr"] is not asyncio.subprocess.PIPE
-    assert captured["stdout"] is not captured["stderr"]
-    assert captured["stdout"].closed is True  # type: ignore[union-attr]
-    assert captured["stderr"].closed is True  # type: ignore[union-attr]
-    assert terminations == [(0.2, 1.0)]
-
-
-@pytest.mark.asyncio
-async def test_noop_backend_windows_file_capture_timeout_preserves_partial_output(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    termination_count = 0
-    first_wait_entered = asyncio.Event()
-
-    class Process:
-        pid = 8181
-        returncode: int | None = None
-        wait_count = 0
-
-        async def wait(self) -> int:
-            self.wait_count += 1
-            if self.wait_count == 1:
-                captured["stdout"].write(b"partial output\n")  # type: ignore[union-attr]
-                first_wait_entered.set()
-                await asyncio.Future()
-            self.returncode = 1
-            return 1
-
-        async def communicate(self, *, input: bytes | None = None):
-            raise AssertionError("Windows file capture must not use communicate")
-
-    class Owner:
-        async def terminate(self, *, graceful_timeout: float, kill_timeout: float) -> bool:
-            nonlocal termination_count
-            termination_count += 1
-            return True
-
-    async def fake_spawn(*_argv: str, **kwargs: object) -> Process:
-        captured.update(kwargs)
-        return process
-
-    process = Process()
-    monkeypatch.setattr(noop_mod, "os", SimpleNamespace(name="nt"))
-    monkeypatch.setattr(noop_mod, "HAS_RESOURCE", False)
     monkeypatch.setattr(
         noop_mod,
-        "_limits_from_policy",
-        lambda _request: SimpleNamespace(wall_seconds=0.01, env_whitelist=("PATH",)),
+        "os",
+        SimpleNamespace(
+            name="nt",
+            environ={"PSModuleAnalysisCachePath": host_cache},
+        ),
     )
+    monkeypatch.setattr(noop_mod, "HAS_RESOURCE", False)
     monkeypatch.setattr(noop_mod, "create_owned_subprocess_exec", fake_spawn)
     monkeypatch.setattr(noop_mod, "capture_process_tree_owner", lambda *_args, **_kwargs: Owner())
 
+    policy = replace(
+        _policy(tmp_path),
+        env_allowlist=("PATH", "psmoduleanalysiscachepath"),
+    )
     result = await NoopBackend().run(
         SandboxRequest(
-            argv=("powershell.exe", "-Command", "Start-Sleep 60"),
+            argv=(executable, "-Command", "Write-Output ok"),
             cwd=tmp_path,
             action_kind="shell.exec",
-            policy=_policy(tmp_path),
+            policy=policy,
+            env={"psmoduleanalysiscachepath": request_cache},
         )
     )
 
-    assert result.returncode == 1
-    assert result.stdout == "partial output\n"
-    assert result.timed_out is True
-    assert first_wait_entered.is_set()
-    assert process.wait_count == 2
-    assert termination_count == 2
-    assert captured["stdout"].closed is True  # type: ignore[union-attr]
-    assert captured["stderr"].closed is True  # type: ignore[union-attr]
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["PSModuleAnalysisCachePath"] == host_cache
+    assert "psmoduleanalysiscachepath" not in child_env
+    assert result.returncode == 0
+    assert result.stdout == "ok\n"
 
 
 @pytest.mark.asyncio
-async def test_noop_backend_windows_file_capture_cancel_closes_files(
+async def test_noop_backend_windows_non_powershell_omits_host_analysis_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
-    wait_entered = asyncio.Event()
-    terminated = asyncio.Event()
 
     class Process:
         pid = 8181
         returncode: int | None = None
 
-        async def wait(self) -> int:
-            wait_entered.set()
-            await asyncio.Future()
-            raise AssertionError("unreachable")
-
         async def communicate(self, *, input: bytes | None = None):
-            raise AssertionError("Windows file capture must not use communicate")
+            assert input is None
+            self.returncode = 0
+            return b"ok\n", b""
 
     class Owner:
         async def terminate(self, *, graceful_timeout: float, kill_timeout: float) -> bool:
-            terminated.set()
             return True
 
     async def fake_spawn(*_argv: str, **kwargs: object) -> Process:
         captured.update(kwargs)
         return Process()
 
-    monkeypatch.setattr(noop_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        noop_mod,
+        "os",
+        SimpleNamespace(
+            name="nt",
+            environ={"PSModuleAnalysisCachePath": r"C:\trusted\ModuleAnalysisCache"},
+        ),
+    )
     monkeypatch.setattr(noop_mod, "HAS_RESOURCE", False)
     monkeypatch.setattr(noop_mod, "create_owned_subprocess_exec", fake_spawn)
     monkeypatch.setattr(noop_mod, "capture_process_tree_owner", lambda *_args, **_kwargs: Owner())
 
-    running = asyncio.create_task(
-        NoopBackend().run(
-            SandboxRequest(
-                argv=("powershell.exe", "-Command", "Start-Sleep 60"),
-                cwd=tmp_path,
-                action_kind="shell.exec",
-                policy=_policy(tmp_path),
-            )
+    await NoopBackend().run(
+        SandboxRequest(
+            argv=(sys.executable, "-c", "print('ok')"),
+            cwd=tmp_path,
+            action_kind="shell.exec",
+            policy=_policy(tmp_path),
         )
     )
-    await asyncio.wait_for(wait_entered.wait(), timeout=1.0)
-    running.cancel()
-    cancelled = await asyncio.gather(running, return_exceptions=True)
 
-    assert isinstance(cancelled[0], asyncio.CancelledError)
-    assert terminated.is_set()
-    assert captured["stdout"].closed is True  # type: ignore[union-attr]
-    assert captured["stderr"].closed is True  # type: ignore[union-attr]
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert "PSModuleAnalysisCachePath" not in child_env
 
 
 @pytest.mark.asyncio
