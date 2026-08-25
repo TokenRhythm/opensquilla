@@ -397,7 +397,7 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
     }
 
 
-def _operator_network_tool_context(ctx: RpcContext) -> ToolContext:
+def _operator_network_tool_context() -> ToolContext:
     """The Run Context an operator-invoked network diagnostic runs under.
 
     ``search.query`` reaches the same in-process network path as the chat
@@ -443,7 +443,7 @@ def _operator_network_tool_context(ctx: RpcContext) -> ToolContext:
 
 
 @contextmanager
-def _operator_network_context(ctx: RpcContext) -> Iterator[None]:
+def _operator_network_context() -> Iterator[None]:
     """Run the block under the operator Run Context, or unchanged if it cannot be built.
 
     Failing to build the context must not fail the caller: for ``search.query``
@@ -452,7 +452,7 @@ def _operator_network_context(ctx: RpcContext) -> Iterator[None]:
     """
 
     try:
-        token = current_tool_context.set(_operator_network_tool_context(ctx))
+        token = current_tool_context.set(_operator_network_tool_context())
     except Exception:  # noqa: BLE001 - diagnostics degrade, they do not fail
         log.debug("search.operator_network_context_unavailable", exc_info=True)
         yield
@@ -478,7 +478,7 @@ async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[st
     # Probe it under the same context the query establishes: asking outside it
     # would report the refusal the query no longer meets, which is the same
     # disagreement from the other side.
-    with _operator_network_context(ctx):
+    with _operator_network_context():
         reason = in_process_network_precondition()
     payload["networkReady"] = reason is None
     payload["networkBlockedReason"] = reason
@@ -517,7 +517,7 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             provider=provider_name,
         )
 
-    with _operator_network_context(ctx):
+    with _operator_network_context():
         payload_or_denial = await run_in_process_network_action(
             action_kind="web.fetch",
             argv=(

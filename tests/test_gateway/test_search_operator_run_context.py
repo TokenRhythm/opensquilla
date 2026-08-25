@@ -166,7 +166,7 @@ async def test_the_operator_context_carries_no_grants_of_its_own(tmp_path: Path)
     """
     _configure("recommended", tmp_path)
 
-    context = _operator_network_tool_context(_ctx()).sandbox_run_context
+    context = _operator_network_tool_context().sandbox_run_context
 
     assert isinstance(context, RunContext)
     assert context.mounts == ()
@@ -178,33 +178,38 @@ async def test_the_operator_context_carries_no_grants_of_its_own(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_the_operator_context_never_publishes_full_host_access(tmp_path: Path) -> None:
-    """Safe, even when the deployment is configured Full.
+    """The context never raises the run mode above what the deployment set.
 
     A tool context is not a description of the deployment. Every guard that
     calls `full_host_access_active()` reads the run mode off whatever context is
     current, so a `full` here stands down protections that have nothing to do
     with the network proxy. An earlier draft of this fix derived the mode from
     the gateway config; a default `GatewayConfig()` resolves to `full`, and that
-    silently disabled the sensitive-payload guard below.
+    silently disabled the sensitive-payload guard the next test covers.
+
+    Two assertions, because they are different claims. On a sandboxed
+    deployment the pin decides the answer, and the answer is Safe. On a
+    deployment that turned the sandbox off, `full_host_access_for_context`
+    returns True before it ever looks at a context — the operator RPC is Full
+    there because everything is, chat included — so what is left to pin is that
+    the context still declares Safe and contributes nothing to that outcome.
     """
     _configure("recommended", tmp_path)
-    full_deployment = SimpleNamespace(
-        config=SimpleNamespace(
-            sandbox=SimpleNamespace(run_mode="full", model_fields_set={"run_mode"}),
-            permissions=SimpleNamespace(default_mode="bypass"),
-        )
-    )
 
-    for ctx in (_ctx(), full_deployment):
-        context = _operator_network_tool_context(ctx)
-        assert context.run_mode == RunMode.SAFE.value
-        assert context.sandbox_run_context.run_mode is RunMode.SAFE
+    context = _operator_network_tool_context()
+    assert context.run_mode == RunMode.SAFE.value
+    assert context.sandbox_run_context.run_mode is RunMode.SAFE
 
-        token = current_tool_context.set(context)
-        try:
-            assert full_host_access_active() is False
-        finally:
-            current_tool_context.reset(token)
+    token = current_tool_context.set(context)
+    try:
+        assert full_host_access_active() is False
+    finally:
+        current_tool_context.reset(token)
+
+    _configure("sandbox-off", tmp_path)
+    full_context = _operator_network_tool_context()
+    assert full_context.run_mode == RunMode.SAFE.value
+    assert full_context.sandbox_run_context.run_mode is RunMode.SAFE
 
 
 @pytest.mark.asyncio
