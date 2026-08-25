@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import tempfile
 import time
 
 from opensquilla.process_tree import (
@@ -75,67 +77,95 @@ class NoopBackend(Backend):
         limits = _limits_from_policy(request)
         started = time.monotonic()
         child_env = _filtered_env(limits.env_whitelist, _filtered_request_env(request))
-        spawn_kwargs: dict[str, object] = {
-            "stdin": asyncio.subprocess.PIPE if request.stdin is not None else None,
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-            "cwd": str(request.cwd),
-            "env": child_env,
-            "start_new_session": True,
-        }
-        if HAS_RESOURCE:
-            spawn_kwargs["preexec_fn"] = _preexec(limits)
-        try:
-            proc = await create_owned_subprocess_exec(
-                *request.argv,
-                **spawn_kwargs,
+        # The controlled Windows launcher adds a helper process. Waiting on two
+        # Proactor pipe readers can lag far behind that helper's exit, so use
+        # inherited regular files and make process completion the sole signal.
+        windows_file_capture = os.name == "nt" and request.stdin is None
+        with contextlib.ExitStack() as capture_stack:
+            stdout_file = (
+                capture_stack.enter_context(tempfile.TemporaryFile())
+                if windows_file_capture
+                else None
             )
-        except (OSError, ValueError) as exc:
+            stderr_file = (
+                capture_stack.enter_context(tempfile.TemporaryFile())
+                if windows_file_capture
+                else None
+            )
+            spawn_kwargs: dict[str, object] = {
+                "stdin": asyncio.subprocess.PIPE if request.stdin is not None else None,
+                "stdout": stdout_file if stdout_file is not None else asyncio.subprocess.PIPE,
+                "stderr": stderr_file if stderr_file is not None else asyncio.subprocess.PIPE,
+                "cwd": str(request.cwd),
+                "env": child_env,
+                "start_new_session": True,
+            }
+            if HAS_RESOURCE:
+                spawn_kwargs["preexec_fn"] = _preexec(limits)
+            try:
+                proc = await create_owned_subprocess_exec(
+                    *request.argv,
+                    **spawn_kwargs,
+                )
+            except (OSError, ValueError) as exc:
+                return SandboxResult(
+                    returncode=-1,
+                    stdout="",
+                    stderr=str(exc),
+                    wall_time_s=time.monotonic() - started,
+                    backend_used=self.name,
+                    policy_used=request.policy.summary(),
+                    timed_out=False,
+                )
+
+            process_tree = capture_process_tree_owner(proc, isolated=True)
+            timed_out = False
+            stdout: bytes | str | None = None
+            stderr: bytes | str | None = None
+            try:
+                if windows_file_capture:
+                    await asyncio.wait_for(proc.wait(), timeout=limits.wall_seconds)
+                else:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(input=request.stdin),
+                        timeout=limits.wall_seconds,
+                    )
+            except TimeoutError:
+                timed_out = True
+                await process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+                with contextlib.suppress(Exception):
+                    if windows_file_capture:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    else:
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1.0)
+            except asyncio.CancelledError:
+                await asyncio.shield(process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0))
+                raise
+
+            # Successful leaders may have daemonized children that did not inherit
+            # stdout/stderr. Do not let them escape this finite sandbox invocation.
+            await process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+            if windows_file_capture:
+                assert stdout_file is not None
+                assert stderr_file is not None
+                stdout_file.flush()
+                stderr_file.flush()
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read()
+                stderr = stderr_file.read()
+            elapsed = time.monotonic() - started
             return SandboxResult(
-                returncode=-1,
-                stdout="",
-                stderr=str(exc),
-                wall_time_s=time.monotonic() - started,
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=_decode_stream(stdout),
+                stderr=_decode_stream(stderr),
+                wall_time_s=elapsed,
                 backend_used=self.name,
                 policy_used=request.policy.summary(),
-                timed_out=False,
+                truncated_stdout=False,
+                truncated_stderr=False,
+                timed_out=timed_out,
             )
-
-        process_tree = capture_process_tree_owner(proc, isolated=True)
-        timed_out = False
-        stdout: bytes | str | None = None
-        stderr: bytes | str | None = None
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=request.stdin),
-                timeout=limits.wall_seconds,
-            )
-        except TimeoutError:
-            timed_out = True
-            await process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
-            with contextlib.suppress(Exception):
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1.0)
-        except asyncio.CancelledError:
-            await asyncio.shield(
-                process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
-            )
-            raise
-
-        # Successful leaders may have daemonized children that did not inherit
-        # stdout/stderr. Do not let them escape this finite sandbox invocation.
-        await process_tree.terminate(graceful_timeout=0.2, kill_timeout=1.0)
-        elapsed = time.monotonic() - started
-        return SandboxResult(
-            returncode=proc.returncode if proc.returncode is not None else -1,
-            stdout=_decode_stream(stdout),
-            stderr=_decode_stream(stderr),
-            wall_time_s=elapsed,
-            backend_used=self.name,
-            policy_used=request.policy.summary(),
-            truncated_stdout=False,
-            truncated_stderr=False,
-            timed_out=timed_out,
-        )
 
 
 __all__ = ["NoopBackend"]
