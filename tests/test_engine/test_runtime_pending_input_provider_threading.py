@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import opensquilla.engine.runtime as runtime_module
 from opensquilla.cli.tui import turn_bridge
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.runtime import TurnRunner
@@ -14,11 +15,20 @@ from opensquilla.tools.types import ToolContext
 
 
 @pytest.mark.asyncio
-async def test_turnrunner_run_threads_pending_input_provider_to_run_turn() -> None:
+async def test_turnrunner_run_threads_pending_input_provider_to_run_turn(monkeypatch) -> None:
     runner = TurnRunner(provider_selector=None, config=None)
     pending = ListPendingInputProvider()
     pending.append("later")
     seen_kwargs: list[dict[str, Any]] = []
+    created_contexts: list[Any] = []
+    create_context = runtime_module.create_turn_execution_context
+
+    def _record_context(**kwargs: Any) -> Any:
+        context = create_context(**kwargs)
+        created_contexts.append(context)
+        return context
+
+    monkeypatch.setattr(runtime_module, "create_turn_execution_context", _record_context)
 
     async def _recording_run_turn(
         self: TurnRunner,
@@ -37,11 +47,17 @@ async def test_turnrunner_run_threads_pending_input_provider_to_run_turn() -> No
         tool_context=ToolContext(session_key="agent:main:pending-thread-test"),
         pending_input_provider=pending,
         root_turn_id="gateway-turn-1",
+        assistant_message_id="assistant-turn-1",
     ):
         pass
 
     assert seen_kwargs[0]["pending_input_provider"] is pending
     assert seen_kwargs[0]["root_turn_id"] == "gateway-turn-1"
+    context = seen_kwargs[0]["execution_context"]
+    assert len(created_contexts) == 1
+    assert context is created_contexts[0]
+    assert context.identity.turn_id == "gateway-turn-1"
+    assert context.identity.assistant_message_id == "assistant-turn-1"
 
 
 @pytest.mark.asyncio

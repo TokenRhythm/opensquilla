@@ -17,6 +17,8 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine import tool_result_store as trs_module
 from opensquilla.provider import ContentBlockToolResult, ContentBlockToolUse, Message
+from opensquilla.tools import ToolRegistry, tool
+from opensquilla.tools.dispatch import build_tool_handler
 
 
 class _CapturingProvider:
@@ -26,7 +28,24 @@ class _CapturingProvider:
         return []
 
 
+def _retrieval_surface():
+    registry = ToolRegistry()
+
+    @tool(
+        name="retrieve_tool_result",
+        description="Retrieve a stored tool result.",
+        params={"handle": {"type": "string"}},
+        required=["handle"],
+        registry=registry,
+    )
+    async def retrieve_tool_result(handle: str) -> str:
+        return handle
+
+    return registry.to_tool_definitions(), build_tool_handler(registry)
+
+
 def _agent_with_store(tmp_path: Path) -> Agent:
+    tool_definitions, tool_handler = _retrieval_surface()
     return Agent(
         provider=_CapturingProvider(),
         config=AgentConfig(
@@ -36,6 +55,8 @@ def _agent_with_store(tmp_path: Path) -> Agent:
             tool_result_store_session_key="agent:main:webchat:a",
             tool_result_store_agent_id="main",
         ),
+        tool_definitions=tool_definitions,
+        tool_handler=tool_handler,
     )
 
 

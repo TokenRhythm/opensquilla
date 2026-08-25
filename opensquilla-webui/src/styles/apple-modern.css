@@ -258,14 +258,16 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   background: var(--sidebar-item-active);
 }
 
-.sidebar-recents-header {
+.sidebar-recents-header,
+.sidebar-zone-heading {
   align-items: center;
   gap: var(--sp-1);
   min-height: 40px;
   padding: 4px 10px;
 }
 
-.sidebar-recents-eyebrow {
+.sidebar-recents-eyebrow,
+.sidebar-zone-heading__label {
   font-size: var(--fs-sm);
   font-weight: 400;
   line-height: 20px;
@@ -273,7 +275,8 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   text-transform: none;
 }
 
-.sidebar-recents-count {
+.sidebar-recents-count,
+.sidebar-zone-heading__count {
   align-self: center;
   color: var(--sidebar-text-soft);
   font-size: var(--fs-xs);
@@ -283,7 +286,9 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .sidebar-recents-header .sidebar-cmd-btn,
-.sidebar-recents-header .sidebar-bulk-mode-btn {
+.sidebar-recents-header .sidebar-bulk-mode-btn,
+.sidebar-zone-heading .sidebar-cmd-btn,
+.sidebar-zone-heading .sidebar-bulk-mode-btn {
   align-items: center;
   display: inline-flex;
   height: 32px;
@@ -417,6 +422,10 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   position: relative;
 }
 
+.sidebar-history-row .sidebar-history-item {
+  margin-right: calc(-1 * var(--sp-1));
+}
+
 .sidebar-history-item.is-current {
   background:
     linear-gradient(
@@ -450,19 +459,17 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   position: relative;
 }
 
-.sidebar-row-enter-from,
-.sidebar-row-leave-to {
+.sidebar-group-enter-active,
+.sidebar-group-leave-active {
+  transition:
+    grid-template-rows var(--dur-base) var(--ease-out),
+    opacity var(--dur-base) var(--ease-out);
+}
+
+.sidebar-group-enter-from,
+.sidebar-group-leave-to {
+  grid-template-rows: 0fr;
   opacity: 0;
-  transform: translateY(-4px);
-}
-
-.sidebar-row-leave-active {
-  position: absolute;
-  width: 100%;
-}
-
-.sidebar-row-move {
-  transition: transform var(--dur-base) var(--ease-out);
 }
 
 .sidebar-foot {

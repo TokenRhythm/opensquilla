@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
+from opensquilla.git_runtime import GitRunState
 from opensquilla.tools.builtin import filesystem
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.registry import get_default_registry
@@ -51,7 +52,14 @@ async def test_filesystem_write_notifies_bootstrap_or_memory_sources(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_filesystem_write_tools_record_workspace_writes(tmp_path) -> None:
+async def test_filesystem_write_tools_record_workspace_writes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.tools.write_tracking.probe_git_repository",
+        lambda *_args, **_kwargs: GitRunState.OK,
+    )
     target = tmp_path / "src" / "app.py"
     target.parent.mkdir()
     target.write_text("old\n", encoding="utf-8")
@@ -676,7 +684,14 @@ def test_coding_tool_descriptions_explain_file_edit_workflow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_patch_reports_workspace_write_progress(tmp_path) -> None:
+async def test_apply_patch_reports_workspace_write_progress(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.tools.write_tracking.probe_git_repository",
+        lambda *_args, **_kwargs: GitRunState.OK,
+    )
     target = tmp_path / "src" / "app.py"
     target.parent.mkdir()
     target.write_text("old\n", encoding="utf-8")

@@ -180,6 +180,21 @@ class BackgroundCompletionManager:
                 self._cancel_group_locked(group_id)
         return len(group_ids)
 
+    async def cancel_task(self, parent_session_key: str, parent_task_id: str) -> int:
+        """Cancel only the completion group owned by one exact parent task."""
+        group_id = self.group_id(parent_session_key, parent_task_id)
+        async with self._state_lock:
+            known_group_ids = self._group_ids_for_parent_sessions_locked(
+                (parent_session_key,)
+            )
+            was_known = group_id in known_group_ids
+            # Remember the exact cancellation even if group admission is racing
+            # this call. A later admission for the same task must not revive it.
+            self._group_parents.setdefault(group_id, parent_session_key)
+            self._cancel_group_locked(group_id)
+            self._notify_watch_state_changed()
+        return int(was_known)
+
     @contextlib.asynccontextmanager
     async def quiesce_sessions(
         self,

@@ -21,6 +21,10 @@ from opensquilla.gateway.approval_events import (
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.event_bridge import EventBridge
+from opensquilla.gateway.session_streams import (
+    get_session_streams,
+    reset_session_streams,
+)
 
 
 class _FakeConn:
@@ -64,6 +68,7 @@ def _build_bridge(
 
 @pytest.mark.asyncio
 async def test_exec_approval_request_pushes_event_to_approvals_scoped_client() -> None:
+    reset_session_streams(stream_generation="approval-push-test")
     approvals_conn = _FakeConn("c-approvals", frozenset({"operator.approvals"}))
     read_only_conn = _FakeConn("c-read", frozenset({"operator.read"}))
     node_conn = _FakeConn("c-node", frozenset({"node"}), role="node")
@@ -96,6 +101,13 @@ async def test_exec_approval_request_pushes_event_to_approvals_scoped_client() -
         assert payload["deadline"] == 0.0
         assert payload["args"] == {"command": "rm -rf ./scratch dir", "workdir": None}
         assert payload["warning"] == ""
+        assert payload["stream_seq"] == 1
+        replay = get_session_streams().live_snapshot(
+            "agent:main:webchat:demo",
+        )
+        assert [(item.event_name, item.stream_seq) for item in replay.events] == [
+            ("exec.approval.requested", 1),
+        ]
         assert "approved" not in payload
         # The approvals surface stays scoped: read-only and node-role
         # connections must not receive approval pushes.
@@ -104,6 +116,7 @@ async def test_exec_approval_request_pushes_event_to_approvals_scoped_client() -
     finally:
         remove()
         queue.close()
+        reset_session_streams()
 
 
 @pytest.mark.asyncio

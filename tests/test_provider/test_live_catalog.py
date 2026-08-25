@@ -326,6 +326,37 @@ def test_scoped_live_entries_outrank_corrections_without_leaking() -> None:
     assert catalog.resolve_context_window("deepseek-v4-pro") == 1_000_000
 
 
+def test_tokenrhythm_v4_pro_0813_live_fields_merge_with_scoped_offline_row() -> None:
+    catalog = ModelCatalog()
+    catalog.set_live_provider_entries(
+        "tokenrhythm",
+        {
+            "deepseek-v4-pro-0813": {
+                "context_window": 900_000,
+                "status": "online",
+            }
+        },
+    )
+
+    resolved = catalog.resolve_entry("deepseek-v4-pro-0813", provider="tokenrhythm")
+    assert resolved.source == "live"
+    assert resolved.context_window == 900_000
+    assert resolved.max_output_tokens == 384_000
+    assert resolved.supports_reasoning is True
+    assert resolved.supports_tools is True
+    assert resolved.supports_vision is False
+    assert resolved.reasoning_format == "none"
+    assert resolved.input_cost_per_mtok == pytest.approx(1.2903225806451613)
+    assert resolved.output_cost_per_mtok == pytest.approx(3.870967741935484)
+    assert resolved.cache_read_cost_per_mtok == pytest.approx(0.043010752688172046)
+
+    direct = catalog.resolve_entry("deepseek-v4-pro-0813", provider="deepseek")
+    assert direct.source != "live"
+    assert direct.input_cost_per_mtok is None
+    assert direct.output_cost_per_mtok is None
+    assert direct.cache_read_cost_per_mtok is None
+
+
 def test_scoped_live_keeps_corrections_reasoning_dialect() -> None:
     # The mixed-family catalog remains neutral at reasoning_format="none";
     # exact official V4 wire controls do not mutate catalog capabilities.

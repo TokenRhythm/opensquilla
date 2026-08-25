@@ -12,7 +12,6 @@ from pydantic import ValidationError
 
 from opensquilla.channels.registry import discover_all, parse_channel_entry
 from opensquilla.gateway.config import (
-    STATIC_B5_SELECTION_MODE_PROVIDERS,
     AudioConfig,
     ChannelsConfig,
     GatewayConfig,
@@ -69,8 +68,16 @@ from opensquilla.provider.image_generation_policy import (
 from opensquilla.provider.preset_registry import ProviderPreset, get_preset
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
+    HIGHEST_TEXT_TIER,
+    ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
+    STATIC_B5_SELECTION_MODE_PROVIDERS,
     TEXT_TIERS,
+    TierConfig,
+    effective_ensemble_selection_mode,
+    ensemble_selection_configured,
     normalize_text_tier,
+    router_dynamic_tier_members_active,
+    tier_provider_role,
 )
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, MAX_SEARCH_RESULTS
 from opensquilla.secrets import clean_header_secret
@@ -89,6 +96,8 @@ _TIER_KEY_ALIASES = {
     "thinkingLevel": "thinking_level",
     "supportsImage": "supports_image",
     "imageOnly": "image_only",
+    "ensembleSelectionMode": "ensemble_selection_mode",
+    "ensembleEnabled": "ensemble_enabled",
 }
 _REMOTE_MEMORY_EMBEDDING_PROVIDERS = {"openai", "openai-compatible"}
 _DEFAULT_REMOTE_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
@@ -166,6 +175,62 @@ def _positive_int(value: int | str, *, label: str) -> int:
     if parsed < 1:
         raise ValueError(f"{label} must be >= 1")
     return parsed
+
+
+def _bounded_non_negative_int(
+    value: int | str,
+    *,
+    label: str,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be an integer between 0 and {maximum}") from None
+    if parsed < 0 or parsed > maximum:
+        raise ValueError(f"{label} must be between 0 and {maximum}")
+    return parsed
+
+
+_C3_ENSEMBLE_POLICY_DEFAULTS: dict[str, object] = {
+    "min_successful_proposers": 1,
+    "proposer_max_retries": 1,
+    "all_failed_policy": "fallback_single",
+}
+
+
+def _materialize_c3_ensemble_policy_defaults(config: GatewayConfig) -> tuple[str, ...]:
+    """Persist C3's shared-fusion defaults without overriding operator values."""
+
+    router = getattr(config, "squilla_router", None)
+    tiers = getattr(router, "tiers", {}) or {}
+    c3 = TierConfig.from_value(tiers.get(HIGHEST_TEXT_TIER))
+    if not bool(getattr(router, "enabled", False)) or c3.ensemble_enabled is not True:
+        return ()
+
+    ensemble = config.llm_ensemble
+    explicit_fields = set(getattr(ensemble, "model_fields_set", set()))
+    generated_fields = {
+        field_name
+        for field_name in _C3_ENSEMBLE_POLICY_DEFAULTS
+        if field_name not in explicit_fields
+    }
+    if not generated_fields:
+        return ()
+
+    payload = ensemble.model_dump(mode="python")
+    for field_name in generated_fields:
+        payload[field_name] = _C3_ENSEMBLE_POLICY_DEFAULTS[field_name]
+    materialized = LlmEnsembleConfig(**payload)
+    object.__setattr__(
+        materialized,
+        "__pydantic_fields_set__",
+        explicit_fields | generated_fields,
+    )
+    config.llm_ensemble = materialized
+    for field_name in generated_fields:
+        config.mark_force_persist(f"llm_ensemble.{field_name}")
+    return tuple(sorted(generated_fields))
 
 
 def _preset_tiers_with_model(preset: ProviderPreset, model: str) -> dict[str, dict]:
@@ -247,6 +312,15 @@ def _merge_router_tiers(
         tier_name = normalize_text_tier(name) or str(name)
         override = _normalize_tier_payload(tier_name, raw_override)
         current = dict(merged.get(tier_name, {}))
+        # A pre-``ensemble_enabled`` client can still submit an explicit
+        # per-tier selection mode.  That legacy field is an ownership
+        # boundary: do not let a managed preset's new shared-plan flag turn
+        # the explicit legacy profile into an inherited global selection.
+        if (
+            "ensemble_selection_mode" in override
+            and "ensemble_enabled" not in override
+        ):
+            current.pop("ensemble_enabled", None)
         current.update(override)
         merged[tier_name] = _enforce_router_tier_role_invariants(tier_name, current)
     return merged
@@ -256,6 +330,16 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
     thinking = tier.get("thinking_level")
     if thinking is None:
         thinking = tier.get("thinkingLevel")
+    raw_ensemble_enabled = tier.get(
+        "ensemble_enabled",
+        tier.get("ensembleEnabled"),
+    )
+    ensemble_enabled = (
+        raw_ensemble_enabled if isinstance(raw_ensemble_enabled, bool) else None
+    )
+    legacy_selection_mode = str(
+        tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
+    ).strip()
     return {
         "provider": str(tier.get("provider") or "").strip().lower(),
         "model": str(tier.get("model") or "").strip(),
@@ -263,6 +347,13 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
         "thinking_level": (str(thinking or "").strip() or None),
         "supports_image": bool(tier.get("supports_image", tier.get("supportsImage", False))),
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
+        "ensemble_enabled": ensemble_enabled,
+        # Once the new tri-state field exists it owns execution. Retained
+        # legacy metadata is intentionally ignored for semantic preset
+        # comparison, while still round-tripping in the actual tier dict.
+        "ensemble_selection_mode": (
+            legacy_selection_mode if ensemble_enabled is None else ""
+        ),
     }
 
 
@@ -342,6 +433,23 @@ def _validate_router_tiers(tiers: dict[str, Any], default_tier: str) -> None:
             raise ValueError(f"router tier {tier_name!r} requires provider")
         if not str(tier.get("model") or "").strip():
             raise ValueError(f"router tier {tier_name!r} requires model")
+        selection_mode = TierConfig.from_value(tier).ensemble_selection_mode
+        raw_ensemble_enabled = tier.get(
+            "ensemble_enabled",
+            tier.get("ensembleEnabled"),
+        )
+        if raw_ensemble_enabled is not None and not isinstance(raw_ensemble_enabled, bool):
+            raise ValueError(f"router tier {tier_name!r} ensembleEnabled must be a boolean")
+        if tier_name != HIGHEST_TEXT_TIER and raw_ensemble_enabled is True:
+            raise ValueError(
+                f"router tier {tier_name!r} ensembleEnabled is only supported "
+                f"for {HIGHEST_TEXT_TIER}"
+            )
+        if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
+            allowed = ", ".join(sorted(ROUTER_TIER_ENSEMBLE_SELECTION_MODES))
+            raise ValueError(
+                f"router tier {tier_name!r} ensembleSelectionMode must be one of: {allowed}"
+            )
 
 
 def _tier_provider_deployment_unready_reason(
@@ -375,6 +483,8 @@ def _cross_provider_tier_warnings(
     tiers: dict[str, Any],
     active_provider: str,
     *,
+    shared_selection_mode: str = "",
+    ensemble_globally_enabled: bool = False,
     cross_provider_enabled: bool = False,
     tier_provider_mismatch: str = "route",
     llm_profiles: dict[str, Any] | None = None,
@@ -391,9 +501,30 @@ def _cross_provider_tier_warnings(
     if not active_provider:
         return []
     warnings: list[str] = []
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers,
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
     for tier_name in sorted(tiers):
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
+            continue
+        provider_role = tier_provider_role(
+            tier_name,
+            tier,
+            shared_selection_mode=shared_selection_mode,
+            router_dynamic_members_active=dynamic_members_active,
+            ensemble_globally_enabled=ensemble_globally_enabled,
+        )
+        if provider_role == "dormant_draft":
+            continue
+        if provider_role == "blocked":
+            warnings.append(
+                f"Router tier '{tier_name}' uses a shared multi-model plan that cannot "
+                "be resolved. Choose a supported llm_ensemble.selection_mode before "
+                "routing requests to this tier."
+            )
             continue
         tier_provider = str(tier.get("provider") or "").strip().lower()
         if not tier_provider or tier_provider == active_provider:
@@ -528,6 +659,8 @@ def _implicit_primary_and_router(config: GatewayConfig) -> bool:
 def _router_provider_conflicts(
     config: GatewayConfig,
     target_provider: str,
+    *,
+    shared_selection_mode: str | None = None,
 ) -> tuple[str, ...]:
     """Foreign providers that would be vetoed/misrouted after a primary swap."""
 
@@ -537,11 +670,33 @@ def _router_provider_conflicts(
     if bool(getattr(router, "cross_provider_tiers", False)):
         return ()
     target = str(target_provider or "").strip().lower()
-    conflicts: set[str] = set()
+    effective_shared_mode = (
+        effective_ensemble_selection_mode(config)
+        if shared_selection_mode is None
+        else str(shared_selection_mode or "").strip()
+    )
     tiers = getattr(router, "tiers", {}) or {}
+    ensemble_globally_enabled = bool(
+        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+    )
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers if isinstance(tiers, Mapping) else {},
+        shared_selection_mode=effective_shared_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
+    conflicts: set[str] = set()
     if isinstance(tiers, Mapping):
-        for tier in tiers.values():
+        for tier_name, tier in tiers.items():
             if not isinstance(tier, Mapping):
+                continue
+            provider_role = tier_provider_role(
+                tier_name,
+                tier,
+                shared_selection_mode=effective_shared_mode,
+                router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
+            )
+            if provider_role not in {"direct", "dynamic_member"}:
                 continue
             provider = str(tier.get("provider") or "").strip().lower()
             if provider and provider != target:
@@ -627,7 +782,11 @@ def _apply_primary_provider_router_policy(
     if not primary_changed:
         return
 
-    conflicts = _router_provider_conflicts(source, target_provider)
+    conflicts = _router_provider_conflicts(
+        source,
+        target_provider,
+        shared_selection_mode=effective_ensemble_selection_mode(candidate),
+    )
     if conflicts:
         joined = ", ".join(conflicts)
         raise LlmProfileActivationError(
@@ -861,6 +1020,7 @@ def upsert_llm_provider(
         router_action=router_action,
         explicit_preset=preset,
     )
+    _materialize_c3_ensemble_policy_defaults(new_cfg)
     if api_key:
         clear_runtime_secret_paths(new_cfg, {"llm.api_key"})
     # Explicit endpoint/proxy values override any boot-time env resolution:
@@ -1088,6 +1248,10 @@ def upsert_router(
         warnings = _cross_provider_tier_warnings(
             cast(dict[str, Any], router_payload.get("tiers") or {}),
             provider,
+            shared_selection_mode=effective_ensemble_selection_mode(config),
+            ensemble_globally_enabled=bool(
+                getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+            ),
             cross_provider_enabled=bool(router_payload.get("cross_provider_tiers")),
             tier_provider_mismatch=str(
                 router_payload.get("tier_provider_mismatch") or "route"
@@ -1103,6 +1267,38 @@ def upsert_router(
         # A genuine enable is a strategy switch: route through the canonical
         # mode patch (ensemble off, rollout_phase full, force-persisted).
         apply_model_routing_mode(new_cfg, "router")
+    shared_tier_enabled = (
+        bool(getattr(new_cfg.squilla_router, "enabled", False))
+        and TierConfig.from_value(
+            (getattr(new_cfg.squilla_router, "tiers", {}) or {}).get(HIGHEST_TEXT_TIER)
+        ).ensemble_enabled
+        is True
+    )
+    if shared_tier_enabled and not ensemble_selection_configured(new_cfg):
+        activation = ensemble_activation_patches(new_cfg)
+        if activation:
+            ensemble_payload = new_cfg.llm_ensemble.model_dump(mode="python")
+            generated_fields: set[str] = set()
+            if "llm_ensemble.selection_mode" in activation:
+                ensemble_payload["selection_mode"] = activation[
+                    "llm_ensemble.selection_mode"
+                ]
+                generated_fields.add("selection_mode")
+            if "llm_ensemble.candidates" in activation:
+                ensemble_payload["candidates"] = activation[
+                    "llm_ensemble.candidates"
+                ]
+                generated_fields.add("candidates")
+            materialized = LlmEnsembleConfig(**ensemble_payload)
+            fields_set = set(
+                getattr(new_cfg.llm_ensemble, "model_fields_set", set())
+            ) | generated_fields
+            object.__setattr__(materialized, "__pydantic_fields_set__", fields_set)
+            new_cfg.llm_ensemble = materialized
+            for field_name in generated_fields:
+                new_cfg.mark_force_persist(f"llm_ensemble.{field_name}")
+    if shared_tier_enabled:
+        _materialize_c3_ensemble_policy_defaults(new_cfg)
     # Otherwise this is ladder/settings maintenance on an already-enabled
     # router (the common Web UI tier-table save and CLI default-tier path).
     # Applying the mode patch here would silently escalate an operator's
@@ -1145,6 +1341,7 @@ def upsert_llm_ensemble(
     model_options: list[str] | None = None,
     candidates: list[dict[str, object]] | None = None,
     min_successful_proposers: int | str | None = None,
+    proposer_max_retries: int | str | None = None,
     all_failed_policy: str | None = None,
 ) -> MutationResult:
     """Update the ``[llm_ensemble]`` routing surface.
@@ -1222,6 +1419,13 @@ def upsert_llm_ensemble(
             min_successful_proposers, label="min_successful_proposers"
         )
         explicit_fields.add("min_successful_proposers")
+    if proposer_max_retries is not None:
+        merged["proposer_max_retries"] = _bounded_non_negative_int(
+            proposer_max_retries,
+            label="proposer_max_retries",
+            maximum=10,
+        )
+        explicit_fields.add("proposer_max_retries")
     if all_failed_policy is not None:
         policy_clean = str(all_failed_policy).strip()
         if policy_clean not in _LLM_ENSEMBLE_ALL_FAILED_POLICIES:
@@ -1240,8 +1444,10 @@ def upsert_llm_ensemble(
         activation = ensemble_activation_patches(config)
         if activation:
             merged["selection_mode"] = activation["llm_ensemble.selection_mode"]
-            merged["candidates"] = activation["llm_ensemble.candidates"]
-            generated_fields.update({"selection_mode", "candidates"})
+            generated_fields.add("selection_mode")
+            if "llm_ensemble.candidates" in activation:
+                merged["candidates"] = activation["llm_ensemble.candidates"]
+                generated_fields.add("candidates")
             explicit_fields.update(generated_fields)
 
     try:
@@ -1287,12 +1493,17 @@ def upsert_llm_ensemble(
         new_cfg.mark_force_persist("llm_ensemble.selection_mode")
     if candidates is not None or "candidates" in generated_fields:
         new_cfg.mark_force_persist("llm_ensemble.candidates")
+    if all_failed_policy is not None:
+        new_cfg.mark_force_persist("llm_ensemble.all_failed_policy")
+    if proposer_max_retries is not None:
+        new_cfg.mark_force_persist("llm_ensemble.proposer_max_retries")
 
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
         "selection_mode": new_ensemble.selection_mode,
         "model_options": list(new_ensemble.model_options),
         "min_successful_proposers": new_ensemble.min_successful_proposers,
+        "proposer_max_retries": new_ensemble.proposer_max_retries,
         "all_failed_policy": new_ensemble.all_failed_policy,
     }
     if candidates is not None or new_ensemble.candidates:

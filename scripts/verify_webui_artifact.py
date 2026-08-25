@@ -23,6 +23,7 @@ SOURCE_INPUT_ROOTS = (
     ".env.local",
     ".env.production",
     ".env.production.local",
+    "desktop.html",
     "index.html",
     "package.json",
     "package-lock.json",
@@ -242,9 +243,14 @@ def verify_dist(
             f"WebUI artifact contains forbidden metadata or sensitive files: {forbidden}"
         )
     index = files.get("index.html")
+    desktop = files.get("desktop.html")
     manifest_bytes = files.get(MANIFEST_NAME)
     if not index:
         raise ArtifactError(f"WebUI entrypoint is missing or empty: {dist_dir / 'index.html'}")
+    if not desktop:
+        raise ArtifactError(
+            f"Desktop WebUI entrypoint is missing or empty: {dist_dir / 'desktop.html'}"
+        )
     if not manifest_bytes:
         raise ArtifactError(f"WebUI artifact manifest is missing: {dist_dir / MANIFEST_NAME}")
 
@@ -280,27 +286,29 @@ def verify_dist(
     if forbid_personal_bgm:
         _verify_official_music(files)
 
-    try:
-        html = index.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ArtifactError(f"WebUI index.html is not valid UTF-8: {exc}") from exc
-    references = []
-    for raw in re.findall(r'\b(?:src|href)="([^"]+)"', html):
-        if raw.startswith(("data:", "http://", "https://", "//", "#")):
-            continue
-        relative = raw.split("?", 1)[0].split("#", 1)[0].removeprefix("./")
-        pure = PurePosixPath(relative)
-        if pure.is_absolute() or ".." in pure.parts:
-            raise ArtifactError(f"WebUI entry asset escapes the artifact: {raw}")
-        if relative:
-            references.append(relative)
-    if not any(path.endswith(".js") for path in references):
-        raise ArtifactError("WebUI index.html has no JavaScript module entry")
-    if not any(path.endswith(".css") for path in references):
-        raise ArtifactError("WebUI index.html has no stylesheet entry")
-    missing = sorted(path for path in references if path not in files)
-    if missing:
-        raise ArtifactError(f"WebUI index.html references missing assets: {missing}")
+    for entry_name, entry_bytes in (("index.html", index), ("desktop.html", desktop)):
+        try:
+            html = entry_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ArtifactError(f"WebUI {entry_name} is not valid UTF-8: {exc}") from exc
+        references = []
+        asset_html = re.sub(r"<base\b[^>]*>", "", html, flags=re.IGNORECASE)
+        for raw in re.findall(r'\b(?:src|href)="([^"]+)"', asset_html):
+            if raw.startswith(("data:", "http://", "https://", "//", "#")):
+                continue
+            relative = raw.split("?", 1)[0].split("#", 1)[0].removeprefix("./")
+            pure = PurePosixPath(relative)
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ArtifactError(f"WebUI entry asset escapes the artifact: {raw}")
+            if relative:
+                references.append(relative)
+        if not any(path.endswith(".js") for path in references):
+            raise ArtifactError(f"WebUI {entry_name} has no JavaScript module entry")
+        if not any(path.endswith(".css") for path in references):
+            raise ArtifactError(f"WebUI {entry_name} has no stylesheet entry")
+        missing = sorted(path for path in references if path not in files)
+        if missing:
+            raise ArtifactError(f"WebUI {entry_name} references missing assets: {missing}")
 
     return files
 

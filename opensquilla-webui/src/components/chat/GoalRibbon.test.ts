@@ -121,13 +121,36 @@ describe('GoalRibbon', () => {
     expect(objective?.getAttribute('aria-expanded')).toBe('false')
   })
 
-  it('keeps routine accounting out of the compact active row', () => {
+  it('keeps authoritative elapsed time and accounting visible in the compact active row', () => {
     const host = mountRibbon()
     const meta = host.querySelector('.goal-ribbon__meta')
 
+    expect(meta?.textContent).toContain('12s active')
     expect(meta?.textContent).toContain('2 turns')
     expect(meta?.textContent).toContain('170 tokens')
-    expect(meta?.classList.contains('goal-ribbon__meta--visible')).toBe(false)
+    expect(meta?.classList.contains('goal-ribbon__meta--visible')).toBe(true)
+  })
+
+  it('omits zero Goal accounting values from the compact active row', () => {
+    const host = mountRibbon({
+      goal: goal({
+        turnsStarted: 0,
+        turnsSettled: 0,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
+        },
+      }),
+    })
+    const meta = host.querySelector('.goal-ribbon__meta')
+
+    expect(meta?.textContent).toContain('12s active')
+    expect(meta?.textContent).not.toContain('turns')
+    expect(meta?.textContent).not.toContain('tokens')
   })
 
   it('keeps lifecycle reasons visible without requiring expansion', () => {

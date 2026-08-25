@@ -1591,19 +1591,23 @@ async def test_goal_terminal_summary_preflight_failure_degrades_without_system_e
             fail_terminal_summary_assembly,
         )
     elif preflight_failure == "request_validation":
-        original_validate = agent_module.validate_provider_chat_request
+        original_validate = agent_module.validate_provider_chat_admission
 
-        def fail_terminal_summary_validation(provider: Any, messages: list[Message]) -> Any:
+        def fail_terminal_summary_validation(
+            provider: Any,
+            messages: list[Message],
+            config: Any,
+        ) -> Any:
             if getattr(provider, "calls", 0) == 3:
                 return ProviderError(
                     message="Synthetic terminal summary validation failure.",
                     code="synthetic_terminal_summary_validation_failure",
                 )
-            return original_validate(provider, messages)
+            return original_validate(provider, messages, config)
 
         monkeypatch.setattr(
             agent_module,
-            "validate_provider_chat_request",
+            "validate_provider_chat_admission",
             fail_terminal_summary_validation,
         )
     else:
@@ -3167,7 +3171,10 @@ class _GoalArtifactFallbackSelector:
         )
         self._remaining = [
             self.current_config,
-            SimpleNamespace(provider="test-fallback", model="deepseek-v4-flash"),
+            SimpleNamespace(
+                provider="test-fallback",
+                model="synthetic-tool-capable",
+            ),
         ]
 
     def clone(self) -> _GoalArtifactFallbackSelector:
@@ -3185,7 +3192,7 @@ class _GoalArtifactFallbackSelector:
         return list(self._remaining)
 
     def resolve(self) -> Any:
-        if self.current_config.model == "deepseek-v4-flash":
+        if self.current_config.model == "synthetic-tool-capable":
             return self.fallback
         return self.primary
 
@@ -3204,6 +3211,13 @@ class _GoalArtifactEnsembleProvider(_GoalPostPublishLoopProvider):
     """Attach one proposer and aggregator receipt to each normal decision."""
 
     provider_name = "ensemble"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replay_boundary_activations = 0
+
+    def activate_provider_state_replay_boundary(self) -> None:
+        self.replay_boundary_activations += 1
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         async for event in super()._stream(call_number):
@@ -3231,7 +3245,7 @@ class _GoalArtifactEnsembleProvider(_GoalPostPublishLoopProvider):
                 ]
                 event.ensemble_trace = {
                     "profile": "test",
-                    "llm_request_count": 2,
+                    "llm_request_count": 2 * call_number,
                 }
             yield event
 
@@ -3303,6 +3317,7 @@ def _goal_artifact_topology_config(
 ) -> GatewayConfig:
     return GatewayConfig(
         attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+        llm={"model": "deepseek-v4-pro"},
         squilla_router=SquillaRouterConfig(enabled=router),
         llm_ensemble={
             "enabled": ensemble,
@@ -3375,7 +3390,7 @@ async def test_goal_post_publish_selector_keeps_the_active_fallback_leg(
 
     assert selector.primary.calls == 1
     assert selector.fallback_calls == 1
-    assert selector.current_config.model == "deepseek-v4-flash"
+    assert selector.current_config.model == "synthetic-tool-capable"
     assert fallback.calls == 4
     assert control_calls == ["progress:completed", "goal:complete"]
     assert qa_calls == []
@@ -3414,6 +3429,7 @@ async def test_goal_post_publish_ensemble_runs_each_normal_decision_once(
     )
 
     assert len(ensemble_builds) == 1
+    assert provider.replay_boundary_activations == 1
     assert provider.calls == 4
     assert control_calls == ["progress:completed", "goal:complete"]
     assert qa_calls == []

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import subprocess
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _finalize_variant_challenge_from_env,
     _scratch_verify_mirror_from_env,
 )
+from opensquilla.git_runtime import GitRunState
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -355,6 +357,19 @@ def test_hash_guard_withholds_credit_for_diverged_mirror_copy(tmp_path) -> None:
     assert agent._scratch_verify_mirror_evidence_credit(command) is False
 
 
+def test_hash_guard_withholds_credit_for_missing_original_outside_repository(
+    tmp_path,
+) -> None:
+    agent = _guard_agent(tmp_path)
+    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_extra.py"
+    mirror.parent.mkdir(parents=True)
+    mirror.write_text("assert extra_case()\n", encoding="utf-8")
+
+    command = f"pytest {mirror.as_posix()}"
+
+    assert agent._scratch_verify_mirror_evidence_credit(command) is False
+
+
 def test_hash_guard_allows_new_check_files_shadowing_nothing(tmp_path) -> None:
     # The workspace is a git repo with no tests/test_extra.py anywhere: the
     # mirror file is the model's own new check, not a weakened copy.
@@ -386,6 +401,33 @@ def test_hash_guard_allows_new_check_files_shadowing_nothing(tmp_path) -> None:
     command = f"pytest {mirror.as_posix()}"
 
     assert agent._scratch_verify_mirror_evidence_credit(command) is True
+
+
+def test_hash_guard_withholds_credit_when_head_blob_probe_becomes_unavailable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _guard_agent(tmp_path)
+    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_extra.py"
+    mirror.parent.mkdir(parents=True)
+    mirror.write_text("assert extra_case()\n", encoding="utf-8")
+
+    def fake_run(args, **_kwargs):
+        if args[0] == "rev-parse":
+            return SimpleNamespace(ok=True, state=GitRunState.OK, stdout=b"true\n")
+        assert args[0] == "show"
+        return SimpleNamespace(
+            ok=False,
+            state=GitRunState.UNAVAILABLE,
+            stdout=b"",
+            stderr_text="git_not_found",
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.run_git", fake_run)
+
+    command = f"pytest {mirror.as_posix()}"
+
+    assert agent._scratch_verify_mirror_evidence_credit(command) is False
 
 
 def test_hash_guard_withholds_credit_for_deleted_original_with_diverged_head(

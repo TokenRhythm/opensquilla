@@ -101,10 +101,10 @@ try {
         ? ['gitBash', 'node', 'python']
         : ['node', 'python'],
     )
-    assert.equal(assets.node.version, '24.18.1')
-    assert.equal(assets.python.version, '3.13.14+20260728')
+    assert.equal(assets.node.version, '24.19.0')
+    assert.equal(assets.python.version, '3.13.15+20260814')
     if (target.startsWith('windows-')) {
-      assert.equal(assets.gitBash.version, '2.55.0.windows.3')
+      assert.equal(assets.gitBash.version, '2.55.0.windows.5')
     }
     for (const asset of Object.values(assets)) {
       assert.equal(releaseAssetIds.has(asset.id), false, `duplicate runtime asset id: ${asset.id}`)

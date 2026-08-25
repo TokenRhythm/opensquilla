@@ -34,8 +34,12 @@ def _patch_transport(
     monkeypatch: Any,
     captured: dict[str, Any],
     response: httpx.Response,
+    *,
+    calls: list[httpx.Request] | None = None,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(request)
         captured["url"] = str(request.url)
         captured["headers"] = request.headers
         captured["payload"] = (
@@ -218,6 +222,29 @@ def test_openai_responses_provider_posts_responses_payload_and_usage(
     assert done.model == "gpt-5.4"
 
 
+def test_openai_responses_auth_failure_uses_one_physical_request(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    calls: list[httpx.Request] = []
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(401, json={"error": {"message": "expired"}}),
+        calls=calls,
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(
+        provider,
+        config=ChatConfig(physical_attempt_limit=1),
+    )
+
+    assert len(calls) == 1
+    assert any(isinstance(event, ErrorEvent) and event.code == "401" for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
 def test_openai_responses_candidate_mode_demotes_oversized_function_call(
     monkeypatch: Any,
 ) -> None:
@@ -325,7 +352,87 @@ def test_openai_responses_normal_mode_keeps_tool_name_limit(
         isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
         for event in events
     )
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
     assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_openai_responses_malformed_arguments_emit_start_before_terminal_error(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "id": "resp_incomplete_edit",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_edit",
+                        "name": "document_apply",
+                        "arguments": '{"operations":',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(provider)
+
+    lifecycle = [
+        event
+        for event in events
+        if isinstance(event, ToolUseStartEvent | ToolUseEndEvent | ErrorEvent)
+    ]
+    assert isinstance(lifecycle[0], ToolUseStartEvent)
+    assert lifecycle[0].tool_use_id == "call_edit"
+    assert lifecycle[0].tool_name == "document_apply"
+    assert isinstance(lifecycle[1], ErrorEvent)
+    assert lifecycle[1].code == "incomplete_tool_call"
+    assert not any(isinstance(event, ToolUseDeltaEvent | ToolUseEndEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_openai_responses_malformed_call_without_name_does_not_emit_start(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "id": "resp_missing_name",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_missing_name",
+                        "arguments": '{"operations":',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(provider)
+
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+    assert not any(isinstance(event, ToolUseEndEvent | DoneEvent) for event in events)
 
 
 def test_openai_responses_candidate_mode_retains_semantically_invalid_call(

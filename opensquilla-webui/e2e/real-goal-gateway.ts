@@ -13,6 +13,8 @@ type ProviderCall = {
   progressIsNull: boolean
   firstReplyInAssistantHistory: boolean
   requestHasInternalContinuation: boolean
+  historyHasSilentSentinel: boolean
+  silentVisibleBodyInAssistantHistory: boolean
 }
 
 type ProviderGateEvent = {
@@ -30,6 +32,8 @@ export type RealGoalGateway = {
   releaseSecondTask: () => Promise<void>
   stop: () => Promise<void>
 }
+
+export type RealGoalGatewayScenario = 'continuation' | 'lifecycle' | 'silent-reply'
 
 async function reserveLoopbackPort(): Promise<number> {
   const server = createServer()
@@ -98,7 +102,7 @@ async function stopProcess(child: ChildProcessWithoutNullStreams): Promise<void>
 export async function startRealGoalGateway(options: {
   outputDir: string
   webuiOrigin: string
-  scenario?: 'continuation' | 'lifecycle'
+  scenario?: RealGoalGatewayScenario
 }): Promise<RealGoalGateway> {
   const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
   const fixturePath = fileURLToPath(new URL('./goal-mode-gateway.py', import.meta.url))
@@ -107,8 +111,14 @@ export async function startRealGoalGateway(options: {
   const firstReleaseFile = join(options.outputDir, 'release-first-task')
   const secondReleaseFile = join(options.outputDir, 'release-second-task')
   const logDir = join(options.outputDir, 'logs')
+  const tempDir = join(options.outputDir, 'tmp')
+  const appDataDir = join(stateDir, 'appdata')
+  const localAppDataDir = join(stateDir, 'local-appdata')
   await mkdir(stateDir, { recursive: true })
   await mkdir(logDir, { recursive: true })
+  await mkdir(tempDir, { recursive: true })
+  await mkdir(appDataDir, { recursive: true })
+  await mkdir(localAppDataDir, { recursive: true })
 
   const port = await reserveLoopbackPort()
   const python = process.env.OPENSQUILLA_WEBUI_E2E_PYTHON
@@ -127,17 +137,10 @@ export async function startRealGoalGateway(options: {
       Object.fromEntries(
         [
           'PATH',
-          'HOME',
-          'TMPDIR',
-          'TEMP',
-          'TMP',
           'LANG',
           'LC_ALL',
           'SYSTEMROOT',
           'WINDIR',
-          'USERPROFILE',
-          'APPDATA',
-          'LOCALAPPDATA',
           'COMSPEC',
           'PATHEXT',
         ]
@@ -145,6 +148,20 @@ export async function startRealGoalGateway(options: {
           .map(key => [key, process.env[key]]),
       ),
       {
+        // Never let the fixture discover the developer's profile, dotenv,
+        // cache, or platform application-data directories. All persistence is
+        // disposable Playwright output owned by this test invocation.
+        HOME: stateDir,
+        USERPROFILE: stateDir,
+        APPDATA: appDataDir,
+        LOCALAPPDATA: localAppDataDir,
+        XDG_CONFIG_HOME: join(stateDir, 'xdg-config'),
+        XDG_CACHE_HOME: join(stateDir, 'xdg-cache'),
+        XDG_DATA_HOME: join(stateDir, 'xdg-data'),
+        TMPDIR: tempDir,
+        TEMP: tempDir,
+        TMP: tempDir,
+        PYTHONNOUSERSITE: '1',
         OPENSQUILLA_WEBUI_GOAL_E2E_PORT: String(port),
         OPENSQUILLA_WEBUI_GOAL_E2E_STATE: stateDir,
         OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG: eventLog,

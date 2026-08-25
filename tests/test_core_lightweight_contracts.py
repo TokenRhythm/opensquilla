@@ -10,7 +10,12 @@ from opensquilla.engine.tool_text_compat import (
 )
 from opensquilla.provider.openai import _build_openai_messages, _usage_fields
 from opensquilla.provider.openrouter_attribution import openrouter_app_headers
-from opensquilla.provider.types import ContentBlockText, ContentBlockToolResult, Message
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockText,
+    ContentBlockToolResult,
+    Message,
+)
 from opensquilla.session.keys import (
     allows_private_memory_prompt_injection,
     build_subagent_session_key,
@@ -201,6 +206,35 @@ def test_openai_payload_splits_tool_results_into_provider_tool_messages() -> Non
             "tool_call_id": "call_1",
             "content": '{"ok": true}',
         }
+    ]
+
+
+def test_openai_payload_keeps_tool_result_then_screenshot_as_user_image() -> None:
+    message = Message(
+        role="user",
+        content=[
+            ContentBlockToolResult(tool_use_id="call_1", content="screenshot attached"),
+            ContentBlockImage(media_type="image/png", data="c3ludGhldGlj"),
+        ],
+    )
+
+    assert _build_openai_messages(message) == [
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "screenshot attached",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,c3ludGhldGlj"
+                    },
+                }
+            ],
+        },
     ]
 
 

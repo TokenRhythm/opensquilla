@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -110,3 +110,28 @@ async def test_provider_output_truncation_error_persistence_uses_message_fallbac
     log.info.assert_called_once()
     assert log.info.call_args.kwargs["code"] == "provider_output_truncated"
     assert log.info.call_args.kwargs["turn_outcome"]["kind"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_terminal_reset_error_records_row_without_duplicate_transcript_message() -> None:
+    manager = _RecordingSessionManager()
+    runner = TurnRunner(
+        provider_selector=None,
+        session_manager=manager,
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+    record_error = AsyncMock(return_value="error-terminal-reset")
+    runner._record_turn_error = record_error
+
+    await runner._persist_turn_error(
+        "agent:main:webchat:test",
+        ErrorEvent(
+            message="The fallback model also failed.",
+            code="ensemble_fixed_error",
+            failure_kind="provider_error",
+        ),
+        append_transcript=False,
+    )
+
+    record_error.assert_awaited_once()
+    assert manager.messages == []

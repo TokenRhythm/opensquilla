@@ -20,11 +20,19 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "artifacts.list",
         "artifacts.get",
         "sessions.list",
+        "sessions.rename",
+        "sessions.delete",
         "sessions.bootstrap",
         "sessions.messages.subscribe",
         "sessions.messages.hydrate",
         "sessions.messages.snapshot",
         "sessions.messages.unsubscribe",
+        "sessions.pending_inputs.enqueue",
+        "sessions.pending_inputs.list",
+        "sessions.pending_inputs.update",
+        "sessions.pending_inputs.reorder",
+        "sessions.pending_inputs.cancel",
+        "sessions.pending_inputs.dispatch",
     }
 )
 
@@ -35,10 +43,17 @@ _SESSION_KEY_FIELDS = {
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),
     "sessions.bootstrap": ("key", "sessionKey"),
+    "sessions.rename": ("key", "sessionKey"),
     "sessions.messages.subscribe": ("key", "sessionKey"),
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
+    "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
+    "sessions.pending_inputs.list": ("key", "sessionKey"),
+    "sessions.pending_inputs.update": ("key", "sessionKey"),
+    "sessions.pending_inputs.reorder": ("key", "sessionKey"),
+    "sessions.pending_inputs.cancel": ("key", "sessionKey"),
+    "sessions.pending_inputs.dispatch": ("key", "sessionKey"),
 }
 
 
@@ -126,6 +141,16 @@ class GuestRpcPolicy:
         if not owner_id or not _OWNER_ID_RE.fullmatch(str(owner_id)):
             raise GuestRpcPolicyError("Anonymous guest identity is unavailable")
 
+        # Guests may send their first message but cannot choose a cost or
+        # capability profile that their principal is not allowed to mutate.
+        # Keep the global routing default for both immediate and staged sends.
+        if method in {"chat.send", "sessions.pending_inputs.enqueue"} and isinstance(
+            params, dict
+        ):
+            params = dict(params)
+            params.pop("initialRoutingMode", None)
+            params.pop("initial_routing_mode", None)
+
         if method == "sessions.list":
             return params
 
@@ -145,6 +170,21 @@ class GuestRpcPolicy:
             normalized_source["noMemoryCapture"] = True
             normalized_source["no_memory_capture"] = True
             normalized["_source"] = normalized_source
+            return normalized
+
+        if method == "sessions.delete":
+            if not isinstance(params, dict):
+                raise GuestRpcPolicyError("Guest session key is required")
+            raw_keys = params.get("keys")
+            if raw_keys is None:
+                raw_keys = [params.get("key")]
+            if not isinstance(raw_keys, list) or not raw_keys:
+                raise GuestRpcPolicyError("Guest session key is required")
+            if not all(guest_owns_session_key(owner_id, key) for key in raw_keys):
+                raise GuestRpcPolicyError("Guest session is not owned by this browser")
+            normalized = dict(params)
+            normalized["keys"] = raw_keys
+            normalized.pop("key", None)
             return normalized
 
         if not isinstance(params, dict):

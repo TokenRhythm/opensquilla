@@ -214,6 +214,9 @@
 .chat-thread {
   flex: 1;
   overflow-y: auto;
+  /* ChatMessageList owns variable-row anchor correction. Native scroll
+     anchoring would apply the same height delta a second time. */
+  overflow-anchor: none;
   padding: 0.25rem 0 1.5rem;
   display: flex;
   flex-direction: column;
@@ -225,12 +228,26 @@
   scrollbar-gutter: stable;
 }
 
-/* Floating composer (existing conversation, toggle on): the dock leaves the
-   document flow and pins to the chat container's bottom edge, so the last
-   messages can scroll underneath the glass panel and the backdrop blur reads
-   through them. ResizeObserver publishes the entire dock's natural height, so
-   attachments, a growing draft, and pending work cannot cover the live edge. */
-.chat.chat--composer-floating .chat-thread {
+/* Native anchoring preserves a non-virtualized reader's visible paragraph
+   across width reflow. Live following and virtualized history keep their
+   existing application-owned pin/correction so the two systems never stack. */
+.chat-thread--reading-history:has(.chat-message-list[data-virtualized="false"]) {
+  overflow-anchor: auto;
+}
+
+/* Vue-owned fallback for WebViews without :has(): ChatView mirrors the
+   virtualizer state on the thread element so historical reflow keeps the
+   browser's native anchor in the same cases. */
+.chat-thread--reading-history.chat-thread--nonvirtualized {
+  overflow-anchor: auto;
+}
+
+/* Floating composer (existing conversation, toggle on): reserve the dock's
+   measured height in the body itself. This shortens the scroll viewport so no
+   visible transcript text can enter the glass panel, including while the
+   composer retracts or expands. The ResizeObserver-driven custom property is
+   intentionally not transitioned: clearance must track every layout frame. */
+.chat.chat--composer-floating .chat-body {
   padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
 }
 
@@ -416,11 +433,13 @@
 .chat-jump-latest {
   position: absolute;
   bottom: calc(100% + 8px);
-  right: 12px;
+  inset-inline-end: 12px;
   z-index: 30;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-block-size: 44px;
+  min-inline-size: 44px;
   padding: 6px 12px;
   border-radius: var(--radius-full);
   border: 1px solid var(--border);
@@ -586,9 +605,10 @@
   pointer-events: auto;
 }
 
-/* The transcript retains the unresolved interrupt for chronological folding,
-   while the active Plan questionnaire is owned by the composer dock. */
-.chat--plan-questionnaire-open .chat-thread :deep(.clarify-card--plan) {
+/* The transcript retains the interrupt for chronological folding, while the
+   active Plan questionnaire (pending or submitting) has one owner: the dock. */
+.chat--plan-questionnaire-open .chat-thread :deep(.clarify-card--plan),
+.chat--plan-questionnaire-open .chat-thread :deep(.clarify-outcome--plan) {
   display: none;
 }
 
@@ -1182,11 +1202,6 @@
 
   .chat-thread {
     padding: 0.75rem 0.75rem 1.5rem;
-  }
-
-  .chat.chat--composer-floating .chat-thread {
-    padding: 0.75rem;
-    padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
   }
 
 }

@@ -370,6 +370,40 @@ async def test_cancel_session_blocks_late_subagent_parent_wake() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_task_preserves_other_groups_in_same_parent_session() -> None:
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+    other_task_id = "task-other"
+
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        pending_count=1,
+    )
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=other_task_id,
+        pending_count=1,
+    )
+
+    assert await manager.cancel_task(PARENT, other_task_id) == 1
+    assert await manager.active_group_ids(PARENT) == [
+        manager.group_id(PARENT, PARENT_TASK)
+    ]
+
+    # Cancellation is also a fence for a not-yet-admitted exact task group.
+    late_task_id = "task-late"
+    assert await manager.cancel_task(PARENT, late_task_id) == 0
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=late_task_id,
+        pending_count=1,
+    )
+    assert await manager.active_group_ids(PARENT) == [
+        manager.group_id(PARENT, PARENT_TASK)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_quiesce_sessions_cancels_only_target_watcher_and_fences_new_groups() -> None:
     runtime = _BlockingSendRuntime()
     manager = BackgroundCompletionManager(session_manager=_SessionManager())

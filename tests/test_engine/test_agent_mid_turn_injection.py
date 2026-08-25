@@ -142,6 +142,12 @@ class _SecondCallFirstPullFailureProvider(_NoToolProvider):
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
+class _FailingApplyPendingInputProvider(ListPendingInputProvider):
+    def mark_applied(self, *, iteration: int, model_call_id: str) -> None:
+        del iteration, model_call_id
+        raise RuntimeError("pending input apply failed")
+
+
 class _SequencedPlainProvider:
     provider_name = "fake"
 
@@ -507,8 +513,14 @@ async def test_done_event_records_unicode_model_call_segment_for_applied_steer()
         event async for event in agent.run_turn("原始问题", pending_input_provider=pending)
     ]
     done = next(event for event in events if event.kind == "done")
+    text_events = [event for event in events if event.kind == "text_delta"]
 
     assert done.text == "前😀后续"
+    assert done.router_model_call_id == "1.0"
+    assert done.router_iteration == 1
+    assert [
+        (event.text, event.model_call_id, event.iteration) for event in text_events
+    ] == [("前😀", "1.0", 1), ("后续", "2.0", 2)]
     assert done.model_call_segments == [
         {
             "model_call_id": "2.0",
@@ -649,18 +661,23 @@ async def test_claimed_input_is_not_applied_when_the_next_provider_call_cannot_s
     pending.append("RETRY_LATER")
     agent = _agent(provider)
 
-    with pytest.raises(RuntimeError, match="provider call did not start"):
-        _events = [
-            event
-            async for event in agent.run_turn(
-                "just answer",
-                pending_input_provider=pending,
-            )
-        ]
+    events = [
+        event
+        async for event in agent.run_turn(
+            "just answer",
+            pending_input_provider=pending,
+        )
+    ]
 
-    assert len(provider.calls) == 2
-    assert pending.applications == ()
-    assert pending.reclaim_pending() == ["RETRY_LATER"]
+    assert len(provider.calls) == 3
+    assert len(pending.applications) == 1
+    assert pending.applications[0].texts == ("RETRY_LATER",)
+    # The failed call was 2.0. The claim is committed only after retry 2.1
+    # produces its first event, so the failed physical request cannot consume it.
+    assert pending.applications[0].model_call_id == "2.1"
+    assert pending.reclaim_pending() == []
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "error" for event in events)
 
 
 @pytest.mark.asyncio
@@ -670,7 +687,31 @@ async def test_claimed_input_is_not_applied_when_first_stream_pull_fails() -> No
     pending.append("RETRY_AFTER_FIRST_PULL")
     agent = _agent(provider)
 
-    with pytest.raises(RuntimeError, match="provider stream did not start"):
+    events = [
+        event
+        async for event in agent.run_turn(
+            "just answer",
+            pending_input_provider=pending,
+        )
+    ]
+
+    assert len(provider.calls) == 3
+    assert len(pending.applications) == 1
+    assert pending.applications[0].texts == ("RETRY_AFTER_FIRST_PULL",)
+    assert pending.applications[0].model_call_id == "2.1"
+    assert pending.reclaim_pending() == []
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_internal_pending_apply_error_is_not_projected_as_provider_retry() -> None:
+    provider = _NoToolProvider()
+    pending = _FailingApplyPendingInputProvider()
+    pending.append("RETRY_INTERNAL_APPLY")
+    agent = _agent(provider)
+
+    with pytest.raises(RuntimeError, match="pending input apply failed"):
         _events = [
             event
             async for event in agent.run_turn(
@@ -681,7 +722,7 @@ async def test_claimed_input_is_not_applied_when_first_stream_pull_fails() -> No
 
     assert len(provider.calls) == 2
     assert pending.applications == ()
-    assert pending.reclaim_pending() == ["RETRY_AFTER_FIRST_PULL"]
+    assert pending.reclaim_pending() == ["RETRY_INTERNAL_APPLY"]
 
 
 @pytest.mark.asyncio

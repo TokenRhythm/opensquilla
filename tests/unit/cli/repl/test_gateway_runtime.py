@@ -57,6 +57,76 @@ def test_gateway_session_context_mirrors_state_to_legacy_scope() -> None:
     assert context.scope["model"] == "gateway/slash-model"
 
 
+@pytest.mark.asyncio
+async def test_routing_observer_projects_only_the_current_session() -> None:
+    from opensquilla.cli.repl import gateway_runtime
+
+    class _Frames:
+        def __init__(self) -> None:
+            self._frames = iter(
+                [
+                    {
+                        "event": "models.routing.changed",
+                        "payload": {"mode": "ensemble"},
+                    },
+                    {
+                        "event": "sessions.routing.changed",
+                        "payload": {
+                            "sessionKey": "agent:main:other",
+                            "mode": "router",
+                        },
+                    },
+                    {
+                        "event": "sessions.routing.changed",
+                        "payload": {
+                            "sessionKey": "agent:main:current",
+                            "mode": "direct",
+                        },
+                    },
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            try:
+                return next(self._frames)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class _Output:
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, dict[str, Any]]] = []
+
+        async def send_message(self, kind: str, payload: dict[str, Any]) -> None:
+            self.messages.append((kind, payload))
+
+    output = _Output()
+    scope: gateway_runtime.GatewayRuntimeScope = {
+        "session_key": "agent:main:current",
+    }
+    deps = gateway_runtime.GatewayRuntimeDependencies(
+        stream_response=cast(Any, None),
+        handle_slash_command=cast(Any, None),
+        run_input_loop=cast(Any, None),
+        get_tui_output=lambda _scope: cast(Any, output),
+        is_exit_command=lambda _value: False,
+        notify=lambda _notice: None,
+    )
+
+    await gateway_runtime._watch_model_routing_events(
+        _Frames(),
+        deps=deps,
+        scope=scope,
+    )
+
+    assert gateway_runtime._MODEL_ROUTING_EVENTS == {"sessions.routing.changed"}
+    assert len(output.messages) == 1
+    assert output.messages[0][0] == "model.routing.state"
+    assert output.messages[0][1]["mode"] == "direct"
+
+
 def test_external_turn_fence_advances_pending_identity_without_idle_gap() -> None:
     from opensquilla.cli.repl import gateway_runtime
 

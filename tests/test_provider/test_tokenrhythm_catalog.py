@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from opensquilla.provider import model_catalog as model_catalog_module
+from opensquilla.provider import tokenrhythm_catalog as tokenrhythm_catalog_module
 from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.tokenrhythm_catalog import (
@@ -24,6 +26,25 @@ from opensquilla.provider.tokenrhythm_catalog import (
     tokenrhythm_published_to_wire,
 )
 from opensquilla.provider.types import ModelInfo
+
+
+def _patch_log_method(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    method: str,
+    callback: Any,
+) -> None:
+    """Patch a module logger without freezing BoundLoggerLazyProxy methods."""
+
+    real_log = module.log
+
+    class _LogShim:
+        def __getattr__(self, name: str) -> Any:
+            if name == method:
+                return callback
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(module, "log", _LogShim())
 
 
 def _published_row(**overrides: Any) -> dict[str, Any]:
@@ -146,6 +167,7 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
                     "max_completion_tokens": 131_072,
                     "supports_tools": True,
                     "supports_streaming": True,
+                    "supports_vision": True,
                 }
             ]
         }
@@ -159,6 +181,7 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
                     "max_completion_tokens": 8_192,
                     "supports_tools": False,
                     "supports_streaming": False,
+                    "supports_vision": False,
                 }
             ]
         }
@@ -216,6 +239,18 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
     assert caps_a.supports_streaming is True
     assert caps_b.supports_tools is False
     assert caps_b.supports_streaming is False
+    assert catalog.resolve_deployment_vision_support(
+        "qwen3.8-max",
+        provider="tokenrhythm",
+        api_key="synthetic-authority-key-a",
+        base_url="https://tokenrhythm.studio/v1",
+    ) == "supported"
+    assert catalog.resolve_deployment_vision_support(
+        "qwen3.8-max",
+        provider="tokenrhythm",
+        api_key="synthetic-authority-key-b",
+        base_url="https://tokenrhythm.studio/v1",
+    ) == "unsupported"
 
 
 def test_custom_tokenrhythm_deployment_never_uses_website_projection() -> None:
@@ -418,8 +453,10 @@ def test_schema_drift_logs_only_unknown_field_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "opensquilla.provider.tokenrhythm_catalog.log.debug",
+    _patch_log_method(
+        monkeypatch,
+        tokenrhythm_catalog_module,
+        "debug",
         lambda event, **fields: events.append((event, fields)),
     )
     secret_value = "DO_NOT_LOG_SECRET_VALUE"
@@ -692,8 +729,10 @@ def test_explicit_override_is_not_clamped_and_warns_once(
     )
 
     warnings: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "opensquilla.provider.model_catalog.log.warning",
+    _patch_log_method(
+        monkeypatch,
+        model_catalog_module,
+        "warning",
         lambda event, **fields: warnings.append((event, fields)),
     )
     first = catalog.resolve_max_tokens(
@@ -729,8 +768,10 @@ def test_deployment_lookup_warns_for_oversized_logical_override(
         declared_by_authority={},
     )
     warnings: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "opensquilla.provider.model_catalog.log.warning",
+    _patch_log_method(
+        monkeypatch,
+        model_catalog_module,
+        "warning",
         lambda event, **fields: warnings.append((event, fields)),
     )
 
@@ -770,8 +811,10 @@ def test_per_model_override_is_not_clamped_and_warns(
         {"tokenrhythm/qwen3.8-max": {"max_output_tokens": 200_000}}
     )
     warnings: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "opensquilla.provider.model_catalog.log.warning",
+    _patch_log_method(
+        monkeypatch,
+        model_catalog_module,
+        "warning",
         lambda event, **fields: warnings.append((event, fields)),
     )
 
@@ -928,8 +971,10 @@ async def test_typed_declared_fetch_redacts_schema_drift_secret_keys(
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
     client.get = AsyncMock(return_value=response)
-    monkeypatch.setattr(
-        "opensquilla.provider.tokenrhythm_catalog.log.debug",
+    _patch_log_method(
+        monkeypatch,
+        tokenrhythm_catalog_module,
+        "debug",
         lambda event, **fields: events.append((event, fields)),
     )
     monkeypatch.setattr(
@@ -1028,8 +1073,10 @@ async def test_tokenrhythm_list_models_merges_public_and_auth_metadata(
 ) -> None:
     api_key = "sk-tr-synthetic-not-a-real-secret"
     schema_events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "opensquilla.provider.tokenrhythm_catalog.log.debug",
+    _patch_log_method(
+        monkeypatch,
+        tokenrhythm_catalog_module,
+        "debug",
         lambda event, **fields: schema_events.append((event, fields)),
     )
     catalog = ModelCatalog()

@@ -5,6 +5,7 @@ import composerSource from './ChatComposer.vue?raw'
 import viewSource from '../../views/ChatView.vue?raw'
 import appearanceSource from '../settings/SettingsAppearancePanel.vue?raw'
 import slashSource from '../../composables/chat/useChatSlashCommands.ts?raw'
+import en from '../../locales/en.json'
 import zhHans from '../../locales/zh-Hans.json'
 
 describe('ChatComposer control hierarchy', () => {
@@ -106,19 +107,70 @@ describe('ChatComposer model routing contract', () => {
   it('threads the independent model-routing control through ChatComposer and ChatView', () => {
     expect(composerSource).toContain('ChatComposerModelRouting')
     expect(composerSource).toContain('<Icon name="router"')
-    expect(composerSource).toContain('chat-model-routing-btn--${modelRoutingMode}')
-    expect(composerSource).toContain("'is-active': modelRoutingOpen || modelRoutingMode !== 'off'")
-    expect(composerSource).toContain(':model-routing-mode="modelRoutingMode"')
-    expect(composerSource).toContain(':busy="modelRoutingSettingsBusy"')
-    expect(composerSource).toContain('@set-model-routing-mode="emit(\'setModelRoutingMode\', $event)"')
-    expect(composerSource).toContain('modelRoutingMode: ModelRoutingMode')
-    expect(composerSource).toContain('setModelRoutingMode: [mode: ModelRoutingMode]')
+    expect(composerSource).toContain('chat-model-routing-btn--${sessionRoutingMode}')
+    expect(composerSource).toContain("'is-active': modelRoutingOpen || sessionRoutingMode !== 'off'")
+    expect(composerSource).toContain(':model-routing-mode="sessionRoutingMode"')
+    expect(composerSource).toContain(':busy="sessionRoutingBusy || sessionRoutingControlBlocked"')
+    expect(composerSource).toContain('@set-session-routing-mode="emit(\'setSessionRoutingMode\', $event)"')
+    expect(composerSource).toContain('sessionRoutingMode: ModelRoutingMode')
+    expect(composerSource).toContain('setSessionRoutingMode: [mode: ModelRoutingMode]')
 
-    expect(viewSource).toContain(':model-routing-mode="modelRoutingMode"')
-    expect(viewSource).toContain(':model-routing-settings-busy="modelRoutingSettingsBusy"')
-    expect(viewSource).toContain('@set-model-routing-mode="setComposerModelRoutingMode"')
-    expect(viewSource).toContain('async function setComposerModelRoutingMode(mode: ModelRoutingMode)')
-    expect(viewSource).toContain('await setModelRoutingMode(mode)')
+    expect(viewSource).toContain(':session-routing-mode="modelRoutingMode"')
+    expect(viewSource).toContain(':session-routing-busy="modelRoutingSettingsBusy"')
+    expect(viewSource).toContain(':session-routing-control-blocked="goalBusy"')
+    expect(viewSource).toContain(':session-routing-available="sessionRoutingAvailable"')
+    expect(viewSource).toContain("auth?.principal?.authState === 'authenticated'")
+    expect(viewSource).toContain("rpc.supportsMethod('sessions.routing.get')")
+    expect(viewSource).toContain("rpc.supportsMethod('sessions.routing.set')")
+    expect(composerSource).toContain('v-if="sessionRoutingAvailable"')
+    expect(viewSource).toContain('@set-session-routing-mode="setComposerSessionRoutingMode"')
+    expect(viewSource).toContain('async function setComposerSessionRoutingMode(mode: ModelRoutingMode)')
+    expect(viewSource).toContain('if (goalBusy.value) return')
+    expect(viewSource).toContain('await chatSessionRouting.setMode(mode)')
+    expect(viewSource).toContain('useChatSessionRouting')
+    expect(viewSource).toContain('isDraft: isDraftSurface')
+    expect(viewSource).toContain("return pendingSessionIntent.value === 'new_chat'")
+    expect(viewSource).toContain('if (!isProvisionalDraftSession()) return')
+
+    const setterStart = viewSource.indexOf(
+      'async function setComposerSessionRoutingMode(mode: ModelRoutingMode)',
+    )
+    const setterEnd = viewSource.indexOf(
+      '\nasync function setComposerCodingModeEnabled',
+      setterStart,
+    )
+    const setterSource = viewSource.slice(setterStart, setterEnd)
+    expect(setterStart).toBeGreaterThanOrEqual(0)
+    expect(setterEnd).toBeGreaterThan(setterStart)
+    expect(setterSource).not.toContain('scheduleHistorySync()')
+  })
+
+  it('blocks ordinary sends while this chat route is changing', () => {
+    const start = viewSource.indexOf('async function onComposerSend()')
+    const end = viewSource.indexOf('\nsendCurrentInput = onComposerSend', start)
+    const sendSource = viewSource.slice(start, end)
+    const routingBusyGate = sendSource.indexOf(
+      'if (modelRoutingSettingsBusy.value || planModeBusy.value) return',
+    )
+    const ordinarySend = sendSource.indexOf('onSend()')
+
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    expect(routingBusyGate).toBeGreaterThanOrEqual(0)
+    expect(ordinarySend).toBeGreaterThan(routingBusyGate)
+    expect(viewSource).toContain('sendBlockedReason: effectiveSendBlockedReason,')
+    expect(viewSource).toContain('&& !deliveryBlockedReason.value')
+    expect(viewSource).toContain('sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value')
+    expect(viewSource).toContain(
+      'deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value',
+    )
+    expect(viewSource).not.toContain('\n  || sessionRoutingSendBlockedReason.value\n')
+    expect(composerSource).toContain('|| sessionRoutingBusy || inputDisabled')
+    expect(composerSource).toContain(":aria-busy=\"sessionRoutingBusy ? 'true' : 'false'\"")
+    expect(composerSource).toContain(".chat-send-btn[aria-busy='true']:disabled")
+    expect(composerSource).toContain("'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled")
+    expect(en.chat.composer.routingUpdateBlocked)
+      .toBe('Model routing is being updated. Wait before sending.')
   })
 
   it('offers exactly the three mutually-exclusive model-routing modes', () => {
@@ -127,5 +179,16 @@ describe('ChatComposer model routing contract', () => {
     expect(modelRoutingSource).toContain("value: 'llm_ensemble'")
     expect(modelRoutingSource).not.toContain('setRouterEnabled')
     expect(modelRoutingSource).not.toContain('setLlmEnsembleEnabled')
+    expect(modelRoutingSource).not.toContain(':disabled="busy"')
+    expect(modelRoutingSource).toContain(":aria-disabled=\"busy ? 'true' : 'false'\"")
+    const disabledStart = modelRoutingSource.indexOf(
+      '.composer-model-routing__option[aria-disabled="true"] {',
+    )
+    const disabledEnd = modelRoutingSource.indexOf(
+      '.composer-model-routing__option-main',
+      disabledStart,
+    )
+    expect(modelRoutingSource.slice(disabledStart, disabledEnd)).not.toContain('opacity:')
+    expect(modelRoutingSource).not.toContain(':disabled:hover')
   })
 })

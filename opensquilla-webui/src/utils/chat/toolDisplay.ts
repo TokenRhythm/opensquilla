@@ -48,6 +48,40 @@ export function isInternalToolName(name: string): boolean {
   return name === 'router_control'
 }
 
+const DOCUMENT_AGENT_TOOL_NAMES = [
+  'document_inspect',
+  'document_read',
+  'document_locate',
+  'document_apply',
+  'document_patch',
+  'document_browser_inspect',
+  'document_browser_act',
+  'document_browser_screenshot',
+  'document_browser_reload',
+  'document_finish',
+] as const
+
+function hasToolNameSuffix(name: string, tool: string): boolean {
+  return name === tool
+    || name.endsWith(`.${tool}`)
+    || name.endsWith(`/${tool}`)
+    || name.endsWith(`:${tool}`)
+    || name.endsWith(`__${tool}`)
+}
+
+/** All tools participating in the bound-document autonomous editing loop. */
+export function isDocumentAgentToolName(name: string | undefined): boolean {
+  const normalized = String(name || '').trim().toLowerCase()
+  return Boolean(normalized)
+    && DOCUMENT_AGENT_TOOL_NAMES.some(tool => hasToolNameSuffix(normalized, tool))
+}
+
+export function isDocumentWriterToolName(name: string | undefined): boolean {
+  const normalized = String(name || '').trim().toLowerCase()
+  if (!normalized) return false
+  return ['document_apply', 'document_patch'].some(tool => hasToolNameSuffix(normalized, tool))
+}
+
 export function normalizeToolInputText(raw: unknown): string {
   const record = asRecord(raw)
   const value = record?.input ?? record?.arguments ?? ''
@@ -63,6 +97,9 @@ export function normalizeToolInputText(raw: unknown): string {
 }
 
 export function toolDisplayName(name: string, input: unknown): string {
+  const key = toolOperationKey(name)
+  if (key === 'document.read') return i18n.global.t('chat.tool.readPage')
+  if (key === 'document.update') return i18n.global.t('chat.tool.updatePage')
   if (name === 'publish_artifact') {
     const inputObj = parseToolInput(input)
     const target = inputObj?.name || inputObj?.path
@@ -87,6 +124,13 @@ export function toolIconName(name: string): IconName {
 
 export function toolOperationKey(name: string): string {
   const n = String(name || '').toLowerCase()
+  if (['document_inspect', 'document_read', 'document_locate',
+    'document_browser_inspect', 'document_browser_screenshot', 'document_browser_reload',
+  ].some(tool => hasToolNameSuffix(n, tool))) return 'document.read'
+  if (isDocumentWriterToolName(n)) return 'document.update'
+  if (['document_browser_act', 'document_finish'].some(tool => hasToolNameSuffix(n, tool))) {
+    return 'document.update'
+  }
   if (n.includes('web_discover')) return 'web.discover'
   if (n.includes('web_search') || n === 'search' || n.includes('google') || n.includes('bing')) return 'web.search'
   if (n.includes('web_fetch') || n.includes('http') || n.includes('fetch') || n.includes('curl') || n.includes('wget')) return 'web.read'
@@ -113,10 +157,13 @@ export function toolActionLabel(name: string): string {
   if (key === 'file.edit') return t('chat.tool.editFile')
   if (key === 'artifact.create') return t('chat.tool.createFile')
   if (key === 'memory.search') return t('chat.tool.searchMemory')
+  if (key === 'document.read') return t('chat.tool.readPage')
+  if (key === 'document.update') return t('chat.tool.updatePage')
   return name.replace(/[_-]+/g, ' ')
 }
 
 export function toolSecondaryText(toolCall: ChatToolCall): string {
+  if (toolOperationKey(toolCall.name).startsWith('document.')) return ''
   const source = String(toolCall.inputPreview || toolCall.resultPreview || '').replace(/\s+/g, ' ').trim()
   if (isEmptyToolPreview(source)) return ''
   return truncateToolText(source.replace(/^"|"$/g, ''), 86)

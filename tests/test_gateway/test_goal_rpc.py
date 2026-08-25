@@ -266,7 +266,11 @@ async def _settle_set_task(stack: _GoalRpcStack, response: dict[str, Any]) -> No
 
     task_id = response["taskId"]
     assert isinstance(task_id, str)
-    await stack.runtime.wait(task_id, timeout=2.0)
+    # This helper starts a real runtime task.  Windows process-start and
+    # SQLite scheduling can consume more than two seconds when the gateway
+    # shard is under xdist load; keep a finite bound without turning that
+    # runner hand-off jitter into a product failure.
+    await stack.runtime.wait(task_id, timeout=10.0)
     task = await stack.storage.get_agent_task(task_id)
     assert task is not None and isinstance(task.details, dict)
     context = GoalTurnContext.from_task_detail(task.details.get("goal_context"))
@@ -3232,6 +3236,7 @@ async def test_prepare_shutdown_fences_resume_waiting_for_goal_transition_lock(
         assert len(runs) == 1
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("lost_boundary", ["subscription", "shutdown"])
 @pytest.mark.asyncio
 async def test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates(

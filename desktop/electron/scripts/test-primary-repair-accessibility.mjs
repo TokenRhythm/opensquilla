@@ -138,7 +138,6 @@ function launchEnvironment(isolatedHome) {
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
-    OPENSQUILLA_DESKTOP_GATEWAY_PORT: '18897',
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
     OPENSQUILLA_GATEWAY_WORKSPACE_DIR: '',
@@ -215,13 +214,18 @@ async function assertReducedMotion(page) {
     const blockedStyle = getComputedStyle(document.querySelector('.status-line'), '::before')
     const blockedAnimationName = blockedStyle.animationName
     document.body.classList.remove('errored')
-    const reducedStyle = getComputedStyle(document.querySelector('.status-line'), '::before')
+    const progress = document.querySelector('#startupProgress')
+    const reducedStyle = getComputedStyle(progress, '::before')
+    const loaderStyle = getComputedStyle(document.querySelector('.loader span'))
     const snapshot = {
       mediaMatches: matchMedia('(prefers-reduced-motion: reduce)').matches,
       blockedAnimationName,
       animationName: reducedStyle.animationName,
-      animationDuration: reducedStyle.animationDuration,
-      animationIterationCount: reducedStyle.animationIterationCount,
+      progressRole: progress.getAttribute('role'),
+      progressNow: progress.getAttribute('aria-valuenow'),
+      progressMax: progress.getAttribute('aria-valuemax'),
+      loaderAnimationDuration: loaderStyle.animationDuration,
+      loaderAnimationIterationCount: loaderStyle.animationIterationCount,
       scrollBehavior: getComputedStyle(document.documentElement).scrollBehavior,
     }
     if (bodyWasErrored) document.body.classList.add('errored')
@@ -229,9 +233,15 @@ async function assertReducedMotion(page) {
   })
   assert.equal(result.mediaMatches, true)
   assert.equal(result.blockedAnimationName, 'none')
-  assert.equal(result.animationName, 'progress')
-  assert(durationSeconds(result.animationDuration) <= 0.00001, result.animationDuration)
-  assert.equal(result.animationIterationCount, '1')
+  assert.equal(result.animationName, 'none')
+  assert.equal(result.progressRole, 'progressbar')
+  assert.equal(Number(result.progressNow) >= 0, true)
+  assert.equal(result.progressMax, '4')
+  assert(
+    durationSeconds(result.loaderAnimationDuration) <= 0.00001,
+    result.loaderAnimationDuration,
+  )
+  assert.equal(result.loaderAnimationIterationCount, '1')
   assert.equal(result.scrollBehavior, 'auto')
 }
 

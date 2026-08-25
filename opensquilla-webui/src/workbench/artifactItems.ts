@@ -1,6 +1,8 @@
 import type { ArtifactPayload } from '@/types/rpc'
+import type { WorkbenchPreviewDescriptor } from '@/types/workbenchResources'
 import {
   artifactFileTitle,
+  isOfficeArtifact,
 } from '@/utils/chat/artifacts'
 import {
   artifactUsesWorkbenchPreview,
@@ -69,11 +71,12 @@ function artifactIdentity(artifact: ArtifactPayload): string {
 export function artifactWorkbenchItemId(
   sessionKey: string,
   artifact: ArtifactPayload,
+  resourceIdentity?: string,
 ): string {
   return [
     'artifact-preview',
     privateIdentityDigest(sessionKey),
-    artifactIdentityToken(artifactIdentity(artifact)),
+    artifactIdentityToken(resourceIdentity || artifactIdentity(artifact)),
   ].join(':')
 }
 
@@ -106,19 +109,29 @@ export function createArtifactCollectionWorkbenchItem(options: {
 
 export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
+  initialSection?: 'preview' | 'source'
+  initialSectionRequestId?: number
   navigationArtifacts?: readonly ArtifactPayload[]
   nativeHtml: boolean
+  preparedPreview?: WorkbenchPreviewDescriptor
+  previewLeaseEligible?: boolean
+  resourceIdentity?: string
   sessionKey: string
 }): WorkbenchItem {
   const {
     artifact,
+    initialSection = 'preview',
+    initialSectionRequestId = 0,
     navigationArtifacts = [],
     nativeHtml,
+    preparedPreview,
+    previewLeaseEligible = true,
+    resourceIdentity,
     sessionKey,
   } = options
   const kind = artifactWorkbenchPreviewKind(artifact)
   return {
-    id: artifactWorkbenchItemId(sessionKey, artifact),
+    id: artifactWorkbenchItemId(sessionKey, artifact, resourceIdentity),
     kind: 'artifact-preview',
     title: artifactFileTitle(artifact),
     scope: { type: 'session', id: sessionKey },
@@ -129,11 +142,92 @@ export function createArtifactPreviewWorkbenchItem(options: {
     retention: nativeHtml && kind === 'html' ? 'keep-alive' : 'dispose-on-suspend',
     payload: {
       artifact,
+      initialSection,
+      initialSectionRequestId,
       navigationArtifacts: [...navigationArtifacts],
-      resourceIdentity: artifactIdentity(artifact),
+      ...(preparedPreview
+        ? {
+            preparedPreview: {
+              ...preparedPreview,
+              resource: { ...preparedPreview.resource },
+              ...(preparedPreview.adapter
+                ? { adapter: { ...preparedPreview.adapter } }
+                : {}),
+            },
+          }
+        : {}),
+      previewLeaseEligible,
+      resourceIdentity: resourceIdentity || artifactIdentity(artifact),
       sessionKey,
     },
   }
+}
+
+export function initialSectionFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): 'preview' | 'source' {
+  return item?.kind === 'artifact-preview' && item.payload.initialSection === 'source'
+    ? 'source'
+    : 'preview'
+}
+
+export function initialSectionRequestIdFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): number {
+  const value = item?.kind === 'artifact-preview'
+    ? item.payload.initialSectionRequestId
+    : 0
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0
+}
+
+/**
+ * Mark an explicit user request to open a preview section. Metadata-only item
+ * refreshes must preserve the existing request id instead of calling this.
+ */
+export function requestInitialSectionForWorkbenchItem(
+  item: WorkbenchItem,
+  existing: WorkbenchItem | null,
+): WorkbenchItem {
+  const previousRequestId = existing?.id === item.id
+    ? initialSectionRequestIdFromWorkbenchItem(existing)
+    : 0
+  const initialSectionRequestId = previousRequestId < Number.MAX_SAFE_INTEGER
+    ? previousRequestId + 1
+    : 1
+  return {
+    ...item,
+    payload: {
+      ...item.payload,
+      initialSectionRequestId,
+    },
+  }
+}
+
+/**
+ * Returns only the fail-closed preview policy accepted by the Workbench RPC.
+ * Arbitrary item payloads cannot opt a normal document preview into this path.
+ */
+export function preparedPreviewFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): WorkbenchPreviewDescriptor | null {
+  if (item?.kind !== 'artifact-preview') return null
+  const value = item.payload.preparedPreview
+  if (!value || typeof value !== 'object') return null
+  const preview = value as Record<string, unknown>
+  const resource = preview.resource
+  if (!resource || typeof resource !== 'object') return null
+  const ref = resource as Record<string, unknown>
+  if (
+    preview.mode !== 'isolated'
+    || preview.sandboxProfile !== 'opaque-offline'
+    || preview.network !== false
+    || typeof preview.protocolVersion !== 'number'
+    || typeof ref.type !== 'string'
+    || typeof ref.id !== 'string'
+  ) return null
+  return value as WorkbenchPreviewDescriptor
 }
 
 export function artifactsFromWorkbenchItem(
@@ -176,7 +270,7 @@ export function previewableNavigationArtifactsFromWorkbenchItem(
   item: WorkbenchItem | null,
 ): readonly ArtifactPayload[] {
   return navigationArtifactsFromWorkbenchItem(item)
-    .filter(artifactUsesWorkbenchPreview)
+    .filter(artifact => artifactUsesWorkbenchPreview(artifact) || isOfficeArtifact(artifact))
 }
 
 export function sessionKeyFromWorkbenchItem(item: WorkbenchItem | null): string {

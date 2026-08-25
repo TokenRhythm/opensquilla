@@ -18,6 +18,10 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
+from opensquilla.artifact_session import (
+    ArtifactNotFoundError as ArtifactSessionNotFoundError,
+)
+from opensquilla.artifact_session import ArtifactSessionService
 from opensquilla.artifacts import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
@@ -31,6 +35,7 @@ from opensquilla.gateway.origin_guard import (
 from opensquilla.gateway.origin_guard import (
     request_principal_is_owner as _request_principal_is_owner,
 )
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.paths import media_root_from_config, native_io_path
 
 _OPENABLE_HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
@@ -161,6 +166,52 @@ def register_artifact_routes(
 ) -> None:
     """Register GET /api/v1/artifacts/{artifact_id} on the given Starlette app."""
 
+    async def document_download_handler(request: Request) -> FileResponse | JSONResponse:
+        document_id = request.path_params.get("document_id", "")
+        session_key = (
+            request.query_params.get("sessionKey")
+            or request.query_params.get("session_key")
+            or request.headers.get("x-opensquilla-session-key")
+            or ""
+        )
+        session_id = await _session_id_for_download(session_manager, session_key)
+        storage = get_session_storage(session_manager)
+        if not session_id or storage is None:
+            return JSONResponse(
+                {"error": "Artifact document not found", "code": "NOT_FOUND"},
+                status_code=404,
+            )
+        try:
+            service = await ArtifactSessionService.from_session_storage(storage)
+            document = await service.get_document(str(document_id))
+            if document.session_key != session_key or document.session_id != session_id:
+                raise ArtifactSessionNotFoundError("artifact document not found")
+            revision_id = request.query_params.get("revisionId") or document.head_revision_id
+            revision = await service.get_revision(str(revision_id))
+            if revision.document_id != document.document_id:
+                raise ArtifactSessionNotFoundError("artifact revision not found")
+            ref, path = ArtifactStore(_media_root_from_config(config)).resolve_for_download(
+                revision.artifact_id,
+                session_id=session_id,
+            )
+        except ArtifactIntegrityError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "INTEGRITY_ERROR"},
+                status_code=409,
+            )
+        except (
+            ArtifactSessionNotFoundError,
+            ArtifactNotFoundError,
+            ValueError,
+        ):
+            return JSONResponse(
+                {"error": "Artifact document not found", "code": "NOT_FOUND"},
+                status_code=404,
+            )
+
+        filename = document.name if revision_id == document.head_revision_id else revision.filename
+        return FileResponse(native_io_path(path), media_type=ref.mime, filename=filename)
+
     async def download_handler(request: Request) -> FileResponse | JSONResponse:
         artifact_id = request.path_params.get("artifact_id", "")
         session_key = (
@@ -259,6 +310,13 @@ def register_artifact_routes(
 
     app.router.routes.append(
         Route("/api/v1/artifacts/{artifact_id}/open", open_handler, methods=["POST"])
+    )
+    app.router.routes.append(
+        Route(
+            "/api/v1/artifact-documents/{document_id}",
+            document_download_handler,
+            methods=["GET", "HEAD"],
+        )
     )
     app.router.routes.append(
         Route("/api/v1/artifacts/{artifact_id}", download_handler, methods=["GET", "HEAD"])

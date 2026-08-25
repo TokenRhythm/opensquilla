@@ -156,6 +156,45 @@ def test_resolve_cli_uses_desktop_node_bin_env(tmp_path, monkeypatch):
     assert build_verify._resolve_cli("npm") == str(npm)
 
 
+def test_resolve_cli_safe_mode_prefers_runtime_pack(monkeypatch):
+    monkeypatch.setattr(
+        build_verify,
+        "_runtime_pack_node_binary",
+        lambda _name: "/managed/node/npm",
+    )
+    monkeypatch.setattr(build_verify, "_runtime_pack_precedes_host", lambda: True)
+    monkeypatch.setattr(build_verify.shutil, "which", lambda _name: "/host/npm")
+
+    assert build_verify._resolve_cli("npm") == "/managed/node/npm"
+
+
+def test_resolve_cli_full_mode_prefers_host_with_managed_fallback(monkeypatch):
+    monkeypatch.setattr(
+        build_verify,
+        "_runtime_pack_node_binary",
+        lambda _name: "/managed/node/npm",
+    )
+    monkeypatch.setattr(build_verify, "_runtime_pack_precedes_host", lambda: False)
+    monkeypatch.setattr(build_verify.shutil, "which", lambda _name: "/host/npm")
+
+    assert build_verify._resolve_cli("npm") == "/host/npm"
+
+    monkeypatch.setattr(build_verify.shutil, "which", lambda _name: None)
+    assert build_verify._resolve_cli("npm") == "/managed/node/npm"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (("safe", True), ("full", False), (None, False)),
+)
+def test_runtime_pack_precedence_normalizes_tool_run_mode(monkeypatch, mode, expected):
+    from opensquilla.tools import run_mode as tool_run_mode
+
+    monkeypatch.setattr(tool_run_mode, "current_run_mode", lambda: mode)
+
+    assert build_verify._runtime_pack_precedes_host() is expected
+
+
 def test_verify_build_prepends_desktop_node_bin_to_child_path(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path / "repo")
     node_bin = tmp_path / "node-bin"

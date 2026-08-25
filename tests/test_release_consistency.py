@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.2"
-CURRENT_DESKTOP_VERSION = "0.5.2"
+CURRENT_VERSION = "0.5.4"
+CURRENT_DESKTOP_VERSION = "0.5.4"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -49,6 +49,8 @@ def test_desktop_electron_release_config_matches_current_release() -> None:
         "type": "git",
         "url": "https://github.com/opensquilla/opensquilla.git",
     }
+    assert build["appId"] == "ai.opensquilla.desktop"
+    assert build["productName"] == "OpenSquilla"
     assert build["artifactName"] == "OpenSquilla-${version}-${os}-${arch}.${ext}"
     assert build["mac"]["target"] == ["dmg", "zip"]
     assert build["mac"].get("identity", "auto") is not None
@@ -56,10 +58,20 @@ def test_desktop_electron_release_config_matches_current_release() -> None:
     assert build["nsis"]["oneClick"] is False
     assert build["nsis"]["allowToChangeInstallationDirectory"] is True
     assert build["nsis"]["deleteAppDataOnUninstall"] is False
+    assert build["nsis"].get("guid") is None  # electron-builder derives it from the stable appId.
+    assert build["nsis"]["include"] == "scripts/nsis/installer-progress.nsh"
+    assert "script" not in build["nsis"]
+    assert not Path("desktop/electron/build/installer.nsh").exists()
     package_verifier = Path("desktop/electron/scripts/verify-package.mjs").read_text(
         encoding="utf-8"
     )
     assert "deleteAppDataOnUninstall !== false" in package_verifier
+    assert "verifyInstallerProgressPolicy" in package_verifier
+    installer_policy = Path(
+        "desktop/electron/scripts/installer-progress-policy.mjs"
+    ).read_text(encoding="utf-8")
+    assert "NSIS must not define a custom full installer script" in installer_policy
+    assert "NSIS default build/installer.nsh override must not be present" in installer_policy
 
 
 def test_release_workflow_builds_desktop_installers() -> None:
@@ -70,6 +82,12 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "build-desktop-windows:" in workflow
     assert "npx electron-builder --mac --publish never" in workflow
     assert "npx electron-builder --win --publish never" in workflow
+    assert "npm run fetch:runtimes" not in workflow
+    assert workflow.count("verify-sandbox-package.mjs --source") == 2
+    assert workflow.count("verify-sandbox-package.mjs --release-source") == 2
+    assert "verify_desktop_slim_size.py" in workflow
+    assert "--platform macos" in workflow
+    assert "--platform windows" in workflow
     assert "desktop_asset_version" in workflow
     assert "OpenSquilla-{desktop_version}-mac-arm64.dmg" in workflow
     assert "OpenSquilla-{desktop_version}-win-x64.exe" in workflow
@@ -78,9 +96,46 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert 'NOTES_FILE="docs/releases/${TAG#v}.md"' in workflow
     assert '--notes-file "${NOTES_FILE}"' in workflow
     assert 'gh release upload "${TAG}" dist/* --clobber' in workflow
+    assert "& node scripts/test-packaged-first-send-renderer.mjs `" in workflow
+    assert "--executable $candidate.Path `" in workflow
+    assert "npm run test:packaged-first-send-renderer -- `" not in workflow
+
+    first_send_gate = Path(
+        "desktop/electron/scripts/test-packaged-first-send-renderer.mjs"
+    ).read_text(encoding="utf-8")
+    assert "const alreadyOnEmptyDraft" in first_send_gate
+    assert "if (!alreadyOnEmptyDraft)" in first_send_gate
+    assert "await header.waitFor({ state: 'attached'" in first_send_gate
+    assert "establishStableHeaderIdentity(header, iteration)" in first_send_gate
+    assert "HEADER_IDENTITY_SETTLE_MS" in first_send_gate
+    assert "await header.getAttribute(HEADER_IDENTITY_ATTRIBUTE)" in first_send_gate
+    assert "landingHeaderNode.evaluate" not in first_send_gate
+    assert "await page.mouse.move(1, 1)" in first_send_gate
+    assert "rendererErrors" in first_send_gate
+    assert "consoleErrorMessages" in first_send_gate
+    assert "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS" in first_send_gate
+    assert (
+        "INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = "
+        "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS"
+    ) in first_send_gate
+    assert (
+        "timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS" in first_send_gate
+    )
+    initial_connection = first_send_gate.index("timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS")
+    probe_install = first_send_gate.index(
+        "await page.addInitScript(installBrowserRpcProbe)", initial_connection
+    )
+    current_probe_install = first_send_gate.index(
+        "await page.evaluate(installBrowserRpcProbe)", probe_install
+    )
+    assert initial_connection < probe_install < current_probe_install
+    assert "await page.reload" not in first_send_gate
+    assert "timeout: SEND_TIMEOUT_MS" in first_send_gate[current_probe_install:]
+    assert "PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS" in first_send_gate
+    assert "unexpectedRendererErrorCount" in first_send_gate
 
 
-def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
+def test_release_workflow_runs_v053_windows_upgrade_checks_on_server_2022() -> None:
     workflow = yaml.safe_load(
         Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
     )
@@ -221,21 +276,59 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
 ) -> None:
     probe = Path(".github/scripts/verify-release-profile-preservation.py")
     home = tmp_path / "Application Support" / "OpenSquilla" / "opensquilla"
+    external_root = tmp_path / "synthetic-system-tools"
+    external_scope = ["--external-root", str(external_root)]
     label = "contract-probe"
 
     subprocess.run(
-        [sys.executable, str(probe), "seed", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "seed",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=True,
         text=True,
         capture_output=True,
     )
     verified = subprocess.run(
-        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=True,
         text=True,
         capture_output=True,
     )
     assert "profile preservation verified" in verified.stdout
+    runtime_sentinel = (
+        home
+        / "state"
+        / "runtime-packs"
+        / "v1"
+        / "packages"
+        / "preservation-sentinel"
+        / "payload.bin"
+    )
+    assert runtime_sentinel.read_bytes() == b"synthetic retained Runtime Pack payload\n"
+    for component, expected in {
+        "python": b"synthetic external Python sentinel\n",
+        "node": b"synthetic external Node.js sentinel\n",
+        "git": b"synthetic external Git sentinel\n",
+    }.items():
+        assert (
+            external_root / component / f"{component}-sentinel.bin"
+        ).read_bytes() == expected
     config_text = (home / "config.toml").read_text(encoding="utf-8")
     assert 'provider = "ollama"' in config_text
     assert 'model = "opensquilla-release-session-recovery-smoke"' in config_text
@@ -297,6 +390,7 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
             str(home),
             "--label",
             label,
+            *external_scope,
         ],
         check=True,
         text=True,
@@ -304,7 +398,16 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     )
     assert "profile preservation verified after runtime migration" in runtime_verified.stdout
     install_phase_rejected = subprocess.run(
-        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -315,7 +418,16 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     (home / "config.toml").write_text(config_text, encoding="utf-8", newline="")
 
     reseed = subprocess.run(
-        [sys.executable, str(probe), "seed", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "seed",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -326,7 +438,16 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     identity = home / "workspace" / "IDENTITY.md"
     identity.write_text("changed\n", encoding="utf-8")
     rejected = subprocess.run(
-        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -338,7 +459,16 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     with sqlite3.connect(home / "state" / "sessions.db") as connection:
         connection.execute("UPDATE release_preservation_chat SET body = 'changed'")
     rejected = subprocess.run(
-        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -359,7 +489,16 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
             """
         )
     rejected = subprocess.run(
-        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -393,12 +532,41 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     assert migrated_count == 320
     assert migrated_last_message == "Synthetic retained history message 0320 (contract-probe)"
     migrated_verified = subprocess.run(
-        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
         check=True,
         text=True,
         capture_output=True,
     )
     assert "profile preservation verified" in migrated_verified.stdout
+
+    external_git_sentinel = external_root / "git" / "git-sentinel.bin"
+    external_git_sentinel.write_bytes(b"changed\n")
+    sentinel_rejected = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            "verify",
+            "--home",
+            str(home),
+            "--label",
+            label,
+            *external_scope,
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert sentinel_rejected.returncode != 0
+    assert "external system git sentinel" in sentinel_rejected.stderr
 
 
 def test_release_workflow_gates_built_and_downloaded_installers_on_profile_retention() -> None:
@@ -450,7 +618,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     ):
         assert artifact in probe
     for helper in (mac_helper, windows_helper):
-        assert "v0.5.0rc3" in helper
+        assert "v0.5.3" in helper
         assert "recovery inspect" in helper
         assert "verify-release-profile-preservation.py" in helper
         assert "workspace" in helper
@@ -458,6 +626,11 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "--label" in helper
         assert "test-packaged-session-recovery.mjs" not in helper
         assert "--session-key" not in helper
+
+    assert "runtime/developer/darwin-arm64" in mac_helper
+    assert "test ! -e \"${candidate_runtime}/developer\"" in mac_helper
+    assert "resources\\runtime\\developer\\windows-x64" in windows_helper
+    assert "retained the v0.5.3 bundled developer runtimes" in windows_helper
 
     assert "test-packaged-update-banner.mjs" in windows_helper
     assert "if ($VerifyLongRunningUpdateBanner)" in windows_helper
@@ -509,9 +682,8 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     ]
     windows_audit = workflow[workflow.index("  audit-downloaded-windows-release:") :]
     for audit in (mac_audit, windows_audit):
-        assert "needs: publish-release" in audit
-        assert "contents: write" in audit
-        assert "contents: read" not in audit
+        assert "needs: prestage-draft-updater-assets" in audit
+        assert "contents: read" in audit
         assert "gh release download" in audit
         assert "SHA256SUMS" in audit
         assert "isDraft" in audit
@@ -526,9 +698,77 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "spctl -a -vv -t exec" in mac_audit
     assert "xcrun stapler validate" in mac_audit
     assert "@electron/asar@3.4.1 extract-file" in mac_audit
-    assert "verify-release-macos-upgrade.sh" in mac_audit
+    assert "verify-release-macos-real-update.sh" in mac_audit
     assert "Get-FileHash -Algorithm SHA256" in windows_audit
     assert "verify-release-windows-upgrade.ps1" in windows_audit
+
+
+def test_release_mirror_allows_full_hour_for_cross_cloud_uploads() -> None:
+    workflow = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )
+
+    assert workflow["jobs"]["mirror-release-assets"]["timeout-minutes"] == 60
+
+
+def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
+    workflow_text = Path(".github/workflows/wheelhouse-release.yml").read_text(
+        encoding="utf-8"
+    )
+    workflow = yaml.safe_load(workflow_text)
+    prestage = workflow["jobs"]["prestage-draft-updater-assets"]
+    assert prestage["needs"] == "publish-release"
+    assert prestage["environment"] == "desktop-release-oss-prestage"
+    assert (
+        prestage["env"]["OSS_ACCESS_KEY_ID"]
+        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID }}"
+    )
+    assert (
+        prestage["env"]["OSS_ACCESS_KEY_SECRET"]
+        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET }}"
+    )
+    assert 'release["isDraft"] is True' in workflow_text
+    assert 'ALIYUN_OSS_BUCKET}" == "opensquilla-releases"' in workflow_text
+    assert 'OSS_REGION}" == "cn-beijing"' in workflow_text
+    assert "build-draft-rehearsal" in workflow_text
+    assert "prestage-release-to-oss.sh" in workflow_text
+    assert "get-bucket-versioning" in workflow_text
+    assert 'versioning_endpoint="oss-${OSS_REGION}.aliyuncs.com"' in workflow_text
+    assert "--addressing-style virtual" in workflow_text
+    assert "decoder.raw_decode" in workflow_text
+    assert '{"enabled", "suspended"}' in workflow_text
+    assert "OSS bucket versioning must be unconfigured" in workflow_text
+    assert prestage["steps"][-1]["name"] == "Upload loopback-only updater rehearsal manifest"
+
+    script = Path(".github/scripts/prestage-release-to-oss.sh").read_text(encoding="utf-8")
+    assert '--forbid-overwrite true' in script
+    assert "verify_immutable_object" in script
+    assert 'ALIYUN_OSS_PREFIX_NORMALIZED}" != "releases"' in script
+    assert "/channels/" not in script
+    assert 'mirror_root}/latest' not in script
+    assert "stable.json" not in script
+
+    driver = Path("desktop/electron/scripts/test-packaged-real-update-flow.mjs").read_text(
+        encoding="utf-8"
+    )
+    for contract in (
+        "OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT",
+        "OPENSQUILLA_DESKTOP_UPDATE_SOURCE: 'oss'",
+        "checkForUpdates()",
+        "downloadUpdate()",
+        "relaunchToUpdate()",
+        "installer reported success while the official v0.5.3 process remained live",
+    ):
+        assert contract in driver
+
+    windows_gate = Path(".github/scripts/verify-release-windows-upgrade.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "GetVersionInfo($app)).ProductVersion" in windows_gate
+    assert '"the rehearsed version $expectedInstalledVersion."' in windows_gate
+    assert "--external-root $externalSentinels" in windows_gate
+    assert "NSIS upgrade is not transactional after the old uninstaller" in windows_gate
+    assert "does not claim transactional rollback" in workflow_text
 
 
 def test_manual_release_workflow_without_a_tag_only_uploads_aggregate_artifacts() -> None:
@@ -545,7 +785,27 @@ def test_manual_release_workflow_without_a_tag_only_uploads_aggregate_artifacts(
 
     assert "if" not in aggregate
     assert "github.event.inputs.tag != ''" in github_upload["if"]
-    for job_name in ("audit-downloaded-macos-release", "audit-downloaded-windows-release"):
+    for job_name in ("build-desktop-macos", "build-desktop-windows"):
+        steps = workflow["jobs"][job_name]["steps"]
+        test_package_catalog = next(
+            step
+            for step in steps
+            if step["name"] == "Verify test-package runtime-pack catalog"
+        )
+        release_catalog = next(
+            step
+            for step in steps
+            if step["name"] == "Verify finalized runtime-pack catalog"
+        )
+        assert test_package_catalog["if"] == "${{ env.RELEASE_TAG == '' }}"
+        assert test_package_catalog["run"].endswith("--source")
+        assert release_catalog["if"] == "${{ env.RELEASE_TAG != '' }}"
+        assert release_catalog["run"].endswith("--release-source")
+    for job_name in (
+        "prestage-draft-updater-assets",
+        "audit-downloaded-macos-release",
+        "audit-downloaded-windows-release",
+    ):
         assert "github.event.inputs.tag != ''" in workflow["jobs"][job_name]["if"]
 
 
@@ -938,7 +1198,7 @@ def test_historical_040_release_notes_remain_available() -> None:
     assert "OpenSquilla-0.4.0-mac-arm64.dmg" in notes
 
 
-def test_current_release_notes_cover_steering_startup_upgrade_and_containers() -> None:
+def test_current_release_notes_cover_documents_runtimes_upgrade_and_containers() -> None:
     notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
 
     assert "## Downloads" in notes
@@ -946,25 +1206,24 @@ def test_current_release_notes_cover_steering_startup_upgrade_and_containers() -
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip" in notes
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in notes
     assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
-    assert notes.index("### Same-turn steering across clients") < notes.index(
-        "### Faster startup and safer recovery"
+    assert notes.index("### HTML document editing beta") < notes.index(
+        "### Runtime Packs and slimmer Desktop installers"
     )
-    assert notes.index("### Desktop projects and artifact previews") < notes.index(
-        "### Provider and usage settings"
+    assert notes.index("### Model routing, Ensemble, and providers") < notes.index(
+        "### Chats, tasks, and attachments"
     )
     assert notes.index("## ✨ What's Improved") < notes.index("## Downloads")
-    assert "Normal version upgrades do not require a data transfer" in notes
-    assert "without cancelling or recreating" in notes
-    assert "No database or configuration migration is required" in notes
-    assert "legacy-recovery maintenance" in notes
-    assert "history loads or recovers" in notes
-    assert "Base URL fields" in notes
-    assert "No Windows Portable assets are published for 0.5.2" in notes
-    assert "0.5.2 Portable zip" in notes
-    assert "## Upgrading from 0.5.1" in notes
+    assert "no\nmanual data transfer is required" in notes
+    assert "Additive database\nmigrations run automatically" in notes
+    assert "early beta" in notes
+    assert "limited to single-file UTF-8 HTML" in notes
+    assert "The 0.5.3 bundled\n  runtimes are intentionally not migrated" in notes
+    assert "No Windows Portable assets are published for 0.5.4" in notes
+    assert "0.5.4 Portable zip" in notes
+    assert "## Upgrading from 0.5.3" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
-    assert "ghcr.io/opensquilla/opensquilla:v0.5.2" in notes
+    assert "ghcr.io/opensquilla/opensquilla:v0.5.4" in notes
     assert "`latest` tag follows the most recently verified release tag" in notes
     assert (
         "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
@@ -979,9 +1238,20 @@ def test_current_release_notes_cover_steering_startup_upgrade_and_containers() -
     assert "release gate" not in notes
     assert "## Acknowledgements" in notes
     for login in [
-        "@joyfan621-png",
-        "@jiaoqingrui",
+        "@AmirF194",
+        "@Kiuyor",
         "@Liu-RK",
+        "@LiuXinchen1997",
+        "@Sanjays2402",
+        "@ab2ence",
+        "@freeaccount-create",
+        "@jiaoqingrui",
+        "@kriptoburak",
+        "@lifelmy",
+        "@lihongguang-0014",
+        "@openvictory",
+        "@shixi-li",
+        "@xfjsssq",
     ]:
         assert login in notes
     assert "CONTRIBUTORS.md" in notes
@@ -994,18 +1264,29 @@ def test_docs_index_links_current_release_notes() -> None:
     assert "releases/0.4.0.md" in index
 
 
-def test_current_contributor_ledger_records_052_attribution() -> None:
+def test_current_contributor_ledger_records_054_attribution() -> None:
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    section = ledger.split("## OpenSquilla 0.5.2", 1)[1].split("## OpenSquilla 0.5.1", 1)[0]
+    section = ledger.split("## OpenSquilla 0.5.4", 1)[1].split("## OpenSquilla 0.5.3", 1)[0]
 
     expected = {
-        "@jiaoqingrui": "#903",
-        "@Liu-RK": "#887",
-        "@joyfan621-png": "#901",
+        "@AmirF194": "#1193",
+        "@Kiuyor": "#1185",
+        "@Liu-RK": "#1267",
+        "@LiuXinchen1997": "#1199",
+        "@Sanjays2402": "#1214",
+        "@ab2ence": "#1300",
+        "@freeaccount-create": "#1264",
+        "@jiaoqingrui": "#1350",
+        "@kriptoburak": "#1367",
+        "@lifelmy": "#1215",
+        "@lihongguang-0014": "#1355",
+        "@openvictory": "#1351",
+        "@shixi-li": "#1184",
+        "@xfjsssq": "#1176",
     }
     for login, evidence in expected.items():
         assert login in section
         assert evidence in section
-    assert "#877" in section
+    assert "#1179" in section
     assert "Codex" not in section
     assert "Claude Code" not in section

@@ -7,9 +7,9 @@ function shape(overrides: Partial<RouterShape> = {}): RouterShape {
     slots: ['light', 'standard', 'heavy'],
     models: { light: 'a/x', standard: 'b/y', heavy: 'c/z' },
     configs: {
-      light: { model: 'a/x', supportsImage: false, imageOnly: false },
-      standard: { model: 'b/y', supportsImage: true, imageOnly: false },
-      heavy: { model: 'c/z', supportsImage: false, imageOnly: false },
+      light: { model: 'a/x', supportsImage: false, imageOnly: false, ensembleEnabled: false },
+      standard: { model: 'b/y', supportsImage: true, imageOnly: false, ensembleEnabled: false },
+      heavy: { model: 'c/z', supportsImage: false, imageOnly: false, ensembleEnabled: true },
     },
     ...overrides,
   }
@@ -69,5 +69,9 @@ describe('routerShapeCache — forward compatibility + normalization', () => {
       configs: { standard: { /* no model */ supportsImage: true } },
     }))
     expect(decoded?.configs.standard).toEqual({ model: '', supportsImage: true, imageOnly: false })
+  })
+
+  it('preserves the tier-scoped ensemble flag', () => {
+    expect(decodeRouterShape(encodeRouterShape(shape()))?.configs.heavy?.ensembleEnabled).toBe(true)
   })
 })

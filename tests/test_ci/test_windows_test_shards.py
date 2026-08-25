@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import os
 import runpy
 import subprocess
 import sys
+import tomllib
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,6 +30,10 @@ assignment_snapshot_fingerprint = SHARD_MODULE["assignment_snapshot_fingerprint"
 shard_for_test = SHARD_MODULE["shard_for_test"]
 shard_weight_summary = SHARD_MODULE["shard_weight_summary"]
 validate_assignment_payload = SHARD_MODULE["validate_assignment_payload"]
+validated_files_for_shard = SHARD_MODULE["validated_files_for_shard"]
+requires_isolated_core_wheel = SHARD_MODULE["_requires_isolated_core_wheel"]
+combined_pytest_exit_code = SHARD_MODULE["_combined_pytest_exit_code"]
+pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
 OFFLINE_MARKER_EXCLUSIONS = {
     "tests/functional/test_agent_synthetic_golden.py",
@@ -59,6 +68,15 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_ci/test_plan_ci.py",
+    "tests/test_git_runtime.py",
+    "tests/test_tools/test_gitless_write_tracking.py",
+    "tests/test_gateway/test_artifact_product_errors.py",
+    "tests/test_scripts/test_bench_skill_integrity.py",
+    "tests/test_skills_hash_consumers.py",
+    "tests/test_skills/test_loader_turn_snapshot.py",
+    "tests/test_skills_tree.py",
     "tests/test_recovery/test_config_recovery.py",
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
@@ -88,18 +106,27 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
     "tests/test_ci/test_session_storage_connection_contract.py",
+    "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
     "tests/test_channels/test_stream_terminal_routing.py",
     "tests/test_engine/test_agent_canonical_text_contract.py",
+    "tests/test_engine/test_agent_transactional_tool_publication.py",
+    "tests/test_engine/test_attachment_aware_routing.py",
     "tests/test_engine/test_done_text_snapshot_consumers.py",
     "tests/test_engine/test_provider_request_correlation.py",
+    "tests/test_engine/test_provider_activity.py",
+    "tests/test_engine/test_long_task_backend_boundaries.py",
     "tests/test_engine/test_route_plan.py",
+    "tests/test_engine/test_stream_repetition_guard.py",
     "tests/test_engine/turn_runner/test_canonical_text_contract.py",
+    "tests/test_engine/turn_runner/test_turn_identity_finalizer.py",
     "tests/test_gateway/test_api_chat.py",
     "tests/test_gateway/test_channel_turn_ingress.py",
     "tests/test_gateway/test_config_persist_corruption.py",
     "tests/test_gateway/test_config_profile_paths.py",
     "tests/test_gateway/test_cron_result_payload.py",
     "tests/test_gateway/test_memory_repair_storage_gate.py",
+    "tests/test_gateway/test_p1a_exact_abort_contract.py",
+    "tests/test_gateway/test_rpc_ingress_validation.py",
     "tests/test_gateway/test_rpc_llm_profiles.py",
     "tests/test_gateway/test_rpc_capability_reset.py",
     "tests/test_gateway/test_rpc_provider_credential_clear.py",
@@ -124,6 +151,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_migrations/test_v031_meta_launch_drafts.py",
     "tests/test_migrations/test_v032_meta_launch_discard_tombstones.py",
     "tests/test_live_mixed_provider_gateway.py",
+    "tests/test_live_long_task_case_driver.py",
+    "tests/test_live_long_task_release_gate.py",
     "tests/test_live_multi_provider_matrix.py",
     "tests/test_live_tokenrhythm_billing_audit.py",
     "tests/test_onboarding/test_llm_profiles.py",
@@ -137,6 +166,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_provider_terminal_evidence_anthropic_codex.py",
     "tests/test_provider_text_tool_normalization.py",
     "tests/test_provider_tokenrhythm_correlation.py",
+    "tests/test_long_task_fault_proxy.py",
     "tests/test_recovery/test_atomic_and_locking.py",
     "tests/test_recovery/test_cleanup.py",
     "tests/test_recovery/test_engine.py",
@@ -149,9 +179,12 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_scripts/test_release_channel_manifest.py",
     "tests/test_scripts/test_verify_webui_artifact.py",
     "tests/test_scheduler/test_job_lifecycle.py",
+    "tests/test_session/test_storage_session_list_pagination.py",
     "tests/test_session/test_storage_transactions.py",
     "tests/test_session/test_meta_launch_drafts.py",
+    "tests/test_session/test_pending_chat_inputs.py",
     "tests/test_session/test_turn_acceptance_storage.py",
+    "tests/test_session/test_assistant_message_identity.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
     "tests/test_skills/test_managed_toolchains.py",
     "tests/test_skills/test_meta_readiness.py",
@@ -172,6 +205,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_envelope_policy_deny_cap.py",
     "tests/test_request_proof_levers.py",
     "tests/test_toolcomp_matcher_levers.py",
+    "tests/test_toolcomp_matcher_safety.py",
+    "tests/test_toolcomp_reducer_semantics.py",
     "tests/test_engine/test_agent_patch_hygiene_block.py",
     "tests/test_engine/test_agent_submit_review.py",
     "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py",
@@ -201,6 +236,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_migrations/test_v034_goal_message_anchor.py",
     "tests/test_session/test_goal_storage.py",
     "tests/test_session/test_goals.py",
+    "tests/test_contracts/test_ensemble_fallback_event_wire.py",
+    "tests/test_contracts/test_turn_execution.py",
+    "tests/test_engine/test_turn_control_terminal.py",
+    "tests/test_artifact_session/test_candidate_loop.py",
+    "tests/test_tools/test_document_browser_identity.py",
 }
 
 
@@ -223,6 +263,256 @@ def test_every_pytest_file_belongs_to_exactly_one_windows_shard() -> None:
     assert "tests/fixtures/meta_skill_inputs/code_review_dirty_repo/tests/test_app.py" not in (
         discovered
     )
+    assert set(validated_files_for_shard(Path.cwd(), "core")) == by_shard["core"]
+
+
+def test_parallel_ci_contract_registers_xdist_and_serial_marker() -> None:
+    data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dev_dependencies = data["project"]["optional-dependencies"]["dev"]
+    markers = data["tool"]["pytest"]["ini_options"]["markers"]
+
+    assert any(dependency.startswith("pytest-xdist>=") for dependency in dev_dependencies)
+    assert any(marker.startswith("ci_serial:") for marker in markers)
+
+
+@pytest.mark.parametrize(
+    ("parallel_exit_code", "serial_exit_code", "expected"),
+    [
+        (5, 0, 0),
+        (0, 5, 0),
+        (5, 5, 5),
+        (5, 1, 1),
+        (1, 5, 1),
+    ],
+)
+def test_split_phase_exit_codes_allow_one_empty_successful_phase(
+    parallel_exit_code: int,
+    serial_exit_code: int,
+    expected: int,
+) -> None:
+    assert (
+        combined_pytest_exit_code(
+            parallel_exit_code,
+            serial_exit_code,
+            no_tests_collected=5,
+        )
+        == expected
+    )
+
+
+def test_only_fixture_consuming_shards_prebuild_the_core_wheel() -> None:
+    root = Path.cwd()
+    consumers = {
+        shard
+        for shard in SHARD_NAMES
+        if requires_isolated_core_wheel(root, files_for_shard(root, shard))
+    }
+
+    assert consumers == {"core", "desktop-installer-contracts"}
+
+
+def _function_decorators(path: Path, function_name: str) -> set[str]:
+    parsed = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(parsed):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+            return {ast.unparse(decorator) for decorator in node.decorator_list}
+    raise AssertionError(f"missing test function: {path}:{function_name}")
+
+
+def test_windows_shell_process_runtime_is_marked_ci_serial() -> None:
+    path = Path("tests/test_sandbox/test_windows_shell_process_runtime.py")
+    parsed = ast.parse(path.read_text(encoding="utf-8"))
+
+    assert any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in node.targets
+        )
+        and ast.unparse(node.value) == "pytest.mark.ci_serial"
+        for node in parsed.body
+    )
+
+
+def test_known_process_tree_flakes_are_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_process_tree.py"),
+        "test_owner_registry_supports_concurrent_process_writers",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/functional/test_gateway_stop_process_tree_e2e.py"),
+        "test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_cleanup.py"),
+        "test_cleanup_apply_refuses_running_legacy_gateway",
+    )
+
+
+def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_task_runtime_terminal_cleanup.py"),
+        "test_no_leak_under_load",
+    )
+
+
+def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_goal_rpc.py"),
+        "test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_scripts/test_verify_webui_artifact.py"),
+        "test_node_and_python_source_fingerprints_share_order_and_line_endings",
+    )
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    [
+        "test_native_move_moves_a_regular_tree_between_real_parents",
+        "test_windows_real_legacy_lock_survives_profile_move_and_rebind",
+        "test_windows_real_replacement_locks_survive_two_profile_moves",
+        "test_windows_real_recent_locked_profile_tree_moves_without_metadata_false_positive",
+        "test_windows_primitive_collision_preserves_both_trees",
+        "test_windows_native_move_refuses_real_cross_volume_move",
+        "test_windows_native_move_handles_real_path_longer_than_260_characters",
+        "test_windows_native_move_rejects_real_junction_in_source_tree",
+        "test_windows_no_replace_pins_both_parents_during_real_mutation_window",
+    ],
+)
+def test_native_recovery_global_state_contracts_are_marked_ci_serial(
+    function_name: str,
+) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_atomic_and_locking.py"), function_name
+    )
+
+
+def test_xdist_runtime_roots_are_worker_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conftest_module = runpy.run_path(
+        Path("tests/conftest.py").as_posix(),
+        run_name="pytest_conftest_contract",
+    )
+    state_root = tmp_path / "state"
+    log_root = tmp_path / "logs"
+    user_state_root = tmp_path / "user-state"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(state_root))
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(log_root))
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(user_state_root))
+    monkeypatch.delenv("OPENSQUILLA_PYTEST_XDIST_SCOPE", raising=False)
+
+    conftest_module["pytest_configure"](
+        SimpleNamespace(workerinput={"workerid": "gw2", "testrunuid": "run/unsafe"})
+    )
+
+    expected_suffix = Path(".pytest-xdist") / "run_unsafe" / "gw2"
+    for env_key, root in (
+        ("OPENSQUILLA_STATE_DIR", state_root),
+        ("OPENSQUILLA_LOG_DIR", log_root),
+        ("OPENSQUILLA_USER_STATE_DIR", user_state_root),
+    ):
+        scoped = Path(os.environ[env_key])
+        assert scoped == root / expected_suffix
+        assert scoped.is_dir()
+    assert os.environ["OPENSQUILLA_PYTEST_XDIST_SCOPE"] == "run_unsafe/gw2"
+
+
+def test_approval_queue_default_path_uses_worker_scoped_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.application import approval_queue as approval_queue_module
+
+    conftest_module = runpy.run_path(
+        Path("tests/conftest.py").as_posix(),
+        run_name="pytest_conftest_approval_queue_contract",
+    )
+    state_root = tmp_path / "state-root"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(state_root))
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.delenv("OPENSQUILLA_PYTEST_XDIST_SCOPE", raising=False)
+    monkeypatch.setattr(approval_queue_module, "_DEFAULT_APPROVAL_QUEUE_PATH", None)
+
+    conftest_module["pytest_configure"](
+        SimpleNamespace(workerinput={"workerid": "gw3", "testrunuid": "queue-run"})
+    )
+    queue = approval_queue_module.ApprovalQueue()
+    try:
+        assert queue._db_path == (
+            state_root
+            / ".pytest-xdist"
+            / "queue-run"
+            / "gw3"
+            / "state"
+            / "approval_queue.sqlite"
+        )
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (".", "unknown"),
+        ("..", "unknown"),
+        ("...", "unknown"),
+        ("CON", "_CON"),
+        ("con.txt", "_con.txt"),
+        ("LPT9", "_LPT9"),
+        ("run/unsafe", "run_unsafe"),
+    ],
+)
+def test_xdist_runtime_component_is_cross_platform_path_safe(
+    raw: str,
+    expected: str,
+) -> None:
+    conftest_module = runpy.run_path(
+        Path("tests/conftest.py").as_posix(),
+        run_name="pytest_conftest_component_contract",
+    )
+
+    assert conftest_module["_safe_xdist_component"](raw) == expected
+
+
+def test_live_xdist_worker_uses_isolated_runtime_roots() -> None:
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if not worker_id:
+        pytest.skip("contract is exercised inside an xdist worker")
+
+    for env_key in (
+        "OPENSQUILLA_STATE_DIR",
+        "OPENSQUILLA_LOG_DIR",
+        "OPENSQUILLA_USER_STATE_DIR",
+    ):
+        parts = Path(os.environ[env_key]).parts
+        assert ".pytest-xdist" in parts
+        assert parts[-1] == worker_id
+
+
+def test_prebuilt_core_wheel_environment_is_content_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conftest_module = runpy.run_path(
+        Path("tests/conftest.py").as_posix(),
+        run_name="pytest_core_wheel_contract",
+    )
+    wheel = tmp_path / "opensquilla-0-py3-none-any.whl"
+    wheel.write_bytes(b"immutable wheel contract")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setenv("OPENSQUILLA_TEST_CORE_WHEEL", str(wheel))
+    monkeypatch.setenv("OPENSQUILLA_TEST_CORE_WHEEL_SHA256", digest)
+
+    assert conftest_module["_prebuilt_core_wheel_from_environment"]() == wheel.resolve()
+
+    wheel.write_bytes(b"changed")
+    with pytest.raises(AssertionError, match="SHA-256 mismatch"):
+        conftest_module["_prebuilt_core_wheel_from_environment"]()
 
 
 def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
@@ -239,6 +529,9 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
         ),
         "tests/test_uninstall/test_safety.py": "desktop-installer-contracts",
         "tests/test_install_scripts.py": "desktop-installer-contracts",
+        "tests/test_scripts/test_bench_skill_integrity.py": "recovery-migration",
+        "tests/test_skills_hash_consumers.py": "recovery-migration",
+        "tests/test_skills_tree.py": "recovery-migration",
     }
 
     assert {path: shard_for_test(path) for path in expected} == expected
@@ -256,19 +549,42 @@ def test_windows_shards_are_balanced_by_historical_duration() -> None:
     assert max(estimated_seconds) / min(estimated_seconds) < 1.05
 
 
-def test_windows_assignment_snapshot_freezes_current_mapping_without_movement() -> None:
+def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     baseline, assignments, guardrails, overrides = assignment_governance()
     report = assignment_governance_summary(Path.cwd())
 
-    assert baseline == assignments
+    expected_moved_paths = {
+        "tests/test_gateway/test_goal_rpc.py",
+        "tests/test_gateway/test_project_workspace_execution.py",
+        "tests/test_gateway/test_rpc_meta_runs.py",
+        "tests/test_gateway/test_rpc_router_decisions.py",
+        "tests/test_live_long_task_case_driver.py",
+        "tests/test_live_multi_provider_matrix.py",
+        "tests/test_observability/test_bundle.py",
+        "tests/test_persistence/test_router_decision_writer.py",
+        "tests/test_sandbox/test_windows_default_capability.py",
+        "tests/test_skills/test_meta_resume.py",
+    }
+    moved_paths = {
+        path for path, shard in assignments.items() if baseline[path] != shard
+    }
+
+    assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
-    assert overrides == ()
+    assert {str(override["path"]) for override in overrides} == expected_moved_paths
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
         "minimum_predicted_max_shard_improvement_seconds": 60.0,
     }
-    assert report["predicted_max_shard_improvement_seconds"] == 0.0
+    assert len(moved_paths) <= guardrails["max_moved_files"]
+    assert len(moved_paths) / len(baseline) <= guardrails["max_moved_fraction"]
+    assert report["predicted_max_shard_improvement_seconds"] >= (
+        guardrails["minimum_predicted_max_shard_improvement_seconds"]
+    )
+    proposed_seconds = list(report["current_predicted_seconds"].values())
+    assert max(proposed_seconds) / min(proposed_seconds) < 1.05
     assert report["assignment_sha256"] == assignment_snapshot_fingerprint()
     assert len(str(report["assignment_sha256"])) == 64
 
@@ -410,14 +726,23 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
         and shard_for_test(path) != matches[0]
     }
 
-    # These two long-running files need no shard-specific setup. Releasing them
-    # keeps every other known domain-affinity file on its named responsibility
-    # shard while restoring an even critical path.
+    # These reviewed files need no shard-specific setup. Releasing them keeps
+    # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
         "tests/test_ci/test_migrations_packaged.py": "core",
+        "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
+        "tests/test_gateway/test_project_workspace_execution.py": (
+            "desktop-installer-contracts"
+        ),
+        "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
+        "tests/test_gateway/test_rpc_router_decisions.py": (
+            "desktop-installer-contracts"
+        ),
+        "tests/test_observability/test_bundle.py": "desktop-installer-contracts",
         "tests/test_persistence/test_meta_run_writer.py": (
             "desktop-installer-contracts"
         ),
+        "tests/test_persistence/test_router_decision_writer.py": "core",
     }
     assert shard_for_test("tests/test_recovery/test_atomic_and_locking.py") == (
         "recovery-migration"
@@ -446,6 +771,18 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
             "GITHUB_SHA": "a" * 40,
         }
     )
+    # This contract can itself execute inside the repository's xdist phase.
+    # The nested runner under test starts as a fresh controller, so do not let
+    # the outer worker identity leak into its environment.
+    for key in (
+        "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT",
+        "PYTEST_XDIST_TESTRUNUID",
+        "OPENSQUILLA_PYTEST_XDIST_SCOPE",
+        "OPENSQUILLA_TEST_CORE_WHEEL",
+        "OPENSQUILLA_TEST_CORE_WHEEL_SHA256",
+    ):
+        env.pop(key, None)
 
     result = subprocess.run(
         [
@@ -480,8 +817,306 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert metadata_payload["sha"] == "a" * 40
     assert metadata_payload["shard"] == "core"
     assert metadata_payload["test_files"] == ["tests/test_failure.py"]
+    assert len(metadata_payload["test_files_sha256"]) == 64
+    assert metadata_payload["execution"] == {
+        "parallel": {
+            "dist": "loadfile",
+            "marker": "not ci_serial",
+            "workers": 4,
+        },
+        "serial": {"marker": "ci_serial", "workers": 1},
+    }
     assert len(metadata_payload["assignment_sha256"]) == 64
     text = summary.read_text(encoding="utf-8")
     assert "pytest_exit_code=1" in text
+    assert "parallel_pytest_exit_code=1" in text
+    assert "serial_pytest_exit_code=5" in text
     assert "junit_status=failed" in text
     assert "synthetic shard failure" in text
+
+
+def test_windows_shard_runner_uses_argfile_for_large_file_selection() -> None:
+    files = tuple(
+        f"tests/test_gateway/test_long_windows_selection_{index:04d}.py"
+        for index in range(600)
+    )
+
+    with pytest_file_selection_arg(files) as selection_arg:
+        argfile = Path(selection_arg.removeprefix("@"))
+        assert len(selection_arg) < 260
+        assert argfile.read_text(encoding="utf-8").splitlines() == list(files)
+
+    assert not argfile.exists()
+
+
+def test_windows_shard_runner_accepts_parallel_no_tests_when_serial_passes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        'norecursedirs = ["tests/fixtures"]\n'
+        'markers = ["ci_serial: synthetic serial CI contract"]\n',
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_serial_only.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.ci_serial\n"
+        "def test_serial_only():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    report_dir = tmp_path / "reports"
+    junit = report_dir / "junit.xml"
+    summary = report_dir / "first-failure.txt"
+    env = os.environ.copy()
+    for key in (
+        "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT",
+        "PYTEST_XDIST_TESTRUNUID",
+        "OPENSQUILLA_PYTEST_XDIST_SCOPE",
+        "OPENSQUILLA_TEST_CORE_WHEEL",
+        "OPENSQUILLA_TEST_CORE_WHEEL_SHA256",
+    ):
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            SHARD_SCRIPT.resolve().as_posix(),
+            "run",
+            "core",
+            "--root",
+            tmp_path.as_posix(),
+            "--junit",
+            junit.as_posix(),
+            "--summary",
+            summary.as_posix(),
+            "--workers",
+            "2",
+            "--",
+            "-q",
+            "-m",
+            "ci_serial",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary_text = summary.read_text(encoding="utf-8")
+    assert "pytest_exit_code=0" in summary_text
+    assert "parallel_pytest_exit_code=5" in summary_text
+    assert "serial_pytest_exit_code=0" in summary_text
+    assert "junit_status=passed" in summary_text
+    junit_root = ET.parse(junit).getroot()
+    assert junit_root.get("tests") == "1"
+    assert len(list(junit_root.iter("testcase"))) == 1
+
+
+def test_windows_shard_runner_finalizes_core_wheel_timeout_artifacts(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\nnorecursedirs = ["tests/fixtures"]\n',
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "build_test_core_wheel.py").write_text(
+        "import subprocess\n"
+        "from pathlib import Path\n\n"
+        "def build_isolated_core_wheel(repo_root: Path, temp_root: Path) -> Path:\n"
+        "    raise subprocess.TimeoutExpired(cmd=['uv', 'build'], timeout=300)\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_needs_wheel.py").write_text(
+        "def test_needs_wheel(isolated_core_wheel):\n"
+        "    assert isolated_core_wheel\n",
+        encoding="utf-8",
+    )
+    report_dir = tmp_path / "reports"
+    junit = report_dir / "junit.xml"
+    summary = report_dir / "first-failure.txt"
+    env = os.environ.copy()
+    for key in (
+        "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT",
+        "PYTEST_XDIST_TESTRUNUID",
+        "OPENSQUILLA_PYTEST_XDIST_SCOPE",
+        "OPENSQUILLA_TEST_CORE_WHEEL",
+        "OPENSQUILLA_TEST_CORE_WHEEL_SHA256",
+    ):
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            SHARD_SCRIPT.resolve().as_posix(),
+            "run",
+            "core",
+            "--root",
+            tmp_path.as_posix(),
+            "--junit",
+            junit.as_posix(),
+            "--summary",
+            summary.as_posix(),
+            "--workers",
+            "2",
+            "--",
+            "-q",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "timed out after 300 seconds" in result.stderr
+    summary_text = summary.read_text(encoding="utf-8")
+    assert "pytest_status=started" not in summary_text
+    assert "pytest_exit_code=2" in summary_text
+    assert "junit_status=failed" in summary_text
+    assert "TimeoutExpired" in summary_text
+    junit_root = ET.parse(junit).getroot()
+    assert junit_root.get("tests") == "1"
+    assert junit_root.get("errors") == "1"
+    error = junit_root.find(".//error")
+    assert error is not None
+    assert error.get("type") == "TimeoutExpired"
+
+
+def test_windows_shard_runner_splits_parallel_and_serial_tests(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        'norecursedirs = ["tests/fixtures"]\n'
+        'markers = [\n'
+        '  "ci_serial: synthetic serial CI contract",\n'
+        '  "llm: synthetic excluded marker",\n'
+        ']\n',
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "build_test_core_wheel.py").write_text(
+        "from pathlib import Path\n\n"
+        "def build_isolated_core_wheel(repo_root: Path, temp_root: Path) -> Path:\n"
+        "    counter = Path(__import__('os').environ['PREBUILD_COUNTER'])\n"
+        "    count = int(counter.read_text()) if counter.exists() else 0\n"
+        "    counter.write_text(str(count + 1))\n"
+        "    temp_root.mkdir(parents=True)\n"
+        "    wheel = temp_root / 'opensquilla-0-py3-none-any.whl'\n"
+        "    wheel.write_bytes(b'synthetic immutable wheel')\n"
+        "    return wheel\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "conftest.py").write_text(
+        "import hashlib\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import pytest\n\n"
+        "@pytest.fixture(scope='session')\n"
+        "def isolated_core_wheel():\n"
+        "    wheel = Path(os.environ['OPENSQUILLA_TEST_CORE_WHEEL'])\n"
+        "    assert wheel.is_file()\n"
+        "    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()\n"
+        "    assert digest == os.environ['OPENSQUILLA_TEST_CORE_WHEEL_SHA256']\n"
+        "    return wheel\n",
+        encoding="utf-8",
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    prebuild_counter = evidence_dir / "prebuild-count.txt"
+    (tests_dir / "test_bulk.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "def test_bulk_phase(isolated_core_wheel):\n"
+        "    assert isolated_core_wheel.name.endswith('.whl')\n"
+        "    worker = os.environ.get('PYTEST_XDIST_WORKER', '')\n"
+        "    assert worker.startswith('gw')\n"
+        "    (Path(os.environ['EVIDENCE_DIR']) / 'bulk.txt').write_text(worker)\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_serial.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "import pytest\n\n"
+        "@pytest.mark.ci_serial\n"
+        "def test_serial_phase(isolated_core_wheel):\n"
+        "    assert isolated_core_wheel.name.endswith('.whl')\n"
+        "    assert 'PYTEST_XDIST_WORKER' not in os.environ\n"
+        "    (Path(os.environ['EVIDENCE_DIR']) / 'serial.txt').write_text('serial')\n",
+        encoding="utf-8",
+    )
+    report_dir = tmp_path / "reports"
+    junit = report_dir / "junit.xml"
+    summary = report_dir / "first-failure.txt"
+    metadata = report_dir / "windows-shard-metadata.json"
+    env = os.environ.copy()
+    env["EVIDENCE_DIR"] = str(evidence_dir)
+    env["PREBUILD_COUNTER"] = str(prebuild_counter)
+    for key in (
+        "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT",
+        "PYTEST_XDIST_TESTRUNUID",
+        "OPENSQUILLA_PYTEST_XDIST_SCOPE",
+        "OPENSQUILLA_TEST_CORE_WHEEL",
+        "OPENSQUILLA_TEST_CORE_WHEEL_SHA256",
+    ):
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            SHARD_SCRIPT.resolve().as_posix(),
+            "run",
+            "core",
+            "--root",
+            tmp_path.as_posix(),
+            "--junit",
+            junit.as_posix(),
+            "--summary",
+            summary.as_posix(),
+            "--metadata",
+            metadata.as_posix(),
+            "--workers",
+            "2",
+            "--",
+            "-q",
+            "-m",
+            "not llm",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("Prepared one shared isolated core wheel") == 1
+    assert "Running parallel bulk phase with 2 workers" in result.stdout
+    assert "Running serial phase in the controller process" in result.stdout
+    assert prebuild_counter.read_text(encoding="utf-8") == "1"
+    assert (evidence_dir / "bulk.txt").read_text(encoding="utf-8").startswith("gw")
+    assert (evidence_dir / "serial.txt").read_text(encoding="utf-8") == "serial"
+    junit_root = ET.parse(junit).getroot()
+    assert junit_root.get("tests") == "2"
+    assert len(list(junit_root.iter("testcase"))) == 2
+    summary_text = summary.read_text(encoding="utf-8")
+    assert "pytest_exit_code=0" in summary_text
+    assert "parallel_pytest_exit_code=0" in summary_text
+    assert "serial_pytest_exit_code=0" in summary_text
+    metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert metadata_payload["test_files"] == [
+        "tests/test_bulk.py",
+        "tests/test_serial.py",
+    ]
+    assert metadata_payload["execution"]["parallel"]["workers"] == 2

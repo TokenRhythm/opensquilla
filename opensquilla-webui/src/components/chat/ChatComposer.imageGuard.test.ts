@@ -18,8 +18,8 @@ const BASE_PROPS = {
   sendButtonTitle: 'Send',
   runMode: 'safe',
   allowedRunModes: ['safe', 'full'],
-  modelRoutingMode: 'llm_ensemble',
-  modelRoutingSettingsBusy: false,
+  sessionRoutingMode: 'llm_ensemble',
+  sessionRoutingBusy: false,
   routerVisualEffectsEnabled: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
@@ -80,6 +80,32 @@ describe('ChatComposer image-send guard', () => {
     expect(send?.disabled).toBe(false)
     send?.click()
     expect(onSend).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('disables sending during a routing mutation without mounting a status row', async () => {
+    const onSend = vi.fn()
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(ChatComposer, {
+      ...BASE_PROPS,
+      sessionRoutingBusy: true,
+      onSend,
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
+    const send = el.querySelector<HTMLButtonElement>('.chat-send-btn')
+    expect(el.querySelector('#chat-composer-send-status')).toBeNull()
+    expect(textarea?.getAttribute('aria-describedby')).toBeNull()
+    expect(send?.disabled).toBe(true)
+    expect(send?.getAttribute('aria-busy')).toBe('true')
+    expect(send?.title).toBe('Model routing is being updated. Wait before sending.')
+    send?.click()
+    expect(onSend).not.toHaveBeenCalled()
 
     app.unmount()
   })

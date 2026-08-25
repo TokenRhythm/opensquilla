@@ -12,12 +12,15 @@ function makeRuntime(
 ) {
   const messagesRef = ref<ChatMessage[]>(messages)
   const scrollToBottom = vi.fn()
+  const activeTurnUsesEnsemble = ref(modelRoutingMode === 'llm_ensemble')
+  const activeTurnId = ref('turn-current')
   const runtime = useChatRouterDecisionRuntime({
     messages: messagesRef,
     sessionKey: ref('sess'),
     isStreaming: ref(isStreaming),
     autoScroll: ref(autoScroll),
-    modelRoutingMode: ref(modelRoutingMode),
+    activeTurnUsesEnsemble,
+    activeTurnId,
     streamBubble: ref(true),
     streamHasVisibleOutput: ref(false),
     startStreaming: vi.fn(),
@@ -26,10 +29,152 @@ function makeRuntime(
     setStreamActivity: vi.fn(),
     scrollToBottom,
   })
-  return { runtime, messagesRef, scrollToBottom }
+  return {
+    runtime,
+    messagesRef,
+    scrollToBottom,
+    activeTurnUsesEnsemble,
+    activeTurnId,
+  }
 }
 
+describe('router decision identity', () => {
+  it('reuses the live stream identity when the same decision is replayed from a snapshot', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    const decision = {
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    }
+    runtime.queueRouterDecision({ ...decision, stream_seq: 10 })
+    runtime.queueRouterDecision(decision, 10)
+    runtime.flushPendingRouterDecision()
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]?.messageId).toBe('router-sess-10')
+  })
+
+  it('reuses one generated identity when a sequence-free decision is flushed later', () => {
+    const now = vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(1_000)
+      .mockReturnValueOnce(2_000)
+    try {
+      const { runtime, messagesRef } = makeRuntime([], true, 'squilla_router')
+
+      runtime.queueRouterDecision({
+        tier: 'c1',
+        model: 'provider/first',
+        source: 'squilla_router',
+      })
+      runtime.flushPendingRouterDecision()
+
+      const routers = messagesRef.value.filter(message => message.role === 'router')
+      expect(routers).toHaveLength(1)
+      expect(routers[0]?.messageId).toBe('router-sess-1000-1')
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('keeps distinct sequence-free decisions unique inside the same millisecond', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      const { runtime, messagesRef } = makeRuntime([], true, 'squilla_router')
+
+      runtime.queueRouterDecision({
+        tier: 'c1',
+        model: 'provider/first',
+        source: 'squilla_router',
+      })
+      runtime.flushPendingRouterDecision()
+      runtime.queueRouterDecision({
+        tier: 'c2',
+        model: 'provider/second',
+        source: 'squilla_router',
+      })
+      runtime.flushPendingRouterDecision()
+
+      const routers = messagesRef.value.filter(message => message.role === 'router')
+      expect(routers.map(message => message.messageId)).toEqual([
+        'router-sess-1000-1',
+        'router-sess-1000-2',
+      ])
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('keeps emitted same-turn cards immutable and binds each physical call', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    runtime.queueRouterDecision({
+      stream_seq: 10,
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    })
+    runtime.bindRouterDecisionToModelCall('1.0', 1, 'turn-1')
+    runtime.queueRouterDecision({
+      stream_seq: 20,
+      turn_id: 'turn-1',
+      tier: 'c2',
+      model: 'provider/replay',
+      source: 'squilla_router',
+    })
+    runtime.bindRouterDecisionToModelCall('2.0', 2, 'turn-1')
+    runtime.flushPendingRouterDecision()
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(2)
+    expect(routers.map(message => [
+      message.messageId,
+      message.routerDecision?.model,
+      message.routerModelCallId,
+      message.routerIteration,
+    ])).toEqual([
+      ['router-sess-10', 'provider/first', '1.0', 1],
+      ['router-sess-20', 'provider/replay', '2.0', 2],
+    ])
+  })
+})
+
 describe('appendEnsembleProgress', () => {
+  it('normalizes every internal candidate label to the public Proposer role', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
+
+    for (const [index, label] of ['primary', 'contrast', 'fast_check', 'critic'].entries()) {
+      runtime.appendEnsembleProgress({
+        event_type: 'proposer_start',
+        proposer_index: index,
+        proposer_label: label,
+        proposer_provider: 'tokenrhythm',
+        proposer_model: `model-${index + 1}`,
+      })
+    }
+
+    const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
+    expect(models?.map(model => ({ role: model.role, label: model.label }))).toEqual([
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+    ])
+  })
+
   it('synthesizes a router message and reveals members with running → done status', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 
@@ -105,8 +250,8 @@ describe('appendEnsembleProgress', () => {
     const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
     expect(models).toHaveLength(2)
     expect(models?.[0]).toMatchObject({
-      role: 'critic',
-      label: 'critic',
+      role: 'proposer',
+      label: 'proposer',
       status: 'failed',
       elapsedMs: 118_000,
       error: 'provider timed out',
@@ -148,7 +293,7 @@ describe('appendEnsembleProgress', () => {
 
     const model = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models[0]
     expect(model).toMatchObject({
-      role: 'critic',
+      role: 'proposer',
       status: 'skipped',
       elapsedMs: 21_000,
       errorCode: 'quorum_cancelled',
@@ -208,8 +353,9 @@ describe('appendEnsembleProgress', () => {
     const routers = messagesRef.value.filter(m => m.role === 'router')
     expect(routers).toHaveLength(1)
     expect(routers[0].ensemble?.models).toHaveLength(1)
-    // The strip is upgraded onto the ensemble branch.
-    expect(routers[0].routerDecision?.source).toBe('llm_ensemble')
+    // Preserve the tier decision so the renderer can play routing first and
+    // then continue into the attached ensemble stage.
+    expect(routers[0].routerDecision?.source).toBe('squilla_router')
   })
 
   it('ignores deltas with no model and no aggregator role', () => {
@@ -220,7 +366,7 @@ describe('appendEnsembleProgress', () => {
 
   it('updates ensemble state without re-pinning a reader who scrolled up', () => {
     const { runtime, messagesRef, scrollToBottom } = makeRuntime(
-      [{ role: 'user', text: 'q', ts: 0 }],
+      [{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }],
       true,
       'llm_ensemble',
       false,
@@ -251,9 +397,55 @@ describe('appendEnsembleProgress', () => {
   })
 })
 
+describe('accepted turn routing', () => {
+  it('freezes the active ensemble fact onto an incoming router row', () => {
+    const { runtime, messagesRef, activeTurnUsesEnsemble } = makeRuntime(
+      [{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }],
+      true,
+      'llm_ensemble',
+    )
+
+    runtime.queueRouterDecision({
+      tier: 'c1',
+      model: 'deepseek/deepseek-v4-pro',
+      source: 'squilla_router',
+      turn_id: 'turn-current',
+    })
+    activeTurnUsesEnsemble.value = false
+
+    const router = messagesRef.value.find(message => message.role === 'router')
+    expect(router?.routerDecision).toMatchObject({
+      source: 'squilla_router',
+      accepted_routing_mode: 'ensemble',
+    })
+    runtime.markEnsembleHandoff()
+    expect(router?.routerState).toBe('handoff')
+  })
+
+  it('does not stamp a router decision from another turn', () => {
+    const { runtime, messagesRef } = makeRuntime(
+      [{ role: 'user', text: 'q', ts: 0, turnId: 'turn-old' }],
+      true,
+      'llm_ensemble',
+    )
+
+    runtime.queueRouterDecision({
+      tier: 'c1',
+      model: 'deepseek/deepseek-v4-pro',
+      source: 'squilla_router',
+      turn_id: 'turn-old',
+    })
+
+    const router = messagesRef.value.find(message => message.role === 'router')
+    expect(router?.routerDecision).not.toHaveProperty('accepted_routing_mode')
+  })
+})
+
 describe('markEnsembleHandoff', () => {
   it('synthesizes a handoff router message when only the reserve strip exists', () => {
-    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-current' },
+    ])
 
     runtime.markEnsembleHandoff()
 
@@ -323,12 +515,20 @@ describe('markEnsembleHandoff', () => {
       ts: 1,
       provenanceKind: 'router_decision',
       routerDecision: { tier: 'c1', model: 'deepseek/deepseek-v4-pro', source: 'squilla_router' },
+      turnId: 'turn-current',
     }
-    const { runtime } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }, router], true, 'llm_ensemble')
+    const { runtime, activeTurnUsesEnsemble } = makeRuntime(
+      [{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }, router],
+      true,
+      'llm_ensemble',
+    )
 
+    runtime.markEnsembleHandoff()
+    activeTurnUsesEnsemble.value = false
     runtime.markEnsembleHandoff()
 
     expect(router.routerState).toBe('handoff')
+    expect(router.routerDecision).toMatchObject({ accepted_routing_mode: 'ensemble' })
   })
 
   it('does not mark non-ensemble router messages', () => {
@@ -348,7 +548,7 @@ describe('markEnsembleHandoff', () => {
 
   it('marks the ensemble handoff without re-pinning a reader who scrolled up', () => {
     const { runtime, messagesRef, scrollToBottom } = makeRuntime(
-      [{ role: 'user', text: 'q', ts: 0 }],
+      [{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }],
       true,
       'llm_ensemble',
       false,

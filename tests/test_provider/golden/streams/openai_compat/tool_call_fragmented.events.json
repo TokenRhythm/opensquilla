@@ -1,16 +1,19 @@
 [
   {
+    "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "get_weather",
     "tool_use_id": "call_wire_000",
     "type": "ToolUseStartEvent"
   },
   {
+    "generation_epoch": null,
     "json_fragment": "{\"city\": \"Par",
     "tool_use_id": "call_wire_000",
     "type": "ToolUseDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "json_fragment": "is\", \"unit\": \"celsius\"}",
     "tool_use_id": "call_wire_000",
     "type": "ToolUseDeltaEvent"
@@ -20,6 +23,7 @@
       "city": "Paris",
       "unit": "celsius"
     },
+    "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "get_weather",
     "tool_use_id": "call_wire_000",
@@ -31,6 +35,7 @@
     "cached_tokens": 0,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 21,
     "model": "gpt-test-1",
     "model_usage_breakdown": [],

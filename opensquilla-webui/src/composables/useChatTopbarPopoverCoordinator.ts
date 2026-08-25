@@ -29,11 +29,11 @@ const chatTopbarPopoverCoordinatorKey: InjectionKey<ChatTopbarPopoverCoordinator
   Symbol('chat-topbar-popover-coordinator')
 
 /**
- * Arbitrate only the transient controls in the chat topbar.
+ * Arbitrate transient controls in the global topbar while enabled.
  *
  * The existing component-local refs remain the render source of truth. This
- * controller supplies one shared active identity while the chat route is
- * active, without changing independent menu behavior on every other route.
+ * controller supplies one shared active identity so sibling menus cannot
+ * overlap. Callers may still disable coordination for standalone surfaces.
  */
 export function provideChatTopbarPopoverCoordinator(
   enabled: Readonly<Ref<boolean>>,
@@ -53,9 +53,8 @@ export function provideChatTopbarPopoverCoordinator(
     },
   }
 
-  // A route boundary closes transient chat chrome. Registrations also clear
-  // their local refs when enablement changes, preventing a non-chat menu from
-  // carrying into chat (or vice versa) as an uncoordinated ghost popover.
+  // Registrations clear their local refs when enablement changes, preventing
+  // a menu from carrying between coordinated and standalone surfaces.
   watch(enabled, () => {
     activeId.value = null
   }, { flush: 'sync' })
@@ -65,7 +64,7 @@ export function provideChatTopbarPopoverCoordinator(
 }
 
 /**
- * Register a component-owned open ref with the chat-only coordinator.
+ * Register a component-owned open ref with the topbar coordinator.
  *
  * `controllerOverride` is used by App for its theme menu because a component
  * cannot inject a value that it provides to its own descendants. Standalone

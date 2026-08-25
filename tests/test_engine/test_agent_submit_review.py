@@ -26,6 +26,12 @@ from opensquilla.engine import (
     ToolResultEvent,
     WarningEvent,
 )
+from opensquilla.git_runtime import (
+    GitCapability,
+    GitCapabilityState,
+    GitRunResult,
+    GitRunState,
+)
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -365,6 +371,134 @@ async def test_confirming_submit_terminates_the_turn(tmp_path) -> None:
     # Only the confirming submit carries the terminate flag.
     assert explicit[0]["details"]["terminates_turn"] is False
     assert explicit[-1]["details"]["terminates_turn"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("git_state", "expected_code"),
+    [
+        (GitRunState.UNAVAILABLE, "GIT_UNAVAILABLE"),
+        (GitRunState.NOT_REPOSITORY, "GIT_NOT_REPOSITORY"),
+    ],
+)
+async def test_explicit_submit_git_unknown_terminates_without_empty_diff_retry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_state: GitRunState,
+    expected_code: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capability = GitCapability(
+        state=(
+            GitCapabilityState.UNAVAILABLE
+            if git_state is GitRunState.UNAVAILABLE
+            else GitCapabilityState.AVAILABLE
+        ),
+        executable=(
+            None if git_state is GitRunState.UNAVAILABLE else workspace / "git"
+        ),
+        source="test",
+        reason="git_not_found" if git_state is GitRunState.UNAVAILABLE else None,
+    )
+    result = GitRunResult(
+        state=git_state,
+        returncode=None if git_state is GitRunState.UNAVAILABLE else 128,
+        stdout=b"",
+        stderr=b"git unavailable",
+        capability=capability,
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.run_git",
+        lambda *_args, **_kwargs: result,
+    )
+    provider = _ScriptedProvider([("submit",), ("final",)])
+    tool_context = ToolContext(workspace_dir=str(workspace))
+    agent = Agent(
+        provider=provider,
+        config=_config(tmp_path),
+        tool_handler=_make_tool_handler(workspace, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Submit the work")]
+
+    submit_results = _submit_results(events)
+    assert len(provider.calls) == 1
+    assert len(submit_results) == 1
+    assert submit_results[0].is_error is True
+    payload = json.loads(submit_results[0].result)
+    assert payload["code"] == expected_code
+    assert payload["git_state"] == git_state.value
+    assert payload["retryable"] is False
+    assert "no workspace changes yet" not in submit_results[0].result
+
+
+@pytest.mark.asyncio
+async def test_implicit_submit_review_skips_git_unknown_without_retry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capability = GitCapability(
+        state=GitCapabilityState.UNAVAILABLE,
+        reason="git_not_found",
+    )
+    unavailable = GitRunResult(
+        state=GitRunState.UNAVAILABLE,
+        returncode=None,
+        stdout=b"",
+        stderr=b"git_not_found",
+        capability=capability,
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.run_git",
+        lambda *_args, **_kwargs: unavailable,
+    )
+    provider = _ScriptedProvider([("final",), ("final",)])
+    tool_context = ToolContext(workspace_dir=str(workspace))
+    agent = Agent(
+        provider=provider,
+        config=_config(tmp_path),
+        tool_handler=_make_tool_handler(workspace, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Submit the work")]
+
+    assert len(provider.calls) == 1
+    assert _review_warnings(events) == []
+    assert "submit_review_implicit_recoveries" not in agent.config.metadata
+
+
+@pytest.mark.asyncio
+async def test_submit_review_captures_staged_diff_in_unborn_repository(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
+    source = workspace / "new.py"
+    source.write_text("print('new')\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "new.py"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+    agent = Agent(
+        provider=None,  # type: ignore[arg-type]
+        config=_config(tmp_path),
+        tool_context=ToolContext(workspace_dir=str(workspace)),
+    )
+
+    capture = await agent._workspace_submit_review_capture()
+
+    assert capture is not None
+    file_index, diff_text = capture
+    assert agent._submit_review_git_state is GitRunState.OK
+    assert "A  new.py" in file_index
+    assert "diff --git a/new.py b/new.py" in diff_text
+    assert "+print('new')" in diff_text
 
 
 @pytest.mark.asyncio

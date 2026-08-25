@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 
 from opensquilla.session import manager as session_manager_module
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, CompactionResult
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     format_compaction_summary_context,
@@ -40,6 +40,7 @@ from opensquilla.session.storage import (
 from opensquilla.turn_outcome_projection import (
     attach_fork_terminal_outcome_projection,
     build_fork_terminal_outcome_projection,
+    extract_fork_terminal_outcome_projection,
 )
 
 
@@ -1522,6 +1523,25 @@ async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork
             task_id=turn_id,
             session_key=parent.session_key,
             status=AgentTaskStatus.SUCCEEDED,
+            details={
+                "turn_id": turn_id,
+                "activity_snapshot": {
+                    "version": 2,
+                    "task_id": turn_id,
+                    "turn_id": turn_id,
+                    "complete": True,
+                    "reasoning_utf16_length": 0,
+                    "entries": [{
+                        "type": "phase",
+                        "id": "provider:requesting:4",
+                        "order": 4,
+                        "kind": "provider",
+                        "phase": "requesting",
+                        "at": 1_000,
+                        "ended_at": 2_000,
+                    }],
+                },
+            },
         )
     )
     assert await manager.persist_compaction_result(
@@ -1542,6 +1562,16 @@ async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork
         "agent:main:archived-outcome-child",
         fork_transcript=True,
     )
+    child_page = await manager.get_canonical_transcript_page(child.session_key, limit=20)
+    child_entries = child_page.entries
+    child_projection = extract_fork_terminal_outcome_projection(
+        child_entries[1].turn_context,
+        session_id=child.session_id,
+        session_key=child.session_key,
+        turn_id=turn_id,
+    )
+    assert child_projection is not None
+    assert child_projection["activity_snapshot"]["entries"][0]["order"] == 4
     await manager._storage.delete_session(parent.session_key)
     assert await manager._storage.get_agent_task(turn_id) is None
 
@@ -1555,6 +1585,15 @@ async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork
         "archived question",
         "archived answer",
     ]
+    nested_entries = await manager.get_transcript(nested.session_key)
+    nested_projection = extract_fork_terminal_outcome_projection(
+        nested_entries[1].turn_context,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+        turn_id=turn_id,
+    )
+    assert nested_projection is not None
+    assert nested_projection["activity_snapshot"] == child_projection["activity_snapshot"]
 
 
 @pytest.mark.asyncio
@@ -2406,6 +2445,149 @@ async def test_compact_no_op_small_context(manager):
     assert summary == ""
 
 
+def test_compaction_payload_suppresses_split_goal_marker_around_tool_pair() -> None:
+    raw_segments = [
+        {"type": "text", "text": "NO_"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-split",
+            "name": "read_status",
+            "input": {"id": "job-split"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-split",
+            "name": "read_status",
+            "result": "pending",
+            "is_error": False,
+        },
+        {"type": "text", "text": "REPLY"},
+    ]
+    entry = TranscriptEntry(
+        session_id="session-split",
+        session_key="agent:main:split",
+        role="assistant",
+        content="NO_REPLY",
+        tool_calls=raw_segments,
+        turn_context={"intent": "goal_continuation"},
+    )
+
+    payload = session_manager_module._compaction_entry_payloads([entry])[0]
+
+    assert payload["content"] == ""
+    assert payload["tool_calls"] == [raw_segments[1], raw_segments[2]]
+    assert payload["turn_context"] == {"intent": "goal_continuation"}
+    assert "NO_" not in str(payload["tool_calls"])
+    assert "REPLY" not in str(payload["tool_calls"])
+    assert entry.content == "NO_REPLY"
+    assert entry.tool_calls == raw_segments
+
+
+@pytest.mark.asyncio
+async def test_compaction_payload_sanitizes_silent_replies_without_rewriting_storage(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:main")
+    raw_segments = [
+        {"type": "text", "text": "NO_REPLY\nWaiting for an external update."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+        {"type": "text", "text": "HEARTBEAT_OK"},
+    ]
+    goal_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "HEARTBEAT_OK\nWaiting for an external update.\nNO_REPLY",
+        tool_calls=raw_segments,
+        turn_context={"intent": "goal_continuation"},
+    )
+    await manager._storage.append_transcript_entry(
+        goal_entry,
+        expected_epoch=expected_epoch,
+    )
+    unattributed_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "NO_REPLY\nQuoted protocol example.",
+        tool_calls=[
+            {"type": "text", "text": "HEARTBEAT_OK\nQuoted segment example."}
+        ],
+        turn_context={},
+    )
+    await manager._storage.append_transcript_entry(
+        unattributed_entry,
+        expected_epoch=expected_epoch,
+    )
+    exact_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "NO_REPLY",
+        turn_context={},
+    )
+    await manager._storage.append_transcript_entry(
+        exact_entry,
+        expected_epoch=expected_epoch,
+    )
+
+    captured_payloads: list[dict[str, Any]] = []
+
+    async def capture_compaction_request(request):
+        captured_payloads.extend(request.entries)
+        return CompactionResult(
+            summary="",
+            kept_entries=request.entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+            skip_reason="within_compaction_budget",
+        )
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "compact_context",
+        capture_compaction_request,
+    )
+    stored_before = await manager._storage.get_transcript(node.session_id)
+
+    await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=100_000,
+    )
+
+    payloads = captured_payloads
+
+    assert len(payloads) == len(stored_before) == 3
+    assert payloads[0]["content"] == "Waiting for an external update."
+    assert payloads[0]["tool_calls"] == [
+        {"type": "text", "text": "Waiting for an external update."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+    ]
+    assert payloads[1]["content"] == "NO_REPLY\nQuoted protocol example."
+    assert payloads[1]["tool_calls"][0]["text"] == (
+        "HEARTBEAT_OK\nQuoted segment example."
+    )
+    assert payloads[2]["content"] == ""
+    assert payloads[2]["tool_calls"] is None
+
+    stored_after = await manager._storage.get_transcript(node.session_id)
+    assert [entry.content for entry in stored_after] == [
+        "HEARTBEAT_OK\nWaiting for an external update.\nNO_REPLY",
+        "NO_REPLY\nQuoted protocol example.",
+        "NO_REPLY",
+    ]
+    assert stored_after[0].tool_calls == raw_segments
+
+
 def test_durable_summary_replay_matches_runtime_formatter() -> None:
     summary = "portable checkpoint"
     rendered = format_compaction_summary_context([summary])
@@ -2470,6 +2652,91 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     ]
     assert canonical_contents == original_contents
     assert [entry.content for entry in transcript] == original_contents[-len(transcript) :]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_protected_recent_messages"),
+    [
+        pytest.param(
+            CompactionConfig(protected_recent_messages=1),
+            2,
+            id="explicit-protection",
+        ),
+        pytest.param(
+            CompactionConfig(compaction_profile="coding"),
+            12,
+            id="profile-protection",
+        ),
+    ],
+)
+async def test_compact_with_result_recomputes_bound_to_tail_protection(
+    manager,
+    monkeypatch,
+    config,
+    expected_protected_recent_messages,
+):
+    node = await manager.create("agent:main:protected-boundary")
+    await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    await manager.append_message(node.session_key, "user", "queued request")
+    observed: dict[str, Any] = {}
+
+    async def compact_context_spy(request):
+        observed["protected_recent_messages"] = request.config.protected_recent_messages
+        return CompactionResult(
+            summary="",
+            kept_entries=request.entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+        )
+
+    monkeypatch.setattr(session_manager_module, "compact_context", compact_context_spy)
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1_000,
+        config=config,
+        protected_boundary_message_id=active_user.message_id,
+    )
+
+    assert result.removed_count == 0
+    assert observed["protected_recent_messages"] == expected_protected_recent_messages
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_missing_protected_boundary_fails_closed(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:missing-protected-boundary")
+    entry = await manager.append_message(node.session_key, "user", "active request")
+
+    async def unexpected_compact_context(request):  # noqa: ARG001
+        raise AssertionError("compaction must not run without the protected boundary")
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "compact_context",
+        unexpected_compact_context,
+    )
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1_000,
+        protected_boundary_message_id="missing-message-id",
+    )
+
+    assert result.summary == ""
+    assert result.removed_count == 0
+    assert result.skip_reason == "protected_boundary_missing"
+    transcript = await manager.get_transcript(node.session_key)
+    assert [candidate.message_id for candidate in transcript] == [entry.message_id]
+    current = await manager.get_session(node.session_key)
+    assert current is not None
+    assert current.compaction_count == 0
 
 
 def test_compaction_singleflight_target_fingerprint_is_credential_aware():
@@ -3434,6 +3701,29 @@ async def test_persist_compaction_result_preserves_structured_tail_metadata(mana
     assert transcript[0].reasoning_content == "signed reasoning"
     assert transcript[1].tool_call_id == "tool-live"
     assert transcript[1].content == "result"
+
+
+@pytest.mark.asyncio
+async def test_capture_compaction_source_uses_supplied_transcript_entries(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:capture-snapshot")
+    await manager.append_message(node.session_key, "user", "old question")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    transcript = await manager.get_transcript(node.session_key)
+    get_transcript = AsyncMock(side_effect=AssertionError("unexpected transcript reread"))
+    monkeypatch.setattr(manager, "get_transcript", get_transcript)
+
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+        transcript_entries=transcript,
+    )
+
+    get_transcript.assert_not_awaited()
+    assert source.entries == tuple(transcript)
+    assert source.boundary_message_id == active_user.message_id
 
 
 @pytest.mark.asyncio

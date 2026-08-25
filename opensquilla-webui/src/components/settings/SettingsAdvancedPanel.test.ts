@@ -12,23 +12,39 @@ afterEach(() => {
 })
 
 describe('SettingsAdvancedPanel data maintenance entry', () => {
-  it('keeps maintenance low in Advanced and emits navigation only after activation', async () => {
+  it('keeps memory controls in Advanced and maintenance last', async () => {
     vi.resetModules()
     vi.doMock('@/components/settings/MemoryLearningGroup.vue', () => ({
-      default: { template: '<div />' },
+      default: { template: '<div data-testid="memory-learning-group" />' },
     }))
     const { createApp, nextTick } = await import('vue')
     const i18n = (await import('@/i18n')).default
     i18n.global.locale.value = 'en'
     const Component = (await import('./SettingsAdvancedPanel.vue')).default
     const openDataMaintenance = vi.fn()
+    const updateAutoCapture = vi.fn()
     const el = document.createElement('div')
     document.body.appendChild(el)
-    const app = createApp(Component, { onOpenDataMaintenance: openDataMaintenance })
+    const app = createApp(Component, {
+      autoCapture: true,
+      loaded: true,
+      onOpenDataMaintenance: openDataMaintenance,
+      onUpdateAutoCapture: updateAutoCapture,
+    })
     app.use(i18n)
     app.mount(el)
     mounted.push(app)
     await nextTick()
+
+    const memoryGroup = el.querySelector<HTMLElement>('[data-testid="advanced-memory-group"]')!
+    const capture = memoryGroup.querySelector<HTMLInputElement>('input[name="memory_auto_capture"]')!
+    expect(memoryGroup.textContent).toContain('Memory')
+    expect(memoryGroup.querySelector('[data-testid="memory-learning-group"]')).toBeTruthy()
+    expect(capture.checked).toBe(true)
+    capture.checked = false
+    capture.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    expect(updateAutoCapture).toHaveBeenCalledWith(false)
 
     const rows = el.querySelectorAll('.control-row')
     const maintenance = el.querySelector<HTMLElement>('[data-testid="advanced-data-maintenance"]')!

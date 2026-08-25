@@ -329,7 +329,8 @@ async def test_artifact_rpc_offloads_store_reads_to_threads(
     calls: list[str] = []
 
     async def _record_to_thread(func, /, *args, **kwargs):
-        calls.append(func.__name__)
+        if isinstance(getattr(func, "__self__", None), ArtifactStore):
+            calls.append(func.__name__)
         return await original_to_thread(func, *args, **kwargs)
 
     monkeypatch.setattr(rpc_artifacts.asyncio, "to_thread", _record_to_thread)
@@ -365,9 +366,10 @@ async def test_artifacts_list_hides_directory_errors_as_retryable_unavailable(
     )
 
     assert result.error is not None
-    assert result.error.code == "UNAVAILABLE"
+    assert result.error.code == "DOCUMENT_UNAVAILABLE"
     assert result.error.retryable is True
-    assert result.error.message == "Artifact storage is temporarily unavailable."
+    assert result.error.accepted is False
+    assert result.error.message == "This page is temporarily unavailable. Try again."
     assert sensitive_path not in result.error.message
 
 
@@ -402,9 +404,10 @@ async def test_artifacts_get_hides_directory_errors_as_retryable_unavailable(
     )
 
     assert result.error is not None
-    assert result.error.code == "UNAVAILABLE"
+    assert result.error.code == "DOCUMENT_UNAVAILABLE"
     assert result.error.retryable is True
-    assert result.error.message == "Artifact storage is temporarily unavailable."
+    assert result.error.accepted is False
+    assert result.error.message == "This page is temporarily unavailable. Try again."
     assert sensitive_path not in result.error.message
 
 

@@ -314,6 +314,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
             "selectionMode": "router_dynamic",
             "modelOptions": ["prov/model-a", "prov/model-b"],
             "minSuccessfulProposers": 2,
+            "proposerMaxRetries": 2,
             "allFailedPolicy": "error",
         },
     )
@@ -325,7 +326,9 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
+    assert ensemble["proposer_max_retries"] == 2
     assert ensemble["all_failed_policy"] == "error"
+    assert engine.warnings == []
 
     # A partial payload must only touch the keys it names.
     second = SetupEngine(path=target)
@@ -338,6 +341,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
+    assert ensemble["proposer_max_retries"] == 2
     assert ensemble["all_failed_policy"] == "error"
 
     with pytest.raises(ValueError, match="modelOptions must be a list"):

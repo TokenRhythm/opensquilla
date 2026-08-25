@@ -80,6 +80,28 @@ interface UsageStatusResult {
   total_tokens?: number
 }
 
+const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
+  '/coding',
+  '/compact',
+  '/goal',
+  '/new',
+  '/plan',
+  '/reset',
+  '/usage',
+  'coding.mode',
+  'compact_context',
+  'goal.set',
+  'meta.menu',
+  'new_chat',
+  'plans.setMode',
+  'plans.toggleMode',
+  'reset_session',
+  'sessions.contextCompact',
+  'sessions.reset',
+  'usage.status',
+  'usage_status',
+])
+
 export interface UseChatSlashCommandsOptions {
   rpc: RpcClient
   catalogCallOptions?: RpcCallOptions
@@ -142,6 +164,8 @@ export interface MetaCommandInvocation {
 
 export type DurableMetaDraft = MetaLaunchDraftPayload
 
+export type SlashCommandClassification = 'registered' | 'unknown' | 'unavailable'
+
 export function parseMetaCommandInvocation(args: string): MetaCommandInvocation | null {
   const trimmed = String(args || '').trim()
   if (!trimmed) return null
@@ -198,6 +222,48 @@ function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
       }))
       .filter((c) => c.value),
   }
+}
+
+function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const command = value as SlashCommandPayload
+  const isValidKey = (candidate: unknown): candidate is string => {
+    if (typeof candidate !== 'string') return false
+    const trimmedKey = candidate.trim()
+    return Boolean(
+      trimmedKey
+      && !/\s/.test(trimmedKey)
+      && slashCommandKey(trimmedKey).length > 1,
+    )
+  }
+  const declaredKeys = [command.name, command.cmd]
+  if (!declaredKeys.some(isValidKey)) return false
+  if (declaredKeys.some(key => key !== undefined && !isValidKey(key))) return false
+  if (
+    command.aliases !== undefined
+    && (
+      !Array.isArray(command.aliases)
+      || !command.aliases.every(isValidKey)
+    )
+  ) return false
+  if (command.execution !== undefined) {
+    if (
+      !command.execution
+      || typeof command.execution !== 'object'
+      || Array.isArray(command.execution)
+    ) return false
+    if (
+      command.execution.action !== undefined
+      && (
+        typeof command.execution.action !== 'string'
+        || !command.execution.action.trim()
+      )
+    ) return false
+  }
+  const rawAction = command.execution?.action || command.name || command.cmd
+  return typeof rawAction === 'string'
+    && rawAction === rawAction.trim()
+    && SUPPORTED_WEB_SLASH_ACTIONS.has(rawAction)
 }
 
 function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): ChatSlashCommand {
@@ -426,7 +492,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
             'commands.list_for_surface',
             params,
           )
-      slashCmds.value = (Array.isArray(res?.commands) ? res.commands : []).map(normalizeSlashCommand)
+      if (
+        !Array.isArray(res?.commands)
+        || !res.commands.every(isValidSlashCommandPayload)
+      ) throw new Error('invalid command catalog')
+      slashCmds.value = res.commands.map(normalizeSlashCommand)
       if (
         options.activatePlanMode
         && (options.planModeAvailable?.() ?? true)
@@ -732,7 +802,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         })
         break
       }
-      case 'goal.set': {
+      case 'goal.set':
+      case '/goal': {
         const goalText = String(args || '').trim()
         const first = goalText.split(/\s+/, 1)[0]?.toLowerCase() || ''
         const remainder = first ? goalText.slice(first.length).trim() : ''
@@ -827,23 +898,39 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
   }
 
-  async function executeSlashCommand(text: string): Promise<boolean> {
-    if (!slashCatalogLoaded.value) await loadSlashCommands()
+  async function executeSlashCommand(
+    text: string,
+    knownClassification?: SlashCommandClassification,
+  ): Promise<boolean> {
+    const classification = knownClassification ?? await classifySlashCommand(text)
     const trimmed = text.trim()
     const firstWhitespace = trimmed.search(/\s/)
     const cmdText = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace)
     const args = firstWhitespace === -1 ? '' : trimmed.slice(firstWhitespace).trimStart()
+    if (classification === 'unavailable') {
+      closeSlashMenu()
+      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
+      return true
+    }
     const commandKey = slashCommandKey(cmdText)
     const cmd = slashCmds.value.find(command =>
       slashCommandKeys(command).includes(commandKey),
     )
     if (!cmd) {
       closeSlashMenu()
-      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
-      return true
+      return false
     }
     selectSlashCmd(cmd, args)
     return true
+  }
+
+  async function classifySlashCommand(text: string): Promise<SlashCommandClassification> {
+    if (!slashCatalogLoaded.value) await loadSlashCommands()
+    if (!slashCatalogLoaded.value) return 'unavailable'
+    const commandKey = slashCommandKey(text)
+    return slashCmds.value.some(command => slashCommandKeys(command).includes(commandKey))
+      ? 'registered'
+      : 'unknown'
   }
 
   return {
@@ -857,6 +944,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     completeSlashCmd,
     activateSlashCmd,
     selectSlashCmd,
+    classifySlashCommand,
     executeSlashCommand,
     restoreDurableMetaDrafts,
   }

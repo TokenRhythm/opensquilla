@@ -1,5 +1,6 @@
 [
   {
+    "generation_epoch": null,
     "text": "Hi.",
     "type": "TextDeltaEvent"
   },
@@ -9,6 +10,7 @@
     "cached_tokens": 3,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 7,
     "model": "gpt-test-1",
     "model_usage_breakdown": [],

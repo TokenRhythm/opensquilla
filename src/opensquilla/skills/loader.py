@@ -17,6 +17,7 @@ from typing import Any
 import structlog
 
 from opensquilla.paths import default_opensquilla_home
+from opensquilla.skills.file_hash import _TreeChangedDuringHashError
 from opensquilla.skills.manifest import (
     MAX_SKILL_FILE_BYTES,
     SkillCompileProfile,
@@ -448,6 +449,47 @@ class SkillLoader:
         with self._refresh_lock:
             return self._publication_barrier_snapshot or self._catalog
 
+    def snapshot_for_turn(self, reason: str = "turn") -> SkillCatalogSnapshot:
+        """Return the catalog visible to one turn, probing only when needed.
+
+        A published, clean generation is immutable, so ordinary turns can pin
+        it without touching Skill roots. Initial loads and known invalidations
+        retain the existing full manifest/tree verification path.
+        """
+        started = time.monotonic()
+        with self._refresh_lock:
+            visible = self._publication_barrier_snapshot or self._catalog
+            if self._publication_barrier_depth or self._mutation_depth:
+                self._log_turn_resolution(visible, started, "barrier")
+                return visible
+            if self._initialized and not self._dirty:
+                self._log_turn_resolution(visible, started, "snapshot")
+                return visible
+        result = self.refresh_if_changed(reason=reason)
+        visible = self.snapshot()
+        self._log_turn_resolution(
+            visible,
+            started,
+            "rebuild" if result.changed else "probe",
+        )
+        return visible
+
+    @staticmethod
+    def _log_turn_resolution(
+        snapshot: SkillCatalogSnapshot,
+        started: float,
+        phase: str,
+    ) -> None:
+        if structlog.is_configured():
+            log.debug(
+                "skill_catalog.turn_resolved",
+                catalog_resolve_ms=round((time.monotonic() - started) * 1000, 3),
+                phase=phase,
+                generation=snapshot.generation,
+                skills=len(snapshot.skills),
+                entries=len(snapshot.manifest),
+            )
+
     def freeze_catalog_for_recovery(self, *, reason: str = "recovery-required") -> None:
         """Quarantine managed bytes while retaining their published LKG.
 
@@ -539,6 +581,21 @@ class SkillLoader:
         with self._refresh_lock:
             self._dirty = True
             self._dirty_reason = reason
+        if structlog.is_configured():
+            log.debug("skill_catalog.invalidated", reason=reason)
+
+    def watch_roots(self) -> tuple[Path, ...]:
+        """Return configured Skill roots without probing their contents."""
+        with self._refresh_lock:
+            roots: list[Path] = []
+            seen: set[str] = set()
+            for root, _layer in self._get_layer_dirs():
+                key = os.path.normcase(os.path.abspath(os.fspath(root)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(root)
+            return tuple(roots)
 
     @contextmanager
     def mutation_guard(self, reason: str = "mutation") -> Iterator[None]:
@@ -927,7 +984,6 @@ class SkillLoader:
         started = time.monotonic()
         observed_generation = self._catalog.generation
         with self._refresh_lock:
-            self._last_probe_at = time.monotonic()
             old = self._catalog
             if self._initialized and observed_generation != old.generation and not self._dirty:
                 return self._last_refresh_result
@@ -944,6 +1000,7 @@ class SkillLoader:
             dirty = self._dirty
             effective_reason = self._dirty_reason or reason
             if self._initialized and not force and not dirty and manifest == old.manifest:
+                self._last_probe_at = time.monotonic()
                 return self._unchanged_result(old)
 
             if (
@@ -1034,6 +1091,7 @@ class SkillLoader:
             if not catalog_changed:
                 self._dirty = False
                 self._dirty_reason = ""
+                self._last_probe_at = time.monotonic()
                 return self._unchanged_result(old)
 
             candidate = SkillCatalogSnapshot(
@@ -1423,6 +1481,7 @@ class SkillLoader:
         self._initialized = True
         self._dirty = False
         self._dirty_reason = ""
+        self._last_probe_at = time.monotonic()
         try:
             self._write_snapshot(catalog)
         except (OSError, TypeError, ValueError):
@@ -1443,6 +1502,8 @@ class SkillLoader:
                 removed=len(removed),
                 modified=len(modified),
                 errors=len(catalog.errors),
+                skills=len(catalog.skills),
+                entries=len(catalog.manifest),
                 elapsed_ms=elapsed_ms,
                 initial=initial,
             )
@@ -1551,6 +1612,14 @@ class SkillLoader:
             )
             skill.tree_digest = compute_tree_sha256(skill_dir)
             return skill
+        except _TreeChangedDuringHashError:
+            # A tree digest is an integrity boundary, not a per-Skill parse
+            # concern.  Publishing a catalog that silently omits this Skill
+            # could make a metadata-only race permanent because the cheap
+            # manifest probe may see no subsequent change.  Let the catalog
+            # refresh fail atomically so cold starts retry and warm loaders
+            # retain their complete last-known-good snapshot.
+            raise
         except Exception as exc:
             log.debug("skill.load_failed", dir=str(skill_dir), error=str(exc))
             return None

@@ -13,6 +13,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
 )
@@ -450,6 +451,7 @@ class GatewayClient:
         params: dict[str, Any] = {
             "minProtocol": 1,
             "maxProtocol": 3,
+            "caps": [ANSWER_GENERATION_RESET_CAPABILITY],
             "role": "operator",
             "scopes": ["operator.admin"],
         }
@@ -891,6 +893,27 @@ class GatewayClient:
         result = await self._call("models.routing.set", {"mode": mode})
         return result if isinstance(result, dict) else {}
 
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        result = await self._call("sessions.routing.get", {"sessionKey": key})
+        return result if isinstance(result, dict) else {}
+
+    async def set_session_routing(
+        self,
+        key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        result = await self._call(
+            "sessions.routing.set",
+            {
+                "sessionKey": key,
+                "mode": mode,
+                "expectedRevision": expected_revision,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
     async def usage_status(self) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("usage.status", {}))
 
@@ -1297,6 +1320,16 @@ def _advance_gateway_turn_event(
         payload = _normalize_session_error_payload(payload)
     if task_terminal := _task_terminal_as_session_event(event_name, payload):
         return task_terminal, not active_task_groups
+
+    # A terminal generation reset is already the canonical visible failure.
+    # Stop this turn subscription on that frame so the TaskRuntime's later
+    # task.failed bookkeeping event cannot be projected as a second generic
+    # session.error that overwrites the reset result.
+    if (
+        event_name == "session.event.answer_generation_reset"
+        and payload.get("terminal") is True
+    ):
+        return {"event": event_name, **payload}, True
 
     group_id = payload.get("group_id")
     active_group_event = event_name in {

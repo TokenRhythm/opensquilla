@@ -9,6 +9,15 @@ function successResponse(id: string, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
 
+function replyToPing(
+  ws: { send(message: string): void },
+  frame: { type?: unknown },
+): boolean {
+  if (frame?.type !== 'ping') return false
+  ws.send(JSON.stringify({ type: 'pong' }))
+  return true
+}
+
 function helloResponse(tickIntervalMs: number) {
   return JSON.stringify({
     protocol: 3,
@@ -90,6 +99,7 @@ test('keeps the conversation usable while startup and long history are delayed',
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(30000))
@@ -254,6 +264,7 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
@@ -346,6 +357,7 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(30000))
@@ -429,6 +441,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   let heldHistoryRequests = 0
   let heldSubscribeRequests = 0
   let recoveredHistorySocket = 0
+  let recoveredSubscribeSocket = 0
   const tickSenders: Array<() => void> = []
 
   await page.clock.install({ time: new Date('2026-07-28T00:00:00Z') })
@@ -457,6 +470,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(1000))
@@ -496,6 +510,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
             heldSubscribeRequests += 1
             return
           }
+          recoveredSubscribeSocket = socketId
           ws.send(successResponse(String(frame.id), {
             subscribed: true,
             replay_complete: true,
@@ -528,7 +543,11 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   // Advance past the 15-second aggregate bootstrap budget one second at a
   // time, delivering a server tick after each increment. This models a socket
   // that remains healthy while individual RPCs never produce responses.
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1)
+  // Leave enough headroom for the RPC round-trip between reading the mocked
+  // clock and pausing it. A 1 ms target can already be in the past on a busy
+  // hosted runner, which makes Playwright reject the retry before exercising
+  // the recovery contract.
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000)
   for (let elapsed = 0; elapsed < 16_000; elapsed += 1000) {
     await page.clock.runFor(1000)
     tickSenders.forEach(sendTick => sendTick())
@@ -555,8 +574,24 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   const liveFailure = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
   )
-  await expect(liveFailure).toBeVisible()
-  await liveFailure.getByTestId('chat-session-recovery-retry').click()
+  // The page clock is paused for this deterministic timeout scenario. Keep
+  // advancing it after the history retry so an in-flight subscribe on the
+  // recycled socket can either recover or reach its bounded degraded state.
+  for (let elapsed = 0; elapsed < 16_000 && !await send.isEnabled(); elapsed += 1000) {
+    await page.clock.runFor(1000)
+    tickSenders.forEach(sendTick => sendTick())
+  }
+  // Depending on whether the replacement socket connected before or after
+  // recovery was allowed, the live phase may already be ready or may expose
+  // its explicit retry control. Both paths must converge without losing the
+  // recovered history or composer draft.
+  await expect.poll(async () => (
+    (await send.isEnabled()) || (await liveFailure.isVisible())
+  )).toBe(true)
+  if (await liveFailure.isVisible()) {
+    await liveFailure.getByTestId('chat-session-recovery-retry').click()
+  }
+  await expect.poll(() => recoveredSubscribeSocket).toBeGreaterThan(1)
   await expect(liveFailure).toHaveCount(0)
   await expect(send).toBeEnabled()
   await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
@@ -590,6 +625,7 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(1000))
@@ -642,15 +678,18 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
   await expect(composer).toBeEditable()
   await expect(send).toBeDisabled()
 
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1)
-  for (let elapsed = 0; elapsed < 16_000; elapsed += 1000) {
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000)
+  const liveFailure = page.locator(
+    '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
+  )
+  // A replacement socket can begin one fresh bounded live-recovery budget
+  // after the original subscribe stalls. Advance through both budgets instead
+  // of assuming the first 16 seconds always lands on the terminal frame.
+  for (let elapsed = 0; elapsed < 40_000 && !await liveFailure.isVisible(); elapsed += 1000) {
     await page.clock.runFor(1000)
     tickSenders.forEach(sendTick => sendTick())
   }
 
-  const liveFailure = page.locator(
-    '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
-  )
   await expect(liveFailure).toBeVisible()
   await expect(composer).toHaveValue(taskText)
   await composer.press('Enter')
@@ -675,6 +714,7 @@ test('cancels delayed auto-send when the user edits the draft before live is rea
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(30000))
@@ -738,6 +778,7 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(30000))
@@ -826,6 +867,7 @@ test('ignores a late history response after navigating to another session', asyn
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(30000))

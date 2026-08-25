@@ -57,15 +57,10 @@ function ordinaryChip(label: string): SuggestionChip {
   return { label, prompt: label }
 }
 
-const buildGameChip = computed<SuggestionChip>(() => ({
-  label: t('chat.chips.buildGame'),
-  prompt: t('chat.chips.buildGamePrompt'),
-}))
-
 // Rendered immediately so a late capability lookup swaps labels in place
 // instead of shifting the landing layout, and kept whenever the lookup fails.
 const FALLBACK_CHIPS = computed(() => [
-  buildGameChip.value,
+  ordinaryChip(t('chat.chips.buildGame')),
   ordinaryChip(t('chat.chips.summarizeWebpage')),
   ordinaryChip(t('chat.chips.planWeek')),
 ])
@@ -93,7 +88,7 @@ const chips = computed(() => {
   }
   derived.push(
     ordinaryChip(t('chat.chips.summarizeWebpage')),
-    buildGameChip.value,
+    ordinaryChip(t('chat.chips.buildGame')),
   )
   if (derived.length < 3) derived.push(ordinaryChip(t('chat.chips.planWeek')))
   return derived.slice(0, 4)

@@ -1,4 +1,4 @@
-import { computed, ref, type Ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 
 import {
   optionalSessionRpcCallOptions,
@@ -117,6 +117,26 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
   let requestSequence = 0
   let activeRequestController: AbortController | null = null
   let suppressNextReconnectLoad = false
+  let streamRefreshPending = false
+
+  // Artifact events are intentionally also kept in the transient turn stream
+  // for mixed-version compatibility. A publication, however, must survive the
+  // next turn's stream reset. Refresh the durable index whenever a new live
+  // artifact identity appears so the event becomes a stable session resource
+  // before that transient source is cleared.
+  const stopStreamArtifactRefresh = watch(
+    () => options.streamArtifacts.value.map(artifactIdentity).filter(Boolean).join('\0'),
+    (current, previous) => {
+      if (!current || current === previous || !String(options.sessionKey.value || '').trim()) {
+        return
+      }
+      if (loading.value) {
+        streamRefreshPending = true
+        return
+      }
+      void load()
+    },
+  )
 
   const historyArtifacts = computed<ArtifactPayload[]>(() =>
     options.messages.value.flatMap(message => message.artifacts || []),
@@ -148,6 +168,7 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
     loading.value = false
     indexAvailable.value = false
     suppressNextReconnectLoad = false
+    streamRefreshPending = false
   }
 
   async function load(): Promise<boolean> {
@@ -266,6 +287,10 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
       if (isCurrentRequest()) {
         if (activeRequestController === controller) activeRequestController = null
         loading.value = false
+        if (streamRefreshPending) {
+          streamRefreshPending = false
+          queueMicrotask(() => void load())
+        }
       }
     }
   }
@@ -278,6 +303,11 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
     return load()
   }
 
+  function cleanup() {
+    stopStreamArtifactRefresh()
+    reset()
+  }
+
   return {
     artifacts,
     indexedArtifacts,
@@ -286,6 +316,6 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
     load,
     loadAfterReconnect,
     reset,
-    cleanup: reset,
+    cleanup,
   }
 }

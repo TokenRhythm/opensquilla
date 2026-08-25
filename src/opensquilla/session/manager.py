@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.session.compaction import (
@@ -29,6 +30,7 @@ from opensquilla.session.compaction import (
     await_compaction_phase,
     compact_context,
     compaction_remaining_seconds,
+    effective_protected_recent_messages,
     require_compaction_time,
 )
 from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
@@ -59,6 +61,7 @@ from opensquilla.session.storage import (
     SessionStorage,
 )
 from opensquilla.session.tokenizer import estimate_tokens
+from opensquilla.silent_reply import sanitize_historical_silent_reply
 from opensquilla.turn_outcome_projection import (
     attach_fork_terminal_outcome_projection,
     build_fork_terminal_outcome_projection,
@@ -71,6 +74,7 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+_MODEL_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,21 +349,33 @@ def _successful_submit_plan_input(
 
 
 def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": e.id,
-            "message_id": e.message_id,
-            "role": e.role,
-            "content": e.content or "",
-            "token_count": e.token_count,
-            "tool_calls": e.tool_calls,
-            "tool_call_id": e.tool_call_id,
-            "reasoning_content": e.reasoning_content,
-            "turn_usage": e.turn_usage,
-            "turn_context": e.turn_context,
-        }
-        for e in entries
-    ]
+    payloads: list[dict[str, Any]] = []
+    for entry in entries:
+        silent_reply = sanitize_historical_silent_reply(
+            entry.content or "",
+            entry.tool_calls,
+            role=entry.role,
+            turn_context=entry.turn_context,
+        )
+        # Preserve a strict one-to-one mapping with the durable preimage. The
+        # compactor's removed_count and kept-entry suffix are positional, so a
+        # fully suppressed row projects to empty content instead of being
+        # deleted from this request-scoped view.
+        payloads.append(
+            {
+                "id": entry.id,
+                "message_id": entry.message_id,
+                "role": entry.role,
+                "content": silent_reply.content or "",
+                "token_count": entry.token_count,
+                "tool_calls": silent_reply.segments,
+                "tool_call_id": entry.tool_call_id,
+                "reasoning_content": entry.reasoning_content,
+                "turn_usage": entry.turn_usage,
+                "turn_context": entry.turn_context,
+            }
+        )
+    return payloads
 
 
 def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...], ...]:
@@ -482,6 +498,19 @@ def _entry_turn_id(entry: TranscriptEntry) -> str | None:
     return turn_id_from_context(entry.turn_context)
 
 
+def _accepted_routing_mode_from_task_details(details: object) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    accepted_routing = details.get("accepted_model_routing")
+    if not isinstance(accepted_routing, dict):
+        return None
+    mode = accepted_routing.get("effective_mode")
+    if not isinstance(mode, str):
+        return None
+    normalized = mode.strip().lower()
+    return normalized if normalized in _MODEL_ROUTING_MODES else None
+
+
 def _is_promoted_turn_entry(entry: TranscriptEntry) -> bool:
     return isinstance(entry.turn_context, dict) and (
         entry.turn_context.get("disposition") == "promoted"
@@ -577,6 +606,7 @@ class SessionManager:
         task_runtime: Any = None,
         checkpoint_workspace_dir: str | Path | None = None,
         media_root: str | Path | None = None,
+        model_routing_mode_provider: Callable[[], str] | None = None,
     ) -> None:
         self._storage = storage
         self._memory_sync_notify = memory_sync_notify
@@ -592,6 +622,7 @@ class SessionManager:
         # Attachment/artifact media root, used to carry material into forked
         # children; None disables the copy (e.g. in tests that never touch disk).
         self._media_root = Path(media_root).expanduser() if media_root is not None else None
+        self._model_routing_mode_provider = model_routing_mode_provider
         # In-process epoch cache so _emit_to_subscribers can
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
@@ -636,6 +667,58 @@ class SessionManager:
             now = datetime.now(tz=UTC)
             tz_name = "UTC"
         return _stamp_time_prefix(content, now, tz_name)
+
+    def _default_model_routing_mode(self) -> str:
+        """Return the global mode used to initialize a new session."""
+
+        provider = self._model_routing_mode_provider
+        raw = provider() if callable(provider) else "direct"
+        mode = str(raw or "").strip().lower()
+        if mode not in _MODEL_ROUTING_MODES:
+            # A malformed provider must not create a session with an implicit
+            # inherit state. Direct is the established safe global fallback.
+            return "direct"
+        return mode
+
+    def _prepare_new_session_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(kwargs)
+        supplied = prepared.get("model_routing_mode")
+        if supplied is None:
+            prepared["model_routing_mode"] = self._default_model_routing_mode()
+            return prepared
+        mode = str(supplied).strip().lower()
+        if mode not in _MODEL_ROUTING_MODES:
+            raise ValueError("model_routing_mode must be direct, router, or ensemble")
+        prepared["model_routing_mode"] = mode
+        return prepared
+
+    async def get_session_routing(
+        self,
+        session_key: str,
+        *,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Resolve the durable session mode, materializing a legacy NULL once."""
+
+        return await self._storage.resolve_model_routing_mode(
+            canonicalize_session_key(session_key),
+            fallback_mode,
+        )
+
+    async def set_session_routing(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set the user-selected routing strategy for one session."""
+
+        return await self._storage.set_model_routing_mode(
+            canonicalize_session_key(session_key),
+            mode,
+            expected_revision=expected_revision,
+        )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -708,6 +791,7 @@ class SessionManager:
         if resolved is SessionIntent.NEW_CHAT and existing is not None:
             raise ValueError("session_key conflict")
         if existing is None:
+            create_kwargs = self._prepare_new_session_kwargs(create_kwargs)
             node = self._build_session_node(
                 session_key,
                 agent_id=agent_id,
@@ -746,7 +830,11 @@ class SessionManager:
         if existing is not None:
             raise ValueError(f"Session already exists: {session_key}")
 
-        node = self._build_session_node(session_key, agent_id=agent_id, **kwargs)
+        node = self._build_session_node(
+            session_key,
+            agent_id=agent_id,
+            **self._prepare_new_session_kwargs(kwargs),
+        )
         await self._storage.upsert_session(node)
         return node
 
@@ -1340,6 +1428,8 @@ class SessionManager:
                         started_at=snapshot.get("started_at"),
                         finished_at=snapshot.get("finished_at"),
                         outcome=snapshot["outcome"],
+                        accepted_routing_mode=snapshot.get("accepted_routing_mode"),
+                        activity_snapshot=snapshot.get("activity_snapshot"),
                     )
                     continue
 
@@ -1367,6 +1457,12 @@ class SessionManager:
                     "finished_at": getattr(row, "finished_at", None),
                     "outcome": outcome,
                 }
+                accepted_routing_mode = _accepted_routing_mode_from_task_details(details)
+                if accepted_routing_mode is not None:
+                    snapshot["accepted_routing_mode"] = accepted_routing_mode
+                activity_snapshot = details.get("activity_snapshot")
+                if isinstance(activity_snapshot, dict):
+                    snapshot["activity_snapshot"] = activity_snapshot
             elif turn_id not in invalid_turn_ids:
                 snapshot = source_projections.get(turn_id)
 
@@ -1381,6 +1477,8 @@ class SessionManager:
                 started_at=snapshot.get("started_at"),
                 finished_at=snapshot.get("finished_at"),
                 outcome=snapshot["outcome"],
+                accepted_routing_mode=snapshot.get("accepted_routing_mode"),
+                activity_snapshot=snapshot.get("activity_snapshot"),
             )
 
         return _ForkTerminalOutcomeResolution(
@@ -1452,6 +1550,13 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        # A fork must never inherit a legacy NULL into the future.  Resolve the
+        # parent under its durable row first, then give the child an independent
+        # CAS generation for its copied concrete selection.
+        parent_routing = await self.get_session_routing(
+            parent_session_key,
+            fallback_mode=self._default_model_routing_mode(),
+        )
 
         now = _now_ms()
         child = SessionNode(
@@ -1472,6 +1577,8 @@ class SessionManager:
             display_name=display_name,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            model_routing_mode=str(parent_routing["mode"]),
+            model_routing_revision=0,
         )
 
         if fork_transcript:
@@ -1719,6 +1826,10 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        parent_routing = await self.get_session_routing(
+            parent_session_key,
+            fallback_mode=self._default_model_routing_mode(),
+        )
         parent_coverage = await self._storage.get_canonical_transcript_coverage(
             parent.session_id
         )
@@ -1757,6 +1868,8 @@ class SessionManager:
             forked_from_parent=True,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            model_routing_mode=str(parent_routing["mode"]),
+            model_routing_revision=0,
         )
         child.compaction_count = (
             0
@@ -1817,11 +1930,11 @@ class SessionManager:
     ) -> None:
         """Carry a parent session's attachment/artifact material into a forked child.
 
-        ``branch`` copies transcript rows, but the artifact and attachment material
-        stores are keyed by session id, so without this the child's generated images,
-        generated files, and uploaded attachments resolve to an empty bucket and fail
-        to preview or replay. Runs off the event loop and never raises: a copy failure
-        must not abort the fork, whose session row is committed by the caller next.
+        ``branch`` copies transcript rows, but artifact and attachment material stores
+        are keyed by session id. ArtifactSession documents additionally need a new,
+        generation-one metadata lineage that points back to each parent's current head.
+        Runs off the event loop where appropriate and never raises: a copy failure must
+        not abort the fork, whose session row is committed by the caller next.
         """
         media_root = self._media_root
         if media_root is None:
@@ -1831,20 +1944,30 @@ class SessionManager:
         _log = _structlog.get_logger(__name__)
 
         attachment_hashes: set[str] | None = None
-        artifact_ids: set[str] | None = None
+        transcript_artifact_ids: set[str] | None = None
         if material_references is not None:
-            attachment_hashes, artifact_ids = material_references
+            attachment_hashes, transcript_artifact_ids = material_references
 
-        def _run() -> None:
+        def _copy_files(head_artifact_ids: tuple[str, ...]) -> None:
             from opensquilla.artifacts import ArtifactStore
-            from opensquilla.attachment_refs import copy_transcript_material
 
-            ArtifactStore(media_root).copy_session_artifacts(
+            store = ArtifactStore(media_root)
+            store.copy_session_artifacts(
                 source_session_id=source_session_id,
                 target_session_id=target_session_id,
                 target_session_key=target_session_key,
-                artifact_ids=artifact_ids,
+                artifact_ids=transcript_artifact_ids,
             )
+            store.copy_artifact_heads_for_fork(
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+                target_session_key=target_session_key,
+                artifact_ids=head_artifact_ids,
+            )
+
+        def _copy_attachments() -> None:
+            from opensquilla.attachment_refs import copy_transcript_material
+
             copy_transcript_material(
                 media_root=media_root,
                 source_session_id=source_session_id,
@@ -1853,7 +1976,26 @@ class SessionManager:
             )
 
         try:
-            await asyncio.to_thread(_run)
+            from opensquilla.artifact_session import (
+                Actor,
+                ActorKind,
+                ArtifactSessionService,
+            )
+
+            service = await ArtifactSessionService.from_session_storage(self._storage)
+            snapshots = await service.snapshot_session_heads(session_id=source_session_id)
+            await asyncio.to_thread(
+                _copy_files,
+                tuple(snapshot.revision.artifact_id for snapshot in snapshots),
+            )
+            await service.fork_session_heads(
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+                target_session_key=target_session_key,
+                snapshots=snapshots,
+                actor=Actor(ActorKind.SYSTEM, "session-fork"),
+            )
+            await asyncio.to_thread(_copy_attachments)
         except Exception:
             _log.warning(
                 "session.fork.material_copy_failed",
@@ -1864,12 +2006,38 @@ class SessionManager:
 
     # ── Transcript ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def reserve_assistant_message(
+        turn_id: str,
+        assistant_message_id: str,
+        session_key: str,
+        channel_id: str | None = None,
+    ) -> AssistantMessageReservation:
+        """Reserve an assistant identity without creating a transcript row.
+
+        The reservation is intentionally just a value object.  Materialization
+        happens on the first visible/final assistant write using the same id.
+        """
+
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must be a non-empty string")
+        if not isinstance(assistant_message_id, str) or not assistant_message_id.strip():
+            raise ValueError("assistant_message_id must be a non-empty string")
+        return AssistantMessageReservation(
+            turn_id=turn_id,
+            assistant_message_id=assistant_message_id,
+            session_key=canonicalize_session_key(session_key),
+            channel_id=channel_id,
+        )
+
     async def prepare_message(
         self,
         session_key: str,
         role: str,
         content: str,
         *,
+        message_id: str | None = None,
+        assistant_message_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
@@ -1890,7 +2058,16 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
 
+        if message_id is not None and assistant_message_id is not None:
+            if message_id != assistant_message_id:
+                raise ValueError("message_id and assistant_message_id must match")
+        message_id = assistant_message_id or message_id
         content = self._maybe_stamp_user_message(role, content)
+
+        if message_id is not None and (
+            not isinstance(message_id, str) or not message_id.strip()
+        ):
+            raise ValueError("message_id must be a non-empty string when supplied")
 
         if turn_context is None:
             from opensquilla.session.turn_context import current_turn_context
@@ -1900,6 +2077,7 @@ class SessionManager:
         entry = TranscriptEntry(
             session_id=node.session_id,
             session_key=session_key,
+            message_id=message_id or str(uuid.uuid4()),
             role=role,
             content=content,
             tool_calls=tool_calls,
@@ -1938,6 +2116,8 @@ class SessionManager:
         role: str,
         content: str,
         *,
+        message_id: str | None = None,
+        assistant_message_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
@@ -1947,10 +2127,15 @@ class SessionManager:
     ) -> TranscriptEntry:
         """Append a message and narrowly touch its session in one transaction."""
 
+        if message_id is not None and assistant_message_id is not None:
+            if message_id != assistant_message_id:
+                raise ValueError("message_id and assistant_message_id must match")
+        message_id = assistant_message_id or message_id
         entry, expected_epoch = await self.prepare_message(
             session_key,
             role,
             content,
+            message_id=message_id,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content,
@@ -1965,13 +2150,22 @@ class SessionManager:
             else None
         )
         if submitted_plan is None:
-            await self._storage.append_transcript_entry_and_touch(
-                entry,
-                expected_epoch=expected_epoch,
-                updated_at=_now_ms(),
-                token_delta=token_delta,
-                mark_total_tokens_stale=bool(token_delta),
-            )
+            if message_id is None:
+                await self._storage.append_transcript_entry_and_touch(
+                    entry,
+                    expected_epoch=expected_epoch,
+                    updated_at=_now_ms(),
+                    token_delta=token_delta,
+                    mark_total_tokens_stale=bool(token_delta),
+                )
+            else:
+                await self._storage.upsert_transcript_entry_and_touch(
+                    entry,
+                    expected_epoch=expected_epoch,
+                    updated_at=_now_ms(),
+                    token_delta=token_delta,
+                    mark_total_tokens_stale=bool(token_delta),
+                )
         else:
             node = await self._storage.get_session(session_key)
             if node is None:
@@ -2079,6 +2273,7 @@ class SessionManager:
         session_key: str,
         *,
         boundary_message_id: str | None = None,
+        transcript_entries: Sequence[TranscriptEntry] | None = None,
     ) -> CompactionSourceSnapshot:
         """Freeze the exact durable prefix visible to the active turn.
 
@@ -2087,7 +2282,11 @@ class SessionManager:
         boundary cannot be found.
         """
 
-        transcript = await self.get_transcript(session_key)
+        transcript = (
+            list(transcript_entries)
+            if transcript_entries is not None
+            else await self.get_transcript(session_key)
+        )
         source_entries = transcript
         if boundary_message_id is not None:
             boundary_index = next(
@@ -2487,6 +2686,7 @@ class SessionManager:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
         consumer_admission_fingerprint: str = "",
+        protected_boundary_message_id: str | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -2515,6 +2715,28 @@ class SessionManager:
                 effective_config,
                 phase="snapshotting",
             )
+            if protected_boundary_message_id is not None:
+                protected_boundary_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if entry.message_id == protected_boundary_message_id
+                    ),
+                    None,
+                )
+                if protected_boundary_index is None:
+                    return CompactionResult(
+                        summary="",
+                        kept_entries=_compaction_entry_payloads(entries),
+                        removed_count=0,
+                        chunks_processed=0,
+                        summary_source="skipped",
+                        skip_reason="protected_boundary_missing",
+                    )
+                effective_config.protected_recent_messages = max(
+                    effective_protected_recent_messages(effective_config),
+                    len(entries) - protected_boundary_index,
+                )
             summaries = await await_compaction_phase(
                 self._storage.get_all_summaries(node.session_id),
                 effective_config,

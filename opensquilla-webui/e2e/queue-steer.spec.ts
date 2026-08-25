@@ -270,6 +270,49 @@ function acceptedSteer(
 }
 
 test.describe('Queue/Steer composer semantics', () => {
+  for (const viewport of [
+    { label: 'desktop', width: 1280, height: 720 },
+    { label: 'narrow', width: 390, height: 720 },
+  ]) {
+    test(`a long queued message stays inside the composer width and ellipsizes at ${viewport.label} width`, async ({ page }) => {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height })
+      await installMockGateway(page)
+      await openRunningSession(page)
+
+      const longText = 'queued-message-without-breaks-'.repeat(80)
+      const composer = page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })
+      await composer.fill(longText)
+      await composer.press('Enter')
+
+      const card = page.locator('.chat-pending-card').filter({ hasText: longText })
+      const pendingText = card.locator('.chat-pending-text')
+      await expect(card).toBeVisible()
+      const layout = await page.evaluate(() => {
+        const card = document.querySelector('.chat-pending-card') as HTMLElement
+        const queue = document.querySelector('.chat-pending') as HTMLElement
+        const text = document.querySelector('.chat-pending-text') as HTMLElement
+        const cardRect = card.getBoundingClientRect()
+        const queueRect = queue.getBoundingClientRect()
+        return {
+          cardLeft: cardRect.left,
+          cardRight: cardRect.right,
+          queueLeft: queueRect.left,
+          queueRight: queueRect.right,
+          textClientWidth: text.clientWidth,
+          textScrollWidth: text.scrollWidth,
+          textOverflow: getComputedStyle(text).textOverflow,
+          whiteSpace: getComputedStyle(text).whiteSpace,
+        }
+      })
+      expect(layout.cardLeft).toBeGreaterThanOrEqual(layout.queueLeft - 0.5)
+      expect(layout.cardRight).toBeLessThanOrEqual(layout.queueRight + 0.5)
+      expect(layout.textScrollWidth).toBeGreaterThan(layout.textClientWidth)
+      expect(layout.textOverflow).toBe('ellipsis')
+      expect(layout.whiteSpace).toBe('nowrap')
+      await expect(pendingText).toHaveAttribute('title', longText)
+    })
+  }
+
   test('STORAGE_BUSY and an unknown response retain one exact-id Retry', async ({ page }) => {
     const state = await installMockGateway(page)
     await openRunningSession(page)

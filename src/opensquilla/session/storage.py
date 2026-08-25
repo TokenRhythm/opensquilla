@@ -28,6 +28,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -101,6 +102,7 @@ from opensquilla.session.usage_ledger import (
     UsageLedgerConflictError,
     UsageLedgerState,
     UsageLegacyBaseline,
+    nanos_to_usd,
     usd_to_nanos,
     validate_usage_billing_receipt,
     validate_usage_completion,
@@ -114,6 +116,7 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
+    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -159,6 +162,30 @@ class StorageConnectionPoisonedError(RuntimeError):
 
 class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
+
+
+class SessionRoutingConflictError(ValueError):
+    """Raised when a session routing compare-and-set fence is stale."""
+
+
+class PendingChatInputConflictError(ValueError):
+    """Raised when a staged-input identity or compare-and-set fence conflicts."""
+
+
+class PendingChatInputCapacityError(RuntimeError):
+    """Raised when a session already owns the maximum staged inputs."""
+
+
+class PendingChatInputNotFoundError(KeyError):
+    """Raised when a staged input disappeared before it could be dispatched."""
+
+
+class PendingChatInputCancelledError(RuntimeError):
+    """Raised when a durable cancellation tombstone rejects a delayed enqueue."""
+
+
+class PendingChatInputAlreadyDispatchedError(RuntimeError):
+    """Raised when a delayed enqueue targets an already accepted staged input."""
 
 
 class MetaControlIntentConflictError(ValueError):
@@ -232,6 +259,38 @@ class StrandedSteerInput:
     entry: TranscriptEntry
     receipt: TurnIngressReceipt
     target_task: AgentTaskRecord
+
+
+@dataclass(frozen=True, slots=True)
+class PendingChatInput:
+    """One server-staged follow-up awaiting exactly-once dispatch."""
+
+    pending_input_id: str
+    session_key: str
+    source_scope: str
+    client_request_id: str
+    client_message_id: str
+    request_fingerprint: str
+    payload: dict[str, Any]
+    position: int
+    state_revision: int
+    created_at: int
+    updated_at: int
+    schema_version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class PendingChatInputDispatchReceipt:
+    """Durable binding between one staged identity and its accepted turn receipt."""
+
+    pending_input_id: str
+    session_key: str
+    source_scope: str
+    client_request_id: str
+    client_message_id: str
+    request_fingerprint: str
+    accepted_at: int
+    schema_version: int = 1
 
 
 async def _verify_project_workspace_guard(
@@ -451,8 +510,22 @@ def _serialized_read[**P, R](
 # MetaSkill control intents. Version 18 added the bounded MetaSkill launch outbox
 # and discard tombstones. Version 19 added the generation-fenced current Goal
 # and Goal command idempotency ledger. Version 20 added the durable Goal origin
-# message anchor used by reconnect-safe transcript presentation.
-SCHEMA_VERSION = 20
+# message anchor used by reconnect-safe transcript presentation. Version 21
+# added the bounded durable pending-chat-input outbox.
+# Version 22 added durable ArtifactSession documents, immutable revisions,
+# change sets, editor sessions, anchors, and audit events. Version 23 added
+# prompt-annotation drafts atomically consumed by chat turns. Version 24 added
+# durable idempotency receipts for artifact mutation attempts. Version 25 added
+# the persistent per-session model-routing mode and its compare-and-set revision.
+SCHEMA_VERSION = 25
+MAX_PENDING_CHAT_INPUTS = 5
+
+# These fields have their own atomic resolver/CAS API.  Whole-session writes
+# may seed them when inserting a new row, but must never replace the value of
+# an existing row from a stale ``SessionNode`` snapshot.
+_SESSION_DEDICATED_WRITER_COLUMNS = frozenset(
+    {"model_routing_mode", "model_routing_revision"}
+)
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -482,6 +555,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     auth_profile_override TEXT,
     auth_profile_override_source TEXT,
     context_tokens INTEGER,
+    model_routing_mode TEXT,
+    model_routing_revision INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -966,6 +1041,80 @@ CREATE INDEX IF NOT EXISTS idx_turn_ingress_receipts_accepted_session
 ON turn_ingress_receipts(accepted_session_key, accepted_at)
 """
 
+_CREATE_PENDING_CHAT_INPUTS = """
+CREATE TABLE IF NOT EXISTS pending_chat_inputs (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    source_scope           TEXT NOT NULL,
+    client_request_id      TEXT NOT NULL,
+    client_message_id      TEXT NOT NULL,
+    request_fingerprint    TEXT NOT NULL,
+    payload_json           TEXT NOT NULL,
+    position               INTEGER NOT NULL DEFAULT 0,
+    state_revision         INTEGER NOT NULL DEFAULT 1 CHECK (state_revision >= 1),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_inputs_request
+ON pending_chat_inputs(session_key, client_request_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_inputs_message
+ON pending_chat_inputs(session_key, client_message_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_SESSION_ORDER = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_inputs_session_order
+ON pending_chat_inputs(session_key, position, created_at, pending_input_id)
+"""
+
+_CREATE_PENDING_CHAT_INPUT_CANCELLATIONS = """
+CREATE TABLE IF NOT EXISTS pending_chat_input_cancellations (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    cancelled_at           INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_CANCELLATIONS_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_input_cancellations_session
+ON pending_chat_input_cancellations(session_key, cancelled_at, pending_input_id)
+"""
+
+_CREATE_PENDING_CHAT_INPUT_DISPATCH_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS pending_chat_input_dispatch_receipts (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    source_scope           TEXT NOT NULL,
+    client_request_id      TEXT NOT NULL,
+    client_message_id      TEXT NOT NULL,
+    request_fingerprint    TEXT NOT NULL,
+    accepted_at            INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_input_dispatch_request
+ON pending_chat_input_dispatch_receipts(source_scope, session_key, client_request_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_input_dispatch_message
+ON pending_chat_input_dispatch_receipts(session_key, client_message_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_input_dispatch_session
+ON pending_chat_input_dispatch_receipts(session_key, accepted_at, pending_input_id)
+"""
+
 _CREATE_META_CONTROL_INTENTS = """
 CREATE TABLE IF NOT EXISTS meta_control_intents (
     intent_id TEXT PRIMARY KEY,
@@ -1410,6 +1559,10 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
+    return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
+
+
 def _py_lower(value: Any) -> Any:
     """Unicode-aware lowercase for the ``py_lower`` SQL function.
 
@@ -1542,6 +1695,24 @@ def _json_object_or_none(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionListCursor:
+    """Stable descending sort position for a session-list page."""
+
+    activity_at: int
+    updated_at: int
+    session_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionListPage:
+    """One keyset-paginated page of sessions."""
+
+    sessions: list[SessionNode]
+    next_cursor: SessionListCursor | None
+    has_more: bool
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -1553,8 +1724,12 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._connection_generation = 0
+        self._transcript_reader: Any | None = None
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
+        self._transcript_reader_lock = asyncio.Lock()
+        self._transcript_reader_fallback_warned = False
         self._usage_backfill_index_lock = asyncio.Lock()
         self._usage_backfill_indexes_ready = False
         self._legacy_project_adoption_lock = asyncio.Lock()
@@ -1612,7 +1787,15 @@ class SessionStorage:
         *,
         goal_pause_reason: str = "process_restart",
     ) -> None:
+        if (
+            self._conn is not None
+            or self._transcript_reader is not None
+            or self._meta_launch_draft_gc_task is not None
+        ):
+            await self.close()
+        self._poisoned = False
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
+        self._connection_generation += 1
         self._conn.row_factory = aiosqlite.Row
         # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
         # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
@@ -1630,10 +1813,17 @@ class SessionStorage:
             await self._conn.create_function(  # type: ignore[attr-defined]
                 name, arity, function, deterministic=True
             )
-        await self._conn.execute("PRAGMA journal_mode=WAL")
+        async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
+            journal_mode_row = await cur.fetchone()
+        journal_mode = (
+            str(journal_mode_row[0]).strip().lower()
+            if journal_mode_row is not None
+            else ""
+        )
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+        await self._open_transcript_reader(journal_mode)
         self._meta_launch_draft_gc_task = asyncio.create_task(
             self._run_meta_launch_draft_gc(),
             name="session-storage-meta-launch-draft-gc",
@@ -1652,9 +1842,96 @@ class SessionStorage:
             with contextlib.suppress(asyncio.CancelledError):
                 await gc_task
         async with self._operation_lock:
-            if self._conn:
-                await self._conn.close()
-                self._conn = None
+            async with self._transcript_reader_lock:
+                reader, self._transcript_reader = self._transcript_reader, None
+                conn, self._conn = self._conn, None
+                try:
+                    if reader is not None:
+                        await reader.close()
+                finally:
+                    if conn is not None:
+                        await conn.close()
+
+    def _warn_transcript_reader_fallback_once(
+        self,
+        reason: str,
+        journal_mode: str,
+    ) -> None:
+        if self._transcript_reader_fallback_warned:
+            return
+        self._transcript_reader_fallback_warned = True
+        safe_reason = (
+            reason
+            if reason in {"journal_mode_not_wal", "memory_database", "open_failed"}
+            else "unknown"
+        )
+        safe_journal_mode = (
+            journal_mode
+            if journal_mode in {"delete", "memory", "off", "persist", "truncate", "wal"}
+            else "unknown"
+        )
+        log.warning(
+            "session_storage.transcript_reader_fallback reason=%s journal_mode=%s",
+            safe_reason,
+            safe_journal_mode,
+            extra={
+                "event": "session_storage.transcript_reader_fallback",
+                "reason": safe_reason,
+                "journal_mode": safe_journal_mode,
+            },
+        )
+
+    async def _open_transcript_reader(self, journal_mode: str) -> None:
+        if self._db_path == ":memory:":
+            self._warn_transcript_reader_fallback_once("memory_database", journal_mode)
+            return
+        if journal_mode != "wal":
+            self._warn_transcript_reader_fallback_once(
+                "journal_mode_not_wal",
+                journal_mode,
+            )
+            return
+
+        reader: Any | None = None
+        try:
+            reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+            reader.row_factory = aiosqlite.Row
+            async with reader.execute("PRAGMA query_only=ON"):
+                pass
+            async with reader.execute(
+                f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}"
+            ):
+                pass
+            async with reader.execute("PRAGMA journal_mode") as cur:
+                reader_journal_mode_row = await cur.fetchone()
+            reader_journal_mode = (
+                str(reader_journal_mode_row[0]).strip().lower()
+                if reader_journal_mode_row is not None
+                else ""
+            )
+            if reader_journal_mode != "wal":
+                await reader.close()
+                self._warn_transcript_reader_fallback_once(
+                    "journal_mode_not_wal",
+                    reader_journal_mode,
+                )
+                return
+            async with reader.execute("PRAGMA query_only") as cur:
+                query_only_row = await cur.fetchone()
+            if query_only_row is None or int(query_only_row[0]) != 1:
+                raise RuntimeError("transcript reader query-only mode unavailable")
+        except asyncio.CancelledError:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            raise
+        except Exception:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            self._warn_transcript_reader_fallback_once("open_failed", journal_mode)
+            return
+        self._transcript_reader = reader
 
     async def _run_meta_launch_draft_gc(self) -> None:
         """Physically enforce raw-draft retention while the Gateway stays up."""
@@ -1681,10 +1958,15 @@ class SessionStorage:
 
     async def _retire_poisoned_connection(self) -> None:
         self._poisoned = True
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            with contextlib.suppress(BaseException):
-                await conn.close()
+        async with self._transcript_reader_lock:
+            reader, self._transcript_reader = self._transcript_reader, None
+            conn, self._conn = self._conn, None
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            if conn is not None:
+                with contextlib.suppress(BaseException):
+                    await conn.close()
 
     async def _finish_sqlite_call(self, awaitable: Awaitable[Any]) -> Any:
         """Do not release the operation gate while a cancelled DB call is still queued."""
@@ -1847,6 +2129,35 @@ class SessionStorage:
             if acquired:
                 self._operation_lock.release()
 
+    @property
+    def connection_generation(self) -> int:
+        """Monotonic identity for consumers that cache per-connection setup."""
+
+        if self._conn is None:
+            raise RuntimeError("Storage not connected. Call connect() first.")
+        return self._connection_generation
+
+    @asynccontextmanager
+    async def read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Run a bounded read snapshot on the canonical connection.
+
+        The operation gate prevents interleaving transactions on the shared
+        aiosqlite connection.  A deferred ``BEGIN`` intentionally avoids
+        reserving SQLite's writer slot, so independent WAL writers remain
+        available while the short snapshot runs.
+        """
+
+        qualified_operation = f"read.{operation}"
+        async with self._operation_lock:
+            self._raise_if_poisoned()
+            conn = self.conn
+            try:
+                await self._finish_sqlite_call(conn.execute("BEGIN"))
+                yield conn
+            finally:
+                if bool(getattr(conn, "in_transaction", False)):
+                    await self._rollback_transaction(conn, qualified_operation)
+
     async def _initialize_schema(
         self,
         *,
@@ -1893,6 +2204,18 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUTS)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_SESSION_ORDER)
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUT_CANCELLATIONS)
+        await self._conn.execute(
+            _CREATE_IDX_PENDING_CHAT_INPUT_CANCELLATIONS_SESSION
+        )
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUT_DISPATCH_RECEIPTS)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION)
         await self._conn.execute(_CREATE_META_CONTROL_INTENTS)
         await self._conn.execute(_CREATE_IDX_META_CONTROL_CORRELATION)
         await self._conn.execute(_CREATE_IDX_META_CONTROL_SESSION_STATUS)
@@ -1938,6 +2261,7 @@ class SessionStorage:
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
         await self._migrate_collaboration_columns()
+        await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
@@ -2168,6 +2492,27 @@ class SessionStorage:
             """
         )
         await self._conn.commit()
+
+    async def _migrate_model_routing_columns(self) -> None:
+        """Idempotently add durable per-session model-routing state."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        additions = {
+            "model_routing_mode": "ALTER TABLE sessions ADD COLUMN model_routing_mode TEXT",
+            "model_routing_revision": (
+                "ALTER TABLE sessions ADD COLUMN "
+                "model_routing_revision INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        changed = False
+        for column, sql in additions.items():
+            if column not in columns:
+                await self._conn.execute(sql)
+                changed = True
+        if changed:
+            await self._conn.commit()
 
     async def _migrate_derived_title_column(self) -> None:
         """Idempotently add the derived_title column to an existing sessions table.
@@ -2847,6 +3192,13 @@ class SessionStorage:
         async with self._write_transaction("initialize_usage_ledger") as conn:
             existing = await self._get_usage_state_on_conn(conn)
             if existing is not None:
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn,
+                    captured_at_ms=max(
+                        captured_at_ms,
+                        existing.ledger_started_at_ms + 1,
+                    ),
+                )
                 return existing
 
             await conn.execute(
@@ -2983,6 +3335,265 @@ class SessionStorage:
             assert state is not None
             return state
 
+    @staticmethod
+    async def _repair_post_cutover_usage_baselines_on_conn(
+        conn: Any,
+        *,
+        captured_at_ms: int,
+        session_key: str | None = None,
+    ) -> None:
+        """Repair only generations whose ledger-only ancestry is provable.
+
+        Cutover state and every then-current generation baseline are committed
+        by one transaction. Consequently, a current ``(session_id, epoch)``
+        missing from an existing cutover was created later and has no legacy
+        usage, even when reset preserved an older session ``created_at`` value.
+        Its first baseline is zero; for a later epoch, the baseline is the
+        latest earlier baseline plus intervening live-provider ledger events.
+
+        Mutable compatibility totals are intentionally ignored: normal Done
+        turns may already be present there while cancelled turns may not be, so
+        snapshotting or subtracting them is not authoritative.
+        """
+
+        await conn.execute(
+            """
+            WITH ranked_candidates AS (
+                SELECT
+                    s.session_key,
+                    s.session_id,
+                    usage_nonnegative_int(s.epoch) AS session_epoch,
+                    COALESCE(NULLIF(s.agent_id, ''), 'main') AS agent_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.session_id, usage_nonnegative_int(s.epoch)
+                        ORDER BY s.session_key
+                    ) AS candidate_rank
+                FROM sessions AS s
+                JOIN usage_ledger_state AS state ON state.singleton_id = 1
+                WHERE (? IS NULL OR s.session_key = ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM usage_legacy_baselines AS current_baseline
+                      WHERE current_baseline.session_id = s.session_id
+                        AND current_baseline.session_epoch =
+                            usage_nonnegative_int(s.epoch)
+                  )
+            ), candidates AS (
+                SELECT session_id, session_epoch, agent_id
+                FROM ranked_candidates
+                WHERE candidate_rank = 1
+            ), anchor_epochs AS (
+                SELECT
+                    candidate.*,
+                    MAX(baseline.session_epoch) AS anchor_epoch
+                FROM candidates AS candidate
+                LEFT JOIN usage_legacy_baselines AS baseline
+                  ON baseline.session_id = candidate.session_id
+                 AND baseline.session_epoch < candidate.session_epoch
+                GROUP BY
+                    candidate.session_id,
+                    candidate.session_epoch,
+                    candidate.agent_id
+            ), anchored AS (
+                SELECT
+                    anchor.session_id,
+                    anchor.session_epoch,
+                    anchor.agent_id,
+                    COALESCE(anchor.anchor_epoch, 0) AS ledger_from_epoch,
+                    COALESCE(baseline.input_tokens, 0) AS base_input_tokens,
+                    COALESCE(baseline.output_tokens, 0) AS base_output_tokens,
+                    COALESCE(baseline.cache_read_tokens, 0) AS base_cache_read_tokens,
+                    COALESCE(baseline.cache_write_tokens, 0) AS base_cache_write_tokens,
+                    COALESCE(baseline.cost_nanos, 0) AS base_cost_nanos,
+                    COALESCE(baseline.billed_cost_nanos, 0) AS base_billed_cost_nanos,
+                    COALESCE(baseline.estimated_cost_nanos, 0)
+                        AS base_estimated_cost_nanos,
+                    COALESCE(baseline.cost_source, 'none') AS base_cost_source,
+                    COALESCE(baseline.missing_cost_entries, 0)
+                        AS base_missing_cost_entries
+                FROM anchor_epochs AS anchor
+                LEFT JOIN usage_legacy_baselines AS baseline
+                  ON baseline.session_id = anchor.session_id
+                 AND baseline.session_epoch = anchor.anchor_epoch
+            ), rolled AS (
+                SELECT
+                    anchored.*,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.input_tokens ELSE 0 END), 0) AS live_input_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.output_tokens ELSE 0 END), 0) AS live_output_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cache_read_tokens ELSE 0 END), 0)
+                        AS live_cache_read_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cache_write_tokens ELSE 0 END), 0)
+                        AS live_cache_write_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cost_nanos ELSE 0 END), 0) AS live_cost_nanos,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.billed_cost_nanos ELSE 0 END), 0)
+                        AS live_billed_cost_nanos,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.estimated_cost_nanos ELSE 0 END), 0)
+                        AS live_estimated_cost_nanos,
+                    COALESCE(SUM(CASE
+                        WHEN event.event_id IS NULL THEN 0
+                        WHEN event.status = 'finalized' THEN event.missing_cost_entries
+                        ELSE MAX(1, event.missing_cost_entries)
+                    END), 0) AS live_missing_cost_entries,
+                    COALESCE(SUM(CASE
+                        WHEN event.status = 'finalized'
+                         AND event.cost_source IN ('provider_billed', 'mixed')
+                        THEN 1 ELSE 0 END), 0) AS live_provider_billed_entries,
+                    COALESCE(SUM(CASE
+                        WHEN event.status = 'finalized'
+                         AND event.estimated_cost_nanos > 0
+                        THEN 1 ELSE 0 END), 0) AS live_estimated_cost_entries
+                FROM anchored
+                LEFT JOIN usage_events AS event
+                  ON event.session_id = anchored.session_id
+                 AND event.session_epoch >= anchored.ledger_from_epoch
+                 AND event.session_epoch < anchored.session_epoch
+                 AND event.origin = 'live_provider'
+                GROUP BY
+                    anchored.session_id,
+                    anchored.session_epoch,
+                    anchored.agent_id,
+                    anchored.ledger_from_epoch,
+                    anchored.base_input_tokens,
+                    anchored.base_output_tokens,
+                    anchored.base_cache_read_tokens,
+                    anchored.base_cache_write_tokens,
+                    anchored.base_cost_nanos,
+                    anchored.base_billed_cost_nanos,
+                    anchored.base_estimated_cost_nanos,
+                    anchored.base_cost_source,
+                    anchored.base_missing_cost_entries
+            ), classified AS (
+                SELECT
+                    rolled.*,
+                    (
+                        rolled.base_cost_source IN ('provider_billed', 'mixed')
+                        OR rolled.base_billed_cost_nanos + rolled.live_billed_cost_nanos > 0
+                        OR rolled.live_provider_billed_entries > 0
+                    ) AS has_billed,
+                    (
+                        rolled.base_estimated_cost_nanos
+                            + rolled.live_estimated_cost_nanos > 0
+                        OR rolled.live_estimated_cost_entries > 0
+                    ) AS has_estimate,
+                    (
+                        rolled.base_missing_cost_entries
+                            + rolled.live_missing_cost_entries > 0
+                    ) AS has_unavailable
+                FROM rolled
+            )
+            INSERT OR IGNORE INTO usage_legacy_baselines (
+                session_id, session_epoch, agent_id, captured_at_ms,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, cost_nanos, billed_cost_nanos,
+                estimated_cost_nanos, cost_source, missing_cost_entries
+            )
+            SELECT
+                session_id,
+                session_epoch,
+                agent_id,
+                MAX(
+                    ?,
+                    (SELECT ledger_started_at_ms + 1
+                     FROM usage_ledger_state WHERE singleton_id = 1)
+                ),
+                base_input_tokens + live_input_tokens,
+                base_output_tokens + live_output_tokens,
+                base_input_tokens + live_input_tokens
+                    + base_output_tokens + live_output_tokens,
+                base_cache_read_tokens + live_cache_read_tokens,
+                base_cache_write_tokens + live_cache_write_tokens,
+                base_cost_nanos + live_cost_nanos,
+                base_billed_cost_nanos + live_billed_cost_nanos,
+                base_estimated_cost_nanos + live_estimated_cost_nanos,
+                CASE
+                    WHEN has_billed + has_estimate + has_unavailable > 1 THEN 'mixed'
+                    WHEN has_billed THEN 'provider_billed'
+                    WHEN has_estimate THEN 'opensquilla_estimate'
+                    WHEN has_unavailable THEN 'unavailable'
+                    ELSE 'none'
+                END,
+                base_missing_cost_entries + live_missing_cost_entries
+            FROM classified
+            """,
+            (session_key, session_key, captured_at_ms),
+        )
+
+    @staticmethod
+    async def _ensure_usage_baseline_for_session_on_conn(
+        conn: Any,
+        *,
+        session_key: str,
+    ) -> None:
+        """Snapshot a new durable session generation after ledger cutover.
+
+        This helper is only called in the transaction that creates a generation,
+        before its compatibility totals can contain that generation's live
+        ledger events. Persisted missing generations are repaired separately
+        only when their post-cutover ancestry is provable.
+        """
+
+        captured_at_ms = _now_ms()
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO usage_legacy_baselines (
+                session_id, session_epoch, agent_id, captured_at_ms,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, cost_nanos, billed_cost_nanos,
+                estimated_cost_nanos, cost_source, missing_cost_entries
+            )
+            SELECT
+                session_id,
+                usage_nonnegative_int(epoch),
+                COALESCE(NULLIF(agent_id, ''), 'main'),
+                MAX(
+                    ?,
+                    (SELECT ledger_started_at_ms + 1
+                     FROM usage_ledger_state WHERE singleton_id = 1)
+                ),
+                usage_nonnegative_int(input_tokens),
+                usage_nonnegative_int(output_tokens),
+                usage_nonnegative_int(input_tokens) + usage_nonnegative_int(output_tokens),
+                usage_nonnegative_int(cache_read),
+                usage_nonnegative_int(cache_write),
+                usage_cost_total(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                usage_cost_billed(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                usage_cost_estimated(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                COALESCE(NULLIF(cost_source, ''), 'none'),
+                usage_nonnegative_int(missing_cost_entries)
+                    + usage_invalid_int(epoch)
+                    + usage_invalid_int(input_tokens)
+                    + usage_invalid_int(output_tokens)
+                    + usage_invalid_int(total_tokens)
+                    + usage_invalid_int(cache_read)
+                    + usage_invalid_int(cache_write)
+                    + usage_invalid_int(missing_cost_entries)
+                    + CASE WHEN usage_nonnegative_int(total_tokens)
+                        != usage_nonnegative_int(input_tokens)
+                           + usage_nonnegative_int(output_tokens)
+                      THEN 1 ELSE 0 END
+                    + usage_cost_anomaly(
+                        total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                      )
+            FROM sessions
+            WHERE session_key = ?
+              AND EXISTS (SELECT 1 FROM usage_ledger_state WHERE singleton_id = 1)
+            """,
+            (captured_at_ms, session_key),
+        )
+
     @_serialized_read
     async def get_usage_ledger_state(self) -> UsageLedgerState | None:
         async with self.conn.execute(
@@ -3073,6 +3684,488 @@ class SessionStorage:
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_usage_event_from_row(row) for row in rows]
+
+    @_serialized_read
+    async def get_turn_usage_projection(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        turn_id: str,
+    ) -> dict[str, Any] | None:
+        """Project one turn's durable provider-call ledger into chat metadata.
+
+        Finalized calls contribute measured usage. Started/unknown calls never
+        fabricate token counts, but they do make the projection explicitly
+        incomplete so cancellation cannot look fully accounted.
+        """
+
+        async with self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS event_count,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                    AS input_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                    AS output_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN reasoning_tokens ELSE 0 END), 0)
+                    AS reasoning_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cache_read_tokens ELSE 0 END), 0)
+                    AS cache_read_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cache_write_tokens ELSE 0 END), 0)
+                    AS cache_write_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN total_tokens ELSE 0 END), 0)
+                    AS total_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                    AS cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN billed_cost_nanos ELSE 0 END), 0)
+                    AS billed_cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN estimated_cost_nanos ELSE 0 END), 0)
+                    AS estimated_cost_nanos,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' THEN missing_cost_entries
+                    ELSE MAX(1, missing_cost_entries)
+                END), 0) AS missing_cost_entries,
+                COALESCE(SUM(CASE WHEN status != 'finalized' THEN 1 ELSE 0 END), 0)
+                    AS unknown_event_count,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                    THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                    THEN 1 ELSE 0 END), 0) AS estimated_cost_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND coverage_status != 'complete'
+                    THEN 1 ELSE 0 END), 0) AS incomplete_finalized_count
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND turn_id = ?
+              AND origin = 'live_provider'
+            """,
+            (session_id, session_epoch, turn_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or int(row["event_count"] or 0) == 0:
+            return None
+
+        async with self.conn.execute(
+            """
+            SELECT provider, model
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND turn_id = ?
+              AND origin = 'live_provider'
+            ORDER BY call_index DESC, event_id DESC
+            LIMIT 1
+            """,
+            (session_id, session_epoch, turn_id),
+        ) as cur:
+            identity = await cur.fetchone()
+
+        billed_cost = nanos_to_usd(int(row["billed_cost_nanos"] or 0))
+        estimated_cost = nanos_to_usd(int(row["estimated_cost_nanos"] or 0))
+        missing_entries = max(0, int(row["missing_cost_entries"] or 0))
+        unknown_events = max(0, int(row["unknown_event_count"] or 0))
+        incomplete = max(0, int(row["incomplete_finalized_count"] or 0))
+        cost_source = rollup_cost_source(
+            billed_cost_usd=billed_cost,
+            estimated_cost_component_usd=estimated_cost,
+            missing_cost_entries=missing_entries,
+            provider_billed_entries=max(0, int(row["provider_billed_entries"] or 0)),
+            estimated_cost_entries=max(0, int(row["estimated_cost_entries"] or 0)),
+        )
+        coverage_status = "usage_unknown" if unknown_events or incomplete else "complete"
+        return {
+            "input_tokens": max(0, int(row["input_tokens"] or 0)),
+            "output_tokens": max(0, int(row["output_tokens"] or 0)),
+            "reasoning_tokens": max(0, int(row["reasoning_tokens"] or 0)),
+            "cached_tokens": max(0, int(row["cache_read_tokens"] or 0)),
+            "cache_write_tokens": max(0, int(row["cache_write_tokens"] or 0)),
+            "total_tokens": max(0, int(row["total_tokens"] or 0)),
+            "cost_usd": nanos_to_usd(int(row["cost_nanos"] or 0)),
+            "billed_cost": billed_cost,
+            "estimated_cost_component_usd": estimated_cost,
+            "cost_source": cost_source,
+            "missing_cost_entries": missing_entries,
+            "coverage_status": coverage_status,
+            "usage_unknown": coverage_status != "complete",
+            "unknown_usage_events": unknown_events,
+            "provider": str(identity["provider"] or "") if identity is not None else "",
+            "model": str(identity["model"] or "") if identity is not None else "",
+        }
+
+    @_serialized_read
+    async def get_turn_usage_projections(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        turn_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-project ledger usage for a bounded transcript page."""
+
+        stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
+        if not stable_turn_ids:
+            return {}
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE:
+            raise ValueError("too many turn ids for one usage projection page")
+        placeholders = ", ".join("?" for _ in stable_turn_ids)
+        async with self.conn.execute(
+            f"""
+            SELECT * FROM usage_events
+            WHERE session_id = ? AND session_epoch = ?
+              AND origin = 'live_provider'
+              AND turn_id IN ({placeholders})
+            ORDER BY turn_id, call_index, event_id
+            """,  # noqa: S608 - placeholders are generated from a bounded list
+            (session_id, session_epoch, *stable_turn_ids),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        grouped: dict[str, list[UsageEventRecord]] = {}
+        for row in rows:
+            event = _usage_event_from_row(row)
+            if event.turn_id:
+                grouped.setdefault(event.turn_id, []).append(event)
+
+        projections: dict[str, dict[str, Any]] = {}
+        for stable_turn_id, events in grouped.items():
+            totals = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 0,
+                "cost_nanos": 0,
+                "billed_cost_nanos": 0,
+                "estimated_cost_nanos": 0,
+                "missing_cost_entries": 0,
+            }
+            unknown_events = 0
+            incomplete = False
+            provider_billed_entries = 0
+            estimated_cost_entries = 0
+            for event in events:
+                if event.status != "finalized":
+                    unknown_events += 1
+                    totals["missing_cost_entries"] += max(
+                        1, int(event.missing_cost_entries or 0)
+                    )
+                    continue
+                totals["input_tokens"] += max(0, int(event.input_tokens or 0))
+                totals["output_tokens"] += max(0, int(event.output_tokens or 0))
+                totals["reasoning_tokens"] += max(0, int(event.reasoning_tokens or 0))
+                totals["cached_tokens"] += max(0, int(event.cache_read_tokens or 0))
+                totals["cache_write_tokens"] += max(
+                    0, int(event.cache_write_tokens or 0)
+                )
+                totals["total_tokens"] += max(0, int(event.total_tokens or 0))
+                totals["cost_nanos"] += max(0, int(event.cost_nanos or 0))
+                totals["billed_cost_nanos"] += max(
+                    0, int(event.billed_cost_nanos or 0)
+                )
+                totals["estimated_cost_nanos"] += max(
+                    0, int(event.estimated_cost_nanos or 0)
+                )
+                totals["missing_cost_entries"] += max(
+                    0, int(event.missing_cost_entries or 0)
+                )
+                provider_billed_entries += int(
+                    event.cost_source in {"provider_billed", "mixed"}
+                )
+                estimated_cost_entries += int(event.estimated_cost_nanos > 0)
+                incomplete = incomplete or event.coverage_status != "complete"
+
+            billed_cost = nanos_to_usd(totals["billed_cost_nanos"])
+            estimated_cost = nanos_to_usd(totals["estimated_cost_nanos"])
+            coverage_status = (
+                "usage_unknown" if unknown_events or incomplete else "complete"
+            )
+            latest = events[-1]
+            projections[stable_turn_id] = {
+                "input_tokens": totals["input_tokens"],
+                "output_tokens": totals["output_tokens"],
+                "reasoning_tokens": totals["reasoning_tokens"],
+                "cached_tokens": totals["cached_tokens"],
+                "cache_write_tokens": totals["cache_write_tokens"],
+                "total_tokens": totals["total_tokens"],
+                "cost_usd": nanos_to_usd(totals["cost_nanos"]),
+                "billed_cost": billed_cost,
+                "estimated_cost_component_usd": estimated_cost,
+                "cost_source": rollup_cost_source(
+                    billed_cost_usd=billed_cost,
+                    estimated_cost_component_usd=estimated_cost,
+                    missing_cost_entries=totals["missing_cost_entries"],
+                    provider_billed_entries=provider_billed_entries,
+                    estimated_cost_entries=estimated_cost_entries,
+                ),
+                "missing_cost_entries": totals["missing_cost_entries"],
+                "coverage_status": coverage_status,
+                "usage_unknown": coverage_status != "complete",
+                "unknown_usage_events": unknown_events,
+                "provider": latest.provider or "",
+                "model": latest.model or "",
+            }
+        return projections
+
+    @_serialized_read
+    async def get_turn_ids_continuing_after_cursor(
+        self,
+        *,
+        session_id: str,
+        created_at: int,
+        entry_id: int,
+        turn_ids: Sequence[str],
+    ) -> set[str]:
+        """Return the turns whose assistant history continues past a page.
+
+        Canonical history pages are contiguous keyset slices over
+        ``(created_at, id)``, so a turn with no assistant row after the page's
+        last cursor already holds its terminal row inside that page. Only rows
+        beyond the cursor can move terminality onto a later page, and the
+        newest page has none, so the common read is one empty index seek
+        rather than a scan of the whole session.
+        """
+
+        stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
+        if not stable_turn_ids:
+            return set()
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE - 8:
+            raise ValueError("too many turn ids for one usage continuation probe")
+        requested_rows = ", ".join("(?)" for _ in stable_turn_ids)
+        sql = f"""
+            WITH requested(turn_id) AS (
+                VALUES {requested_rows}
+            ),
+            continuing AS (
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
+                UNION ALL
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM compacted_transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND original_entry_id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
+            )
+            SELECT DISTINCT turn_id
+            FROM continuing
+            WHERE turn_id IN (SELECT turn_id FROM requested)
+        """  # noqa: S608 - placeholders are generated from a bounded list
+        async with self.conn.execute(
+            sql,
+            (
+                *stable_turn_ids,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        return {str(row["turn_id"] or "") for row in rows if row["turn_id"]}
+
+    async def reconcile_session_usage_totals_from_ledger(
+        self,
+        *,
+        session_key: str,
+        expected_epoch: int,
+    ) -> SessionNode | None:
+        """Set compatibility session totals from the ledger, idempotently.
+
+        The cutover baseline owns pre-ledger totals. Only live provider events
+        are added, because backfilled transcript events describe usage already
+        captured by that baseline.
+        """
+
+        stable_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("reconcile_session_usage_totals") as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (stable_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None:
+                return None
+            actual_epoch = max(0, int(session_row["epoch"] or 0))
+            if actual_epoch != expected_epoch:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=stable_key,
+                    expected_epoch=expected_epoch,
+                )
+            session_id = str(session_row["session_id"])
+
+            async with conn.execute(
+                """
+                SELECT * FROM usage_legacy_baselines
+                WHERE session_id = ? AND session_epoch = ?
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                baseline = await cur.fetchone()
+            if baseline is None:
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn,
+                    captured_at_ms=_now_ms(),
+                    session_key=stable_key,
+                )
+                async with conn.execute(
+                    """
+                    SELECT * FROM usage_legacy_baselines
+                    WHERE session_id = ? AND session_epoch = ?
+                    """,
+                    (session_id, expected_epoch),
+                ) as cur:
+                    baseline = await cur.fetchone()
+            if baseline is None:
+                # No cutover means this storage is not ledger-authoritative;
+                # preserve the legacy DoneEvent rollup path.
+                return None
+
+            async with conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                        AS input_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                        AS output_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN cache_read_tokens ELSE 0 END), 0)
+                        AS cache_read_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN cache_write_tokens ELSE 0 END), 0)
+                        AS cache_write_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                        AS cost_nanos,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN billed_cost_nanos ELSE 0 END), 0)
+                        AS billed_cost_nanos,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN estimated_cost_nanos ELSE 0 END), 0)
+                        AS estimated_cost_nanos,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' THEN missing_cost_entries
+                        ELSE MAX(1, missing_cost_entries)
+                    END), 0) AS missing_cost_entries,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                        THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                        THEN 1 ELSE 0 END), 0) AS estimated_cost_entries
+                FROM usage_events
+                WHERE session_id = ? AND session_epoch = ? AND origin = 'live_provider'
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                live = await cur.fetchone()
+            assert live is not None
+            async with conn.execute(
+                """
+                SELECT provider, model
+                FROM usage_events
+                WHERE session_id = ? AND session_epoch = ?
+                  AND origin = 'live_provider' AND status = 'finalized'
+                ORDER BY completed_at_ms DESC, call_index DESC, event_id DESC
+                LIMIT 1
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                latest_identity = await cur.fetchone()
+
+            input_tokens = max(0, int(baseline["input_tokens"] or 0)) + max(
+                0, int(live["input_tokens"] or 0)
+            )
+            output_tokens = max(0, int(baseline["output_tokens"] or 0)) + max(
+                0, int(live["output_tokens"] or 0)
+            )
+            cache_read = max(0, int(baseline["cache_read_tokens"] or 0)) + max(
+                0, int(live["cache_read_tokens"] or 0)
+            )
+            cache_write = max(0, int(baseline["cache_write_tokens"] or 0)) + max(
+                0, int(live["cache_write_tokens"] or 0)
+            )
+            cost_nanos = max(0, int(baseline["cost_nanos"] or 0)) + max(
+                0, int(live["cost_nanos"] or 0)
+            )
+            billed_nanos = max(0, int(baseline["billed_cost_nanos"] or 0)) + max(
+                0, int(live["billed_cost_nanos"] or 0)
+            )
+            estimated_nanos = max(0, int(baseline["estimated_cost_nanos"] or 0)) + max(
+                0, int(live["estimated_cost_nanos"] or 0)
+            )
+            missing_entries = max(0, int(baseline["missing_cost_entries"] or 0)) + max(
+                0, int(live["missing_cost_entries"] or 0)
+            )
+            baseline_source = str(baseline["cost_source"] or "none")
+            cost_source = rollup_cost_source(
+                billed_cost_usd=nanos_to_usd(billed_nanos),
+                estimated_cost_component_usd=nanos_to_usd(estimated_nanos),
+                missing_cost_entries=missing_entries,
+                provider_billed_entries=(
+                    int(baseline_source in {"provider_billed", "mixed"})
+                    + max(0, int(live["provider_billed_entries"] or 0))
+                ),
+                estimated_cost_entries=(
+                    int(int(baseline["estimated_cost_nanos"] or 0) > 0)
+                    + max(0, int(live["estimated_cost_entries"] or 0))
+                ),
+            )
+            await conn.execute(
+                """
+                UPDATE sessions
+                SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
+                    total_tokens_fresh = 1, estimated_cost_usd = ?, total_cost_usd = ?,
+                    billed_cost_usd = ?, estimated_cost_component_usd = ?,
+                    cost_source = ?, missing_cost_entries = ?,
+                    cache_read = ?, cache_write = ?,
+                    model_override = COALESCE(?, model_override),
+                    model_provider = COALESCE(?, model_provider)
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    input_tokens,
+                    output_tokens,
+                    input_tokens + output_tokens,
+                    nanos_to_usd(cost_nanos),
+                    nanos_to_usd(cost_nanos),
+                    nanos_to_usd(billed_nanos),
+                    nanos_to_usd(estimated_nanos),
+                    cost_source,
+                    missing_entries,
+                    cache_read,
+                    cache_write,
+                    (
+                        str(latest_identity["model"])
+                        if latest_identity is not None and latest_identity["model"]
+                        else None
+                    ),
+                    (
+                        str(latest_identity["provider"])
+                        if latest_identity is not None and latest_identity["provider"]
+                        else None
+                    ),
+                    stable_key,
+                    expected_epoch,
+                ),
+            )
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (stable_key,),
+            ) as cur:
+                updated = await cur.fetchone()
+            assert updated is not None
+            return SessionNode(**_deserialize_row(dict(updated)))
 
     @_serialized_read
     async def query_usage_event_items(
@@ -3955,7 +5048,7 @@ class SessionStorage:
         placeholders = ", ".join("?" for _ in cols)
         update_columns = []
         for c in cols:
-            if c == "session_key":
+            if c == "session_key" or c in _SESSION_DEDICATED_WRITER_COLUMNS:
                 continue
             if c == "epoch":
                 # Hard guarantee: epoch can only increase, never roll back.
@@ -3969,6 +5062,22 @@ class SessionStorage:
             f"ON CONFLICT(session_key) DO UPDATE SET {updates}"
         )
         async with self._write_transaction("upsert_session") as conn:
+            async with conn.execute(
+                """
+                SELECT session_id, epoch, model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (node.session_key,),
+            ) as cursor:
+                previous_identity = await cursor.fetchone()
+            if previous_identity is not None:
+                # Keep the caller-visible node coherent with the dedicated
+                # writer fields that this general-purpose UPSERT preserves.
+                node.model_routing_mode = previous_identity["model_routing_mode"]
+                node.model_routing_revision = max(
+                    0,
+                    int(previous_identity["model_routing_revision"] or 0),
+                )
             if expected_session_id is not None:
                 if node.session_id != expected_session_id:
                     raise KeyError(
@@ -3984,6 +5093,14 @@ class SessionStorage:
                         f"Session generation changed: {node.session_key}"
                     )
             await conn.execute(sql, values)
+            if previous_identity is None or (
+                str(previous_identity["session_id"]) != node.session_id
+                or int(previous_identity["epoch"] or 0) != int(node.epoch or 0)
+            ):
+                await self._ensure_usage_baseline_for_session_on_conn(
+                    conn,
+                    session_key=node.session_key,
+                )
 
     @_serialized_read
     async def get_session(self, session_key: str) -> SessionNode | None:
@@ -4097,7 +5214,8 @@ class SessionStorage:
             {where}
             ORDER BY
                 max(sessions.updated_at, COALESCE(active_tasks.active_at, 0)) DESC,
-                sessions.updated_at DESC
+                sessions.updated_at DESC,
+                sessions.session_key DESC
             LIMIT ? OFFSET ?
         """
         query_params = [
@@ -4111,11 +5229,131 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_read
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        cursor: SessionListCursor | None = None,
+        guest_owner_id: str | None = None,
+    ) -> SessionListPage:
+        """Return a stable keyset page in the same order as ``list_sessions``."""
+
+        page_limit = max(1, int(limit))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return SessionListPage(sessions=[], next_cursor=None, has_more=False)
+            clauses.append(
+                "sessions.session_key GLOB ? "
+                "AND (length(sessions.session_key) - "
+                "length(replace(sessions.session_key, ':', ''))) = 5"
+            )
+            params.append(f"agent:?*:webchat:guest:{owner_id}:?*")
+        source_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        cursor_where = ""
+        cursor_params: list[Any] = []
+        if cursor is not None:
+            cursor_where = """
+                WHERE list_activity_at < ?
+                   OR (list_activity_at = ? AND updated_at < ?)
+                   OR (
+                       list_activity_at = ?
+                       AND updated_at = ?
+                       AND session_key < ?
+                   )
+            """
+            cursor_params = [
+                cursor.activity_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.session_key,
+            ]
+
+        sql = f"""
+            WITH active_tasks AS (
+                SELECT
+                    session_key,
+                    MAX(
+                        max(
+                            max(COALESCE(updated_at, 0), COALESCE(started_at, 0)),
+                            COALESCE(created_at, 0)
+                        )
+                    ) AS active_at
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                GROUP BY session_key
+            ), ordered_sessions AS (
+                SELECT
+                    sessions.*,
+                    max(
+                        sessions.updated_at,
+                        COALESCE(active_tasks.active_at, 0)
+                    ) AS list_activity_at
+                FROM sessions
+                LEFT JOIN active_tasks
+                    ON active_tasks.session_key = sessions.session_key
+                {source_where}
+            )
+            SELECT *
+            FROM ordered_sessions
+            {cursor_where}
+            ORDER BY list_activity_at DESC, updated_at DESC, session_key DESC
+            LIMIT ?
+        """
+        query_params = [
+            AgentTaskStatus.QUEUED.value,
+            AgentTaskStatus.RUNNING.value,
+            *params,
+            *cursor_params,
+            page_limit + 1,
+        ]
+        async with self.conn.execute(sql, query_params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > page_limit
+        page_rows = rows[:page_limit]
+        sessions: list[SessionNode] = []
+        positions: list[SessionListCursor] = []
+        for row in page_rows:
+            data = dict(row)
+            activity_at = int(data.pop("list_activity_at"))
+            session = SessionNode(**_deserialize_row(data))
+            sessions.append(session)
+            positions.append(
+                SessionListCursor(
+                    activity_at=activity_at,
+                    updated_at=int(session.updated_at),
+                    session_key=session.session_key,
+                )
+            )
+        next_cursor = positions[-1] if has_more and positions else None
+        return SessionListPage(
+            sessions=sessions,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
     async def _delete_session_rows(
         self,
         conn: aiosqlite.Connection,
         session: SessionNode,
     ) -> None:
+        from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+        # ArtifactSession state is fenced and removed inside the same durable
+        # boundary as the owning session.  A failure aborts the whole delete;
+        # post-commit filesystem cleanup is intentionally handled separately.
+        await purge_session_on_connection(
+            conn,
+            session_id=session.session_id,
+            boundary="session_delete",
+        )
         for table in (
             "transcript_entries",
             "compacted_transcript_entries",
@@ -4149,6 +5387,18 @@ class SessionStorage:
             )
         await conn.execute(
             "DELETE FROM turn_ingress_receipts WHERE accepted_session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_inputs WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_input_cancellations WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
             (session.session_key,),
         )
         await conn.execute(
@@ -4202,6 +5452,18 @@ class SessionStorage:
             )
             await conn.execute(
                 "DELETE FROM meta_launch_drafts WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_inputs WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_input_cancellations WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
                 (session_key,),
             )
             await conn.execute(
@@ -4285,6 +5547,10 @@ class SessionStorage:
                 row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=session_key,
+            )
             return int(row[0])
 
     async def advance_reset_epoch(self, session_key: str) -> int:
@@ -4309,6 +5575,10 @@ class SessionStorage:
                 row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=session_key,
+            )
             await self._tombstone_meta_launches_for_boundary(
                 conn,
                 session_key=session_key,
@@ -4379,6 +5649,181 @@ class SessionStorage:
                 (normalized_key, normalized_value, _now_ms()),
             )
         return normalized_value
+
+    # ── Per-session model routing ──────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_model_routing_mode(value: str) -> str:
+        mode = value.strip().lower() if isinstance(value, str) else ""
+        if mode not in {"direct", "router", "ensemble"}:
+            raise ValueError("model routing mode must be direct, router, or ensemble")
+        return mode
+
+    @_serialized_read
+    async def _read_model_routing_state(self, session_key: str) -> Any:
+        async with self.conn.execute(
+            """
+            SELECT model_routing_mode, model_routing_revision
+            FROM sessions WHERE session_key = ?
+            """,
+            (session_key,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def resolve_model_routing_mode(
+        self,
+        session_key: str,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Read one session's mode, atomically materializing legacy NULL rows.
+
+        A NULL only represents a pre-feature (or not-yet-materialized) row.  It
+        is never returned to an execution caller: the fallback is persisted
+        under the write transaction so subsequent global changes cannot alter
+        the session's routing policy.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        fallback = self._normalize_model_routing_mode(fallback_mode)
+        row = await self._read_model_routing_state(session_key)
+        if row is None:
+            raise KeyError(f"Session not found: {session_key}")
+        raw_mode = row["model_routing_mode"]
+        revision = max(0, int(row["model_routing_revision"] or 0))
+        if raw_mode is not None:
+            return {
+                "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                "revision": revision,
+                "source": "session",
+                "initialized": False,
+            }
+
+        # Only legacy NULL rows require writer ownership. Re-read after taking
+        # that ownership because another process may have materialized the row
+        # between the read-only fast path and BEGIN IMMEDIATE.
+        async with self._write_transaction("resolve_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            raw_mode = row["model_routing_mode"]
+            revision = max(0, int(row["model_routing_revision"] or 0))
+            if raw_mode is not None:
+                return {
+                    "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                    "revision": revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1
+                WHERE session_key = ? AND model_routing_mode IS NULL
+                """,
+                (fallback, session_key),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                # Another writer materialized the row after our read.  Read
+                # its authoritative choice rather than overwriting it.
+                async with conn.execute(
+                    """
+                    SELECT model_routing_mode, model_routing_revision
+                    FROM sessions WHERE session_key = ?
+                    """,
+                    (session_key,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"Session not found: {session_key}")
+                return {
+                    "mode": self._normalize_model_routing_mode(
+                        str(row["model_routing_mode"])
+                    ),
+                    "revision": max(0, int(row["model_routing_revision"] or 0)),
+                    "source": "session",
+                    "initialized": False,
+                }
+            return {
+                "mode": fallback,
+                "revision": revision + 1,
+                "source": "legacy_initialized",
+                "initialized": True,
+            }
+
+    async def set_model_routing_mode(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set one persisted session routing mode."""
+
+        session_key = canonicalize_session_key(session_key)
+        normalized_mode = self._normalize_model_routing_mode(mode)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        async with self._write_transaction("set_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            current_mode = row["model_routing_mode"]
+            current_revision = max(0, int(row["model_routing_revision"] or 0))
+            if current_mode == normalized_mode:
+                # A lost acknowledgement may retry the same durable choice
+                # with the caller's older generation. Treat that as idempotent
+                # rather than forcing a needless UI reload.
+                return {
+                    "mode": normalized_mode,
+                    "revision": current_revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            if expected_revision is not None and current_revision != expected_revision:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1,
+                    updated_at = ?
+                WHERE session_key = ? AND model_routing_revision = ?
+                """,
+                (normalized_mode, _now_ms(), session_key, current_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            return {
+                "mode": normalized_mode,
+                "revision": current_revision + 1,
+                "source": "session",
+                "initialized": current_mode is None,
+            }
 
     # ── Collaboration plans ────────────────────────────────────────────────
 
@@ -8598,6 +10043,116 @@ class SessionStorage:
                 expected_epoch=expected_epoch,
             )
 
+    @classmethod
+    async def _upsert_transcript_entry(
+        cls,
+        conn: Any,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int | None,
+    ) -> bool:
+        """Materialize or replace one row identified by session + message id.
+
+        ``message_id`` is not made a database-wide unique key: it is a
+        caller-supplied identity scoped to the current session.  The enclosing
+        write transaction serializes the select/update-or-insert decision, and
+        the epoch guard remains identical to ordinary transcript writes.
+        """
+
+        if expected_epoch is not None:
+            async with conn.execute(
+                "SELECT epoch FROM sessions WHERE session_key = ?",
+                (entry.session_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None or int(session_row[0]) != expected_epoch:
+                await cls._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+
+        async with conn.execute(
+            """
+            SELECT id, created_at
+            FROM transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (entry.session_id, entry.message_id),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing is None:
+            await cls._insert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            return True
+
+        entry.id = int(existing[0])
+        entry.created_at = int(existing[1])
+        data = entry.model_dump(exclude={"id", "created_at"})
+        assignments = [f"{column} = ?" for column in data]
+        values = [_serialize(data[column]) for column in data]
+        values.append(entry.id)
+        await conn.execute(
+            f"UPDATE transcript_entries SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
+        return False
+
+    async def upsert_transcript_entry_and_touch(
+        self,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int,
+        updated_at: int,
+        token_delta: int = 0,
+        mark_total_tokens_stale: bool = False,
+    ) -> bool:
+        """Upsert caller-identified content and touch its session once.
+
+        Returns ``True`` only when a new row was materialized.  Replaying the
+        same finalization therefore cannot add another transcript row or count
+        its token delta a second time.
+        """
+
+        entry.session_key = canonicalize_session_key(entry.session_key)
+        async with self._write_transaction("upsert_transcript_entry_and_touch") as conn:
+            inserted = await self._upsert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            effective_token_delta = token_delta if inserted else 0
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?,
+                    total_tokens = total_tokens + ?,
+                    total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    updated_at,
+                    effective_token_delta,
+                    int(mark_total_tokens_stale and inserted),
+                    entry.session_key,
+                    expected_epoch,
+                ),
+            ) as cur:
+                touched = cur.rowcount or 0
+            if touched == 0:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+        return inserted
+
     async def append_transcript_entry_and_touch(
         self,
         entry: TranscriptEntry,
@@ -8858,6 +10413,715 @@ class SessionStorage:
                     task_details.get("goal_candidate")
                 ),
             )
+
+    @staticmethod
+    def _pending_chat_input_from_row(row: Any) -> PendingChatInput:
+        raw = dict(row)
+        payload_raw = raw.pop("payload_json", None)
+        try:
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else None
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("pending chat input contains invalid payload JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("pending chat input payload must be an object")
+        return PendingChatInput(payload=payload, **raw)
+
+    @staticmethod
+    async def _select_pending_chat_input(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> PendingChatInput | None:
+        async with conn.execute(
+            "SELECT * FROM pending_chat_inputs WHERE pending_input_id = ?",
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            SessionStorage._pending_chat_input_from_row(row)
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    async def _select_pending_chat_input_cancellation(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> tuple[str, int] | None:
+        async with conn.execute(
+            """
+            SELECT session_key, cancelled_at
+            FROM pending_chat_input_cancellations
+            WHERE pending_input_id = ?
+            """,
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return str(row["session_key"]), int(row["cancelled_at"])
+
+    @staticmethod
+    async def _select_pending_chat_input_dispatch_receipt(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> PendingChatInputDispatchReceipt | None:
+        async with conn.execute(
+            """
+            SELECT * FROM pending_chat_input_dispatch_receipts
+            WHERE pending_input_id = ?
+            """,
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            PendingChatInputDispatchReceipt(**_deserialize_row(dict(row)))
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    async def _find_pending_chat_input_dispatch_receipts(
+        conn: Any,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+    ) -> list[PendingChatInputDispatchReceipt]:
+        async with conn.execute(
+            """
+            SELECT * FROM pending_chat_input_dispatch_receipts
+            WHERE pending_input_id = ?
+               OR (
+                    session_key = ?
+                AND source_scope = ?
+                AND client_request_id = ?
+               )
+               OR (session_key = ? AND client_message_id = ?)
+            ORDER BY accepted_at ASC, pending_input_id ASC
+            """,
+            (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                session_key,
+                client_message_id,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            PendingChatInputDispatchReceipt(**_deserialize_row(dict(row)))
+            for row in rows
+        ]
+
+    @staticmethod
+    async def _insert_pending_chat_input_dispatch_receipt(
+        conn: Any,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        accepted_at: int,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO pending_chat_input_dispatch_receipts (
+                pending_input_id, session_key, source_scope,
+                client_request_id, client_message_id, request_fingerprint, accepted_at,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                client_message_id,
+                request_fingerprint,
+                accepted_at,
+            ),
+        )
+
+    async def enqueue_pending_chat_input(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        payload: dict[str, Any],
+        position: int | None = None,
+    ) -> tuple[PendingChatInput, bool]:
+        """Stage one follow-up, returning ``(row, replayed)``.
+
+        Capacity and all three stable identities are checked under the same
+        write lock.  An ambiguous enqueue can therefore retry byte-for-byte;
+        the retry either returns the original row or raises a hard conflict.
+        """
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        source_scope = source_scope.strip()
+        client_request_id = client_request_id.strip()
+        client_message_id = client_message_id.strip()
+        request_fingerprint = request_fingerprint.strip()
+        identifiers = {
+            "pending_input_id": pending_input_id,
+            "session_key": session_key,
+            "source_scope": source_scope,
+            "client_request_id": client_request_id,
+            "client_message_id": client_message_id,
+            "request_fingerprint": request_fingerprint,
+        }
+        if any(not value for value in identifiers.values()):
+            raise ValueError("pending input identities must be non-empty")
+        for name in ("pending_input_id", "client_request_id", "client_message_id"):
+            if len(identifiers[name]) > 256:
+                raise ValueError(f"{name} must not exceed 256 characters")
+        if len(session_key) > 512 or len(source_scope) > 256:
+            raise ValueError("pending input session/source identity is too long")
+        if not isinstance(payload, dict):
+            raise ValueError("pending input payload must be an object")
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = _now_ms()
+        async with self._write_transaction("enqueue_pending_chat_input") as conn:
+            dispatch_receipts = (
+                await self._find_pending_chat_input_dispatch_receipts(
+                    conn,
+                    pending_input_id=pending_input_id,
+                    session_key=session_key,
+                    source_scope=source_scope,
+                    client_request_id=client_request_id,
+                    client_message_id=client_message_id,
+                )
+            )
+            if dispatch_receipts:
+                exact = (
+                    len(dispatch_receipts) == 1
+                    and dispatch_receipts[0].pending_input_id == pending_input_id
+                    and dispatch_receipts[0].session_key == session_key
+                    and dispatch_receipts[0].source_scope == source_scope
+                    and dispatch_receipts[0].client_request_id
+                    == client_request_id
+                    and dispatch_receipts[0].client_message_id
+                    == client_message_id
+                    and dispatch_receipts[0].request_fingerprint
+                    == request_fingerprint
+                )
+                if exact:
+                    raise PendingChatInputAlreadyDispatchedError(
+                        "pending input was already dispatched"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input dispatch identity was already used"
+                )
+            cancellation = await self._select_pending_chat_input_cancellation(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if cancellation is not None:
+                cancelled_session_key, _cancelled_at = cancellation
+                if cancelled_session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input cancellation belongs to a different session"
+                    )
+                raise PendingChatInputCancelledError(
+                    "pending input was durably cancelled"
+                )
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE pending_input_id = ?
+                   OR (session_key = ? AND client_request_id = ?)
+                   OR (session_key = ? AND client_message_id = ?)
+                ORDER BY created_at ASC
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    client_request_id,
+                    session_key,
+                    client_message_id,
+                ),
+            ) as cur:
+                matches = await cur.fetchall()
+            if matches:
+                rows = [self._pending_chat_input_from_row(row) for row in matches]
+                first = rows[0]
+                exact = (
+                    len(rows) == 1
+                    and first.pending_input_id == pending_input_id
+                    and first.session_key == session_key
+                    and first.source_scope == source_scope
+                    and first.client_request_id == client_request_id
+                    and first.client_message_id == client_message_id
+                    and first.request_fingerprint == request_fingerprint
+                    and first.payload == payload
+                )
+                if exact:
+                    return first, True
+                raise PendingChatInputConflictError(
+                    "pending input identity was already used for a different payload"
+                )
+
+            async with conn.execute(
+                "SELECT COUNT(*) FROM pending_chat_inputs WHERE session_key = ?",
+                (session_key,),
+            ) as cur:
+                count_row = await cur.fetchone()
+            if int(count_row[0] if count_row is not None else 0) >= MAX_PENDING_CHAT_INPUTS:
+                raise PendingChatInputCapacityError(
+                    f"session already has {MAX_PENDING_CHAT_INPUTS} pending inputs"
+                )
+            if position is None:
+                async with conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 "
+                    "FROM pending_chat_inputs WHERE session_key = ?",
+                    (session_key,),
+                ) as cur:
+                    position_row = await cur.fetchone()
+                position = int(position_row[0] if position_row is not None else 0)
+            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                raise ValueError("position must be a non-negative integer")
+            await conn.execute(
+                """
+                INSERT INTO pending_chat_inputs (
+                    pending_input_id, session_key, source_scope,
+                    client_request_id, client_message_id, request_fingerprint,
+                    payload_json, position, state_revision, created_at, updated_at,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1)
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    source_scope,
+                    client_request_id,
+                    client_message_id,
+                    request_fingerprint,
+                    payload_json,
+                    position,
+                    now,
+                    now,
+                ),
+            )
+            row = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            assert row is not None
+            return row, False
+
+    @_serialized_read
+    async def get_pending_chat_input(
+        self,
+        pending_input_id: str,
+    ) -> PendingChatInput | None:
+        return await self._select_pending_chat_input(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+        )
+
+    @_serialized_read
+    async def get_pending_chat_input_dispatch_receipt(
+        self,
+        pending_input_id: str,
+    ) -> PendingChatInputDispatchReceipt | None:
+        return await self._select_pending_chat_input_dispatch_receipt(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+        )
+
+    async def consume_replayed_pending_chat_input(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        expected_revision: int,
+    ) -> bool:
+        """Remove a stale staged row after its turn receipt already committed.
+
+        Older or racing clients may retry enqueue after another tab committed
+        dispatch but before observing its acknowledgement.  The accepted turn
+        remains exactly once through ``turn_ingress_receipts``; this repair
+        consumes the otherwise permanent queue ghost only after all durable
+        request and message identities match the dispatch receipt.
+        """
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        source_scope = source_scope.strip()
+        client_request_id = client_request_id.strip()
+        client_message_id = client_message_id.strip()
+        request_fingerprint = request_fingerprint.strip()
+        if any(
+            not value
+            for value in (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                client_message_id,
+                request_fingerprint,
+            )
+        ):
+            raise ValueError("pending dispatch replay identities must be non-empty")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+
+        async with self._write_transaction(
+            "consume_replayed_pending_chat_input"
+        ) as conn:
+            receipts = await self._find_pending_chat_input_dispatch_receipts(
+                conn,
+                pending_input_id=pending_input_id,
+                session_key=session_key,
+                source_scope=source_scope,
+                client_request_id=client_request_id,
+                client_message_id=client_message_id,
+            )
+            if len(receipts) != 1:
+                raise PendingChatInputConflictError(
+                    "pending input dispatch receipt is missing or ambiguous"
+                )
+            receipt = receipts[0]
+            if (
+                receipt.session_key != session_key
+                or receipt.source_scope != source_scope
+                or receipt.client_request_id != client_request_id
+                or receipt.client_message_id != client_message_id
+                or receipt.request_fingerprint != request_fingerprint
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input does not match its accepted dispatch receipt"
+                )
+
+            pending = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if pending is None:
+                return False
+            if (
+                pending.session_key != session_key
+                or pending.source_scope != source_scope
+                or pending.client_request_id != client_request_id
+                or pending.client_message_id != client_message_id
+                or pending.request_fingerprint != request_fingerprint
+                or pending.state_revision != expected_revision
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input changed before dispatch replay cleanup"
+                )
+            async with conn.execute(
+                """
+                DELETE FROM pending_chat_inputs
+                WHERE pending_input_id = ?
+                  AND session_key = ?
+                  AND source_scope = ?
+                  AND client_request_id = ?
+                  AND client_message_id = ?
+                  AND request_fingerprint = ?
+                  AND state_revision = ?
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    source_scope,
+                    client_request_id,
+                    client_message_id,
+                    request_fingerprint,
+                    expected_revision,
+                ),
+            ) as cur:
+                consumed = int(cur.rowcount or 0)
+            if consumed != 1:
+                raise PendingChatInputConflictError(
+                    "pending input changed before dispatch replay cleanup"
+                )
+            return True
+
+    @_serialized_read
+    async def list_pending_chat_inputs(self, session_key: str) -> list[PendingChatInput]:
+        session_key = canonicalize_session_key(session_key)
+        async with self.conn.execute(
+            """
+            SELECT * FROM pending_chat_inputs
+            WHERE session_key = ?
+            ORDER BY position ASC, created_at ASC, pending_input_id ASC
+            """,
+            (session_key,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._pending_chat_input_from_row(row) for row in rows]
+
+    async def update_pending_chat_input(
+        self,
+        pending_input_id: str,
+        *,
+        session_key: str,
+        expected_revision: int,
+        position: int,
+    ) -> PendingChatInput:
+        """Move one row using a monotonic compare-and-set revision."""
+
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+            raise ValueError("position must be a non-negative integer")
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("update_pending_chat_input") as conn:
+            async with conn.execute(
+                """
+                UPDATE pending_chat_inputs
+                SET position = ?, state_revision = state_revision + 1, updated_at = ?
+                WHERE pending_input_id = ? AND session_key = ? AND state_revision = ?
+                """,
+                (position, _now_ms(), pending_input_id, session_key, expected_revision),
+            ) as cur:
+                changed = int(cur.rowcount or 0)
+            if changed != 1:
+                existing = await self._select_pending_chat_input(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if existing is None:
+                    raise PendingChatInputNotFoundError(pending_input_id)
+                if existing.session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input belongs to a different session"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input revision changed before update"
+                )
+            row = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            assert row is not None
+            return row
+
+    async def reorder_pending_chat_inputs(
+        self,
+        *,
+        session_key: str,
+        expected_revisions: list[tuple[str, int]],
+    ) -> list[PendingChatInput]:
+        """Replace one session's complete pending order atomically.
+
+        The caller supplies every currently staged row in the desired order.
+        Comparing the complete identity set and every state revision prevents a
+        concurrent enqueue, cancel, dispatch, or peer reorder from producing a
+        partially-applied order.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        if not 2 <= len(expected_revisions) <= MAX_PENDING_CHAT_INPUTS:
+            raise ValueError(
+                f"expected_revisions must contain 2-{MAX_PENDING_CHAT_INPUTS} rows"
+            )
+        pending_ids: list[str] = []
+        revisions: dict[str, int] = {}
+        for raw_pending_id, revision in expected_revisions:
+            pending_input_id = raw_pending_id.strip()
+            if not pending_input_id or len(pending_input_id) > 256:
+                raise ValueError("pending_input_id must be a non-empty bounded string")
+            if pending_input_id in revisions:
+                raise ValueError("pending_input_id values must be unique")
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise ValueError("expected revision must be a positive integer")
+            pending_ids.append(pending_input_id)
+            revisions[pending_input_id] = revision
+
+        async with self._write_transaction("reorder_pending_chat_inputs") as conn:
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                current_rows = await cur.fetchall()
+            current = [self._pending_chat_input_from_row(row) for row in current_rows]
+            if len(current) != len(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            current_by_id = {row.pending_input_id: row for row in current}
+            if set(current_by_id) != set(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            for pending_input_id, expected_revision in revisions.items():
+                if current_by_id[pending_input_id].state_revision != expected_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before reorder"
+                    )
+
+            updated_at = _now_ms()
+            for position, pending_input_id in enumerate(pending_ids):
+                async with conn.execute(
+                    """
+                    UPDATE pending_chat_inputs
+                    SET position = ?, state_revision = state_revision + 1,
+                        updated_at = ?
+                    WHERE pending_input_id = ? AND session_key = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        position,
+                        updated_at,
+                        pending_input_id,
+                        session_key,
+                        revisions[pending_input_id],
+                    ),
+                ) as cur:
+                    if int(cur.rowcount or 0) != 1:
+                        raise PendingChatInputConflictError(
+                            "pending input changed during reorder"
+                        )
+
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                reordered_rows = await cur.fetchall()
+            return [self._pending_chat_input_from_row(row) for row in reordered_rows]
+
+    async def cancel_pending_chat_input(
+        self,
+        pending_input_id: str,
+        *,
+        session_key: str,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Cancel one staged row; missing rows are an idempotent success."""
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        async with self._write_transaction("cancel_pending_chat_input") as conn:
+            existing = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if existing is None:
+                dispatch_receipt = (
+                    await self._select_pending_chat_input_dispatch_receipt(
+                        conn,
+                        pending_input_id=pending_input_id,
+                    )
+                )
+                if dispatch_receipt is not None:
+                    if dispatch_receipt.session_key != session_key:
+                        raise PendingChatInputConflictError(
+                            "pending input dispatch belongs to a different session"
+                        )
+                    return False
+                cancellation = await self._select_pending_chat_input_cancellation(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if cancellation is not None:
+                    if cancellation[0] != session_key:
+                        raise PendingChatInputConflictError(
+                            "pending input cancellation belongs to a different session"
+                        )
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO pending_chat_input_cancellations (
+                        pending_input_id, session_key, cancelled_at, schema_version
+                    ) VALUES (?, ?, ?, 1)
+                    """,
+                    (pending_input_id, session_key, _now_ms()),
+                )
+                return False
+            if existing.session_key != session_key:
+                raise PendingChatInputConflictError(
+                    "pending input belongs to a different session"
+                )
+            if (
+                expected_revision is not None
+                and existing.state_revision != expected_revision
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input revision changed before cancellation"
+                )
+            dispatch_receipt = await self._select_pending_chat_input_dispatch_receipt(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if dispatch_receipt is not None:
+                if dispatch_receipt.session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch belongs to a different session"
+                    )
+            else:
+                cancellation = await self._select_pending_chat_input_cancellation(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if cancellation is not None and cancellation[0] != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input cancellation belongs to a different session"
+                    )
+                if cancellation is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO pending_chat_input_cancellations (
+                            pending_input_id, session_key, cancelled_at, schema_version
+                        ) VALUES (?, ?, ?, 1)
+                        """,
+                        (pending_input_id, session_key, _now_ms()),
+                    )
+            await conn.execute(
+                "DELETE FROM pending_chat_inputs WHERE pending_input_id = ?",
+                (pending_input_id,),
+            )
+            return True
 
     @staticmethod
     async def _select_meta_control_intent(
@@ -9710,7 +11974,6 @@ class SessionStorage:
         if int(node.epoch or 0) != expected_epoch + 1:
             raise ValueError("reset epoch must advance exactly once")
 
-        session_data = node.model_dump()
         async with self._write_transaction("reset_session") as conn:
             async with conn.execute(
                 """
@@ -9729,6 +11992,9 @@ class SessionStorage:
                 )
             assert previous_row is not None
             previous_node = SessionNode(**_deserialize_row(dict(previous_row)))
+            node.model_routing_mode = previous_node.model_routing_mode
+            node.model_routing_revision = previous_node.model_routing_revision
+            session_data = node.model_dump()
             snapshot = ResetArchiveSnapshot(
                 node=previous_node,
                 entries=tuple(
@@ -9746,11 +12012,25 @@ class SessionStorage:
             )
             await archive_writer(snapshot)
 
-            assignments = [f"{column} = ?" for column in session_data if column != "session_key"]
+            from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+            await purge_session_on_connection(
+                conn,
+                session_id=expected_session_id,
+                boundary="session_reset",
+            )
+
+            assignments = [
+                f"{column} = ?"
+                for column in session_data
+                if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
+            ]
             values = [
                 _serialize(value)
                 for column, value in session_data.items()
                 if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
             ]
             async with conn.execute(
                 f"UPDATE sessions SET {', '.join(assignments)} "
@@ -9769,6 +12049,10 @@ class SessionStorage:
                     session_key=node.session_key,
                     expected_epoch=expected_epoch,
                 )
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=node.session_key,
+            )
 
             await self._delete_reset_history(conn, expected_session_id)
             # Reset rotates the Goal generation boundary.  Command receipts
@@ -9824,6 +12108,9 @@ class SessionStorage:
             )
 
         _clear_pending_meta_launch_boundary(node.session_key)
+        from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+        await run_session_artifact_cleanup(expected_session_id, node.session_key)
 
     async def accept_turn(
         self,
@@ -9853,6 +12140,12 @@ class SessionStorage:
         goal_mutation: (
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
+        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
+        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
+        prompt_annotation_turn_id: str | None = None,
+        pending_input_id: str | None = None,
+        pending_input_fingerprint: str | None = None,
+        pending_input_revision: int | None = None,
     ) -> TurnAcceptanceResult:
         """Commit one user message, optional task, and request receipt atomically.
 
@@ -9893,6 +12186,48 @@ class SessionStorage:
             raise ValueError("Goal turns cannot start or claim a Plan run")
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
+        expected_prompt_annotations = tuple(expected_prompt_annotations)
+        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
+        if expected_prompt_annotations and prepared_prompt_annotation_targets:
+            raise ValueError(
+                "prompt annotation acceptance cannot use legacy and prepared inputs together"
+            )
+        prompt_annotation_acceptance = bool(
+            expected_prompt_annotations or prepared_prompt_annotation_targets
+        )
+        if prompt_annotation_acceptance:
+            if session_node is not None or merge_into_task:
+                raise ValueError(
+                    "prompt annotations require an existing session and a distinct turn"
+                )
+            if not isinstance(prompt_annotation_turn_id, str) or not (
+                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
+            ):
+                raise ValueError("prompt_annotation_turn_id is required")
+        pending_guard_values = (
+            pending_input_id,
+            pending_input_fingerprint,
+            pending_input_revision,
+        )
+        if any(value is not None for value in pending_guard_values) and not all(
+            value is not None for value in pending_guard_values
+        ):
+            raise ValueError("pending input dispatch guard must be complete")
+        if pending_input_id is not None:
+            pending_input_id = pending_input_id.strip()
+            pending_input_fingerprint = str(pending_input_fingerprint).strip()
+            if not pending_input_id or not pending_input_fingerprint:
+                raise ValueError("pending input dispatch identity must not be blank")
+            if request_fingerprint != pending_input_fingerprint:
+                raise PendingChatInputConflictError(
+                    "pending input fingerprint must match the accepted turn fingerprint"
+                )
+            if (
+                isinstance(pending_input_revision, bool)
+                or not isinstance(pending_input_revision, int)
+                or pending_input_revision < 1
+            ):
+                raise ValueError("pending input revision must be a positive integer")
 
         request_session_key = canonicalize_session_key(request_session_key)
         entry.session_key = canonicalize_session_key(entry.session_key)
@@ -10039,6 +12374,7 @@ class SessionStorage:
                 "active_plan_revision_id may only select the accepted plan run"
             )
 
+        pending_dispatch_client_message_id: str | None = None
         async with self._write_transaction("accept_turn") as conn:
             selected = await self._select_turn_ingress_receipt(
                 conn,
@@ -10067,6 +12403,45 @@ class SessionStorage:
                     """,
                     (request_session_key, client_request_id),
                 )
+                if pending_input_id is not None:
+                    dispatch_receipt = (
+                        await self._select_pending_chat_input_dispatch_receipt(
+                            conn,
+                            pending_input_id=pending_input_id,
+                        )
+                    )
+                    if dispatch_receipt is None or (
+                        dispatch_receipt.session_key != request_session_key
+                        or dispatch_receipt.source_scope != source_scope
+                        or dispatch_receipt.client_request_id != client_request_id
+                        or dispatch_receipt.request_fingerprint
+                        != pending_input_fingerprint
+                    ):
+                        raise PendingChatInputConflictError(
+                            "pending input is not bound to the accepted turn receipt"
+                        )
+                    pending = await self._select_pending_chat_input(
+                        conn,
+                        pending_input_id=pending_input_id,
+                    )
+                    if pending is not None:
+                        if (
+                            pending.session_key != request_session_key
+                            or pending.source_scope != source_scope
+                            or pending.client_request_id != client_request_id
+                            or pending.client_message_id
+                            != dispatch_receipt.client_message_id
+                            or pending.request_fingerprint
+                            != pending_input_fingerprint
+                            or pending.state_revision != pending_input_revision
+                        ):
+                            raise PendingChatInputConflictError(
+                                "pending input does not match the accepted turn receipt"
+                            )
+                        await conn.execute(
+                            "DELETE FROM pending_chat_inputs WHERE pending_input_id = ?",
+                            (pending_input_id,),
+                        )
                 if isinstance(goal_mutation, StartGoalMutation):
                     goal_command_result = await self._replay_goal_command_on_conn(
                         conn,
@@ -10098,6 +12473,67 @@ class SessionStorage:
                         task_details.get("goal_candidate")
                     ),
                 )
+
+            if prompt_annotation_acceptance:
+                from opensquilla.artifact_session import (
+                    consume_prepared_prompt_annotations_on_conn,
+                    consume_prompt_annotations_on_conn,
+                )
+
+                assert prompt_annotation_turn_id is not None
+                if prepared_prompt_annotation_targets:
+                    await consume_prepared_prompt_annotations_on_conn(
+                        conn,
+                        prepared_targets=prepared_prompt_annotation_targets,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+                else:
+                    await consume_prompt_annotations_on_conn(
+                        conn,
+                        expected_annotations=expected_prompt_annotations,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+            if pending_input_id is not None:
+                pending = await self._select_pending_chat_input(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if pending is None:
+                    raise PendingChatInputNotFoundError(pending_input_id)
+                if (
+                    pending.session_key != request_session_key
+                    or pending.source_scope != source_scope
+                    or pending.client_request_id != client_request_id
+                    or pending.request_fingerprint != pending_input_fingerprint
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch identity changed before acceptance"
+                    )
+                if pending.state_revision != pending_input_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before acceptance"
+                    )
+                turn_context = entry.turn_context if isinstance(entry.turn_context, dict) else {}
+                turn_client_message_id = turn_context.get("client_message_id")
+                if (
+                    isinstance(turn_client_message_id, str)
+                    and turn_client_message_id
+                    and turn_client_message_id != pending.client_message_id
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input message identity changed before acceptance"
+                    )
+                pending_dispatch_client_message_id = pending.client_message_id
 
             if meta_control_intent_id is not None:
                 if task_record is None:
@@ -10255,6 +12691,10 @@ class SessionStorage:
                         f"VALUES ({session_placeholders})",
                         [_serialize(session_data[col]) for col in session_cols],
                     )
+                    await self._ensure_usage_baseline_for_session_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                    )
                 else:
                     previous_epoch = max(0, expected_epoch - 1)
                     async with conn.execute(
@@ -10280,6 +12720,10 @@ class SessionStorage:
                     previous_node = SessionNode(
                         **_deserialize_row(dict(previous_row))
                     )
+                    session_node.model_routing_mode = previous_node.model_routing_mode
+                    session_node.model_routing_revision = (
+                        previous_node.model_routing_revision
+                    )
                     reset_archive_snapshot = ResetArchiveSnapshot(
                         node=previous_node,
                         entries=tuple(
@@ -10298,15 +12742,26 @@ class SessionStorage:
                     if reset_archive_writer is not None:
                         await reset_archive_writer(reset_archive_snapshot)
                         reset_archive_snapshot = None
+                    from opensquilla.artifact_session.lifecycle import (
+                        purge_session_on_connection,
+                    )
+
+                    await purge_session_on_connection(
+                        conn,
+                        session_id=reset_from_session_id,
+                        boundary="session_reset",
+                    )
                     assignments = [
                         f"{column} = ?"
                         for column in session_data
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     values = [
                         _serialize(value)
                         for column, value in session_data.items()
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     async with conn.execute(
                         f"UPDATE sessions SET {', '.join(assignments)} "
@@ -10325,6 +12780,10 @@ class SessionStorage:
                             session_key=session_node.session_key,
                             expected_epoch=previous_epoch,
                         )
+                    await self._ensure_usage_baseline_for_session_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                    )
                     await self._delete_reset_history(conn, reset_from_session_id)
                     await conn.execute(
                         "DELETE FROM session_goals WHERE session_key = ?",
@@ -10912,6 +13371,50 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
+            if pending_input_id is not None:
+                if pending_dispatch_client_message_id is None:
+                    raise AssertionError(
+                        "validated pending input lost its client message identity"
+                    )
+                try:
+                    await self._insert_pending_chat_input_dispatch_receipt(
+                        conn,
+                        pending_input_id=pending_input_id,
+                        session_key=request_session_key,
+                        source_scope=source_scope,
+                        client_request_id=client_request_id,
+                        client_message_id=pending_dispatch_client_message_id,
+                        request_fingerprint=str(pending_input_fingerprint),
+                        accepted_at=receipt.accepted_at,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch identity was already consumed"
+                    ) from exc
+                async with conn.execute(
+                    """
+                    DELETE FROM pending_chat_inputs
+                    WHERE pending_input_id = ?
+                      AND session_key = ?
+                      AND source_scope = ?
+                      AND client_request_id = ?
+                      AND request_fingerprint = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        pending_input_id,
+                        request_session_key,
+                        source_scope,
+                        client_request_id,
+                        pending_input_fingerprint,
+                        pending_input_revision,
+                    ),
+                ) as cur:
+                    consumed = int(cur.rowcount or 0)
+                if consumed != 1:
+                    raise PendingChatInputConflictError(
+                        "pending input changed before atomic dispatch"
+                    )
             await conn.execute(
                 """
                 DELETE FROM meta_launch_drafts
@@ -10976,21 +13479,134 @@ class SessionStorage:
                 preserve_client_request_id=client_request_id,
                 preserve_message=entry.content,
             )
+            from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+            await run_session_artifact_cleanup(reset_from_session_id, entry.session_key)
         return acceptance_result
 
-    @_serialized_read
-    async def get_transcript(
-        self, session_id: str, limit: int | None = None, offset: int = 0
-    ) -> list[TranscriptEntry]:
+    async def _fetchall_transcript_rows(self, cursor: Any) -> list[Any]:
+        return cast(
+            list[Any],
+            await self._finish_sqlite_call(cursor.fetchall()),
+        )
+
+    async def _fetch_transcript_rows(
+        self,
+        conn: Any,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
         # SQLite requires LIMIT before OFFSET; use -1 for unlimited
         limit_val = limit if limit is not None else -1
         sql = (
             "SELECT * FROM transcript_entries WHERE session_id = ? "
             "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"
         )
-        async with self.conn.execute(sql, (session_id, limit_val, offset)) as cur:
-            rows = await cur.fetchall()
-        return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
+        async with conn.execute(sql, (session_id, limit_val, offset)) as cur:
+            return await self._fetchall_transcript_rows(cur)
+
+    async def _fetch_transcript_rows_on_writer(
+        self,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            async with self._operation_lock:
+                self._raise_if_poisoned()
+                return cast(
+                    list[Any],
+                    await self._finish_sqlite_call(
+                        self._fetch_transcript_rows(
+                            self.conn,
+                            session_id,
+                            limit,
+                            offset,
+                        )
+                    )
+                )
+
+        started = self._monotonic()
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._operation_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_operation_lock",
+                ) from exc
+            acquired = True
+            self._raise_if_poisoned()
+            return cast(
+                list[Any],
+                await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        self.conn,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            )
+        finally:
+            if acquired:
+                self._operation_lock.release()
+
+    @asynccontextmanager
+    async def _transcript_reader_access(self) -> AsyncIterator[Any | None]:
+        acquired = False
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            await self._transcript_reader_lock.acquire()
+            acquired = True
+        else:
+            started = self._monotonic()
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._transcript_reader_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_transcript_reader_lock",
+                ) from exc
+            acquired = True
+        try:
+            self._raise_if_poisoned()
+            yield self._transcript_reader
+        finally:
+            if acquired:
+                self._transcript_reader_lock.release()
+
+    async def get_transcript(
+        self, session_id: str, limit: int | None = None, offset: int = 0
+    ) -> list[TranscriptEntry]:
+        async with self._transcript_reader_access() as reader:
+            if reader is not None:
+                rows = await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        reader,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            else:
+                rows = None
+        if rows is None:
+            rows = await self._fetch_transcript_rows_on_writer(
+                session_id,
+                limit,
+                offset,
+            )
+        return await asyncio.to_thread(_decode_transcript_rows, rows)
 
     @_serialized_read
     async def get_canonical_transcript(
@@ -12256,7 +14872,7 @@ class SessionStorage:
                 node_placeholders = ", ".join("?" for _ in node_cols)
                 node_updates: list[str] = []
                 for col in node_cols:
-                    if col == "session_key":
+                    if col == "session_key" or col in _SESSION_DEDICATED_WRITER_COLUMNS:
                         continue
                     if col == "epoch":
                         node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")

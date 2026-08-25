@@ -1,11 +1,13 @@
 [
   {
+    "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "lookup",
     "tool_use_id": "call_0",
     "type": "ToolUseStartEvent"
   },
   {
+    "generation_epoch": null,
     "json_fragment": "{\"q\": \"cache\"}",
     "tool_use_id": "call_0",
     "type": "ToolUseDeltaEvent"
@@ -14,6 +16,7 @@
     "arguments": {
       "q": "cache"
     },
+    "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "lookup",
     "tool_use_id": "call_0",
@@ -25,6 +28,7 @@
     "cached_tokens": 0,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 9,
     "model": "test-model",
     "model_usage_breakdown": [],

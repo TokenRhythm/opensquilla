@@ -40,6 +40,7 @@ from .compat_policy import (
     OpenAICompatPolicy,
     ReasoningModelRule,
     compat_policy_for_kind,
+    effective_reasoning_format,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
 from .error_redaction import (
@@ -632,6 +633,94 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     if isinstance(value, list):
         return [_strip_tool_schema_keywords(item, unsupported) for item in value]
     return value
+
+
+_SINGLE_CHILD_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+
+
+def _complete_itemless_arrays_with_string_items(value: Any) -> Any:
+    """Project itemless schema arrays to Gemini's typed wire format.
+
+    Callers must gate this lossy projection to tools whose values have safe
+    textual wire semantics. Only schema-bearing keywords are traversed, so
+    schema-shaped literal values under ``default``, ``enum``, or ``const``
+    remain unchanged.
+    """
+
+    if not isinstance(value, dict):
+        return value
+
+    rebuilt = dict(value)
+    for key in _SINGLE_CHILD_SCHEMA_KEYWORDS:
+        child = rebuilt.get(key)
+        if isinstance(child, dict):
+            rebuilt[key] = _complete_itemless_arrays_with_string_items(child)
+        elif key == "items" and isinstance(child, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in child
+            ]
+    for key in _SCHEMA_ARRAY_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in children
+            ]
+    for key in _SCHEMA_MAP_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, dict):
+            rebuilt[key] = {
+                name: _complete_itemless_arrays_with_string_items(child)
+                if isinstance(child, dict)
+                else child
+                for name, child in children.items()
+            }
+    dependencies = rebuilt.get("dependencies")
+    if isinstance(dependencies, dict):
+        rebuilt["dependencies"] = {
+            name: _complete_itemless_arrays_with_string_items(child)
+            if isinstance(child, dict)
+            else child
+            for name, child in dependencies.items()
+        }
+
+    declared_type = rebuilt.get("type")
+    is_array = declared_type == "array" or (
+        isinstance(declared_type, list) and "array" in declared_type
+    )
+    if is_array and "items" not in rebuilt:
+        rebuilt["items"] = {"type": "string"}
+    return rebuilt
 
 
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
@@ -1527,6 +1616,10 @@ _MAX_MONEY_NANOS = (1 << 63) - 1
 _TOKENRHYTHM_CNY_PER_USD = TOKENRHYTHM_CNY_PER_USD
 _TOKENRHYTHM_FX_NANOS = TOKENRHYTHM_CNY_PER_USD_NANOS
 _USD_FX_NANOS = _MONEY_NANO_SCALE
+_TOKENRHYTHM_MONEY_STRING_MAX_CHARS = 128
+_TOKENRHYTHM_MONEY_STRING_RE = re.compile(
+    r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
 
 
 @dataclass
@@ -1580,6 +1673,31 @@ def _decimal_json_number(value: Any) -> Decimal | None:
         return None
     try:
         parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
+def _decimal_tokenrhythm_amount(value: Any) -> Decimal | None:
+    """Parse TokenRhythm's native amount without widening its trust boundary.
+
+    TokenRhythm normally emits ``cost_cny`` as a JSON number, but its live
+    streaming API also emits the same finite non-negative decimal as a JSON
+    string. Accept only strings whose complete contents use JSON number
+    syntax. This deliberately rejects whitespace, signs on positive values,
+    leading zeroes, separators, non-finite spellings, and structured values.
+    """
+
+    if not isinstance(value, str):
+        return _decimal_json_number(value)
+    if not 0 < len(value) <= _TOKENRHYTHM_MONEY_STRING_MAX_CHARS:
+        return None
+    if _TOKENRHYTHM_MONEY_STRING_RE.fullmatch(value) is None:
+        return None
+    try:
+        parsed = Decimal(value)
     except (InvalidOperation, ValueError):
         return None
     if not parsed.is_finite() or parsed < 0:
@@ -1680,7 +1798,7 @@ def _billing_result(
         return 0.0, "none", None
 
     amount = (
-        _decimal_json_number(billing.tokenrhythm_cost_cny)
+        _decimal_tokenrhythm_amount(billing.tokenrhythm_cost_cny)
         if billing.tokenrhythm_cost_present
         else None
     )
@@ -1953,6 +2071,20 @@ def _segment_text_tool_events(
                 events.append(TextDeltaEvent(text=segment.text))
             continue
         if isinstance(segment, RejectedTextToolSegment):
+            id_prefix = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text_rejected",
+                TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat_rejected",
+                TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat_rejected",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml_rejected",
+            }[segment.dialect]
+            for tool_name in segment.recognized_tool_names:
+                events.append(
+                    ToolUseStartEvent(
+                        tool_use_id=f"{id_prefix}_{uuid4().hex[:12]}",
+                        tool_name=tool_name,
+                        synthetic_from_text=True,
+                    )
+                )
             continue
         if isinstance(segment, InertDsmlSegment):
             raise AssertionError("inert DSML reached executable event conversion")
@@ -2024,14 +2156,14 @@ def _text_tool_rejection_error(
     cache_shape: Mapping[str, Any],
     trace: LLMTraceRecorder,
 ) -> ErrorEvent | None:
-    """Convert one rejected DSML response into a payload-free terminal error."""
+    """Convert rejected text-tool output into a payload-free terminal error."""
 
     details = _text_tool_rejection_details(segments)
     if details is None:
         return None
     reasons, call_count = details
     log.warning(
-        "provider.deepseek_dsml_tool_call_rejected",
+        "provider.text_tool_call_rejected",
         provider=provider_kind,
         model=model,
         reasons=reasons,
@@ -2039,7 +2171,7 @@ def _text_tool_rejection_error(
     )
     trace.record_error(
         code="incomplete_tool_call",
-        message="Provider returned rejected DeepSeek DSML tool-call text",
+        message="Provider returned rejected text-encoded tool-call output",
         metadata={
             "phase": phase,
             "cache_shape": cache_shape,
@@ -2049,7 +2181,7 @@ def _text_tool_rejection_error(
     )
     return ErrorEvent(
         message=(
-            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            f"{display_name} returned an invalid text-encoded tool call; "
             "no text-encoded tools were executed"
         ),
         code="incomplete_tool_call",
@@ -2062,6 +2194,7 @@ def _synthesize_text_tool_events(
     *,
     provider_kind: str,
     model: str,
+    base_url: str = "",
 ) -> list[ToolUseStartEvent | ToolUseEndEvent]:
     """Compatibility helper backed by the scoped, atomic classifier."""
 
@@ -2069,7 +2202,7 @@ def _synthesize_text_tool_events(
     segments = classify_text_tool_segments(
         full_text,
         tools,
-        dialects=policy.text_tool_profile.dialects_for_model(model),
+        dialects=policy.text_tool_profile.dialects_for_model(model, base_url),
         provider_kind=provider_kind,
         model=model,
     )
@@ -2088,9 +2221,12 @@ def _build_openai_tool(
     tool: ToolDefinition,
     *,
     unsupported_keywords: frozenset[str] = frozenset(),
+    complete_itemless_arrays_with_string_items: bool = False,
 ) -> dict[str, Any]:
     schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
     schema = _strip_tool_schema_keywords(schema, unsupported_keywords)
+    if complete_itemless_arrays_with_string_items:
+        schema = _complete_itemless_arrays_with_string_items(schema)
     return {
         "type": "function",
         "function": {
@@ -2121,6 +2257,7 @@ def _dashscope_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
         return True
     return model_name.startswith(
         (
+            "qwen3.8-max",
             "qwen3.7-max",
             "qwen3.6-max-preview",
             "qwen3.7-plus",
@@ -2136,6 +2273,13 @@ def _dashscope_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
     )
 
 
+def _tokenrhythm_model_supports_explicit_prompt_cache(model: str) -> bool:
+    """Return True only for TokenRhythm models with live cache-control proof."""
+
+    model_name = model.rsplit("/", 1)[-1].strip().lower()
+    return model_name in {"qwen3.7-max", "qwen3.8-max"}
+
+
 def _supports_explicit_prompt_cache(
     provider_kind: str,
     model: str,
@@ -2147,6 +2291,8 @@ def _supports_explicit_prompt_cache(
         return cache_mode == "on" or _openrouter_model_likely_supports_explicit_prompt_cache(model)
     if provider_kind == "dashscope":
         return cache_mode == "on" or _dashscope_model_likely_supports_explicit_prompt_cache(model)
+    if provider_kind == "tokenrhythm":
+        return _tokenrhythm_model_supports_explicit_prompt_cache(model)
     return False
 
 
@@ -2262,7 +2408,7 @@ def _log_provider_cache_usage(
     cache_write_tokens: int,
     cache_shape: Mapping[str, Any],
 ) -> None:
-    if provider_kind != "dashscope":
+    if provider_kind not in {"dashscope", "tokenrhythm"}:
         return
     log.info(
         f"{provider_kind}.prompt_cache_usage",
@@ -2868,8 +3014,10 @@ def _build_openai_messages(
     per tool result, while opensquilla packs multiple tool results into a single
     Message.
 
-    Invariant: tool_result blocks never coexist with text/image blocks in the
-    same Message (agent.py always packs tool results into a dedicated message).
+    Tool results normally arrive in a dedicated message.  The autonomous
+    document loop may additionally place a screenshot image in that message;
+    it is emitted as a trailing user image message because OpenAI-compatible
+    APIs accept only text in a ``role=tool`` payload.
     """
     if isinstance(msg.content, str):
         return [
@@ -2922,8 +3070,14 @@ def _build_openai_messages(
                 }
             )
 
-    # Tool results → one message per result (OpenAI requirement)
+    # Tool results → one message per result (OpenAI requirement).  A browser
+    # screenshot is carried as a separate user image message because the
+    # Chat Completions API accepts only text in a ``role=tool`` payload; doing
+    # this here preserves the tool-call/result pairing while still giving a
+    # vision-capable model the pixels.
     if tool_results:
+        if parts:
+            tool_results.append({"role": "user", "content": parts})
         return tool_results
 
     # Assistant message with tool_calls (preserve text alongside calls)
@@ -3012,7 +3166,9 @@ def _build_openai_wire_messages(
             content_blocks = _build_cache_breakpoint_blocks(
                 cfg.cache_breakpoints,
                 max_cache_markers=(
-                    _DASHSCOPE_MAX_CACHE_MARKERS if provider_kind == "dashscope" else None
+                    _DASHSCOPE_MAX_CACHE_MARKERS
+                    if provider_kind in {"dashscope", "tokenrhythm"}
+                    else None
                 ),
             )
             openai_messages.append({"role": "system", "content": content_blocks})
@@ -3092,7 +3248,11 @@ def _build_openai_wire_messages(
                         (_reasoning_replay_signature(built_message), suppressed_units)
                     )
         openai_messages.extend(built_messages)
-    if provider_kind == "dashscope" and cfg.cache_mode == "on":
+    if (
+        provider_kind in {"dashscope", "tokenrhythm"}
+        and cfg.cache_mode == "on"
+        and explicit_cache_supported
+    ):
         _attach_cache_control_to_latest_text_messages(
             openai_messages,
             max_cache_markers=_DASHSCOPE_MAX_CACHE_MARKERS,
@@ -3402,6 +3562,13 @@ class OpenAIProvider:
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
+                    complete_itemless_arrays_with_string_items=(
+                        tool.allow_string_item_schema_projection
+                        and self._compat.allows_string_item_schema_projection(
+                            tool.name,
+                            self._base_url,
+                        )
+                    ),
                 )
                 for tool in tools
             ]
@@ -3434,7 +3601,7 @@ class OpenAIProvider:
         if (caps and caps.supports_reasoning and cfg.thinking) or (
             thinking_toggle_model and cfg.thinking
         ):
-            reasoning_format = (
+            resolved_reasoning_format = (
                 reasoning_rule.reasoning_format
                 if reasoning_rule and reasoning_rule.reasoning_format
                 else (
@@ -3442,6 +3609,11 @@ class OpenAIProvider:
                     if caps is not None
                     else self._compat.default_reasoning_format
                 )
+            )
+            reasoning_format = effective_reasoning_format(
+                self._compat,
+                resolved_reasoning_format,
+                self._base_url,
             )
             reasoning_effort_override: str | None = None
             if reasoning_rule and reasoning_rule.reasoning_format:
@@ -3494,9 +3666,14 @@ class OpenAIProvider:
                     "none",
                     "off",
                 }:
+                    reasoning_format = effective_reasoning_format(
+                        self._compat,
+                        reasoning_rule.reasoning_format,
+                        self._base_url,
+                    )
                     apply_reasoning_disable(
                         payload,
-                        reasoning_rule.reasoning_format,
+                        reasoning_format,
                         ReasoningDisableArgs(model=self._model),
                     )
             else:
@@ -3504,7 +3681,9 @@ class OpenAIProvider:
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
                 payload,
-                caps.reasoning_format,
+                effective_reasoning_format(
+                    self._compat, caps.reasoning_format, self._base_url
+                ),
                 ReasoningDisableArgs(
                     model=self._model,
                     disable_reasoning_by_default_models=(
@@ -3604,18 +3783,23 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        # A coordinator-issued physical attempt is already the one upstream
+        # request for this adapter call.  Keep the legacy compatibility
+        # fallbacks available for unbounded direct calls, but never turn a
+        # coordinator-owned attempt into a hidden stream/non-stream resend.
+        coordinator_owns_retry = cfg.physical_attempt_limit == 1
         non_stream_fallback_allowed = (
             self._provider_kind != "dashscope"
             or _dashscope_non_stream_fallback_from_env()
         )
         stream_timeout_fallback = (
             self._compat.stream_timeout_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         empty_stream_fallback = (
             self._compat.empty_stream_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         (
@@ -3776,7 +3960,10 @@ class OpenAIProvider:
         streamed_thought_signature: str | None = None
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -4024,24 +4211,12 @@ class OpenAIProvider:
                                 message_limit_proof=message_limit_proof,
                             )
                             return
-                        # Diagnostic: dump payload head (no auth headers)
-                        # so 400s from picky upstreams are debuggable. Truncated
-                        # to keep memory low.
-                        try:
-                            _payload_head = json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                            )[:4000]
-                        except Exception:  # noqa: BLE001
-                            _payload_head = repr(payload)[:4000]
                         log.warning(
                             "provider.chat_http_error",
                             provider=self._provider_kind,
                             model=self._model,
                             status_code=response.status_code,
-                            message=message,
-                            response_body=safe_body_text[:2000],
-                            request_payload_head=_payload_head,
+                            response_body_chars=len(response.text),
                         )
                         trace.record_error(
                             code=str(response.status_code),
@@ -4128,8 +4303,7 @@ class OpenAIProvider:
                                 "provider.stream_error_frame",
                                 provider=self._provider_kind,
                                 model=self._model,
-                                code=err_code,
-                                message=err_message,
+                                error_message_chars=len(err_message),
                             )
                             trace.record_error(
                                 code=err_code,
@@ -4336,7 +4510,41 @@ class OpenAIProvider:
                                 )
                                 return
 
-                            # Text content
+                            # Reasoning content (always parsed, not gated on thinking).
+                            # Streamed in real time as ReasoningDeltaEvent; the
+                            # accumulator also retains the joined text for DoneEvent.
+                            # Counts as an emitted stream event: once the caller
+                            # has received reasoning deltas, an empty-stream or
+                            # timeout fallback retry would deliver (and bill)
+                            # the turn twice.
+                            for fragment in _openai_reasoning_fragments(delta):
+                                reasoning_event = reasoning.emit(fragment)
+                                if reasoning_event is None:
+                                    continue
+                                emitted_stream_event = True
+                                if text_tool_normalizer.native_lifecycle_deferred:
+                                    _append_coalesced_stream_event(
+                                        deferred_post_native_events,
+                                        reasoning_event,
+                                    )
+                                    if deferred_queue_is_oversized():
+                                        for release_event in release_deferred_queue():
+                                            if isinstance(
+                                                release_event,
+                                                TextDeltaEvent,
+                                            ):
+                                                visible_assistant_text_parts.append(
+                                                    release_event.text
+                                                )
+                                            yield release_event
+                                else:
+                                    yield reasoning_event
+
+                            # Text content follows reasoning when an
+                            # OpenAI-compatible gateway puts both fields in the
+                            # same delta. The wire object has no meaningful JSON
+                            # key order, but our semantic lifecycle does: a
+                            # thinking block must open before visible answer text.
                             text = delta.get("content")
                             if text:
                                 emitted_stream_event = True
@@ -4368,36 +4576,6 @@ class OpenAIProvider:
                                                 release_event.text
                                             )
                                         yield release_event
-
-                            # Reasoning content (always parsed, not gated on thinking).
-                            # Streamed in real time as ReasoningDeltaEvent; the
-                            # accumulator also retains the joined text for DoneEvent.
-                            # Counts as an emitted stream event: once the caller
-                            # has received reasoning deltas, an empty-stream or
-                            # timeout fallback retry would deliver (and bill)
-                            # the turn twice.
-                            for fragment in _openai_reasoning_fragments(delta):
-                                reasoning_event = reasoning.emit(fragment)
-                                if reasoning_event is None:
-                                    continue
-                                emitted_stream_event = True
-                                if text_tool_normalizer.native_lifecycle_deferred:
-                                    _append_coalesced_stream_event(
-                                        deferred_post_native_events,
-                                        reasoning_event,
-                                    )
-                                    if deferred_queue_is_oversized():
-                                        for release_event in release_deferred_queue():
-                                            if isinstance(
-                                                release_event,
-                                                TextDeltaEvent,
-                                            ):
-                                                visible_assistant_text_parts.append(
-                                                    release_event.text
-                                                )
-                                            yield release_event
-                                else:
-                                    yield reasoning_event
 
                             # Gemini thought_signature on non-FC deltas
                             # (streamed thinking path): Gemini sends it on
@@ -5047,6 +5225,19 @@ class OpenAIProvider:
                         trace=trace,
                     )
                     if rejection_error is not None:
+                        for event in _segment_text_tool_events(
+                            normalized_segments,
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                        ):
+                            if isinstance(event, ToolUseEndEvent):
+                                raise AssertionError(
+                                    "rejected text tool output produced a completed call"
+                                )
+                            emitted_stream_event = True
+                            if isinstance(event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(event.text)
+                            yield event
                         yield rejection_error
                         return
                     for event in _segment_text_tool_events(
@@ -5228,7 +5419,6 @@ class OpenAIProvider:
                     model=self._model,
                     timeout_seconds=cfg.timeout,
                     timeout_phase=type(exc).__name__,
-                    error=safe_error,
                 )
                 yield ProviderHeartbeatEvent(
                     phase="llm_fallback",
@@ -5285,7 +5475,6 @@ class OpenAIProvider:
                         "provider.stream_internal_error",
                         provider=self._provider_kind,
                         model=self._model,
-                        error=fallback_error,
                         exception_type=type(fallback_exc).__name__,
                     )
                     trace.record_error(code="provider_internal", message=fallback_error)
@@ -5405,7 +5594,6 @@ class OpenAIProvider:
                 "provider.stream_internal_error",
                 provider=self._provider_kind,
                 model=self._model,
-                error=safe_error,
                 exception_type=type(exc).__name__,
             )
             trace.record_error(
@@ -5513,7 +5701,7 @@ class OpenAIProvider:
                 "openrouter.non_stream_fallback_timeout",
                 model=self._model,
                 timeout_seconds=cfg.timeout,
-                stream_error=safe_error,
+                timeout_phase=type(timeout_exc).__name__,
             )
             trace.record_error(
                 code="timeout",
@@ -5718,7 +5906,10 @@ class OpenAIProvider:
         trace_tool_calls: list[dict[str, Any]] = []
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -5983,6 +6174,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message=(
@@ -6012,6 +6206,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message="Provider returned invalid native tool arguments",
@@ -6047,6 +6244,18 @@ class OpenAIProvider:
             trace=trace,
         )
         if rejection_error is not None:
+            for event in _segment_text_tool_events(
+                normalized_segments,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            ):
+                if isinstance(event, ToolUseEndEvent):
+                    raise AssertionError(
+                        "rejected text tool output produced a completed call"
+                    )
+                if isinstance(event, TextDeltaEvent):
+                    visible_assistant_text_parts.append(event.text)
+                yield event
             yield rejection_error
             return
         for event in _segment_text_tool_events(

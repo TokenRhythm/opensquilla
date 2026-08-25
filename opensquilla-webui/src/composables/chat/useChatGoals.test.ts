@@ -768,6 +768,48 @@ describe('useChatGoals', () => {
     expect(api.activeGoal.value?.goalId).toBe('g1')
   })
 
+  it('resets only the Goal transport watermark when a new stream generation starts', () => {
+    const { api, handlers } = harness()
+    expect(api.applyHydration({
+      key: SESSION_KEY,
+      epoch: 1,
+      goalSnapshotStreamSeq: 100,
+      goal: goalPayload('active'),
+    })).toBe(true)
+    const authoritativeGoal = api.goal.value
+
+    expect(api.applyHydration({
+      key: SESSION_KEY,
+      epoch: 1,
+      stream_generation: 'gateway-generation-2',
+      goal: null,
+      goalSnapshotStreamSeq: null,
+      deferred_fields: ['goal', 'goalSnapshotStreamSeq'],
+    })).toBe(false)
+    // A transport restart must not blank durable Goal state while metadata is
+    // still hydrating.
+    expect(api.goal.value).toBe(authoritativeGoal)
+
+    handlers.get('session.event.goal')?.({
+      session_key: SESSION_KEY,
+      session_id: SESSION_ID,
+      epoch: 1,
+      stream_generation: 'gateway-generation-2',
+      stream_seq: 1,
+      event_type: 'updated',
+      goal: goalPayload('paused', {
+        stateRevision: 2,
+        activeTaskId: null,
+        executionState: 'idle',
+      }),
+    })
+
+    expect(api.goal.value).toMatchObject({
+      status: 'paused',
+      stateRevision: 2,
+    })
+  })
+
   it('applies clear tombstones and does not resurrect the cleared Goal', () => {
     const { api, handlers } = harness()
     api.applyHydration({

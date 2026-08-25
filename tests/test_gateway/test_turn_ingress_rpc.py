@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,6 +15,21 @@ from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    AnchorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+    PromptAnnotationStatus,
+)
+from opensquilla.artifacts import ArtifactStore
+from opensquilla.attachment_refs import (
+    PENDING_CHAT_INPUT_MATERIAL_STORE,
+    pending_chat_input_material_path,
+    transcript_material_path,
+)
 from opensquilla.engine.steps.meta_command import (
     format_meta_replay_sentinel,
     meta_command_launch,
@@ -22,15 +39,36 @@ from opensquilla.engine.steps.meta_command import (
     pending_meta_launch_state,
 )
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.artifact_contexts import (
+    DOCUMENT_CONTEXT_TOOL_NAMES,
+    PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+    PROMPT_ANNOTATION_TOOL_NAMES,
+    BoundDocumentContext,
+)
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.model_routing import (
+    capture_model_routing_config,
+    model_routing_snapshot,
+)
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.rpc_sessions import _handle_sessions_send
+from opensquilla.gateway.session_model_routing import (
+    capture_accepted_model_routing_config,
+)
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.gateway.turn_ingress import request_fingerprint
+from opensquilla.gateway.uploads import UploadStore, get_upload_store, set_upload_store
 from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, TranscriptEntry
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    TranscriptEntry,
+    TurnIngressReceipt,
+)
+from opensquilla.session.storage import SessionStorage, TurnAcceptanceResult
 from opensquilla.session.turn_context import current_turn_context, turn_context_scope
 
 SESSION_KEY = "agent:main:webchat:atomic-ingress"
@@ -91,6 +129,7 @@ async def _open_real_stack(
         principal=_PRINCIPAL,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
+            attachments={"media_root": str(db_path.parent / "media")},
             memory={"flush_enabled": False},
             naming={"enabled": False},
         ),
@@ -138,6 +177,307 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
     assert runtime._tasks == {}
     assert runtime._pending_by_session == {}
     assert runtime._running_by_session == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "run_kind_injection"),
+    [
+        ("sessions.send", {"runKind": "cron_turn"}),
+        ("chat.send", {"run_kind": "cron_turn"}),
+        ("sessions.send", {"_source": {"run_kind": "cron_turn"}}),
+    ],
+)
+async def test_public_send_cannot_inject_global_routing_run_kind(
+    tmp_path: Path,
+    method: str,
+    run_kind_injection: dict[str, Any],
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        global_config = GatewayConfig(
+            squilla_router={"enabled": True, "rollout_phase": "full"},
+        )
+
+        async def accepted_config_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                global_config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = accepted_config_provider
+        params: dict[str, Any] = {
+            "message": "ordinary public input",
+            "clientRequestId": f"public-run-kind-{method}",
+            **run_kind_injection,
+        }
+        if method == "chat.send":
+            params["sessionKey"] = SESSION_KEY
+        else:
+            params["key"] = SESSION_KEY
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-public-run-kind-{method}",
+            method,
+            params,
+            stack.context,
+        )
+        await stack.wait_until_running()
+
+        assert response.ok is True
+        task = await stack.storage.get_agent_task(response.payload["task_id"])
+        assert task is not None and task.details is not None
+        audit = task.details["accepted_model_routing"]
+        assert task.run_kind == "session_turn"
+        assert audit["run_kind"] == "session_turn"
+        assert audit["scope"] == "session"
+        assert audit["effective_mode"] == "direct"
+        assert model_routing_snapshot(global_config)["mode"] == "router"
+
+
+@pytest.mark.asyncio
+async def test_internal_send_can_supply_trusted_background_run_kind(tmp_path: Path) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        global_config = GatewayConfig(
+            squilla_router={"enabled": True, "rollout_phase": "full"},
+        )
+
+        async def accepted_config_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                global_config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = accepted_config_provider
+        accepted = await _handle_sessions_send(
+            {
+                "key": SESSION_KEY,
+                "message": "trusted internal background input",
+                "clientRequestId": "trusted-internal-run-kind",
+            },
+            stack.context,
+            trusted_run_kind="cron_turn",
+        )
+        await stack.wait_until_running()
+
+        task = await stack.storage.get_agent_task(accepted["task_id"])
+        assert task is not None and task.details is not None
+        audit = task.details["accepted_model_routing"]
+        assert task.run_kind == "cron_turn"
+        assert audit["run_kind"] == "cron_turn"
+        assert audit["scope"] == "global"
+        assert audit["effective_mode"] == "router"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "display_text"),
+    [("/coding", "//coding"), ("//usr/bin/env", "///usr/bin/env")],
+)
+async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
+    tmp_path: Path,
+    message: str,
+    display_text: str,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-literal-slash.db") as stack:
+        staged = await get_dispatcher().dispatch(
+            "pending-literal-slash-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-literal-slash",
+                "clientRequestId": "pending-literal-slash-request",
+                "clientMessageId": "pending-literal-slash-message",
+                "message": message,
+                "displayText": display_text,
+            },
+            stack.context,
+        )
+        assert staged.ok is True
+        row = await stack.storage.get_pending_chat_input("pending-literal-slash")
+        assert row is not None
+        assert row.payload["message"] == message
+        assert row.payload["displayText"] == display_text
+
+        listed = await get_dispatcher().dispatch(
+            "pending-literal-slash-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert listed.payload["items"][0]["message"] == message
+        assert listed.payload["items"][0]["displayText"] == display_text
+
+        accepted = await get_dispatcher().dispatch(
+            "pending-literal-slash-dispatch",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-literal-slash",
+                "clientRequestId": "pending-literal-slash-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        entry = next(
+            item
+            for item in transcript
+            if item.message_id == accepted.payload["message_id"]
+        )
+        persisted_content = json.loads(entry.content)
+        assert persisted_content["text"] == message
+        assert persisted_content["display_text"] == display_text
+
+
+@pytest.mark.asyncio
+async def test_pending_input_confirmed_plain_slash_survives_staging_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-confirmed-plain.db") as stack:
+        staged = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-confirmed-plain",
+                "clientRequestId": "pending-confirmed-plain-request",
+                "clientMessageId": "pending-confirmed-plain-message",
+                "message": "/gamemode creative",
+                "confirmedPlainText": True,
+            },
+            stack.context,
+        )
+        assert staged.ok is True
+        row = await stack.storage.get_pending_chat_input("pending-confirmed-plain")
+        assert row is not None
+        assert row.payload["message"] == "/gamemode creative"
+        assert row.payload["confirmedPlainText"] is True
+
+        listed = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert listed.payload["items"][0]["confirmedPlainText"] is True
+
+        accepted = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-dispatch",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-confirmed-plain",
+                "clientRequestId": "pending-confirmed-plain-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        entry = next(
+            item
+            for item in transcript
+            if item.message_id == accepted.payload["message_id"]
+        )
+        assert entry.content == "/gamemode creative"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display_text", [None, "//different"])
+async def test_pending_input_rejects_unmarked_control_commands(
+    tmp_path: Path,
+    display_text: str | None,
+) -> None:
+    suffix = "missing" if display_text is None else "mismatched"
+    async with _open_real_stack(tmp_path / f"pending-control-{suffix}.db") as stack:
+        params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-control",
+            "clientRequestId": "pending-control-request",
+            "clientMessageId": "pending-control-message",
+            "message": "/coding",
+        }
+        if display_text is not None:
+            params["displayText"] = display_text
+        rejected = await get_dispatcher().dispatch(
+            "pending-control-enqueue",
+            "sessions.pending_inputs.enqueue",
+            params,
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["/coding", "/reset now", "/clear now", "/plan draft"],
+)
+async def test_pending_input_plain_marker_rejects_registered_web_controls(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    suffix = message.split(maxsplit=1)[0].removeprefix("/")
+    async with _open_real_stack(tmp_path / f"pending-registered-{suffix}.db") as stack:
+        rejected = await get_dispatcher().dispatch(
+            "pending-registered-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-registered",
+                "clientRequestId": "pending-registered-request",
+                "clientMessageId": "pending-registered-message",
+                "message": message,
+                "confirmedPlainText": True,
+            },
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "display_text", "confirmed_plain_text"),
+    [
+        ("ordinary provider text", "/reset", False),
+        ("/gamemode creative", "/reset", True),
+    ],
+)
+async def test_pending_input_rejects_unpaired_display_text(
+    tmp_path: Path,
+    message: str,
+    display_text: str,
+    confirmed_plain_text: bool,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-display-mismatch.db") as stack:
+        rejected = await get_dispatcher().dispatch(
+            "pending-display-mismatch-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-display-mismatch",
+                "clientRequestId": "pending-display-mismatch-request",
+                "clientMessageId": "pending-display-mismatch-message",
+                "message": message,
+                "displayText": display_text,
+                "confirmedPlainText": confirmed_plain_text,
+            },
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_DISPLAY_TEXT_MISMATCH"
 
 
 async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
@@ -208,6 +548,1462 @@ async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
     assert settled.status == "active"
     assert settled.active_task_id is None
     return settled
+
+
+async def _create_html_prompt_annotation(
+    stack: _RealIngressStack,
+    *,
+    annotation_id: str,
+) -> tuple[ArtifactSessionService, Any]:
+    service = await ArtifactSessionService.from_session_storage(stack.storage)
+    source = b"<html><body><h1>Original</h1></body></html>"
+    ref = ArtifactStore(
+        Path(stack.context.config.attachments.media_root or "")
+    ).publish_bytes(
+        source,
+        session_id=stack.session_id,
+        session_key=SESSION_KEY,
+        name="page.html",
+        mime="text/html",
+        source="test",
+    )
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=stack.session_id,
+        name="page.html",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=ref.id,
+            sha256=ref.sha256,
+            filename=ref.name,
+            media_type=ref.mime,
+            byte_size=ref.size,
+        ),
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    anchor = await service.create_anchor(
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        kind=AnchorKind.DOM_SOURCE,
+        locator={
+            "start_offset": source.decode().index("<h1>"),
+            "start_tag_end_offset": source.decode().index("<h1>") + len("<h1>"),
+            "tag_name": "h1",
+            "source_sha256": ref.sha256,
+            "offset_encoding": "unicode-code-point",
+        },
+        quote="<h1>",
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    draft = await service.create_prompt_annotation(
+        annotation_id=annotation_id,
+        session_key=SESSION_KEY,
+        session_id=stack.session_id,
+        session_epoch=0,
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        anchor_id=anchor.anchor_id,
+        body="Change this heading to Accepted.",
+    )
+    return service, draft
+
+
+async def _create_html_document(
+    stack: _RealIngressStack,
+    *,
+    session_key: str = SESSION_KEY,
+    session_id: str | None = None,
+) -> tuple[ArtifactSessionService, Any]:
+    service = await ArtifactSessionService.from_session_storage(stack.storage)
+    created = await service.create_document(
+        session_key=session_key,
+        session_id=session_id or stack.session_id,
+        name="page.html",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=f"artifact-{session_key}-{session_id or stack.session_id}",
+            sha256="c" * 64,
+            filename="page.html",
+            media_type="text/html",
+            byte_size=32,
+        ),
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    return service, created
+
+
+@pytest.mark.asyncio
+async def test_chat_send_binds_current_document_head_as_additive_runtime_context(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context.db") as stack:
+        _service, created = await _create_html_document(stack)
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "Update the open document heading.",
+            "clientRequestId": "document-context-ingress-1",
+            "documentContext": {
+                "documentId": created.document.document_id,
+                "headRevisionId": created.revision.revision_id,
+            },
+        }
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-ingress",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert isinstance(bound, BoundDocumentContext)
+        assert bound.document_id == created.document.document_id
+        assert bound.revision_id == created.revision.revision_id
+        assert bound.tool_names == DOCUMENT_CONTEXT_TOOL_NAMES
+        assert "document_read" in bound.request_context_prompt
+        assert "document_patch" in bound.request_context_prompt
+        assert "first source read MUST be document_read" in bound.request_context_prompt
+        assert 'cursor=""' in bound.request_context_prompt
+        assert "provider adapter requires that field" in bound.request_context_prompt
+        assert "Never invent a non-empty cursor" in bound.request_context_prompt
+        assert "sha256 returned by document_read" in bound.request_context_prompt
+        assert "write_file, edit_file, and apply_patch" in bound.request_context_prompt
+        assert "MUST NOT substitute for document_patch" in bound.request_context_prompt
+        assert "workspace mutators are unavailable" in bound.request_context_prompt
+
+        from opensquilla.gateway.routing import tool_context_from_envelope
+
+        tool_context = tool_context_from_envelope(
+            runtime_task.envelope,
+            is_owner=True,
+        )
+        assert tool_context.surfaced_tools == set(DOCUMENT_CONTEXT_TOOL_NAMES)
+        assert tool_context.exclusive_tools is None
+        assert tool_context.allowed_tools is None
+
+        replay_params = {key: value for key, value in params.items() if key != "documentContext"}
+        replay_params["document_context"] = {
+            "document_id": created.document.document_id,
+            "head_revision_id": created.revision.revision_id,
+        }
+        replay = await get_dispatcher().dispatch(
+            "rpc-document-context-ingress-replay",
+            "chat.send",
+            replay_params,
+            stack.context,
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["replayed"] is True
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_carries_latest_annotation_focus_into_document_followup(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-followup.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-followup-1",
+        )
+        document = await service.get_document(draft.document_id)
+        revision = await service.get_revision(draft.revision_id)
+        anchor = await service.get_anchor(draft.anchor_id)
+        snapshot = {
+            "version": 1,
+            "annotationId": draft.annotation_id,
+            "order": 0,
+            "body": draft.body,
+            "targetText": "Original",
+            "targetKind": "heading",
+            "targetStatus": "ready",
+            "targetReason": None,
+            "document": {
+                "id": document.document_id,
+                "name": document.name,
+                "kind": document.kind.value,
+            },
+            "revision": {
+                "id": revision.revision_id,
+                "generation": revision.generation,
+                "sha256": revision.artifact_sha256,
+            },
+            "anchor": {
+                "id": anchor.anchor_id,
+                "kind": anchor.kind.value,
+                "tagName": "h1",
+                "locator": anchor.locator,
+                "quote": anchor.quote,
+            },
+        }
+        session = await stack.storage.get_session(SESSION_KEY)
+        assert session is not None
+        await stack.storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=stack.session_id,
+                session_key=SESSION_KEY,
+                message_id="annotation-followup-history-1",
+                role="user",
+                content=json.dumps(
+                    {
+                        "text": "？",
+                        "attachments": [],
+                        "prompt_annotations": [snapshot],
+                    },
+                    ensure_ascii=False,
+                ),
+                created_at=1,
+            ),
+            expected_epoch=session.epoch,
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-followup",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "删除这个标题",
+                "clientRequestId": "document-context-followup-1",
+                "documentContext": {
+                    "documentId": document.document_id,
+                    "headRevisionId": revision.revision_id,
+                },
+            },
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert isinstance(bound, BoundDocumentContext)
+        assert "<previous_annotation_focus readonly='true'>" in bound.request_context_prompt
+        assert "page.html" in bound.request_context_prompt
+        assert "Original" in bound.request_context_prompt
+        assert "<previous_intent>Change this heading to Accepted.</previous_intent>" in (
+            bound.request_context_prompt
+        )
+        assert draft.annotation_id not in bound.request_context_prompt
+        assert revision.revision_id not in bound.request_context_prompt
+        assert revision.artifact_sha256 not in bound.request_context_prompt
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
+    from opensquilla.gateway.routing import tool_context_from_envelope
+
+    async with _open_real_stack(tmp_path / "generated-artifact-adopter.db") as stack:
+        response = await get_dispatcher().dispatch(
+            "rpc-generated-artifact-adopter",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Generate a small HTML page.",
+                "clientRequestId": "generated-artifact-adopter-1",
+            },
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        adopter = runtime_task.envelope.runtime_services.get(
+            "generated_artifact_adopter"
+        )
+        assert isinstance(adopter, GeneratedArtifactAdopter)
+        assert adopter.session_key == SESSION_KEY
+        assert adopter.session_id == stack.session_id
+        context = tool_context_from_envelope(runtime_task.envelope, is_owner=True)
+        assert context.generated_artifact_adopter is adopter
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_rejects_unbound_document_context_before_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-cross-session.db") as stack:
+        _service, created = await _create_html_document(
+            stack,
+            session_key="agent:main:webchat:another-session",
+            session_id="another-session-id",
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-cross-session",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Edit this document.",
+                "clientRequestId": "document-context-cross-session",
+                "documentContext": {
+                    "documentId": created.document.document_id,
+                    "headRevisionId": created.revision.revision_id,
+                },
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "DOCUMENT_UNAVAILABLE"
+        assert response.error.accepted is False
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_treats_document_context_revision_as_freshness_hint(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-hint.db") as stack:
+        _service, created = await _create_html_document(stack)
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-hint",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Edit this document.",
+                "clientRequestId": "document-context-hint",
+                "documentContext": {
+                    "documentId": created.document.document_id,
+                    "headRevisionId": "old-client-head-hint",
+                },
+            },
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert isinstance(bound, BoundDocumentContext)
+        assert bound.revision_id == created.revision.revision_id
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_rejects_document_context_for_non_owner(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-guest.db") as stack:
+        _service, created = await _create_html_document(stack)
+        stack.context.principal = Principal(
+            role="operator",
+            scopes=frozenset({"operator.write"}),
+            is_owner=False,
+            authenticated=True,
+        )
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-guest",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Edit this document.",
+                "clientRequestId": "document-context-guest",
+                "documentContext": {
+                    "documentId": created.document.document_id,
+                    "headRevisionId": created.revision.revision_id,
+                },
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "DOCUMENT_CONTEXT_FORBIDDEN"
+        assert response.error.accepted is False
+
+
+@pytest.mark.asyncio
+async def test_chat_send_atomically_consumes_prompt_annotations_into_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.naming.enabled = True
+        await stack.manager.update(SESSION_KEY, display_name="WebChat")
+        scheduled_titles: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def _record_auto_title(*args: Any, **kwargs: Any) -> None:
+            scheduled_titles.append((args, kwargs))
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.rpc_sessions._schedule_auto_title",
+            _record_auto_title,
+        )
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-ingress-1",
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-ingress",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": "prompt-annotation-ingress-1",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        assert response.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.status is PromptAnnotationStatus.SENT
+        assert sent.anchor_id != draft.anchor_id
+        normalized_anchor = await service.get_anchor(sent.anchor_id)
+        assert normalized_anchor.remapped_from_anchor_id == draft.anchor_id
+        assert sent.sent_message_id == response.payload["user_message_id"]
+        assert sent.sent_turn_id == response.payload["task_id"]
+        entries = await stack.storage.get_transcript(stack.session_id)
+        envelope = json.loads(entries[-1].content)
+        assert envelope["prompt_annotations"][0]["annotationId"] == draft.annotation_id
+        assert envelope["prompt_annotations"][0]["body"] == draft.body
+        assert envelope["prompt_annotations"][0]["targetStatus"] == "ready"
+        assert envelope["prompt_annotations"][0]["targetKind"] == "heading"
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert bound.operation_class == "selection_edit"
+        assert bound.annotation_ids == (draft.annotation_id,)
+        assert bound.targets[0].status == "ready"
+        assert bound.targets[0].anchor_id == sent.anchor_id
+        # The real-stack fixture has no Electron bridge.  It therefore uses
+        # the protocol-v3 source-only compatibility surface; a live v4
+        # desktop context receives the full candidate/browser loop.
+        assert bound.tool_names in {
+            PROMPT_ANNOTATION_TOOL_NAMES,
+            PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
+        }
+        assert "document_apply" in bound.request_context_prompt
+        assert "html_edit_source" not in bound.request_context_prompt
+        assert "version=" not in bound.request_context_prompt
+        assert scheduled_titles == []
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-ingress-replay",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": "prompt-annotation-ingress-1",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["replayed"] is True
+        assert replay.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
+        assert scheduled_titles == []
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pending_prompt_annotation_replay_restores_acceptance_ids(
+    tmp_path: Path,
+) -> None:
+    """A lost staged-dispatch response must still clear accepted annotation drafts."""
+
+    async with _open_real_stack(tmp_path / "pending-prompt-annotation.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-pending-replay-1",
+        )
+        staged = await get_dispatcher().dispatch(
+            "pending-prompt-annotation-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-prompt-annotation-1",
+                "clientRequestId": "pending-prompt-annotation-request",
+                "clientMessageId": "pending-prompt-annotation-message",
+                "message": "Apply the selected annotation.",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+        assert staged.ok is True, staged.error
+        assert staged.payload["promptAnnotationIds"] == [draft.annotation_id]
+
+        dispatch_params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-prompt-annotation-1",
+            "clientRequestId": "pending-prompt-annotation-request",
+            "requestFingerprint": staged.payload["requestFingerprint"],
+        }
+        accepted = await get_dispatcher().dispatch(
+            "pending-prompt-annotation-dispatch",
+            "sessions.pending_inputs.dispatch",
+            dispatch_params,
+            stack.context,
+        )
+        assert accepted.ok is True, accepted.error
+        assert accepted.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.status is PromptAnnotationStatus.SENT
+
+        # The first response is deliberately treated as lost.  The staged row
+        # is already consumed, so this exercises the receipt-only replay path
+        # that no longer has promptAnnotationIds in its RPC params.
+        replay = await get_dispatcher().dispatch(
+            "pending-prompt-annotation-replay",
+            "sessions.pending_inputs.dispatch",
+            dispatch_params,
+            stack.context,
+        )
+        assert replay.ok is True, replay.error
+        assert replay.payload["replayed"] is True
+        assert replay.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
+        assert replay.payload["task_id"] == accepted.payload["task_id"]
+        assert replay.payload["message_id"] == accepted.payload["message_id"]
+
+        stack.release_handler.set()
+        await stack.runtime.wait(accepted.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_source", "expected_status", "expected_reason"),
+    [
+        (
+            b"<html><body><section><h1 style='color:blue'>Original</h1></section></body></html>",
+            "ready",
+            None,
+        ),
+        (
+            b"<html><body><h1>Original</h1><h1>Original</h1></body></html>",
+            "contextual",
+            "ambiguous",
+        ),
+    ],
+    ids=["moved-and-restyled", "ambiguous"],
+)
+async def test_chat_send_normalizes_annotations_to_current_head_before_acceptance(
+    tmp_path: Path,
+    current_source: bytes,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
+    async with _open_real_stack(tmp_path / f"normalize-{expected_status}.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id=f"annotation-normalize-{expected_status}",
+        )
+        document = await service.get_document(draft.document_id)
+        ref = ArtifactStore(
+            Path(stack.context.config.attachments.media_root or "")
+        ).publish_bytes(
+            current_source,
+            session_id=stack.session_id,
+            session_key=SESSION_KEY,
+            name="page.html",
+            mime="text/html",
+            source="test-current-head",
+        )
+        current = await service.commit_revision(
+            document_id=document.document_id,
+            expected_head_revision_id=document.head_revision_id,
+            expected_state_revision=document.state_revision,
+            artifact=ArtifactBlobRef(
+                artifact_id=ref.id,
+                sha256=ref.sha256,
+                filename=ref.name,
+                media_type=ref.mime,
+                byte_size=ref.size,
+            ),
+            actor=Actor(ActorKind.USER, "owner"),
+        )
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-normalize-{expected_status}",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": f"normalize-{expected_status}",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.revision_id == current.revision.revision_id
+        normalized_anchor = await service.get_anchor(sent.anchor_id)
+        assert normalized_anchor.remapped_from_anchor_id == draft.anchor_id
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        target = runtime_task.envelope.runtime_services["artifact_context"].targets[0]
+        assert target.status == expected_status
+        assert target.reason == expected_reason
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_reprepares_annotation_after_head_race_before_provider_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "annotation-head-race.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-head-race",
+        )
+        original_accept_turn = stack.storage.accept_turn
+        acceptance_calls = 0
+        raced_revision_id: str | None = None
+
+        async def _accept_after_one_head_change(*args: Any, **kwargs: Any) -> Any:
+            nonlocal acceptance_calls, raced_revision_id
+            acceptance_calls += 1
+            if acceptance_calls == 1:
+                assert stack.handler_started.is_set() is False
+                document = await service.get_document(draft.document_id)
+                source = b"<html><body><section><h1>Original</h1></section></body></html>"
+                ref = ArtifactStore(
+                    Path(stack.context.config.attachments.media_root or "")
+                ).publish_bytes(
+                    source,
+                    session_id=stack.session_id,
+                    session_key=SESSION_KEY,
+                    name="page.html",
+                    mime="text/html",
+                    source="test-head-race",
+                )
+                committed = await service.commit_revision(
+                    document_id=document.document_id,
+                    expected_head_revision_id=document.head_revision_id,
+                    expected_state_revision=document.state_revision,
+                    artifact=ArtifactBlobRef(
+                        artifact_id=ref.id,
+                        sha256=ref.sha256,
+                        filename=ref.name,
+                        media_type=ref.mime,
+                        byte_size=ref.size,
+                    ),
+                    actor=Actor(ActorKind.USER, "owner"),
+                )
+                raced_revision_id = committed.revision.revision_id
+            return await original_accept_turn(*args, **kwargs)
+
+        monkeypatch.setattr(stack.storage, "accept_turn", _accept_after_one_head_change)
+
+        response = await get_dispatcher().dispatch(
+            "rpc-annotation-head-race",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": "annotation-head-race",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        assert acceptance_calls == 2
+        assert raced_revision_id is not None
+        await stack.wait_until_running()
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.revision_id == raced_revision_id
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 1,
+            "agent_tasks": 1,
+            "turn_ingress_receipts": 1,
+        }
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.naming.enabled = True
+        await stack.manager.update(SESSION_KEY, display_name="WebChat")
+        scheduled_titles: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def _record_auto_title(*args: Any, **kwargs: Any) -> None:
+            scheduled_titles.append((args, kwargs))
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.rpc_sessions._schedule_auto_title",
+            _record_auto_title,
+        )
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "Name this ordinary first turn.",
+            "clientRequestId": "ordinary-first-turn-naming",
+        }
+
+        response = await get_dispatcher().dispatch(
+            "rpc-ordinary-first-turn-naming",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+        assert len(scheduled_titles) == 1
+        assert scheduled_titles[0][0][2] == "Name this ordinary first turn."
+        assert scheduled_titles[0][1]["enabled"] is True
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-ordinary-first-turn-naming-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["replayed"] is True
+        assert len(scheduled_titles) == 1
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pending_input_rpc_dispatch_is_exactly_once_across_response_replay(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-dispatch.db") as stack:
+        enqueue_params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-rpc-exactly-once",
+            "clientRequestId": "pending-rpc-request",
+            "clientMessageId": "pending-rpc-message",
+            "message": "Run this queued follow-up exactly once.",
+        }
+        staged = await get_dispatcher().dispatch(
+            "pending-enqueue",
+            "sessions.pending_inputs.enqueue",
+            enqueue_params,
+            stack.context,
+        )
+        assert staged.ok is True
+        assert staged.payload["status"] == "staged"
+        staged_row = await stack.storage.get_pending_chat_input(
+            "pending-rpc-exactly-once"
+        )
+        assert staged_row is not None
+
+        listed = await get_dispatcher().dispatch(
+            "pending-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert [item["pendingInputId"] for item in listed.payload["items"]] == [
+            "pending-rpc-exactly-once"
+        ]
+
+        dispatch_params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-rpc-exactly-once",
+            "clientRequestId": "pending-rpc-request",
+            "requestFingerprint": staged.payload["requestFingerprint"],
+        }
+        missing_fingerprint = await get_dispatcher().dispatch(
+            "pending-dispatch-missing-fingerprint",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-exactly-once",
+                "clientRequestId": "pending-rpc-request",
+            },
+            stack.context,
+        )
+        assert missing_fingerprint.ok is False
+        assert missing_fingerprint.error is not None
+        assert missing_fingerprint.error.code == "PENDING_INPUT_FINGERPRINT_REQUIRED"
+        accepted = await get_dispatcher().dispatch(
+            "pending-dispatch",
+            "sessions.pending_inputs.dispatch",
+            dispatch_params,
+            stack.context,
+        )
+        late_enqueue = await get_dispatcher().dispatch(
+            "pending-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            enqueue_params,
+            stack.context,
+        )
+        assert late_enqueue.ok is False
+        assert late_enqueue.error is not None
+        assert late_enqueue.error.code == "PENDING_INPUT_ALREADY_DISPATCHED"
+        changed_message_identity = await get_dispatcher().dispatch(
+            "pending-changed-message-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            {
+                **enqueue_params,
+                "clientMessageId": "pending-rpc-message-changed",
+            },
+            stack.context,
+        )
+        assert changed_message_identity.ok is False
+        assert changed_message_identity.error is not None
+        assert changed_message_identity.error.code == "PENDING_INPUT_CONFLICT"
+        conflicting_late_enqueue = await get_dispatcher().dispatch(
+            "pending-conflicting-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            {
+                **enqueue_params,
+                "pendingInputId": "pending-rpc-late-arbitrary-id",
+            },
+            stack.context,
+        )
+        assert conflicting_late_enqueue.ok is False
+        assert conflicting_late_enqueue.error is not None
+        assert conflicting_late_enqueue.error.code == "PENDING_INPUT_CONFLICT"
+        reused_message_identity = await get_dispatcher().dispatch(
+            "pending-reused-message-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            {
+                **enqueue_params,
+                "pendingInputId": "pending-rpc-late-new-request",
+                "clientRequestId": "pending-rpc-request-new",
+            },
+            stack.context,
+        )
+        assert reused_message_identity.ok is False
+        assert reused_message_identity.error is not None
+        assert reused_message_identity.error.code == "PENDING_INPUT_CONFLICT"
+
+        # Reproduce a queue ghost left by a pre-fix racing tab. Dispatch replay
+        # must bind it to the original request/message receipt and consume it
+        # without creating a second transcript or task.
+        ghost_id = "pending-rpc-legacy-ghost"
+        async with stack.storage._write_transaction(
+            "test_insert_legacy_pending_ghost"
+        ) as conn:
+            await conn.execute(
+                """
+                INSERT INTO pending_chat_inputs (
+                    pending_input_id, session_key, source_scope,
+                    client_request_id, client_message_id, request_fingerprint,
+                    payload_json, position, state_revision, created_at, updated_at,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, 1)
+                """,
+                (
+                    ghost_id,
+                    staged_row.session_key,
+                    staged_row.source_scope,
+                    staged_row.client_request_id,
+                    staged_row.client_message_id,
+                    staged_row.request_fingerprint,
+                    json.dumps(
+                        staged_row.payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    staged_row.updated_at + 1,
+                    staged_row.updated_at + 1,
+                ),
+            )
+        ghost_replayed = await get_dispatcher().dispatch(
+            "pending-dispatch-legacy-ghost",
+            "sessions.pending_inputs.dispatch",
+            {**dispatch_params, "pendingInputId": ghost_id},
+            stack.context,
+        )
+        assert ghost_replayed.ok is True
+        assert ghost_replayed.payload["replayed"] is True
+        assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+
+        replayed = await get_dispatcher().dispatch(
+            "pending-dispatch-replay",
+            "sessions.pending_inputs.dispatch",
+            dispatch_params,
+            stack.context,
+        )
+
+        assert accepted.ok is True
+        assert replayed.ok is True
+        assert replayed.payload["task_id"] == accepted.payload["task_id"]
+        assert replayed.payload["message_id"] == accepted.payload["message_id"]
+        arbitrary_pending = await get_dispatcher().dispatch(
+            "pending-dispatch-arbitrary-id",
+            "sessions.pending_inputs.dispatch",
+            {
+                **dispatch_params,
+                "pendingInputId": "pending-rpc-arbitrary-id",
+            },
+            stack.context,
+        )
+        assert arbitrary_pending.ok is False
+        assert arbitrary_pending.error is not None
+        assert arbitrary_pending.error.code == "PENDING_INPUT_NOT_FOUND"
+        assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+        counts = _table_counts(stack.db_path)
+        assert counts == {
+            "transcript_entries": 1,
+            "agent_tasks": 1,
+            "turn_ingress_receipts": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_pending_input_cancel_tombstone_blocks_delayed_enqueue(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "cancel-first-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-input-cancel-first.db"
+        ) as stack:
+            identity = {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-cancel-first",
+            }
+            cancelled = await get_dispatcher().dispatch(
+                "pending-cancel-before-enqueue",
+                "sessions.pending_inputs.cancel",
+                identity,
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert cancelled.payload["alreadyMissing"] is True
+
+            payload = b"cancelled delayed attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("cancelled.txt", "text/plain", payload)
+            delayed = await get_dispatcher().dispatch(
+                "pending-delayed-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    **identity,
+                    "clientRequestId": "pending-rpc-cancel-first-request",
+                    "clientMessageId": "pending-rpc-cancel-first-message",
+                    "message": "This delayed enqueue must stay cancelled.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "cancelled.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert delayed.ok is False
+            assert delayed.error is not None
+            assert delayed.error.code == "PENDING_INPUT_CANCELLED"
+            assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+            assert not pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                "pending-rpc-cancel-first",
+                digest,
+            ).exists()
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_pending_input_rpc_rejects_conflicts_and_expired_attachments(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-conflict.db") as stack:
+        base = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-rpc-conflict",
+            "clientRequestId": "pending-rpc-conflict-request",
+            "clientMessageId": "pending-rpc-conflict-message",
+            "message": "original payload",
+        }
+        first = await get_dispatcher().dispatch(
+            "pending-conflict-first",
+            "sessions.pending_inputs.enqueue",
+            base,
+            stack.context,
+        )
+        assert first.ok is True
+
+        conflict = await get_dispatcher().dispatch(
+            "pending-conflict-second",
+            "sessions.pending_inputs.enqueue",
+            {**base, "message": "different payload"},
+            stack.context,
+        )
+        assert conflict.ok is False
+        assert conflict.error is not None
+        assert conflict.error.code == "PENDING_INPUT_CONFLICT"
+
+        attachment = await get_dispatcher().dispatch(
+            "pending-attachment",
+            "sessions.pending_inputs.enqueue",
+            {
+                **base,
+                "pendingInputId": "pending-rpc-attachment",
+                "clientRequestId": "pending-rpc-attachment-request",
+                "clientMessageId": "pending-rpc-attachment-message",
+                "attachments": [{"kind": "staged", "file_uuid": "expiring-token"}],
+            },
+            stack.context,
+        )
+        assert attachment.ok is False
+        assert attachment.error is not None
+        assert attachment.error.code == "ATTACHMENT_EXPIRED"
+        assert len(await stack.storage.list_pending_chat_inputs(SESSION_KEY)) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_attachment_survives_restart_dispatches_once_and_cleans_owner(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-attachment.db") as stack:
+            payload = b"durable queued attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("queued.txt", "text/plain", payload)
+            enqueue_params = {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-durable-attachment",
+                "clientRequestId": "pending-rpc-durable-attachment-request",
+                "clientMessageId": "pending-rpc-durable-attachment-message",
+                "message": "Use the durable attachment.",
+                "attachments": [
+                    {
+                        "type": "text/plain",
+                        "mime": "text/plain",
+                        "name": "queued.txt",
+                        "file_uuid": file_uuid,
+                    }
+                ],
+            }
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-enqueue",
+                "sessions.pending_inputs.enqueue",
+                enqueue_params,
+                stack.context,
+            )
+            assert staged.ok is True
+            assert staged.payload["attachments"] == [
+                {
+                    "name": "queued.txt",
+                    "mime": "text/plain",
+                    "type": "text/plain",
+                    "size": len(payload),
+                }
+            ]
+
+            row = await stack.storage.get_pending_chat_input(
+                "pending-rpc-durable-attachment"
+            )
+            assert row is not None
+            assert row.payload["attachments"] == [
+                {
+                    "kind": "attachment_ref",
+                    "type": "text/plain",
+                    "mime": "text/plain",
+                    "name": "queued.txt",
+                    "size": len(payload),
+                    "sha256": digest,
+                    "material_id": digest,
+                    "store": PENDING_CHAT_INPUT_MATERIAL_STORE,
+                    "scope": stack.session_id,
+                    "pending_input_id": "pending-rpc-durable-attachment",
+                    "source": "upload",
+                    "_was_staged": True,
+                }
+            ]
+            owner_path = pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                "pending-rpc-durable-attachment",
+                digest,
+            )
+            assert owner_path.read_bytes() == payload
+
+            # The expiring upload is gone and the process-local upload store is
+            # replaced, matching a Gateway restart. Dispatch must use only the
+            # durable material reference retained by SQLite.
+            assert file_uuid not in upload_store._entries
+            set_upload_store(UploadStore(tmp_path / "upload-markers"))
+            enqueue_replay = await get_dispatcher().dispatch(
+                "pending-attachment-enqueue-replay",
+                "sessions.pending_inputs.enqueue",
+                enqueue_params,
+                stack.context,
+            )
+            assert enqueue_replay.ok is True
+            assert enqueue_replay.payload["replayed"] is True
+            assert (
+                enqueue_replay.payload["requestFingerprint"]
+                == staged.payload["requestFingerprint"]
+            )
+            dispatch_params = {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-durable-attachment",
+                "clientRequestId": "pending-rpc-durable-attachment-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            }
+            accepted = await get_dispatcher().dispatch(
+                "pending-attachment-dispatch",
+                "sessions.pending_inputs.dispatch",
+                dispatch_params,
+                stack.context,
+            )
+            replayed = await get_dispatcher().dispatch(
+                "pending-attachment-dispatch-replay",
+                "sessions.pending_inputs.dispatch",
+                dispatch_params,
+                stack.context,
+            )
+            assert accepted.ok is True
+            assert replayed.ok is True
+            assert replayed.payload["message_id"] == accepted.payload["message_id"]
+            assert not owner_path.exists()
+            assert transcript_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                digest,
+            ).read_bytes() == payload
+            assert _table_counts(stack.db_path) == {
+                "transcript_entries": 1,
+                "agent_tasks": 1,
+                "turn_ingress_receipts": 1,
+            }
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_pending_attachment_cancel_removes_only_its_private_owner(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "cancel-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-attachment-cancel.db") as stack:
+            payload = b"cancel this queued attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("cancel.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-cancel-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-cancel-attachment",
+                    "clientRequestId": "pending-rpc-cancel-attachment-request",
+                    "clientMessageId": "pending-rpc-cancel-attachment-message",
+                    "message": "Queue then cancel this attachment.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "cancel.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            owner_path = pending_chat_input_material_path(
+                media_root,
+                stack.session_id,
+                "pending-rpc-cancel-attachment",
+                digest,
+            )
+            canonical_path = transcript_material_path(
+                media_root,
+                stack.session_id,
+                digest,
+            )
+            assert owner_path.read_bytes() == payload
+            assert not canonical_path.exists()
+
+            cancelled = await get_dispatcher().dispatch(
+                "pending-attachment-cancel",
+                "sessions.pending_inputs.cancel",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-cancel-attachment",
+                    "expectedRevision": staged.payload["revision"],
+                },
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert not owner_path.exists()
+            assert not canonical_path.exists()
+            assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_session_delete_reclaims_pending_attachment_owner(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "delete-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-attachment-delete.db") as stack:
+            payload = b"delete this session-owned pending attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("delete.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-delete-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-delete-attachment",
+                    "clientRequestId": "pending-rpc-delete-attachment-request",
+                    "clientMessageId": "pending-rpc-delete-attachment-message",
+                    "message": "Delete this queued attachment with the session.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "delete.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            owner_path = pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                "pending-rpc-delete-attachment",
+                digest,
+            )
+            assert owner_path.read_bytes() == payload
+
+            deleted = await get_dispatcher().dispatch(
+                "pending-attachment-session-delete",
+                "sessions.delete",
+                {"key": SESSION_KEY},
+                stack.context,
+            )
+            assert deleted.ok is True
+            assert deleted.payload == {"deleted": [SESSION_KEY], "errors": []}
+            assert not owner_path.exists()
+            assert await stack.storage.get_pending_chat_input(
+                "pending-rpc-delete-attachment"
+            ) is None
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleans_unreferenced_canonical_copy_after_failed_dispatch(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "failed-dispatch-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-attachment-failed-dispatch.db",
+            max_pending_per_session=1,
+        ) as stack:
+            payload = b"failed dispatch must not leak canonical bytes\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("failed.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-failed-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-failed-attachment",
+                    "clientRequestId": "pending-rpc-failed-attachment-request",
+                    "clientMessageId": "pending-rpc-failed-attachment-message",
+                    "message": "This dispatch will hit queue capacity.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "failed.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            blocker = await stack.runtime.reserve(
+                RouteEnvelope(
+                    source_kind=SourceKind.WEB,
+                    source_name="pending-attachment-capacity-test",
+                    agent_id="main",
+                    session_key=SESSION_KEY,
+                    input_provenance={"kind": "synthetic-test"},
+                ),
+                "reserve the only queue slot",
+            )
+            dispatch = await get_dispatcher().dispatch(
+                "pending-attachment-failed-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-failed-attachment",
+                    "clientRequestId": "pending-rpc-failed-attachment-request",
+                    "requestFingerprint": staged.payload["requestFingerprint"],
+                },
+                stack.context,
+            )
+            assert dispatch.ok is False
+            assert dispatch.error is not None
+            assert dispatch.error.code == "QUEUE_FULL"
+            canonical_path = transcript_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                digest,
+            )
+            assert canonical_path.read_bytes() == payload
+
+            cancelled = await get_dispatcher().dispatch(
+                "pending-attachment-failed-cancel",
+                "sessions.pending_inputs.cancel",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-failed-attachment",
+                    "expectedRevision": staged.payload["revision"],
+                },
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert not canonical_path.exists()
+            await stack.runtime.abort_reservation(blocker)
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_cancel_preserves_canonical_material_referenced_by_transcript(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "shared-material-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-attachment-shared-material.db",
+            max_pending_per_session=1,
+        ) as stack:
+            payload = b"shared transcript attachment bytes\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            canonical_path = transcript_material_path(
+                media_root,
+                stack.session_id,
+                digest,
+            )
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            canonical_path.write_bytes(payload)
+            await stack.manager.append_message(
+                SESSION_KEY,
+                role="user",
+                content=json.dumps(
+                    {
+                        "text": "existing transcript reference",
+                        "attachments": [
+                            {
+                                "sha256_ref": digest,
+                                "name": "existing.txt",
+                                "mime": "text/plain",
+                                "size": len(payload),
+                            }
+                        ],
+                    }
+                ),
+            )
+            file_uuid = await upload_store.put("shared.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-shared-material-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-shared-material",
+                    "clientRequestId": "pending-rpc-shared-material-request",
+                    "clientMessageId": "pending-rpc-shared-material-message",
+                    "message": "Do not delete the shared canonical material.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "shared.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            blocker = await stack.runtime.reserve(
+                RouteEnvelope(
+                    source_kind=SourceKind.WEB,
+                    source_name="pending-shared-material-capacity-test",
+                    agent_id="main",
+                    session_key=SESSION_KEY,
+                    input_provenance={"kind": "synthetic-test"},
+                ),
+                "reserve the only queue slot",
+            )
+            dispatch = await get_dispatcher().dispatch(
+                "pending-shared-material-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-shared-material",
+                    "clientRequestId": "pending-rpc-shared-material-request",
+                    "requestFingerprint": staged.payload["requestFingerprint"],
+                },
+                stack.context,
+            )
+            assert dispatch.ok is False
+            assert dispatch.error is not None
+            assert dispatch.error.code == "QUEUE_FULL"
+            cancelled = await get_dispatcher().dispatch(
+                "pending-shared-material-cancel",
+                "sessions.pending_inputs.cancel",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-shared-material",
+                    "expectedRevision": staged.payload["revision"],
+                },
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert canonical_path.read_bytes() == payload
+            await stack.runtime.abort_reservation(blocker)
+    finally:
+        set_upload_store(original_store)
 
 
 @pytest.mark.asyncio
@@ -368,6 +2164,143 @@ async def test_default_turn_claims_goal_inside_atomic_acceptance_without_pre_rea
         # the acceptance transaction.
         current_goal = await original_get_goal(SESSION_KEY)
         assert current_goal is not None and current_goal.goal_id == seeded_goal.goal_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"type": "image/png", "name": "synthetic.png", "data": "aW1hZ2U="},
+        {"type": "text/plain", "name": "synthetic.txt", "data": "dGV4dA=="},
+    ],
+    ids=["image", "file"],
+)
+async def test_prompt_annotations_reject_attachments_before_runtime_acceptance(
+    tmp_path: Path,
+    attachment: dict[str, str],
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-with-attachment",
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-attachment-rejected",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Apply this annotation and inspect the image.",
+                "clientRequestId": "prompt-annotation-attachment-rejected",
+                "promptAnnotationIds": [draft.annotation_id],
+                "attachments": [attachment],
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "PROMPT_ANNOTATION_ATTACHMENTS_UNSUPPORTED"
+        assert response.error.accepted is False
+        assert (await service.get_prompt_annotation(draft.annotation_id)).status is (
+            PromptAnnotationStatus.DRAFT
+        )
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotations_reject_plan_mode_before_runtime_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-in-plan-mode",
+        )
+        await stack.storage.set_collaboration_mode(
+            SESSION_KEY,
+            "plan",
+            expected_revision=0,
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-plan-rejected",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Apply this annotation while planning.",
+                "clientRequestId": "prompt-annotation-plan-rejected",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "ARTIFACT_PROMPT_ANNOTATIONS_PLAN_UNSUPPORTED"
+        assert response.error.accepted is False
+        assert (await service.get_prompt_annotation(draft.annotation_id)).status is (
+            PromptAnnotationStatus.DRAFT
+        )
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotation_attachment_rule_runs_after_receipt_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "Legacy accepted annotation with an image.",
+            "clientRequestId": "legacy-annotation-attachment",
+            "promptAnnotationIds": ["legacy-annotation"],
+            "attachments": [{"type": "image/png", "name": "legacy.png"}],
+        }
+        receipt = TurnIngressReceipt(
+            source_scope="web:web:operator",
+            request_session_key=SESSION_KEY,
+            client_request_id="legacy-annotation-attachment",
+            request_fingerprint=request_fingerprint(params),
+            accepted_session_key=SESSION_KEY,
+            session_id=stack.session_id,
+            message_id="legacy-message",
+            task_id=None,
+            accepted_at=1,
+        )
+
+        async def _replay(**_kwargs: object) -> TurnAcceptanceResult:
+            return TurnAcceptanceResult(
+                receipt=receipt,
+                replayed=True,
+                fresh_user_session=False,
+            )
+
+        monkeypatch.setattr(stack.storage, "replay_turn_ingress_receipt", _replay)
+
+        response = await get_dispatcher().dispatch(
+            "rpc-legacy-prompt-annotation-attachment-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        assert response.payload["replayed"] is True
+        assert response.payload["acceptedPromptAnnotationIds"] == ["legacy-annotation"]
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
 
 
 @pytest.mark.asyncio
@@ -649,6 +2582,22 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     session = await manager.create(SESSION_KEY, agent_id="main")
     blocker_started = asyncio.Event()
     hold_blocker = asyncio.Event()
+    gateway_config = GatewayConfig(
+        workspace_dir=str(tmp_path / "workspace"),
+        memory={"flush_enabled": False},
+        naming={"enabled": False},
+    )
+    routing_state: dict[str, Any] = {"mode": "router", "revision": 7}
+
+    def _accepted_routing_provider(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == SESSION_KEY
+        assert run_kind in {"session_turn", "recovery_model_routing_base"}
+        return capture_model_routing_config(
+            gateway_config,
+            session_mode=routing_state["mode"],
+            session_routing_revision=routing_state["revision"],
+            session_routing_source="session",
+        )
 
     async def _blocking_handler(_run: Any) -> None:
         blocker_started.set()
@@ -659,15 +2608,12 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         turn_handler=_blocking_handler,
         max_concurrency=1,
         running_heartbeat_interval_s=None,
+        accepted_config_provider=_accepted_routing_provider,
     )
     context = RpcContext(
         conn_id="meta-restart-before-start",
         principal=_PRINCIPAL,
-        config=GatewayConfig(
-            workspace_dir=str(tmp_path / "workspace"),
-            memory={"flush_enabled": False},
-            naming={"enabled": False},
-        ),
+        config=gateway_config,
         session_manager=manager,
         task_runtime=runtime,
     )
@@ -710,6 +2656,8 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     assert queued.details is not None
     assert queued.details["meta_control_message"] == launch_text
     assert queued.details["meta_control_semantic_message"] == launch_text
+    assert queued.details["accepted_model_routing"]["session_mode"] == "router"
+    assert queued.details["accepted_model_routing"]["session_revision"] == 7
     transcript = await storage.get_transcript(session.session_id)
     control_entry = next(
         entry
@@ -731,6 +2679,7 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     await asyncio.gather(*old_async_tasks, return_exceptions=True)
 
     reopened = await SessionStorage.open(str(db_path))
+    routing_state.update(mode="direct", revision=8)
     recovered_runs: list[tuple[Any, dict[str, Any] | None]] = []
 
     async def _capture_recovered(run: Any) -> None:
@@ -742,6 +2691,7 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         turn_handler=_capture_recovered,
         max_concurrency=1,
         running_heartbeat_interval_s=None,
+        accepted_config_provider=_accepted_routing_provider,
     )
     try:
         abandoned = await reopened.get_agent_task(task_id)
@@ -757,6 +2707,9 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         assert recovered_run.task_id == task_id
         assert recovered_run.message == launch_text
         assert recovered_run.semantic_message == launch_text
+        assert recovered_run.accepted_config.session_mode == "router"
+        assert recovered_run.accepted_config.session_routing_revision == 7
+        assert recovered_run.accepted_config.session_routing_source == "session"
         assert recovered_context is not None
         assert recovered_context["meta_control"]["name"] == "meta-tiny"
 
@@ -1080,6 +3033,82 @@ async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_pat
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_pending_input_rpc_reorders_complete_queue_atomically(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-reorder.db") as stack:
+        staged_items: list[dict[str, object]] = []
+        for index in range(3):
+            staged = await get_dispatcher().dispatch(
+                f"pending-reorder-enqueue-{index}",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": f"pending-reorder-{index}",
+                    "clientRequestId": f"pending-reorder-request-{index}",
+                    "clientMessageId": f"pending-reorder-message-{index}",
+                    "message": f"queued reorder {index}",
+                    "position": 10 - index,
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            staged_items.append(staged.payload)
+
+        reordered = await get_dispatcher().dispatch(
+            "pending-reorder",
+            "sessions.pending_inputs.reorder",
+            {
+                "key": SESSION_KEY,
+                "items": [
+                    {
+                        "pendingInputId": staged_items[index]["pendingInputId"],
+                        "expectedRevision": staged_items[index]["revision"],
+                    }
+                    for index in (2, 0, 1)
+                ],
+            },
+            stack.context,
+        )
+        assert reordered.ok is True
+        assert [item["pendingInputId"] for item in reordered.payload["items"]] == [
+            "pending-reorder-2",
+            "pending-reorder-0",
+            "pending-reorder-1",
+        ]
+        assert [item["position"] for item in reordered.payload["items"]] == [0, 1, 2]
+        assert [item["revision"] for item in reordered.payload["items"]] == [2, 2, 2]
+
+        stale = await get_dispatcher().dispatch(
+            "pending-reorder-stale",
+            "sessions.pending_inputs.reorder",
+            {
+                "key": SESSION_KEY,
+                "items": [
+                    {"pendingInputId": "pending-reorder-1", "expectedRevision": 2},
+                    {"pendingInputId": "pending-reorder-2", "expectedRevision": 1},
+                    {"pendingInputId": "pending-reorder-0", "expectedRevision": 2},
+                ],
+            },
+            stack.context,
+        )
+        assert stale.ok is False
+        assert stale.error is not None
+        assert stale.error.code == "PENDING_INPUT_CONFLICT"
+        listed = await get_dispatcher().dispatch(
+            "pending-reorder-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert [item["pendingInputId"] for item in listed.payload["items"]] == [
+            "pending-reorder-2",
+            "pending-reorder-0",
+            "pending-reorder-1",
+        ]
 
 
 @pytest.mark.asyncio
@@ -1526,6 +3555,39 @@ async def test_sessions_send_queue_full_is_unaccepted_and_does_not_persist_messa
         assert stack.runtime._reservations_by_session == {SESSION_KEY: [blocker]}
 
         await stack.runtime.abort_reservation(blocker)
+        _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_during_shutdown_is_unavailable_without_persistence(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        result = await stack.runtime.shutdown(timeout=1.0)
+        assert result.clean is True
+
+        response = await get_dispatcher().dispatch(
+            "rpc-runtime-shutting-down",
+            "sessions.send",
+            {
+                "key": SESSION_KEY,
+                "message": "must not be persisted",
+                "clientRequestId": CLIENT_REQUEST_ID,
+                "queueMode": "followup",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == "UNAVAILABLE"
+        assert response.error.retryable is True
+        assert response.error.accepted is False
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
         _assert_no_runtime_acceptance_state(stack.runtime)
 
 

@@ -836,19 +836,38 @@ def _zero_usage(*, model: str = "") -> dict[str, Any]:
     }
 
 
-def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+def _estimate_cost_usd(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    provider: str = "",
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
     if not model or (input_tokens <= 0 and output_tokens <= 0):
         return 0.0
     try:
-        from opensquilla.engine.pricing import lookup_price
+        from opensquilla.engine.pricing import estimate_cost, lookup_price
 
-        price = lookup_price(model)
-        return (input_tokens * price.input_per_m + output_tokens * price.output_per_m) / 1_000_000
+        price = lookup_price(model, provider=provider)
+        return estimate_cost(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            price=price,
+        ).cost_usd
     except Exception:  # noqa: BLE001
         return 0.0
 
 
-def _usage_from_event(event: Any | None, *, request_count: int | None = None) -> dict[str, Any]:
+def _usage_from_event(
+    event: Any | None,
+    *,
+    request_count: int | None = None,
+    provider: str = "",
+) -> dict[str, Any]:
     if event is None:
         return _zero_usage()
     input_tokens = _coerce_int(getattr(event, "input_tokens", 0))
@@ -859,8 +878,16 @@ def _usage_from_event(event: Any | None, *, request_count: int | None = None) ->
     billed_cost = _coerce_float(getattr(event, "billed_cost", 0.0))
     estimated_cost = _coerce_float(getattr(event, "cost_usd", 0.0))
     model = str(getattr(event, "model", "") or "")
+    provider_id = str(provider or getattr(event, "provider", "") or "")
     if estimated_cost <= 0.0:
-        estimated_cost = _estimate_cost_usd(model, input_tokens, output_tokens)
+        estimated_cost = _estimate_cost_usd(
+            model,
+            input_tokens,
+            output_tokens,
+            provider=provider_id,
+            cache_read_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
     resolved_request_count = (
         request_count
         if request_count is not None
@@ -902,6 +929,7 @@ def _provider_allows_billed_usage(provider: Any) -> bool:
 
 def _usage_from_complete_response(resp: Any, provider: Any) -> dict[str, Any]:
     allow_billed_cost = _provider_allows_billed_usage(provider)
+    provider_id = _provider_pricing_id(provider)
     usage = getattr(resp, "usage", None)
     if isinstance(usage, dict):
         input_tokens = _coerce_int(usage.get("input_tokens", usage.get("prompt_tokens")))
@@ -931,7 +959,7 @@ def _usage_from_complete_response(resp: Any, provider: Any) -> dict[str, Any]:
             cost_usd=_coerce_float(usage.get("estimated_cost_usd")),
             model=str(usage.get("model") or getattr(resp, "model", "") or ""),
         )
-        return _usage_from_event(event, request_count=1)
+        return _usage_from_event(event, request_count=1, provider=provider_id)
     event_model = getattr(resp, "model", None) or _provider_model_id(provider) or ""
     event = SimpleNamespace(
         input_tokens=getattr(resp, "input_tokens", 0),
@@ -943,7 +971,7 @@ def _usage_from_complete_response(resp: Any, provider: Any) -> dict[str, Any]:
         cost_usd=getattr(resp, "cost_usd", 0.0),
         model=event_model,
     )
-    return _usage_from_event(event, request_count=1)
+    return _usage_from_event(event, request_count=1, provider=provider_id)
 
 
 def _merge_usage(*items: dict[str, Any] | None) -> dict[str, Any]:
@@ -1192,7 +1220,7 @@ async def _provider_complete(
         metadata = provider_metadata(provider)
         stream = account_provider_stream(
             lambda: chat(messages, config=config),
-            provider=metadata.provider_name or metadata.provider_kind,
+            provider=_provider_pricing_id(provider),
             model=metadata.model,
         )
         close_stream = stream
@@ -1217,7 +1245,11 @@ async def _provider_complete(
             await aclose()
     return _CompletionResult(
         text="".join(chunks),
-        usage=_usage_from_event(done_event, request_count=1),
+        usage=_usage_from_event(
+            done_event,
+            request_count=1,
+            provider=_provider_pricing_id(provider),
+        ),
     )
 
 
@@ -1786,6 +1818,12 @@ def _provider_model_id(provider: Any) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def _provider_pricing_id(provider: Any) -> str:
+    """Return the configured provider identity used by the price resolver."""
+    metadata = provider_metadata(provider)
+    return str(metadata.provider_id or metadata.provider_name or metadata.provider_kind or "")
 
 
 def _pure_flush_prompt(messages: list[Message]) -> str:
@@ -3255,6 +3293,7 @@ class SessionFlushService:
     ) -> FlushReceipt:
         t0 = started_at if started_at is not None else time.monotonic()
         plan = resolve_flush_plan()
+        provider_id = _provider_pricing_id(provider)
         slug, slug_usage = await self._generate_slug_with_usage(
             [message for segment in segments for message in segment.messages],
             provider,
@@ -3300,7 +3339,7 @@ class SessionFlushService:
             saved_paths = [result.path for result in save_results]
             flushed = sorted(set(saved_paths)) or [segment_plan.relative_path]
             all_saved_paths.extend(flushed)
-            usage_items.append(_usage_from_event(done_event))
+            usage_items.append(_usage_from_event(done_event, provider=provider_id))
 
             payload = _segment_receipt_payload(
                 index=index,

@@ -11,8 +11,9 @@ from opensquilla.gateway.guest_rpc_policy import (
     GuestRpcPolicyError,
     guest_owned_session_key,
 )
-from opensquilla.gateway.rpc import RpcContext, RpcRegistry
+from opensquilla.gateway.rpc import RpcContext, RpcRegistry, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _handle_sessions_list
+from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode, SessionStatus
 from opensquilla.session.storage import SessionStorage
 
@@ -55,6 +56,8 @@ def _ctx(*, owner_id: str = "a" * 64, session_manager=None) -> RpcContext:
         "skills.list",
         "sessions.subscribe",
         "sessions.send",
+        "sessions.routing.get",
+        "sessions.routing.set",
     ],
 )
 def test_guest_policy_denies_global_control_plane(method: str) -> None:
@@ -185,6 +188,37 @@ def test_guest_chat_send_forces_every_memory_capture_alias_true() -> None:
     assert normalized["_source"]["no_memory_capture"] is True
 
 
+def test_guest_first_turn_cannot_override_session_routing() -> None:
+    ctx = _ctx()
+    owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
+
+    immediate = GuestRpcPolicy.authorize(
+        "chat.send",
+        {
+            "sessionKey": owned,
+            "message": "hello",
+            "intent": "new_chat",
+            "initialRoutingMode": "ensemble",
+            "initial_routing_mode": "router",
+        },
+        ctx,
+    )
+    staged = GuestRpcPolicy.authorize(
+        "sessions.pending_inputs.enqueue",
+        {
+            "key": owned,
+            "initialRoutingMode": "ensemble",
+            "initial_routing_mode": "router",
+        },
+        ctx,
+    )
+
+    assert "initialRoutingMode" not in immediate
+    assert "initial_routing_mode" not in immediate
+    assert "initialRoutingMode" not in staged
+    assert "initial_routing_mode" not in staged
+
+
 def test_guest_policy_normalizes_verified_chat_key_alias_for_handler() -> None:
     ctx = _ctx()
     owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
@@ -217,6 +251,90 @@ def test_guest_can_submit_clarification_only_for_owned_session() -> None:
     params = {"sessionKey": owned, "fields": {"destination": "Tokyo"}}
 
     assert GuestRpcPolicy.authorize("chat.clarify_submit", params, ctx) == params
+
+
+def test_guest_can_rename_its_owned_session() -> None:
+    ctx = _ctx()
+    owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
+
+    assert GuestRpcPolicy.authorize(
+        "sessions.rename",
+        {"sessionKey": owned, "displayName": "Renamed"},
+        ctx,
+    ) == {"key": owned, "displayName": "Renamed"}
+
+
+@pytest.mark.parametrize("use_bulk_shape", [False, True])
+def test_guest_can_delete_its_owned_session(use_bulk_shape: bool) -> None:
+    ctx = _ctx()
+    owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
+    params = {"keys": [owned]} if use_bulk_shape else {"key": owned}
+
+    assert GuestRpcPolicy.authorize("sessions.delete", params, ctx) == {
+        "keys": [owned]
+    }
+
+
+@pytest.mark.parametrize("method", ["sessions.rename", "sessions.delete"])
+def test_guest_session_mutations_reject_unowned_keys(method: str) -> None:
+    params = (
+        {"key": "agent:main:webchat:owner", "displayName": "Renamed"}
+        if method == "sessions.rename"
+        else {"keys": ["agent:main:webchat:owner"]}
+    )
+
+    with pytest.raises(GuestRpcPolicyError):
+        GuestRpcPolicy.authorize(method, params, _ctx())
+
+
+@pytest.mark.asyncio
+async def test_default_docker_guest_can_rename_and_delete_owned_sessions(tmp_path) -> None:
+    from opensquilla.gateway.auth import resolve_auth
+
+    config = GatewayConfig(host="0.0.0.0", auth=AuthConfig(mode="none"))
+    principal = resolve_auth(
+        config,
+        auth_params={"guestSessionKey": GUEST_KEY},
+        role_claim="operator",
+        peer_ip="127.0.0.1",
+    )
+    assert principal is not None
+    assert principal.is_owner is False
+    assert principal.authenticated is False
+    rename_key = guest_owned_session_key(principal.guest_owner_id, "rename-me")
+    delete_key = guest_owned_session_key(principal.guest_owner_id, "delete-me")
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    manager = SessionManager(storage)
+    await manager.create(rename_key)
+    await manager.create(delete_key)
+    ctx = RpcContext(
+        conn_id="docker-guest",
+        principal=principal,
+        config=config,
+        session_manager=manager,
+    )
+    dispatcher = get_dispatcher()
+    try:
+        rename_response = await dispatcher.dispatch(
+            "docker-rename",
+            "sessions.rename",
+            {"key": rename_key, "displayName": "Renamed"},
+            ctx,
+        )
+        delete_response = await dispatcher.dispatch(
+            "docker-delete",
+            "sessions.delete",
+            {"keys": [delete_key]},
+            ctx,
+        )
+
+        assert rename_response.ok is True
+        assert (await storage.get_session(rename_key)).display_name == "Renamed"
+        assert delete_response.ok is True
+        assert delete_response.payload == {"deleted": [delete_key], "errors": []}
+        assert await storage.get_session(delete_key) is None
+    finally:
+        await storage.close()
 
 
 @pytest.mark.parametrize("method", ["artifacts.list", "artifacts.get"])

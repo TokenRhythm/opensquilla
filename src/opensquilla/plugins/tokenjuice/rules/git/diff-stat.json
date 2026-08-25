@@ -4,6 +4,8 @@
   "description": "Compact git diff --stat output.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["diff"],
+    "argvIncludesBeforeDoubleDash": [["--stat"]],
     "argvIncludes": [["diff"], ["--stat"]]
   },
   "transforms": {

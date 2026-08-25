@@ -28,28 +28,19 @@
         v-if="
           showTurnOutcome
           && message.turnOutcome
-          && !hasActivity
-          && !hasPlan
+          && (
+            processRestart
+            || (!showActivityDisclosure && !hasPlan)
+          )
         "
         :outcome="message.turnOutcome"
       />
-      <TextPart
-        v-if="
-          hasPlan
-          && activityProjection.canSeparateActivity
-          && activityProjection.answerPart
-        "
-        class="plan-message-intro"
-        :part="activityProjection.answerPart"
-        :sources="message.sources ?? []"
-        @citation="onCitation"
-      />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
-          v-if="hasActivity"
+          v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="0"
+          :failure-count="documentWriterFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -59,20 +50,72 @@
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
+          <UnifiedAssistantActivityTimeline
+            v-if="hasUnifiedActivityOrder"
+            :projection="visibleActivityProjection"
+            :timeline-items="visibleActivityItems"
+            :reasoning-blocks="reasoningBlocks"
+            :reasoning-pace-bursts="reasoningRevealPending"
+            :state-scope="toolStateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+            @reveal-complete="completeTerminalReasoningReveal"
+            @toggle-group="$emit('toggleToolGroup', $event)"
+            @toggle-item="$emit('toggleToolItem', $event)"
+            @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
+          >
+            <template #interrupt="{ part }">
+              <InterruptPart
+                v-if="part.resolution"
+                :part="part"
+                timeline
+                @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
+                @extend="id => $emit('extendInterrupt', id)"
+                @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+                @clarify-dismiss="$emit('clarifyDismiss')"
+              />
+            </template>
+          </UnifiedAssistantActivityTimeline>
+          <template v-else>
+          <AssistantActivityTimeline
+            v-if="hasBeforeReasoningActivity"
+            :projection="visibleActivityProjection"
+            status-position="before-reasoning"
+            :show-items="false"
+            :state-scope="toolStateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+          />
+          <ReasoningTimeline
+            v-if="reasoningBlocks.length"
+            :blocks="reasoningBlocks"
+            :pace-bursts="reasoningRevealPending"
+            nested
+            timeline-phase
+            @reveal-complete="completeTerminalReasoningReveal"
+          />
           <ReasoningPart
-            v-if="reasoningPart"
+            v-else-if="reasoningPart"
             :part="reasoningPart"
             :live="activityLifecycle === 'working' || activityLifecycle === 'answering'"
             :embedded="hasPlan"
             :hide-summary="hasPlan"
             :nested="!hasPlan"
+            :timeline-phase="!hasPlan"
           />
           <AssistantActivityTimeline
             v-if="
               visibleActivityItems.length
-              || activityProjection.statusSteps.length
+              || hasAfterReasoningActivity
             "
             :projection="visibleActivityProjection"
+            status-position="after-reasoning"
             :timeline-items="visibleActivityItems"
             :state-scope="toolStateScope"
             :is-tool-group-open="isToolGroupOpen"
@@ -96,11 +139,19 @@
               />
             </template>
           </AssistantActivityTimeline>
+          </template>
+          <p
+            v-if="message.activitySnapshotIncomplete"
+            class="assistant-activity-incomplete"
+            role="status"
+          >
+            {{ t('chat.activity.recordIncomplete') }}
+          </p>
         </ActivityDisclosure>
         <div
           v-if="activityProjection.answerPart && !hasPlan"
           class="assistant-answer"
-          :class="{ 'assistant-answer--separated': hasActivity }"
+          :class="{ 'assistant-answer--separated': showActivityDisclosure }"
         >
           <TextPart
             :part="activityProjection.answerPart"
@@ -114,7 +165,13 @@
            but no canonical message.text. Preserve their original order and
            visibility instead of guessing which fragment was the answer. -->
       <template v-else>
-        <ReasoningPart v-if="reasoningPart" :part="reasoningPart" />
+        <ReasoningTimeline
+          v-if="reasoningBlocks.length"
+          :blocks="reasoningBlocks"
+          :pace-bursts="reasoningRevealPending"
+          @reveal-complete="completeTerminalReasoningReveal"
+        />
+        <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" />
         <ToolCallTimeline
           :items="visibleLegacyTimelineItems"
           :state-scope="toolStateScope"
@@ -145,6 +202,18 @@
         />
       </template>
 
+      <TextPart
+        v-if="
+          hasPlan
+          && activityProjection.canSeparateActivity
+          && activityProjection.answerPart
+        "
+        class="plan-message-intro"
+        :part="activityProjection.answerPart"
+        :sources="message.sources ?? []"
+        @citation="onCitation"
+      />
+
       <PlanCard
         v-for="part in planParts"
         :key="part.key"
@@ -155,6 +224,13 @@
         @implement-current="$emit('planImplementCurrent', $event)"
         @implement-new="$emit('planImplementNew', $event)"
         @replan="$emit('planReplan', $event)"
+      />
+
+      <SessionCreatedCard
+        v-for="createdSession in createdSessions"
+        :key="createdSession.callId"
+        :session-key="createdSession.sessionKey"
+        @open="$emit('openSession', $event)"
       />
 
       <div
@@ -222,7 +298,7 @@
             >
               <div v-if="message.meta.model && !message.meta.ensemble" class="msg-meta-popover__row">
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.model') }}</span>
-                <span class="msg-meta-popover__value">{{ message.meta.modelShort }}</span>
+                <span class="msg-meta-popover__value">{{ message.meta.modelShort || message.meta.model }}</span>
               </div>
               <div v-if="message.meta.costUsd && !message.meta.ensemble" class="msg-meta-popover__row">
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
@@ -257,19 +333,31 @@
                 <div class="msg-meta-popover__models" :aria-label="t('chat.msgMeta.ensembleModelsAria')">
                   <div
                     v-for="member in message.meta.ensemble.models"
-                    :key="`${member.role}:${member.provider}:${member.model}`"
+                    :key="`${member.role}:${member.provider}:${member.model}:${member.sampleIndex || 0}`"
                     class="msg-meta-popover__model"
                   >
-                    <span class="msg-meta-popover__model-role">{{ ensembleRole(member.role, member.label) }}</span>
+                    <span class="msg-meta-popover__model-role">
+                      {{ ensembleMemberRoleLabel(member.role) }} <span aria-hidden="true">·</span>
+                    </span>
                     <span class="msg-meta-popover__model-name" :title="member.model">{{ member.modelShort }}</span>
-                    <span class="msg-meta-popover__model-cost">{{ fmtUsd(member.costUsd) }}</span>
+                    <span class="msg-meta-popover__model-cost">
+                      {{ fmtUsd(member.costUsd) }}
+                    </span>
                   </div>
                 </div>
               </template>
+              <div
+                v-if="usageCoverageDetail"
+                class="msg-meta-popover__row msg-meta-popover__row--coverage"
+                data-turn-usage-coverage="incomplete"
+              >
+                <span class="msg-meta-popover__label">{{ t('chat.msgMeta.coverage') }}</span>
+                <span class="msg-meta-popover__value">{{ usageCoverageDetail }}</span>
+              </div>
             </div>
           </span>
         </div>
-        <div v-if="!shareMode && !message.stopNotice" class="msg-ai-actions">
+        <div v-if="!hasPlan && !shareMode && !message.stopNotice" class="msg-ai-actions">
           <button
             type="button"
             class="msg-action"
@@ -281,7 +369,7 @@
             <Icon :name="copyIconName" :size="12" />
           </button>
           <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
-          <button type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
+          <button v-if="regenerateAvailable !== false" type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
             <Icon name="refresh" :size="12" />
           </button>
           <template v-if="feedbackDecisionId">
@@ -351,6 +439,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
+import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import SourcesRow from '@/components/chat/SourcesRow.vue'
@@ -358,12 +447,23 @@ import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
+import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
+import SessionCreatedCard from '@/components/chat/SessionCreatedCard.vue'
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
+import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
+import {
+  isDocumentAgentToolName,
+  isDocumentWriterToolName,
+} from '@/utils/chat/toolDisplay'
+import {
+  hasIncompleteUsageCoverage,
+  usageCoverageText,
+} from '@/utils/chat/usageCoverage'
 import type {
   ChatRenderedMessage,
   ChatStreamTimelineItem,
@@ -380,6 +480,9 @@ import type {
   PlanCardActionTarget,
 } from '@/types/plans'
 import {
+  isBeforeReasoningActivityStatusStep,
+  isRoutineActivityPhaseStep,
+  isVisibleActivityStatusStep,
   projectAssistantActivity,
   type AssistantActivityLifecycle,
 } from '@/utils/chat/assistantActivity'
@@ -388,7 +491,9 @@ import {
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 import {
+  isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
   turnOutcomePresentation,
 } from '@/utils/chat/turnOutcome'
@@ -408,6 +513,7 @@ const props = defineProps<{
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
+  regenerateAvailable?: boolean
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
@@ -438,6 +544,7 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  openSession: [sessionKey: string]
 }>()
 
 // Absolute label is static; only the relative label subscribes to the shared
@@ -468,16 +575,54 @@ const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
 const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
+// The persisted activity timeline for this finished turn. Empty (fold hidden)
+// for OFF-mode turns and reloaded threads, which carry no snapshot.
+const statusHistory = computed(() => props.message.statusHistory ?? [])
 
 // Reasoning still comes from the normalized parts surface. The visible answer
 // is projected separately from authoritative message.text below; timeline text
 // is never treated as a terminal-answer heuristic.
-const reasoningPart = computed(
-  () =>
-    props.message.parts?.find(
+const reasoningPart = computed(() => {
+  const part = props.message.parts?.find(
       (part): part is Extract<ChatPart, { type: 'reasoning' }> => part.type === 'reasoning',
-    ) ?? null,
+    ) ?? null
+  if (!part) return null
+
+  // A physical provider call may close its reasoning block only when the
+  // whole response ends. The first answer phase is the presentation boundary
+  // users actually experienced, so use status transitions to avoid charging
+  // answer generation time to the thought disclosure.
+  const entries = statusHistory.value
+  let measuredSeconds = 0
+  const terminalAt = epochMilliseconds(props.message.ts)
+  for (const [index, entry] of entries.entries()) {
+    if (String(entry.action).toLowerCase() !== 'provider:reasoning') continue
+    const next = entries.slice(index + 1).find(candidate => candidate.category !== 'maintenance')
+    const startedAt = epochMilliseconds(entry.at)
+    const endedAt = next ? epochMilliseconds(next.at) : terminalAt
+    if (startedAt > 0 && endedAt >= startedAt) {
+      measuredSeconds += Math.floor((endedAt - startedAt) / 1000)
+    }
+  }
+  return measuredSeconds > 0 ? { ...part, seconds: measuredSeconds } : part
+})
+const reasoningBlocks = computed(() =>
+  (props.message.reasoningBlocks ?? [])
+    .filter(block => block.text)
+    .map(block => ({ ...block })),
 )
+const reasoningRevealPending = ref(Boolean(
+  props.message.reasoningPresentationPending
+  && !(
+    typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  ),
+))
+
+function completeTerminalReasoningReveal() {
+  reasoningRevealPending.value = false
+}
 // Inline interrupt parts (approval / clarify) fold into the body order after
 // text/tools and before the ending; render them through the shared adapter.
 const interruptParts = computed(
@@ -494,9 +639,6 @@ const timelineResolvedInterruptKeys = computed(() => new Set(
     )
     .map(item => item.part.key) ?? [],
 ))
-const standaloneInterruptParts = computed(() =>
-  interruptParts.value.filter(part => !timelineResolvedInterruptKeys.value.has(part.key)),
-)
 const planParts = computed(
   () =>
     props.message.parts?.filter(
@@ -504,10 +646,19 @@ const planParts = computed(
     ) ?? [],
 )
 const hasPlan = computed(() => planParts.value.length > 0)
-// The persisted activity timeline for this finished turn. Empty (fold hidden)
-// for OFF-mode turns and reloaded threads, which carry no snapshot.
-const statusHistory = computed(() => props.message.statusHistory ?? [])
+const standaloneInterruptParts = computed(() =>
+  interruptParts.value.filter(part => (
+    !timelineResolvedInterruptKeys.value.has(part.key)
+    && !(
+      hasPlan.value
+      && part.interruptKind === 'clarify'
+      && part.clarify?.presentation === 'plan_questionnaire_v1'
+      && part.resolution === 'replied'
+    )
+  )),
+)
 const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
   if (value == null) return 0
@@ -539,11 +690,14 @@ const cronBadgeTitle = computed(() => safeCronSourceTool.value
   ? t('chat.provenance.cronSource', { tool: safeCronSourceTool.value })
   : t('chat.provenance.cron'))
 const showFooter = computed(() =>
-  planParts.value.length === 0
-  && (
-    !!props.goalOutcome
-    || !!props.message.meta
-    || (!props.shareMode && !props.message.stopNotice)
+  hasMetaDetails.value
+  || (
+    planParts.value.length === 0
+    && (
+      !!props.goalOutcome
+      || isCronMessage.value
+      || (!props.shareMode && !props.message.stopNotice)
+    )
   ),
 )
 
@@ -582,8 +736,18 @@ const hasMetaDetails = computed(() => {
     || meta.cachedTokens > 0
     || meta.reasoningTokens > 0
     || meta.ensemble
+    || hasIncompleteUsageCoverage(meta)
   )
 })
+
+const usageCoverageDetail = computed(() => (
+  props.message.meta && !props.message.meta.ensemble
+    ? usageCoverageText(
+        props.message.meta,
+        (key, named) => String(named ? t(key, named) : t(key)),
+      )
+    : ''
+))
 
 const ensembleSummary = computed(() => {
   const ensemble = props.message.meta?.ensemble
@@ -652,6 +816,14 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
   }))
 })
 
+const semanticCreatedSessions = computed(() => createdSessionsFromMessage(props.message))
+const createdSessions = computed(() => (
+  props.message.createdSessionLinks ?? semanticCreatedSessions.value
+))
+const createdSessionCallIds = computed(() => new Set(
+  semanticCreatedSessions.value.map(createdSession => createdSession.callId),
+))
+
 const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
   if (outcomePresentation.value === 'stopped') return 'interrupted'
   if (outcomePresentation.value === 'interrupted') return 'interrupted'
@@ -679,6 +851,9 @@ const activityProjection = computed(() =>
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
+      endedAt: epochMilliseconds(
+        props.message.turnOutcome?.finishedAt ?? props.message.ts,
+      ),
     },
   ),
 )
@@ -688,6 +863,8 @@ function withoutFailedActivity(
 ): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
+    const documentAgentGroup = item.group.operationKey.startsWith('document.')
+      || isDocumentAgentToolName(item.group.operationKey)
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
     )
@@ -697,22 +874,38 @@ function withoutFailedActivity(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
+      && !documentAgentGroup
     ) {
       return []
     }
+    const groupLevelWriterError = documentAgentGroup
+      && (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
     const calls = item.group.calls.filter(
-      call => !call.isError && call.status !== 'error',
-    )
+      call => (
+        (
+          (!call.isError && call.status !== 'error')
+          || isDocumentAgentToolName(call.name)
+        )
+        && !createdSessionCallIds.value.has(call.toolId)
+      ),
+    ).map(call => groupLevelWriterError
+      ? { ...call, isError: true, status: 'error' as const }
+      : call)
     if (calls.length === 0) return []
     const isRunning = calls.some(call => call.isRunning)
+    const isError = calls.some(call => call.isError || call.status === 'error')
+      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
         ...item.group,
         calls,
         isRunning,
-        isError: false,
-        status: isRunning
+        isError,
+        status: isError
+          ? 'error'
+          : isRunning
           ? ''
           : calls.every(call => call.status === 'success')
             ? 'success'
@@ -737,35 +930,81 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    !cluster.isFailure
+    (!cluster.isFailure || cluster.calls.some(call => isDocumentAgentToolName(call.name)))
     && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
+)
+const visibleActivityStatusSteps = computed(() =>
+  activityProjection.value.statusSteps.filter(isVisibleActivityStatusStep),
 )
 const visibleActivityProjection = computed(() => ({
   ...activityProjection.value,
   activityClusters: visibleActivityClusters.value,
+  statusSteps: visibleActivityStatusSteps.value,
 }))
+function validActivityOrder(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+const hasUnifiedActivityOrder = computed(() => {
+  const orders = [
+    ...visibleActivityStatusSteps.value.map(step => step.activityOrder),
+    ...reasoningBlocks.value.map(block => block.activityOrder),
+    ...visibleActivityItems.value.map(item => (
+      item.activityOrder
+      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
+    )),
+  ]
+  return orders.length > 0 && orders.every(validActivityOrder)
+})
+const hasBeforeReasoningActivity = computed(() =>
+  visibleActivityStatusSteps.value.some(isBeforeReasoningActivityStatusStep),
+)
+const hasAfterReasoningActivity = computed(() =>
+  visibleActivityStatusSteps.value.some(step => !isBeforeReasoningActivityStatusStep(step)),
+)
 const hasVisibleActivityItem = computed(() => visibleActivityItems.value.length > 0)
 const hasActivity = computed(() =>
-  !!reasoningPart.value
+  reasoningBlocks.value.length > 0
+  || !!reasoningPart.value
   || hasVisibleActivityItem.value
-  || statusHistory.value.length > 0,
+  || visibleActivityStatusSteps.value.length > 0,
+)
+const showActivityDisclosure = computed(() =>
+  (activityProjection.value.canSeparateActivity && hasActivity.value)
+  || props.message.activitySnapshotIncomplete === true,
+)
+
+const documentWriterFailureCount = computed(() =>
+  visibleActivityItems.value.reduce((count, item) => {
+    if (item.type !== 'tool-group') return count
+    return count + item.group.calls.filter(call =>
+      isDocumentWriterToolName(call.name)
+      && (call.isError || call.status === 'error'),
+    ).length
+  }, 0),
+)
+
+const documentMutationOutcome = computed(() =>
+  props.message.turnOutcome?.documentMutationOutcome,
 )
 
 const activityStepCount = computed(() => Math.max(
   1,
   visibleActivityClusters.value.length
-    + activityProjection.value.statusSteps.filter(step => step.category !== 'maintenance').length
-    + (reasoningPart.value ? 1 : 0),
+    + visibleActivityStatusSteps.value.filter(step => step.category !== 'maintenance').length
+    + (reasoningBlocks.value.length || (reasoningPart.value ? 1 : 0)),
 ))
 // Keep live work visible without making its expansion sticky. The disclosure
 // follows this lifecycle default in both directions, so terminal states fold
 // automatically while a later user click can still inspect the finished work.
 const activityDefaultOpen = computed(() =>
-  activityLifecycle.value === 'working' || activityLifecycle.value === 'answering',
+  activityLifecycle.value === 'working'
+  || activityLifecycle.value === 'answering'
+  || reasoningRevealPending.value,
 )
 const activityCompletionConfirmed = computed(() =>
   activityLifecycle.value === 'settled'
+  && !reasoningRevealPending.value
   && !props.message.isStreaming
   && interruptParts.value.every(part =>
     !part.busy
@@ -790,18 +1029,51 @@ const activityContinuityKey = computed(() =>
       ])
     : '',
 )
+
+// Finished phase rows and the total must use one timing model. Routine status
+// steps are consecutive slices of the client-observed turn, so their sum is a
+// reliable lower bound for the total shown beside the parent lifecycle label.
+// A reasoning-only legacy row has no matching status step and falls back to
+// the duration carried by its reasoning part.
+const routineActivityDurationSeconds = computed(() => {
+  let seconds = 0
+  let reasoningStatusSeconds = 0
+  for (const step of activityProjection.value.statusSteps) {
+    if (!isRoutineActivityPhaseStep(step)) continue
+    if (step.label.code === 'chat.activity.provider.reasoning') {
+      reasoningStatusSeconds += Math.max(0, Math.floor(Number(step.durationSeconds || 0)))
+      continue
+    }
+    seconds += Math.max(0, Math.floor(Number(step.durationSeconds || 0)))
+  }
+  // ReasoningPart owns the visible reasoning row and may carry a provider-side
+  // duration that differs from the status slice after coarse event batching.
+  // Sum the value the row actually renders; fall back to the status boundary
+  // only when no reasoning part survived normalization.
+  const structuredReasoningSeconds = reasoningBlocks.value.reduce((total, block) => {
+    const end = block.endedAt ?? block.startedAt
+    return total + Math.max(0, Math.floor((end - block.startedAt) / 1000))
+  }, 0)
+  const visibleReasoningSeconds = structuredReasoningSeconds || Math.max(
+    0,
+    Math.floor(Number(reasoningPart.value?.seconds || 0)),
+  )
+  seconds += visibleReasoningSeconds || reasoningStatusSeconds
+  return seconds
+})
+
 const activityDurationSeconds = computed(() => {
-  const outcomeDuration = turnOutcomeDurationSeconds(props.message.turnOutcome)
-  if (outcomeDuration > 0) return outcomeDuration
+  const phaseDuration = routineActivityDurationSeconds.value
   const measured = measuredActivityDurationSeconds.value
-  if (measured > 0) return measured
+  if (measured > 0) return Math.max(measured, phaseDuration)
+  const outcomeDuration = turnOutcomeDurationSeconds(props.message.turnOutcome)
+  if (outcomeDuration > 0) return Math.max(outcomeDuration, phaseDuration)
   const persisted = readAssistantActivityDuration(
     activityStateKey.value,
     activityContinuityKey.value,
   )
-  if (persisted > 0) return persisted
-  const reasoningSeconds = Math.floor(Number(reasoningPart.value?.seconds || 0))
-  return reasoningSeconds > 0 ? reasoningSeconds : 0
+  if (persisted > 0) return Math.max(persisted, phaseDuration)
+  return phaseDuration
 })
 
 // Persisting a measured duration is a side effect, so it lives in a watcher
@@ -819,16 +1091,6 @@ watch(
   { immediate: true },
 )
 
-const activityElapsedLabel = computed(() => {
-  const seconds = Math.max(0, Math.floor(activityDurationSeconds.value || 0))
-  if (seconds <= 0) return ''
-  if (seconds < 60) return t('chat.workedForSeconds', { seconds })
-  return t('chat.workedForMinutes', {
-    minutes: Math.floor(seconds / 60),
-    seconds: seconds % 60,
-  })
-})
-
 const activityCompactElapsedLabel = computed(() => {
   const seconds = Math.max(0, Math.floor(activityDurationSeconds.value || 0))
   if (seconds <= 0) return ''
@@ -839,10 +1101,10 @@ const activityCompactElapsedLabel = computed(() => {
   }))
 })
 
-// Expanded metadata keeps the activity footprint (capped at two kinds plus a
-// "{count} more" descriptor) and the verbose elapsed copy. The collapsed,
-// completed row uses the compact elapsed label above instead of an arbitrary
-// item count.
+// Expanded metadata only keeps concrete activity footprints (capped at two
+// kinds plus a "{count} more" descriptor). The parent lifecycle row already
+// owns the total elapsed time, so repeating "Worked for ..." here adds no
+// information and makes the hierarchy look like two competing totals.
 const activityDetailLabel = computed(() => {
   const counts = new Map<string, number>()
   for (const cluster of visibleActivityClusters.value) {
@@ -860,7 +1122,6 @@ const activityDetailLabel = computed(() => {
       .reduce((total, part) => total + part.count, 0)
     parts.push(String(t('chat.activity.more', { count: remainingCount })))
   }
-  if (activityElapsedLabel.value) parts.push(activityElapsedLabel.value)
   return parts.join(' · ')
 })
 
@@ -880,6 +1141,26 @@ function withMaintenanceSummary(label: string): string {
 }
 
 const activitySummaryLabel = computed(() => {
+  const mutationStatus = documentMutationOutcome.value?.status
+  const mutationSummaryKey = mutationStatus === 'applied'
+    ? 'applied'
+    : mutationStatus === 'ambiguous'
+      ? 'ambiguous'
+      : mutationStatus
+        ? 'not_applied'
+        : ''
+  if (mutationSummaryKey) {
+    return withMaintenanceSummary([
+      String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
+  if (documentWriterFailureCount.value > 0) {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',
@@ -925,16 +1206,15 @@ function fmtUsd(value: number): string {
   return `$${n.toFixed(6).replace(/\.?0+$/, '')}`
 }
 
-function ensembleRole(role: string, label: string): string {
-  const normalized = String(role || '').replace(/_/g, ' ')
-  if (normalized === 'proposer') return 'proposer'
-  if (normalized === 'aggregator') return 'aggregator'
-  if (normalized === 'fallback single') return 'fallback'
-  return label || normalized || 'member'
-}
 </script>
 
 <style scoped>
+.assistant-activity-incomplete {
+  margin: 0.375rem 0 0;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 0.75rem;
+}
+
 .msg-ai-main > :deep(.approval-card),
 .msg-ai-main > :deep(.clarify-card) {
   width: 100%;
@@ -1269,6 +1549,22 @@ function ensembleRole(role: string, label: string): string {
   align-items: baseline;
   justify-content: space-between;
   gap: 0.75rem;
+}
+
+.msg-meta-popover__row--coverage {
+  align-items: flex-start;
+  margin-top: 0.125rem;
+  padding-top: 0.375rem;
+  border-top: 1px solid var(--hairline);
+  white-space: normal;
+}
+
+.msg-meta-popover__row--coverage .msg-meta-popover__value {
+  max-width: 18rem;
+  color: var(--warn);
+  font-family: inherit;
+  font-variant-numeric: normal;
+  text-align: right;
 }
 
 .msg-meta-popover__label {

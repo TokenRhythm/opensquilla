@@ -12,8 +12,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-import pytest
-
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDoneEvent
@@ -140,23 +138,26 @@ def test_observer_records_failed_sample_when_stream_raises() -> None:
     def observer(**kwargs: Any) -> None:
         calls.append(kwargs)
 
-    with pytest.raises(RuntimeError, match="connection reset mid-stream"):
-        _run_turn(
-            AgentConfig(
-                max_iterations=2,
-                provider_id="vllm",
-                model_id="test-model",
-                provider_call_observer=observer,
-            ),
-            provider=_RaisingProvider(),
-        )
+    events = _run_turn(
+        AgentConfig(
+            max_iterations=2,
+            max_provider_retries=0,
+            provider_id="vllm",
+            model_id="test-model",
+            provider_call_observer=observer,
+        ),
+        provider=_RaisingProvider(),
+    )
 
     assert len(calls) == 1
     sample = calls[0]
     assert sample["ok"] is False
-    assert sample["failure_kind"] == "raised"
+    assert sample["failure_kind"] == "transport_transient"
     assert sample["ttft_ms"] is not None
     assert sample["duration_ms"] >= 0
+    terminal = next(event for event in events if getattr(event, "kind", "") == "error")
+    assert terminal.code == "response_incomplete"
+    assert "connection reset mid-stream" not in repr(events)
 
 
 def test_observer_records_failed_sample_on_total_deadline_timeout() -> None:

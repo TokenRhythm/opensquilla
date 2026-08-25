@@ -1373,7 +1373,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   gap: var(--sp-3);
   margin: var(--sp-3) 0 0;
   justify-items: center;
-  padding: var(--sp-7) var(--sp-4);
+  padding: var(--sp-5) var(--sp-4);
   text-align: center;
 }
 

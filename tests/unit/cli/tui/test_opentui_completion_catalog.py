@@ -97,8 +97,9 @@ def test_gateway_catalog_projects_curated_order_aliases_and_arguments() -> None:
         item.label for item in commands if item.visible_by_default and not item.deprecated
     ]
 
-    assert default_labels[:12] == [
+    assert default_labels[:13] == [
         "/model",
+        "/routing",
         "/strategy",
         "/sessions",
         "/new",
@@ -120,6 +121,17 @@ def test_gateway_catalog_projects_curated_order_aliases_and_arguments() -> None:
         "ensemble",
         "status",
     ]
+    assert [choice.value for choice in items["/routing"].argument_choices] == [
+        "direct",
+        "router",
+        "ensemble",
+    ]
+    assert "/routing" in _by_label(
+        build_completion_catalog(
+            surface=Surface.CLI_STANDALONE,
+            skill_loader=FakeSkillLoader(),
+        )
+    )
     assert items["/resume"].submit_behavior == "submit"
     assert items["/delete"].submit_behavior == "complete"
     assert items["/models"].visible_by_default is False

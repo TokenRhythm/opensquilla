@@ -17,6 +17,7 @@ from opensquilla.tools.policy.chain import POLICY_CHAIN, run_chain, run_chain_wi
 from opensquilla.tools.policy.checks import (
     AllowListPolicy,
     DenyListPolicy,
+    ExclusiveToolCeilingPolicy,
     GuestSafePolicy,
     OwnerOnlyPolicy,
     PermissionMatrixPolicy,
@@ -30,6 +31,7 @@ from opensquilla.tools.policy.types import DispatchInput, PolicyCheck, PolicyDec
 __all__ = [
     "AllowListPolicy",
     "DenyListPolicy",
+    "ExclusiveToolCeilingPolicy",
     "GuestSafePolicy",
     "DispatchInput",
     "OwnerOnlyPolicy",

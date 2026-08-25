@@ -11,7 +11,7 @@ import ntpath
 import os
 import re
 import shlex
-import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,7 +20,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import structlog
 
@@ -29,6 +29,13 @@ from opensquilla.gateway.approval_queue import (
 )
 from opensquilla.gateway.approval_queue import (
     get_approval_queue,
+)
+from opensquilla.process_tree import (
+    ProcessTreeOwner,
+    capture_process_tree_owner,
+    create_owned_popen,
+    create_owned_subprocess_exec,
+    create_owned_subprocess_shell,
 )
 from opensquilla.sandbox.backend.bubblewrap import (
     BubblewrapBackend,
@@ -171,6 +178,7 @@ from opensquilla.tools.write_tracking import (
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
     summarize_patch_hygiene_warning,
+    workspace_write_deny_effect_preflight,
 )
 
 log = structlog.get_logger(__name__)
@@ -1048,6 +1056,101 @@ def _base_shell_environment() -> dict[str, str]:
     return _runtime_shell_environment(dict(os.environ))
 
 
+def _guest_requires_managed_runtime() -> bool:
+    context = current_tool_context.get()
+    return bool(context is not None and context.guest_safe)
+
+
+def _managed_skill_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep strict Guest PATH limited to verified Runtime Packs."""
+
+    if _guest_requires_managed_runtime():
+        return dict(environment)
+    return managed_skill_env(environment)
+
+
+def _direct_runtime_command(
+    command: str,
+    *,
+    windows: bool | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(component, executable)`` for one unwrapped direct runtime call."""
+
+    native_windows = os.name == "nt" if windows is None else windows
+    platform_name = "windows" if native_windows else "linux"
+    try:
+        segments = parse_shell_segments(command, platform=platform_name)
+        if len(segments) != 1 or segments[0].source.strip() != command.strip():
+            return None
+        tokens = shlex.split(segments[0].source, posix=not native_windows)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    executable = tokens[0].strip().strip("'\"")
+    if not executable or any(marker in executable for marker in ("/", "\\", ":", "$", "`")):
+        return None
+    name = _shell_command_basename(executable)
+    if name in {"python", "python3"}:
+        return ("python", executable)
+    if name in {"node", "npm", "npx"}:
+        return ("node", executable)
+    if native_windows and name in {"git", "bash"}:
+        return ("gitBash", executable)
+    return None
+
+
+def _strict_runtime_unavailable_envelope(
+    command: str,
+    environment: dict[str, str],
+) -> dict[str, object] | None:
+    """Classify a missing direct runtime without guessing about compound shell code."""
+
+    if not _guest_requires_managed_runtime():
+        return None
+    runtime_command = _direct_runtime_command(command)
+    if runtime_command is None:
+        return None
+    component_id, executable = runtime_command
+    path_key = next((key for key in environment if key.casefold() == "path"), "PATH")
+    if shutil.which(executable, path=environment.get(path_key, "")) is not None:
+        return None
+    try:
+        from opensquilla.runtime_packs import status_snapshot
+
+        status = status_snapshot()
+        component = next(
+            (
+                item
+                for item in status.components
+                if item.component_id == component_id
+            ),
+            None,
+        )
+        runtime_policy = active_sandbox_policy().runtimes
+        enabled = bool(
+            runtime_policy.enabled
+            and {
+                "python": runtime_policy.python,
+                "node": runtime_policy.node,
+                "gitBash": runtime_policy.git_bash,
+            }[component_id]
+        )
+        if enabled and component is not None and component.availability.value == "ready":
+            return None
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return {
+        "status": "failed",
+        "code": "RUNTIME_UNAVAILABLE",
+        "componentId": component_id,
+        "retryable": False,
+        "message": (
+            f"The managed {component_id} runtime is unavailable for strict execution."
+        ),
+    }
+
+
 def _runtime_shell_environment(
     environment: dict[str, str],
     *,
@@ -1268,7 +1371,9 @@ class _BgSession:
     session_id: str
     command: str
     process: asyncio.subprocess.Process
+    process_tree: ProcessTreeOwner | None = None
     session_key: str | None = None
+    task_id: str | None = None
     agent_id: str | None = None
     is_owner_run: bool = False
     local_urls: list[str] = field(default_factory=list)
@@ -1288,6 +1393,7 @@ class _BgSession:
 @dataclass(frozen=True)
 class _SpawnedBackgroundProcess:
     process: asyncio.subprocess.Process
+    process_tree: ProcessTreeOwner
     cleanup_callbacks: list[Callable[[], None]] = field(default_factory=list)
     async_cleanup_callbacks: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
 
@@ -2118,6 +2224,11 @@ def _append_windows_app_alias_path(
     *,
     runtime: object | None = None,
 ) -> None:
+    # WindowsApps is a host-controlled executable-alias directory.  Strict
+    # Guest execution must keep PATH limited to receipt-verified Runtime Packs,
+    # even when winget or a Store Python alias is present for the desktop user.
+    if _guest_requires_managed_runtime():
+        return
     if os.name != "nt" and not _windows_sandbox_backend_active(runtime):
         return
     candidates: list[Path] = []
@@ -2219,6 +2330,15 @@ def _windows_direct_powershell_argv(command: str) -> tuple[str, ...]:
         "Bypass",
         "-Command",
         _windows_with_powershell_proxy_defaults(command),
+    )
+
+
+def _windows_powershell_with_final_exit_code(command: str) -> str:
+    return (
+        f"{command}; "
+        "if ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) "
+        "{ exit $global:LASTEXITCODE }; "
+        "if (-not $?) { exit 1 }"
     )
 
 
@@ -3093,6 +3213,10 @@ def _sandbox_shell_backend_argv(
     backend_name = getattr(backend, "name", "")
     if backend_name.startswith("windows_"):
         return _windows_shell_host_argv(command, cwd=cwd)
+    if os.name == "nt" and backend_name == "noop":
+        return _windows_direct_powershell_argv(
+            _windows_powershell_with_final_exit_code(command)
+        )
     return ("sh", "-lc", command)
 
 
@@ -3543,7 +3667,7 @@ def _policy_with_active_tool_mounts(policy: SandboxPolicy) -> SandboxPolicy:
 
 
 def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolicy:
-    """Make activated, receipt-validated toolchains visible read-only."""
+    """Make activated, receipt-validated managed packages visible read-only."""
 
     if not hasattr(policy, "mounts"):
         return policy
@@ -3554,7 +3678,20 @@ def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolic
         (str(mount.host_path), sandbox_path_text(mount.sandbox_path)): mount
         for mount in policy.mounts
     }
-    for path in managed_toolchain_readonly_paths():
+    managed_paths = (
+        []
+        if _guest_requires_managed_runtime()
+        else list(managed_toolchain_readonly_paths())
+    )
+    try:
+        from opensquilla.runtime_packs import runtime_roots
+
+        managed_paths.extend(runtime_roots(active_sandbox_policy().runtimes))
+    except (OSError, RuntimeError, ValueError):
+        # A broken optional Runtime Pack must never weaken or abort sandbox
+        # policy construction; it is simply omitted from PATH and mounts.
+        pass
+    for path in managed_paths:
         key = (str(path), sandbox_path_text(path))
         existing = mounts_by_target.get(key)
         if existing is not None and existing.mode == "rw":
@@ -5897,6 +6034,11 @@ def _bg_rendered_output(session: _BgSession) -> str:
 
 def _finalize_bg_session(session: _BgSession) -> None:
     session.returncode = session.process.returncode
+    if session.process_tree is not None:
+        # Querying also closes an empty Windows Job handle. A still-live tree
+        # remains owned and discoverable by task-scoped Stop after its leader
+        # has exited.
+        session.process_tree.is_active()
     if session.ended_at is None:
         session.ended_at = time.time()
     session.done = True
@@ -5916,25 +6058,6 @@ async def _finalize_bg_session_async(session: _BgSession) -> None:
             await callback()
 
 
-def _signal_bg_process(session: _BgSession, sig: signal.Signals) -> None:
-    proc = session.process
-    if proc.returncode is not None:
-        return
-    if os.name == "posix":
-        os_mod = cast(Any, os)
-        try:
-            os_mod.killpg(proc.pid, sig)
-            return
-        except ProcessLookupError:
-            return
-        except OSError:
-            pass
-    if sig == signal.SIGTERM:
-        proc.terminate()
-    else:
-        proc.kill()
-
-
 async def _wait_bg_process(session: _BgSession, timeout: float) -> bool:
     try:
         await asyncio.wait_for(session.process.wait(), timeout=timeout)
@@ -5943,16 +6066,71 @@ async def _wait_bg_process(session: _BgSession, timeout: float) -> bool:
     return True
 
 
-async def _terminate_bg_session(session: _BgSession) -> None:
-    if session.process.returncode is not None:
-        return
-    _signal_bg_process(session, signal.SIGTERM)
-    if await _wait_bg_process(session, _BACKGROUND_TERMINATE_TIMEOUT):
-        return
-    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-    _signal_bg_process(session, kill_signal)
-    if not await _wait_bg_process(session, _BACKGROUND_KILL_TIMEOUT):
+async def _terminate_bg_session(session: _BgSession) -> bool:
+    process_tree = session.process_tree
+    if process_tree is None:
+        process_tree = capture_process_tree_owner(
+            session.process,
+            isolated=session.process.returncode is None,
+        )
+        session.process_tree = process_tree
+    stopped = await process_tree.terminate(
+        graceful_timeout=_BACKGROUND_TERMINATE_TIMEOUT,
+        kill_timeout=_BACKGROUND_KILL_TIMEOUT,
+    )
+    if not stopped:
         log.warning("background_process_termination_timeout", session_id=session.session_id)
+    return stopped
+
+
+async def cancel_background_processes_for_task(session_key: str, task_id: str) -> int:
+    """Terminate registered background process trees owned by one exact task."""
+
+    sessions = [
+        session
+        for session in tuple(_bg_sessions.values())
+        if session.session_key == session_key
+        and session.task_id == task_id
+        and session.process_tree is not None
+        and session.process_tree.is_active()
+    ]
+    if not sessions:
+        return 0
+
+    async def terminate_one(session: _BgSession) -> None:
+        session.killed = True
+        try:
+            await _terminate_bg_session(session)
+        except Exception:
+            log.warning(
+                "background_process_task_cancel_failed",
+                session_id=session.session_id,
+                task_id=task_id,
+                exc_info=True,
+            )
+
+    cleanup = asyncio.gather(*(terminate_one(session) for session in sessions))
+    # An abort RPC has a shorter shared deadline than process-tree escalation.
+    # Keep owned cleanup alive if that deadline cancels this waiter.
+    await asyncio.shield(cleanup)
+    return len(sessions)
+
+
+def active_background_process_task_owners() -> tuple[tuple[str, str], ...]:
+    """Snapshot exact durable identities for live registered background processes."""
+
+    return tuple(
+        dict.fromkeys(
+            (session.session_key, session.task_id)
+            for session in tuple(_bg_sessions.values())
+            if isinstance(session.session_key, str)
+            and session.session_key
+            and isinstance(session.task_id, str)
+            and session.task_id
+            and session.process_tree is not None
+            and session.process_tree.is_active()
+        )
+    )
 
 
 async def _wait_exec_process(proc: Any, timeout: float) -> bool:
@@ -5965,32 +6143,19 @@ async def _wait_exec_process(proc: Any, timeout: float) -> bool:
     return True
 
 
-def _signal_exec_process_tree(proc: Any, sig: signal.Signals) -> bool:
-    if os.name == "posix":
-        os_mod = cast(Any, os)
-        try:
-            os_mod.killpg(proc.pid, sig)
-            return True
-        except ProcessLookupError:
-            return True
-        except OSError:
-            pass
-    if proc.returncode is not None:
-        return False
-    if sig == signal.SIGTERM:
-        proc.terminate()
-    else:
-        proc.kill()
-    return True
-
-
-async def _terminate_exec_process_tree(proc: Any) -> None:
-    _signal_exec_process_tree(proc, signal.SIGTERM)
-    if await _wait_exec_process(proc, _EXEC_TERMINATE_TIMEOUT):
-        return
-    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-    _signal_exec_process_tree(proc, kill_signal)
-    if not await _wait_exec_process(proc, _EXEC_KILL_TIMEOUT):
+async def _terminate_exec_process_tree(
+    proc: Any,
+    process_tree: ProcessTreeOwner | None = None,
+) -> None:
+    owner = process_tree or capture_process_tree_owner(
+        proc,
+        isolated=getattr(proc, "returncode", None) is None,
+    )
+    stopped = await owner.terminate(
+        graceful_timeout=_EXEC_TERMINATE_TIMEOUT,
+        kill_timeout=_EXEC_KILL_TIMEOUT,
+    )
+    if not stopped:
         log.warning("exec_command_termination_timeout", pid=proc.pid)
 
 
@@ -6068,10 +6233,16 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
 
 
 def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
-    return subprocess.Popen(_windows_direct_powershell_argv(command), **kwargs)
+    return create_owned_popen(_windows_direct_powershell_argv(command), **kwargs)
 
 
-def _terminate_windows_host_shell_process(proc: Any) -> None:
+def _terminate_windows_host_shell_process(
+    proc: Any,
+    process_tree: ProcessTreeOwner,
+) -> None:
+    if process_tree.windows_job is not None:
+        with contextlib.suppress(OSError):
+            process_tree.windows_job.terminate()
     if proc.poll() is not None:
         return
     proc.terminate()
@@ -6089,21 +6260,35 @@ def _terminate_windows_host_shell_process(proc: Any) -> None:
 
 async def _communicate_windows_host_shell_process(
     proc: Any,
+    process_tree: ProcessTreeOwner,
     stdin_bytes: bytes,
     timeout: float,
 ) -> bool:
     """Write finite Windows stdin outside Proactor and bound the worker wait."""
 
     communicate_task = asyncio.create_task(asyncio.to_thread(proc.communicate, input=stdin_bytes))
-    done, _pending = await asyncio.wait(
-        {communicate_task},
-        timeout=max(0.0, timeout),
-    )
+    try:
+        done, _pending = await asyncio.wait(
+            {communicate_task},
+            timeout=max(0.0, timeout),
+        )
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            asyncio.to_thread(_terminate_windows_host_shell_process, proc, process_tree)
+        )
+        done, _pending = await asyncio.wait(
+            {communicate_task},
+            timeout=_EXEC_TERMINATE_TIMEOUT + _EXEC_KILL_TIMEOUT,
+        )
+        if communicate_task in done:
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                communicate_task.result()
+        raise
     if communicate_task in done:
         await communicate_task
         return True
 
-    await asyncio.to_thread(_terminate_windows_host_shell_process, proc)
+    await asyncio.to_thread(_terminate_windows_host_shell_process, proc, process_tree)
     done, _pending = await asyncio.wait(
         {communicate_task},
         timeout=_EXEC_TERMINATE_TIMEOUT + _EXEC_KILL_TIMEOUT,
@@ -6121,6 +6306,7 @@ async def _run_windows_host_shell_command_with_stdin(
     env: dict[str, str],
     stdin_bytes: bytes,
     effective_timeout: float,
+    on_process_started: Callable[[], None] | None = None,
 ) -> str:
     try:
         with tempfile.TemporaryFile() as output_file:
@@ -6134,11 +6320,16 @@ async def _run_windows_host_shell_command_with_stdin(
                 env=env,
                 creationflags=creationflags,
             )
+            if on_process_started is not None:
+                on_process_started()
+            process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
             completed = await _communicate_windows_host_shell_process(
                 proc,
+                process_tree,
                 stdin_bytes,
                 effective_timeout,
             )
+            await _terminate_exec_process_tree(proc, process_tree)
             output_file.flush()
             output_file.seek(0)
             raw_output = output_file.read()
@@ -6175,6 +6366,7 @@ async def _run_host_shell_command(
     env: dict[str, str],
     stdin_bytes: bytes | None,
     effective_timeout: float,
+    on_process_started: Callable[[], None] | None = None,
 ) -> str:
     if _use_windows_blocking_exec_stdin() and stdin_bytes is not None:
         return await _run_windows_host_shell_command_with_stdin(
@@ -6183,6 +6375,7 @@ async def _run_host_shell_command(
             env=env,
             stdin_bytes=stdin_bytes,
             effective_timeout=effective_timeout,
+            on_process_started=on_process_started,
         )
     try:
         with tempfile.TemporaryFile() as output_file:
@@ -6209,31 +6402,42 @@ async def _run_host_shell_command(
                 return _exec_timeout_output(effective_timeout, command, output_file.read())
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
+            if on_process_started is not None:
+                on_process_started()
+            process_tree = capture_process_tree_owner(proc, isolated=True)
             stdin_writer: asyncio.Task[None] | None = None
             remaining = deadline - loop.time()
             if remaining <= 0:
-                await _terminate_exec_process_tree(proc)
+                await _terminate_exec_process_tree(proc, process_tree)
                 return timeout_result()
             try:
                 if stdin_bytes is not None:
                     stdin_writer = asyncio.create_task(_write_exec_stdin(proc, stdin_bytes))
                     if not await _wait_exec_stdin_writer(proc, stdin_writer, remaining):
                         await _cancel_exec_stdin_writer(proc, stdin_writer)
-                        await _terminate_exec_process_tree(proc)
+                        await _terminate_exec_process_tree(proc, process_tree)
                         return timeout_result()
             except TimeoutError:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
-                await _terminate_exec_process_tree(proc)
+                await _terminate_exec_process_tree(proc, process_tree)
                 return timeout_result()
-
-            remaining = deadline - loop.time()
-            if remaining <= 0 or not await _wait_exec_process(proc, remaining):
+            except asyncio.CancelledError:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
-                await _terminate_exec_process_tree(proc)
-                return timeout_result()
+                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+                raise
+
+            try:
+                remaining = deadline - loop.time()
+                if remaining <= 0 or not await _wait_exec_process(proc, remaining):
+                    await _cancel_exec_stdin_writer(proc, stdin_writer)
+                    await _terminate_exec_process_tree(proc, process_tree)
+                    return timeout_result()
+            except asyncio.CancelledError:
+                await _cancel_exec_stdin_writer(proc, stdin_writer)
+                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+                raise
             await _cancel_exec_stdin_writer(proc, stdin_writer)
-            if os.name == "posix":
-                _signal_exec_process_tree(proc, signal.SIGTERM)
+            await _terminate_exec_process_tree(proc, process_tree)
 
             output_file.flush()
             output_file.seek(0)
@@ -6257,7 +6461,12 @@ async def _run_full_host_shell_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
-    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(_host_shell_env(merged_env))
@@ -6277,11 +6486,11 @@ async def _create_host_shell_subprocess(
     **kwargs: Any,
 ) -> Any:
     if os.name == "nt" or windows_host:
-        return await asyncio.create_subprocess_exec(
+        return await create_owned_subprocess_exec(
             *_windows_direct_powershell_argv(command),
             **kwargs,
         )
-    return await asyncio.create_subprocess_shell(command, **kwargs)
+    return await create_owned_subprocess_shell(command, **kwargs)
 
 
 @tool(
@@ -6556,20 +6765,33 @@ async def exec_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
-    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
     effective_timeout = _resolve_exec_timeout(timeout)
     stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
     mutation_before = snapshot_current_workspace_mutations()
+    protection_block = workspace_write_deny_effect_preflight(
+        tool_name="exec_command",
+        before=mutation_before,
+    )
+    if protection_block is not None:
+        return protection_block
     source_mutation_signal = (
         _shell_source_mutation_signal(command, cwd)
         if _shell_source_mutation_telemetry_enabled()
         else None
     )
 
-    def finish(output: str) -> str:
+    def finish(output: str, *, executed: bool = True) -> str:
+        if not executed:
+            return output
         metadata: dict[str, Any] = {"command_hash": mutation_ledger_text_hash(command)}
         if source_mutation_signal is not None:
             metadata.update(source_mutation_signal)
@@ -6591,6 +6813,10 @@ async def exec_command(
             output=output,
         )
 
+    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
+    if runtime_unavailable is not None:
+        return finish(json.dumps(runtime_unavailable, ensure_ascii=False), executed=False)
+
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
             _apply_windows_session_tmp_env(merged_env)
@@ -6605,7 +6831,7 @@ async def exec_command(
             ),
         )
         if isinstance(decision, DenialResult):
-            return finish(json.dumps(decision.to_dict()))
+            return finish(json.dumps(decision.to_dict()), executed=False)
         if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             backend_retry_granted = True
@@ -6618,7 +6844,10 @@ async def exec_command(
             )
             if retry_gate is not None:
                 if not retry_gate.allowed:
-                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                    return finish(
+                        json.dumps(retry_gate.to_envelope(), ensure_ascii=False),
+                        executed=False,
+                    )
                 host_execution = True
                 backend_retry_granted = True
             else:
@@ -6642,9 +6871,9 @@ async def exec_command(
                 )
                 preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                 if isinstance(preflight, DenialResult):
-                    return finish(json.dumps(preflight.to_dict()))
+                    return finish(json.dumps(preflight.to_dict()), executed=False)
                 if isinstance(preflight, dict):
-                    return finish(json.dumps(preflight))
+                    return finish(json.dumps(preflight), executed=False)
                 try:
                     sandbox_result = await _run_backend_with_managed_network(
                         backend_request,
@@ -6673,8 +6902,14 @@ async def exec_command(
                     )
                     if escalation is not None:
                         if isinstance(escalation, DenialResult):
-                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
-                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                            return finish(
+                                json.dumps(escalation.to_dict(), ensure_ascii=False),
+                                executed=False,
+                            )
+                        return finish(
+                            json.dumps(escalation.to_envelope(), ensure_ascii=False),
+                            executed=False,
+                        )
                     raise
                 except Exception as exc:
                     raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
@@ -6722,16 +6957,23 @@ async def exec_command(
         )
         merged_env = _host_shell_env(merged_env)
 
+    host_process_started = False
+
+    def mark_host_process_started() -> None:
+        nonlocal host_process_started
+        host_process_started = True
+
     host_output = await _run_host_shell_command(
         command,
         cwd=cwd,
         env=merged_env,
         stdin_bytes=stdin_bytes,
         effective_timeout=effective_timeout,
+        on_process_started=mark_host_process_started,
     )
     exit_code_match = re.match(r"exit_code=(-?\d+)\n", host_output)
     if exit_code_match is None:
-        return finish(host_output)
+        return finish(host_output, executed=host_process_started)
     returncode = int(exit_code_match.group(1))
     output = host_output[exit_code_match.end() :]
     output = _append_patch_hygiene_warning(command, cwd, output)
@@ -6755,7 +6997,12 @@ async def _start_host_background_process(
 
     session_id = str(uuid.uuid4())[:8]
     base_env = dict(env) if env is not None else _base_shell_environment()
-    host_env = managed_skill_env(_runtime_shell_environment(base_env))
+    host_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            base_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
     apply_utf8_child_env(host_env)
     host_env = _host_shell_env(host_env)
     _append_windows_app_alias_path(host_env, runtime=runtime)
@@ -6770,18 +7017,25 @@ async def _start_host_background_process(
     }
     if os.name == "posix":
         process_kwargs["start_new_session"] = True
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creationflags:
+            process_kwargs["creationflags"] = creationflags
     proc = await _create_host_shell_subprocess(
         command,
         windows_host=_windows_sandbox_backend_active(runtime),
         **process_kwargs,
     )
+    process_tree = capture_process_tree_owner(proc, isolated=True)
 
     ctx = current_tool_context.get()
     session = _BgSession(
         session_id=session_id,
         command=command,
         process=proc,
+        process_tree=process_tree,
         session_key=ctx.session_key if ctx is not None else None,
+        task_id=ctx.task_id if ctx is not None else None,
         agent_id=ctx.agent_id if ctx is not None else None,
         is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
         local_urls=_local_server_urls_from_command(command),
@@ -7019,9 +7273,12 @@ async def background_process(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
     effective_timeout = _resolve_background_timeout(timeout)
+    merged_env = _managed_skill_environment(_base_shell_environment())
+    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
-        merged_env = managed_skill_env(_base_shell_environment())
         apply_utf8_child_env(merged_env)
         _append_windows_app_alias_path(merged_env, runtime=runtime)
         merged_env = _dedupe_windows_env_keys(merged_env)
@@ -7130,7 +7387,9 @@ async def background_process(
                 session_id=session_id,
                 command=command,
                 process=spawned.process,
+                process_tree=spawned.process_tree,
                 session_key=ctx.session_key if ctx is not None else None,
+                task_id=ctx.task_id if ctx is not None else None,
                 agent_id=ctx.agent_id if ctx is not None else None,
                 is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
                 local_urls=_local_server_urls_from_command(command),
@@ -7269,7 +7528,7 @@ async def _spawn_sandboxed_background_process(
                         log.warning("background_process_policy_violation", message=message)
 
                 cleanup_callbacks.append(cleanup_protected_create)
-            process = await asyncio.create_subprocess_exec(
+            process = await create_owned_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -7280,6 +7539,7 @@ async def _spawn_sandboxed_background_process(
             )
             return _SpawnedBackgroundProcess(
                 process=process,
+                process_tree=capture_process_tree_owner(process, isolated=True),
                 cleanup_callbacks=cleanup_callbacks,
                 async_cleanup_callbacks=async_cleanup_callbacks,
             )
@@ -7297,7 +7557,7 @@ async def _spawn_sandboxed_background_process(
                 wrapper_tmp.cleanup()
             raise
     if isinstance(backend, NoopBackend):
-        process = await asyncio.create_subprocess_exec(
+        process = await create_owned_subprocess_exec(
             *request.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -7306,7 +7566,10 @@ async def _spawn_sandboxed_background_process(
             env=getattr(request, "env", None) or {},
             start_new_session=True,
         )
-        return _SpawnedBackgroundProcess(process=process)
+        return _SpawnedBackgroundProcess(
+            process=process,
+            process_tree=capture_process_tree_owner(process, isolated=True),
+        )
     if isinstance(backend, SeatbeltBackend):
         tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
         profile_path: Path | None = None
@@ -7340,7 +7603,7 @@ async def _spawn_sandboxed_background_process(
                 getattr(request, "env", None) or {},
                 tmp_dir=tmp_dir,
             )
-            process = await asyncio.create_subprocess_exec(
+            process = await create_owned_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -7349,7 +7612,11 @@ async def _spawn_sandboxed_background_process(
                 env=env,
                 start_new_session=True,
             )
-            return _SpawnedBackgroundProcess(process=process, cleanup_callbacks=[cleanup])
+            return _SpawnedBackgroundProcess(
+                process=process,
+                process_tree=capture_process_tree_owner(process, isolated=True),
+                cleanup_callbacks=[cleanup],
+            )
         except Exception:
             cleanup()
             raise
@@ -7477,7 +7744,10 @@ async def process(
         )
 
     if action == "kill":
-        if session.done or session.process.returncode is not None:
+        tree_active = bool(
+            session.process_tree is not None and session.process_tree.is_active()
+        )
+        if not tree_active and (session.done or session.process.returncode is not None):
             if session.collector_task is not None and not session.collector_task.done():
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
@@ -7496,9 +7766,8 @@ async def process(
                 }
             )
 
-        if session.process.returncode is None:
-            session.killed = True
-            await _terminate_bg_session(session)
+        session.killed = True
+        await _terminate_bg_session(session)
         if session.collector_task is not None:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
@@ -7520,6 +7789,12 @@ async def process(
     if action == "remove":
         if not session.done:
             raise ToolError(f"Cannot remove running session: {session.session_id}")
+        if session.process_tree is not None and session.process_tree.is_active():
+            session.killed = True
+            if not await _terminate_bg_session(session):
+                raise ToolError(
+                    f"Cannot remove session with a live process tree: {session.session_id}"
+                )
         del _bg_sessions[session.session_id]
         return json.dumps({"status": "removed", "action": action, "session_id": session.session_id})
 

@@ -504,6 +504,56 @@ async def test_clawhub_verified_legacy_underscore_name_keeps_runtime_identity(
 
 
 @pytest.mark.asyncio
+async def test_managed_lifecycle_accepts_root_reached_through_symlink(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias_root = tmp_path / "alias"
+    try:
+        alias_root.symlink_to(real_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    managed = alias_root / "managed"
+    lockfile_path = alias_root / "skills-lock.json"
+    loader = SkillLoader(managed_dir=managed, lockfile_path=lockfile_path)
+    loader.reload(force=True, reason="test.symlinked-managed-root")
+    source = FakeImmutableSource(
+        {
+            "SKILL.md": (
+                "---\nname: linked-root-skill\n"
+                "description: Install through a linked profile root.\n"
+                "---\nCommunity instructions.\n"
+            )
+        }
+    )
+    service = SkillManagementService(
+        router=SourceRouter([source]),
+        managed_dir=managed,
+        lockfile_path=lockfile_path,
+        loader=loader,
+        journal_path=alias_root / "transaction.json",
+    )
+
+    result = await service.install("linked-root-skill", "fake")
+
+    assert result.success is True
+    assert result.active is True
+    assert result.instruction_usable is True
+    assert loader.get_by_name("linked-root-skill") is not None
+
+    updated = await service.update("linked-root-skill")
+    assert len(updated) == 1
+    assert updated[0].success is True
+    assert updated[0].unchanged is True
+
+    removed = await service.uninstall("linked-root-skill")
+    assert removed.success is True
+    assert loader.get_by_name("linked-root-skill") is None
+
+
+@pytest.mark.asyncio
 async def test_clawhub_legacy_runtime_name_preserves_winner_precedence(
     tmp_path: Path,
 ) -> None:
@@ -2504,7 +2554,10 @@ async def test_rejected_drifted_reinstall_does_not_reload_or_advance_catalog(
     assert result.lifecycle.install_state.value == "drifted"
     assert loader.snapshot() is snapshot
     assert loader.snapshot().generation == snapshot.generation
-    current = loader.get_by_name("example-skill")
+    # get_by_name() may run its compatibility filesystem probe after 250 ms.
+    # Inspect the already-pinned live snapshot so scheduler delay cannot turn
+    # this transaction assertion into a separate external-drift refresh.
+    current = next(skill for skill in snapshot.skills if skill.name == "example-skill")
     assert current is published
     assert "Local drift." not in current.content
 
@@ -3010,14 +3063,15 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         }
         source.revision = "b" * 40
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
     rollback_started = threading.Event()
     real_reload = loader.reload_verified
 
     def blocking_reload(verifier, *args, **kwargs) -> SkillReloadResult:
-        worker_started.set()
+        loop.call_soon_threadsafe(worker_started.set)
         if not release_worker.wait(timeout=5):
             raise TimeoutError("test did not release postflight reload")
         try:
@@ -3044,9 +3098,9 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         mutation = asyncio.create_task(service.install("cancellation-skill", "fake"))
     else:
         mutation = asyncio.create_task(service.update("cancellation-skill"))
-    assert await asyncio.to_thread(worker_started.wait, 1)
     cancellation_propagated = False
     try:
+        await asyncio.wait_for(worker_started.wait(), timeout=5)
         assert service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 1
 
@@ -3065,12 +3119,15 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         assert not rollback_started.is_set()
     finally:
         release_worker.set()
+        if not mutation.done():
+            mutation.cancel()
         try:
-            await asyncio.wait_for(mutation, timeout=2)
+            await asyncio.wait_for(mutation, timeout=5)
         except asyncio.CancelledError:
             cancellation_propagated = True
 
     assert cancellation_propagated is True
+    assert mutation.done()
     assert worker_finished.is_set()
     assert rollback_started.is_set()
     assert not service._mutation_lock.locked()
@@ -3108,14 +3165,15 @@ async def test_cancelled_uninstall_drains_postflight_before_rollback_and_unlock(
     service = _service(tmp_path, source, loader=loader)
     assert (await service.install("cancellation-uninstall", "fake")).success is True
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
     rollback_started = threading.Event()
     real_reload = loader.reload_verified
 
     def blocking_reload(verifier, *args, **kwargs) -> SkillReloadResult:
-        worker_started.set()
+        loop.call_soon_threadsafe(worker_started.set)
         if not release_worker.wait(timeout=5):
             raise TimeoutError("test did not release uninstall postflight reload")
         try:
@@ -3139,9 +3197,9 @@ async def test_cancelled_uninstall_drains_postflight_before_rollback_and_unlock(
     )
 
     mutation = asyncio.create_task(service.uninstall("cancellation-uninstall"))
-    assert await asyncio.to_thread(worker_started.wait, 1)
     cancellation_propagated = False
     try:
+        await asyncio.wait_for(worker_started.wait(), timeout=5)
         assert service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 1
 
@@ -3160,12 +3218,15 @@ async def test_cancelled_uninstall_drains_postflight_before_rollback_and_unlock(
         assert not rollback_started.is_set()
     finally:
         release_worker.set()
+        if not mutation.done():
+            mutation.cancel()
         try:
-            await asyncio.wait_for(mutation, timeout=2)
+            await asyncio.wait_for(mutation, timeout=5)
         except asyncio.CancelledError:
             cancellation_propagated = True
 
     assert cancellation_propagated is True
+    assert mutation.done()
     assert worker_finished.is_set()
     assert rollback_started.is_set()
     assert not service._mutation_lock.locked()

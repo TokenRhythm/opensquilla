@@ -2,6 +2,7 @@ import type { Ref } from 'vue'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { downloadText } from '@/utils/browser'
 import { artifactMeta, artifactName } from '@/utils/chat/artifacts'
+import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
 
 export interface UseChatMarkdownExportOptions {
   messages: Readonly<Ref<ChatRenderedMessage[]>>
@@ -55,16 +56,25 @@ export function buildChatMarkdown(options: BuildChatMarkdownOptions): string {
   for (const message of options.messages) {
     if (message.isRouterStrip) {
       const winner = message.gridCells?.[message.winnerIdx ?? -1]
-      if (winner) lines.push(`> Router selected ${winner.displayName || winner.model || winner.tier}`)
+      const selectedModel = String(message.routerSelectedModel || '').trim()
+      if (selectedModel || winner) {
+        lines.push(`> Router selected ${selectedModel || winner?.model || winner?.displayName || winner?.tier}`)
+      }
       continue
     }
     if (!['user', 'assistant', 'system', 'subagent', 'error'].includes(message.displayRole || message.role)) continue
     lines.push(`## ${message.roleLabel || message.displayRole || message.role}`)
     if (message.timeStr) lines.push(`_${message.timeStr}_`)
-    if (message.text) {
+    const presentationText = message.displayRole === 'assistant'
+      ? sanitizeAssistantPresentationText(message.text, {
+          inputMode: message.turnInputMode,
+          runKind: message.turnRunKind,
+        })
+      : message.text
+    if (presentationText) {
       const body = message.displayRole === 'subagent'
-        ? subagentCompletionMarkdown(message.text)
-        : markdownEscape(message.text)
+        ? subagentCompletionMarkdown(presentationText)
+        : markdownEscape(presentationText)
       if (body) lines.push('', body)
     }
     if (message.artifacts?.length) {

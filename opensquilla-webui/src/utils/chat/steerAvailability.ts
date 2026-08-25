@@ -35,10 +35,11 @@ export function steerUnavailableReason(
 ): SteerUnavailableReason | null {
   if (!state.isStreaming) return 'noActiveTurn'
   if (!state.methodAvailable) return 'gatewayUnsupported'
-  if (state.modelRoutingMode === 'llm_ensemble') return 'ensemble'
 
   const capability = state.capability
-  if (!capability) return 'capabilityPending'
+  if (!capability) {
+    return state.modelRoutingMode === 'llm_ensemble' ? 'ensemble' : 'capabilityPending'
+  }
   const serverReason = String(capability.reason || '').trim()
   if (serverReason) return SERVER_REASON_MAP[serverReason] || 'generic'
   if (capability.mode === 'queue_only') return 'queueOnly'
