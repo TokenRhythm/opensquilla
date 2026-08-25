@@ -664,6 +664,65 @@ def test_certification_rejects_case_that_exceeds_its_pre_reserved_calls() -> Non
         asyncio.run(e2e._run_certification(OverrunningDriver(), hard_cap=64))
 
 
+@pytest.mark.asyncio
+async def test_wait_for_task_retries_transient_storage_busy(tmp_path: Path) -> None:
+    driver = e2e.GatewayCertificationDriver(
+        temp_root=tmp_path,
+        api_key="synthetic",
+        timeout_seconds=1.0,
+        provider_endpoint="http://127.0.0.1:9/v1",
+        preload_router=False,
+    )
+
+    class Client:
+        calls = 0
+
+        async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "sessions.bootstrap"
+            assert params == {"key": "agent:main:test", "limit": 100}
+            self.calls += 1
+            if self.calls == 1:
+                raise e2e.GatewayRPCError(
+                    method,
+                    code="STORAGE_BUSY",
+                    message="Session storage is temporarily busy. Retry this operation.",
+                )
+            return {"tasks": [{"task_id": "task-1", "status": "succeeded"}]}
+
+    client = Client()
+    driver.client = client
+
+    task = await driver._wait_for_task("agent:main:test", "task-1")
+
+    assert task["status"] == "succeeded"
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_wait_for_task_does_not_retry_other_rpc_errors(tmp_path: Path) -> None:
+    driver = e2e.GatewayCertificationDriver(
+        temp_root=tmp_path,
+        api_key="synthetic",
+        timeout_seconds=1.0,
+        provider_endpoint="http://127.0.0.1:9/v1",
+        preload_router=False,
+    )
+
+    class Client:
+        calls = 0
+
+        async def call(self, method: str, _params: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            raise e2e.GatewayRPCError(method, code="FORBIDDEN", message="denied")
+
+    client = Client()
+    driver.client = client
+
+    with pytest.raises(e2e.GatewayRPCError, match="FORBIDDEN"):
+        await driver._wait_for_task("agent:main:test", "task-1")
+    assert client.calls == 1
+
+
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_owned_gateway_preflights_use_real_rpc_bridge_and_zero_provider_calls(
