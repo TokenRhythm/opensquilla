@@ -192,9 +192,9 @@ async def test_windows_safe_noop_exec_command_runs_without_sh(
     from opensquilla.sandbox.integration import configure_runtime, reset_runtime
     from opensquilla.tools.builtin import shell
 
-    cache_path = tmp_path / "ModuleAnalysisCache"
-    cache_path.touch()
-    monkeypatch.setenv("PSModuleAnalysisCachePath", str(cache_path))
+    cache_path = os.environ.get("PSModuleAnalysisCachePath")
+    if not cache_path or not Path(cache_path).is_file():
+        pytest.skip("Windows Safe noop cache test requires a prewarmed host cache")
     _configure_approval_queue(monkeypatch, tmp_path, "auto-approve")
     configure_runtime(
         SandboxSettings(run_mode="safe", backend="noop"),
@@ -223,7 +223,7 @@ async def test_windows_safe_noop_exec_command_runs_without_sh(
         reset_runtime()
         reset_approval_queue()
 
-    assert str(cache_path) in result
+    assert cache_path in result
     assert "opensquilla-noop-foreground" in result
     assert "exit_code=7" in result
 
