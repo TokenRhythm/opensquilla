@@ -113,6 +113,15 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "await page.mouse.move(1, 1)" in first_send_gate
     assert "rendererErrors" in first_send_gate
     assert "consoleErrorMessages" in first_send_gate
+    assert "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS" in first_send_gate
+    assert (
+        "INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = "
+        "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS"
+    ) in first_send_gate
+    assert (
+        "timeout: iteration === 1 ? INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS : SEND_TIMEOUT_MS"
+        in first_send_gate
+    )
 
 
 def test_release_workflow_runs_v053_windows_upgrade_checks_on_server_2022() -> None:

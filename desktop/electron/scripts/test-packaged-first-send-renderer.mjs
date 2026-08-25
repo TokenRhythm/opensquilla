@@ -10,9 +10,11 @@ import {
   requiredOption,
   waitFor,
 } from './packaged-smoke-helpers.mjs'
+import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
+const INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS
 const HEADER_IDENTITY_ATTRIBUTE = 'data-opensquilla-first-send-identity'
 const HEADER_IDENTITY_SETTLE_MS = 250
 const FORBIDDEN_RENDERER_ERROR = /(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])/i
@@ -401,7 +403,11 @@ try {
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
     await page.locator('.conn-pill.connected').waitFor({
       state: 'visible',
-      timeout: SEND_TIMEOUT_MS,
+      // The local renderer is intentionally visible before profile inspection
+      // and Gateway cold start complete. Preserve the runtime's full startup
+      // budget on the first iteration; later reconnects keep the strict send
+      // timeout used by every other interaction in this gate.
+      timeout: iteration === 1 ? INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS : SEND_TIMEOUT_MS,
     })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
     // The packaged app can expose its initial draft URL before Vue has mounted
