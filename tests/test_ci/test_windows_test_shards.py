@@ -365,6 +365,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         Path("tests/test_scripts/test_verify_webui_artifact.py"),
         "test_node_and_python_source_fingerprints_share_order_and_line_endings",
     )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_long_task_case_driver.py"),
+        "test_fault_case_executes_through_isolated_gateway_without_real_provider",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_long_task_case_driver.py"),
+        "test_fault_429_case_proves_retry_after_was_not_violated",
+    )
 
 
 @pytest.mark.parametrize(

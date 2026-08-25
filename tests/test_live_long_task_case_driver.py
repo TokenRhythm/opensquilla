@@ -932,6 +932,7 @@ def test_runtime_failure_preserves_physical_usage_and_cost_budget_evidence(
     assert result["cost"]["billed_cost_usd"] == pytest.approx(0.01)
 
 
+@pytest.mark.ci_serial
 def test_fault_case_executes_through_isolated_gateway_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -963,6 +964,7 @@ def test_fault_case_executes_through_isolated_gateway_without_real_provider(
     assert result["cost"]["billed_cost_usd"] == 0
 
 
+@pytest.mark.ci_serial
 def test_fault_429_case_proves_retry_after_was_not_violated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
