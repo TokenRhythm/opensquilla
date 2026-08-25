@@ -2694,6 +2694,11 @@ class GatewayConfig(BaseSettings):
     context_budget_tokens: int = 100_000
     context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
     preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
+    # Advisory context waterline: emit a one-shot system-message alert once
+    # durable history crosses this ratio of the active context window and
+    #
+
+    context_waterline_alert_ratio: float = Field(default=0.70, gt=0.0, le=1.0)
 
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
