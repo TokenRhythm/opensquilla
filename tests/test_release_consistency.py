@@ -703,6 +703,14 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "verify-release-windows-upgrade.ps1" in windows_audit
 
 
+def test_release_mirror_allows_full_hour_for_cross_cloud_uploads() -> None:
+    workflow = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )
+
+    assert workflow["jobs"]["mirror-release-assets"]["timeout-minutes"] == 60
+
+
 def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     workflow_text = Path(".github/workflows/wheelhouse-release.yml").read_text(
         encoding="utf-8"
