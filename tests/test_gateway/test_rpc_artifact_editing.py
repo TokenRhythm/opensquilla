@@ -231,7 +231,7 @@ async def test_prompt_annotation_create_replay_does_not_reuse_native_candidate(
     monkeypatch.setattr(
         artifact_editing_rpc,
         "get_desktop_artifact_bridge_client",
-        lambda: object(),
+        object,
     )
     replayed = await _dispatch(env, "artifacts.prompt_annotations.create", params)
     assert replayed.error is None, replayed.error
