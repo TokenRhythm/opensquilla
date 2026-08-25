@@ -1178,7 +1178,7 @@ def test_current_release_notes_cover_documents_runtimes_upgrade_and_containers()
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip" in notes
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in notes
     assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
-    assert notes.index("### Autonomous HTML document editing") < notes.index(
+    assert notes.index("### HTML document editing beta") < notes.index(
         "### Runtime Packs and slimmer Desktop installers"
     )
     assert notes.index("### Model routing, Ensemble, and providers") < notes.index(
@@ -1187,7 +1187,8 @@ def test_current_release_notes_cover_documents_runtimes_upgrade_and_containers()
     assert notes.index("## ✨ What's Improved") < notes.index("## Downloads")
     assert "no\nmanual data transfer is required" in notes
     assert "Additive database\nmigrations run automatically" in notes
-    assert "Candidate changes remain isolated" in notes
+    assert "early beta" in notes
+    assert "limited to single-file UTF-8 HTML" in notes
     assert "The 0.5.3 bundled\n  runtimes are intentionally not migrated" in notes
     assert "No Windows Portable assets are published for 0.5.4" in notes
     assert "0.5.4 Portable zip" in notes

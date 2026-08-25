@@ -2,7 +2,7 @@
 
 | Version | Tag | Date | Notes |
 |---|---|---|---|
-| 0.5.4 | v0.5.4 | 2026-08-25 | Stable: autonomous HTML editing, optional Runtime Packs, per-session routing, resilient C3 fusion, and cross-platform reliability |
+| 0.5.4 | v0.5.4 | 2026-08-25 | Stable: HTML document editing beta, optional Runtime Packs, per-session routing, resilient C3 fusion, and cross-platform reliability |
 | 0.5.3 | v0.5.3 | 2026-08-13 | Maintenance: durable Goals and follow-ups, resilient long-running chats, Skills and schedule workflows, safer recovery, and Web/Desktop refinements |
 | 0.5.2 | v0.5.2 | 2026-07-30 | Maintenance: same-turn steering, responsive startup and session history, safer recovery and usage accounting, and Desktop/provider/UI fixes |
 | 0.5.1 | v0.5.1 | 2026-07-29 | Maintenance: Full host/Cron reliability, Plan mode and project workspaces, artifact previews, desktop recovery, and provider/UI improvements |

@@ -10,10 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- Electron Desktop can import, inspect, version, edit, verify, and revert
-  single-file HTML documents. Element-scoped instructions can use the shared
-  Agent Loop, and the autonomous editing loop keeps candidate changes isolated
-  until an explicit commit.
+- Electron Desktop includes a beta for editing single-file HTML attachments and
+  deliverables. It provides preview, source, version, and change views plus
+  Agent-assisted candidate edits that users review before committing. Other
+  document formats and project-wide editing are not included.
 - Optional Python, Node.js, and Windows Git Bash Runtime Packs can be downloaded
   from Sandbox settings through an immutable catalog. Downloads support resume,
   cancellation, source fallback, integrity verification, removal, and cache
@@ -59,10 +59,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
-- HTML editing uses isolated preview surfaces, opaque mutation grants, atomic
-  revisions, and capability-gated document tools. Older or incomplete Desktop
-  bridges fail closed, while existing attachments and deliverables remain
-  readable and immutable.
+- The HTML editing beta uses isolated preview surfaces, opaque mutation grants,
+  atomic revisions, and capability-gated document tools. Older or incomplete
+  Desktop bridges fail closed, while existing attachments and deliverables
+  remain readable and immutable.
 - Runtime Pack downloads are restricted to pinned sources and verified by exact
   size and SHA-256 before safe extraction and activation. Failures remain local
   to the requested component and do not block Gateway startup.
