@@ -6163,6 +6163,18 @@ class TestSessionsAbort:
     ):
         cancel_entered = asyncio.Event()
         cancel_cancelled = asyncio.Event()
+        real_time = rpc_sessions.time
+
+        class ControlledAbortClock:
+            expired = False
+
+            def monotonic(self) -> float:
+                return 1.0 if self.expired else 0.0
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
+
+        clock = ControlledAbortClock()
 
         class Runtime:
             async def list(self, session_key: str | None = None):
@@ -6171,6 +6183,7 @@ class TestSessionsAbort:
 
             async def cancel(self, **_kwargs: Any) -> int:
                 cancel_entered.set()
+                clock.expired = True
                 try:
                     await asyncio.Event().wait()
                 finally:
@@ -6191,6 +6204,11 @@ class TestSessionsAbort:
             "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
             cancel_background,
         )
+        # Keep setup operations inside the shared budget regardless of runner
+        # scheduling, then expire that same budget once Runtime.cancel starts.
+        # asyncio's own monotonic clock remains real, so its timeout still
+        # drives cancellation of the deliberately stuck runtime call.
+        monkeypatch.setattr(rpc_sessions, "time", clock)
         monkeypatch.setattr(rpc_sessions, "_session_tree_keys", session_tree_keys)
         monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
         # The runtime cancellation intentionally never completes.  The
