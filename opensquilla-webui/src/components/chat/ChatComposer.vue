@@ -240,6 +240,30 @@
               <Icon name="x" :size="12" aria-hidden="true" />
             </button>
             <div
+              v-if="agentOptions && agentOptions.length > 1"
+              ref="agentSelectAnchorEl"
+              class="chat-settings-anchor"
+            >
+              <button
+                class="btn btn--icon btn--ghost chat-agent-select-btn"
+                :class="{ 'is-active': agentSelectOpen }"
+                :title="t('chat.composer.agentSelect')"
+                :aria-label="t('chat.composer.agentSelect')"
+                aria-haspopup="dialog"
+                :aria-expanded="agentSelectOpen ? 'true' : 'false'"
+                @click="toggleAgentSelect"
+              >
+                <Icon name="agents" :size="16" />
+              </button>
+              <ChatComposerAgentSelect
+                v-if="agentSelectOpen"
+                :options="agentOptions"
+                :selected-agent-id="selectedAgentId || ''"
+                @close="agentSelectOpen = false"
+                @select-agent="emit('selectAgent', $event)"
+              />
+            </div>
+            <div
               v-if="sessionRoutingAvailable"
               ref="modelRoutingAnchorEl"
               class="chat-settings-anchor"
@@ -450,6 +474,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
+import ChatComposerAgentSelect from '@/components/chat/ChatComposerAgentSelect.vue'
 import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
 import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
@@ -498,6 +523,8 @@ const props = withDefaults(defineProps<{
   sessionRoutingAvailable?: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
+  agentOptions?: Array<{ id: string; name: string; model?: string }>
+  selectedAgentId?: string
   addMenuAvoidElement?: HTMLElement | null
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
@@ -528,6 +555,8 @@ const props = withDefaults(defineProps<{
   floating?: boolean
 }>(), {
   canChooseProject: true,
+  agentOptions: () => [],
+  selectedAgentId: '',
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
   sessionRoutingAvailable: true,
@@ -553,6 +582,7 @@ const emit = defineEmits<{
   setSessionRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
+  selectAgent: [agentId: string]
   armGoal: []
   disarmGoal: []
   cancelReplan: []
@@ -671,12 +701,19 @@ function dismissRouterNewBadge() {
 }
 const runModeOpen = ref(false)
 const addMenuAnchorEl = ref<HTMLElement | null>(null)
+const agentSelectAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
 const moreActionsAnchorEl = ref<HTMLElement | null>(null)
+const agentSelectOpen = ref(false)
+
+function toggleAgentSelect() {
+  agentSelectOpen.value = !agentSelectOpen.value
+}
 
 const anyPopoverOpen = computed(() =>
   addMenuOpen.value
+  || agentSelectOpen.value
   || modelRoutingOpen.value
   || runModeOpen.value
   || moreActionsOpen.value,
@@ -701,6 +738,9 @@ function closeOpenPopoversFromOutside(event: PointerEvent) {
   }
   if (modelRoutingOpen.value && !eventInsideRoot(event, modelRoutingAnchorEl.value)) {
     modelRoutingOpen.value = false
+  }
+  if (agentSelectOpen.value && !eventInsideRoot(event, agentSelectAnchorEl.value)) {
+    agentSelectOpen.value = false
   }
   if (runModeOpen.value && !eventInsideRoot(event, runModeAnchorEl.value)) {
     runModeOpen.value = false
