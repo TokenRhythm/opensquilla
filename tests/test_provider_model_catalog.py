@@ -22,6 +22,33 @@ def test_deepseek_v4_direct_models_use_models_dev_limits() -> None:
         assert caps.reasoning_format == "deepseek"
 
 
+@pytest.mark.parametrize(
+    ("model", "context_window", "max_output_tokens", "supports_vision"),
+    [
+        ("qwen/qwen3.7-flash", 1_000_000, 65_536, True),
+        ("z-ai/glm-5.3", 1_048_576, 131_072, False),
+    ],
+)
+def test_lite_default_new_openrouter_models_resolve_offline(
+    model: str,
+    context_window: int,
+    max_output_tokens: int,
+    supports_vision: bool,
+) -> None:
+    catalog = ModelCatalog()
+
+    entry = catalog.resolve_entry(model, provider="openrouter")
+    caps = catalog.get_capabilities(model, provider_name="openrouter")
+
+    assert entry.source == "corrections"
+    assert entry.context_window == context_window
+    assert entry.max_output_tokens == max_output_tokens
+    assert caps.supports_reasoning is True
+    assert caps.supports_tools is True
+    assert caps.supports_vision is supports_vision
+    assert caps.reasoning_format == "openrouter"
+
+
 def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     """tokenrhythm has no models.dev table: without the provider-scoped
     corrections layer, the snapshot's cross-provider bare-id merge would

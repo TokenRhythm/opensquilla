@@ -111,7 +111,14 @@ _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
         _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
     }
 )
-_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-20.1"
+_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-25.1"
+_PRE_LITE_DEFAULT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-20.1"
+_PRE_LITE_DEFAULT_REGISTRY_SNAPSHOT_VERSION = (
+    "curated-openrouter-step2-2026-08-20.1-reliability-20260818T121632Z-519ac973e9da"
+)
+_PRE_LITE_DEFAULT_REGISTRY_RESOURCE = (
+    "router_dynamic_model_profiles_20260820_519ac973e9da.json"
+)
 _PRE_QWEN35_9B_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-19.1"
 _PRE_QWEN35_9B_REGISTRY_SNAPSHOT_VERSION = (
     "curated-openrouter-step2-2026-08-19.1-reliability-20260818T121632Z-01580c6982b4"
@@ -127,6 +134,7 @@ _LEGACY_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-07-31.1"
 _HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
     {
         _CURRENT_REGISTRY_BASE_VERSION,
+        _PRE_LITE_DEFAULT_REGISTRY_BASE_VERSION,
         _PRE_QWEN35_9B_REGISTRY_BASE_VERSION,
         _PRE_STATUS_DISABLE_REGISTRY_BASE_VERSION,
         _PREVIOUS_REGISTRY_BASE_VERSION,
@@ -6875,6 +6883,30 @@ def _archived_pre_qwen35_9b_registry_snapshot() -> dict[str, Any]:
     return validated
 
 
+def _archived_pre_lite_default_registry_snapshot() -> dict[str, Any]:
+    """Load the exact 80-model snapshot that predates the new Lite ladder."""
+
+    try:
+        path = resources.files("opensquilla.provider").joinpath(
+            _PRE_LITE_DEFAULT_REGISTRY_RESOURCE
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - surfaced as a precise startup/build error
+        raise DynamicRankingError(
+            "router_dynamic archived pre-Lite-default registry snapshot unavailable"
+        ) from exc
+    validated = _validate_registry_snapshot(payload)
+    _validate_packaged_role_reliability_provenance(validated)
+    if (
+        str(validated.get("snapshot_version") or "").strip()
+        != _PRE_LITE_DEFAULT_REGISTRY_SNAPSHOT_VERSION
+    ):
+        raise DynamicRankingError(
+            "router_dynamic archived pre-Lite-default registry has an unexpected version"
+        )
+    return validated
+
+
 def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, Any]:
     """Select the packaged registry or reconstruct an allowlisted base snapshot."""
 
@@ -6889,6 +6921,8 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
     packaged_version = str(packaged.get("snapshot_version") or "").strip()
     if requested == packaged_version:
         return packaged
+    if requested == _PRE_LITE_DEFAULT_REGISTRY_SNAPSHOT_VERSION:
+        return _archived_pre_lite_default_registry_snapshot()
     if requested == _PRE_QWEN35_9B_REGISTRY_SNAPSHOT_VERSION:
         return _archived_pre_qwen35_9b_registry_snapshot()
     if requested == _PRE_STATUS_DISABLE_REGISTRY_SNAPSHOT_VERSION:
@@ -6898,7 +6932,9 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
             f"router_dynamic model registry base_version {requested!r} is not available"
         )
     reconstruction_source = packaged
-    if requested != _CURRENT_REGISTRY_BASE_VERSION:
+    if requested == _PRE_LITE_DEFAULT_REGISTRY_BASE_VERSION:
+        reconstruction_source = _archived_pre_lite_default_registry_snapshot()
+    elif requested != _CURRENT_REGISTRY_BASE_VERSION:
         reconstruction_source = _archived_pre_qwen35_9b_registry_snapshot()
     source_version = str(reconstruction_source.get("snapshot_version") or "").strip()
     provenance = reconstruction_source.get("role_reliability_snapshot")
@@ -6949,6 +6985,7 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
             requested
             not in {
                 _CURRENT_REGISTRY_BASE_VERSION,
+                _PRE_LITE_DEFAULT_REGISTRY_BASE_VERSION,
                 _PRE_QWEN35_9B_REGISTRY_BASE_VERSION,
             }
             and model_id in _POST_CURRENT_BASE_DISABLED_MODEL_IDS

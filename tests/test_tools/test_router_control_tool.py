@@ -51,7 +51,7 @@ async def test_router_control_set_hold_writes_store_and_requests_replay() -> Non
     assert result.terminates_turn is True
     assert payload["accepted"] is True
     assert payload["target_tier"] == "c3"
-    assert payload["target_model"] == "anthropic/claude-opus-4.8"
+    assert payload["target_model"] == "z-ai/glm-5.3"
     assert payload["replay_required"] is True
     hold = ctx.router_control_hold_store.get_valid(ctx.session_key or "")
     assert hold is not None
@@ -93,7 +93,7 @@ def test_router_control_tool_schema_includes_dynamic_target_enum() -> None:
     assert "enum" in target_schema
     assert "tier:c3" in target_schema["enum"]
     assert "tier:t3" not in target_schema["enum"]
-    assert "model:z-ai/glm-5.2" not in target_schema["enum"]
+    assert "model:z-ai/glm-5.3" not in target_schema["enum"]
 
 
 @pytest.mark.asyncio

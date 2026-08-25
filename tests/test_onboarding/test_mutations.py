@@ -413,9 +413,11 @@ def test_provider_default_direct_model_does_not_follow_existing_router_tier():
         model="",
     )
 
-    assert res.config.llm.model == "deepseek/deepseek-v4-pro"
+    assert res.config.llm.model == "deepseek/deepseek-v4-flash"
     assert res.config.squilla_router.default_tier == "c2"
-    assert res.config.squilla_router.tiers["c2"]["model"] == "z-ai/glm-5.2"
+    assert res.config.squilla_router.tiers["c2"]["model"] == (
+        "deepseek/deepseek-v4-pro"
+    )
 
 
 def test_upsert_channel_appends_new():

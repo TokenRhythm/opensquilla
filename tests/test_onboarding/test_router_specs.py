@@ -19,6 +19,15 @@ def test_router_catalog_exposes_supported_profiles_and_tiers():
     assert "description" in deepseek["tiers"]["c0"]
     assert "thinkingLevel" in deepseek["tiers"]["c0"]
     openrouter = profiles["openrouter"]
+    assert {
+        tier: openrouter["tiers"][tier]["model"]
+        for tier in ("c0", "c1", "c2", "c3")
+    } == {
+        "c0": "qwen/qwen3.7-flash",
+        "c1": "deepseek/deepseek-v4-flash",
+        "c2": "deepseek/deepseek-v4-pro",
+        "c3": "z-ai/glm-5.3",
+    }
     assert "image_model" in openrouter["tiers"]
     assert openrouter["tiers"]["image_model"]["supportsImage"] is True
     byteplus = profiles["byteplus"]

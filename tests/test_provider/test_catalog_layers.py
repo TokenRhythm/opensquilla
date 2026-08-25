@@ -299,14 +299,58 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
     assert set(payload["openrouter"]) == {
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-4.6",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+        "qwen/qwen3.7-flash",
         "x-ai/grok-4.3",
         "stepfun/step-3.5-flash",
+        "z-ai/glm-5.3",
     }
     # Every packaged row survives normalization — no unknown field names,
     # no mistyped values (a dropped field would silently weaken a layer).
     tables = model_catalog_module._normalize_corrections(payload)
     assert {p: set(t) for p, t in tables.items()} == {p: set(t) for p, t in payload.items()}
     assert all(fields for table in tables.values() for fields in table.values())
+
+
+@pytest.mark.parametrize(
+    (
+        "model",
+        "context_window",
+        "max_output_tokens",
+        "input_cost",
+        "output_cost",
+        "cache_read_cost",
+        "cache_write_cost",
+    ),
+    [
+        ("qwen/qwen3.7-flash", 1_000_000, 65_536, 0.03, 0.13, 0.006, 0.038),
+        ("deepseek/deepseek-v4-flash", 1_048_576, 65_536, 0.08, 0.18, 0.016, None),
+        ("deepseek/deepseek-v4-pro", 1_048_576, 384_000, 1.188, 3.564, 0.0396, None),
+        ("z-ai/glm-5.3", 1_048_576, 131_072, 1.40, 4.40, 0.26, None),
+    ],
+)
+def test_lite_default_openrouter_models_resolve_packaged_corrections(
+    model: str,
+    context_window: int,
+    max_output_tokens: int,
+    input_cost: float,
+    output_cost: float,
+    cache_read_cost: float,
+    cache_write_cost: float | None,
+) -> None:
+    entry = ModelCatalog().resolve_entry(model, provider="openrouter")
+
+    assert entry.source == "corrections"
+    assert entry.context_window == context_window
+    assert entry.max_output_tokens == max_output_tokens
+    assert entry.input_cost_per_mtok == pytest.approx(input_cost)
+    assert entry.output_cost_per_mtok == pytest.approx(output_cost)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(cache_read_cost)
+    if cache_write_cost is None:
+        assert entry.cache_write_cost_per_mtok is None
+    else:
+        assert entry.cache_write_cost_per_mtok == pytest.approx(cache_write_cost)
 
 
 def test_ladder_glob_rows_keep_specific_before_general_file_order() -> None:

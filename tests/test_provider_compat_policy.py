@@ -129,6 +129,13 @@ def test_openrouter_replay_follows_capability_format() -> None:
     )
 
 
+def test_openrouter_lite_models_keep_model_specific_reasoning_off_policy() -> None:
+    openrouter = compat_policy_for_kind("openrouter")
+
+    assert "qwen/qwen3.7-flash" in openrouter.disable_reasoning_by_default_models
+    assert "z-ai/glm-5.3" not in openrouter.disable_reasoning_by_default_models
+
+
 def test_max_completion_tokens_requires_official_host() -> None:
     openai_policy = compat_policy_for_kind("openai")
     openrouter_policy = compat_policy_for_kind("openrouter")

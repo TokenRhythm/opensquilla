@@ -23,14 +23,14 @@ def reset_pricing_cache() -> Iterator[None]:
 def test_deepseek_v4_pro_static_price_matches_current_official(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Official price since 2026-05-31: $0.435/M in (miss), $0.87/M out, $0.003625/M cache hit."""
+    """OpenRouter's current V4 Pro route costs $1.188/M in and $3.564/M out."""
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
 
     price = lookup_price("deepseek/deepseek-v4-pro")
 
-    assert price.input_per_m == pytest.approx(0.435)
-    assert price.output_per_m == pytest.approx(0.87)
-    assert price.cache_read_per_m == pytest.approx(0.003625)
+    assert price.input_per_m == pytest.approx(1.188)
+    assert price.output_per_m == pytest.approx(3.564)
+    assert price.cache_read_per_m == pytest.approx(0.0396)
 
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ def test_versioned_deepseek_id_prefix_matches_static_entry(
 
     price = lookup_price("deepseek/deepseek-v4-pro-20260423")
 
-    assert price.input_per_m == pytest.approx(0.435)
+    assert price.input_per_m == pytest.approx(1.188)
 
 
 def test_price_entry_cache_fields_default_none() -> None:
@@ -216,6 +216,8 @@ def test_cache_quote_rejects_static_entry_without_provider_price_provenance() ->
         ("deepseek-chat", 0.14, 0.28),
         ("deepseek-reasoner", 0.26, 0.38),
         ("glm-5.2", 1.40, 4.40),
+        ("qwen/qwen3.7-flash", 0.03, 0.13),
+        ("z-ai/glm-5.3", 1.40, 4.40),
         ("qwen3.7-max", 1.475, 4.425),
         ("qwen3.7-plus", 0.40, 1.60),
     ],
@@ -234,7 +236,7 @@ def test_previously_missing_ids_now_have_static_entries(
     assert price.output_per_m == pytest.approx(output_per_m)
 
 
-@pytest.mark.parametrize("model", ["z-ai/glm-5.1", "z-ai/glm-5.2"])
+@pytest.mark.parametrize("model", ["z-ai/glm-5.1", "z-ai/glm-5.2", "z-ai/glm-5.3"])
 def test_glm_5_static_price_matches_openrouter_native_provider(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
@@ -245,6 +247,33 @@ def test_glm_5_static_price_matches_openrouter_native_provider(
 
     assert price.input_per_m == pytest.approx(1.40)
     assert price.output_per_m == pytest.approx(4.40)
+
+
+@pytest.mark.parametrize(
+    ("model", "input_per_m", "output_per_m", "cache_read_per_m", "cache_write_per_m"),
+    [
+        ("qwen/qwen3.7-flash", 0.03, 0.13, 0.006, 0.038),
+        ("deepseek/deepseek-v4-flash", 0.08, 0.18, 0.016, None),
+        ("deepseek/deepseek-v4-pro", 1.188, 3.564, 0.0396, None),
+        ("z-ai/glm-5.3", 1.40, 4.40, 0.26, None),
+    ],
+)
+def test_lite_default_openrouter_static_prices_match_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    input_per_m: float,
+    output_per_m: float,
+    cache_read_per_m: float,
+    cache_write_per_m: float | None,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price(model)
+
+    assert price.input_per_m == pytest.approx(input_per_m)
+    assert price.output_per_m == pytest.approx(output_per_m)
+    assert price.cache_read_per_m == pytest.approx(cache_read_per_m)
+    assert price.cache_write_per_m == cache_write_per_m
 
 
 @pytest.mark.parametrize(

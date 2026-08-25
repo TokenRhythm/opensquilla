@@ -137,6 +137,7 @@ try {
   const openRouterProvider = page.locator('#providerGrid [data-provider="openrouter"]')
   await openRouterProvider.click()
   assert.equal(await page.locator('#provider').inputValue(), 'openrouter')
+  assert.equal(await page.locator('#model').inputValue(), 'deepseek/deepseek-v4-flash')
   assert.equal(await openRouterProvider.getAttribute('aria-pressed'), 'true')
   assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'false')
   await page.locator('#onboardingLocale').selectOption('zh-Hans')

@@ -464,7 +464,7 @@ space. The implementation is split across:
 - `src/opensquilla/provider/ranking_router.py` — context adapters, task-profile
   validation, hard filters, scoring, greedy selection, and trace generation;
 - `src/opensquilla/provider/router_dynamic_model_profiles.json` — versioned
-  80-model curated OpenRouter registry and static/online profile estimates;
+  82-model curated OpenRouter registry and static/online profile estimates;
 - `src/opensquilla/provider/router_dynamic_ranking_config.json` — the complete
   dynamic-routing parameter set, including limits, fallback/mock defaults,
   hard-filter states, ranking, reranking, proposer count, and session behavior;

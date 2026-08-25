@@ -126,6 +126,22 @@ def test_openrouter_has_correct_default_base_url():
     assert spec.default_base_url == "https://openrouter.ai/api/v1"
 
 
+def test_openrouter_direct_default_matches_balanced_router_tier():
+    spec = get_provider_setup_spec("openrouter")
+    row = next(
+        row
+        for row in provider_catalog_payload()
+        if row["providerId"] == "openrouter"
+    )
+
+    assert spec.default_direct_model == "deepseek/deepseek-v4-flash"
+    assert row["defaultDirectModel"] == "deepseek/deepseek-v4-flash"
+    assert row["defaultModel"] == "deepseek/deepseek-v4-flash"
+    assert row["presets"][0]["tiers"]["c1"]["model"] == (
+        "deepseek/deepseek-v4-flash"
+    )
+
+
 def test_bailian_coding_regions_are_explicit_provider_choices():
     international = get_provider_setup_spec("bailian_coding")
     mainland = get_provider_setup_spec("bailian_coding_cn")

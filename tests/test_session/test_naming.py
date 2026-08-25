@@ -343,7 +343,7 @@ async def test_call_naming_llm_payload_and_sanitization(monkeypatch):
 
     title = await call_naming_llm(
         "Help me reset my password please",
-        model="deepseek/deepseek-v4-pro",
+        model="deepseek/deepseek-v4-flash",
         api_key="test-key",
         base_url="https://openrouter.ai/api/v1",
         timeout=10.0,
@@ -356,7 +356,7 @@ async def test_call_naming_llm_payload_and_sanitization(monkeypatch):
     # cover reasoning-by-default models that spend thinking tokens before the
     # title (a 96-token cap returned empty content at finish_reason=length).
     assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
-    assert captured["json"]["model"] == "deepseek/deepseek-v4-pro"
+    assert captured["json"]["model"] == "deepseek/deepseek-v4-flash"
     assert captured["json"]["max_tokens"] == 512
     assert captured["json"]["temperature"] == 0
     assert captured["json"]["stream"] is False
@@ -387,8 +387,13 @@ async def test_call_naming_llm_adds_tokenrhythm_app_attribution(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+)
 async def test_call_naming_llm_disables_openrouter_reasoning_for_reasoning_models(
     monkeypatch,
+    model,
 ):
     captured: dict = {}
     monkeypatch.setattr(
@@ -398,7 +403,7 @@ async def test_call_naming_llm_disables_openrouter_reasoning_for_reasoning_model
 
     title = await call_naming_llm(
         "Help me reset my password please",
-        model="deepseek/deepseek-v4-pro",
+        model=model,
         api_key="test-key",
         base_url="https://openrouter.ai/api/v1",
     )

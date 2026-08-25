@@ -15,7 +15,7 @@ def _default_model_for_provider(provider: str) -> str:
     if normalized == "tokenrhythm":
         return "deepseek-v4-pro"
     if normalized == "openrouter":
-        return "deepseek/deepseek-v4-pro"
+        return "deepseek/deepseek-v4-flash"
     if normalized == "deepseek":
         return "deepseek-v4-flash"
     return "openai/gpt-4o-mini"

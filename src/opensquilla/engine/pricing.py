@@ -411,6 +411,10 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("qwen/qwen3-coder-plus", PriceEntry(0.65, 3.25)),
     ("qwen/qwen3.7-max", PriceEntry(1.475, 4.425)),
     (
+        "qwen/qwen3.7-flash",
+        PriceEntry(0.03, 0.13, cache_read_per_m=0.006, cache_write_per_m=0.038),
+    ),
+    (
         "qwen/qwen3.8-max",
         PriceEntry(
             2.0,
@@ -424,11 +428,12 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("stepfun/step-3.5-flash", PriceEntry(0.10, 0.30)),
     ("z-ai/glm-4.5-air", PriceEntry(0.13, 0.85)),
     ("minimax/minimax-m2.5", PriceEntry(0.118, 0.99)),
-    ("deepseek/deepseek-v4-flash", PriceEntry(0.14, 0.28, cache_read_per_m=0.0028)),
-    ("deepseek/deepseek-v4-pro", PriceEntry(0.435, 0.87, cache_read_per_m=0.003625)),
+    ("deepseek/deepseek-v4-flash", PriceEntry(0.08, 0.18, cache_read_per_m=0.016)),
+    ("deepseek/deepseek-v4-pro", PriceEntry(1.188, 3.564, cache_read_per_m=0.0396)),
     ("deepseek/deepseek-v3.2", PriceEntry(0.26, 0.38)),
     ("google/gemini-3-flash-preview", PriceEntry(0.50, 3.0)),
     ("qwen/qwen3.7-plus", PriceEntry(0.40, 1.60)),
+    ("z-ai/glm-5.3", PriceEntry(1.40, 4.40, cache_read_per_m=0.26)),
     ("z-ai/glm-5.2", PriceEntry(1.40, 4.40)),
     ("z-ai/glm-5.1", PriceEntry(1.40, 4.40)),
     ("z-ai/glm-5", PriceEntry(0.72, 2.30)),

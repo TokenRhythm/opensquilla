@@ -130,7 +130,7 @@ async def test_router_control_replay_event_replays_turn_once(monkeypatch) -> Non
     assert replay_events[0].target_tier == "c3"
     # Initial turn routes to c1 (the strategy returns c1); the router_control
     # hold replays it at c3. Models follow the default tier profile.
-    assert provider.calls == ["deepseek/deepseek-v4-pro", "anthropic/claude-opus-4.8"]
+    assert provider.calls == ["deepseek/deepseek-v4-flash", "z-ai/glm-5.3"]
     assert done_events[-1].text == "new final"
     assert text.endswith("new final")
 

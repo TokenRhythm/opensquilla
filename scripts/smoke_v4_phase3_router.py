@@ -34,25 +34,25 @@ from opensquilla.gateway.config import GatewayConfig  # noqa: E402
 TIERS = {
     "c0": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-flash",
+        "model": "qwen/qwen3.7-flash",
         "description": "short text and trivial follow-ups",
         "thinking_level": "high",
     },
     "c1": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-pro",
+        "model": "deepseek/deepseek-v4-flash",
         "description": "normal coding and agent tasks",
         "thinking_level": "high",
     },
     "c2": {
         "provider": "openrouter",
-        "model": "z-ai/glm-5.2",
+        "model": "deepseek/deepseek-v4-pro",
         "description": "structured multi-step work",
         "thinking_level": "high",
     },
     "c3": {
         "provider": "openrouter",
-        "model": "anthropic/claude-opus-4.8",
+        "model": "z-ai/glm-5.3",
         "description": "deep reasoning and hard recovery turns",
         "thinking_level": "high",
     },
@@ -948,22 +948,22 @@ def _live_tier_model_map(live_model: str) -> dict[str, str]:
         "c0": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C0_MODEL",
             "OPENSQUILLA_LIVE_LLM_T0_MODEL",
-            "deepseek/deepseek-v4-flash",
+            "qwen/qwen3.7-flash",
         ),
         "c1": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C1_MODEL",
             "OPENSQUILLA_LIVE_LLM_T1_MODEL",
-            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
         ),
         "c2": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C2_MODEL",
             "OPENSQUILLA_LIVE_LLM_T2_MODEL",
-            "z-ai/glm-5.2",
+            "deepseek/deepseek-v4-pro",
         ),
         "c3": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C3_MODEL",
             "OPENSQUILLA_LIVE_LLM_T3_MODEL",
-            "anthropic/claude-opus-4.8",
+            "z-ai/glm-5.3",
         ),
     }
     if live_model:

@@ -39,6 +39,15 @@ Use the OpenRouter mixed defaults:
 opensquilla configure router --router openrouter-mix
 ```
 
+The built-in OpenRouter text tiers are:
+
+| Tier | Model |
+| --- | --- |
+| `c0` | `qwen/qwen3.7-flash` |
+| `c1` | `deepseek/deepseek-v4-flash` |
+| `c2` | `deepseek/deepseek-v4-pro` |
+| `c3` | `z-ai/glm-5.3` |
+
 Disable routing and use the configured provider/model directly:
 
 ```sh

@@ -966,7 +966,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
     id: 'openrouter',
     label: 'OpenRouter',
-    model: 'deepseek/deepseek-v4-pro',
+    model: 'deepseek/deepseek-v4-flash',
     baseUrl: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     requiresApiKey: true,
@@ -1334,10 +1334,10 @@ const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
     image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true },
   },
   openrouter: {
-    c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
-    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
-    c2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
-    c3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
+    c0: { provider: 'openrouter', model: 'qwen/qwen3.7-flash', description: 'Fast thinking for everyday work', thinkingLevel: 'high' },
+    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Balanced agent work', thinkingLevel: 'high' },
+    c2: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Complex reasoning', thinkingLevel: 'high' },
+    c3: { provider: 'openrouter', model: 'z-ai/glm-5.3', description: 'Highest quality review and planning', thinkingLevel: 'high' },
     image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true, thinkingLevel: 'medium' },
   },
   openai: {

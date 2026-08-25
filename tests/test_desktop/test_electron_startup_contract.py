@@ -537,6 +537,23 @@ def test_desktop_tokenrhythm_onboarding_supports_all_model_routing_modes() -> No
         assert model in tokenrhythm_profile
 
 
+def test_desktop_openrouter_onboarding_uses_current_default_ladder() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    openrouter_catalog = _section(main_ts, "id: 'openrouter'", "id: 'openai'")
+    openrouter_profile = _section(main_ts, "  openrouter: {", "  openai: {")
+
+    assert "model: 'deepseek/deepseek-v4-flash'" in openrouter_catalog
+    for tier, model in {
+        "c0": "qwen/qwen3.7-flash",
+        "c1": "deepseek/deepseek-v4-flash",
+        "c2": "deepseek/deepseek-v4-pro",
+        "c3": "z-ai/glm-5.3",
+    }.items():
+        assert f"{tier}: {{ provider: 'openrouter', model: '{model}'" in (
+            openrouter_profile
+        )
+
+
 def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     preload = _read("desktop/electron/src/preload.cts")

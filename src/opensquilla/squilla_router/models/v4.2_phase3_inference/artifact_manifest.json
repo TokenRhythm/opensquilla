@@ -117,8 +117,8 @@
     },
     {
       "path": "router.runtime.yaml",
-      "size_bytes": 5078,
-      "sha256": "9c442007c5b45054b10b629d8df67ac3c6d300d039c162efc38467f55ed1ea72",
+      "size_bytes": 5064,
+      "sha256": "6e43c2a1a112c7f82f88ce2415b2f1511602b70cbdf97c00618907176515a691",
       "kind": "yaml_config",
       "source_note": "Router V4 Phase 3 bundle metadata or runtime configuration."
     },

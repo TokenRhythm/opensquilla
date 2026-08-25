@@ -115,6 +115,45 @@ max_output_tokens = 16384
 context_window = 256000
 max_output_tokens = 16384
 
+[openrouter."qwen/qwen3.7-flash"]
+display_name = "Qwen3.7 Flash"
+release_date = "2026-07-27"
+status = "available"
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+input_cost_per_mtok = 0.03
+output_cost_per_mtok = 0.13
+cache_read_cost_per_mtok = 0.006
+cache_write_cost_per_mtok = 0.038
+
+[openrouter."deepseek/deepseek-v4-flash"]
+input_cost_per_mtok = 0.08
+output_cost_per_mtok = 0.18
+cache_read_cost_per_mtok = 0.016
+
+[openrouter."deepseek/deepseek-v4-pro"]
+input_cost_per_mtok = 1.188
+output_cost_per_mtok = 3.564
+cache_read_cost_per_mtok = 0.0396
+
+[openrouter."z-ai/glm-5.3"]
+display_name = "GLM-5.3"
+release_date = "2026-08-16"
+status = "available"
+context_window = 1048576
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "openrouter"
+input_cost_per_mtok = 1.40
+output_cost_per_mtok = 4.40
+cache_read_cost_per_mtok = 0.26
+
 # --- capability ladder migration (transcribed from get_capabilities) ---
 #
 # Rows below carry the per-provider capability ladder that used to live as

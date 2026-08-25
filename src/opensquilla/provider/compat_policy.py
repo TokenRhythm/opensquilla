@@ -188,11 +188,12 @@ _DEEPSEEK_V4_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 # reasoning context is lost across tool-call rounds.
 _TOKENHUB_HY3_MODEL_IDS = frozenset({"hy3", "hy3-preview"})
 
-# OpenRouter's reasoning controls are model/provider-specific: GLM can be
-# stabilized by explicitly disabling reasoning when OpenSquilla has not
-# requested thinking, while MiniMax reasoning endpoints reject that payload.
+# OpenRouter's reasoning controls are model/provider-specific.  Models in this
+# set reason by default but accept an explicit disabled control; mandatory-
+# reasoning models such as GLM-5.3 must never be added here.
 _OPENROUTER_DISABLE_REASONING_MODELS = frozenset(
     {
+        "qwen/qwen3.7-flash",
         "z-ai/glm-4.5",
         "z-ai/glm-4.5-air",
         "z-ai/glm-5",

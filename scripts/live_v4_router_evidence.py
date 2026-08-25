@@ -38,21 +38,21 @@ from scripts.smoke_v4_phase3_router import (  # noqa: E402
 CASES = [
     {
         "id": "r0_prompt_hint",
-        "expected_model": "deepseek/deepseek-v4-flash",
+        "expected_model": "qwen/qwen3.7-flash",
         "expected_thinking": False,
         "expected_response_policy": True,
         "message": "谢谢。",
     },
     {
         "id": "r0_prompt_hint_en",
-        "expected_model": "deepseek/deepseek-v4-flash",
+        "expected_model": "qwen/qwen3.7-flash",
         "expected_thinking": False,
         "expected_response_policy": True,
         "message": "Thanks.",
     },
     {
         "id": "r1_standard",
-        "expected_model": "deepseek/deepseek-v4-pro",
+        "expected_model": "deepseek/deepseek-v4-flash",
         "expected_thinking": True,
         "expected_thinking_level": "medium",
         "expected_response_policy": False,
@@ -60,7 +60,7 @@ CASES = [
     },
     {
         "id": "r2_thinking_medium",
-        "expected_model": "z-ai/glm-5.2",
+        "expected_model": "deepseek/deepseek-v4-pro",
         "expected_thinking": True,
         "expected_thinking_level": "medium",
         "expected_response_policy": False,
@@ -71,7 +71,7 @@ CASES = [
     },
     {
         "id": "r3_thinking_high",
-        "expected_model": "anthropic/claude-opus-4.8",
+        "expected_model": "z-ai/glm-5.3",
         "expected_thinking": True,
         "expected_thinking_level": "high",
         "expected_response_policy": False,

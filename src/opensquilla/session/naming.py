@@ -49,6 +49,8 @@ _TITLE_MAX_TOKENS = 512
 _OPENROUTER_REASONING_DEFAULT_MODELS = frozenset(
     {
         "deepseek/deepseek-v4",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-20260423",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-pro-20260423",
         "z-ai/glm-4.5",

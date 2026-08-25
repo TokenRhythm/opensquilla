@@ -43,6 +43,7 @@ OPENROUTER_DEFAULT_PROVIDER_ROUTING = {
     "qwen/qwen3-coder-plus": "alibaba",
     "qwen/qwen3.5-9b": "siliconflow",
     "qwen/qwen3.5-122b-a10b": "alibaba",
+    "qwen/qwen3.7-flash": "alibaba",
     "qwen/qwen3.7-plus": "alibaba",
     "qwen/qwen3.7-max": "alibaba",
     "qwen/qwen3.8-max": "alibaba",
@@ -52,6 +53,7 @@ OPENROUTER_DEFAULT_PROVIDER_ROUTING = {
     "z-ai/glm-4.6": "z-ai",
     "z-ai/glm-5.1": "z-ai",
     "z-ai/glm-5.2": "z-ai",
+    "z-ai/glm-5.3": "z-ai",
 }
 
 

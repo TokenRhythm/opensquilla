@@ -2441,6 +2441,85 @@ def test_regular_openrouter_deepseek_non_thinking_omits_reasoning(
     assert "reasoning" not in captured["payload"]
 
 
+def test_openrouter_qwen37_flash_non_thinking_explicitly_disables_reasoning(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen/qwen3.7-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            thinking=False,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_format="openrouter",
+            ),
+        ),
+    )
+
+    assert captured["payload"]["reasoning"] == {"enabled": False}
+
+
+def test_openrouter_glm53_non_thinking_does_not_disable_mandatory_reasoning(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="z-ai/glm-5.3",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            thinking=False,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_format="openrouter",
+            ),
+        ),
+    )
+
+    assert "reasoning" not in captured["payload"]
+
+
+def test_openrouter_glm53_max_thinking_uses_provider_native_effort(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="z-ai/glm-5.3",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            thinking=True,
+            thinking_level=ThinkingLevel.MAX,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_format="openrouter",
+            ),
+        ),
+    )
+
+    assert captured["payload"]["reasoning"] == {"effort": "max"}
+
+
 def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
