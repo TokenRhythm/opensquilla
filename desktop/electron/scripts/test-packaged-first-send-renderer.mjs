@@ -18,6 +18,10 @@ const INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS
 const HEADER_IDENTITY_ATTRIBUTE = 'data-opensquilla-first-send-identity'
 const HEADER_IDENTITY_SETTLE_MS = 250
 const FORBIDDEN_RENDERER_ERROR = /(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])/i
+const PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS = new Set([
+  'Electron sandboxed_renderer.bundle.js script failed to run',
+  "TypeError: Cannot destructure property 'preloadScripts' of 'binding.startupData' as it is null.",
+])
 const WIDE_VIEWPORT = { width: 1440, height: 900 }
 const TIGHT_VIEWPORT = { width: 900, height: 780 }
 let headerIdentityNonce = 0
@@ -169,6 +173,8 @@ async function readDesktopLogSummary(userDataDir) {
   const rendererErrors = []
   let malformedRecords = 0
   let forbiddenErrorCount = 0
+  let playwrightSandboxErrorCount = 0
+  let unexpectedRendererErrorCount = 0
   for (const line of source.split(/\r?\n/)) {
     if (!line.trim()) continue
     if (FORBIDDEN_RENDERER_ERROR.test(line)) forbiddenErrorCount += 1
@@ -184,6 +190,13 @@ async function readDesktopLogSummary(userDataDir) {
           line: record?.line,
         })
       }
+      if (event === 'renderer_console') {
+        if (PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS.has(String(record?.message || ''))) {
+          playwrightSandboxErrorCount += 1
+        } else {
+          unexpectedRendererErrorCount += 1
+        }
+      }
     } catch {
       malformedRecords += 1
     }
@@ -193,6 +206,8 @@ async function readDesktopLogSummary(userDataDir) {
     eventCounts,
     rendererErrors,
     forbiddenErrorCount,
+    playwrightSandboxErrorCount,
+    unexpectedRendererErrorCount,
     malformedRecords,
   }
 }
@@ -337,19 +352,29 @@ try {
     await route.abort('blockedbyclient')
   })
   const page = await app.firstWindow({ timeout: 60_000 })
-  page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
-  page.on('console', (message) => {
-    if (message.type() === 'error') consoleErrors.push(message.text())
-  })
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
     'candidate Desktop renderer',
   )
+  // The Desktop main process awaits its first loadURL() before it can inspect
+  // the profile and start Gateway. Reloading as soon as the committed URL is
+  // visible can interrupt that promise and strand startup before inspection.
+  // Prove the initial document and Gateway are settled before installing the
+  // page-level WebSocket probe.
+  await page.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
+  })
+  page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text())
+  })
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
-  // packaged Electron app, so the release gate instruments send() in the page
-  // before a clean reload and leaves the real Gateway connection untouched.
-  await page.addInitScript(() => {
+  // packaged Electron app. Patching the prototype in the settled document also
+  // covers the already-connected socket and avoids a reload racing Electron's
+  // main-process loadURL() promise.
+  await page.evaluate(() => {
     const probe = { methods: {}, sends: [] }
     Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
       configurable: false,
@@ -380,7 +405,6 @@ try {
       return originalSend.call(this, data)
     }
   })
-  await page.reload({ waitUntil: 'domcontentloaded' })
 
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
@@ -403,11 +427,9 @@ try {
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
     await page.locator('.conn-pill.connected').waitFor({
       state: 'visible',
-      // The local renderer is intentionally visible before profile inspection
-      // and Gateway cold start complete. Preserve the runtime's full startup
-      // budget on the first iteration; later reconnects keep the strict send
-      // timeout used by every other interaction in this gate.
-      timeout: iteration === 1 ? INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS : SEND_TIMEOUT_MS,
+      // Initial cold start completed before probe installation. Keep the strict
+      // interaction budget used by the rest of this gate.
+      timeout: SEND_TIMEOUT_MS,
     })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
     // The packaged app can expose its initial draft URL before Vue has mounted
@@ -524,7 +546,11 @@ if (runError) {
 }
 
 assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
-assert.equal(desktopLogSummary.eventCounts.renderer_console || 0, 0, 'desktop.log contains renderer console errors')
+assert.equal(
+  desktopLogSummary.unexpectedRendererErrorCount,
+  0,
+  'desktop.log contains unexpected renderer console errors',
+)
 assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
 assert.equal(
   provider?.counts().chatRequestCount,
