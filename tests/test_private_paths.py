@@ -64,7 +64,10 @@ def test_windows_private_acl_rejects_unverified_extra_principal() -> None:
         def read_dacl_sddl(self, _handle: object) -> str:
             return "O:S-1-5-21-123D:P(A;;FA;;;S-1-5-21-123)(A;;FA;;;SY)(A;;FR;;;S-1-1-0)"
 
-    with pytest.raises(OSError, match="did not retain a private DACL"):
+    with pytest.raises(
+        private_paths._WindowsPrivateDaclVerificationError,
+        match="did not retain a private DACL",
+    ):
         private_paths.apply_windows_private_dacl(
             Path("synthetic-private-file"),
             directory=False,
