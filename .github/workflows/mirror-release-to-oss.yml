@@ -25,7 +25,7 @@ jobs:
   mirror-release-assets:
     name: Mirror release assets to Aliyun OSS
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
       ALIYUN_OSS_PREFIX: ${{ vars.ALIYUN_OSS_PREFIX }}
