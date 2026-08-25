@@ -802,6 +802,11 @@ class AgentConfig:
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
+    # Context waterline: project oversized historical tool results in the
+    # provider request view once history spans more than this many completed
+    # assistant turns. 0 disables the pass. This bounds monotonic history
+    # growth without waiting for request-level budget pressure.
+    tool_result_history_projection_keep_recent_turns: int = 3
     tool_failure_loop_block_threshold: int = 3
     repeated_tool_call_recovery_threshold: int = 0
     # Extra tool names covered by repeated-identical-call recovery, on top of
