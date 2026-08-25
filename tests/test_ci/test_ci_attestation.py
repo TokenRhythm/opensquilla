@@ -111,6 +111,9 @@ def test_verify_queue_command_emits_fail_closed_outputs(
         kwargs["details"].update(
             reason_code="reusable_exact",
             combined_smoke_suites="[]",
+            source_successful_suites='["workflow-lint"]',
+            source_planner_digest="a" * 64,
+            source_suite_execution_digests='{"workflow-lint":"b"}',
         )
         return True, "trusted exact evidence", 123
 
@@ -200,6 +203,17 @@ def _seed_suite_execution_input_fixtures(repo: Path) -> None:
             _write(repo, candidate, "synthetic suite input\n")
 
 
+def _seed_trust_policy_input_fixtures(repo: Path) -> None:
+    """Materialize the production trust manifest and every declared input."""
+
+    manifest_path = Path(".github/ci/trust-policy.v1.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _write(repo, str(manifest_path), json.dumps(manifest, indent=2) + "\n")
+    for relative in manifest["merge_critical_inputs"]:
+        if not (repo / relative).exists():
+            _write(repo, relative, f"synthetic merge-critical input: {relative}\n")
+
+
 def _merge_preview_repo(
     tmp_path: Path,
     *,
@@ -214,13 +228,13 @@ def _merge_preview_repo(
     _git(repo, "config", "user.name", "CI Test")
     _git(repo, "config", "user.email", "ci@example.invalid")
     _write(repo, ".github/workflows/ci.yml", "name: CI\n")
-    _write(repo, ".github/scripts/classify-ci-changes.sh", "#!/bin/sh\n")
     _write(repo, ".github/scripts/windows_test_shards.py", "TEST_SHARDS = 1\n")
     for relative in (
         ".github/ci/suites.v1.json",
         ".github/scripts/plan_ci.py",
     ):
         _write(repo, relative, Path(relative).read_text(encoding="utf-8"))
+    _seed_trust_policy_input_fixtures(repo)
     _write(repo, "pyproject.toml", "[project]\nname='fixture'\nversion='0'\n")
     _write(repo, "src/example.py", "BASE = True\n")
     if feature_path != "src/example.py":
@@ -861,6 +875,7 @@ def _composition_fixture(
         ".github/scripts/plan_ci.py",
     ):
         _write(repo, relative, Path(relative).read_text(encoding="utf-8"))
+    _seed_trust_policy_input_fixtures(repo)
     _write(repo, source_path, "VALUE = 1\n")
     _write(repo, "README.md", "base readme\n")
     _write(repo, "docs/base.md", "base\n")
@@ -1278,6 +1293,13 @@ def test_verify_queue_reuses_only_exact_trusted_evidence_without_nightly(
     assert details["candidate_count"] == 1
     assert details["artifact_name"].startswith("ci-evidence-v2-tree-")
     assert details["combined_smoke_suites"] == "[]"
+    assert json.loads(str(details["source_successful_suites"])) == attestation[
+        "successful_suites"
+    ]
+    assert details["source_planner_digest"] == attestation["planner_digest"]
+    assert json.loads(str(details["source_suite_execution_digests"])) == attestation[
+        "suite_execution_digests"
+    ]
     assert all("event=schedule" not in url for url in api_calls)
 
     newer_run = {**run, "id": 124, "created_at": "2026-08-21T00:00:00Z"}
