@@ -4,6 +4,7 @@ import { createApp, nextTick, type App, type ComponentPublicInstance } from 'vue
 import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
+import chatHeaderActionsSource from './ChatHeaderActions.vue?raw'
 import type { ContextUsage } from '@/composables/chat/useChatUsageWidget'
 
 type LayoutName = 'wide' | 'compact' | 'tight'
@@ -705,5 +706,24 @@ describe('ChatHeaderActions', () => {
       contextUsage: { pct: 42, usedK: 54, windowK: 128, warning: false },
     })
     expect(contextChip(el)).toBeNull()
+  })
+
+  it('keeps the warning percentage readable against its own background', () => {
+    // `--warn-fill` is an indicator colour: every other use in the app is a dot
+    // or a bar with nothing written on it, and `foundation.css` defaults it to
+    // `var(--warn)`. Painting `color: var(--warn)` on a bare `var(--warn-fill)`
+    // ground therefore erases the percentage in every theme that does not give
+    // the two roles separate values — which, today, is most of them. The fill
+    // has to be tinted for text to sit on it.
+    const start = chatHeaderActionsSource.indexOf('.chat-header__context.is-warning {')
+    expect(start).toBeGreaterThanOrEqual(0)
+    const rule = chatHeaderActionsSource.slice(
+      start,
+      chatHeaderActionsSource.indexOf('}', start),
+    )
+
+    expect(rule).toContain('color: var(--warn);')
+    expect(rule).not.toContain('background: var(--warn-fill);')
+    expect(rule).toMatch(/background:\s*color-mix\(/)
   })
 })

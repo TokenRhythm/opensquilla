@@ -587,7 +587,13 @@ defineExpose({ focusAction, closeMenu })
 }
 
 .chat-header__context.is-warning {
-  background: var(--warn-fill);
+  /* `--warn-fill` is a solid indicator colour — every other use in the app is a
+     dot or a bar with nothing written on it, and `foundation.css` defaults it
+     to `var(--warn)`, so painting warn text on a warn-fill ground erases the
+     percentage in every theme that does not override the two separately.
+     Tinting it is the pattern the degraded status glyph in OverviewView
+     already uses for warn-coloured text on a warn ground. */
+  background: color-mix(in srgb, var(--warn-fill) 14%, transparent);
   border-color: var(--warn);
   color: var(--warn);
 }
