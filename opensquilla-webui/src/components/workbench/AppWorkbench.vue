@@ -128,6 +128,13 @@
           @click="performPanelAction(item, toolbarItem.id)"
         >
           <Icon :name="toolbarItem.icon" :size="15" aria-hidden="true" />
+          <span
+            v-if="toolbarItem.id === 'toggle-annotation-mode'"
+            class="app-workbench__action-beta"
+            aria-hidden="true"
+          >
+            β
+          </span>
         </button>
       </template>
     </template>
@@ -1411,6 +1418,7 @@ onBeforeUnmount(() => {
 }
 
 .app-workbench__action {
+  position: relative;
   display: inline-flex;
   width: 30px;
   height: 30px;
@@ -1423,6 +1431,18 @@ onBeforeUnmount(() => {
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
+}
+
+.app-workbench__action-beta {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  color: currentColor;
+  font-size: 7px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.58;
+  pointer-events: none;
 }
 
 .app-workbench__switcher {
