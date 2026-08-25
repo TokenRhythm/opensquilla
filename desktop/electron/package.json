@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {

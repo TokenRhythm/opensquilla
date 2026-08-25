@@ -2099,10 +2099,16 @@ class GatewayCertificationDriver:
     async def _wait_for_task(self, session_key: str, task_id: str) -> Mapping[str, Any]:
         deadline = time.monotonic() + self.timeout_seconds
         while time.monotonic() < deadline:
-            bootstrap = await self.client.call(
-                "sessions.bootstrap",
-                {"key": session_key, "limit": 100},
-            )
+            try:
+                bootstrap = await self.client.call(
+                    "sessions.bootstrap",
+                    {"key": session_key, "limit": 100},
+                )
+            except GatewayRPCError as exc:
+                if exc.code != "STORAGE_BUSY":
+                    raise
+                await asyncio.sleep(0.25)
+                continue
             tasks = bootstrap.get("tasks")
             if isinstance(tasks, list):
                 match = next(
