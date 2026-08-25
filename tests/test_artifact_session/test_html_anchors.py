@@ -173,24 +173,40 @@ def test_element_proof_v2_accepts_only_additive_reordered_path_classes() -> None
     "runtime",
     [
         # Removing/replacing a source class token is not additive.
-        '<main class="shell" id="app" data-state="source" style="color:red">'
-        '<span id="target" class="selected base">Leaf</span></main>',
-        '<main class="shell other" id="app" data-state="source" style="color:red">'
-        '<span id="target" class="selected base">Leaf</span></main>',
+        (
+            '<main class="shell" id="app" data-state="source" style="color:red">'
+            + '<span id="target" class="selected base">Leaf</span></main>'
+        ),
+        (
+            '<main class="shell other" id="app" data-state="source" style="color:red">'
+            + '<span id="target" class="selected base">Leaf</span></main>'
+        ),
         # All non-class ancestor attributes remain strict, including style.
-        '<main class="shell base" id="changed" data-state="source" style="color:red">'
-        '<span id="target" class="selected base">Leaf</span></main>',
-        '<main class="shell base" id="app" data-state="changed" style="color:red">'
-        '<span id="target" class="selected base">Leaf</span></main>',
-        '<main class="shell base" id="app" data-state="source" style="color:blue">'
-        '<span id="target" class="selected base">Leaf</span></main>',
+        (
+            '<main class="shell base" id="changed" data-state="source" style="color:red">'
+            + '<span id="target" class="selected base">Leaf</span></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="changed" style="color:red">'
+            + '<span id="target" class="selected base">Leaf</span></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:blue">'
+            + '<span id="target" class="selected base">Leaf</span></main>'
+        ),
         # Removing/replacing a selected-element source class is not additive.
-        '<main class="shell base" id="app" data-state="source" style="color:red">'
-        '<span id="target">Leaf</span></main>',
-        '<main class="shell base" id="app" data-state="source" style="color:red">'
-        '<span id="target" class="changed">Leaf</span></main>',
-        '<main class="shell base" id="app" data-state="source" style="color:red">'
-        '<span id="target" class="selected base" style="opacity:.5">Leaf</span></main>',
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            + '<span id="target">Leaf</span></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            + '<span id="target" class="changed">Leaf</span></main>'
+        ),
+        (
+            '<main class="shell base" id="app" data-state="source" style="color:red">'
+            + '<span id="target" class="selected base" style="opacity:.5">Leaf</span></main>'
+        ),
     ],
 )
 def test_element_proof_v2_rejects_non_additive_or_non_class_changes(runtime: str) -> None:
