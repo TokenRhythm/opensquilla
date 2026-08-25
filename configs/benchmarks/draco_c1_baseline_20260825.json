@@ -1,0 +1,63 @@
+{
+  "schema_version": "draco-single-route-baseline-v1",
+  "baseline_id": "C1",
+  "status": "formal_default",
+  "promoted_at": "2026-08-25",
+  "ranking_config_version": "step2-ranking-2026-08-25.1",
+  "candidate_pool": [
+    "openrouter:deepseek/deepseek-v4-flash",
+    "openrouter:deepseek/deepseek-v4-pro",
+    "openrouter:qwen/qwen3.5-122b-a10b",
+    "openrouter:qwen/qwen3.5-9b"
+  ],
+  "ranking_parameters": {
+    "normalization": {
+      "price_reference_usd_per_million": 5.5,
+      "price_input_weight": 0.30,
+      "price_output_weight": 0.70
+    },
+    "penalties": {
+      "task_cost_weights": {
+        "low": 0.45,
+        "medium": 0.10,
+        "high": 0.04,
+        "hard_limit": 0.28
+      }
+    },
+    "task_match": {
+      "capability_weight": 0.55,
+      "domain_weight": 0.15,
+      "tier_weight": 0.30
+    }
+  },
+  "single_route_calibration": {
+    "enabled": true,
+    "activation_model_identities": [
+      "openrouter:deepseek/deepseek-v4-flash",
+      "openrouter:deepseek/deepseek-v4-pro",
+      "openrouter:qwen/qwen3.5-122b-a10b",
+      "openrouter:qwen/qwen3.5-9b"
+    ],
+    "model_prior_weight": 0.25,
+    "model_quality_priors": {
+      "openrouter:deepseek/deepseek-v4-flash": 0.59359463632,
+      "openrouter:deepseek/deepseek-v4-pro": 0.628725667385,
+      "openrouter:qwen/qwen3.5-122b-a10b": 0.38502804159,
+      "openrouter:qwen/qwen3.5-9b": 0.294177039967
+    },
+    "residual_weight": 0.0,
+    "residual_clip": 0.15,
+    "model_residual_coefficients": {},
+    "quality_guard_enabled": false,
+    "max_quality_drop": 0.02,
+    "predicted_total_cost_enabled": false,
+    "predicted_cost_reference_usd": 1.0,
+    "input_tokens_by_tier": {},
+    "output_tokens_by_tier": {}
+  },
+  "provenance": {
+    "experiment": "draco-mini-router-e13-calibration-c-grid-atlascloud-v7-20260824",
+    "arm": "C1",
+    "parent_baseline": "G4"
+  }
+}

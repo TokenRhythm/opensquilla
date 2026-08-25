@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-ranking-config-v4",
-  "config_version": "step2-ranking-2026-08-21.2",
+  "config_version": "step2-ranking-2026-08-25.1",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -209,14 +209,14 @@
     "decision_propensity": 1.0
   },
   "normalization": {
-    "price_reference_usd_per_million": 20.0,
+    "price_reference_usd_per_million": 5.5,
     "latency_reference_ms": 30000.0,
     "price_input_weight": 0.30,
     "price_output_weight": 0.70
   },
   "task_match": {
-    "capability_weight": 0.45,
-    "domain_weight": 0.25,
+    "capability_weight": 0.55,
+    "domain_weight": 0.15,
     "tier_weight": 0.30,
     "proposer_task_weight": 0.82,
     "proposer_role_fit_weight": 0.18,
@@ -225,6 +225,31 @@
     "format_strength_multiplier": 0.08,
     "missing_strength_default": 0.35,
     "missing_role_fit_default": 0.40
+  },
+  "single_route_calibration": {
+    "enabled": true,
+    "activation_model_identities": [
+      "openrouter:deepseek/deepseek-v4-flash",
+      "openrouter:deepseek/deepseek-v4-pro",
+      "openrouter:qwen/qwen3.5-122b-a10b",
+      "openrouter:qwen/qwen3.5-9b"
+    ],
+    "model_prior_weight": 0.25,
+    "model_quality_priors": {
+      "openrouter:deepseek/deepseek-v4-flash": 0.59359463632,
+      "openrouter:deepseek/deepseek-v4-pro": 0.628725667385,
+      "openrouter:qwen/qwen3.5-122b-a10b": 0.38502804159,
+      "openrouter:qwen/qwen3.5-9b": 0.294177039967
+    },
+    "residual_weight": 0.0,
+    "residual_clip": 0.15,
+    "model_residual_coefficients": {},
+    "quality_guard_enabled": false,
+    "max_quality_drop": 0.02,
+    "predicted_total_cost_enabled": false,
+    "predicted_cost_reference_usd": 1.0,
+    "input_tokens_by_tier": {},
+    "output_tokens_by_tier": {}
   },
   "user_score": {
     "neutral_score": 0.50,
@@ -243,7 +268,7 @@
   "penalties": {
     "latency_penalty_enabled": false,
     "task_cost_weights": {
-      "low": 0.20,
+      "low": 0.45,
       "medium": 0.10,
       "high": 0.04,
       "hard_limit": 0.28

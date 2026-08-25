@@ -299,6 +299,60 @@ def _cache_ranking_config(
     return ranking_config_snapshot(override={"session": {"kv_cache_affinity": policy}})
 
 
+def _calibration_ranking_config(
+    *,
+    enabled: bool = True,
+    activation_model_identities: list[str] | None = None,
+    prior_weight: float = 0.0,
+    priors: dict[str, float] | None = None,
+    residual_weight: float = 0.0,
+    residuals: dict[str, dict[str, Any]] | None = None,
+    residual_clip: float = 0.5,
+    quality_guard_enabled: bool = False,
+    max_quality_drop: float = 0.1,
+    predicted_total_cost_enabled: bool = False,
+    predicted_cost_reference_usd: float = 1.0,
+    input_tokens_by_tier: dict[str, int] | None = None,
+    output_tokens_by_tier: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    policy = {
+        "enabled": enabled,
+        "activation_model_identities": activation_model_identities or [],
+        "model_prior_weight": prior_weight,
+        "model_quality_priors": priors or {},
+        "residual_weight": residual_weight,
+        "residual_clip": residual_clip,
+        "model_residual_coefficients": residuals or {},
+        "quality_guard_enabled": quality_guard_enabled,
+        "max_quality_drop": max_quality_drop,
+        "predicted_total_cost_enabled": predicted_total_cost_enabled,
+        "predicted_cost_reference_usd": predicted_cost_reference_usd,
+        "input_tokens_by_tier": input_tokens_by_tier
+        or {str(tier): 1_000 for tier in range(1, 5)},
+        "output_tokens_by_tier": output_tokens_by_tier
+        or {str(tier): 1_000 for tier in range(1, 5)},
+    }
+    return ranking_config_snapshot(
+        override={"single_route_calibration": policy}
+    )
+
+
+def _calibration_residual(intercept: float) -> dict[str, Any]:
+    return {
+        "intercept": intercept,
+        "centers": {
+            "capability": 0.0,
+            "domain": 0.0,
+            "tier": 0.0,
+        },
+        "coefficients": {
+            "capability": 0.0,
+            "domain": 0.0,
+            "tier": 0.0,
+        },
+    }
+
+
 def _cache_evidence(
     identity: str,
     *,
@@ -980,14 +1034,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-21.2",
-            "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc",
+            "step2-ranking-2026-08-25.1",
+            "268ebb0c002994a9434eeecaef6b76571d0bd803db6eb2e7c8a788f3e2210e96",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-21.2",
-            "d0d8b213346a40951985ff750ab69c4c22ad931acaa8f23b64f1a0e084bdfc05",
+            "step2-ranking-2026-08-25.1",
+            "799b95e6426b243aff7672f0df3bdba58034a5b39a0b01fe5fb69f648456b31c",
         ),
     ],
 )
@@ -1082,14 +1136,14 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-21.2"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-25.1"
     assert "role_reliability" in default["base_config"]
     assert default["base_config"]["normalization"][
         "price_reference_usd_per_million"
-    ] == pytest.approx(20.0)
+    ] == pytest.approx(5.5)
     assert default["base_config"]["penalties"]["latency_penalty_enabled"] is False
     assert default["base_config"]["penalties"]["task_cost_weights"] == {
-        "low": pytest.approx(0.20),
+        "low": pytest.approx(0.45),
         "medium": pytest.approx(0.10),
         "high": pytest.approx(0.04),
         "hard_limit": pytest.approx(0.28),
@@ -1097,6 +1151,22 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert default["base_config"]["rerank"]["top_l_min"] == 8
     assert default["base_config"]["task_analyzer"]["max_retries"] == 1
     assert default["base_config"]["task_analyzer"]["schema_repair_max_retries"] == 0
+
+    previous_c1_baseline = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-21.2",
+    )
+    previous_c1_baseline_thinking = ranking_config_resolution(
+        thinking_assignment_enabled=True,
+        base_version="step2-ranking-2026-08-21.2",
+    )
+    assert previous_c1_baseline["base_sha256"] == (
+        "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc"
+    )
+    assert previous_c1_baseline_thinking["base_sha256"] == (
+        "d0d8b213346a40951985ff750ab69c4c22ad931acaa8f23b64f1a0e084bdfc05"
+    )
+    assert "single_route_calibration" not in previous_c1_baseline["base_config"]
 
     previous_upstream_policy = ranking_config_resolution(
         thinking_assignment_enabled=False,
@@ -1154,11 +1224,11 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     )
     assert (
         previous_schema_repair_policy["base_config"]["normalization"]
-        == (default["base_config"]["normalization"])
+        == (previous_c1_baseline["base_config"]["normalization"])
     )
     assert (
         previous_schema_repair_policy["base_config"]["penalties"]
-        == (default["base_config"]["penalties"])
+        == (previous_c1_baseline["base_config"]["penalties"])
     )
     assert previous_schema_repair_policy["base_sha256"] == (
         "667eb6057b2d261a2cb6a82b1073c87896e5b3f7b25124f18ade488900792e16"
@@ -1181,7 +1251,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert "latency_penalty_enabled" not in previous_resource_policy["base_config"]["penalties"]
     assert (
         previous_resource_policy["base_config"]["penalties"]["task_cost_weights"]
-        == default["base_config"]["penalties"]["task_cost_weights"]
+        == previous_c1_baseline["base_config"]["penalties"]["task_cost_weights"]
     )
     assert previous_resource_policy["base_config"]["rerank"]["top_l_min"] == 8
     assert previous_resource_policy["base_config"]["task_analyzer"]["max_retries"] == 1
@@ -1315,14 +1385,14 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
 
     assert resolution["base_config"]["penalties"]["task_cost_weights"]["medium"] == 0.10
     assert resolution["effective_config"]["penalties"]["task_cost_weights"] == {
-        "low": 0.20,
+        "low": 0.45,
         "medium": 0.17,
         "high": 0.04,
         "hard_limit": 0.28,
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-21.2+override.{resolution['override_sha256'][:12]}"
+        f"step2-ranking-2026-08-25.1+override.{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
     override["penalties"]["task_cost_weights"]["medium"] = 99
@@ -1494,10 +1564,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-21.2+override.{suffix}"
+        f"step2-ranking-2026-08-25.1+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-21.2+override.{suffix}"
+        f"step2-ranking-2026-08-25.1+override.{suffix}"
     )
 
 
@@ -6734,7 +6804,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc"
+        == "268ebb0c002994a9434eeecaef6b76571d0bd803db6eb2e7c8a788f3e2210e96"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
@@ -7671,13 +7741,13 @@ def test_packaged_ranking_config_without_affinity_preserves_golden_bytes_and_has
     resolution = ranking_config_resolution()
 
     assert hashlib.sha256(raw_payload).hexdigest() == (
-        "0cd9c3ac18c5a6185f102a4cb5ed8d67aa0937aab0d27a7f4c63293536f9963e"
+        "c4e2f727aee8438a348029dcc4fa95ba45320b4272ced48dda3c7fc48e4529d8"
     )
     assert canonical_json_sha256(loaded) == (
-        "cdf6147bd1819978c9af493a10b4c43d905679c1f6ce1e787cef2dcf5ddca195"
+        "b94b7bba4de316c4dbdedc2578de15df8d42438879482c7d7e23172bc7775df6"
     )
     assert resolution["base_sha256"] == (
-        "2b89c0769b67e5b0cdaaf8da5f4de36db893b636e7c7552c2f08537bde97b7bc"
+        "268ebb0c002994a9434eeecaef6b76571d0bd803db6eb2e7c8a788f3e2210e96"
     )
     assert resolution["effective_sha256"] == resolution["base_sha256"]
     assert "kv_cache_affinity" not in loaded["session"]
@@ -9054,3 +9124,332 @@ def test_rank_single_model_no_eligible_model_fails_closed() -> None:
         _single_decision(_model("disabled", status="disabled"))
 
     assert exc_info.value.reason == "no_eligible_single_model"
+
+
+def test_single_route_calibration_absent_or_disabled_preserves_v1_scores() -> None:
+    models = (
+        _model("alpha", capability=0.9, price=1.0),
+        _model("beta", capability=0.8, price=0.5),
+    )
+    absent = _single_decision(*models)
+    disabled = _single_decision(
+        *models,
+        ranking_config=_calibration_ranking_config(enabled=False),
+    )
+
+    assert absent.model.identity == disabled.model.identity
+    assert absent.trace["model_scores"] == disabled.trace["model_scores"]
+    assert absent.trace["ranking_version"] == "router-single-ranking-v1"
+    assert disabled.trace["ranking_version"] == "router-single-ranking-v1"
+    assert absent.trace["selection_policy"] == "base_score_top1"
+    assert disabled.trace["selection_policy"] == "base_score_top1"
+    assert "quality_guard" not in disabled.trace
+
+
+def test_single_route_calibration_does_not_change_multi_model_scoring() -> None:
+    models = (
+        _model("alpha", capability=0.9, price=1.0),
+        _model("beta", capability=0.8, price=1.0),
+    )
+    calibrated_config = _calibration_ranking_config(
+        prior_weight=1.0,
+        priors={
+            "test-provider:alpha": 0.1,
+            "test-provider:beta": 0.9,
+        },
+    )
+    baseline = _decision(*models, user_profile=None)
+    calibrated = _decision(
+        *models,
+        user_profile=None,
+        ranking_config=calibrated_config,
+    )
+
+    assert [model.identity for model in baseline.proposers] == [
+        model.identity for model in calibrated.proposers
+    ]
+    assert baseline.aggregator.identity == calibrated.aggregator.identity
+    assert baseline.trace["model_scores"] == calibrated.trace["model_scores"]
+
+
+def test_single_route_model_prior_blend_changes_top1_and_emits_v2_trace() -> None:
+    config = _calibration_ranking_config(
+        prior_weight=1.0,
+        priors={
+            "test-provider:raw-high": 0.2,
+            "test-provider:prior-high": 0.9,
+        },
+    )
+    decision = _single_decision(
+        _model("raw-high", capability=0.95, price=1.0),
+        _model("prior-high", capability=0.70, price=1.0),
+        ranking_config=config,
+    )
+
+    assert decision.model.model_id == "prior-high"
+    assert decision.trace["ranking_version"] == "router-single-ranking-v2"
+    assert decision.trace["selection_policy"] == "calibrated_base_score_top1"
+    prior_score = next(
+        row
+        for row in decision.trace["model_scores"]
+        if row["model"] == "prior-high"
+    )
+    calibration = prior_score["single_route_calibration"]
+    assert calibration["model_quality_prior"] == pytest.approx(0.9)
+    assert calibration["quality_prior_blended"] == pytest.approx(0.9)
+    assert calibration["quality_calibrated_clean"] == pytest.approx(0.9)
+
+
+def test_single_route_centered_residual_changes_top1() -> None:
+    centered_residual = _calibration_residual(0.2)
+    centered_residual["centers"]["capability"] = 0.5
+    centered_residual["coefficients"]["capability"] = 0.5
+    config = _calibration_ranking_config(
+        residual_weight=1.0,
+        residuals={
+            "test-provider:raw-high": _calibration_residual(-0.3),
+            "test-provider:residual-high": centered_residual,
+        },
+    )
+    decision = _single_decision(
+        _model("raw-high", capability=0.9, price=1.0),
+        _model("residual-high", capability=0.7, price=1.0),
+        ranking_config=config,
+    )
+
+    assert decision.model.model_id == "residual-high"
+    residual_score = next(
+        row
+        for row in decision.trace["model_scores"]
+        if row["model"] == "residual-high"
+    )["single_route_calibration"]
+    assert residual_score["match_features"] == {
+        "capability": pytest.approx(0.7),
+        "domain": pytest.approx(0.7),
+        "tier": pytest.approx(0.7),
+    }
+    assert residual_score["residual_raw"] == pytest.approx(0.3)
+    assert residual_score["residual_clipped"] == pytest.approx(0.3)
+
+
+def test_single_route_predicted_total_cost_uses_effective_tier_token_mix() -> None:
+    input_cheap = _model("input-cheap", capability=0.8)
+    input_cheap["registry_facts"]["price"].update(
+        {"input_per_million": 1.0, "output_per_million": 20.0}
+    )
+    output_cheap = _model("output-cheap", capability=0.8)
+    output_cheap["registry_facts"]["price"].update(
+        {"input_per_million": 10.0, "output_per_million": 1.0}
+    )
+    input_tokens = {str(tier): 1_000 for tier in range(1, 5)}
+    output_tokens = {str(tier): 1_000 for tier in range(1, 5)}
+    input_tokens["3"] = 10_000
+    output_tokens["3"] = 100
+    decision = _single_decision(
+        input_cheap,
+        output_cheap,
+        analysis=_analysis(tier=3),
+        ranking_config=_calibration_ranking_config(
+            predicted_total_cost_enabled=True,
+            predicted_cost_reference_usd=0.2,
+            input_tokens_by_tier=input_tokens,
+            output_tokens_by_tier=output_tokens,
+        ),
+    )
+
+    assert decision.model.model_id == "input-cheap"
+    cost_trace = next(
+        row
+        for row in decision.trace["model_scores"]
+        if row["model"] == "input-cheap"
+    )["single_route_calibration"]["predicted_total_cost"]
+    assert cost_trace["effective_tier"] == "3"
+    assert cost_trace["input_tokens"] == 10_000
+    assert cost_trace["output_tokens"] == 100
+    assert cost_trace["predicted_cost_usd"] == pytest.approx(0.012)
+    assert cost_trace["normalized"] == pytest.approx(0.06)
+
+
+def test_single_route_quality_guard_uses_strict_drop_boundary() -> None:
+    quality_best = _model("quality-best", capability=0.8, price=100.0)
+    cheap = _model("cheap", capability=0.8, price=0.0)
+    common = {
+        "prior_weight": 1.0,
+        "priors": {
+            "test-provider:quality-best": 0.875,
+            "test-provider:cheap": 0.8125,
+        },
+        "quality_guard_enabled": True,
+        "predicted_total_cost_enabled": True,
+        "predicted_cost_reference_usd": 0.1,
+    }
+    boundary = _single_decision(
+        quality_best,
+        cheap,
+        ranking_config=_calibration_ranking_config(
+            **common,
+            max_quality_drop=0.0625,
+        ),
+    )
+    guarded = _single_decision(
+        quality_best,
+        cheap,
+        ranking_config=_calibration_ranking_config(
+            **common,
+            max_quality_drop=0.06,
+        ),
+    )
+
+    assert boundary.model.model_id == "cheap"
+    assert boundary.trace["quality_guard"]["applied"] is False
+    assert guarded.model.model_id == "quality-best"
+    assert guarded.trace["quality_guard"]["applied"] is True
+    assert guarded.trace["quality_guard"]["provisional_model"] == (
+        "test-provider:cheap"
+    )
+    assert guarded.trace["quality_guard"]["selected_model"] == (
+        guarded.model.identity
+    )
+    assert guarded.trace["model_scores"][0]["model"] == "cheap"
+    assert guarded.trace["selected_model"] == guarded.model.identity
+    assert guarded.trace["selected_P"] == [guarded.model.identity]
+
+
+def test_single_route_calibration_requires_full_eligible_model_coverage() -> None:
+    config = _calibration_ranking_config(
+        prior_weight=0.5,
+        priors={"test-provider:covered": 0.8},
+    )
+
+    with pytest.raises(DynamicRankingError, match="lacks eligible identities"):
+        _single_decision(
+            _model("covered"),
+            _model("missing"),
+            ranking_config=config,
+        )
+
+
+def test_single_route_calibrated_trace_is_replayable() -> None:
+    config = _calibration_ranking_config(
+        prior_weight=0.5,
+        priors={
+            "test-provider:alpha": 0.8,
+            "test-provider:beta": 0.9,
+        },
+    )
+    decision = _single_decision(
+        _model("alpha", capability=0.9),
+        _model("beta", capability=0.8),
+        ranking_config=config,
+    )
+
+    assert single_ranking_trace_replay_reasons(decision.trace) == []
+
+
+def test_pre_scope_single_route_calibrated_trace_remains_replayable() -> None:
+    config = _calibration_ranking_config(
+        prior_weight=0.5,
+        priors={
+            "test-provider:alpha": 0.8,
+            "test-provider:beta": 0.9,
+        },
+    )
+    trace = deepcopy(
+        _single_decision(
+            _model("alpha", capability=0.9),
+            _model("beta", capability=0.8),
+            ranking_config=config,
+        ).trace
+    )
+    trace.pop("single_route_calibration_scope")
+    trace["ranking_parameters"]["single_route_calibration"].pop(
+        "activation_model_identities"
+    )
+    trace["ranking_config_hash"] = canonical_json_sha256(
+        trace["ranking_parameters"]
+    )
+
+    assert single_ranking_trace_replay_reasons(trace) == []
+
+
+def test_scoped_single_route_calibrated_trace_requires_scope_evidence() -> None:
+    measured_models = (
+        _model("deepseek/deepseek-v4-flash", provider="openrouter"),
+        _model("deepseek/deepseek-v4-pro", provider="openrouter"),
+        _model("qwen/qwen3.5-122b-a10b", provider="openrouter"),
+        _model("qwen/qwen3.5-9b", provider="openrouter"),
+    )
+    trace = deepcopy(_single_decision(*measured_models).trace)
+    trace.pop("single_route_calibration_scope")
+
+    assert single_ranking_trace_replay_reasons(trace) == [
+        "single_frozen_ranker_replay_mismatch"
+    ]
+
+
+def test_single_route_calibration_schema_rejects_unknown_policy_key() -> None:
+    with pytest.raises(DynamicRankingError, match="unknown or missing keys"):
+        ranking_config_snapshot(
+            override={
+                "single_route_calibration": {
+                    "unknown_policy_key": True,
+                }
+            }
+        )
+
+
+def test_packaged_c1_baseline_parameters_are_exact() -> None:
+    config = load_ranking_config()
+
+    assert config["normalization"] == {
+        "price_reference_usd_per_million": pytest.approx(5.5),
+        "latency_reference_ms": pytest.approx(30_000.0),
+        "price_input_weight": pytest.approx(0.30),
+        "price_output_weight": pytest.approx(0.70),
+    }
+    assert config["penalties"]["task_cost_weights"] == {
+        "low": pytest.approx(0.45),
+        "medium": pytest.approx(0.10),
+        "high": pytest.approx(0.04),
+        "hard_limit": pytest.approx(0.28),
+    }
+    assert {
+        key: config["task_match"][key]
+        for key in ("capability_weight", "domain_weight", "tier_weight")
+    } == {
+        "capability_weight": pytest.approx(0.55),
+        "domain_weight": pytest.approx(0.15),
+        "tier_weight": pytest.approx(0.30),
+    }
+    calibration = config["single_route_calibration"]
+    assert calibration["enabled"] is True
+    assert calibration["model_prior_weight"] == pytest.approx(0.25)
+    assert calibration["residual_weight"] == pytest.approx(0.0)
+    assert calibration["quality_guard_enabled"] is False
+    assert calibration["predicted_total_cost_enabled"] is False
+    assert set(calibration["activation_model_identities"]) == set(
+        calibration["model_quality_priors"]
+    )
+
+
+def test_packaged_c1_calibration_is_scoped_to_the_measured_four_model_pool() -> None:
+    measured_models = (
+        _model("deepseek/deepseek-v4-flash", provider="openrouter"),
+        _model("deepseek/deepseek-v4-pro", provider="openrouter"),
+        _model("qwen/qwen3.5-122b-a10b", provider="openrouter"),
+        _model("qwen/qwen3.5-9b", provider="openrouter"),
+    )
+
+    measured = _single_decision(*measured_models)
+    full = _single_decision(
+        *measured_models,
+        _model("openai/gpt-5.6-sol", provider="openrouter"),
+    )
+
+    assert measured.trace["ranking_version"] == "router-single-ranking-v2"
+    assert measured.trace["single_route_calibration_scope"]["applied"] is True
+    assert all("single_route_calibration" in row for row in measured.trace["model_scores"])
+    assert full.trace["ranking_version"] == "router-single-ranking-v1"
+    assert full.trace["single_route_calibration_scope"]["applied"] is False
+    assert all("single_route_calibration" not in row for row in full.trace["model_scores"])
+    assert single_ranking_trace_replay_reasons(full.trace) == []

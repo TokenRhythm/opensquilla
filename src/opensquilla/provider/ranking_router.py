@@ -67,14 +67,16 @@ class CacheAffinityUnavailableReason(StrEnum):
 
 RANKING_VERSION = "step2-ranking-v4"
 SINGLE_MODEL_RANKING_VERSION = "router-single-ranking-v1"
+CALIBRATED_SINGLE_MODEL_RANKING_VERSION = "router-single-ranking-v2"
 LEGACY_THINKING_RANKING_VERSION = "step2-ranking-v3"
 LEGACY_RANKING_VERSION = "step2-ranking-v2"
 RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-21.2"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-21.2"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-25.1"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-25.1"
+_PRE_C1_BASELINE_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-21.2"
 _PRE_TOGETHER_TASK_ANALYZER_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-21.1"
 _PRE_DEEPSEEK_TASK_ANALYZER_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.4"
 _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
@@ -96,6 +98,7 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PRE_C1_BASELINE_RANKING_CONFIG_VERSION,
         _PRE_TOGETHER_TASK_ANALYZER_RANKING_CONFIG_VERSION,
         _PRE_DEEPSEEK_TASK_ANALYZER_RANKING_CONFIG_VERSION,
         _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION,
@@ -1361,6 +1364,298 @@ def _require_exact_config_keys(
     )
 
 
+_SINGLE_ROUTE_CALIBRATION_KEYS = {
+    "enabled",
+    "activation_model_identities",
+    "model_prior_weight",
+    "model_quality_priors",
+    "residual_weight",
+    "residual_clip",
+    "model_residual_coefficients",
+    "quality_guard_enabled",
+    "max_quality_drop",
+    "predicted_total_cost_enabled",
+    "predicted_cost_reference_usd",
+    "input_tokens_by_tier",
+    "output_tokens_by_tier",
+}
+_SINGLE_ROUTE_RESIDUAL_ROW_KEYS = {
+    "intercept",
+    "centers",
+    "coefficients",
+}
+_SINGLE_ROUTE_RESIDUAL_FEATURE_KEYS = {
+    "capability",
+    "domain",
+    "tier",
+}
+
+
+def _validate_single_route_calibration_config(
+    config: Mapping[str, Any],
+) -> None:
+    """Validate the optional, model-bound direct-routing calibration policy."""
+
+    if "single_route_calibration" not in config:
+        return
+    policy = _ranking_mapping(config, "single_route_calibration")
+    actual_policy_keys = set(policy)
+    required_policy_keys = _SINGLE_ROUTE_CALIBRATION_KEYS - {
+        "activation_model_identities"
+    }
+    missing_policy_keys = sorted(required_policy_keys - actual_policy_keys)
+    unknown_policy_keys = sorted(actual_policy_keys - _SINGLE_ROUTE_CALIBRATION_KEYS)
+    if missing_policy_keys or unknown_policy_keys:
+        raise DynamicRankingError(
+            "router_dynamic ranking config single_route_calibration has unknown "
+            f"or missing keys (missing={missing_policy_keys}, "
+            f"unknown={unknown_policy_keys})"
+        )
+    enabled = _ranking_bool(config, "single_route_calibration", "enabled")
+    raw_activation_identities = policy.get("activation_model_identities")
+    if raw_activation_identities is None:
+        raw_activation_identities = []
+    if not isinstance(raw_activation_identities, list):
+        raise DynamicRankingError(
+            "router_dynamic ranking config single_route_calibration."
+            "activation_model_identities must be a list"
+        )
+    activation_identities: list[str] = []
+    for raw_identity in raw_activation_identities:
+        if (
+            not isinstance(raw_identity, str)
+            or raw_identity != raw_identity.strip()
+            or not raw_identity
+            or ":" not in raw_identity
+        ):
+            raise DynamicRankingError(
+                "router_dynamic single-route calibration activation identity "
+                "must be a trimmed provider:model string"
+            )
+        activation_identities.append(raw_identity)
+    if len(activation_identities) > 256 or len(set(activation_identities)) != len(
+        activation_identities
+    ):
+        raise DynamicRankingError(
+            "router_dynamic single-route calibration activation identities "
+            "must be unique and contain at most 256 models"
+        )
+    prior_weight = _ranking_number(
+        config,
+        "single_route_calibration",
+        "model_prior_weight",
+    )
+    residual_weight = _ranking_number(
+        config,
+        "single_route_calibration",
+        "residual_weight",
+    )
+    residual_clip = _ranking_number(
+        config,
+        "single_route_calibration",
+        "residual_clip",
+    )
+    _ranking_bool(
+        config,
+        "single_route_calibration",
+        "quality_guard_enabled",
+    )
+    max_quality_drop = _ranking_number(
+        config,
+        "single_route_calibration",
+        "max_quality_drop",
+    )
+    predicted_total_cost_enabled = _ranking_bool(
+        config,
+        "single_route_calibration",
+        "predicted_total_cost_enabled",
+    )
+    predicted_cost_reference = _ranking_number(
+        config,
+        "single_route_calibration",
+        "predicted_cost_reference_usd",
+    )
+    for label, value in (
+        ("model_prior_weight", prior_weight),
+        ("residual_weight", residual_weight),
+        ("residual_clip", residual_clip),
+        ("max_quality_drop", max_quality_drop),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise DynamicRankingError(
+                "router_dynamic ranking config single_route_calibration."
+                f"{label} must be between 0 and 1"
+            )
+    if predicted_cost_reference <= 0.0:
+        raise DynamicRankingError(
+            "router_dynamic ranking config single_route_calibration."
+            "predicted_cost_reference_usd must be positive"
+        )
+
+    priors = _ranking_mapping(
+        config,
+        "single_route_calibration",
+        "model_quality_priors",
+    )
+    if len(priors) > 256:
+        raise DynamicRankingError(
+            "router_dynamic single-route calibration has too many model priors"
+        )
+    for identity in priors:
+        if (
+            not isinstance(identity, str)
+            or identity != identity.strip()
+            or not identity
+            or ":" not in identity
+        ):
+            raise DynamicRankingError(
+                "router_dynamic single-route calibration model prior identity "
+                "must be a trimmed provider:model string"
+            )
+        value = _ranking_number(
+            config,
+            "single_route_calibration",
+            "model_quality_priors",
+            identity,
+        )
+        if not 0.0 <= value <= 1.0:
+            raise DynamicRankingError(
+                "router_dynamic single-route calibration model priors must be "
+                "between 0 and 1"
+            )
+    if enabled and prior_weight > 0.0 and not priors:
+        raise DynamicRankingError(
+            "router_dynamic enabled single-route prior calibration requires "
+            "model_quality_priors"
+        )
+    if enabled and prior_weight > 0.0:
+        missing_activation_priors = sorted(set(activation_identities) - set(priors))
+        if missing_activation_priors:
+            raise DynamicRankingError(
+                "router_dynamic enabled single-route prior calibration lacks "
+                f"activation identities {missing_activation_priors}"
+            )
+
+    residual_rows = _ranking_mapping(
+        config,
+        "single_route_calibration",
+        "model_residual_coefficients",
+    )
+    if len(residual_rows) > 256:
+        raise DynamicRankingError(
+            "router_dynamic single-route calibration has too many residual rows"
+        )
+    for identity, raw_row in residual_rows.items():
+        if (
+            not isinstance(identity, str)
+            or identity != identity.strip()
+            or not identity
+            or ":" not in identity
+            or not isinstance(raw_row, Mapping)
+        ):
+            raise DynamicRankingError(
+                "router_dynamic single-route residual identity or row is invalid"
+            )
+        _require_exact_config_keys(
+            config,
+            (
+                "single_route_calibration",
+                "model_residual_coefficients",
+                identity,
+            ),
+            _SINGLE_ROUTE_RESIDUAL_ROW_KEYS,
+        )
+        intercept = _ranking_number(
+            config,
+            "single_route_calibration",
+            "model_residual_coefficients",
+            identity,
+            "intercept",
+        )
+        if not -1.0 <= intercept <= 1.0:
+            raise DynamicRankingError(
+                "router_dynamic single-route residual intercept must be between "
+                "-1 and 1"
+            )
+        for section in ("centers", "coefficients"):
+            _require_exact_config_keys(
+                config,
+                (
+                    "single_route_calibration",
+                    "model_residual_coefficients",
+                    identity,
+                    section,
+                ),
+                _SINGLE_ROUTE_RESIDUAL_FEATURE_KEYS,
+            )
+            for feature in sorted(_SINGLE_ROUTE_RESIDUAL_FEATURE_KEYS):
+                value = _ranking_number(
+                    config,
+                    "single_route_calibration",
+                    "model_residual_coefficients",
+                    identity,
+                    section,
+                    feature,
+                )
+                if section == "centers" and not 0.0 <= value <= 1.0:
+                    raise DynamicRankingError(
+                        "router_dynamic single-route residual centers must be "
+                        "between 0 and 1"
+                    )
+                if section == "coefficients" and not -10.0 <= value <= 10.0:
+                    raise DynamicRankingError(
+                        "router_dynamic single-route residual coefficients must be "
+                        "between -10 and 10"
+                    )
+    if enabled and residual_weight > 0.0 and not residual_rows:
+        raise DynamicRankingError(
+            "router_dynamic enabled single-route residual calibration requires "
+            "model_residual_coefficients"
+        )
+    if enabled and residual_weight > 0.0:
+        missing_activation_residuals = sorted(
+            set(activation_identities) - set(residual_rows)
+        )
+        if missing_activation_residuals:
+            raise DynamicRankingError(
+                "router_dynamic enabled single-route residual calibration lacks "
+                f"activation identities {missing_activation_residuals}"
+            )
+
+    expected_tiers = {str(tier) for tier in TIERS}
+    for token_map_name in ("input_tokens_by_tier", "output_tokens_by_tier"):
+        values = _ranking_mapping(
+            config,
+            "single_route_calibration",
+            token_map_name,
+        )
+        if values and set(values) != expected_tiers:
+            raise DynamicRankingError(
+                "router_dynamic single-route predicted-cost token maps must be "
+                f"empty or contain tiers {sorted(expected_tiers)}"
+            )
+        for tier in values:
+            tokens = _ranking_int(
+                config,
+                "single_route_calibration",
+                token_map_name,
+                tier,
+            )
+            if tokens <= 0:
+                raise DynamicRankingError(
+                    "router_dynamic single-route predicted-cost token counts "
+                    "must be positive"
+                )
+    if predicted_total_cost_enabled and (
+        not policy["input_tokens_by_tier"]
+        or not policy["output_tokens_by_tier"]
+    ):
+        raise DynamicRankingError(
+            "router_dynamic enabled single-route predicted cost requires complete "
+            "input and output token maps"
+        )
+
+
 def _validate_cache_affinity_config(config: Mapping[str, Any]) -> None:
     session = _ranking_mapping(config, "session")
     if "kv_cache_affinity" not in session:
@@ -1661,6 +1956,7 @@ def _validate_ranking_config(
         raise DynamicRankingError(
             "router_dynamic ranking config lacks the versioned role_reliability policy"
         )
+    has_single_route_calibration = "single_route_calibration" in config
     base_required_sections = (
         "validation",
         "trace",
@@ -1683,6 +1979,11 @@ def _validate_ranking_config(
         "proposer_count",
         "rerank",
         "aggregator",
+        *(
+            ("single_route_calibration",)
+            if has_single_route_calibration
+            else ()
+        ),
     )
     required_sections = (
         (*base_required_sections, "thinking_assignment")
@@ -1991,6 +2292,7 @@ def _validate_ranking_config(
     if has_latency_penalty_policy:
         _ranking_bool(config, "penalties", "latency_penalty_enabled")
     _validate_cache_affinity_config(config)
+    _validate_single_route_calibration_config(config)
     if "prompt_version" in aggregator_config:
         from .aggregator_prompt import AGGREGATOR_PROMPT_VERSIONS
 
@@ -2773,6 +3075,14 @@ def _ranking_config_for_base_version(
         )
     historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
+    historical.pop("single_route_calibration", None)
+    historical["normalization"]["price_reference_usd_per_million"] = 20.0
+    historical["penalties"]["task_cost_weights"]["low"] = 0.20
+    historical["task_match"]["capability_weight"] = 0.45
+    historical["task_match"]["domain_weight"] = 0.25
+    historical["task_match"]["tier_weight"] = 0.30
+    if requested == _PRE_C1_BASELINE_RANKING_CONFIG_VERSION:
+        return _validate_ranking_config(historical)
     if requested == _PRE_TOGETHER_TASK_ANALYZER_RANKING_CONFIG_VERSION:
         historical["task_analyzer"]["upstream_provider"] = "deepseek"
         return _validate_ranking_config(historical)
@@ -7956,6 +8266,224 @@ def _model_price_components(model: RankedModel) -> tuple[float, float] | None:
     return float(raw_input), float(raw_output)
 
 
+def _single_route_calibration_policy(
+    ranking_config: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Return the enabled direct-route calibration policy, if any."""
+
+    raw_policy = ranking_config.get("single_route_calibration")
+    if raw_policy is None:
+        return None
+    if not isinstance(raw_policy, Mapping):
+        raise DynamicRankingError(
+            "router_dynamic ranking config single_route_calibration must be an object"
+        )
+    return raw_policy if raw_policy.get("enabled") is True else None
+
+
+def _validate_single_route_calibration_coverage(
+    policy: Mapping[str, Any] | None,
+    models: Sequence[RankedModel],
+) -> bool:
+    """Return whether a validated calibration applies to this eligible pool.
+
+    An empty activation list preserves the original strict all-model behavior used
+    by experiment overrides. A non-empty list scopes a production calibration to
+    the measured model family: pools containing any other eligible model keep the
+    shared ranking weights but do not mix calibrated and uncalibrated quality
+    scores.
+    """
+
+    if policy is None:
+        return False
+    identities = {model.identity for model in models}
+    raw_activation_identities = policy.get("activation_model_identities")
+    activation_identities = (
+        {
+            str(identity)
+            for identity in raw_activation_identities
+            if isinstance(identity, str)
+        }
+        if isinstance(raw_activation_identities, Sequence)
+        and not isinstance(raw_activation_identities, (str, bytes))
+        else set()
+    )
+    if activation_identities and not identities.issubset(activation_identities):
+        return False
+    required_sources = (
+        (
+            "model_quality_priors",
+            _as_float(policy.get("model_prior_weight")) > 0.0,
+        ),
+        (
+            "model_residual_coefficients",
+            _as_float(policy.get("residual_weight")) > 0.0,
+        ),
+    )
+    for source_name, required in required_sources:
+        if not required:
+            continue
+        raw_values = policy.get(source_name)
+        values = raw_values if isinstance(raw_values, Mapping) else {}
+        missing = sorted(identities - set(values))
+        if missing:
+            raise DynamicRankingError(
+                "router_dynamic enabled single-route calibration "
+                f"{source_name} lacks eligible identities {missing}"
+            )
+    if policy.get("predicted_total_cost_enabled") is True:
+        missing_prices = sorted(
+            model.identity
+            for model in models
+            if _model_price_components(model) is None
+        )
+        if missing_prices:
+            raise DynamicRankingError(
+                "router_dynamic enabled single-route predicted cost requires "
+                f"decomposable prices for eligible identities {missing_prices}"
+            )
+    return True
+
+
+def _single_route_match_features(
+    model: RankedModel,
+    task_profile: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+) -> dict[str, float]:
+    """Return raw capability/domain/tier expectations for residual calibration."""
+
+    features: dict[str, float] = {}
+    for feature, task_key, profile_key in (
+        ("capability", "capability_dist", "capability_dist_prior"),
+        ("domain", "domain_dist", "domain_dist_prior"),
+        ("tier", "tier_dist", "tier_dist_prior"),
+    ):
+        raw_distribution = task_profile.get(task_key)
+        distribution = (
+            raw_distribution if isinstance(raw_distribution, Mapping) else {}
+        )
+        features[feature] = _expectation(
+            model,
+            distribution,
+            profile_key,
+            ranking_config,
+        )
+    return features
+
+
+def _single_route_quality_calibration(
+    model: RankedModel,
+    task_profile: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+    *,
+    quality_raw_clean: float,
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply model-prior blending and the fitted centered residual."""
+
+    prior_weight = _as_float(policy.get("model_prior_weight"))
+    raw_priors = policy.get("model_quality_priors")
+    priors = raw_priors if isinstance(raw_priors, Mapping) else {}
+    model_quality_prior = (
+        _as_float(priors[model.identity])
+        if prior_weight > 0.0
+        else quality_raw_clean
+    )
+    quality_prior_blended = (
+        (1.0 - prior_weight) * quality_raw_clean
+        + prior_weight * model_quality_prior
+    )
+
+    match_features = _single_route_match_features(
+        model,
+        task_profile,
+        ranking_config,
+    )
+    residual_weight = _as_float(policy.get("residual_weight"))
+    residual_raw = 0.0
+    if residual_weight > 0.0:
+        raw_rows = policy.get("model_residual_coefficients")
+        rows = raw_rows if isinstance(raw_rows, Mapping) else {}
+        raw_row = rows[model.identity]
+        if not isinstance(raw_row, Mapping):
+            raise DynamicRankingError(
+                "router_dynamic single-route residual row must be an object"
+            )
+        raw_centers = raw_row.get("centers")
+        raw_coefficients = raw_row.get("coefficients")
+        centers = raw_centers if isinstance(raw_centers, Mapping) else {}
+        coefficients = (
+            raw_coefficients if isinstance(raw_coefficients, Mapping) else {}
+        )
+        residual_raw = _as_float(raw_row.get("intercept")) + sum(
+            _as_float(coefficients[feature])
+            * (match_features[feature] - _as_float(centers[feature]))
+            for feature in sorted(_SINGLE_ROUTE_RESIDUAL_FEATURE_KEYS)
+        )
+    residual_clip = _as_float(policy.get("residual_clip"))
+    residual_clipped = max(
+        -residual_clip,
+        min(residual_clip, residual_raw),
+    )
+    quality_calibrated_clean = _clamp(
+        quality_prior_blended + residual_weight * residual_clipped
+    )
+    return {
+        "quality_raw_clean": quality_raw_clean,
+        "model_quality_prior": model_quality_prior,
+        "model_prior_weight": prior_weight,
+        "quality_prior_blended": quality_prior_blended,
+        "match_features": match_features,
+        "residual_raw": residual_raw,
+        "residual_clipped": residual_clipped,
+        "residual_clip": residual_clip,
+        "residual_weight": residual_weight,
+        "quality_calibrated_clean": quality_calibrated_clean,
+    }
+
+
+def _single_route_predicted_total_cost(
+    model: RankedModel,
+    task_profile: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Predict input-plus-output spend from the effective task tier."""
+
+    prices = _model_price_components(model)
+    if prices is None:
+        raise DynamicRankingError(
+            "router_dynamic enabled single-route predicted cost requires "
+            f"a decomposable price for {model.identity}"
+        )
+    effective_tier = str(_effective_tier(task_profile, ranking_config))
+    raw_input_tokens = policy.get("input_tokens_by_tier")
+    raw_output_tokens = policy.get("output_tokens_by_tier")
+    input_tokens_by_tier = (
+        raw_input_tokens if isinstance(raw_input_tokens, Mapping) else {}
+    )
+    output_tokens_by_tier = (
+        raw_output_tokens if isinstance(raw_output_tokens, Mapping) else {}
+    )
+    input_tokens = _as_int(input_tokens_by_tier[effective_tier])
+    output_tokens = _as_int(output_tokens_by_tier[effective_tier])
+    input_price, output_price = prices
+    predicted_cost_usd = (
+        input_tokens * input_price + output_tokens * output_price
+    ) / 1_000_000.0
+    reference_usd = _as_float(policy.get("predicted_cost_reference_usd"))
+    return {
+        "effective_tier": effective_tier,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "input_price_usd_per_million": input_price,
+        "output_price_usd_per_million": output_price,
+        "predicted_cost_usd": predicted_cost_usd,
+        "reference_usd": reference_usd,
+        "normalized": _clamp(predicted_cost_usd / reference_usd),
+    }
+
+
 def _model_price_source(model: RankedModel) -> str | None:
     """Return the frozen registry provenance for decomposable model pricing."""
 
@@ -8580,6 +9108,9 @@ def _base_score_row(
     user_profile: Mapping[str, Any] | None,
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any],
+    *,
+    single_route: bool = False,
+    single_route_calibration_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     task_match = _task_match(model, task_profile, ranking_config, role="proposer")
     user_score = (
@@ -8593,20 +9124,50 @@ def _base_score_row(
             + _ranking_number(ranking_config, "quality", "user_score_weight") * user_score
         )
     reliability = _role_reliability_score(model, "proposer", ranking_config)
-    quality_clean = quality_before_reliability - _as_float(reliability["penalty"])
+    quality_raw_clean = quality_before_reliability - _as_float(
+        reliability["penalty"]
+    )
+    calibration_policy = single_route_calibration_policy if single_route else None
+    calibration: dict[str, Any] | None = None
+    if calibration_policy is not None:
+        calibration = _single_route_quality_calibration(
+            model,
+            task_profile,
+            ranking_config,
+            quality_raw_clean=quality_raw_clean,
+            policy=calibration_policy,
+        )
+        quality_clean = _as_float(calibration["quality_calibrated_clean"])
+    else:
+        quality_clean = quality_raw_clean
     quality = _clamp(quality_clean + session_score)
     price_reference = _ranking_number(
         ranking_config, "normalization", "price_reference_usd_per_million"
     )
     latency_reference = _ranking_number(ranking_config, "normalization", "latency_reference_ms")
-    cost_normalized = _clamp(_model_price(model, ranking_config) / price_reference)
+    predicted_total_cost: dict[str, Any] | None = None
+    if (
+        calibration_policy is not None
+        and calibration_policy.get("predicted_total_cost_enabled") is True
+    ):
+        predicted_total_cost = _single_route_predicted_total_cost(
+            model,
+            task_profile,
+            ranking_config,
+            calibration_policy,
+        )
+        cost_normalized = _as_float(predicted_total_cost["normalized"])
+    else:
+        cost_normalized = _clamp(
+            _model_price(model, ranking_config) / price_reference
+        )
     latency = _as_float(
         model.registry_facts.get("latency_p95_ms", model.registry_facts.get("latency_p95")),
         latency_reference,
     )
     latency_normalized = _clamp(latency / latency_reference)
     cost_weight, latency_weight = _cost_latency_weights(task_profile, user_profile, ranking_config)
-    return {
+    row = {
         "model": model,
         "task_match": task_match,
         "user_score": user_score,
@@ -8624,6 +9185,11 @@ def _base_score_row(
         - latency_weight * latency_normalized,
         "base": quality - cost_weight * cost_normalized - latency_weight * latency_normalized,
     }
+    if calibration is not None:
+        row["single_route_calibration"] = calibration
+        if predicted_total_cost is not None:
+            row["predicted_total_cost"] = predicted_total_cost
+    return row
 
 
 def _score_trace(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) -> dict[str, Any]:
@@ -8666,6 +9232,91 @@ def _score_trace(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) -> d
                 ),
             }
         )
+    calibration = row.get("single_route_calibration")
+    if isinstance(calibration, Mapping):
+        raw_features = calibration.get("match_features")
+        features = raw_features if isinstance(raw_features, Mapping) else {}
+        calibration_trace: dict[str, Any] = {
+            "quality_raw_clean": round(
+                _as_float(calibration.get("quality_raw_clean")),
+                decimal_places,
+            ),
+            "model_quality_prior": round(
+                _as_float(calibration.get("model_quality_prior")),
+                decimal_places,
+            ),
+            "model_prior_weight": round(
+                _as_float(calibration.get("model_prior_weight")),
+                decimal_places,
+            ),
+            "quality_prior_blended": round(
+                _as_float(calibration.get("quality_prior_blended")),
+                decimal_places,
+            ),
+            "match_features": {
+                feature: round(
+                    _as_float(features.get(feature)),
+                    decimal_places,
+                )
+                for feature in sorted(_SINGLE_ROUTE_RESIDUAL_FEATURE_KEYS)
+            },
+            "residual_raw": round(
+                _as_float(calibration.get("residual_raw")),
+                decimal_places,
+            ),
+            "residual_clipped": round(
+                _as_float(calibration.get("residual_clipped")),
+                decimal_places,
+            ),
+            "residual_clip": round(
+                _as_float(calibration.get("residual_clip")),
+                decimal_places,
+            ),
+            "residual_weight": round(
+                _as_float(calibration.get("residual_weight")),
+                decimal_places,
+            ),
+            "quality_calibrated_clean": round(
+                _as_float(calibration.get("quality_calibrated_clean")),
+                decimal_places,
+            ),
+        }
+        predicted_cost = row.get("predicted_total_cost")
+        if isinstance(predicted_cost, Mapping):
+            calibration_trace["predicted_total_cost"] = {
+                "effective_tier": str(
+                    predicted_cost.get("effective_tier") or ""
+                ),
+                "input_tokens": _as_int(predicted_cost.get("input_tokens")),
+                "output_tokens": _as_int(
+                    predicted_cost.get("output_tokens")
+                ),
+                "input_price_usd_per_million": round(
+                    _as_float(
+                        predicted_cost.get("input_price_usd_per_million")
+                    ),
+                    decimal_places,
+                ),
+                "output_price_usd_per_million": round(
+                    _as_float(
+                        predicted_cost.get("output_price_usd_per_million")
+                    ),
+                    decimal_places,
+                ),
+                "predicted_cost_usd": round(
+                    _as_float(predicted_cost.get("predicted_cost_usd")),
+                    decimal_places,
+                ),
+                "reference_usd": round(
+                    _as_float(predicted_cost.get("reference_usd")),
+                    decimal_places,
+                ),
+                "normalized": round(
+                    _as_float(predicted_cost.get("normalized")),
+                    decimal_places,
+                ),
+            }
+        trace["single_route_calibration"] = calibration_trace
     return trace
 
 
@@ -9573,6 +10224,9 @@ def rank_single_model(
         ranking_config,
         thinking_assignment_enabled=ranking_thinking_assignment_enabled,
     )
+    configured_calibration_policy = _single_route_calibration_policy(
+        effective_ranking_config
+    )
     cache_affinity_policy = _cache_affinity_policy_for_topology(
         effective_ranking_config,
         "single",
@@ -9709,6 +10363,19 @@ def rank_single_model(
             reason="no_eligible_single_model",
         )
 
+    calibration_policy = (
+        configured_calibration_policy
+        if _validate_single_route_calibration_coverage(
+            configured_calibration_policy,
+            eligible,
+        )
+        else None
+    )
+    single_ranking_version = (
+        CALIBRATED_SINGLE_MODEL_RANKING_VERSION
+        if calibration_policy is not None
+        else SINGLE_MODEL_RANKING_VERSION
+    )
     score_rows = [
         _base_score_row(
             model,
@@ -9716,6 +10383,8 @@ def rank_single_model(
             user_profile,
             request_context,
             effective_ranking_config,
+            single_route=True,
+            single_route_calibration_policy=calibration_policy,
         )
         for model in eligible
     ]
@@ -9746,7 +10415,53 @@ def rank_single_model(
             row["model"].identity,
         )
     )
-    selected = score_rows[0]["model"]
+    provisional_row = score_rows[0]
+    selected_row = provisional_row
+    quality_guard_decision: dict[str, Any] | None = None
+    if (
+        calibration_policy is not None
+        and calibration_policy.get("quality_guard_enabled") is True
+    ):
+        quality_best_row = min(
+            score_rows,
+            key=lambda row: (
+                -_as_float(row["quality_clean"]),
+                -_as_float(row.get("final_score"), row["base"]),
+                row["model"].identity,
+            ),
+        )
+        quality_drop = _as_float(
+            quality_best_row["quality_clean"]
+        ) - _as_float(provisional_row["quality_clean"])
+        maximum_drop = _as_float(calibration_policy.get("max_quality_drop"))
+        guard_applied = quality_drop > maximum_drop
+        if guard_applied:
+            selected_row = quality_best_row
+        quality_guard_decision = {
+            "enabled": True,
+            "max_quality_drop": maximum_drop,
+            "provisional_model": provisional_row["model"].identity,
+            "quality_best_model": quality_best_row["model"].identity,
+            "selected_model": selected_row["model"].identity,
+            "provisional_quality_clean": _as_float(
+                provisional_row["quality_clean"]
+            ),
+            "quality_best_clean": _as_float(
+                quality_best_row["quality_clean"]
+            ),
+            "quality_drop": quality_drop,
+            "applied": guard_applied,
+            "quality_best_tie_breakers": [
+                "S_qual_clean_desc",
+                (
+                    "S_final_desc"
+                    if cache_affinity_policy is not None
+                    else "S_base_desc"
+                ),
+                "identity_asc",
+            ],
+        }
+    selected = selected_row["model"]
     session_nonzero_epsilon = _ranking_number(
         effective_ranking_config, "trace", "session_nonzero_epsilon"
     )
@@ -9824,7 +10539,7 @@ def rank_single_model(
         "strategy": "router_dynamic",
         "execution_mode": "router_single",
         "decision_id": decision_id,
-        "ranking_version": SINGLE_MODEL_RANKING_VERSION,
+        "ranking_version": single_ranking_version,
         "base_ranking_version": base_ranking_version,
         "ranking_config_schema_version": str(effective_ranking_config["schema_version"]),
         "ranking_config_version": str(effective_ranking_config["config_version"]),
@@ -9870,23 +10585,89 @@ def rank_single_model(
         "proposer_count": 1,
         "stop_reason": "single_model_top1_selected",
     }
-    if cache_affinity_policy is not None:
+    if configured_calibration_policy is not None:
+        configured_scope = configured_calibration_policy.get(
+            "activation_model_identities"
+        )
+        trace["single_route_calibration_scope"] = {
+            "configured": True,
+            "applied": calibration_policy is not None,
+            "activation_model_identities": (
+                list(configured_scope)
+                if isinstance(configured_scope, Sequence)
+                and not isinstance(configured_scope, (str, bytes))
+                else []
+            ),
+        }
+    if calibration_policy is not None:
+        trace["selection_policy"] = "calibrated_base_score_top1"
+        trace["quality_guard"] = (
+            {
+                "enabled": False,
+                "max_quality_drop": round(
+                    _as_float(calibration_policy.get("max_quality_drop")),
+                    profile_decimal_places,
+                ),
+            }
+            if quality_guard_decision is None
+            else {
+                **quality_guard_decision,
+                "max_quality_drop": round(
+                    _as_float(
+                        quality_guard_decision.get("max_quality_drop")
+                    ),
+                    profile_decimal_places,
+                ),
+                "provisional_quality_clean": round(
+                    _as_float(
+                        quality_guard_decision.get(
+                            "provisional_quality_clean"
+                        )
+                    ),
+                    profile_decimal_places,
+                ),
+                "quality_best_clean": round(
+                    _as_float(
+                        quality_guard_decision.get("quality_best_clean")
+                    ),
+                    profile_decimal_places,
+                ),
+                "quality_drop": round(
+                    _as_float(quality_guard_decision.get("quality_drop")),
+                    profile_decimal_places,
+                ),
+            }
+        )
+        if quality_guard_decision is not None:
+            trace["selection_policy"] = "calibrated_base_score_with_quality_guard"
+            if quality_guard_decision["applied"] is True:
+                trace["stop_reason"] = "single_model_quality_guard_selected"
+    if (
+        cache_affinity_policy is not None
+        or configured_calibration_policy is not None
+    ):
         trace["ranking_parameters"] = _detached_ranking_config(effective_ranking_config)
         trace["requires_tools"] = requires_tools
         trace["ranking_thinking_assignment_enabled"] = ranking_thinking_assignment_enabled
-        trace["cache_continuity_available"] = bool(cache_continuity_available)
-        trace["cache_affinity_inputs"] = [
-            adjustment.trace()
-            for row in score_rows
-            if isinstance(
-                adjustment := row.get("cache_affinity_adjustment"),
-                CacheAffinityScoreAdjustment,
+        if cache_affinity_policy is not None or calibration_policy is not None:
+            trace["cache_continuity_available"] = bool(cache_continuity_available)
+            trace["cache_affinity_inputs"] = (
+                [
+                    adjustment.trace()
+                    for row in score_rows
+                    if isinstance(
+                        adjustment := row.get("cache_affinity_adjustment"),
+                        CacheAffinityScoreAdjustment,
+                    )
+                ]
+                if cache_affinity_policy is not None
+                else []
             )
-        ]
-        trace["selection_policy"] = "cache_adjusted_base_score_top1"
-        trace["selection_tie_breakers"][0] = "S_final_desc"
-        if cache_affinity_unavailable_reasons:
-            trace["cache_affinity_unavailable_reasons"] = cache_affinity_unavailable_reasons
+        if cache_affinity_policy is not None:
+            trace["selection_policy"] = "cache_adjusted_" + str(trace["selection_policy"])
+            trace["selection_tie_breakers"][0] = "S_final_desc"
+            if cache_affinity_unavailable_reasons:
+                trace["cache_affinity_unavailable_reasons"] = cache_affinity_unavailable_reasons
     if thinking_policy is not None:
         trace.update(
             {
@@ -9907,7 +10688,7 @@ def rank_single_model(
         "llm_ensemble.router_dynamic.single_model_selection_recorded",
         decision_id=decision_id,
         selected_model=assigned_model.identity,
-        ranking_version=SINGLE_MODEL_RANKING_VERSION,
+        ranking_version=single_ranking_version,
         candidate_pool_size=len(models),
         eligible_model_count=len(eligible),
         requires_tools=requires_tools,
@@ -10980,11 +11761,16 @@ def rank_models(
 
 
 def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
-    """Replay one cache-aware router-single trace from frozen safe evidence."""
+    """Replay one cache-aware or calibrated single-route trace."""
 
+    ranking_version = trace.get("ranking_version")
     if (
         trace.get("execution_mode") != "router_single"
-        or trace.get("ranking_version") != SINGLE_MODEL_RANKING_VERSION
+        or ranking_version
+        not in {
+            SINGLE_MODEL_RANKING_VERSION,
+            CALIBRATED_SINGLE_MODEL_RANKING_VERSION,
+        }
     ):
         return ["wrong_single_ranking_replay_mode"]
     if trace.get("user_profile_enabled") is not False:
@@ -11035,22 +11821,60 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
         ranking_parameters,
         "single",
     )
+    calibration_policy = _single_route_calibration_policy(ranking_parameters)
+    calibration_scope = trace.get("single_route_calibration_scope")
+    if isinstance(calibration_scope, Mapping):
+        calibration_applied = calibration_scope.get("applied")
+        if (
+            not isinstance(calibration_applied, bool)
+            or calibration_policy is None
+            or (
+                ranking_version == CALIBRATED_SINGLE_MODEL_RANKING_VERSION
+            )
+            != calibration_applied
+        ):
+            return ["single_replay_calibration_version_mismatch"]
+    elif (
+        ranking_version == CALIBRATED_SINGLE_MODEL_RANKING_VERSION
+    ) != (calibration_policy is not None):
+        # Compatibility for frozen pre-scope calibration traces.
+        return ["single_replay_calibration_version_mismatch"]
     raw_continuity = trace.get("cache_continuity_available")
     requires_tools = trace.get("requires_tools")
     thinking_enabled = trace.get("ranking_thinking_assignment_enabled")
     if (
-        cache_policy is None
-        or not isinstance(raw_continuity, bool)
-        or not isinstance(requires_tools, bool)
+        not isinstance(requires_tools, bool)
         or not isinstance(thinking_enabled, bool)
+        or (cache_policy is None and calibration_policy is None)
     ):
         return ["invalid_single_ranking_replay_cache_policy"]
     try:
-        frozen_adjustments = _cache_affinity_adjustments_from_trace(
-            trace.get("cache_affinity_inputs"),
-            policy=cache_policy,
-            candidate_pool_size=len(registry_snapshot.get("models") or []),
-        )
+        if cache_policy is None:
+            calibration_was_bypassed = (
+                isinstance(calibration_scope, Mapping)
+                and calibration_scope.get("applied") is False
+            )
+            if raw_continuity is None and calibration_was_bypassed:
+                frozen_cache_continuity = False
+            elif isinstance(raw_continuity, bool):
+                frozen_cache_continuity = raw_continuity
+            else:
+                return ["invalid_single_ranking_replay_cache_policy"]
+            frozen_cache_inputs = trace.get("cache_affinity_inputs")
+            if frozen_cache_inputs is None and calibration_was_bypassed:
+                pass
+            elif frozen_cache_inputs != []:
+                return ["invalid_single_ranking_replay_cache_affinity_inputs"]
+            frozen_adjustments = None
+        else:
+            if not isinstance(raw_continuity, bool):
+                return ["invalid_single_ranking_replay_cache_policy"]
+            frozen_cache_continuity = raw_continuity
+            frozen_adjustments = _cache_affinity_adjustments_from_trace(
+                trace.get("cache_affinity_inputs"),
+                policy=cache_policy,
+                candidate_pool_size=len(registry_snapshot.get("models") or []),
+            )
         analysis = TaskAnalysisResult(
             profile=copy.deepcopy(dict(raw_profile)),
             source=str(analyzer.get("source") or "replay"),
@@ -11090,7 +11914,7 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
             ranking_config=copy.deepcopy(dict(ranking_parameters)),
             decision_id=str(trace.get("decision_id") or ""),
             ranking_thinking_assignment_enabled=thinking_enabled,
-            cache_continuity_available=raw_continuity,
+            cache_continuity_available=frozen_cache_continuity,
             _cache_affinity_unavailable_reasons=trace.get("cache_affinity_unavailable_reasons"),
             _cache_affinity_replay_adjustments=frozen_adjustments,
         ).trace
@@ -11102,6 +11926,16 @@ def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
         ValueError,
     ):
         return ["invalid_single_ranking_replay_cache_affinity_inputs"]
+    raw_calibration_policy = ranking_parameters.get("single_route_calibration")
+    if (
+        "single_route_calibration_scope" not in trace
+        and isinstance(raw_calibration_policy, Mapping)
+        and "activation_model_identities" not in raw_calibration_policy
+    ):
+        # Frozen calibration-v2 traces predate explicit activation-scope
+        # evidence. Their policy is still replayed strictly; only the additive
+        # scope annotation is omitted for byte-shape compatibility.
+        replayed.pop("single_route_calibration_scope", None)
     if dict(trace) != replayed:
         return ["single_frozen_ranker_replay_mismatch"]
     return []
