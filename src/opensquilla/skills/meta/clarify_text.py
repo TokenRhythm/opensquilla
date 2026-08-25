@@ -36,10 +36,7 @@ _NUMBERED_RE = re.compile(r"^\s*(\d+)\s*[\)\.]\s*(.*?)\s*$")
 # to "not a bool" because the table only carried "是" / "否". Users
 # reading the prompt naturally answered with the conversational
 # equivalents, hit a parse error, and were re-prompted — the
-# "information not understood" symptom in chat-mode clarify. Keep the
-# CLI ``clarify_form.py`` table in lockstep with this set; the two
-# surfaces must accept the same vocabulary or a multi-surface skill
-# reports inconsistent outcomes.
+# "information not understood" symptom in chat-mode clarify.
 _TRUE_VALUES = frozenset({
     "true", "yes", "1", "on",
     "是", "好", "对", "嗯", "可以", "确认", "没问题", "ok",

@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
     },
     "preset": {
-      "summary": "ルーティングテンプレート: {label}",
-      "desc": "一度適用してモデルルーティングを埋めます。アクティブな階層はそこで編集します。",
-      "customizedSummary": "モデルルーティングはすでに {label} を使用しています。",
-      "customizedDesc": "アクティブな階層はモデルルーティングで編集します。",
-      "synthesizedLabel": "生成済みルーティングテンプレート",
-      "synthesizedBadge": "生成済みテンプレート",
-      "customize": "テンプレート詳細を表示 →",
-      "hide": "テンプレート詳細を隠す",
-      "apply": "モデルルーティングに適用",
-      "viewInRouter": "モデルルーティングを開く →",
-      "modeRecommended": "ルーティングテンプレート",
-      "modeCustom": "カスタム",
-      "modeDisabled": "オフ"
+      "modeCustom": "カスタム"
     },
     "modelStrategy": {
       "title": "モデルルーティング",
@@ -1704,8 +1692,6 @@
       "routerSaved": "ルーターを保存しました。",
       "routerSavedRestart": "ルーターを保存しました。再起動が必要です。",
       "ensembleSaved": "アンサンブルを保存しました。",
-      "presetApplied": "ルーティングプリセットを適用しました。",
-      "presetAppliedRestart": "ルーティングプリセットを適用しました。再起動が必要です。",
       "channelSaved": "チャンネルを保存しました — ローカル検証済み。「接続テスト」で認証情報を確認できます",
       "channelSavedLive": "チャネルを保存して適用しました——新しい設定で稼働中",
       "channelStartFailed": "チャネルは保存されましたが起動に失敗しました——ステータスでエラーを確認し、再起動で再試行してください",
@@ -2935,16 +2921,6 @@
     "tile": {
       "installed": "インストール済み",
       "add": "追加"
-    },
-    "skillCard": {
-      "subSkillsTitle": "このメタスキルが使用するサブスキル",
-      "uses": "使用",
-      "dependencies": "宣言済み依存関係",
-      "pythonCount": "Python パッケージ: {count}",
-      "binaryCount": "バイナリ: {count}",
-      "envCount": "環境変数: {count}",
-      "missingCount": "不足している依存関係: {count}",
-      "advisoryCount": "注意事項: {count}"
     },
     "skillDetail": {
       "dialogLabel": "スキルの詳細: {name}",

@@ -16,7 +16,6 @@ import type {
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
 import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
-import type { SetupTierRow } from '@/composables/setup/useSetupRouterForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
 const { t, locale } = useI18n()
@@ -98,22 +97,8 @@ interface ProviderPanelContract {
   providerFieldValue: (field: FieldSpec) => string
 }
 
-interface PresetCardContract {
-  hasPreset: boolean
-  presetLabel: string
-  presetDescription: string
-  synthesized: boolean
-  tierRows: SetupTierRow[]
-  tierLabel: (tier: string) => string
-  routerMode: string
-  routerCustomized: boolean
-}
-
 const props = defineProps<{
   panel: ProviderPanelContract
-  // Optional routing-preset card contract (absent on older gateways whose
-  // catalog carries no presets — the card simply doesn't render).
-  preset?: PresetCardContract | null
   dirty?: boolean
   saving?: boolean
 }>()
@@ -128,7 +113,6 @@ const emit = defineEmits<{
   refreshModels: []
   saveProvider: []
   cancelProviderEdit: []
-  applyPreset: []
   copy: [command: string]
   goToSection: [value: string]
   selectConfiguredProvider: [value: string]

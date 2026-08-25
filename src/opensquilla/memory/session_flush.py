@@ -29,9 +29,7 @@ from opensquilla.engine.usage_accounting import (
 )
 from opensquilla.memory.archive import RawArchiveWriteResult, write_raw_fallback_archive
 from opensquilla.memory.flush import (
-    build_flush_user_prompt_with_audit,
     dump_transcript_excerpt_with_audit,
-    resolve_flush_plan,
     validate_flush_save_arguments,
 )
 from opensquilla.memory.protocols import MemoryProviderCapability, MemoryToolHandler
@@ -1108,40 +1106,6 @@ def _build_flush_segments(
 
     emit_current()
     return segments
-
-
-def _segment_receipt_payload(
-    *,
-    index: int,
-    flushed_paths: list[str],
-    prompt: Any,
-    input_message_count: int,
-    selected_start_index: int | None,
-    segment: _FlushSegment,
-) -> dict[str, Any]:
-    audit = _receipt_audit_kwargs(
-        prompt,
-        input_message_count=input_message_count,
-        selected_start_index=(selected_start_index or 1) + segment.first_message - 1,
-    )
-    if segment.truncated:
-        audit["truncated"] = True
-        audit["truncation_policy"] = segment.truncation_policy
-    return {
-        "index": index,
-        "flushed_paths": flushed_paths,
-        **audit,
-    }
-
-
-def _plan_with_relative_path(plan: Any, relative_path: str) -> Any:
-    return type(plan)(
-        relative_path=relative_path,
-        system_prompt=plan.system_prompt.replace(plan.relative_path, relative_path),
-        soft_threshold_tokens=plan.soft_threshold_tokens,
-        force_flush_transcript_bytes=plan.force_flush_transcript_bytes,
-        reserve_tokens_floor=plan.reserve_tokens_floor,
-    )
 
 
 @dataclass(frozen=True)
@@ -2650,16 +2614,6 @@ class SessionFlushService:
             return False
         return any(getattr(td, "name", None) == "memory_save" for td in defs)
 
-    def _flush_tool_definitions(self, *, agent_id: str, source_name: str) -> list[Any]:
-        """Return internal flush tools, including non-default helpers explicitly allowed here."""
-        try:
-            defs = self._tool_registry.to_tool_definitions(
-                _flush_tool_context(agent_id, source_name=source_name)
-            )
-        except TypeError:
-            defs = self._tool_registry.to_tool_definitions()
-        return [td for td in defs if getattr(td, "name", None) == "memory_save"]
-
     def _record_extraction_stats(
         self,
         *,
@@ -3153,9 +3107,8 @@ class SessionFlushService:
     ) -> FlushReceipt:
         """Extract structured durable memory and apply it through memory_save.
 
-        The agentic sub-agent helper is retained for compatibility tests and
-        emergency fallback experiments, but the product lifecycle surface uses
-        the same auditable candidate extraction path as the cheap-model lane.
+        The product lifecycle surface uses the auditable candidate extraction
+        path shared with the cheap-model lane.
         """
         t0 = time.monotonic()
         if segment_mode != "off":
@@ -3230,231 +3183,6 @@ class SessionFlushService:
                 "total_prompt_char_count": receipt.prompt_char_count,
             }
         )
-
-    async def _run_llm_flush_sub_agent(
-        self,
-        provider: Any,
-        *,
-        agent_id: str,
-        plan: Any,
-        user_prompt: str,
-        flush_tools: list[Any],
-        source_name: str,
-    ) -> tuple[list[_MemorySaveResult], Any | None]:
-        from opensquilla.engine.agent import Agent, AgentConfig
-
-        cfg = AgentConfig(
-            system_prompt=plan.system_prompt,
-            max_iterations=3,
-            timeout=0,
-            max_tokens=2048,
-        )
-        sub_agent = Agent(
-            provider=provider,
-            config=cfg,
-            tool_definitions=flush_tools,
-            tool_handler=_make_flush_read_only_handler(
-                self._tool_handler,
-                relative_path=plan.relative_path,
-            ),
-            provider_request_correlation=current_provider_request_correlation(),
-        )
-
-        save_results: list[_MemorySaveResult] = []
-        done_event: Any | None = None
-        _ctx_token = current_tool_context.set(
-            _flush_tool_context(agent_id, source_name=source_name)
-        )
-        try:
-            async for event in sub_agent.run_turn(user_prompt):
-                if getattr(event, "tool_name", None) == "memory_save":
-                    result_text = getattr(event, "result", None) or ""
-                    parsed = _parse_memory_save_result(result_text)
-                    if parsed is not None:
-                        save_results.append(parsed)
-                if getattr(event, "kind", "") == "done" or type(event).__name__ == "DoneEvent":
-                    done_event = event
-        finally:
-            current_tool_context.reset(_ctx_token)
-        return save_results, done_event
-
-    async def _llm_flush_segments(
-        self,
-        segments: list[_FlushSegment],
-        provider: Any,
-        agent_id: str,
-        *,
-        segment_mode: SegmentMode,
-        segment_max_chars: int,
-        segment_overlap_messages: int,
-        input_message_count: int | None = None,
-        selected_start_index: int | None = None,
-        started_at: float | None = None,
-    ) -> FlushReceipt:
-        t0 = started_at if started_at is not None else time.monotonic()
-        plan = resolve_flush_plan()
-        provider_id = _provider_pricing_id(provider)
-        slug, slug_usage = await self._generate_slug_with_usage(
-            [message for segment in segments for message in segment.messages],
-            provider,
-            agent_id=agent_id,
-        )
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        base_slug = slug or "session-flush"
-        flush_tools = self._flush_tool_definitions(agent_id=agent_id, source_name="llm-flush")
-
-        all_saved_paths: list[str] = []
-        usage_items: list[dict[str, Any]] = [slug_usage]
-        segment_payloads: list[dict[str, Any]] = []
-        covered_messages: set[int] = set()
-        receipt_input_count = input_message_count or sum(
-            len(segment.messages) for segment in segments
-        )
-        prompt_message_count = 0
-        prompt_char_count = 0
-        truncated = False
-        truncation_policies: list[str] = []
-
-        for index, segment in enumerate(segments, start=1):
-            if len(segments) == 1:
-                relative_path = f"memory/{today}-{base_slug}.md"
-            else:
-                relative_path = f"memory/{today}-{base_slug}-part{index:03d}.md"
-            segment_plan = _plan_with_relative_path(plan, relative_path)
-            per_message_max_chars = segment_max_chars if segment.truncated else None
-            prompt = build_flush_user_prompt_with_audit(
-                segment_plan,
-                segment.messages,
-                max_chars=None if segment.truncated else segment_max_chars,
-                per_message_max_chars=per_message_max_chars,
-            )
-            save_results, done_event = await self._run_llm_flush_sub_agent(
-                provider,
-                agent_id=agent_id,
-                plan=segment_plan,
-                user_prompt=prompt.text,
-                flush_tools=flush_tools,
-                source_name=f"llm-flush-segment-{index}",
-            )
-            saved_paths = [result.path for result in save_results]
-            flushed = sorted(set(saved_paths)) or [segment_plan.relative_path]
-            all_saved_paths.extend(flushed)
-            usage_items.append(_usage_from_event(done_event, provider=provider_id))
-
-            payload = _segment_receipt_payload(
-                index=index,
-                flushed_paths=flushed,
-                prompt=prompt,
-                input_message_count=receipt_input_count,
-                selected_start_index=selected_start_index,
-                segment=segment,
-            )
-            payload["integrity_status"] = _merge_integrity_status(save_results)
-            payload["indexed_chunk_count"] = sum(result.chunk_count for result in save_results)
-            payload["result_status"] = "ok_candidates_written"
-            segment_payloads.append(payload)
-            covered_messages.update(range(segment.first_message, segment.last_message + 1))
-            prompt_message_count = len(covered_messages)
-            prompt_char_count += int(payload["prompt_char_count"])
-            truncated = truncated or bool(payload["truncated"])
-            policy = str(payload["truncation_policy"] or "")
-            if policy and policy != "full":
-                truncation_policies.append(policy)
-
-        total_input_messages = input_message_count or prompt_message_count
-        first_included = (
-            (selected_start_index or 1) + min(covered_messages) - 1 if covered_messages else None
-        )
-        last_included = (
-            (selected_start_index or 1) + max(covered_messages) - 1 if covered_messages else None
-        )
-        source_coverage = (
-            round(prompt_message_count / total_input_messages, 6) if total_input_messages else 0.0
-        )
-        duration_ms = int((time.monotonic() - t0) * 1000)
-        return FlushReceipt(
-            mode="llm",
-            flushed_paths=sorted(set(all_saved_paths)),
-            slug=slug,
-            message_count=prompt_message_count,
-            duration_ms=duration_ms,
-            raw_reason=None,
-            error=None,
-            result_status="ok_candidates_written",
-            usage=_merge_usage(*usage_items),
-            input_message_count=total_input_messages,
-            prompt_message_count=prompt_message_count,
-            prompt_char_count=prompt_char_count,
-            truncated=truncated,
-            truncation_policy=(
-                ";".join(sorted(set(truncation_policies)))
-                if truncation_policies
-                else f"segmented:{segment_mode}"
-            ),
-            first_included_message=first_included,
-            last_included_message=last_included,
-            source_coverage=source_coverage,
-            segment_mode=segment_mode,
-            segment_count=len(segments),
-            segments=segment_payloads,
-            total_prompt_char_count=prompt_char_count,
-            integrity_status=_merge_integrity_status(
-                [
-                    _MemorySaveResult(
-                        path=path,
-                        chunk_count=payload.get("indexed_chunk_count", 0),
-                        integrity_status=str(payload.get("integrity_status", "unverified")),
-                    )
-                    for payload in segment_payloads
-                    for path in payload.get("flushed_paths", [])
-                ]
-            ),
-            indexed_chunk_count=sum(
-                _coerce_int(payload.get("indexed_chunk_count")) for payload in segment_payloads
-            ),
-        )
-
-    async def _generate_slug(
-        self,
-        messages: list[Message],
-        provider: Any,
-        agent_id: str = "main",
-    ) -> str | None:
-        slug, _usage = await self._generate_slug_with_usage(
-            messages,
-            provider,
-            agent_id=agent_id,
-        )
-        return slug
-
-    async def _generate_slug_with_usage(
-        self,
-        messages: list[Message],
-        provider: Any,
-        agent_id: str = "main",
-    ) -> tuple[str | None, dict[str, Any]]:
-        """Ask provider for a short kebab-case topic slug.
-
-        Returns None on any failure; caller then writes to the plain dated
-        path instead of a slugged file.
-        """
-        prompt = (
-            "In <= 5 words, kebab-case, summarize the topic of this chat "
-            "as a filename slug. Reply with ONLY the slug, no quotes.\n\n"
-        )
-        joined = "\n".join(f"{m.role}: {m.content[:500]}" for m in messages[-8:])
-        try:
-            complete_messages = [Message(role="user", content=prompt + joined)]
-            completion = await _provider_complete(
-                provider,
-                messages=complete_messages,
-                max_tokens=32,
-            )
-            text = completion.text
-            slug = _sanitize_slug(text.strip().splitlines()[0] if text.strip() else "")
-            return slug or None, completion.usage
-        except Exception:  # noqa: BLE001
-            return None, _zero_usage()
 
     async def _raw_dump_fallback(
         self,

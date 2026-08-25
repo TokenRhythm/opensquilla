@@ -1130,19 +1130,7 @@
       "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
     },
     "preset": {
-      "summary": "Routing template: {label}",
-      "desc": "Apply once to fill Model Routing; edit the active tiers there.",
-      "customizedSummary": "Model Routing already uses {label}.",
-      "customizedDesc": "Active tiers are edited in Model Routing.",
-      "synthesizedLabel": "Generated routing template",
-      "synthesizedBadge": "Generated template",
-      "customize": "View template details →",
-      "hide": "Hide template details",
-      "apply": "Apply to Model Routing",
-      "viewInRouter": "Open Model Routing →",
-      "modeRecommended": "routing template",
-      "modeCustom": "custom tiers",
-      "modeDisabled": "off"
+      "modeCustom": "custom tiers"
     },
     "modelStrategy": {
       "title": "Model routing",
@@ -1792,8 +1780,6 @@
       "routerSaved": "Router saved.",
       "routerSavedRestart": "Router saved. Restart required.",
       "ensembleSaved": "Ensemble saved.",
-      "presetApplied": "Routing preset applied.",
-      "presetAppliedRestart": "Routing preset applied. Restart required.",
       "channelSaved": "Channel saved — configuration validated locally; use Test connection to verify credentials",
       "channelSavedLive": "Channel saved and applied — running with the new configuration",
       "channelStartFailed": "Channel saved, but it failed to start — open its status for the error, then retry with Restart",
@@ -3023,16 +3009,6 @@
     "tile": {
       "installed": "Installed",
       "add": "Add"
-    },
-    "skillCard": {
-      "subSkillsTitle": "Sub-skills used by this meta-skill",
-      "uses": "uses",
-      "dependencies": "Declared dependencies",
-      "pythonCount": "Python packages: {count}",
-      "binaryCount": "Binaries: {count}",
-      "envCount": "Environment variables: {count}",
-      "missingCount": "Missing dependencies: {count}",
-      "advisoryCount": "Advisories: {count}"
     },
     "skillDetail": {
       "dialogLabel": "Skill details: {name}",

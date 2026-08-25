@@ -174,7 +174,6 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useConfirm } from '@/composables/useConfirm'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
@@ -217,10 +216,7 @@ import {
   normalizeBrowserUrl,
   type BrowserWorkbenchOpenEventDetail,
 } from '@/workbench/browserItems'
-import {
-  artifactCategory,
-  artifactFileTitle,
-} from '@/utils/chat/artifacts'
+import { artifactFileTitle } from '@/utils/chat/artifacts'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import {
   readPreviewPreferences,
@@ -302,7 +298,6 @@ const artifactDocumentProvider = createRpcArtifactDocumentProvider(rpc)
 artifactDocuments.setProvider(artifactDocumentProvider)
 const workbenchResourceProvider = createRpcWorkbenchResourceProvider(rpc)
 workbenchResources.setProvider(props.workbenchResourcesEnabled ? workbenchResourceProvider : null)
-const artifactImageLightbox = useArtifactImageLightbox()
 const nativeSurfaceOccluded = useNativeSurfaceOcclusionState()
 const surfaceBlocked = computed(() => props.modalBlocked || nativeSurfaceOccluded.value)
 const baseOrigin = (() => {
@@ -421,28 +416,6 @@ for (const definition of createArtifactWorkbenchDefinitions({
   }),
   currentSessionId: () => store.activeSessionId || props.sessionId,
   getPreviewPreferences: () => readPreviewPreferences(platform),
-  openArtifact: (artifact, sessionKey, navigationArtifacts) => {
-    if (artifactCategory(artifact) === 'visual') {
-      artifactImageLightbox.open({
-        artifact,
-        navigationArtifacts,
-        sessionKey,
-      })
-      return
-    }
-    const opened = store.openItem(artifactPreviewItemForExplicitOpen({
-      artifact,
-      navigationArtifacts,
-      nativeHtml: Boolean(
-        platform.capabilities.hasNativeWorkbenchSurfaces
-        && platform.workbench.native,
-      ),
-      sessionKey,
-    }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
-  },
   publishDocument: async request => {
     await workbenchResources.publishDocument(
       request.sessionKey,

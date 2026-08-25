@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
     },
     "preset": {
-      "summary": "Plantilla de enrutamiento: {label}",
-      "desc": "Aplícala una vez para llenar Enrutamiento de modelos; edita allí los niveles activos.",
-      "customizedSummary": "Enrutamiento de modelos ya usa {label}.",
-      "customizedDesc": "Los niveles activos se editan en Enrutamiento de modelos.",
-      "synthesizedLabel": "Plantilla de enrutamiento generada",
-      "synthesizedBadge": "Plantilla generada",
-      "customize": "Ver detalles de la plantilla →",
-      "hide": "Ocultar detalles de la plantilla",
-      "apply": "Aplicar a Enrutamiento de modelos",
-      "viewInRouter": "Abrir Enrutamiento de modelos →",
-      "modeRecommended": "plantilla de enrutamiento",
-      "modeCustom": "personalizado",
-      "modeDisabled": "desactivado"
+      "modeCustom": "personalizado"
     },
     "modelStrategy": {
       "title": "Enrutamiento de modelos",
@@ -1704,8 +1692,6 @@
       "routerSaved": "Enrutador guardado.",
       "routerSavedRestart": "Enrutador guardado. Se requiere reiniciar.",
       "ensembleSaved": "Conjunto guardado.",
-      "presetApplied": "Preajuste de enrutamiento aplicado.",
-      "presetAppliedRestart": "Preajuste de enrutamiento aplicado. Se requiere reinicio.",
       "channelSaved": "Canal guardado: configuración validada localmente; usa «Probar conexión» para verificar las credenciales",
       "channelSavedLive": "Canal guardado y aplicado — en ejecución con la nueva configuración",
       "channelStartFailed": "Canal guardado, pero no pudo iniciarse — revisa su estado para ver el error y reintenta con Reiniciar",
@@ -2935,16 +2921,6 @@
     "tile": {
       "installed": "Instalado",
       "add": "Añadir"
-    },
-    "skillCard": {
-      "subSkillsTitle": "Subhabilidades que usa esta metahabilidad",
-      "uses": "usa",
-      "dependencies": "Dependencias declaradas",
-      "pythonCount": "Paquetes de Python: {count}",
-      "binaryCount": "Binarios: {count}",
-      "envCount": "Variables de entorno: {count}",
-      "missingCount": "Dependencias faltantes: {count}",
-      "advisoryCount": "Avisos: {count}"
     },
     "skillDetail": {
       "dialogLabel": "Detalles de la habilidad: {name}",

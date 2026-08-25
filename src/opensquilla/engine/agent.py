@@ -4759,35 +4759,6 @@ class Agent:
             ),
         )
 
-    def _tokenjuice_tool_reduction(
-        self,
-        *,
-        tool_name: str,
-        content: str,
-        is_error: bool,
-        tool_use_id: str,
-        arguments: dict[str, Any] | None = None,
-        command: str | None = None,
-        cwd: str | None = None,
-        max_inline_chars: int | None = None,
-    ) -> str | None:
-        reduction = reduce_tool_result_with_tokenjuice(
-            tool_name=tool_name,
-            content=content,
-            is_error=is_error,
-            tool_use_id=tool_use_id,
-            arguments=arguments,
-            command=command,
-            cwd=cwd,
-            max_inline_chars=self._tokenjuice_max_inline_chars(max_inline_chars),
-        )
-        if reduction is None:
-            return None
-        self.config.metadata["tool_projection_backend"] = "tokenjuice"
-        if reduction.reducer:
-            self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
-        return reduction.inline_text
-
     def _semantic_tool_result_projection_skip_reason(
         self,
         result: ToolResult,

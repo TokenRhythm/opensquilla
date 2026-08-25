@@ -612,128 +612,6 @@ async function uninstallSkillAndClose(name: string, installId: string) {
 .sk-grid {
   padding: var(--sp-3) var(--sp-4) var(--sp-4);
 }
-.sk-card__head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.sk-card__dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.sk-card__dot.is-ready {
-  background: var(--ok);
-}
-.sk-card__dot.is-needs {
-  background: var(--warn-fill);
-}
-.sk-card__dot.is-unverified {
-  background: var(--text-dim);
-}
-.sk-card__dot.is-provider-check {
-  background: var(--text-dim);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-dim) 18%, transparent);
-}
-.sk-card__emoji {
-  font-size: 14px;
-  line-height: 1;
-}
-.sk-card__name {
-  font-weight: 600;
-  font-size: var(--fs-sm);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-.sk-card__kind-badge {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--accent);
-  flex-shrink: 0;
-}
-.sk-card__desc {
-  margin: 0;
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  line-height: 1.4;
-}
-.sk-card__deps {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-.sk-card__dep {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-dim);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  padding: 1px 5px;
-}
-.sk-card__dep--missing {
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
-  color: var(--warn);
-}
-.sk-card__dep--advisory {
-  border-style: dashed;
-  color: var(--text-muted);
-}
-.sk-card__provider-status {
-  align-self: flex-start;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 1px 6px;
-  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, var(--border));
-  border-radius: var(--radius-sm);
-  color: var(--text-dim);
-  background: var(--bg-elevated);
-  font-size: 10px;
-  font-weight: 600;
-}
-.sk-card__sub-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-wrap: wrap;
-  margin-top: 2px;
-}
-.sk-card__sub-label {
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin-right: 2px;
-}
-.sk-card__sub-chip {
-  font-size: 10px;
-  padding: 1px 6px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-}
-.sk-card__sub-chip--more {
-  background: transparent;
-  border-style: dashed;
-}
 
 /* Proposals list */
 .sk-proposals-list {
@@ -1350,28 +1228,11 @@ async function uninstallSkillAndClose(name: string, installId: string) {
   line-height: 20px;
 }
 
-/* Shared typography contract for every skill-card surface. */
-.sk-card,
 .sk-tile,
 .sk-stat,
 .sk-proposal-row {
   font-family: var(--font-sans);
 }
-.sk-card__name {
-  font-size: 13px;
-  font-weight: 650;
-  line-height: 20px;
-}
-.sk-card__desc {
-  font-size: 13px;
-  line-height: 22px;
-}
-.sk-card__desc {
-  min-height: 44px;
-}
-.sk-card__dep,
-.sk-card__sub-label,
-.sk-card__sub-chip,
 .sk-prop-chip,
 .sk-prop-hash {
   font-size: 11px;
