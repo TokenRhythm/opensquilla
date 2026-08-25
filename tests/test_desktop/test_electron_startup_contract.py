@@ -2519,6 +2519,20 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
     ]:
         assert expected in verifier
 
+    assert "createWindowIndex + 8_000" not in verifier
+    assert "waitIndex + 1_000" not in verifier
+    assert re.search(
+        r"sourceBetweenMarkers\(\s*source,\s*'async function createMainWindow',"
+        r"\s*'function currentMainWindow',",
+        verifier,
+    )
+    assert re.search(
+        r"sourceBetweenMarkers\(\s*source,\s*'async function waitForGateway',"
+        r"\s*'function hasGatewayProcessExited',",
+        verifier,
+    )
+    assert r"readinessCheck\(\s*url(?:\s*,[^)]*)?\)" in verifier
+
 
 def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
