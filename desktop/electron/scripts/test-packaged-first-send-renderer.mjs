@@ -238,6 +238,38 @@ async function browserRpcSnapshot(page) {
   })
 }
 
+function installBrowserRpcProbe() {
+  const probe = { methods: {}, sends: [] }
+  Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
+    configurable: false,
+    enumerable: false,
+    value: probe,
+    writable: false,
+  })
+  const originalSend = WebSocket.prototype.send
+  WebSocket.prototype.send = function opensquillaP15ObservedSend(data) {
+    try {
+      if (typeof data === 'string') {
+        const frame = JSON.parse(data)
+        if (frame?.type === 'req' && typeof frame.method === 'string') {
+          probe.methods[frame.method] = (probe.methods[frame.method] || 0) + 1
+          if (frame.method === 'chat.send') {
+            probe.sends.push({
+              message: typeof frame.params?.message === 'string' ? frame.params.message : '',
+              sessionKey: typeof frame.params?.sessionKey === 'string'
+                ? frame.params.sessionKey
+                : '',
+            })
+          }
+        }
+      }
+    } catch {
+      // The probe is diagnostic only; malformed/non-JSON frames stay intact.
+    }
+    return originalSend.call(this, data)
+  }
+}
+
 async function observedChatSendCount(page, message) {
   const snapshot = await browserRpcSnapshot(page)
   return snapshot.sends.filter((entry) => entry.message === message).length
@@ -371,40 +403,11 @@ try {
   })
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
-  // packaged Electron app. Patching the prototype in the settled document also
-  // covers the already-connected socket and avoids a reload racing Electron's
-  // main-process loadURL() promise.
-  await page.evaluate(() => {
-    const probe = { methods: {}, sends: [] }
-    Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
-      configurable: false,
-      enumerable: false,
-      value: probe,
-      writable: false,
-    })
-    const originalSend = WebSocket.prototype.send
-    WebSocket.prototype.send = function opensquillaP15ObservedSend(data) {
-      try {
-        if (typeof data === 'string') {
-          const frame = JSON.parse(data)
-          if (frame?.type === 'req' && typeof frame.method === 'string') {
-            probe.methods[frame.method] = (probe.methods[frame.method] || 0) + 1
-            if (frame.method === 'chat.send') {
-              probe.sends.push({
-                message: typeof frame.params?.message === 'string' ? frame.params.message : '',
-                sessionKey: typeof frame.params?.sessionKey === 'string'
-                  ? frame.params.sessionKey
-                  : '',
-              })
-            }
-          }
-        }
-      } catch {
-        // The probe is diagnostic only; malformed/non-JSON frames stay intact.
-      }
-      return originalSend.call(this, data)
-    }
-  })
+  // packaged Electron app. Register the probe for later full-document route
+  // transitions, then patch the already-settled initial document directly.
+  // No reload can race Electron's main-process loadURL() promise.
+  await page.addInitScript(installBrowserRpcProbe)
+  await page.evaluate(installBrowserRpcProbe)
 
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)

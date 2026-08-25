@@ -122,11 +122,15 @@ def test_release_workflow_builds_desktop_installers() -> None:
         "timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS" in first_send_gate
     )
     initial_connection = first_send_gate.index("timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS")
-    probe_install = first_send_gate.index("await page.evaluate(() => {", initial_connection)
-    assert initial_connection < probe_install
-    assert "await page.addInitScript" not in first_send_gate
+    probe_install = first_send_gate.index(
+        "await page.addInitScript(installBrowserRpcProbe)", initial_connection
+    )
+    current_probe_install = first_send_gate.index(
+        "await page.evaluate(installBrowserRpcProbe)", probe_install
+    )
+    assert initial_connection < probe_install < current_probe_install
     assert "await page.reload" not in first_send_gate
-    assert "timeout: SEND_TIMEOUT_MS" in first_send_gate[probe_install:]
+    assert "timeout: SEND_TIMEOUT_MS" in first_send_gate[current_probe_install:]
     assert "PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS" in first_send_gate
     assert "unexpectedRendererErrorCount" in first_send_gate
 
