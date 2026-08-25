@@ -31,6 +31,13 @@ PRODUCTION_ENDPOINT = "https://telemetry.opensquilla.ai/v1/install"
 # other 7000 tests are unrelated.
 _BARRIER_TIMEOUT_S = 60.0
 
+# Reaping a worker after ``terminate()`` is not a barrier: nothing is waiting on
+# the test any more, the signal has already been delivered, and a process that
+# has not gone away in a few seconds is not going to. Keeping this short means a
+# genuinely wedged worker still surfaces quickly instead of holding the shard
+# for a minute per process.
+_REAP_TIMEOUT_S = 5.0
+
 
 def _load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -809,7 +816,7 @@ print(json.dumps({
         for worker in workers:
             if worker.poll() is None:
                 worker.terminate()
-                worker.wait(timeout=_BARRIER_TIMEOUT_S)
+                worker.wait(timeout=_REAP_TIMEOUT_S)
 
     for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
         assert worker.returncode == 0, stderr
