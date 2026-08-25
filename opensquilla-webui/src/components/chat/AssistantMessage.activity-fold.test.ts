@@ -897,6 +897,35 @@ describe('AssistantMessage activity disclosure', () => {
       .toBe('Checked constraints and compatibility.')
   })
 
+  it('keeps explicit tool progress inside activity instead of the Plan intro', async () => {
+    const marker = 'E2E_TOOL_PROGRESS_MARKER'
+    const el = mountMessage(baseMessage({
+      text: marker,
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'progress-marker',
+          html: `<p>${marker}</p>`,
+          rawText: marker,
+          presentation: 'intermediate',
+        },
+        timelineGroup(successfulCall('submit-plan', 'submit_plan')),
+      ],
+      parts: [planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const outsideText = [...el.querySelectorAll<HTMLElement>('.msg-ai-text')]
+      .filter(node => !activity?.contains(node))
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(activity?.textContent).toContain(marker)
+    expect(el.querySelector('.plan-message-intro')).toBeNull()
+    expect(outsideText.every(node => !node.textContent?.includes(marker))).toBe(true)
+  })
+
   it('does not add a generic completed receipt below a Plan card', async () => {
     const el = mountMessage(baseMessage({
       text: '',
