@@ -709,6 +709,87 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('restores a server-staged literal slash escape from its display text', async () => {
+    const { wal, records } = memoryWal()
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') {
+        return {
+          items: [{
+            pendingInputId: 'pending-literal-slash',
+            clientRequestId: 'request-literal-slash',
+            clientMessageId: 'message-literal-slash',
+            requestFingerprint: 'sha256:literal-slash',
+            revision: 1,
+            message: '/coding',
+            displayText: '//coding',
+            attachments: [],
+          }],
+        }
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      rpc,
+      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+    })
+
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: '//coding',
+      pendingPersistenceState: 'staged',
+    })
+    expect(records.get('pending-literal-slash')?.text).toBe('//coding')
+    queue.cleanup()
+  })
+
+  it('restores the confirmed plain-text marker for a server-staged unknown slash', async () => {
+    const { wal, records } = memoryWal()
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') {
+        return {
+          items: [{
+            pendingInputId: 'pending-unknown-slash',
+            clientRequestId: 'request-unknown-slash',
+            clientMessageId: 'message-unknown-slash',
+            requestFingerprint: 'sha256:unknown-slash',
+            revision: 1,
+            message: '/gamemode creative',
+            confirmedPlainText: true,
+            attachments: [],
+          }],
+        }
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      rpc,
+      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+    })
+
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: '/gamemode creative',
+      confirmedPlainText: true,
+      pendingPersistenceState: 'staged',
+    })
+    expect(records.get('pending-unknown-slash')?.confirmedPlainText).toBe(true)
+    queue.cleanup()
+  })
+
   it('strips an ACK-lost upload token when server reconciliation proves ownership', async () => {
     const { wal, records } = memoryWal([{
       schemaVersion: 1,
@@ -1019,6 +1100,25 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('does not edit a queued annotation batch into plain text', async () => {
+    const { inputText, queue } = makeQueue()
+    await expect(queue.enqueuePendingPayload({
+      text: 'apply the second selected edit',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    })).resolves.toBe(true)
+    const itemId = pendingUiId(queue, 0)
+    inputText.value = 'keep the current composer draft'
+
+    expect(queue.editPendingItem(itemId)).toBe(false)
+    expect(queue.pendingQueue.value).toHaveLength(1)
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: 'apply the second selected edit',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    })
+    expect(inputText.value).toBe('keep the current composer draft')
+    queue.cleanup()
+  })
+
   it('hydrates a cancelling WAL as cancel-only without restoring the server row', async () => {
     const { wal } = memoryWal([{
       schemaVersion: 1,
@@ -1102,6 +1202,136 @@ describe('useChatPendingQueue delivery state', () => {
       || method === 'sessions.pending_inputs.cancel'
     ))).toBe(true)
     queue.cleanup()
+  })
+
+  it('retains a reclassified draft when the cancel acknowledgement is lost', async () => {
+    const { wal, records } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-retain-after-cancel',
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-retain-after-cancel',
+      clientMessageId: 'message-retain-after-cancel',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:retain-after-cancel',
+      serverRevision: 3,
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    let serverRowExists = true
+    let cancelCalls = 0
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') {
+        return {
+          items: serverRowExists
+            ? [{
+                pendingInputId: 'pending-retain-after-cancel',
+                clientRequestId: 'request-retain-after-cancel',
+                clientMessageId: 'message-retain-after-cancel',
+                requestFingerprint: 'sha256:retain-after-cancel',
+                revision: 3,
+                message: '/gamemode creative',
+                confirmedPlainText: true,
+                attachments: [],
+              }]
+            : [],
+        }
+      }
+      if (method === 'sessions.pending_inputs.cancel') {
+        cancelCalls += 1
+        if (cancelCalls === 1) {
+          serverRowExists = false
+          throw new Error('cancel committed but acknowledgement was lost')
+        }
+        return { cancelled: true, alreadyMissing: true }
+      }
+      if (method === 'sessions.pending_inputs.enqueue') {
+        throw new Error('retained drafts must never be re-staged')
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const initial = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      },
+    )
+    await vi.waitFor(() => {
+      expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+    })
+    const item = initial.queue.pendingQueue.value[0]!
+
+    await expect(initial.queue.cancelDurableItem(
+      item,
+      { retainAfterCancel: true },
+    )).resolves.toBe(false)
+    expect(records.get('pending-retain-after-cancel')).toMatchObject({
+      state: 'cancelling',
+      retainAfterCancel: true,
+    })
+    item.deliveryState = 'retryable'
+
+    await initial.queue.hydratePendingQueue()
+    await vi.waitFor(() => {
+      expect(initial.queue.pendingQueue.value[0]).toMatchObject({
+        text: '/gamemode creative',
+        pendingPersistenceState: 'local_only',
+        pendingMayHaveServerCopy: false,
+        pendingRetainAfterCancel: true,
+      })
+      expect(initial.queue.pendingQueue.value[0]?.deliveryState).toBeUndefined()
+    })
+    expect(records.get('pending-retain-after-cancel')).toMatchObject({
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      retainAfterCancel: true,
+    })
+    expect(cancelCalls).toBe(2)
+    initial.queue.cleanup()
+
+    const restored = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      },
+    )
+    await vi.waitFor(() => {
+      expect(restored.queue.pendingQueue.value[0]).toMatchObject({
+        text: '/gamemode creative',
+        pendingPersistenceState: 'local_only',
+      })
+    })
+    expect(rpcCall.mock.calls.map(call => call[0])).not.toContain(
+      'sessions.pending_inputs.enqueue',
+    )
+
+    expect(restored.queue.editPendingItem(pendingUiId(restored.queue, 0))).toBe(true)
+    await vi.waitFor(() => {
+      expect(restored.queue.pendingQueue.value).toEqual([])
+      expect(restored.inputText.value).toBe('/gamemode creative')
+      expect(records.has('pending-retain-after-cancel')).toBe(false)
+    })
+    restored.queue.cleanup()
   })
 
   it.each([
@@ -1244,6 +1474,120 @@ describe('useChatPendingQueue delivery state', () => {
     queue.switchPendingQueue('agent:main:webchat:test')
     expect(queue.pendingQueue.value).toEqual([])
     queue.cleanup()
+  })
+
+  it('never rehydrates or auto-dispatches an accepted steer after repeated session returns', async () => {
+    vi.useFakeTimers()
+    const sessionA = 'agent:main:webchat:A'
+    const sessionB = 'agent:main:webchat:B'
+    const record: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-consumed-steer',
+      sessionKey: sessionB,
+      clientRequestId: 'request-consumed-steer',
+      clientMessageId: 'message-consumed-steer',
+      text: 'consume this steer once',
+      attachments: [],
+      intent: null,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:consumed-steer',
+      serverRevision: 1,
+      position: 0,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal, records } = memoryWal([record])
+    let serverRows: Array<Record<string, unknown>> = [{
+      pendingInputId: record.pendingInputId,
+      clientRequestId: record.clientRequestId,
+      clientMessageId: record.clientMessageId,
+      requestFingerprint: record.requestFingerprint,
+      message: record.text,
+      attachments: [],
+      position: record.position,
+      revision: record.serverRevision,
+    }]
+    const listedSessionKeys: string[] = []
+    const rpcCall = vi.fn(async (
+      method: string,
+      params?: Record<string, unknown>,
+    ): Promise<unknown> => {
+      if (method !== 'sessions.pending_inputs.list') {
+        throw new Error(`unexpected method: ${method}`)
+      }
+      const key = String(params?.key || '')
+      listedSessionKeys.push(key)
+      return {
+        items: key === sessionB ? structuredClone(serverRows) : [],
+      }
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+        rpcCall(method, params) as Promise<T>
+      ),
+    }
+    const sessionKey = ref(sessionB)
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const { queue } = makeQueue(
+      dispatchPendingItem,
+      () => false,
+      undefined,
+      undefined,
+      {
+        sessionKey,
+        pendingInputWal: wal,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        connectionState: ref('connected'),
+      },
+    )
+
+    const returnToBAndSignalReady = async () => {
+      const previousBLists = listedSessionKeys.filter(key => key === sessionB).length
+      queue.switchPendingQueue(sessionB)
+      sessionKey.value = sessionB
+      await vi.waitFor(() => {
+        expect(listedSessionKeys.filter(key => key === sessionB).length)
+          .toBeGreaterThan(previousBLists)
+      })
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+
+      // This is the same drain signal ChatView emits when livePhase becomes ready.
+      queue.schedulePendingDrainAfterTerminal()
+      queue.flushDeferredPendingDrain()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(queue.pendingQueue.value).toEqual([])
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+    }
+
+    try {
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+      const steering = queue.beginPendingDelivery(pendingUiId(queue, 0))
+      expect(steering).not.toBeNull()
+
+      // The server consumes the durable row atomically with accepting the steer.
+      serverRows = []
+      queue.switchPendingQueue(sessionA)
+      sessionKey.value = sessionA
+      queue.settlePendingDelivery(steering!, 'accepted')
+      await nextTick()
+      await vi.waitFor(() => expect(records.size).toBe(0))
+
+      await returnToBAndSignalReady()
+      queue.switchPendingQueue(sessionA)
+      sessionKey.value = sessionA
+      await nextTick()
+      await returnToBAndSignalReady()
+
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
   })
 
   it('parks an in-flight steer with its source session and exact request snapshot', () => {

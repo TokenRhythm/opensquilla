@@ -7,6 +7,33 @@ import pytest
 from opensquilla.provider.model_catalog import ModelCatalog, _corrections_budget_fallback
 
 
+def test_user_override_price_fields_keep_qualified_precedence_and_bare_fallback() -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "vendor/priced-model": {
+                "input_cost_per_mtok": 1.0,
+                "output_cost_per_mtok": 2.0,
+                "cache_write_cost_per_mtok": 4.0,
+                "context_window": 131_072,
+            },
+            "custom/vendor/priced-model": {
+                "input_cost_per_mtok": 0.0,
+                "cache_read_cost_per_mtok": 0.1,
+            },
+        }
+    )
+
+    assert catalog.user_override_price_fields(
+        "VENDOR/PRICED-MODEL", provider="CUSTOM"
+    ) == {
+        "input_cost_per_mtok": 0.0,
+        "output_cost_per_mtok": 2.0,
+        "cache_read_cost_per_mtok": 0.1,
+        "cache_write_cost_per_mtok": 4.0,
+    }
+
+
 def test_deepseek_v4_direct_models_use_models_dev_limits() -> None:
     # The vendored models.dev snapshot supplies the real per-(provider, model)
     # budgets offline (PR #406 roadmap item 4); the packaged corrections
@@ -36,6 +63,29 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
         "deepseek-v4-flash", provider="tokenrhythm"
     ) == (1_000_000, "catalog")
     assert catalog.resolve_max_tokens("deepseek-v4-flash", provider="tokenrhythm") == 384_000
+    assert catalog.resolve_context_window_with_source(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == (1_000_000, "catalog")
+    assert (
+        catalog.resolve_max_tokens(
+            "deepseek-v4-flash-0731", provider="tokenrhythm"
+        )
+        == 384_000
+    )
+    assert catalog.resolve_context_window_with_source(
+        "qwen3.7-flash", provider="tokenrhythm"
+    ) == (1_000_000, "catalog")
+    assert catalog.resolve_max_tokens("qwen3.7-flash", provider="tokenrhythm") == 65_536
+    qwen_flash_caps = catalog.get_capabilities(
+        "qwen3.7-flash", provider_name="tokenrhythm"
+    )
+    # TokenRhythm streams reasoning content but rejects thinking-toggle
+    # request fields, so the effective capability intentionally keeps the
+    # injectable reasoning dialect disabled.
+    assert qwen_flash_caps.supports_reasoning is False
+    assert qwen_flash_caps.reasoning_format == "none"
+    assert qwen_flash_caps.supports_tools is True
+    assert qwen_flash_caps.supports_vision is True
     # Discriminating rows — the bare-id merge would report the origin
     # providers' windows here, not the relay's published ones.
     assert catalog.resolve_context_window("glm-5", provider="tokenrhythm") == 1_000_000
@@ -76,6 +126,26 @@ def test_tokenrhythm_v4_flash_0731_offline_metadata_is_exact_and_scoped() -> Non
     ) == 384_000
 
     direct = catalog.resolve_entry("deepseek-v4-flash-0731", provider="deepseek")
+    assert direct.input_cost_per_mtok is None
+    assert direct.output_cost_per_mtok is None
+    assert direct.cache_read_cost_per_mtok is None
+
+
+def test_tokenrhythm_v4_pro_0813_offline_metadata_is_exact_and_scoped() -> None:
+    catalog = ModelCatalog()
+
+    entry = catalog.resolve_entry("deepseek-v4-pro-0813", provider="tokenrhythm")
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 384_000
+    assert entry.supports_reasoning is True
+    assert entry.supports_tools is True
+    assert entry.supports_vision is False
+    assert entry.reasoning_format == "none"
+    assert entry.input_cost_per_mtok == pytest.approx(1.2903225806451613)
+    assert entry.output_cost_per_mtok == pytest.approx(3.870967741935484)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.043010752688172046)
+
+    direct = catalog.resolve_entry("deepseek-v4-pro-0813", provider="deepseek")
     assert direct.input_cost_per_mtok is None
     assert direct.output_cost_per_mtok is None
     assert direct.cache_read_cost_per_mtok is None
@@ -288,6 +358,27 @@ def test_get_capabilities_honors_user_vision_override_on_live_reasoning_model() 
 
     assert caps.supports_reasoning is True
     assert caps.supports_vision is False
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="openrouter",
+    ) == "unsupported"
+
+
+def test_vision_support_distinguishes_live_evidence_from_synthesized_default() -> None:
+    catalog = _catalog_with_live_reasoning_model()
+
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="openrouter",
+    ) == "supported"
+    assert catalog.resolve_vision_support(
+        "vendor/unknown-model",
+        provider_name="openrouter",
+    ) == "unknown"
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="synthetic-provider",
+    ) == "unknown"
 
 
 @pytest.mark.parametrize(

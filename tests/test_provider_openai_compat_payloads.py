@@ -11,6 +11,7 @@ import structlog.testing
 
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.compat_policy import compat_policy_for_kind
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _build_openai_tool,
@@ -1854,6 +1855,250 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
+def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
+    monkeypatch: Any,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    original_definition = create_csv.model_copy(deep=True)
+    assert create_csv.allow_string_item_schema_projection is True
+    assert "allow_string_item_schema_projection" not in create_csv.model_dump()
+    assert (
+        "allow_string_item_schema_projection"
+        not in ToolDefinition.model_json_schema()["properties"]
+    )
+    assert create_csv.model_copy(deep=True).allow_string_item_schema_projection is True
+    assert (
+        ToolDefinition.model_validate(create_csv.model_dump())
+        .allow_string_item_schema_projection
+        is False
+    )
+    assert create_csv.input_schema.properties["rows"]["items"] == {"type": "array"}
+    assert _tool_schema_accepts_arguments(
+        create_csv,
+        {"rows": [["text", 1, True, None, {"x": 1}, ["nested"]]]},
+    )
+
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+    _collect_events(provider, ChatConfig(), tools=[create_csv])
+
+    wire_rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert wire_rows["items"] == {"type": "array", "items": {"type": "string"}}
+    assert create_csv == original_definition
+
+
+@pytest.mark.parametrize(
+    ("base_url", "tool_name"),
+    [
+        ("https://relay.example/v1", "create_csv"),
+        ("https://openrouter.ai/api/v1", "create_csv"),
+        ("https://generativelanguage.googleapis.com/v1beta/openai", "mcp_csv"),
+    ],
+)
+def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
+    monkeypatch: Any,
+    base_url: str,
+    tool_name: str,
+) -> None:
+    tool = ToolDefinition(
+        name=tool_name,
+        description="Create a CSV-like artifact.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url=base_url,
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert rows["items"] == {"type": "array"}
+
+
+def test_gemini_does_not_project_an_untrusted_same_named_tool(monkeypatch: Any) -> None:
+    tool = ToolDefinition.model_validate(
+        {
+            "name": "create_csv",
+            "description": "Third-party tool with unrelated row semantics.",
+            "input_schema": {
+                "properties": {
+                    "rows": {"type": "array", "items": {"type": "array"}}
+                },
+                "required": ["rows"],
+            },
+            "allow_string_item_schema_projection": True,
+            "_string_item_schema_projection_capability": True,
+        }
+    )
+    injected_copy = tool.model_copy(
+        update={
+            "allow_string_item_schema_projection": True,
+            "_string_item_schema_projection_capability": True,
+        }
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert tool.allow_string_item_schema_projection is False
+    assert injected_copy.allow_string_item_schema_projection is False
+    assert rows["items"] == {"type": "array"}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        " https://generativelanguage.googleapis.com/v1beta/openai",
+        "http://generativelanguage.googleapis.com/v1beta/openai",
+        "https://generativelanguage.googleapis.com:8443/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai/custom",
+        "https://user@generativelanguage.googleapis.com/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai?alt=sse",
+        "https://generativelanguage.googleapis.com/v1beta/openai#custom",
+    ],
+)
+def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
+    monkeypatch: Any,
+    base_url: str,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url=base_url,
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[create_csv])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert rows["items"] == {"type": "array"}
+
+
+def test_string_item_projection_preserves_schema_shaped_literals() -> None:
+    literal = {"type": "array"}
+    tool = ToolDefinition(
+        name="create_csv",
+        description="Create a CSV file.",
+        input_schema=ToolInputSchema(
+            properties={
+                "value": {
+                    "anyOf": [{"type": "array"}],
+                    "default": literal,
+                    "enum": [literal],
+                    "const": literal,
+                }
+            }
+        ),
+    )
+    original_definition = tool.model_copy(deep=True)
+
+    payload = _build_openai_tool(
+        tool,
+        complete_itemless_arrays_with_string_items=True,
+    )
+
+    value = payload["function"]["parameters"]["properties"]["value"]
+    assert value["anyOf"] == [{"type": "array", "items": {"type": "string"}}]
+    assert value["default"] == literal
+    assert value["enum"] == [literal]
+    assert value["const"] == literal
+    assert tool == original_definition
+
+
+def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
+    monkeypatch: Any,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    tool = create_csv.model_copy(
+        deep=True,
+        update={
+            "input_schema": ToolInputSchema(
+                properties={
+                    "all_of": {"allOf": [{"type": "array"}]},
+                    "any_of": {
+                        "anyOf": [
+                            {"type": ["array", "null"]},
+                            {"type": "string"},
+                        ]
+                    },
+                    "one_of": {"oneOf": [{"type": "array"}, {"type": "object"}]},
+                    "tuple": {
+                        "type": "array",
+                        "prefixItems": [{"type": "array"}],
+                    },
+                },
+            )
+        },
+    )
+    original_definition = tool.model_copy(deep=True)
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    properties = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]
+    assert properties["all_of"]["allOf"][0]["items"] == {"type": "string"}
+    assert properties["any_of"]["anyOf"][0]["items"] == {"type": "string"}
+    assert properties["one_of"]["oneOf"][0]["items"] == {"type": "string"}
+    assert properties["tuple"]["items"] == {"type": "string"}
+    assert properties["tuple"]["prefixItems"][0]["items"] == {"type": "string"}
+    assert tool == original_definition
+
+
 def test_deepseek_thinking_uses_provider_thinking_field_not_openai_reasoning_effort(
     monkeypatch: Any,
 ) -> None:
@@ -2440,6 +2685,220 @@ def test_zai_non_thinking_sends_provider_disabled_for_default_thinking_model(
     _collect(provider, cfg)
 
     assert captured["payload"]["thinking"] == {"type": "disabled"}
+
+
+_ZHIPU_CATALOG_MODELS = (
+    ("glm-4.5", True),
+    ("glm-4.5-air", True),
+    ("glm-4.5-flash", True),
+    ("glm-4.5v", True),
+    ("glm-4.6", False),
+    ("glm-4.6v", False),
+    ("glm-4.7", True),
+    ("glm-4.7-flash", True),
+    ("glm-4.7-flashx", True),
+    ("glm-5", True),
+    ("glm-5-turbo", True),
+    ("glm-5.1", True),
+    ("glm-5.2", True),
+    ("glm-5v-turbo", True),
+)
+
+
+def _project_zhipu_payload(
+    *,
+    model: str = "glm-5.2",
+    base_url: str,
+    thinking: bool,
+    capabilities: ModelCapabilities,
+    provider_kind: str = "zhipu",
+) -> dict[str, Any]:
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url=base_url,
+        provider_kind=provider_kind,
+    )
+    return provider.project_final_request(
+        [Message(role="user", content="hi")],
+        config=ChatConfig(
+            thinking=thinking,
+            thinking_level=ThinkingLevel.HIGH,
+            model_capabilities=capabilities,
+        ),
+    ).payload
+
+
+@pytest.mark.parametrize(("model", "supports_reasoning"), _ZHIPU_CATALOG_MODELS)
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "official"),
+    [
+        ("https://open.bigmodel.cn/api/paas/v4", True),
+        ("https://relay.example.test/v1", False),
+    ],
+)
+def test_all_zhipu_catalog_models_scope_zai_to_the_official_api_root(
+    model: str,
+    supports_reasoning: bool,
+    thinking: bool,
+    base_url: str,
+    official: bool,
+) -> None:
+    capabilities = ModelCatalog().get_capabilities(
+        model,
+        provider_name="zhipu",
+        base_url=base_url,
+    )
+    assert capabilities.supports_reasoning is supports_reasoning
+    assert capabilities.reasoning_format == ("zai" if supports_reasoning else "none")
+
+    payload = _project_zhipu_payload(
+        model=model,
+        base_url=base_url,
+        thinking=thinking,
+        capabilities=capabilities,
+    )
+
+    expected = {"type": "enabled" if thinking else "disabled"}
+    if official and supports_reasoning:
+        assert payload["thinking"] == expected
+    else:
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "official"),
+    [
+        ("https://open.bigmodel.cn/api/paas/v4", True),
+        ("HTTPS://OPEN.BIGMODEL.CN/api/paas/v4", True),
+        ("https://open.bigmodel.cn:443/api/paas/v4", True),
+        ("https://open.bigmodel.cn/api/paas/v4/", True),
+        ("http://open.bigmodel.cn/api/paas/v4", False),
+        ("http://open.bigmodel.cn:80/api/paas/v4", False),
+        ("https://open.bigmodel.cn:80/api/paas/v4", False),
+        ("https://open.bigmodel.cn:8443/api/paas/v4", False),
+        ("https://open.bigmodel.cn", False),
+        ("https://open.bigmodel.cn/api/paas", False),
+        ("https://open.bigmodel.cn/api/paas/v4/chat/completions", False),
+        ("https://user@open.bigmodel.cn/api/paas/v4", False),
+        ("https://user:pass@open.bigmodel.cn/api/paas/v4", False),
+        ("https://open.bigmodel.cn/api/paas/v4?relay=1", False),
+        ("https://open.bigmodel.cn/api/paas/v4#relay", False),
+        ("https://open.bigmodel.cn/api/paas/v4?", False),
+        ("https://open.bigmodel.cn/api/paas/v4#", False),
+        ("https://open.bigmodel.cn/api/paas/v4?#", False),
+        ("https://open.bigmodel.cn.evil.test/api/paas/v4", False),
+        ("https://evil-open.bigmodel.cn/api/paas/v4", False),
+        ("https://open.bigmodel.cn\\@evil.test/api/paas/v4", False),
+        ("https://open.bigmodel.cn:bad/api/paas/v4", False),
+        ("open.bigmodel.cn/api/paas/v4", False),
+    ],
+)
+def test_zhipu_zai_endpoint_identity_matrix(
+    base_url: str,
+    official: bool,
+    thinking: bool,
+) -> None:
+    payload = _project_zhipu_payload(
+        base_url=base_url,
+        thinking=thinking,
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    if official:
+        assert payload["thinking"] == {
+            "type": "enabled" if thinking else "disabled"
+        }
+    else:
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://trusted-zai-relay.example.test/v1",
+        "https://trusted-zai-relay.example.test/v1/%3F",
+        "https://trusted-zai-relay.example.test/v1;mode=compat",
+    ],
+)
+def test_custom_provider_with_explicit_zai_format_remains_available(
+    base_url: str,
+    thinking: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "custom/glm-5.2": {
+                "supports_reasoning": True,
+                "supports_tools": True,
+                "reasoning_format": "zai",
+            }
+        }
+    )
+    payload = _project_zhipu_payload(
+        base_url=base_url,
+        thinking=thinking,
+        provider_kind="custom",
+        capabilities=catalog.get_capabilities(
+            "glm-5.2",
+            provider_name="custom",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled" if thinking else "disabled"}
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_zhipu_model_override_with_non_zai_format_is_not_host_gated(
+    thinking: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "zhipu/glm-4.6": {
+                "supports_reasoning": True,
+                "supports_tools": True,
+                "reasoning_format": "deepseek",
+            }
+        }
+    )
+    payload = _project_zhipu_payload(
+        model="glm-4.6",
+        base_url="https://trusted-deepseek-relay.example.test/v1",
+        thinking=thinking,
+        capabilities=catalog.get_capabilities(
+            "glm-4.6",
+            provider_name="zhipu",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled" if thinking else "disabled"}
+    if thinking:
+        assert payload["reasoning_effort"] == "high"
+    else:
+        assert "reasoning_effort" not in payload
+
+
+def test_other_provider_zai_format_is_not_gated_by_zhipu_endpoint_policy() -> None:
+    payload = _project_zhipu_payload(
+        base_url="https://another-provider.example.test/v1",
+        thinking=True,
+        provider_kind="openai",
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled"}
 
 
 def test_dashscope_cache_on_marks_system_and_latest_user(monkeypatch: Any) -> None:

@@ -4,6 +4,7 @@ import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
   DesktopMainWindowCloseBehavior,
+  DesktopGatewayConnection,
   DesktopPreferences,
   DesktopRetryStartupResult,
   DesktopUpdateState,
@@ -47,6 +48,10 @@ declare global {
     dismissUpdate?: () => Promise<DesktopUpdateState>
     onUpdateState?: (callback: (payload: unknown) => void) => () => void
     getGatewayStatus: () => Promise<DesktopSettings['gateway']>
+    getGatewayConnection?: () => Promise<DesktopGatewayConnection>
+    onGatewayConnectionChanged?: (
+      callback: (payload: DesktopGatewayConnection) => void,
+    ) => () => void
     getCliInvocation?: () => Promise<unknown>
     revealGatewayLog: () => Promise<boolean>
     getDesktopSettings: () => Promise<DesktopSettings>
@@ -106,6 +111,19 @@ declare global {
       payload: NativeArtifactPreviewLeaseControlRequest,
     ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
     getWorkbenchCapabilities?: () => Promise<unknown>
+    getArtifactAnnotationCapabilities?: () => Promise<unknown>
+    setArtifactAnnotationMode?: (
+      payload: import('./platform/types').NativeArtifactAnnotationModeRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    showArtifactAnnotationOverlay?: (
+      payload: import('./platform/types').NativeArtifactAnnotationOverlayRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    closeArtifactAnnotationOverlay?: (
+      payload: import('./platform/types').NativeArtifactAnnotationOverlayCloseRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    screenshot?: (
+      payload: import('./platform/types').NativeArtifactScreenshotRequest,
+    ) => Promise<unknown>
     navigateWorkbenchSurface?: (
       payload: NativeWorkbenchNavigateRequest,
     ) => Promise<NativeWorkbenchSurfaceResult>

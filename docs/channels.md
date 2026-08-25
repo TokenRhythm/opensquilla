@@ -63,6 +63,16 @@ opensquilla channels add slack --name team-webhook \
   --token xoxb-...
 ```
 
+For a newly configured DingTalk channel, provide the application's Client ID
+and Client Secret plus the robot's separate Robot Code. `robot_code` is copied
+from the robot configuration in the DingTalk developer console; it is not the
+Client ID. Grant the app the basic enterprise-API and enterprise-robot message
+permissions (commonly shown as `qyapi_base` and `qyapi_robot_sendmsg`; verify
+the current names in the developer console). Set the advanced `cool_app_code`
+field only when the robot was installed through a Cool App and requires it.
+Legacy stream-only entries without these two new fields continue to load, but
+native artifact delivery remains unavailable until `robot_code` is configured.
+
 Restart the gateway process after config edits:
 
 ```sh
@@ -293,7 +303,7 @@ everything each vendor supports.
 | WeCom | Corp-app webhook and AI Bot websocket messaging. AI Bot live probing and websocket media upload are intentionally unsupported; inbound attachment resolution remains incomplete. Untargeted corp-app sends are rejected instead of broadcasting to `@all`. | [Callback encryption][wecom-callback], [app messages][wecom-messages] |
 | Matrix | Client-server sync and room messaging subset. Full encrypted-media/device-trust behavior and reaction/thread parity remain incomplete. | [Client-Server API v1.19][matrix-client] |
 | QQ | C2C/group text messaging subset. Rich-media, interaction, and complete recall coverage are not yet exposed despite current platform support. | [Message sending][qq-send], [rich media][qq-media] |
-| DingTalk | Stream-mode message/reply and selected card streaming. General inbound media and interactive-card action coverage remain incomplete. | [Robot replies and sends][dingtalk-messages], [card interaction][dingtalk-cards] |
+| DingTalk | Stream-mode message/reply, selected card streaming, and native outbound artifacts associated with the current inbound message. Inbound artifact parsing, proactive/cron attachment sends, and interactive-card action coverage remain incomplete. | [Robot replies and sends][dingtalk-messages], [card interaction][dingtalk-cards] |
 | Microsoft Teams | The legacy adapter is hidden and is not a supported public channel. It must migrate from Bot Framework to Teams SDK or Microsoft 365 Agents SDK before promotion. | [SDK comparison][teams-sdk], [Bot Framework migration][teams-migration] |
 
 ## Attachments and Artifacts
@@ -305,6 +315,30 @@ download/upload capabilities.
 
 When a channel cannot deliver a large artifact directly, use the Web UI artifact
 card or session export as the recovery path.
+
+### DingTalk outbound artifacts
+
+DingTalk can deliver artifacts generated while handling the current inbound
+group or direct message when `robot_code` is configured:
+
+- `.jpg`, `.png`, `.gif`, and `.bmp` are sent as native image messages. The
+  upload contract does not list `.jpeg`, so it follows the ZIP fallback below.
+- `.doc`, `.docx`, `.xlsx`, `.pdf`, `.zip`, and `.rar` are sent as native file
+  messages.
+- Other artifact formats are wrapped in a single-file ZIP named
+  `<original-filename>.zip`; the archive contains only the sanitized basename.
+- DingTalk documents a 20 MB maximum. This adapter enforces that as
+  `20 * 1024 * 1024` bytes for both the original artifact and final ZIP. Larger
+  artifacts stay available in the OpenSquilla task instead of being split.
+
+This support is outbound-only and contextual: OpenSquilla does not yet parse
+inbound DingTalk files/images into task attachments, and scheduled, cron, or
+other proactive turns cannot send attachments. Audio and video are not exposed
+as DingTalk artifact message types in this channel. These boundaries mean the
+DingTalk channel does not yet have full attachment parity with Feishu/Lark.
+The request shapes follow DingTalk's official [media upload][dingtalk-upload],
+[group send][dingtalk-group-send], [one-to-one send][dingtalk-oto-send], and
+[robot message type][dingtalk-message-types] documentation.
 
 ## Troubleshooting
 
@@ -347,6 +381,10 @@ If a channel does not respond:
 [qq-media]: https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/send-receive/rich-media.html
 [dingtalk-messages]: https://open.dingtalk.com/document/dingstart/robot-reply-and-send-messages
 [dingtalk-cards]: https://open.dingtalk.com/document/dingstart/using-event-chains-for-card-interaction
+[dingtalk-upload]: https://open.dingtalk.com/document/development/upload-media-files
+[dingtalk-group-send]: https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message
+[dingtalk-oto-send]: https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches
+[dingtalk-message-types]: https://open.dingtalk.com/document/development/robot-message-type
 [teams-sdk]: https://learn.microsoft.com/en-us/microsoftteams/platform/teams-sdk/teams/sdk-comparison
 [teams-migration]: https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/bf-migration-guidance
 

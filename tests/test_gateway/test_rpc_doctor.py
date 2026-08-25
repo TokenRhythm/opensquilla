@@ -268,6 +268,7 @@ async def test_doctor_status_includes_search_and_image_generation_findings(
         RpcContext(
             conn_id="test",
             config=GatewayConfig(
+                llm={"api_key": "sk-tokenrhythm-synthetic"},
                 search_provider="brave",
                 search_api_key_env="CUSTOM_SEARCH_KEY",
             ),
@@ -494,6 +495,116 @@ def test_router_payload_deep_mode_loads_runtime_and_classifies_native_error(
     assert deep["runtimeValid"] is False
     assert deep["runtimeErrorKind"] == "macos_libomp_missing"
     assert "libomp.dylib" in deep["error"]
+
+
+def test_router_payload_reports_mode_aware_provider_roles() -> None:
+    def config_for(selection_mode: str) -> GatewayConfig:
+        return GatewayConfig(
+            llm={"provider": "deepseek", "model": "deepseek-chat"},
+            llm_ensemble={"selection_mode": selection_mode},
+            squilla_router={
+                "enabled": True,
+                "tiers": {
+                    "c3": {
+                        "provider": "openrouter",
+                        "model": "synthetic/model",
+                        "ensemble_enabled": True,
+                    }
+                },
+            },
+        )
+
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    static = rpc_doctor._router_payload(
+        RpcContext(conn_id="static", config=config_for("static_openrouter_b5"))
+    )
+    dynamic = rpc_doctor._router_payload(
+        RpcContext(conn_id="dynamic", config=config_for("router_dynamic"))
+    )
+
+    assert static["routerProviderRoles"]["c3"] == "dormant_draft"
+    assert static["mismatchedTierProviders"] == {}
+    assert dynamic["routerProviderRoles"]["c3"] == "dynamic_member"
+    assert dynamic["mismatchedTierProviders"] == {"c3": "openrouter"}
+
+
+def test_router_payload_ignores_global_fixed_lineup_draft_providers() -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    config = GatewayConfig(
+        llm={"provider": "deepseek", "model": "deepseek-chat"},
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+        },
+        squilla_router={
+            "enabled": True,
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "openai", "model": "gpt-test"},
+                "c3": {"provider": "openrouter", "model": "synthetic/model"},
+                "image_model": {
+                    "provider": "openai",
+                    "model": "gpt-vision-test",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            },
+        },
+    )
+
+    payload = rpc_doctor._router_payload(RpcContext(conn_id="global", config=config))
+
+    assert payload["routerProviderRoles"] == {
+        "c0": "dormant_draft",
+        "c3": "dormant_draft",
+        "image_model": "direct",
+    }
+    assert payload["mismatchedTierProviders"] == {"image_model": "openai"}
+
+
+def test_llm_ensemble_payload_exposes_configured_failure_policy_as_effective() -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    payload = rpc_doctor._llm_ensemble_payload(
+        RpcContext(
+            conn_id="explicit-policy",
+            config=GatewayConfig(llm_ensemble={"all_failed_policy": "error"}),
+        )
+    )
+
+    assert payload["configuredAllFailedPolicy"] == "error"
+    assert payload["effectiveAllFailedPolicy"] == "error"
+    assert payload["policyDeprecated"] is False
+
+
+def test_llm_ensemble_payload_exposes_missing_fixed_fallback() -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    payload = rpc_doctor._llm_ensemble_payload(
+        RpcContext(
+            conn_id="missing-fixed",
+            config=GatewayConfig(
+                llm={
+                    "provider": "tokenrhythm",
+                    "model": "",
+                    "api_key": "synthetic-test-key",
+                },
+                llm_ensemble={
+                    "enabled": True,
+                    "selection_mode": "static_tokenrhythm_b5",
+                },
+            ),
+        )
+    )
+
+    assert payload["runtimeStatus"] == "blocked"
+    assert payload["configurationReady"] is False
+    assert payload["blockedReason"] == "missing_fixed_fallback"
+    assert payload["fixedFallbackReady"] is False
+    assert payload["fixedFallbackProvider"] == "tokenrhythm"
+    assert payload["fixedFallbackModel"] == ""
 
 
 @pytest.mark.asyncio
@@ -1032,6 +1143,96 @@ async def test_doctor_status_reports_static_tokenrhythm_b5_ready_when_keyed(
     ids = [finding["id"] for finding in response.payload["findings"]]
     assert "llm_ensemble.static_tokenrhythm_b5.credentials.missing" not in ids
     assert "llm_ensemble.static_tokenrhythm_b5.ready" in ids
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_retained_tier_plan_over_global_plan(
+    monkeypatch,
+) -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _patch_all_but_llm_ensemble(monkeypatch, rpc_doctor)
+
+    config = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "tiers": {
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "example/quality",
+                    "ensemble_selection_mode": "static_openrouter_b5",
+                }
+            },
+        },
+    )
+    response = await get_dispatcher().dispatch(
+        "req-1",
+        "doctor.status",
+        {},
+        RpcContext(conn_id="test", config=config),
+    )
+
+    assert response.ok is True
+    ids = [finding["id"] for finding in response.payload["findings"]]
+    assert "llm_ensemble.static_tokenrhythm_b5.ready" in ids
+    tier_finding = next(
+        finding
+        for finding in response.payload["findings"]
+        if finding["id"] == "llm_ensemble.static_openrouter_b5.credentials.missing"
+    )
+    assert tier_finding["evidence"]["activationSource"] == "router_tier"
+    assert tier_finding["evidence"]["activationTiers"] == ["C3"]
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_tier_managed_c3_ensemble_fallback_when_keyless(
+    monkeypatch,
+) -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    _patch_all_but_llm_ensemble(monkeypatch, rpc_doctor)
+
+    config = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "",
+        },
+        llm_ensemble={"enabled": False},
+    )
+    response = await get_dispatcher().dispatch(
+        "req-1",
+        "doctor.status",
+        {},
+        RpcContext(conn_id="test", config=config),
+    )
+
+    assert response.ok is True
+    finding = next(
+        finding
+        for finding in response.payload["findings"]
+        if finding["id"] == "llm_ensemble.fixed_fallback.not_ready"
+    )
+    assert finding["evidence"]["globalEnabled"] is False
+    assert finding["evidence"]["activationSource"] == "router_tier"
+    assert finding["evidence"]["activationTiers"] == ["C3"]
+    assert finding["evidence"]["fixedFallbackReady"] is False
+    assert finding["evidence"]["fixedFallbackProvider"] == "tokenrhythm"
+    assert "C3" in finding["detail"]
+    commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
+    assert "opensquilla config set llm_ensemble.enabled false" not in commands
 
 
 @pytest.mark.asyncio

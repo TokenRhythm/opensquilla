@@ -83,6 +83,9 @@
       :session-order="sidebarSessionOrder"
       :error="sessionListError"
       :loading="isLoading"
+      :loading-more="isLoadingMore"
+      :load-more-error="loadMoreError"
+      :has-more="hasMore"
       :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
@@ -90,6 +93,7 @@
       :can-create-projects="rpcStore.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
+      @load-more="loadMoreSessions"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
@@ -208,6 +212,7 @@
           :copy-live-text="chatRouteHeaderCopyLiveText"
           :deliverable-count="chatRouteHeaderDeliverableCount"
           :context-usage="chatRouteHeaderContextUsage"
+          :has-new-deliverable="chatRouteHeaderHasNewDeliverable"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
@@ -336,6 +341,11 @@
       </main>
       <AppWorkbench
         :enabled="appStore.features.artifactWorkbench === true"
+        :workbench-resources-enabled="(
+          appStore.features.documentWorkbenchResources === true
+          || appStore.features.artifactPromptAnnotations === true
+        )"
+        :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="currentSessionKey"
         :modal-blocked="workbenchModalBlocked"
@@ -511,6 +521,7 @@ import {
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
 import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
+import { createCoalescedRefresh } from './utils/coalescedRefresh'
 import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
@@ -528,10 +539,14 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
-// Chat-only transient chrome is coordinated independently from every modal and
-// from the non-chat topbar. The local menu refs remain authoritative elsewhere.
+// Every transient control in the global topbar shares one active owner. The
+// controls render on chat and non-chat routes, so route-scoped coordination
+// would allow sibling menus such as Language and Theme to overlap.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
-const chatTopbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(isChatRoute)
+const topbarPopoverCoordinationEnabled = ref(true)
+const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
+  topbarPopoverCoordinationEnabled,
+)
 const chatRouteHeader = provideChatRouteHeaderBridge()
 const {
   visible: chatRouteHeaderVisible,
@@ -541,6 +556,7 @@ const {
   copyLiveText: chatRouteHeaderCopyLiveText,
   deliverableCount: chatRouteHeaderDeliverableCount,
   contextUsage: chatRouteHeaderContextUsage,
+  hasNewDeliverable: chatRouteHeaderHasNewDeliverable,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,
 } = chatRouteHeader.model
@@ -605,7 +621,16 @@ const router = useRouter()
 watch(() => appStore.locale, () => {
   document.title = `${routeTitle($route)} — OpenSquilla`
 })
-const { allSessions, sessionListError, isLoading, loadSessions } = useSessions(
+const {
+  allSessions,
+  sessionListError,
+  isLoading,
+  isLoadingMore,
+  loadMoreError,
+  hasMore,
+  loadSessions,
+  loadMoreSessions,
+} = useSessions(
   optionalSessionRpcCallOptions,
 )
 const { bottomRoutes, workNav } = useNavigation()
@@ -755,7 +780,7 @@ const themeMenuOpen = ref(false)
 useChatTopbarPopoverCoordination(
   'theme',
   themeMenuOpen,
-  chatTopbarPopoverCoordinator,
+  topbarPopoverCoordinator,
 )
 const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
@@ -782,7 +807,7 @@ function pickTheme(mode: ThemeMode) {
 function openMoreThemes() {
   themeMenuOpen.value = false
   handleNavClick()
-  router.push('/settings/appearance')
+  router.push('/settings/interface')
 }
 
 useDocumentEvent('click', (e) => {
@@ -1127,9 +1152,6 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
 }
 
-let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
-let sidebarRefreshPending = false
-let sidebarLoadPromise: Promise<void> | null = null
 let appAutomaticRpcMounted = false
 let appAutomaticRpcStarted = false
 
@@ -1363,14 +1385,28 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
     return
   }
   projectCreateBusy.value = true
+  const existingWorkspaceIds = new Set(
+    projectWorkspaces.workspaces.value.map(workspace => workspace.id),
+  )
   try {
     const workspace = await projectWorkspaces.openWorkspace(path)
     if (!workspace) throw new Error('Gateway returned an empty project.')
+    const alreadyExists = existingWorkspaceIds.has(workspace.id)
+    const renamedExisting = alreadyExists && workspace.name !== name
     if (workspace.name !== name) {
       await projectWorkspaces.renameWorkspace(workspace.id, name)
     }
     resetProjectCreator()
-    pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    if (alreadyExists) {
+      pushToast(t(
+        renamedExisting
+          ? 'workspaces.projectExistingRenamed'
+          : 'workspaces.projectAlreadyExists',
+        { name },
+      ), { tone: 'info' })
+    } else {
+      pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    }
   } catch (err) {
     projectCreateBusy.value = false
     projectCreateConfirming.value = false
@@ -1637,40 +1673,24 @@ function openSettings() {
 // Topbar connection pill (web): jump straight to the Connection section so the
 // gateway link can be inspected or re-pointed.
 function openConnectionSettings() {
-  router.push('/settings/connection')
+  router.push('/settings/gateway#connection')
 }
 
 // Compact chat headers hand off to the complete Desktop update workflow rather
 // than recreating update actions inside the status summary.
 function openDesktopRuntimeSettings() {
-  router.push('/settings/runtime')
+  router.push('/settings/gateway#runtime')
 }
 
 function scheduleSessionRefresh() {
-  sidebarRefreshPending = true
-  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
-  sessionRefreshTimer = setTimeout(() => {
-    sessionRefreshTimer = null
-    flushScheduledSidebarRefresh()
-  }, 150)
+  sidebarRefresh.schedule()
 }
 
 function flushScheduledSidebarRefresh() {
-  if (
-    !sidebarRefreshPending
-    || !appAutomaticRpcMounted
-    || !optionalSessionRpcAllowed.value
-  ) return
-  sidebarRefreshPending = false
-  if (sessionRefreshTimer) {
-    clearTimeout(sessionRefreshTimer)
-    sessionRefreshTimer = null
-  }
-  void loadSidebarData()
+  sidebarRefresh.flush()
 }
 
-function loadSidebarData(): Promise<void> {
-  if (sidebarLoadPromise) return sidebarLoadPromise
+async function performSidebarLoad(): Promise<void> {
   const requests: Promise<unknown>[] = [loadSessions()]
   if (
     rpcStore.canManageProjectWorkspaces
@@ -1680,17 +1700,22 @@ function loadSidebarData(): Promise<void> {
       projectWorkspaces.loadWorkspaces(optionalSessionRpcCallOptions),
     )
   }
-  const request = Promise.allSettled(requests).then(() => undefined)
-  const tracked = request.finally(() => {
-    if (sidebarLoadPromise === tracked) sidebarLoadPromise = null
-  })
-  sidebarLoadPromise = tracked
-  return tracked
+  await Promise.allSettled(requests)
+}
+
+const sidebarRefresh = createCoalescedRefresh({
+  run: performSidebarLoad,
+  allowed: () => appAutomaticRpcMounted && optionalSessionRpcAllowed.value,
+  delayMs: 150,
+})
+
+function loadSidebarData(): Promise<void> {
+  return sidebarRefresh.load()
 }
 
 function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
   if (!optionalSessionRpcAllowed.value) {
-    sidebarRefreshPending = true
+    sidebarRefresh.defer()
     return
   }
   return loadSidebarData()
@@ -1973,11 +1998,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   appAutomaticRpcMounted = false
-  sidebarRefreshPending = false
+  sidebarRefresh.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.removeEventListener('focus', markCurrentSessionReadIfVisible)
   document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionListSubscription.cleanup()
   unsubscribeApprovals()
   unsubscribeCronFinished?.()

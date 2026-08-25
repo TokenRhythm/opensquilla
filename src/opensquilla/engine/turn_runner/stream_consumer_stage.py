@@ -30,7 +30,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
 import structlog
 
@@ -38,8 +38,14 @@ from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.route_plan import route_plan_snapshot
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
 from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+    SILENT_REPLY_SENTINELS,
+)
 
 if TYPE_CHECKING:
+    from opensquilla.contracts.turn_execution import TurnExecutionContext
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.agent_injection import PendingInputProvider
     from opensquilla.engine.artifact_delivery import OmittedArtifactPublishResult
@@ -48,6 +54,7 @@ if TYPE_CHECKING:
         AgentEvent,
         ArtifactEvent,
         CompactionEvent,
+        ControlTerminalEvent,
         DoneEvent,
         ErrorEvent,
         TextDeltaEvent,
@@ -66,6 +73,65 @@ _SUPPRESS: Final = object()
 _CURRENT_SILENT_REPLY_TEXT_MARKER: Final = (
     "_opensquilla_current_silent_reply_text"
 )
+_HUMAN_SILENT_REPLY_PREFIX_MAX_CHARS: Final = 64
+
+
+def _could_be_human_silent_reply_prefix(text: str) -> bool:
+    """Hold only a short initial payload that can still be a silent sentinel.
+
+    The character bound limits how much ordinary response text can be withheld.
+    """
+
+    if len(text) > _HUMAN_SILENT_REPLY_PREFIX_MAX_CHARS:
+        return False
+    candidate = text.strip()
+    if not candidate:
+        return True
+    return any(sentinel.startswith(candidate) for sentinel in SILENT_REPLY_SENTINELS)
+
+
+def _move_held_human_text_to_current_tail(
+    state: _StreamState,
+    held_text: str,
+) -> bool:
+    """Move withheld text after public non-text events in the durable timeline.
+
+    Tool and activity events remain live while the short prefix is withheld. If
+    the prefix later proves to be ordinary text, the client necessarily sees it
+    after those events. Reposition the matching text carriers so a history reload
+    preserves that same order. The rewrite is all-or-nothing and never changes
+    non-text segments.
+    """
+
+    remaining = held_text
+    rewritten_segments: list[dict[str, Any]] = []
+    for raw_segment in state.turn_segments:
+        segment = dict(raw_segment)
+        if segment.get("type") != "text" or not remaining:
+            rewritten_segments.append(segment)
+            continue
+        text = str(segment.get("text") or "")
+        if remaining.startswith(text):
+            remaining = remaining[len(text) :]
+            continue
+        if text.startswith(remaining):
+            suffix = text[len(remaining) :]
+            remaining = ""
+            if suffix:
+                segment["text"] = suffix
+                rewritten_segments.append(segment)
+            continue
+        return False
+
+    current_text = "".join(state.current_text_parts)
+    if remaining:
+        if not current_text.startswith(remaining):
+            return False
+        current_text = current_text[len(remaining) :]
+
+    state.turn_segments[:] = rewritten_segments
+    state.current_text_parts[:] = [held_text + current_text]
+    return True
 
 # ---------------------------------------------------------------------------
 # Ports -- five narrow Protocols + one callable
@@ -199,7 +265,7 @@ class MemorySyncNotifyPort(Protocol):
 WarningTransformer = Callable[["WarningEvent"], "WarningEvent"]
 
 # ---------------------------------------------------------------------------
-# Stream state -- four owned + four pass-by-reference accumulators
+# Stream state -- four owned + five pass-by-reference accumulators
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -221,16 +287,25 @@ class _StreamState:
 
     # Moved INTO stage scope (declared inline before the stage extraction).
     current_text_parts: list[str] = field(default_factory=list)
+    # Presentation for ``current_text_parts``. Persisted text segments carry
+    # this additive field so history reloads can distinguish user-visible work
+    # narration from the terminal answer. ``answer`` is the compatibility
+    # default for legacy producers and rows that predate the field.
+    current_text_presentation: Literal["intermediate", "answer"] = "answer"
     error_message: str | None = None
     pending_error_event: ErrorEvent | None = None
     done_event: DoneEvent | None = None
     # PASSED IN by the harness -- references, not copies.
     final_text_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
     turn_segments: list[dict] = field(default_factory=list)
     turn_artifacts: list[dict[str, Any]] = field(default_factory=list)
     artifact_delivery_failures: list[str] = field(default_factory=list)
     artifact_delivery_failures_by_target: dict[str, str] = field(default_factory=dict)
     completed_meta_skill_without_text: str | None = None
+    reasoning: list[str] = field(default_factory=list)
+    terminal_generation_reset: bool = False
+    control_terminal_event: ControlTerminalEvent | None = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +379,53 @@ class StreamConsumerStageInput:
     # ``system_event``; their text is held until the terminal snapshot can be
     # canonicalized so silent-reply protocol markers never flash on a client.
     input_mode: str = "user"
+    execution_context: TurnExecutionContext | None = None
+
+
+def _supports_realtime_generation(inp: StreamConsumerStageInput) -> bool:
+    """Return whether this delivery surface can retract speculative output."""
+
+    context = inp.execution_context
+    if context is None:
+        return True
+    surface = context.surface
+    return bool(
+        surface.supports_streaming
+        and surface.supports_edit
+        and surface.supports_generation_reset
+    )
+
+
+def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
+    """Return whether a direct stream consumer declared reset support."""
+
+    context = inp.execution_context
+    if context is None:
+        # Preserve the existing in-process API for callers that have not yet
+        # adopted explicit surface capability negotiation.
+        return True
+    return bool(context.surface.supports_generation_reset)
+
+
+def _control_reason_for_error_code(code: Any) -> Any | None:
+    """Map only typed control/error codes; provider failures stay recoverable."""
+
+    from opensquilla.engine.types import ControlTerminalReason
+
+    normalized = str(code or "").strip().lower().replace("-", "_")
+    return {
+        "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
+        "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
+        "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
+        "shutdown": ControlTerminalReason.SHUTDOWN,
+        "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
+        "cancel": ControlTerminalReason.CANCEL,
+        "cancelled": ControlTerminalReason.CANCEL,
+        "canceled": ControlTerminalReason.CANCEL,
+        "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
+        "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
+        "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
+    }.get(normalized)
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -314,6 +436,37 @@ def _has_tool_boundary(state: _StreamState) -> bool:
         segment.get("type") in {"tool_use", "tool_result"}
         for segment in state.turn_segments
     )
+
+
+def _reset_generation_stream_state(state: _StreamState) -> None:
+    """Discard answer state for a replaced generation, retaining completed tools."""
+
+    completed_tool_ids = {
+        str(segment.get("tool_use_id"))
+        for segment in state.turn_segments
+        if isinstance(segment, dict)
+        and segment.get("type") == "tool_result"
+        and segment.get("tool_use_id")
+    }
+    state.current_text_parts[:] = []
+    state.final_text_parts[:] = []
+    state.reasoning[:] = []
+    state.reasoning_parts[:] = []
+    state.error_message = None
+    state.pending_error_event = None
+    state.done_event = None
+    state.turn_segments[:] = [
+        segment
+        for segment in state.turn_segments
+        if not isinstance(segment, dict)
+        or (
+            segment.get("type") != "text"
+            and (
+                segment.get("type") != "tool_use"
+                or str(segment.get("tool_use_id")) in completed_tool_ids
+            )
+        )
+    ]
 
 
 def _normalize_cumulative_text_delta(text: str, state: _StreamState) -> str:
@@ -332,6 +485,44 @@ def _normalize_cumulative_text_delta(text: str, state: _StreamState) -> str:
     return text
 
 
+def _normalize_text_presentation(value: object) -> Literal["intermediate", "answer"]:
+    """Normalize optional or legacy presentation values to the answer default."""
+
+    return "intermediate" if value == "intermediate" else "answer"
+
+
+def _flush_current_text_segment(state: _StreamState) -> None:
+    """Persist the current text run without losing its presentation metadata."""
+
+    if not state.current_text_parts:
+        return
+    state.turn_segments.append(
+        {
+            "type": "text",
+            "text": "".join(state.current_text_parts),
+            "presentation": state.current_text_presentation,
+        }
+    )
+    state.current_text_parts[:] = []
+
+
+def _append_current_text(
+    state: _StreamState,
+    text: str,
+    *,
+    presentation: object,
+) -> None:
+    """Append text while keeping unlike presentation runs as separate segments."""
+
+    if not text:
+        return
+    normalized = _normalize_text_presentation(presentation)
+    if state.current_text_parts and state.current_text_presentation != normalized:
+        _flush_current_text_segment(state)
+    state.current_text_presentation = normalized
+    state.current_text_parts.append(text)
+
+
 class _TextDeltaHandler:
     """Accumulate streamed text deltas into the final-text and current-text buffers."""
 
@@ -343,7 +534,11 @@ class _TextDeltaHandler:
         canonical_delta = _normalize_cumulative_text_delta(event.text, state)
         if canonical_delta:
             state.final_text_parts.append(canonical_delta)
-            state.current_text_parts.append(canonical_delta)
+            _append_current_text(
+                state,
+                canonical_delta,
+                presentation=event.presentation,
+            )
         return replace(event, text=canonical_delta)
 
 class _ToolUseStartHandler:
@@ -354,11 +549,7 @@ class _ToolUseStartHandler:
         event: ToolUseStartEvent,
         state: _StreamState,
     ) -> ToolUseStartEvent:
-        if state.current_text_parts:
-            state.turn_segments.append(
-                {"type": "text", "text": "".join(state.current_text_parts)}
-            )
-            state.current_text_parts[:] = []
+        _flush_current_text_segment(state)
         state.turn_segments.append(
             {
                 "type": "tool_use",
@@ -554,6 +745,7 @@ class _WarningHandler:
         if accumulated_text.endswith(current_text):
             state.final_text_parts[:] = [accumulated_text[: -len(current_text)]]
         state.current_text_parts[:] = []
+        state.current_text_presentation = "answer"
 
 @dataclass
 class _DonePrePublish:
@@ -1017,22 +1209,29 @@ def _reconcile_done_text_snapshot(
 
         suffix = done_text[len(accumulated_text) :]
         state.final_text_parts.append(suffix)
-        state.current_text_parts.append(suffix)
-        return done_text, _TextDeltaEvent(text=suffix)
+        _append_current_text(state, suffix, presentation="answer")
+        return done_text, _TextDeltaEvent(text=suffix, presentation="answer")
 
     # The terminal aggregate is a complete Agent-owned snapshot. A mismatch means
     # streamed text was intentionally superseded (retry, recovery, or a producer
     # that emitted a cumulative final value). Keep non-text segments so tool
     # execution history is never erased, but collapse text to one canonical value.
+    if state.current_text_parts and state.current_text_presentation == "intermediate":
+        _flush_current_text_segment(state)
     state.final_text_parts[:] = [done_text] if done_text else []
     state.turn_segments[:] = [
         segment
         for segment in state.turn_segments
-        if not (isinstance(segment, dict) and segment.get("type") == "text")
+        if not (
+            isinstance(segment, dict)
+            and segment.get("type") == "text"
+            and _normalize_text_presentation(segment.get("presentation")) == "answer"
+        )
     ]
     state.current_text_parts[:] = (
         [done_text] if done_text and state.turn_segments else []
     )
+    state.current_text_presentation = "answer"
     return done_text, None
 
 
@@ -1054,6 +1253,7 @@ def _silent_reply_state_projection(
             {
                 "type": "text",
                 "text": current_text,
+                "presentation": state.current_text_presentation,
                 _CURRENT_SILENT_REPLY_TEXT_MARKER: True,
             }
         )
@@ -1088,14 +1288,19 @@ def _apply_silent_reply_normalization_to_state(
 
     turn_segments: list[dict[str, Any]] = []
     normalized_current = ""
+    normalized_current_presentation: Literal["intermediate", "answer"] = "answer"
     for raw_segment in projection.normalization.segments:
         segment = dict(raw_segment)
         if segment.pop(_CURRENT_SILENT_REPLY_TEXT_MARKER, False):
             normalized_current += str(segment.get("text") or "")
+            normalized_current_presentation = _normalize_text_presentation(
+                segment.get("presentation")
+            )
             continue
         turn_segments.append(segment)
     state.turn_segments[:] = turn_segments
     state.current_text_parts[:] = [normalized_current] if normalized_current else []
+    state.current_text_presentation = normalized_current_presentation
     state.final_text_parts[:] = (
         [projection.canonical_text] if projection.canonical_text else []
     )
@@ -1128,7 +1333,7 @@ def _append_done_notice_delta(
     separator = "\n\n" if accumulated_text.strip() else ""
     notice_delta = separator + notice
     state.final_text_parts.append(notice_delta)
-    state.current_text_parts.append(notice_delta)
+    _append_current_text(state, notice_delta, presentation="answer")
     final_text = "".join(state.final_text_parts)
     event = replace(
         event,
@@ -1138,7 +1343,7 @@ def _append_done_notice_delta(
         suppression_reason=None,
     )
     state.done_event = event
-    return event, _TextDeltaEvent(text=notice_delta)
+    return event, _TextDeltaEvent(text=notice_delta, presentation="answer")
 
 
 def _is_completed_meta_invoke(event: ToolResultEvent) -> bool:
@@ -1520,20 +1725,51 @@ class StreamConsumerStage:
             compaction_hooks=compaction_hooks,
         )
 
+    async def _adopt_generated_artifact(
+        self,
+        event: ArtifactEvent,
+        tool_context: Any | None,
+    ) -> None:
+        """Best-effort canonicalization before an artifact becomes public.
+
+        The artifact has already been recorded in the shared turn state before
+        this hook runs, so cancellation or adoption failure can never orphan a
+        successfully published deliverable from transcript persistence.
+        """
+
+        adopter = getattr(tool_context, "generated_artifact_adopter", None)
+        if not callable(adopter):
+            return
+        try:
+            await adopter(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - artifact delivery must survive adoption
+            log.warning(
+                "generated_artifact_adoption_failed",
+                artifact_id=str(getattr(event, "id", "") or ""),
+                mime=str(getattr(event, "mime", "") or ""),
+                error_type=type(exc).__name__,
+            )
+
     async def run(
         self,
         inp: StreamConsumerStageInput,
     ) -> AsyncIterator[AgentEvent]:
         # Late imports keep the module import-cycle-free.
         from opensquilla.engine.types import (
+            AnswerGenerationResetEvent,
             ArtifactEvent,
             CompactionEvent,
+            ControlTerminalEvent,
             DoneEvent,
             EnsembleProgressEvent,
             ErrorEvent,
             TextDeltaEvent,
+            ThinkingEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
+            ToolUseEndEvent,
             ToolUseStartEvent,
             WarningEvent,
             done_text_snapshot,
@@ -1547,10 +1783,39 @@ class StreamConsumerStage:
             inp.input_mode == "system_event"
             and inp.run_kind in {"goal", "heartbeat"}
         )
+        gate_human_silent_reply_prefix = inp.input_mode != "system_event"
+        human_silent_reply_prefix_open = gate_human_silent_reply_prefix
+        held_human_silent_reply_text = ""
+        human_prefix_crossed_public_boundary = False
         buffered_text_observed = False
         released_system_event_text: str | None = None
         released_system_event_source_text: str | None = None
         released_suppressed_source_text: str | None = None
+        realtime_generation = _supports_realtime_generation(inp)
+        supports_generation_reset = _supports_generation_reset(inp)
+        deferred_generation_events: list[AgentEvent] = []
+
+        def _is_deferred_generation_event(candidate: object) -> bool:
+            return isinstance(
+                candidate,
+                (
+                    TextDeltaEvent,
+                    ThinkingEvent,
+                    ToolUseStartEvent,
+                    ToolUseDeltaEvent,
+                    ToolUseEndEvent,
+                    ToolResultEvent,
+                    ArtifactEvent,
+                ),
+            )
+
+        def _drop_speculative_text() -> None:
+            deferred_generation_events[:] = [
+                candidate
+                for candidate in deferred_generation_events
+                if not isinstance(candidate, (TextDeltaEvent, ThinkingEvent))
+            ]
+
         async for event in self._agent_run.run_turn(
             inp.agent,
             turn_input=inp.turn_input,
@@ -1560,7 +1825,67 @@ class StreamConsumerStage:
         ):
             transformed: AgentEvent | object
             extra_yields: list[AgentEvent] = []
-            if isinstance(event, TextDeltaEvent):
+            if isinstance(event, AnswerGenerationResetEvent):
+                _reset_generation_stream_state(state)
+                if not realtime_generation:
+                    _drop_speculative_text()
+                terminal_snapshot = ""
+                if event.terminal:
+                    terminal_snapshot = str(
+                        event.terminal_text_snapshot
+                        or event.authoritative_text_snapshot
+                        or "The model could not complete this answer."
+                    )
+                    if terminal_snapshot:
+                        state.current_text_parts.append(terminal_snapshot)
+                        state.final_text_parts.append(terminal_snapshot)
+                    state.terminal_generation_reset = True
+                    # A terminal replacement is the only public failure
+                    # payload, but finalization still needs the same typed
+                    # failure state as an ordinary ErrorEvent so it can write
+                    # turn_errors and a failed durable outcome.
+                    self._error_handler.handle(
+                        ErrorEvent(
+                            message=(
+                                event.terminal_error_message
+                                or "The model provider request failed."
+                            ),
+                            code=(
+                                event.terminal_error_code
+                                or "ensemble_fixed_error"
+                            ),
+                            failure_kind=(
+                                event.terminal_failure_kind or "unknown"
+                            ),
+                            generation_epoch=event.new_generation_epoch,
+                        ),
+                        state,
+                    )
+                if supports_generation_reset:
+                    # Keep the typed failure taxonomy on the trusted
+                    # in-process event until TaskRuntime has classified the
+                    # durable outcome. Gateway serializers scrub these fields
+                    # at the public transport boundary.
+                    transformed = event
+                elif event.terminal:
+                    transformed = ErrorEvent(
+                        message=terminal_snapshot,
+                        code="ensemble_fixed_error",
+                        generation_epoch=event.new_generation_epoch,
+                    )
+                else:
+                    transformed = _SUPPRESS
+            elif isinstance(event, ControlTerminalEvent):
+                state.control_terminal_event = event
+                if not realtime_generation:
+                    _drop_speculative_text()
+                transformed = event
+            elif isinstance(event, ThinkingEvent):
+                if event.text:
+                    state.reasoning.append(event.text)
+                    state.reasoning_parts.append(event.text)
+                transformed = event
+            elif isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
                 if buffer_system_event_text:
                     if event.text and not buffered_text_observed:
@@ -1572,9 +1897,30 @@ class StreamConsumerStage:
                         )
                         buffered_text_observed = True
                     transformed = _SUPPRESS
+                elif human_silent_reply_prefix_open:
+                    held_human_silent_reply_text += transformed.text
+                    if _could_be_human_silent_reply_prefix(
+                        held_human_silent_reply_text
+                    ):
+                        transformed = _SUPPRESS
+                    else:
+                        if human_prefix_crossed_public_boundary:
+                            _move_held_human_text_to_current_tail(
+                                state,
+                                held_human_silent_reply_text,
+                            )
+                        transformed = replace(
+                            transformed,
+                            text=held_human_silent_reply_text,
+                        )
+                        held_human_silent_reply_text = ""
+                        human_silent_reply_prefix_open = False
+                        human_prefix_crossed_public_boundary = False
             elif isinstance(event, ToolUseStartEvent):
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):
+                transformed = event
+            elif isinstance(event, ToolUseEndEvent):
                 transformed = event
             elif isinstance(event, ToolResultEvent):
                 transformed = self._tool_result_handler.handle(
@@ -1584,8 +1930,25 @@ class StreamConsumerStage:
                 )
             elif isinstance(event, ArtifactEvent):
                 transformed = self._artifact_handler.handle(event, state)
+                await self._adopt_generated_artifact(event, inp.tool_context)
             elif isinstance(event, ErrorEvent):
                 transformed = self._error_handler.handle(event, state)
+                if (
+                    human_silent_reply_prefix_open
+                    and held_human_silent_reply_text
+                ):
+                    # A provider failure can terminate while a sentinel is only
+                    # partially streamed. Do not persist or reveal that control
+                    # prefix as a user-visible partial answer.
+                    _reconcile_done_text_snapshot(
+                        "",
+                        state,
+                        accumulated_text="".join(state.final_text_parts),
+                        authoritative=True,
+                    )
+                    held_human_silent_reply_text = ""
+                    human_silent_reply_prefix_open = False
+                    human_prefix_crossed_public_boundary = False
                 if buffer_system_event_text:
                     from opensquilla.engine.silent_reply import (
                         is_silent_reply_prefix,
@@ -1670,6 +2033,20 @@ class StreamConsumerStage:
             elif isinstance(event, WarningEvent):
                 transformed = self._warning_handler.handle(event, state)
             elif isinstance(event, DoneEvent):
+                if state.terminal_generation_reset:
+                    # Agent may emit one accounting-only DoneEvent after a
+                    # terminal generation replacement when failed physical
+                    # attempts carried usage. Preserve that receipt for the
+                    # finalizer, but the terminal reset remains the only public
+                    # outcome and its friendly snapshot remains authoritative.
+                    terminal_snapshot = "".join(state.final_text_parts)
+                    state.done_event = replace(
+                        event,
+                        text=terminal_snapshot,
+                        text_snapshot=terminal_snapshot,
+                    )
+                    transformed = _SUPPRESS
+                    continue
                 if (
                     buffer_system_event_text
                     and released_system_event_source_text is not None
@@ -1771,6 +2148,12 @@ class StreamConsumerStage:
                 transformed, extra_yields = self._done_handler.post_publish(
                     pre, publish_result, inp, state
                 )
+                for extra_event in extra_yields:
+                    if isinstance(extra_event, ArtifactEvent):
+                        await self._adopt_generated_artifact(
+                            extra_event,
+                            inp.tool_context,
+                        )
                 if buffer_system_event_text:
                     # Text deltas generated by reconciliation/notices are
                     # replaced with one canonical terminal answer.  Non-text
@@ -1791,6 +2174,59 @@ class StreamConsumerStage:
                     if release_delta:
                         extra_yields.insert(0, TextDeltaEvent(text=release_delta))
                     released_system_event_text = canonical_text
+                elif (
+                    human_silent_reply_prefix_open
+                    and held_human_silent_reply_text
+                ):
+                    # A short initial candidate was withheld while it could
+                    # still be a control token. Once Done proves the payload is
+                    # visible, release one canonical delta and discard any
+                    # notice/reconciliation deltas that would duplicate it.
+                    extra_yields = [
+                        extra_event
+                        for extra_event in extra_yields
+                        if not isinstance(extra_event, TextDeltaEvent)
+                    ]
+                    snapshot_present, canonical_text = done_text_snapshot(transformed)
+                    if not snapshot_present:
+                        canonical_text = transformed.text
+                    if canonical_text and human_prefix_crossed_public_boundary:
+                        _move_held_human_text_to_current_tail(
+                            state,
+                            held_human_silent_reply_text,
+                        )
+                    if canonical_text:
+                        extra_yields.insert(0, TextDeltaEvent(text=canonical_text))
+                    held_human_silent_reply_text = ""
+                    human_silent_reply_prefix_open = False
+                    human_prefix_crossed_public_boundary = False
+
+                human_silent_reply_disallowed = (
+                    inp.input_mode != "system_event"
+                    and transformed.delivery == "suppressed"
+                    and transformed.suppression_reason
+                    in {"no_reply", "heartbeat_ack"}
+                    and not transformed.text.strip()
+                )
+                if human_silent_reply_disallowed:
+                    # Keep the usage-bearing DoneEvent in state for transcript
+                    # usage/session totals, but replace the public success
+                    # terminal with the existing error path. The outer runner
+                    # emits pending_error_event only after finalization.
+                    extra_yields = [
+                        extra_event
+                        for extra_event in extra_yields
+                        if not isinstance(extra_event, TextDeltaEvent)
+                    ]
+                    if state.pending_error_event is None:
+                        self._error_handler.handle(
+                            ErrorEvent(
+                                message=SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+                                code=SILENT_REPLY_NOT_ALLOWED_CODE,
+                            ),
+                            state,
+                        )
+                    transformed = _SUPPRESS
             elif isinstance(event, CompactionEvent):
                 await self._compaction_handler.handle(event, inp)
                 transformed = _SUPPRESS
@@ -1807,14 +2243,48 @@ class StreamConsumerStage:
                     output_tokens=event.output_tokens,
                     cost_usd=event.cost_usd,
                     error=event.error,
+                    generation_epoch=event.generation_epoch,
                 )
             else:
                 transformed = event
 
+            if (
+                human_silent_reply_prefix_open
+                and bool(held_human_silent_reply_text)
+                and not isinstance(event, (TextDeltaEvent, ErrorEvent, DoneEvent))
+                and (bool(extra_yields) or transformed is not _SUPPRESS)
+            ):
+                human_prefix_crossed_public_boundary = True
+
+            if realtime_generation:
+                for extra_event in extra_yields:
+                    yield extra_event
+                if transformed is not _SUPPRESS:
+                    yield transformed  # type: ignore[misc]
+                continue
+
             for extra_event in extra_yields:
-                yield extra_event
-            if transformed is not _SUPPRESS:
-                yield transformed  # type: ignore[misc]
+                if _is_deferred_generation_event(extra_event):
+                    deferred_generation_events.append(extra_event)
+                else:
+                    yield extra_event
+
+            if transformed is _SUPPRESS:
+                continue
+            if _is_deferred_generation_event(transformed):
+                deferred_generation_events.append(transformed)  # type: ignore[arg-type]
+                continue
+            if isinstance(
+                transformed,
+                (DoneEvent, ErrorEvent, ControlTerminalEvent),
+            ) or (
+                isinstance(transformed, AnswerGenerationResetEvent)
+                and transformed.terminal
+            ):
+                for deferred_event in deferred_generation_events:
+                    yield deferred_event
+                deferred_generation_events.clear()
+            yield transformed  # type: ignore[misc]
 
         # Post-stream: notify sync manager once.
         self._memory_sync_notify.notify_message_bytes(

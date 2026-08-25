@@ -22,6 +22,7 @@ interface RegistrySearchData {
 
 export interface InstallResult {
   success: boolean
+  cancelled?: boolean
   unchanged?: boolean
   name?: string
   message?: string
@@ -45,6 +46,8 @@ export interface InstallResult {
 export type SkillInstallQueueStatus =
   | 'queued'
   | 'installing'
+  | 'cancelling'
+  | 'cancelled'
   | 'installed'
   | 'unchanged'
   | 'deferred'
@@ -84,6 +87,30 @@ const GITHUB_RATE_LIMIT_DIAGNOSTIC_CODES = new Set([
   'SOURCE_RATE_LIMITED',
   'FETCH_RATE_LIMITED',
 ])
+
+function createInstallOperationId(): string {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID()
+  }
+  const bytes = new Uint8Array(16)
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(bytes)
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256)
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = [...bytes].map(value => value.toString(16).padStart(2, '0'))
+  return [
+    hex.slice(0, 4).join(''),
+    hex.slice(4, 6).join(''),
+    hex.slice(6, 8).join(''),
+    hex.slice(8, 10).join(''),
+    hex.slice(10).join(''),
+  ].join('-')
+}
 
 export function skillInstallWasRateLimited(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false
@@ -191,6 +218,8 @@ export interface SkillRegistry {
   installingId: Ref<string | null>
   installActivities: Ref<SkillInstallActivities>
   runningSource: Ref<SkillInstallSource | null>
+  cancellableInstallSource: ComputedRef<SkillInstallSource | null>
+  cancellingSource: Ref<SkillInstallSource | null>
   queueRunning: ComputedRef<boolean>
   mutationBusy: ComputedRef<boolean>
   installingDepsId: Ref<string | null>
@@ -199,6 +228,7 @@ export interface SkillRegistry {
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
   retryQueueItem: (id: string, acknowledgeRisk?: boolean) => Promise<void>
+  cancelInstall: (source: SkillInstallSource) => Promise<void>
   clearInstallActivity: (source: SkillInstallSource) => void
   installDeps: (
     name: string,
@@ -228,11 +258,22 @@ export function useSkillRegistry(
     github: { items: [], refreshWarning: '', phase: 'terminal' },
   })
   const runningSource = ref<SkillInstallSource | null>(null)
+  const cancellingSource = ref<SkillInstallSource | null>(null)
+  const installCancellationSupported = computed(() =>
+    typeof rpc.supportsMethod === 'function'
+    && rpc.supportsMethod('skills.install.cancel'))
+  const activeInstallOperation = ref<{
+    id: string
+    itemId: string
+    source: SkillInstallSource
+  } | null>(null)
+  const cancellableInstallSource = computed(() => activeInstallOperation.value?.source || null)
   const queueRunning = computed(() => runningSource.value !== null)
   const mutationBusy = computed(() => mutationGate.busy.value)
   const installingDepsId = ref<string | null>(null)
   const uninstallingName = ref<string | null>(null)
   let searchRequestId = 0
+  let cancelRequestedOperationId = ''
 
   async function searchRegistry() {
     const query = registryQuery.value.trim()
@@ -340,19 +381,36 @@ export function useSkillRegistry(
       item.result = undefined
       installingId.value = item.id
       let rateLimited = false
+      const operationId = installCancellationSupported.value
+        ? createInstallOperationId()
+        : ''
+      if (operationId) {
+        activeInstallOperation.value = {
+          id: operationId,
+          itemId: item.id,
+          source: activitySource(item.source),
+        }
+      }
       try {
         const res = await rpc.call<InstallResult>('skills.install', {
           identifier: item.identifier,
           source: item.source,
+          ...(operationId ? { operationId } : {}),
           ...(riskConfirmation
             ? { force: true, riskConfirmation }
             : {}),
         })
         item.result = res
         item.displayName = res.name || item.displayName
-        item.status = res.success ? (res.unchanged ? 'unchanged' : 'installed') : 'failed'
-        item.error = res.success ? '' : (res.message || t('cronSkills.registry.installFailed'))
-        markRegistryResultOutcome(item.identifier, item.source, res)
+        item.status = res.cancelled
+          ? 'cancelled'
+          : res.success
+            ? (res.unchanged ? 'unchanged' : 'installed')
+            : 'failed'
+        item.error = res.success || res.cancelled
+          ? ''
+          : (res.message || t('cronSkills.registry.installFailed'))
+        if (!res.cancelled) markRegistryResultOutcome(item.identifier, item.source, res)
         rateLimited = item.source === 'github' && skillInstallWasRateLimited(res)
       } catch (err) {
         rateLimited = item.source === 'github' && skillInstallWasRateLimited(err)
@@ -362,7 +420,12 @@ export function useSkillRegistry(
         item.error = (err as Error).message
       } finally {
         installingId.value = null
+        if (activeInstallOperation.value?.id === operationId) {
+          activeInstallOperation.value = null
+          cancellingSource.value = null
+        }
       }
+      if (operationId && cancelRequestedOperationId === operationId) break
       if (!rateLimited) continue
       for (const deferred of items.slice(index + 1)) {
         deferred.status = 'deferred'
@@ -374,7 +437,9 @@ export function useSkillRegistry(
 
   function settleInterruptedItems(source: SkillInstallSource) {
     for (const item of installActivities.value[source].items) {
-      if (item.status !== 'queued' && item.status !== 'installing') continue
+      if (item.status !== 'queued'
+        && item.status !== 'installing'
+        && item.status !== 'cancelling') continue
       item.status = 'unknown'
       item.error ||= t('cronSkills.registry.installResultUnknown')
     }
@@ -398,6 +463,9 @@ export function useSkillRegistry(
       settleInterruptedItems(source)
       runningSource.value = null
       installingId.value = null
+      activeInstallOperation.value = null
+      cancellingSource.value = null
+      cancelRequestedOperationId = ''
       mutationGate.release('install_queue')
     }
   }
@@ -447,7 +515,7 @@ export function useSkillRegistry(
       installActivities.value[candidate].items.some(item => item.id === id))
     if (!source) return
     const item = installActivities.value[source].items.find(candidate => candidate.id === id)
-    if (!item || item.status !== 'failed') return
+    if (!item || (item.status !== 'failed' && item.status !== 'cancelled')) return
     const riskConfirmation = acknowledgeRisk
       ? skillInstallRiskConfirmation(item.result)
       : ''
@@ -464,7 +532,41 @@ export function useSkillRegistry(
       settleInterruptedItems(source)
       runningSource.value = null
       installingId.value = null
+      activeInstallOperation.value = null
+      cancellingSource.value = null
+      cancelRequestedOperationId = ''
       mutationGate.release('install_queue')
+    }
+  }
+
+  async function cancelInstall(source: SkillInstallSource) {
+    const operation = activeInstallOperation.value
+    if (!operation || operation.source !== source || cancellingSource.value) return
+    const activity = installActivities.value[source]
+    const activeItem = activity.items.find(item => item.id === operation.itemId)
+    if (!activeItem) return
+
+    cancelRequestedOperationId = operation.id
+    cancellingSource.value = source
+    activeItem.status = 'cancelling'
+    for (const item of activity.items) {
+      if (item.status === 'queued') {
+        item.status = 'cancelled'
+        item.error = ''
+      }
+    }
+    try {
+      await rpc.call<InstallResult>('skills.install.cancel', {
+        operationId: operation.id,
+      })
+    } catch (err) {
+      if (activeInstallOperation.value?.id === operation.id) {
+        activeItem.status = 'installing'
+        cancellingSource.value = null
+      }
+      pushToast(t('cronSkills.registry.cancelInstallFailed', {
+        error: (err as Error).message,
+      }), { tone: 'danger' })
     }
   }
 
@@ -561,6 +663,8 @@ export function useSkillRegistry(
     installingId,
     installActivities,
     runningSource,
+    cancellableInstallSource,
+    cancellingSource,
     queueRunning,
     mutationBusy,
     installingDepsId,
@@ -569,6 +673,7 @@ export function useSkillRegistry(
     installGithub,
     installSkill,
     retryQueueItem,
+    cancelInstall,
     clearInstallActivity,
     installDeps,
     uninstallSkill,

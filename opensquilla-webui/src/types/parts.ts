@@ -155,6 +155,10 @@ export interface StatusPart {
   action: string
   label: string
   at: number
+  /** Stable activity chronology; timestamps are presentation metadata only. */
+  activityOrder?: number
+  /** Authoritative phase boundary; timestamps never participate in ordering. */
+  endedAt?: number
   /** Stable lifecycle id for a maintenance event; phase rows omit it. */
   id?: string
   /** Maintenance rows are context housekeeping, not semantic task steps. */

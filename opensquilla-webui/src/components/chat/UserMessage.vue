@@ -27,6 +27,55 @@
          above the text bubble, never packed inside it — text gets a filled
          bubble, images render as bordered bare media, files as icon chips. -->
     <div class="msg-user-stack">
+      <div
+        v-if="message.promptAnnotations?.length"
+        class="msg-prompt-annotations"
+        :aria-label="t('chat.promptAnnotations.sentLabel')"
+      >
+        <div class="msg-prompt-annotations__label" data-testid="sent-prompt-annotations-label">
+          <Icon name="chat" :size="13" aria-hidden="true" />
+          <span>{{ t('chat.promptAnnotations.label') }} · {{ message.promptAnnotations.length }}</span>
+        </div>
+        <article
+          v-for="annotation in message.promptAnnotations"
+          :key="annotation.annotationId"
+          class="msg-prompt-annotation"
+          data-testid="sent-prompt-annotation"
+        >
+          <span class="msg-prompt-annotation__rail" aria-hidden="true" />
+          <span class="msg-prompt-annotation__body">
+            <span class="msg-prompt-annotation__meta">
+              {{ annotation.documentName }} ·
+              {{ promptAnnotationTargetLabel(annotation, t) }}
+            </span>
+            <span class="msg-prompt-annotation__text">{{ annotation.body }}</span>
+          </span>
+          <button
+            v-if="canReusePromptAnnotations && !shareMode"
+            type="button"
+            class="msg-prompt-annotation__reuse"
+            :title="t('chat.promptAnnotations.reuseDescription')"
+            :aria-label="t('chat.promptAnnotations.reuseDescription')"
+            @click.stop="emit('reusePromptAnnotation', annotation)"
+          >
+            <Icon name="copy" :size="14" />
+          </button>
+        </article>
+        <span
+          v-if="promptAnnotationStatus"
+          class="msg-prompt-annotations__status"
+          :class="`msg-prompt-annotations__status--${promptAnnotationStatus}`"
+          :data-status="promptAnnotationStatus"
+          data-testid="prompt-annotation-turn-status"
+          :role="promptAnnotationStatusRole"
+          aria-live="polite"
+        >
+          <span class="msg-prompt-annotations__status-dot" aria-hidden="true" />
+          <span class="msg-prompt-annotations__status-copy">
+            <strong>{{ promptAnnotationStatusLabel }}</strong>
+          </span>
+        </span>
+      </div>
       <div v-if="message.attachments?.length" class="msg-attachments">
         <template v-for="attachment in message.attachments" :key="attachment.renderKey">
           <button
@@ -48,27 +97,52 @@
               <span class="spinner msg-file-chip__spinner" />
             </span>
           </button>
-          <button
-            v-else
-            type="button"
-            class="msg-file-chip"
-            :class="{ 'msg-file-chip--failed': failedDownloads.has(attachment.renderKey) }"
-            :title="attachmentDownloadLabel(attachment)"
-            :aria-label="attachmentDownloadLabel(attachment)"
-            :aria-busy="downloadingAttachments.has(attachment.renderKey)"
-            :disabled="downloadingAttachments.has(attachment.renderKey)"
-            @click.stop="downloadAttachment(attachment)"
-          >
-            <span class="msg-file-chip__icon" aria-hidden="true">
-              <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
-              <Icon v-else-if="failedDownloads.has(attachment.renderKey)" name="refresh" :size="16" />
-              <Icon v-else name="fileText" :size="16" />
+          <span v-else class="msg-file-resource">
+            <button
+              type="button"
+              class="msg-file-chip"
+              :class="{ 'msg-file-chip--failed': failedDownloads.has(attachment.renderKey) }"
+              :title="attachmentPrimaryActionLabel(attachment)"
+              :aria-label="attachmentPrimaryActionLabel(attachment)"
+              :aria-busy="downloadingAttachments.has(attachment.renderKey)"
+              :disabled="downloadingAttachments.has(attachment.renderKey)"
+              @click.stop="activateAttachment(attachment)"
+            >
+              <span class="msg-file-chip__icon" aria-hidden="true">
+                <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
+                <Icon v-else-if="failedDownloads.has(attachment.renderKey)" name="refresh" :size="16" />
+                <Icon v-else name="fileText" :size="16" />
+              </span>
+              <span class="msg-file-chip__body">
+                <span class="msg-file-chip__name">{{ attachment.name }}</span>
+                <span class="msg-file-chip__meta">{{ attachmentMeta(attachment) }}</span>
+              </span>
+            </button>
+            <span
+              v-if="workbenchAttachmentResource(attachment) && !shareMode"
+              class="msg-file-resource__actions"
+            >
+              <button
+                v-if="attachmentCanOpen(attachment)"
+                type="button"
+                :title="attachmentDownloadLabel(attachment)"
+                :aria-label="attachmentDownloadLabel(attachment)"
+                :aria-busy="downloadingAttachments.has(attachment.renderKey)"
+                :disabled="downloadingAttachments.has(attachment.renderKey)"
+                @click.stop="downloadAttachment(attachment)"
+              >
+                <Icon name="download" :size="14" />
+              </button>
+              <span
+                v-if="attachmentUnavailableReason(attachment)"
+                class="msg-file-resource__unavailable"
+                data-testid="attachment-workbench-unavailable"
+                role="status"
+              >
+                {{ attachmentUnavailableReason(attachment) }}
+              </span>
             </span>
-            <span class="msg-file-chip__body">
-              <span class="msg-file-chip__name">{{ attachment.name }}</span>
-              <span class="msg-file-chip__meta">{{ attachmentMeta(attachment) }}</span>
-            </span>
-          </button>
+          </span>
         </template>
       </div>
       <div v-if="message.text" class="msg-user-bubble">
@@ -87,7 +161,7 @@
         {{ steerStatusLabel }}
       </span>
       <TurnOutcomeStatus
-        v-if="showTurnOutcome && message.turnOutcome"
+        v-if="showTurnOutcomeStatus && message.turnOutcome"
         :outcome="message.turnOutcome"
       />
     </div>
@@ -129,9 +203,23 @@ import Icon from '@/components/Icon.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
-import type { ChatRenderedMessage, DisplayAttachment } from '@/types/chat'
+import type {
+  ChatRenderedMessage,
+  DisplayAttachment,
+} from '@/types/chat'
+import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
+import {
+  isProcessRestartOutcome,
+  turnOutcomePresentation,
+} from '@/utils/chat/turnOutcome'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import {
+  workbenchResourceActionReasonCode,
+  workbenchResourceUnavailableReasonKey,
+} from '@/workbench/resourceCapabilityPresentation'
 
 const { t } = useI18n()
 
@@ -146,11 +234,18 @@ const props = defineProps<{
   showTurnOutcome?: boolean
   isStreaming?: boolean
   isGoalSource?: boolean
+  canReusePromptAnnotations?: boolean
+  workbenchResourcePreviewEnabled?: boolean
+  workbenchResourceEditEnabled?: boolean
+  workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
 }>()
 
 const emit = defineEmits<{
   edit: [message: ChatRenderedMessage]
+  editAttachment: [attachment: DisplayAttachment]
+  previewAttachment: [attachment: DisplayAttachment]
   toggleShare: [messageId: string]
+  reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
 }>()
 
 const { copyState, copyIconName, copyTitle, copyLiveText, onCopyClick } = useCopyFeedback(
@@ -164,6 +259,40 @@ const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
 const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
+
+type PromptAnnotationTurnStatus = 'applied' | 'not_applied' | 'ambiguous'
+
+const documentMutationOutcome = computed(() => props.message.turnOutcome?.documentMutationOutcome)
+const showTurnOutcomeStatus = computed(() => Boolean(
+  props.showTurnOutcome
+  && props.message.turnOutcome
+  && (
+    !props.message.promptAnnotations?.length
+    || isProcessRestartOutcome(props.message.turnOutcome)
+    || ['failed', 'timeout'].includes(turnOutcomePresentation(props.message.turnOutcome))
+    || props.message.turnOutcome.errorClass?.trim()
+  ),
+))
+
+const promptAnnotationStatus = computed<PromptAnnotationTurnStatus | null>(() => {
+  if (!props.message.promptAnnotations?.length) return null
+  const status = documentMutationOutcome.value?.status
+  if (!status) return null
+  if (status === 'applied') return 'applied'
+  if (status === 'ambiguous') return 'ambiguous'
+  return 'not_applied'
+})
+
+const promptAnnotationStatusLabel = computed(() => {
+  const status = promptAnnotationStatus.value
+  if (!status) return ''
+  return t(`chat.promptAnnotations.status.${status}`)
+})
+const promptAnnotationStatusRole = computed<'alert' | 'status'>(() => (
+  promptAnnotationStatus.value === 'not_applied'
+    ? 'alert'
+    : 'status'
+))
 const STEER_WAIT_DETAIL_DELAY_MS = 700
 const showSteerWaitDetail = ref(false)
 let steerWaitDetailTimer: ReturnType<typeof setTimeout> | undefined
@@ -249,6 +378,55 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   const size = Number(attachment.size)
   if (!Number.isFinite(size) || size <= 0) return label
   return `${label} · ${Math.max(1, Math.round(size / 1024))} KB`
+}
+
+function workbenchAttachment(attachment: DisplayAttachment): boolean {
+  if (!attachment.attachmentId) return false
+  const mime = attachment.mime.split(';', 1)[0].trim().toLowerCase()
+  const name = attachment.name.trim().toLowerCase()
+  return mime === 'text/html' || mime === 'application/xhtml+xml'
+    || name.endsWith('.html') || name.endsWith('.htm') || name.endsWith('.xhtml')
+}
+
+function workbenchAttachmentResource(attachment: DisplayAttachment): WorkbenchResource | null {
+  if (!workbenchAttachment(attachment) || !attachment.attachmentId) return null
+  return props.workbenchAttachmentResources?.get(attachment.attachmentId) || null
+}
+
+function attachmentCanOpen(attachment: DisplayAttachment): boolean {
+  const resource = workbenchAttachmentResource(attachment)
+  if (!resource) return false
+  if (!props.workbenchResourcePreviewEnabled && !props.workbenchResourceEditEnabled) return false
+  return resource.capabilities.preview === true || resource.capabilities.manualEdit === true
+}
+
+function attachmentOpenReason(attachment: DisplayAttachment): string {
+  const resource = workbenchAttachmentResource(attachment)
+  if (!resource || attachmentCanOpen(attachment)) return ''
+  if (!props.workbenchResourcePreviewEnabled && !props.workbenchResourceEditEnabled) return ''
+  const action = props.workbenchResourcePreviewEnabled ? 'preview' : 'edit'
+  return t(workbenchResourceUnavailableReasonKey(
+    workbenchResourceActionReasonCode(resource.capabilities, action),
+  ))
+}
+
+function attachmentPrimaryActionLabel(attachment: DisplayAttachment): string {
+  if (!attachmentCanOpen(attachment)) return attachmentDownloadLabel(attachment)
+  const label = t('workbench.resources.open', { name: attachment.name })
+  const reason = attachmentOpenReason(attachment)
+  return reason ? `${label}. ${reason}` : label
+}
+
+function attachmentUnavailableReason(attachment: DisplayAttachment): string {
+  return attachmentOpenReason(attachment)
+}
+
+function activateAttachment(attachment: DisplayAttachment) {
+  if (attachmentCanOpen(attachment)) {
+    emit('previewAttachment', attachment)
+    return
+  }
+  void downloadAttachment(attachment)
 }
 </script>
 
@@ -389,6 +567,146 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   color: var(--text-dim);
   font-size: var(--fs-xs);
   line-height: 1.3;
+}
+
+.msg-prompt-annotations {
+  display: grid;
+  justify-items: stretch;
+  width: min(88%, 32rem);
+}
+
+.msg-prompt-annotations__label {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 0.375rem;
+  min-height: 1.5rem;
+  margin-bottom: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
+.msg-prompt-annotation {
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.625rem;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 3rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  text-align: left;
+}
+
+.msg-prompt-annotations__label + .msg-prompt-annotation {
+  border-top: 1px solid var(--border);
+}
+
+.msg-prompt-annotation__rail {
+  width: 3px;
+  align-self: stretch;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+
+.msg-prompt-annotation__body {
+  display: grid;
+  min-width: 0;
+  gap: 0.125rem;
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+
+.msg-prompt-annotation__meta {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-prompt-annotation__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-prompt-annotation__reuse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.msg-prompt-annotation__reuse:hover,
+.msg-prompt-annotation__reuse:focus-visible {
+  outline: 0;
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+
+.msg-prompt-annotations__status {
+  display: inline-flex;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 0.375rem;
+  justify-self: start;
+  width: auto;
+  min-height: 1.25rem;
+  padding: 0.125rem 0;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+  text-align: left;
+}
+
+.msg-prompt-annotations__status-copy {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-width: 0;
+  gap: 0.375rem;
+}
+
+.msg-prompt-annotations__status-copy strong {
+  font-weight: 600;
+}
+
+.msg-prompt-annotations__status-copy small {
+  color: color-mix(in srgb, currentcolor 76%, var(--text-muted));
+  font-size: inherit;
+}
+
+.msg-prompt-annotations__status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  flex: 0 0 auto;
+  border-radius: var(--radius-full);
+  background: currentColor;
+  opacity: 0.72;
+}
+
+.msg-prompt-annotations__status--applied {
+  color: var(--ok);
+}
+
+.msg-prompt-annotations__status--not_applied {
+  color: var(--danger);
+}
+
+.msg-prompt-annotations__status--conflict,
+.msg-prompt-annotations__status--ambiguous {
+  color: var(--warn);
 }
 
 /* Arrival feedback stays local to the destination instead of washing the full
@@ -608,6 +926,58 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   background: color-mix(in srgb, var(--accent) 12%, var(--bg-surface));
   border-radius: var(--radius-control);
   color: var(--accent);
+}
+
+.msg-file-resource {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: .25rem;
+}
+
+.msg-file-resource__actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .125rem;
+}
+
+.msg-file-resource__actions button {
+  display: inline-flex;
+  width: 1.875rem;
+  height: 1.875rem;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.msg-file-resource__actions button:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.msg-file-resource__actions button:disabled,
+.msg-file-resource__actions button:disabled:hover {
+  background: transparent;
+  color: var(--text-dim);
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.msg-file-resource__actions button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.msg-file-resource__unavailable {
+  max-width: 15rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
 }
 
 .msg-file-chip {

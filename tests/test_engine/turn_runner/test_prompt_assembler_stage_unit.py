@@ -76,12 +76,22 @@ class _RecordingRouterContext:
     context: dict[str, Any] = field(default_factory=dict)
     calls: list[tuple[str, bool]] = field(default_factory=list)
     bound_user_message_ids: list[str | None] = field(default_factory=list)
+    include_capacity_flags: list[bool] = field(default_factory=list)
+    transcript_snapshots: list[Any | None] = field(default_factory=list)
 
     async def fetch_router_context(
-        self, session_key, *, exclude_last_user, bound_user_message_id=None
+        self,
+        session_key,
+        *,
+        exclude_last_user,
+        bound_user_message_id=None,
+        include_capacity=False,
+        transcript_snapshot=None,
     ):
         self.calls.append((session_key, exclude_last_user))
         self.bound_user_message_ids.append(bound_user_message_id)
+        self.include_capacity_flags.append(include_capacity)
+        self.transcript_snapshots.append(transcript_snapshot)
         return dict(self.context)
 
 
@@ -227,6 +237,7 @@ def _make_input(
     ingress_pipeline_steps=None,
     input_provenance=None,
     skill_catalog=None,
+    transcript_snapshot=None,
 ):
     return PromptAssemblerStageInput(
         runtime_message=runtime_message,
@@ -250,6 +261,7 @@ def _make_input(
         ingress_pipeline_steps=ingress_pipeline_steps,
         input_provenance=input_provenance,
         skill_catalog=skill_catalog,
+        transcript_snapshot=transcript_snapshot,
     )
 
 
@@ -357,6 +369,67 @@ async def test_prompt_assembler_uses_effective_tool_workspace() -> None:
     assert prompt_assembler.last_kwargs["workspace_dir"] == "D:\\lrk\\opensquilla"
 
 
+@pytest.mark.asyncio
+async def test_restricted_tool_boundary_suppresses_workspace_prompt_inputs() -> None:
+    prompt_assembler = _RecordingPromptAssembler(
+        metadata_to_emit={"injected_workspace_files_count": 0}
+    )
+    executor = _RecordingPipelineExecutor(
+        turn=_make_turn(
+            metadata={
+                "skill_count": 0,
+                "skills_rendered_count": 0,
+                "skills_prompt_chars": 0,
+            }
+        ),
+        provider=_StubProvider(),
+    )
+    builder = _RecordingPromptReportBuilder()
+    stage = _make_stage(
+        assembler=prompt_assembler,
+        executor=executor,
+        builder=builder,
+    )
+    skill_catalog = object()
+
+    await stage.run(
+        _make_input(
+            extra_prompt_context={"project": "/secret/workspace"},
+            bootstrap_context_mode="full",
+            effective_tool_context=ToolContext(
+                workspace_dir="/secret/workspace",
+                exclusive_tools={"artifact_reader"},
+            ),
+            skill_catalog=skill_catalog,
+        )
+    )
+
+    assert prompt_assembler.last_kwargs["workspace_dir"] is None
+    assert prompt_assembler.last_kwargs["extra_context"] is None
+    assert (
+        prompt_assembler.last_kwargs["bootstrap_context_mode"]
+        == "restricted_tool_boundary"
+    )
+    assert executor.requests[0].skill_catalog is None
+    assert builder.last_kwargs["metadata"]["injected_workspace_files_count"] == 0
+    assert builder.last_kwargs["metadata"]["skill_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_preserves_skill_catalog_projection() -> None:
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    skill_catalog = object()
+
+    await _make_stage(executor=executor).run(
+        _make_input(
+            effective_tool_context=ToolContext(workspace_dir="/project"),
+            skill_catalog=skill_catalog,
+        )
+    )
+
+    assert executor.requests[0].skill_catalog is skill_catalog
+
+
 async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context():
     router_context = _RecordingRouterContext()
     stage = _make_stage(router=router_context)
@@ -365,6 +438,59 @@ async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context
 
     assert router_context.calls == [("agent:main:s1", True)]
     assert router_context.bound_user_message_ids == ["msg-bound"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_assembler_forwards_turn_transcript_snapshot() -> None:
+    router_context = _RecordingRouterContext()
+    stage = _make_stage(router=router_context)
+    transcript_snapshot = SimpleNamespace()
+
+    await stage.run(_make_input(transcript_snapshot=transcript_snapshot))
+
+    assert router_context.transcript_snapshots == [transcript_snapshot]
+
+
+@pytest.mark.asyncio
+async def test_attachment_prompt_carries_repr_safe_router_replay_request() -> None:
+    router_context = _RecordingRouterContext()
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    stage = _make_stage(router=router_context, executor=executor)
+    transcript_snapshot = SimpleNamespace(private_history="history-secret")
+
+    await stage.run(
+        _make_input(
+            attachments=[{"type": "image/png", "data": "current-secret"}],
+            bound_user_message_id="msg-bound",
+            transcript_snapshot=transcript_snapshot,
+        )
+    )
+
+    request = executor.requests[0]
+    replay_request = request.router_history_replay_request
+    assert router_context.include_capacity_flags == [False]
+    assert replay_request is not None
+    assert replay_request.exclude_last_user is True
+    assert replay_request.bound_user_message_id == "msg-bound"
+    assert replay_request.transcript_snapshot is transcript_snapshot
+    assert repr(replay_request) == "RouterHistoryReplayRequest()"
+    assert "history-secret" not in repr(request)
+    assert "current-secret" not in repr(request.router_history_replay_request)
+
+
+@pytest.mark.asyncio
+async def test_attachment_context_missing_capacity_proof_is_incomplete() -> None:
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    stage = _make_stage(
+        router=_RecordingRouterContext(context={}),
+        executor=executor,
+    )
+
+    await stage.run(
+        _make_input(attachments=[{"type": "text/plain", "data": "synthetic"}])
+    )
+
+    assert executor.requests[0].history_capacity_estimate_complete is False
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ class SessionTaskSnapshot:
 
     running_task_id: str | None
     queued_task_ids: tuple[str, ...]
+    cancel_requested_task_ids: tuple[str, ...] = ()
 
     @property
     def active_task(self) -> dict[str, str] | None:

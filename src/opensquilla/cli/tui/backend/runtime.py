@@ -377,11 +377,23 @@ async def run_tui_runtime(
                         )
                     continue
 
+                if (
+                    category is TuiInputKind.COMMAND_REQUIRES_QUEUE_EMPTY
+                    and runtime_state.pending_size > 0
+                ):
+                    if hooks.notice is not None:
+                        hooks.notice(
+                            "[yellow]Command requires an empty input queue. "
+                            "Wait for queued input to finish.[/yellow]"
+                        )
+                    continue
+
                 if category in (
                     TuiInputKind.LOCAL,
                     TuiInputKind.CONTROL,
                     TuiInputKind.COMMAND,
                     TuiInputKind.COMMAND_REQUIRES_IDLE,
+                    TuiInputKind.COMMAND_REQUIRES_QUEUE_EMPTY,
                 ):
                     # Host UI, Gateway control, and deterministic slash
                     # commands act now, inline on the loop, with no prompt echo

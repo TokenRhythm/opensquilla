@@ -13,12 +13,15 @@ import os
 import posixpath
 import re
 import sys
+import time
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+
+import structlog
 
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
@@ -92,6 +95,20 @@ from opensquilla.tools.write_tracking import (
     workspace_write_progress_note,
 )
 
+log = structlog.get_logger(__name__)
+
+
+def _settlement_duration_bucket(duration_ms: int) -> str:
+    if duration_ms <= 10:
+        return "le_10ms"
+    if duration_ms <= 50:
+        return "le_50ms"
+    if duration_ms <= 250:
+        return "le_250ms"
+    if duration_ms <= 1000:
+        return "le_1s"
+    return "gt_1s"
+
 _SPREADSHEET_EXTENSIONS = {".csv", ".tsv", ".xlsx"}
 _OFFICE_BINARY_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 _BINARY_EXTENSIONS = {
@@ -156,6 +173,61 @@ _SOURCE_SYMBOL_EXTENSIONS = frozenset(
         ".tsx",
     }
 )
+
+
+async def _run_executor_mutation[ExecutorResult](
+    worker: Callable[[], ExecutorResult],
+    *,
+    settle: Callable[[BaseException | None], None],
+) -> ExecutorResult:
+    """Run an unkillable thread mutation and reconcile it before cancellation.
+
+    Cancelling an asyncio future cannot stop a callable that is already running
+    in a thread. Shield the future, absorb repeated cancellation until it ends,
+    then run the caller's disk/receipt reconciliation before propagating the
+    first cancellation.
+    """
+    # Keep the historical event-loop injection seam used by race tests and
+    # embedders while normal async callers still receive the running loop.
+    loop = asyncio.get_event_loop()
+    started_at = time.monotonic()
+    future = asyncio.ensure_future(loop.run_in_executor(None, worker))
+    pending_cancel: asyncio.CancelledError | None = None
+    worker_error: BaseException | None = None
+    result: ExecutorResult | None = None
+
+    while not future.done():
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            if pending_cancel is None:
+                pending_cancel = exc
+        except BaseException as exc:  # noqa: BLE001 - reconciled below
+            worker_error = exc
+            break
+
+    if future.done() and worker_error is None and result is None:
+        try:
+            result = future.result()
+        except BaseException as exc:  # noqa: BLE001 - reconciled below
+            worker_error = exc
+
+    settle(worker_error)
+    duration_ms = int((time.monotonic() - started_at) * 1000)
+    log.info(
+        "filesystem.executor_mutation_settled",
+        duration_ms=duration_ms,
+        duration_bucket=_settlement_duration_bucket(duration_ms),
+        cancellation_delayed=pending_cancel is not None,
+        worker_outcome="failed" if worker_error is not None else "completed",
+    )
+    if pending_cancel is not None:
+        raise pending_cancel
+    if worker_error is not None:
+        raise worker_error
+    return result  # type: ignore[return-value]
+
+
 _SOURCE_SYMBOL_REGEXES: tuple[tuple[frozenset[str], str, re.Pattern[str]], ...] = (
     (
         frozenset({".py", ".pyi"}),
@@ -2040,17 +2112,22 @@ async def write_file(
 ) -> str:
     p = _resolve_path(path)
     if full_host_access_active():
-        loop = asyncio.get_event_loop()
         created = not p.exists()
 
         def _write_full_host() -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
 
-        await loop.run_in_executor(None, _write_full_host)
-        record_workspace_file_write(p, operation="write_file", created=created)
-        _notify_memory_source_write(p)
-        _notify_bootstrap_source_write(p)
+        def _settle_full_host(error: BaseException | None) -> None:
+            if error is None:
+                record_workspace_file_write(p, operation="write_file", created=created)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
+
+        await _run_executor_mutation(
+            _write_full_host,
+            settle=_settle_full_host,
+        )
         return f"Written {len(content)} bytes to {p}"
 
     approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
@@ -2066,7 +2143,6 @@ async def write_file(
     if approval is not None:
         return json.dumps(approval)
 
-    loop = asyncio.get_event_loop()
     created = not p.exists()
     if not created:
         require_fresh_workspace_file_read(p, tool_name="write_file", original_path=path)
@@ -2110,22 +2186,26 @@ async def write_file(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    record_semantic_mutation_receipt(
-        tool_name="write_file",
-        path=p,
-        operation="write_file",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={"created": created},
-    )
-    record_workspace_file_write(p, operation="write_file", created=created)
-    refresh_workspace_file_read_state(p, operation="write_file")
-    record_scratch_file_write(p)
-    _notify_memory_source_write(p)
-    _notify_bootstrap_source_write(p)
+    def _settle_write(error: BaseException | None) -> None:
+        after_fingerprint = fingerprint_path(p)
+        changed = before_fingerprint != after_fingerprint
+        record_semantic_mutation_receipt(
+            tool_name="write_file",
+            path=p,
+            operation="write_file",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=error is not None,
+            metadata={"created": created},
+        )
+        if error is None or changed:
+            record_workspace_file_write(p, operation="write_file", created=created)
+            refresh_workspace_file_read_state(p, operation="write_file")
+            record_scratch_file_write(p)
+            _notify_memory_source_write(p)
+            _notify_bootstrap_source_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_write)
     return (
         f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
         f"{_backup_receipt_note(backup_summaries)}"
@@ -2205,16 +2285,21 @@ async def write_scratch(path: str, content: str) -> str:
     if blocked is not None:
         return json.dumps(blocked)
 
-    loop = asyncio.get_event_loop()
     before_fingerprint = fingerprint_path(p)
+    settled_after: dict[str, Any] = {}
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    record_scratch_file_write(p)
+    def _settle_write(error: BaseException | None) -> None:
+        after_fingerprint = fingerprint_path(p)
+        settled_after.update(after_fingerprint)
+        if error is None or before_fingerprint != after_fingerprint:
+            record_scratch_file_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_write)
+    after_fingerprint = settled_after
     result = {
         "status": "written",
         "path": relative_path,
@@ -2353,36 +2438,63 @@ async def create_source(path: str, content: str, approval_id: str | None = None)
             f"create_source refused because the file already exists: {path}. "
             "Use read_source/edit_source for existing files."
         )
-    loop = asyncio.get_event_loop()
     before_fingerprint = fingerprint_path(p)
+    settled_create: dict[str, Any] = {}
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("x", encoding="utf-8") as handle:
             handle.write(content)
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    after_revision = source_revision_for_path(p)
     display_path = _workspace_display_path(p, path)
-    receipt = record_semantic_mutation_receipt(
-        tool_name="create_source",
-        path=p,
-        operation="create_source",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={
-            "after_revision": after_revision,
+
+    def _settle_create(error: BaseException | None) -> None:
+        if isinstance(error, FileExistsError):
+            # Exclusive open proves this worker did not create or write the
+            # file. A racing external writer must not be attributed to the
+            # tool through a synthetic mutation receipt.
+            return
+        after_fingerprint = fingerprint_path(p)
+        after_revision = (
+            source_revision_for_path(p)
+            if after_fingerprint.get("exists") and p.is_file()
+            else None
+        )
+        metadata: dict[str, Any] = {
             "created": True,
             "contract": "source_create_v1",
-        },
-    )
-    workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-    record_workspace_file_write(p, operation="create_source", created=True)
-    refresh_workspace_file_read_state(p, operation="create_source")
-    _notify_memory_source_write(p)
-    _notify_bootstrap_source_write(p)
+        }
+        if after_revision is not None:
+            metadata["after_revision"] = after_revision
+        receipt = record_semantic_mutation_receipt(
+            tool_name="create_source",
+            path=p,
+            operation="create_source",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=error is not None,
+            metadata=metadata,
+        )
+        settled_create.update(
+            {
+                "after_fingerprint": after_fingerprint,
+                "after_revision": after_revision,
+                "workspace_epoch": (
+                    receipt["workspace_epoch"] if receipt is not None else None
+                ),
+            }
+        )
+        if error is None or before_fingerprint != after_fingerprint:
+            record_workspace_file_write(p, operation="create_source", created=True)
+            refresh_workspace_file_read_state(p, operation="create_source")
+            _notify_memory_source_write(p)
+            _notify_bootstrap_source_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_create)
+    after_revision = settled_create.get("after_revision")
+    if not isinstance(after_revision, str):
+        raise ToolError("create_source write settled without a valid revision.")
+    workspace_epoch = settled_create.get("workspace_epoch")
     result = {
         "status": "created",
         "path": display_path,
@@ -2579,9 +2691,22 @@ async def edit_file(
         loop = asyncio.get_event_loop()
         original = await loop.run_in_executor(None, p.read_text, "utf-8")
         updated = _apply_edit_replacements(original, replacements, path=path)
-        await loop.run_in_executor(None, p.write_text, updated, "utf-8")
-        _notify_memory_source_write(p)
-        _notify_bootstrap_source_write(p)
+        before_fingerprint = fingerprint_path(p)
+
+        def _write_full_host() -> int:
+            return p.write_text(updated, encoding="utf-8")
+
+        def _settle_full_host(error: BaseException | None) -> None:
+            after_fingerprint = fingerprint_path(p)
+            if error is None or before_fingerprint != after_fingerprint:
+                record_workspace_file_write(p, operation="edit_file", created=False)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
+
+        await _run_executor_mutation(
+            _write_full_host,
+            settle=_settle_full_host,
+        )
         if len(replacements) == 1:
             replacement = replacements[0]
             return (
@@ -2665,22 +2790,26 @@ async def edit_file(
     def _write() -> None:
         p.write_text(updated, encoding="utf-8")
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    record_semantic_mutation_receipt(
-        tool_name="edit_file",
-        path=p,
-        operation="edit_file",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={"replacement_count": len(replacements)},
-    )
-    record_workspace_file_write(p, operation="edit_file", created=False)
-    refresh_workspace_file_read_state(p, operation="edit_file")
-    record_scratch_file_write(p)
-    _notify_memory_source_write(p)
-    _notify_bootstrap_source_write(p)
+    def _settle_edit(error: BaseException | None) -> None:
+        after_fingerprint = fingerprint_path(p)
+        changed = before_fingerprint != after_fingerprint
+        record_semantic_mutation_receipt(
+            tool_name="edit_file",
+            path=p,
+            operation="edit_file",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=error is not None,
+            metadata={"replacement_count": len(replacements)},
+        )
+        if error is None or changed:
+            record_workspace_file_write(p, operation="edit_file", created=False)
+            refresh_workspace_file_read_state(p, operation="edit_file")
+            record_scratch_file_write(p)
+            _notify_memory_source_write(p)
+            _notify_bootstrap_source_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_edit)
     if len(replacements) == 1:
         replacement = replacements[0]
         return (
@@ -2908,36 +3037,63 @@ async def edit_source(
 
     before_fingerprint = fingerprint_path(p)
     if updated != original:
+        settled_edit: dict[str, Any] = {}
 
         def _write() -> None:
             p.write_text(updated, encoding="utf-8")
 
-        await loop.run_in_executor(None, _write)
+        def _settle_edit(error: BaseException | None) -> None:
+            after_fingerprint = fingerprint_path(p)
+            after_revision = source_revision_for_path(p)
+            receipt = record_semantic_mutation_receipt(
+                tool_name="edit_source",
+                path=p,
+                operation="edit_source",
+                before=before_fingerprint,
+                after=after_fingerprint,
+                partial=error is not None,
+                metadata={
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "edit_count": len(edits),
+                    "contract": "source_revision_line_edit_v1",
+                },
+            )
+            settled_edit.update(
+                {
+                    "after_fingerprint": after_fingerprint,
+                    "after_revision": after_revision,
+                    "receipt": receipt,
+                }
+            )
+            if error is None or before_fingerprint != after_fingerprint:
+                record_workspace_file_write(p, operation="edit_source", created=False)
+                refresh_workspace_file_read_state(p, operation="edit_source")
+                record_scratch_file_write(p)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
 
-    after_fingerprint = fingerprint_path(p)
-    after_revision = source_revision_for_path(p)
-    receipt = record_semantic_mutation_receipt(
-        tool_name="edit_source",
-        path=p,
-        operation="edit_source",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={
-            "before_revision": before_revision,
-            "after_revision": after_revision,
-            "edit_count": len(edits),
-            "contract": "source_revision_line_edit_v1",
-        },
-    )
+        await _run_executor_mutation(_write, settle=_settle_edit)
+        after_revision = settled_edit["after_revision"]
+        receipt = settled_edit["receipt"]
+    else:
+        after_fingerprint = fingerprint_path(p)
+        after_revision = source_revision_for_path(p)
+        receipt = record_semantic_mutation_receipt(
+            tool_name="edit_source",
+            path=p,
+            operation="edit_source",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=False,
+            metadata={
+                "before_revision": before_revision,
+                "after_revision": after_revision,
+                "edit_count": len(edits),
+                "contract": "source_revision_line_edit_v1",
+            },
+        )
     workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-
-    if updated != original:
-        record_workspace_file_write(p, operation="edit_source", created=False)
-        refresh_workspace_file_read_state(p, operation="edit_source")
-        record_scratch_file_write(p)
-        _notify_memory_source_write(p)
-        _notify_bootstrap_source_write(p)
 
     result = {
         "status": "applied",

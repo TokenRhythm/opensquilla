@@ -57,6 +57,19 @@ def test_ensemble_multimodal_rejection_is_surfaced_without_fallback(
     assert FallbackPolicy().should_retry(kind, attempt=0) is False
 
 
+def test_image_input_rejection_is_surfaced_without_fallback() -> None:
+    kind = classify_provider_error(
+        provider_name="openrouter",
+        status_code=None,
+        raw_code="image_input_unsupported",
+        message="The selected model cannot process image input.",
+    )
+
+    assert kind is ProviderFailureKind.BAD_REQUEST
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
+    assert FallbackPolicy().should_retry(kind, attempt=0) is False
+
+
 @pytest.mark.parametrize(
     ("provider_name", "raw_code", "message"),
     [

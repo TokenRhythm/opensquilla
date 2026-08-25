@@ -83,11 +83,12 @@ def _artifact(
         )
 
     (dist / "assets").mkdir(parents=True)
-    (dist / "index.html").write_text(
+    synthetic_entrypoint = (
         '<script type="module" src="assets/app.js"></script>'
-        '<link rel="stylesheet" href="assets/app.css">',
-        encoding="utf-8",
+        '<link rel="stylesheet" href="assets/app.css">'
     )
+    for entrypoint_name in ("index.html", "desktop.html"):
+        (dist / entrypoint_name).write_text(synthetic_entrypoint, encoding="utf-8")
     (dist / "assets/app.js").write_text("console.log('hello')\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body { color: black; }\n", encoding="utf-8")
     if include_personal_audio:
@@ -114,6 +115,7 @@ def test_verify_dist_accepts_artifact_bound_to_current_source(tmp_path: Path) ->
     assert set(files) == {
         "assets/app.css",
         "assets/app.js",
+        "desktop.html",
         "index.html",
         MANIFEST_NAME,
     }
@@ -272,9 +274,11 @@ def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.ci_serial
 def test_node_and_python_source_fingerprints_share_order_and_line_endings(
     tmp_path: Path,
 ) -> None:
+    """Run the cross-runtime Node probe alone on process-constrained runners."""
     webui = tmp_path / "opensquilla-webui"
     source = webui / "src"
     public = webui / "public"
@@ -338,6 +342,11 @@ def test_node_verifier_rejects_sensitive_artifact_files(tmp_path: Path) -> None:
         '<link rel="stylesheet" href="assets/app.css">',
         encoding="utf-8",
     )
+    (dist / "desktop.html").write_text(
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
     (dist / ".env.production").write_text(
         "VITE_PRIVATE_TOKEN=must-not-ship\n",
         encoding="utf-8",
@@ -358,6 +367,41 @@ def test_node_verifier_rejects_sensitive_artifact_files(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_node_verifier_rejects_multiple_control_entry_scripts(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "assets/app.js").write_text("console.log('app')\n", encoding="utf-8")
+    (dist / "assets/shared.js").write_text(
+        "console.log('shared')\n",
+        encoding="utf-8",
+    )
+    (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
+    (dist / "index.html").write_text(
+        '<script type="module" src="assets/shared.js"></script>'
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
+    (dist / "desktop.html").write_text(
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(NODE_VERIFIER), "--write", str(dist)],
+        cwd=REPO_ROOT / "opensquilla-webui",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "exactly one executable module script for Gateway injection" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_python_accepts_node_manifest_with_unicode_artifact_names(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     assets = dist / "assets"
@@ -365,6 +409,11 @@ def test_python_accepts_node_manifest_with_unicode_artifact_names(tmp_path: Path
     (assets / "😀.js").write_text("console.log('emoji')\n", encoding="utf-8")
     (assets / "Ａ.css").write_text("body{}\n", encoding="utf-8")
     (dist / "index.html").write_text(
+        '<script type="module" src="assets/😀.js"></script>'
+        '<link rel="stylesheet" href="assets/Ａ.css">',
+        encoding="utf-8",
+    )
+    (dist / "desktop.html").write_text(
         '<script type="module" src="assets/😀.js"></script>'
         '<link rel="stylesheet" href="assets/Ａ.css">',
         encoding="utf-8",
@@ -394,6 +443,11 @@ def test_node_official_guard_rejects_tracks_in_the_tracked_playlist(
     (dist / "assets/app.js").write_text("console.log('hello')\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
     (dist / "index.html").write_text(
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">',
+        encoding="utf-8",
+    )
+    (dist / "desktop.html").write_text(
         '<script type="module" src="assets/app.js"></script>'
         '<link rel="stylesheet" href="assets/app.css">',
         encoding="utf-8",

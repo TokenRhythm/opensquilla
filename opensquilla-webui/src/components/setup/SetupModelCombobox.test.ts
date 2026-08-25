@@ -166,6 +166,46 @@ describe('SetupModelCombobox', () => {
     expect(popup()?.textContent).not.toContain('Live')
   })
 
+  it('pins an optional semantic choice above models and supports keyboard selection', async () => {
+    const onUpdate = vi.fn()
+    const leadingOption = {
+      value: '__ensemble__',
+      label: 'Multi-model fusion',
+      description: 'Use the shared plan',
+    }
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption,
+      onUpdate,
+    })
+
+    const input = await openList(el)
+    expect(input.value).toBe('Multi-model fusion')
+    const rows = optionRows()
+    expect(rows[0]?.textContent).toContain('Multi-model fusion')
+    expect(rows[0]?.getAttribute('aria-selected')).toBe('true')
+    expect(rows[1]?.textContent).toContain('test-vendor/alpha')
+    expect(rows).toHaveLength(3)
+    expect(listbox()?.textContent).not.toContain('__ensemble__')
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    await nextTick()
+    expect(onUpdate).toHaveBeenCalledWith('__ensemble__')
+  })
+
+  it('keeps the semantic choice available without a discovered model catalog', async () => {
+    const { el } = await mountCombobox({
+      models: [],
+      modelSource: 'none',
+      leadingOption: { value: '__ensemble__', label: 'Multi-model fusion' },
+    })
+
+    await openList(el)
+    expect(optionRows()).toHaveLength(1)
+    expect(optionRows()[0]?.textContent).toContain('Multi-model fusion')
+  })
+
   it('opts out of password-manager field classification', async () => {
     const { el } = await mountCombobox()
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
@@ -185,13 +225,14 @@ describe('SetupModelCombobox', () => {
   it('associates field help and live catalog context with the input', async () => {
     const { el } = await mountCombobox({
       field: { ...FIELD, description: 'Used for direct requests and fallback.' },
+      externalDescriptionId: 'external-model-status',
     })
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
     const description = el.querySelector<HTMLElement>('#setup-provider-model-description')
 
     expect(description?.textContent).toBe('Used for direct requests and fallback.')
     expect(input?.getAttribute('aria-describedby'))
-      .toBe('setup-provider-model-description setup-provider-model-catalog-count')
+      .toBe('setup-provider-model-description external-model-status setup-provider-model-catalog-count')
   })
 
   it('keeps field help associated when no live catalog is available', async () => {
@@ -499,6 +540,72 @@ describe('SetupModelCombobox', () => {
 
     expect(onUpdate).toHaveBeenCalledWith('alp')
     expect(listbox()).toBeTruthy()
+  })
+
+  it('keeps search local in commit-on-select mode and restores the committed choice on blur', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption: {
+        value: '__ensemble__',
+        label: 'Multi-model fusion',
+      },
+      commitOnSelect: true,
+      onUpdate,
+    })
+    const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')!
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'alpha'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(input.value).toBe('alpha')
+    expect(optionRows().map(row => row.textContent)).toEqual(expect.arrayContaining([
+      expect.stringContaining('test-vendor/alpha'),
+      expect.stringContaining('Use "alpha"'),
+    ]))
+
+    input.dispatchEvent(new Event('blur'))
+    await nextTick()
+    expect(input.value).toBe('Multi-model fusion')
+    expect(onUpdate).not.toHaveBeenCalled()
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'beta'
+    input.dispatchEvent(new Event('input'))
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape',
+      cancelable: true,
+      bubbles: true,
+    }))
+    await nextTick()
+    expect(input.value).toBe('Multi-model fusion')
+    expect(onUpdate).not.toHaveBeenCalled()
+  })
+
+  it('commits a typed custom id only through the explicit free-text row', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption: { value: '__ensemble__', label: 'Multi-model fusion' },
+      commitOnSelect: true,
+      onUpdate,
+    })
+    const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')!
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'my/custom-model'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+    const custom = optionRows().find(row => row.textContent?.includes('Use "my/custom-model"'))!
+    custom.click()
+    await nextTick()
+
+    expect(onUpdate).toHaveBeenCalledTimes(1)
+    expect(onUpdate).toHaveBeenCalledWith('my/custom-model')
+    expect(listbox()).toBeNull()
   })
 
   it('selects the active row with Enter after arrow-key navigation', async () => {

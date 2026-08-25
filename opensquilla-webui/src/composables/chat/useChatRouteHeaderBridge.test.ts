@@ -50,6 +50,7 @@ function owner(
       copyLiveText: ref(''),
       deliverableCount: ref(0),
       contextUsage: ref(contextUsage),
+      hasNewDeliverable: ref(false),
       shareMode: ref(false),
       shareableMessageCount: ref(1),
     },

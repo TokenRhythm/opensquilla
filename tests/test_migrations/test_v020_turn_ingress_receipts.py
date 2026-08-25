@@ -232,6 +232,10 @@ def test_schema_ahead_refuses_boot_without_v020(tmp_path: Path) -> None:
         "V030__meta_control_intents.py",
         "V031__meta_launch_drafts.py",
         "V032__meta_launch_discard_tombstones.py",
+        "V037__artifact_sessions.py",
+        "V038__artifact_prompt_annotations.py",
+        "V039__artifact_mutation_attempts.py",
+        "V040__document_resources.py",
     }
     for migration in MIGRATIONS_DIR.glob("V*.py"):
         if migration.name not in unavailable:

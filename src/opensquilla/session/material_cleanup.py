@@ -32,8 +32,10 @@ import structlog
 log = structlog.get_logger(__name__)
 
 SessionMaterialCleanup = Callable[[str, str], Awaitable[None]]
+SessionArtifactCleanup = Callable[[str, str], Awaitable[None]]
 
 _hook: SessionMaterialCleanup | None = None
+_artifact_hook: SessionArtifactCleanup | None = None
 
 
 def set_session_material_cleanup(hook: SessionMaterialCleanup | None) -> None:
@@ -43,9 +45,42 @@ def set_session_material_cleanup(hook: SessionMaterialCleanup | None) -> None:
 
 
 def reset_session_material_cleanup() -> None:
-    """Test hook — drop the registered cleanup."""
-    global _hook
+    """Test hook — drop every registered session-material cleanup."""
+
+    global _artifact_hook, _hook
     _hook = None
+    _artifact_hook = None
+
+
+def set_session_artifact_cleanup(hook: SessionArtifactCleanup | None) -> None:
+    """Register post-commit cleanup for internal ArtifactSession material."""
+
+    global _artifact_hook
+    _artifact_hook = hook
+
+
+def reset_session_artifact_cleanup() -> None:
+    """Test hook — drop the internal ArtifactSession cleanup."""
+
+    global _artifact_hook
+    _artifact_hook = None
+
+
+async def run_session_artifact_cleanup(session_id: str, session_key: str) -> None:
+    """Best-effort removal of internal revision/candidate bytes after commit."""
+
+    hook = _artifact_hook
+    if hook is None:
+        return
+    try:
+        await hook(session_id, session_key)
+    except Exception as exc:  # noqa: BLE001 - DB boundary already committed
+        log.warning(
+            "session_artifact_cleanup.failed",
+            session_id=session_id,
+            session_key=session_key,
+            error=str(exc),
+        )
 
 
 async def run_session_material_cleanup(session_id: str, session_key: str) -> None:

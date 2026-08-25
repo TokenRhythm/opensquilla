@@ -1,6 +1,7 @@
 import { desktopCapabilities } from './capabilities'
 import type {
   CliInvocation,
+  DesktopGatewayConnection,
   DesktopUpdateErrorCode,
   DesktopUpdateInstallMode,
   DesktopUpdateSource,
@@ -12,6 +13,34 @@ import type {
   NativeWorkbenchSurfaceEventType,
   Platform,
 } from './types'
+
+const DESKTOP_GATEWAY_STATUSES = new Set(['starting', 'ready', 'stopped', 'error'])
+
+function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConnection {
+  const raw = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown>
+    : {}
+  if (
+    raw.schemaVersion !== 1
+    || !Number.isInteger(raw.revision)
+    || !DESKTOP_GATEWAY_STATUSES.has(String(raw.status))
+  ) {
+    throw new Error('The Desktop Gateway connection descriptor is invalid.')
+  }
+  return {
+    schemaVersion: 1,
+    revision: raw.revision as number,
+    status: raw.status as DesktopGatewayConnection['status'],
+    instanceId: typeof raw.instanceId === 'string' ? raw.instanceId : null,
+    profileFingerprint: typeof raw.profileFingerprint === 'string'
+      ? raw.profileFingerprint
+      : '',
+    httpUrl: typeof raw.httpUrl === 'string' ? raw.httpUrl : null,
+    wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
+    authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
+    error: typeof raw.error === 'string' ? raw.error : null,
+  }
+}
 
 function requireDesktopApi(): OpenSquillaDesktopApi {
   const api = window.opensquillaDesktop
@@ -53,24 +82,97 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'error',
   'crashed',
   'escape',
+  'annotation-selected',
+  'annotation-draft-change',
+  'annotation-submit',
+  'annotation-cancel',
+  'annotation-overlay-fallback',
+  'agent-edit-released',
 ])
+
+function normalizeArtifactAnnotationSelection(
+  value: unknown,
+): import('./types').NativeArtifactAnnotationSelection | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const rect = raw.rect && typeof raw.rect === 'object'
+    ? raw.rect as Record<string, unknown>
+    : null
+  const selectionId = typeof raw.selectionId === 'string' ? raw.selectionId : ''
+  const tagName = typeof raw.tagName === 'string' ? raw.tagName : ''
+  const elementPath = typeof raw.elementPath === 'string' ? raw.elementPath : ''
+  const elementProofSha256 = typeof raw.elementProofSha256 === 'string'
+    ? raw.elementProofSha256
+    : ''
+  const domSha256 = typeof raw.domSha256 === 'string' ? raw.domSha256 : ''
+  const finite = (field: string) => typeof rect?.[field] === 'number'
+    && Number.isFinite(rect[field])
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(selectionId)
+    || !/^[A-Za-z][A-Za-z0-9:_-]{0,127}$/.test(tagName)
+    || !elementPath
+    || elementPath.length > 4096
+    || !/^[a-f0-9]{64}$/i.test(elementProofSha256)
+    || (domSha256 !== '' && !/^[a-f0-9]{64}$/i.test(domSha256))
+    || !rect
+    || !finite('x')
+    || !finite('y')
+    || !finite('width')
+    || !finite('height')
+  ) return null
+  return {
+    selectionId,
+    tagName: tagName.toLowerCase(),
+    elementPath,
+    elementProofSha256: elementProofSha256.toLowerCase(),
+    ...(domSha256 ? { domSha256: domSha256.toLowerCase() } : {}),
+    rect: {
+      x: Number(rect.x),
+      y: Number(rect.y),
+      width: Math.max(0, Number(rect.width)),
+      height: Math.max(0, Number(rect.height)),
+    },
+  }
+}
 
 function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEvent | null {
   if (!payload || typeof payload !== 'object') return null
   const raw = payload as Record<string, unknown>
   if (
-    (raw.version !== 1 && raw.version !== 2)
+    (raw.version !== 1 && raw.version !== 2 && raw.version !== 3 && raw.version !== 4)
     || typeof raw.surfaceId !== 'string'
     || !NATIVE_SURFACE_EVENT_TYPES.has(raw.type as NativeWorkbenchSurfaceEventType)
   ) return null
+  const annotationEvent = typeof raw.type === 'string' && raw.type.startsWith('annotation-')
+  if (annotationEvent && raw.version !== 3 && raw.version !== 4) return null
   const rawDetail = raw.detail && typeof raw.detail === 'object'
     ? raw.detail as Record<string, unknown>
     : null
+  const selection = normalizeArtifactAnnotationSelection(rawDetail?.selection)
+  const annotationId = typeof rawDetail?.annotationId === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.annotationId)
+    ? rawDetail.annotationId
+    : ''
+  const body = typeof rawDetail?.body === 'string' && rawDetail.body.length <= 16 * 1024
+    ? rawDetail.body
+    : undefined
+  if (raw.type === 'annotation-selected' && !selection) return null
+  if (
+    (raw.type === 'annotation-draft-change' || raw.type === 'annotation-submit')
+    && (!annotationId || body === undefined)
+  ) return null
+  if (
+    (raw.type === 'annotation-cancel' || raw.type === 'annotation-overlay-fallback')
+    && !annotationId
+  ) return null
   const detail = rawDetail
     ? {
         ...(typeof rawDetail.message === 'string' ? { message: rawDetail.message } : {}),
         ...(typeof rawDetail.path === 'string' ? { path: rawDetail.path } : {}),
         ...(typeof rawDetail.reason === 'string' ? { reason: rawDetail.reason } : {}),
+        ...(annotationId ? { annotationId } : {}),
+        ...(body !== undefined ? { body } : {}),
+        ...(selection ? { selection } : {}),
         ...(typeof rawDetail.requestId === 'string' ? { requestId: rawDetail.requestId } : {}),
         ...(typeof rawDetail.permission === 'string'
           ? { permission: rawDetail.permission }
@@ -89,6 +191,10 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
           : {}),
         ...(typeof rawDetail.action === 'string' ? { action: rawDetail.action } : {}),
         ...(typeof rawDetail.code === 'string' ? { code: rawDetail.code } : {}),
+        ...(typeof rawDetail.surfaceInstanceId === 'string'
+          && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.surfaceInstanceId)
+          ? { surfaceInstanceId: rawDetail.surfaceInstanceId }
+          : {}),
       }
     : undefined
   return {
@@ -96,6 +202,54 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
     surfaceId: raw.surfaceId,
     type: raw.type as NativeWorkbenchSurfaceEventType,
     ...(detail ? { detail } : {}),
+  }
+}
+
+function normalizeArtifactScreenshotResult(
+  payload: unknown,
+): import('./types').NativeArtifactScreenshotResult {
+  const raw = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown>
+    : {}
+  if (raw.ok !== true || raw.method !== 'screenshot') {
+    return {
+      ok: false,
+      method: 'screenshot',
+      code: typeof raw.code === 'string' ? raw.code : 'operation-failed',
+      message: typeof raw.message === 'string'
+        ? raw.message
+        : 'The Desktop artifact screenshot is unavailable.',
+    }
+  }
+  const value = raw.value && typeof raw.value === 'object'
+    ? raw.value as Record<string, unknown>
+    : null
+  const data = value?.data instanceof Uint8Array ? value.data : null
+  const width = Number(value?.width)
+  const height = Number(value?.height)
+  if (
+    value?.mime !== 'image/png'
+    || !data
+    || data.byteLength < 1
+    || data.byteLength > 16 * 1024 * 1024
+    || !Number.isSafeInteger(width)
+    || !Number.isSafeInteger(height)
+    || width < 1
+    || height < 1
+    || width > 32_768
+    || height > 32_768
+  ) {
+    return {
+      ok: false,
+      method: 'screenshot',
+      code: 'invalid-response',
+      message: 'The Desktop artifact screenshot response is invalid.',
+    }
+  }
+  return {
+    ok: true,
+    method: 'screenshot',
+    value: { mime: 'image/png', data, width, height },
   }
 }
 
@@ -118,7 +272,11 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
         ? payload as Record<string, unknown>
         : {}
       const versions = Array.isArray(raw.protocolVersions)
-        ? raw.protocolVersions.filter((value): value is 1 | 2 => value === 1 || value === 2)
+        ? raw.protocolVersions.filter(
+            (value): value is 1 | 2 | 3 | 4 => (
+              value === 1 || value === 2 || value === 3 || value === 4
+            ),
+          )
         : []
       const modes = Array.isArray(raw.modes)
         ? raw.modes.filter((value): value is 'full' | 'offline' =>
@@ -138,6 +296,43 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
 
   return {
     getCapabilities,
+    ...(typeof api.getArtifactAnnotationCapabilities === 'function'
+      ? {
+          async getArtifactAnnotationCapabilities() {
+            const payload = await api.getArtifactAnnotationCapabilities!()
+            const raw = payload && typeof payload === 'object'
+              ? payload as Record<string, unknown>
+              : {}
+            return {
+              version: raw.version === 4 ? 4 as const : 3 as const,
+              available: (raw.version === 3 || raw.version === 4) && raw.available === true,
+              ...(typeof raw.picker === 'boolean' ? { picker: raw.picker } : {}),
+              ...(typeof raw.trustedOverlay === 'boolean'
+                ? { trustedOverlay: raw.trustedOverlay }
+                : {}),
+              ...(raw.overlayCopyVersion === 1 ? { overlayCopyVersion: 1 as const } : {}),
+              ...(raw.atomicCloseRearm === true ? { atomicCloseRearm: true as const } : {}),
+              ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+            }
+          },
+        }
+      : {}),
+    ...(typeof api.setArtifactAnnotationMode === 'function'
+      ? { setArtifactAnnotationMode: payload => api.setArtifactAnnotationMode!(payload) }
+      : {}),
+    ...(typeof api.showArtifactAnnotationOverlay === 'function'
+      ? { showArtifactAnnotationOverlay: payload => api.showArtifactAnnotationOverlay!(payload) }
+      : {}),
+    ...(typeof api.closeArtifactAnnotationOverlay === 'function'
+      ? { closeArtifactAnnotationOverlay: payload => api.closeArtifactAnnotationOverlay!(payload) }
+      : {}),
+    ...(typeof api.screenshot === 'function'
+      ? {
+          async screenshot(payload) {
+            return normalizeArtifactScreenshotResult(await api.screenshot!(payload))
+          },
+        }
+      : {}),
     ...(typeof api.createArtifactPreviewLease === 'function'
       && typeof api.renewArtifactPreviewLease === 'function'
       && typeof api.revokeArtifactPreviewLease === 'function'
@@ -309,6 +504,27 @@ export function createDesktopPlatform(): Platform {
     },
     gateway: {
       getStatus: () => requireDesktopApi().getGatewayStatus(),
+      ...(typeof desktopApi.getGatewayConnection === 'function'
+        ? {
+            getConnection: async () => normalizeDesktopGatewayConnection(
+              await requireDesktopApi().getGatewayConnection!(),
+            ),
+          }
+        : {}),
+      ...(typeof desktopApi.onGatewayConnectionChanged === 'function'
+        ? {
+            onConnection: (callback: (connection: DesktopGatewayConnection) => void) => (
+              requireDesktopApi().onGatewayConnectionChanged!((payload) => {
+                try {
+                  callback(normalizeDesktopGatewayConnection(payload))
+                } catch {
+                  // Ignore malformed main-process events; the next trusted
+                  // snapshot or event will restore the authoritative state.
+                }
+              })
+            ),
+          }
+        : {}),
       revealLog: () => requireDesktopApi().revealGatewayLog(),
       retryStartup: () => requireDesktopApi().retryStartup(),
       async getCliInvocation(): Promise<CliInvocation | null> {

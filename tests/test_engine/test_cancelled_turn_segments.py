@@ -16,6 +16,7 @@ from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig, Squilla
 from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import Message, ModelInfo
+from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
@@ -25,6 +26,7 @@ from opensquilla.tools.registry import ToolRegistry, ToolSpec
 from opensquilla.tools.types import CallerKind, ToolContext
 
 PARTIAL_ANSWER = "Based on the lookup, the answer is 42 and the reasoning is as follows"
+PARTIAL_ACTIVITY = "I will inspect another source before answering."
 
 
 class _ToolThenHangingTextProvider:
@@ -64,6 +66,42 @@ class _ToolThenCompletedTextProvider(_ToolThenHangingTextProvider):
             return
         yield ProviderText(text=PARTIAL_ANSWER)
         yield ProviderDone(stop_reason="end_turn", input_tokens=1, output_tokens=1)
+
+
+class _HangingIntermediateTextProvider(_ToolThenHangingTextProvider):
+    """Start a tool and then stream work narration before cancellation."""
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        del call_number
+        yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
+        yield ProviderToolUseEnd(
+            tool_use_id="tool-1",
+            tool_name="lookup",
+            arguments={},
+        )
+        yield ProviderText(text=PARTIAL_ACTIVITY)
+        await asyncio.Event().wait()
+
+
+class _HangingReasoningProvider:
+    """Stream visible reasoning without answer text, then wait for Stop."""
+
+    provider_name = "test"
+
+    def __init__(self) -> None:
+        self.model = "test/model"
+        self.reasoning_consumed = asyncio.Event()
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderReasoning(text="partial reasoning")
+        self.reasoning_consumed.set()
+        await asyncio.Event().wait()
+
+    async def list_models(self) -> list[ModelInfo]:
+        return []
 
 
 class _HangingSystemEventProvider:
@@ -247,6 +285,132 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_turn_preserves_intermediate_text_presentation(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-intermediate-text"
+    await manager.create(session_key)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(_HangingIntermediateTextProvider()),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+    partial_seen = asyncio.Event()
+
+    async def _consume() -> None:
+        async for event in runner.run(
+            "inspect it before answering",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        ):
+            if isinstance(event, TextDeltaEvent) and PARTIAL_ACTIVITY in (event.text or ""):
+                assert event.presentation == "intermediate"
+                partial_seen.set()
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(partial_seen.wait(), timeout=5.0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        transcript = await manager.get_transcript(session_key)
+        assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
+        text_segments = [
+            segment
+            for segment in (assistant.tool_calls or [])
+            if isinstance(segment, dict) and segment.get("type") == "text"
+        ]
+        assert text_segments == [
+            {
+                "type": "text",
+                "text": PARTIAL_ACTIVITY,
+                "presentation": "intermediate",
+            }
+        ]
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reasoning_only_turn_persists_assistant_history(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-reasoning-only"
+    await manager.create(session_key)
+    provider = _HangingReasoningProvider()
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),  # type: ignore[arg-type]
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "reason before answering",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.reasoning_consumed.wait(), timeout=5.0)
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            pytest.fail("Expected CancelledError when awaiting cancelled task")
+
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0].content == ""
+        assert assistants[0].reasoning_content == "partial reasoning"
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Cancellation is the expected cleanup outcome for this task.
+                pass
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_cancel_during_finalizer_does_not_duplicate_text_segment(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -375,6 +539,126 @@ async def test_cancelled_system_event_does_not_persist_partial_sentinel(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "partial_marker",
+    ["N", "NO_REP", "HEART", pytest.param("   ", id="whitespace-only")],
+)
+async def test_cancelled_human_turn_does_not_persist_withheld_sentinel_prefix(
+    tmp_path,
+    partial_marker: str,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = f"agent:main:webchat:cancel-human-prefix-{partial_marker}"
+    await manager.create(session_key)
+    provider = _HangingSystemEventProvider(partial_marker)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "ordinary human request",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="user",
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            _ = await task
+        assert task.cancelled()
+
+        transcript = await manager.get_transcript(session_key)
+        assert [entry for entry in transcript if entry.role == "assistant"] == []
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                _ = await task
+            assert task.cancelled()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_human_turn_preserves_released_over_bound_prefix(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-human-released-prefix"
+    await manager.create(session_key)
+    released_text = "N" + (" " * 64)
+    provider = _HangingSystemEventProvider(released_text)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+    visible_text: list[str] = []
+
+    async def _consume() -> None:
+        async for event in runner.run(
+            "ordinary human request",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="user",
+            no_memory_capture=True,
+        ):
+            if isinstance(event, TextDeltaEvent):
+                visible_text.append(event.text)
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        assert "".join(visible_text) == released_text
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            _ = await task
+        assert task.cancelled()
+
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0].content == "N"
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                _ = await task
+            assert task.cancelled()
         await storage.close()
 
 

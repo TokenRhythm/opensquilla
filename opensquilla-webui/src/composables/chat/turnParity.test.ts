@@ -35,6 +35,7 @@ function makeFold(toolCalls: ChatToolCall[], extra: Partial<FoldedTurn> = {}): F
     statusHistory: [],
     timelineSegments: [],
     ...extra,
+    reasoningBlocks: extra.reasoningBlocks ?? [],
   }
 }
 
@@ -113,5 +114,25 @@ describe('diffFoldVsLegacy — terminal states and structure', () => {
       makeLegacy([makeCall()]),
     )
     expect(problems.some(p => p.includes('timeline length'))).toBe(true)
+  })
+
+  it('flags a semantic text-presentation mismatch', () => {
+    const foldedTimeline = [{
+      type: 'text' as const,
+      key: 'text-0',
+      html: '',
+      rawText: 'Working note.',
+      presentation: 'intermediate' as const,
+    }]
+    const legacyTimeline = [{
+      ...foldedTimeline[0],
+      presentation: 'answer' as const,
+    }]
+    const problems = diffFoldVsLegacy(
+      makeFold([], { timelineItems: foldedTimeline }),
+      makeLegacy([], { timelineItems: legacyTimeline }),
+    )
+
+    expect(problems).toContain('timeline text 0 presentation diverges')
   })
 })

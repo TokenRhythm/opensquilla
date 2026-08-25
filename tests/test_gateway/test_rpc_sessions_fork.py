@@ -69,7 +69,12 @@ async def _seed_parent_with_markers(manager) -> tuple[Any, Any, Any]:
     return first, middle, final
 
 
-async def _seed_parent_with_terminal_turn(manager, *, status=AgentTaskStatus.SUCCEEDED) -> str:
+async def _seed_parent_with_terminal_turn(
+    manager,
+    *,
+    status=AgentTaskStatus.SUCCEEDED,
+    accepted_routing_mode: str | None = None,
+) -> str:
     parent = await manager.create(PARENT_KEY, agent_id="main")
     turn_id = "turn-rpc-terminal"
     for role, content in (
@@ -96,11 +101,17 @@ async def _seed_parent_with_terminal_turn(manager, *, status=AgentTaskStatus.SUC
             turn_context={"turn_id": "turn-rpc-later"},
         )
     )
+    details = {}
+    if accepted_routing_mode is not None:
+        details["accepted_model_routing"] = {
+            "effective_mode": accepted_routing_mode,
+        }
     await manager._storage.create_agent_task(
         AgentTaskRecord(
             task_id=turn_id,
             session_key=parent.session_key,
             status=status,
+            details=details,
         )
     )
     return turn_id
@@ -148,6 +159,47 @@ async def test_fork_copies_transcript_and_marks_fork(dispatcher, ctx, manager):
     parent_row = _list_row(list_res, PARENT_KEY)
     assert parent_row["forkedFromParent"] is False
     assert parent_row["spawnDepth"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fork_preserves_router_snapshot_after_parent_deletion(dispatcher, ctx, manager):
+    await manager.create(PARENT_KEY, agent_id="main")
+    snapshot = {
+        "version": 1,
+        "request_kind": "text",
+        "tiers": [
+            {
+                "tier": "c1",
+                "model": "synthetic/model",
+                "execution_kind": "single_model",
+            }
+        ],
+    }
+    await manager.append_message(PARENT_KEY, "user", "question", token_count=1)
+    await manager.append_message(
+        PARENT_KEY,
+        "assistant",
+        "answer",
+        token_count=1,
+        turn_usage={
+            "route_plan": {
+                "version": 2,
+                "tier": "c1",
+                "model": "synthetic/model",
+                "router_tier_snapshot": snapshot,
+            }
+        },
+    )
+
+    fork_res = await dispatcher.dispatch("r1", "sessions.fork", {"key": PARENT_KEY}, ctx)
+    assert fork_res.ok is True
+    child_key = fork_res.payload["key"]
+    delete_res = await dispatcher.dispatch("r2", "sessions.delete", {"key": PARENT_KEY}, ctx)
+    assert delete_res.ok is True
+
+    child_entries = await manager.get_transcript(child_key)
+    assert child_entries[-1].turn_usage is not None
+    assert child_entries[-1].turn_usage["route_plan"]["router_tier_snapshot"] == snapshot
 
 
 @pytest.mark.asyncio
@@ -861,6 +913,71 @@ async def test_forked_turn_outcome_and_nested_fork_survive_parent_delete(
     assert [
         entry.content for entry in await manager.get_transcript(nested_res.payload["key"])
     ] == ["turn question", "tool request", "tool output", "turn answer"]
+
+
+@pytest.mark.asyncio
+async def test_forked_turn_accepted_routing_mode_survives_parent_delete(
+    dispatcher,
+    ctx,
+    manager,
+):
+    turn_id = await _seed_parent_with_terminal_turn(
+        manager,
+        accepted_routing_mode="ensemble",
+    )
+    fork_res = await dispatcher.dispatch(
+        "r1",
+        "sessions.forkThroughTurn",
+        {"key": PARENT_KEY, "throughTurnId": turn_id},
+        ctx,
+    )
+    assert fork_res.ok is True
+    child_key = fork_res.payload["key"]
+
+    delete_res = await dispatcher.dispatch(
+        "r2",
+        "sessions.delete",
+        {"key": PARENT_KEY},
+        ctx,
+    )
+    assert delete_res.ok is True
+    assert await manager._storage.get_agent_task(turn_id) is None
+
+    history_res = await dispatcher.dispatch(
+        "r3",
+        "chat.history",
+        {"sessionKey": child_key},
+        ctx,
+    )
+    assert history_res.ok is True
+    expected_outcomes = [
+        {
+            "turn_id": turn_id,
+            "task_id": turn_id,
+            "status": "succeeded",
+            "started_at": None,
+            "finished_at": None,
+            "outcome": {"kind": "completed", "reason": "succeeded"},
+            "accepted_routing_mode": "ensemble",
+        }
+    ]
+    assert history_res.payload["turn_outcomes"] == expected_outcomes
+
+    nested_res = await dispatcher.dispatch(
+        "r4",
+        "sessions.forkThroughTurn",
+        {"key": child_key, "throughTurnId": turn_id},
+        ctx,
+    )
+    assert nested_res.ok is True
+    nested_history_res = await dispatcher.dispatch(
+        "r5",
+        "chat.history",
+        {"sessionKey": nested_res.payload["key"]},
+        ctx,
+    )
+    assert nested_history_res.ok is True
+    assert nested_history_res.payload["turn_outcomes"] == expected_outcomes
 
 
 @pytest.mark.asyncio

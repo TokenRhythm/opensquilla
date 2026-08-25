@@ -22,6 +22,8 @@ function mountDrawer(options: {
   queue?: SkillInstallQueueItem[]
   activities?: SkillInstallActivities
   runningSource?: SkillInstallSource | null
+  cancellableInstallSource?: SkillInstallSource | null
+  cancellingSource?: SkillInstallSource | null
   mutationBlocked?: boolean
   results?: RegistryResult[]
   registryDiagnostics?: SkillDiagnostic[]
@@ -44,9 +46,11 @@ function mountDrawer(options: {
     },
   })
   const runningSource = ref<SkillInstallSource | null>(options.runningSource ?? null)
+  const cancellingSource = ref<SkillInstallSource | null>(options.cancellingSource ?? null)
   const installed: Array<[string, string, string]> = []
   const retried: Array<[string, boolean | undefined]> = []
   const cleared: SkillInstallSource[] = []
+  const cancelled: SkillInstallSource[] = []
 
   const Root = defineComponent({
     setup() {
@@ -65,6 +69,8 @@ function mountDrawer(options: {
           registrySearchError: '',
           activities: activities.value,
           runningSource: runningSource.value,
+          cancellableInstallSource: options.cancellableInstallSource ?? null,
+          cancellingSource: cancellingSource.value,
           mutationBlocked: options.mutationBlocked || false,
           'onUpdate:registryQuery': (value: string) => { registryQuery.value = value },
           'onUpdate:githubUrl': (value: string) => { githubUrl.value = value },
@@ -74,6 +80,9 @@ function mountDrawer(options: {
           },
           onRetry: (id: string, acknowledgeRisk?: boolean) => {
             retried.push([id, acknowledgeRisk])
+          },
+          onCancelInstall: (source: SkillInstallSource) => {
+            cancelled.push(source)
           },
           onClearActivity: (source: SkillInstallSource) => {
             cleared.push(source)
@@ -98,9 +107,11 @@ function mountDrawer(options: {
     queue,
     activities,
     runningSource,
+    cancellingSource,
     installed,
     retried,
     cleared,
+    cancelled,
   }
 }
 
@@ -260,6 +271,55 @@ describe('SkillsAddDrawer', () => {
 
     expect(document.querySelector('.sk-add-queue-item')?.getAttribute('data-status')).toBe('installed')
     expect(document.querySelector('.sk-add-queue-item')?.textContent).toContain('legacy-skill')
+  })
+
+  it('offers backend cancellation only for a cancellable active install', async () => {
+    const queue: SkillInstallQueueItem[] = [{
+      id: '["github","active"]',
+      identifier: 'active',
+      source: 'github',
+      displayName: 'active-skill',
+      status: 'installing',
+    }]
+    const mounted = mountDrawer({
+      queue,
+      runningSource: 'github',
+      cancellableInstallSource: 'github',
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    const cancel = document.querySelector<HTMLButtonElement>('[data-testid="skills-cancel-install"]')!
+    expect(cancel.textContent).toContain('Cancel install')
+    expect(cancel.disabled).toBe(false)
+    cancel.click()
+    expect(mounted.cancelled).toEqual(['github'])
+
+    mounted.cancellingSource.value = 'github'
+    await nextTick()
+    expect(cancel.textContent).toContain('Cancelling')
+    expect(cancel.disabled).toBe(true)
+  })
+
+  it('counts cancelled items as processed and allows a safe retry', async () => {
+    const queue: SkillInstallQueueItem[] = [{
+      id: '["github","cancelled"]',
+      identifier: 'cancelled',
+      source: 'github',
+      displayName: 'cancelled-skill',
+      status: 'cancelled',
+    }]
+    const mounted = mountDrawer({ queue })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    expect(document.querySelector('.sk-add-section-title')?.textContent)
+      .toContain('1 / 1 processed · 1 cancelled')
+    const retry = document.querySelector<HTMLButtonElement>('.sk-add-retry')!
+    expect(retry.disabled).toBe(false)
+    retry.click()
+    expect(mounted.retried).toEqual([['["github","cancelled"]', false]])
+    expect(document.querySelector('[data-testid="skills-cancel-install"]')).toBeNull()
   })
 
   it('renders upstream diagnostic details as text and disables mutations while running', async () => {

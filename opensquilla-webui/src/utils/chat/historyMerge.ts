@@ -1,5 +1,6 @@
 import type { ChatMessage } from '@/types/chat'
 import type { StatusPart } from '@/types/parts'
+import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 
 const TERMINAL_STEER_DISPOSITIONS = new Set([
   'applied',
@@ -86,11 +87,23 @@ export function mergeLiveOnlyFields(
   if (serverSeconds <= 0 && (prev.reasoning?.seconds ?? 0) > 0) {
     merged.reasoning = prev.reasoning
   }
+  // History currently persists the canonical concatenated reasoning text but
+  // not its physical-call boundaries. Preserve the just-finished structured
+  // blocks after this function has already proved both rows are the same turn.
+  if (
+    !server.activitySnapshot?.complete
+    && !server.reasoningBlocks?.length
+    && prev.reasoningBlocks?.length
+  ) {
+    merged.reasoningBlocks = prev.reasoningBlocks.map(block => ({ ...block }))
+  }
 
   // The fold's phase snapshot supplies an exact same-session activity start.
   // History does not persist it, so retain the local snapshot across the first
   // authoritative refresh; a cold reload still correctly falls back to counts.
-  if ((prev.statusHistory?.length ?? 0) > 0 || (server.statusHistory?.length ?? 0) > 0) {
+  if (server.activitySnapshot?.complete && !server.activitySnapshotIncomplete) {
+    merged.statusHistory = (server.statusHistory ?? []).map(entry => ({ ...entry }))
+  } else if ((prev.statusHistory?.length ?? 0) > 0 || (server.statusHistory?.length ?? 0) > 0) {
     const serverRows = server.statusHistory ?? []
     const previousRows = prev.statusHistory ?? []
     const serverHasTaskPhases = serverRows.some(entry => entry.category !== 'maintenance')
@@ -122,7 +135,10 @@ export function mergeLiveOnlyFields(
         rows[index] = { ...rows[index], ...entry, at: rows[index]!.at }
       }
     }
-    merged.statusHistory = rows.sort((a, b) => a.at - b.at)
+    // Legacy/no-v2 rows keep their established timestamp merge behavior.
+    // Complete v2 snapshots return from the authoritative branch above and
+    // are never sorted by display timestamps.
+    merged.statusHistory = rows.sort((left, right) => left.at - right.at)
   }
 
   // routerSettled is sticky: once a strip has settled it stays settled.
@@ -151,6 +167,10 @@ export function mergeLiveOnlyFields(
     if (prev.turnId) merged.turnId = prev.turnId
   }
   if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
+  if (!server.activitySnapshot && prev.activitySnapshot) {
+    merged.activitySnapshot = prev.activitySnapshot
+    merged.activitySnapshotIncomplete = prev.activitySnapshotIncomplete
+  }
   if (!server.turnInputMode && prev.turnInputMode) {
     merged.turnInputMode = prev.turnInputMode
   }
@@ -167,6 +187,21 @@ export function mergeLiveOnlyFields(
     merged.promotedFromTurnId = prev.promotedFromTurnId
   }
   if (prev.steerRestored) merged.steerRestored = true
+
+  // Older gateways may return the canonical answer without the ordered local
+  // timeline. Keep the just-finished snapshot so intermediate/answer roles and
+  // their grouped call ids survive the immediate history replacement. A
+  // non-empty server timeline remains authoritative.
+  if (
+    !server.activitySnapshot?.complete
+    && (server.timeline?.length ?? 0) === 0
+    && (prev.timeline?.length ?? 0) > 0
+  ) {
+    merged.timeline = prev.timeline?.map(segment => ({ ...segment }))
+    if ((prev.tool_calls?.length ?? 0) > 0) {
+      merged.tool_calls = prev.tool_calls?.map(call => ({ ...call }))
+    }
+  }
 
   // Approval/clarify interrupts are live event metadata. Canonical transcript
   // rows currently persist the surrounding text/tools but not these decisions,
@@ -498,6 +533,43 @@ export function reconcileClientTerminalNotices(
       .slice(userIndex + 1, turnEnd)
       .some(message => message.role === 'error')
     if (durableErrorExists) continue
+
+    // A retryable pre-provider failure can leave a status-only assistant with
+    // no durable message id while the terminal task projection is still
+    // catching up. Preserve that activity only when both snapshots prove the
+    // same durable user id and exact turn id. Once canonical history carries a
+    // same-turn status snapshot, it replaces this optimistic row naturally.
+    const exactTurnId = notice.turnId?.trim()
+    const previousUser = prev[priorUserIndex]
+    const exactIncomingUserIndex = exactTurnId && previousUser?.messageId
+      ? merged.findIndex(message =>
+          message.role === 'user'
+          && message.messageId === previousUser.messageId
+          && message.turnId === exactTurnId,
+        )
+      : -1
+    if (
+      isUsageAccountingBarrier(notice.errorCode)
+      && exactIncomingUserIndex >= 0
+      && previousUser.turnId === exactTurnId
+    ) {
+      const optimisticActivities = prev.slice(priorUserIndex + 1, i).filter(message =>
+        message.role === 'assistant'
+        && message.turnId === exactTurnId
+        && !message.messageId
+        && (message.statusHistory?.length ?? 0) > 0,
+      )
+      const durableActivityExists = merged.some(message =>
+        message.role === 'assistant'
+        && message.turnId === exactTurnId
+        && Boolean(message.messageId)
+        && (message.statusHistory?.length ?? 0) > 0,
+      )
+      if (optimisticActivities.length === 1 && !durableActivityExists) {
+        merged.splice(turnEnd, 0, optimisticActivities[0]!)
+        turnEnd += 1
+      }
+    }
     merged.splice(turnEnd, 0, notice)
   }
 

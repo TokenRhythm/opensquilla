@@ -46,6 +46,7 @@ from opensquilla.gateway.config import (
     is_public_bind,
 )
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
@@ -55,6 +56,15 @@ from opensquilla.gateway.session_lifecycle import (
 )
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
+from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
+from opensquilla.gateway.terminal_activity import (
+    append_activity_phase,
+    is_usage_accounting_barrier,
+    safe_primary_user_message_id,
+    safe_retry_after_ms,
+    terminal_activity_snapshot,
+    usage_barrier_replay_proof,
+)
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.permissions import configured_default_elevated
@@ -73,6 +83,8 @@ log = structlog.get_logger(__name__)
 GATEWAY_GRACEFUL_TIMEOUT_ENV = "OPENSQUILLA_GATEWAY_GRACEFUL_TIMEOUT"
 _DEFAULT_GRACEFUL_TIMEOUT_S = 30.0
 _MAX_GRACEFUL_TIMEOUT_S = 120.0
+_WS_SHUTDOWN_CLOSE_TIMEOUT_S = 2.0
+_WS_SHUTDOWN_CANCEL_GRACE_S = 0.05
 
 
 def _elapsed_monotonic_ms(started_at: float, ended_at: float | None = None) -> int:
@@ -314,11 +326,21 @@ class TaskRuntimeStreamError(RuntimeError):
         code: str | None = None,
         terminal_reason: str | None = None,
         failure_kind: str | None = None,
+        retry_after_ms: int | None = None,
+        activity_snapshot: dict[str, Any] | None = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.terminal_reason = terminal_reason
         self.failure_kind = failure_kind
+        self.retry_after_ms = retry_after_ms
+        self.activity_snapshot = activity_snapshot
+        self.usage_call_index = usage_call_index
+        self.no_prior_provider_dispatch = no_prior_provider_dispatch
+        self.replay_safe = replay_safe
 
 
 # fmt: off
@@ -653,6 +675,7 @@ class ServiceContainer:
     tool_registry: ToolRegistry | None = None
     session_manager: SessionManager | None = None
     skill_loader: SkillLoader | None = None
+    skill_watcher: Any = None
     skill_management_service: Any = None
     skill_management_state: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker | None = None
@@ -723,6 +746,14 @@ class ServiceContainer:
                 pass
             except Exception:
                 log.debug("gateway.deferred_warmup_close_failed", exc_info=True)
+
+        skill_watcher = self.skill_watcher
+        self.skill_watcher = None
+        if skill_watcher is not None:
+            try:
+                await skill_watcher.stop()
+            except Exception:
+                log.debug("gateway.skill_watcher_close_failed", exc_info=True)
 
         model_catalog_refresh_coordinator = self.model_catalog_refresh_coordinator
         self.model_catalog_refresh_coordinator = None
@@ -1346,6 +1377,13 @@ async def dispatch_task_runtime_turn(
 
     pin_sandbox_policy(tool_context, config)
     tool_context.task_id = run.task_id
+    run_metadata = getattr(run.envelope, "metadata", {})
+    parent_session_key = run_metadata.get("parent_session_key")
+    parent_task_id = run_metadata.get("parent_task_id")
+    tool_context.parent_session_key = (
+        parent_session_key if isinstance(parent_session_key, str) else None
+    )
+    tool_context.parent_task_id = parent_task_id if isinstance(parent_task_id, str) else None
     if (
         session is None
         and session_manager is not None
@@ -1373,6 +1411,8 @@ async def dispatch_task_runtime_turn(
     heartbeat_interval = _optional_positive_timeout(
         config, "agent_stream_heartbeat_interval_seconds", 15.0
     )
+    from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
     try:
         with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
             raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
@@ -1382,6 +1422,7 @@ async def dispatch_task_runtime_turn(
                 event_emitter,
                 idle_timeout=stream_idle_timeout,
                 heartbeat_interval=heartbeat_interval,
+                context_bound=is_context_bound_owner(turn_runner),
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
                 session_id=getattr(run.envelope, "session_id", None),
@@ -1391,6 +1432,17 @@ async def dispatch_task_runtime_turn(
                 input_mode=getattr(run, "input_mode", "user"),
                 run_kind=getattr(run, "run_kind", None),
             )
+            finalizer_receipt_sink = getattr(run, "finalizer_receipt_sink", None)
+            if finalizer_receipt_sink is not None:
+                try:
+                    finalizer_receipt_sink()
+                except Exception:
+                    log.warning(
+                        "task_runtime.finalizer_receipt_failed",
+                        session_key=run.session_key,
+                        task_id=getattr(run, "task_id", None),
+                        exc_info=True,
+                    )
     except TaskRuntimeStreamError as exc:
         if exc.code in {
             "provider_request_budget_exhausted",
@@ -1455,8 +1507,10 @@ def build_session_material_cleanup(config: Any) -> Any:
     Removes all on-disk material stores for a deleted session: the canonical
     transcript-material store (``<media_root>/transcripts/<sid>/``) and the
     tool-visible workspace materialization
-    (``<workspace>/.opensquilla/attachments/<segment>/``), plus generated
-    Artifact files and bundle blobs below ``<media_root>/artifacts``. Lives in the gateway
+    (``<workspace>/.opensquilla/attachments/<segment>/``), plus every ArtifactStore
+    bucket owned by that session below ``<media_root>/artifacts``. Session deletion
+    is a privacy and disk-reclamation boundary, so both listed and internal
+    artifacts are removed. Lives in the gateway
     layer because it resolves the agent workspace via ``agents.scope``; the
     low-level ``session`` package only owns the hook registry + guarded remover.
     """
@@ -1484,9 +1538,24 @@ def build_session_material_cleanup(config: Any) -> Any:
         segment = _safe_path_segment(session_id, fallback="session")
         attachments_dir = workspace / ".opensquilla" / "attachments" / segment
         rmtree_scoped(attachments_dir, expected_name=segment)
-        # 3. Generated artifacts, including content-addressed bundle blobs and
-        #    legacy layouts. ArtifactStore owns the layout and deletion guards.
+        # 3. Every artifact owned by the deleted session, including listed
+        #    chat artifacts, internal revisions/candidates, bundle blobs, and
+        #    legacy layouts. ArtifactStore owns the scoped layout and link guards.
         ArtifactStore(media_root).delete_session_artifacts(session_id)
+
+    return _cleanup
+
+
+def build_session_artifact_cleanup(config: Any) -> Any:
+    """Build post-reset cleanup for internal ArtifactSession material only."""
+
+    from opensquilla.artifacts import ArtifactStore
+    from opensquilla.paths import media_root_from_config
+
+    async def _cleanup(session_id: str, _session_key: str) -> None:
+        ArtifactStore(media_root_from_config(config)).delete_session_internal_artifacts(
+            session_id
+        )
 
     return _cleanup
 
@@ -1549,6 +1618,13 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
+    document_mutation_outcome_sink = getattr(
+        run,
+        "document_mutation_outcome_sink",
+        None,
+    )
+    if document_mutation_outcome_sink is not None:
+        kwargs["document_mutation_outcome_sink"] = document_mutation_outcome_sink
     return kwargs
 
 
@@ -1734,6 +1810,7 @@ async def _emit_task_runtime_stream_events(
     *,
     idle_timeout: float | None = 180.0,
     heartbeat_interval: float | None = None,
+    context_bound: bool | None = None,
     stream_event_sink: Any = None,
     task_id: str | None = None,
     session_id: str | None = None,
@@ -1758,11 +1835,20 @@ async def _emit_task_runtime_stream_events(
     error_code: str | None = None
     failure_kind: str | None = None
     terminal_reason: str | None = None
+    retry_after_ms: int | None = None
+    activity_phases: list[dict[str, Any]] = []
+    activity_snapshot: dict[str, Any] | None = None
+    replay_proof: dict[str, Any] = {
+        "no_prior_provider_dispatch": False,
+        "replay_safe": False,
+    }
+    primary_user_message_id = safe_primary_user_message_id(user_message_id)
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
         heartbeat_interval=heartbeat_interval,
         heartbeat_message="Agent run is still active",
+        context_bound=context_bound,
     ):
         if is_dataclass(event):
             event_dict = asdict(event)
@@ -1773,6 +1859,56 @@ async def _emit_task_runtime_stream_events(
                 if not key.startswith("_")
             }
         event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        if event_kind == "answer_generation_reset" and event_dict.get("terminal") is True:
+            # A terminal generation reset is the canonical visible outcome
+            # when the fixed provider also fails.  It intentionally replaces
+            # the speculative answer without emitting a second public Error,
+            # but TaskRuntime must still classify the turn as failed instead
+            # of treating a clean stream EOF as success.
+            raw_terminal_text = event_dict.get("terminal_text_snapshot")
+            raw_authoritative_text = event_dict.get("authoritative_text_snapshot")
+            error_message = (
+                raw_terminal_text
+                if isinstance(raw_terminal_text, str) and raw_terminal_text
+                else raw_authoritative_text
+                if isinstance(raw_authoritative_text, str) and raw_authoritative_text
+                else "The model could not complete this answer."
+            )
+            raw_terminal_code = event_dict.get("terminal_error_code")
+            error_code = (
+                str(raw_terminal_code)
+                if isinstance(raw_terminal_code, str) and raw_terminal_code
+                else "ensemble_fixed_error"
+            )
+            raw_terminal_failure_kind = event_dict.get("terminal_failure_kind")
+            failure_kind = (
+                str(raw_terminal_failure_kind)
+                if isinstance(raw_terminal_failure_kind, str)
+                and raw_terminal_failure_kind
+                else None
+            )
+            terminal_reason = "error"
+            event_dict.setdefault("terminal_reason", terminal_reason)
+        if event_kind == "answer_generation_reset":
+            # These fields exist only to carry a typed failed outcome through
+            # the in-process finalizer contract.  The reset snapshot is the
+            # complete public payload; never expose internal failure metadata
+            # through either the session-event emitter or a relay sink. Scrub
+            # normal and terminal resets alike.
+            event_dict.pop("terminal_error_message", None)
+            event_dict.pop("terminal_error_code", None)
+            event_dict.pop("terminal_failure_kind", None)
+        if event_kind == "thinking" and not event_dict.get("block_id"):
+            # Preserve the exact legacy payload for producers that still
+            # construct an unscoped ThinkingEvent.
+            event_dict.pop("block_id", None)
+            event_dict.pop("block_index", None)
+        append_activity_phase(
+            activity_phases,
+            event_kind=event_kind,
+            payload=event_dict,
+            observed_at_ms=int(time.time() * 1_000),
+        )
         if event_kind == "artifact":
             event_dict = enrich_artifact_event_dict(event_dict)
         if event_kind == "error":
@@ -1782,6 +1918,12 @@ async def _emit_task_runtime_stream_events(
             )
             code = event_dict.get("code")
             error_code = str(code) if code else None
+            raw_retry_after_ms = event_dict.pop("retry_after_ms", None)
+            raw_usage_call_index = event_dict.pop("usage_call_index", None)
+            raw_no_prior_provider_dispatch = event_dict.pop(
+                "no_prior_provider_dispatch", None
+            )
+            raw_replay_safe = event_dict.pop("replay_safe", None)
             # Keep the normalized provider classification internal to the
             # durable task outcome; it is not part of the public stream event.
             raw_failure_kind = event_dict.pop("failure_kind", None)
@@ -1796,9 +1938,14 @@ async def _emit_task_runtime_stream_events(
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
-            terminal_reason = (
-                "timeout" if is_timeout else "output_truncated" if is_output_truncated else "error"
-            )
+            if is_timeout:
+                terminal_reason = "timeout"
+            elif is_output_truncated:
+                terminal_reason = "output_truncated"
+            elif code_text == "model_repetition_loop_detected":
+                terminal_reason = "model_repetition_loop_detected"
+            else:
+                terminal_reason = "error"
             terminal_payload = {
                 "status": "timeout" if is_timeout else "failed",
                 "terminal_reason": terminal_reason,
@@ -1815,6 +1962,13 @@ async def _emit_task_runtime_stream_events(
                 event_dict["code"] = safe_error_code
                 terminal_payload["error_class"] = safe_error_code
                 terminal_payload["error_message"] = safe_error_message
+            if is_usage_accounting_barrier(error_code):
+                replay_proof = usage_barrier_replay_proof(
+                    usage_call_index=raw_usage_call_index,
+                    no_prior_provider_dispatch=raw_no_prior_provider_dispatch,
+                    replay_safe=raw_replay_safe,
+                )
+                terminal_payload.update(replay_proof)
             terminal_message = build_terminal_reply(terminal_payload)
             # Additive ref suffix joining the reply to its durable turn_errors
             # row; absent when no record was written (error_id empty).
@@ -1829,15 +1983,35 @@ async def _emit_task_runtime_stream_events(
             # without exposing a second raw top-level field. Clients can now
             # offer an explicit retry for transient terminal failures even
             # when a Retry-After hint exceeded the remaining turn deadline.
-            if failure_kind:
+            if failure_kind or is_usage_accounting_barrier(error_code):
                 from opensquilla.engine.outcome import outcome_from_error
 
-                event_dict["turn_outcome"] = outcome_from_error(
+                outcome = outcome_from_error(
                     code=error_code,
                     message=safe_error_message,
                     error_class=error_code,
                     failure_kind=failure_kind,
                 ).to_dict()
+                if is_usage_accounting_barrier(error_code):
+                    retry_after_ms = safe_retry_after_ms(raw_retry_after_ms)
+                    if retry_after_ms is not None:
+                        outcome["retry_after_ms"] = retry_after_ms
+                        event_dict["retry_after_ms"] = retry_after_ms
+                    event_dict["error_class"] = error_code
+                    event_dict["retryable"] = True
+                    event_dict.update(replay_proof)
+                    outcome.update(replay_proof)
+                    if primary_user_message_id is not None:
+                        outcome["user_message_id"] = primary_user_message_id
+                    if task_id:
+                        activity_snapshot = terminal_activity_snapshot(
+                            activity_phases,
+                            task_id=task_id,
+                            turn_id=task_id,
+                        )
+                        if activity_snapshot is not None:
+                            event_dict["activity_snapshot"] = activity_snapshot
+                event_dict["turn_outcome"] = outcome
         if stream_event_sink is not None:
             # Internal stream relays normally consume only text/done/artifact
             # events. Still, project provider failures through the same safe
@@ -1845,8 +2019,8 @@ async def _emit_task_runtime_stream_events(
             # logs or persists its input must never receive a raw upstream
             # body from an ErrorEvent.
             sink_event: Any = event
-            if event_kind == "error":
-                sink_event = {"kind": "error", **event_dict}
+            if event_kind in {"error", "answer_generation_reset"}:
+                sink_event = {"kind": event_kind, **event_dict}
             try:
                 result = stream_event_sink(sink_event)
                 if inspect.isawaitable(result):
@@ -1860,13 +2034,17 @@ async def _emit_task_runtime_stream_events(
                 )
         if task_id:
             event_dict["task_id"] = task_id
-            event_dict["turn_id"] = task_id
+            # Typed generation-reset events carry the engine-owned turn id.
+            # Preserve it; ordinary legacy events still receive the runtime
+            # task id as their turn identity.
+            if not event_dict.get("turn_id"):
+                event_dict["turn_id"] = task_id
         if session_id:
             event_dict["session_id"] = session_id
         if client_message_id:
             event_dict["client_message_id"] = client_message_id
-        if user_message_id:
-            event_dict["user_message_id"] = user_message_id
+        if primary_user_message_id is not None:
+            event_dict["user_message_id"] = primary_user_message_id
         if surface_id:
             event_dict["surface_id"] = surface_id
         if input_mode:
@@ -1887,6 +2065,13 @@ async def _emit_task_runtime_stream_events(
             code=error_code,
             terminal_reason=terminal_reason,
             failure_kind=failure_kind,
+            retry_after_ms=retry_after_ms,
+            activity_snapshot=activity_snapshot,
+            usage_call_index=replay_proof.get("usage_call_index"),
+            no_prior_provider_dispatch=(
+                replay_proof.get("no_prior_provider_dispatch") is True
+            ),
+            replay_safe=replay_proof.get("replay_safe") is True,
         )
 
 
@@ -2074,6 +2259,66 @@ class _GatewayShutdownRelay:
             handler(pending_reason)
 
 
+def _consume_websocket_close_task(task: asyncio.Future[Any]) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        return
+
+
+def _cancel_and_detach_websocket_close_tasks(
+    tasks: set[asyncio.Task[None]],
+) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            task.add_done_callback(_consume_websocket_close_task)
+        else:
+            _consume_websocket_close_task(task)
+
+
+async def _close_gateway_websocket_connections(connections: list[Any]) -> None:
+    tasks: set[asyncio.Task[None]] = set()
+    try:
+        for index, connection in enumerate(connections):
+            tasks.add(
+                asyncio.create_task(
+                    connection.close(),
+                    name=f"gateway-ws-shutdown-close-{index}",
+                )
+            )
+        if not tasks:
+            return
+
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=_WS_SHUTDOWN_CLOSE_TIMEOUT_S,
+        )
+        for task in done:
+            task.result()
+        if not pending:
+            return
+
+        log.warning(
+            "gateway.ws_shutdown_close_timeout",
+            pending_count=len(pending),
+            timeout_seconds=_WS_SHUTDOWN_CLOSE_TIMEOUT_S,
+        )
+        for task in pending:
+            task.cancel()
+        cancelled, lingering = await asyncio.wait(
+            pending,
+            timeout=_WS_SHUTDOWN_CANCEL_GRACE_S,
+        )
+        for task in cancelled:
+            _consume_websocket_close_task(task)
+        for task in lingering:
+            task.add_done_callback(_consume_websocket_close_task)
+    except BaseException:
+        _cancel_and_detach_websocket_close_tasks(tasks)
+        raise
+
+
 @dataclass
 class GatewayServer:
     """Handle returned after gateway startup. Provides close() method."""
@@ -2106,12 +2351,21 @@ class GatewayServer:
         finally:
             self._pid_lock = None
 
-    async def close(self, reason: str = "shutdown") -> None:
+    async def close(
+        self,
+        reason: str = "shutdown",
+    ) -> TaskRuntimeShutdownResult | None:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
+        runtime_shutdown_result: TaskRuntimeShutdownResult | None = None
+        runtime_shutdown_clean = bool(
+            self._services is None
+            or getattr(self._services, "task_runtime", None) is None
+        )
         try:
-            # Drain in-flight turns FIRST so replies are not lost.
-            # task_runtime.shutdown() waits for all running turns to complete before
-            # returning; only then do we stop channel delivery.
+            # Drain in-flight turns FIRST so replies are not lost. A bounded
+            # shutdown can report residual drivers; in that case transports are
+            # stopped below but stateful dependencies stay open until the process
+            # watchdog terminates the Gateway.
             drain_budget = gateway_graceful_timeout()
             goal_service = (
                 getattr(self._services, "goal_service", None)
@@ -2125,13 +2379,40 @@ class GatewayServer:
                     log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
             if self._services is not None and self._services.task_runtime is not None:
                 try:
-                    await self._services.task_runtime.shutdown(
+                    runtime_shutdown_result = await self._services.task_runtime.shutdown(
                         graceful=True, graceful_timeout=drain_budget
                     )
+                    runtime_shutdown_clean = (
+                        runtime_shutdown_result is None
+                        or runtime_shutdown_result.clean
+                    )
                 except Exception:
-                    pass
+                    runtime_shutdown_clean = False
+                    runtime_shutdown_result = TaskRuntimeShutdownResult(
+                        clean=False,
+                        elapsed_ms=0,
+                        abandoned_task_count=0,
+                        remaining_driver_count=0,
+                        remaining_reservation_count=0,
+                        remaining_auxiliary_count=0,
+                    )
+                    log.exception("gateway.task_runtime_shutdown_failed")
 
-            if self._background_completion_manager is not None:
+            if runtime_shutdown_result is not None and not runtime_shutdown_result.clean:
+                log.error(
+                    "gateway.task_runtime_shutdown_incomplete",
+                    elapsed_ms=runtime_shutdown_result.elapsed_ms,
+                    abandoned_tasks=runtime_shutdown_result.abandoned_task_count,
+                    remaining_drivers=runtime_shutdown_result.remaining_driver_count,
+                    remaining_reservations=(
+                        runtime_shutdown_result.remaining_reservation_count
+                    ),
+                    remaining_auxiliary=(
+                        runtime_shutdown_result.remaining_auxiliary_count
+                    ),
+                )
+
+            if self._background_completion_manager is not None and runtime_shutdown_clean:
                 try:
                     await self._background_completion_manager.close(timeout=drain_budget)
                 except Exception:
@@ -2145,6 +2426,10 @@ class GatewayServer:
                 except Exception:
                     pass
                 self._background_completion_manager = None
+            elif self._background_completion_manager is not None:
+                log.warning(
+                    "gateway.background_completion_close_skipped_for_live_runtime"
+                )
 
             # Stop channels after task_runtime is drained (no in-flight turns remain)
             live_channel_manager = self._channel_manager
@@ -2158,25 +2443,37 @@ class GatewayServer:
             await registry.broadcast("shutdown", {"reason": reason})
 
             # Close all active WS connections
-            for conn in registry.all():
-                await conn.close()
+            await _close_gateway_websocket_connections(registry.all())
 
             # Close MCP clients
-            try:
-                from opensquilla.mcp.discovery import close_active_clients
+            if runtime_shutdown_clean:
+                try:
+                    from opensquilla.mcp.discovery import close_active_clients
 
-                await close_active_clients()
-                log.info("gateway.mcp_clients_closed")
-            except ImportError:
-                pass
+                    await close_active_clients()
+                    log.info("gateway.mcp_clients_closed")
+                except ImportError:
+                    log.debug(
+                        "gateway.mcp_clients_close_skipped_import_unavailable",
+                        exc_info=True,
+                    )
+            else:
+                log.warning("gateway.mcp_clients_close_skipped_for_live_runtime")
 
-            log.info("gateway.stopped", reason=reason)
+            if runtime_shutdown_clean:
+                log.info("gateway.stopped", reason=reason)
+            else:
+                log.warning(
+                    "gateway.transports_stopped_with_runtime_residuals",
+                    reason=reason,
+                )
         finally:
             # Always stop the serve task so it is never left pending, even when a
             # teardown step above raised (close() is now invoked on every shutdown,
             # not only on Ctrl+C, so the serve task is typically still running). A
-            # teardown exception still propagates after this runs; the pid lock is
-            # released regardless in the inner finally.
+            # teardown exception still propagates after this runs. The pid lock
+            # is released only after a clean runtime shutdown; otherwise process
+            # exit remains the ownership fence.
             try:
                 if self._server is not None:
                     self._server.should_exit = True
@@ -2201,13 +2498,17 @@ class GatewayServer:
                         preview_task.cancel()
                 if preview_socket is not None:
                     preview_socket.close()
-                if self._services is not None:
+                if self._services is not None and runtime_shutdown_clean:
                     try:
                         await self._services.close()
                     except Exception:
                         log.debug("gateway.services_close_failed", exc_info=True)
+                elif self._services is not None:
+                    log.warning("gateway.services_close_skipped_for_live_runtime")
             finally:
-                self._release_pid_lock()
+                if runtime_shutdown_clean:
+                    self._release_pid_lock()
+        return runtime_shutdown_result
 
 
 def build_flush_service(
@@ -2637,6 +2938,19 @@ async def build_services(
     """
     services_started_at = time.monotonic()
 
+    # Electron gives its owned Gateway a one-process bridge credential. Consume
+    # and scrub it before loading .env or constructing services/tool
+    # subprocesses. This prevents a profile file from manufacturing bridge
+    # authority and leaves only the fixed-method runtime client in memory.
+    try:
+        from opensquilla.gateway.desktop_artifact_bridge import (
+            initialize_desktop_artifact_bridge_client,
+        )
+
+        initialize_desktop_artifact_bridge_client()
+    except ValueError:
+        log.warning("artifact.desktop_bridge_environment_rejected")
+
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
 
@@ -2647,6 +2961,7 @@ async def build_services(
         config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
+
     _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
@@ -2658,9 +2973,13 @@ async def build_services(
     # DB-only deletions otherwise and leak on disk). The concrete cleanup lives
     # here (gateway layer) because it resolves the agent workspace via
     # ``agents.scope`` — the low-level ``session`` package must not depend on it.
-    from opensquilla.session.material_cleanup import set_session_material_cleanup
+    from opensquilla.session.material_cleanup import (
+        set_session_artifact_cleanup,
+        set_session_material_cleanup,
+    )
 
     set_session_material_cleanup(build_session_material_cleanup(config))
+    set_session_artifact_cleanup(build_session_artifact_cleanup(config))
 
     validate_squilla_router_runtime(config)
     from opensquilla.memory.embedding_resolver import resolve_memory_embedding
@@ -2687,7 +3006,23 @@ async def build_services(
             ensure_sandbox_upgrade_migrated,
         )
 
-        upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        sandbox_upgrade_started_at = time.monotonic()
+        log.info("build_services.sandbox_upgrade_started")
+        try:
+            upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        except Exception as exc:
+            log.exception(
+                "build_services.sandbox_upgrade_failed",
+                duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log.info(
+            "build_services.sandbox_upgrade_finished",
+            ok=upgrade_report.ok,
+            status=upgrade_report.status,
+            duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
+        )
         if not upgrade_report.ok:
             raise RuntimeError(
                 "migration_failed_manual_recovery_required: "
@@ -2780,6 +3115,7 @@ async def build_services(
             agent_registry=agent_registry,
             checkpoint_workspace_dir=config.workspace_dir,
             media_root=media_root_from_config(config),
+            model_routing_mode_provider=lambda: model_routing_snapshot(config)["mode"],
         )
 
     # Wire session manager into tool layer (like set_scheduler, set_gateway_config)
@@ -2791,6 +3127,83 @@ async def build_services(
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
     session_storage = get_session_storage(session_manager)
+    if session_storage is not None and callable(
+        getattr(session_storage, "_write_transaction", None)
+    ):
+        from opensquilla.artifact_session import ArtifactSessionService
+        from opensquilla.artifacts import ArtifactStore
+        from opensquilla.gateway.artifact_mutation_recovery import (
+            reconcile_pending_artifact_mutations,
+            reject_orphaned_artifact_drafts,
+        )
+        from opensquilla.gateway.document_resource_recovery import (
+            reconcile_pending_document_resources,
+        )
+        from opensquilla.gateway.rpc import RpcContext
+        from opensquilla.gateway.rpc_workbench_resources import (
+            resolve_recovery_import_source,
+        )
+        from opensquilla.paths import media_root_from_config
+
+        artifact_recovery_service = await ArtifactSessionService.from_session_storage(
+            session_storage
+        )
+        resource_recovery_context = RpcContext(
+            conn_id="document-resource-recovery",
+            session_manager=session_manager,
+            config=config,
+        )
+
+        try:
+            draft_recovery_summary = await reject_orphaned_artifact_drafts(
+                artifact_recovery_service,
+                ArtifactStore(media_root_from_config(config)),
+            )
+            recovery_summary = await reconcile_pending_artifact_mutations(
+                artifact_recovery_service,
+                ArtifactStore(media_root_from_config(config)),
+            )
+            resource_recovery_summary = await reconcile_pending_document_resources(
+                artifact_recovery_service,
+                ArtifactStore(media_root_from_config(config)),
+                import_source_resolver=lambda attempt: resolve_recovery_import_source(
+                    resource_recovery_context,
+                    attempt,
+                ),
+            )
+        finally:
+            await artifact_recovery_service.close()
+        if recovery_summary.examined:
+            log.info(
+                "build_services.artifact_mutations_reconciled",
+                examined=recovery_summary.examined,
+                applied=recovery_summary.applied,
+                failed=recovery_summary.failed,
+                ambiguous=recovery_summary.ambiguous,
+                deleted_candidates=recovery_summary.deleted_candidates,
+            )
+        if draft_recovery_summary.examined:
+            log.info(
+                "build_services.artifact_drafts_reconciled",
+                examined=draft_recovery_summary.examined,
+                rejected=draft_recovery_summary.rejected,
+                ambiguous=draft_recovery_summary.ambiguous,
+                deleted_candidates=draft_recovery_summary.deleted_candidates,
+            )
+        if resource_recovery_summary.examined:
+            log.info(
+                "build_services.document_resources_reconciled",
+                imports_examined=resource_recovery_summary.imports_examined,
+                imports_applied=resource_recovery_summary.imports_applied,
+                imports_failed=resource_recovery_summary.imports_failed,
+                imports_ambiguous=resource_recovery_summary.imports_ambiguous,
+                publishes_examined=resource_recovery_summary.publishes_examined,
+                publishes_applied=resource_recovery_summary.publishes_applied,
+                publishes_failed=resource_recovery_summary.publishes_failed,
+                publishes_ambiguous=resource_recovery_summary.publishes_ambiguous,
+                deleted_candidates=resource_recovery_summary.deleted_candidates,
+                promoted_deliverables=resource_recovery_summary.promoted_deliverables,
+            )
     from opensquilla.application.approval_queue import get_approval_queue
 
     _expire_restart_orphaned_approvals(
@@ -3536,6 +3949,15 @@ async def build_services(
         deferred_warmups=deferred_warmups,
         sandbox_setup_task=sandbox_setup_task,
     )
+    if skill_loader is not None:
+        try:
+            from opensquilla.skills.watcher import SkillCatalogWatcher
+
+            skill_watcher = SkillCatalogWatcher(skill_loader)
+            await skill_watcher.start()
+            svc.skill_watcher = skill_watcher
+        except Exception:
+            log.warning("build_services.skill_watcher_failed", exc_info=True)
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
     log.info(
@@ -3732,6 +4154,17 @@ async def start_gateway_server(
     _pid_lock = GatewayPidLock(_state_path(config, ""))
     _pid_lock.acquire()
 
+    # The profile PID lock proves there is no live Gateway writer for this
+    # runtime state. Reconcile exact persisted owners before any new turn can
+    # launch work; malformed or unsupported rows remain fail-safe and are never
+    # widened into PID/name scans.
+    try:
+        from opensquilla.process_tree import reconcile_persisted_processes
+
+        await reconcile_persisted_processes(getattr(config, "state_dir", None))
+    except Exception:
+        log.warning("gateway.process_owner_reconcile_failed")
+
     # A Desktop child opts into a stronger, nonce-verifiable ownership record.
     # Keep it separate from gateway.pid so legacy CLI/readers retain their
     # exact schema. Electron supplies a separate userData control directory so
@@ -3922,7 +4355,9 @@ async def start_gateway_server(
 
     from opensquilla.gateway.background_completion import BackgroundCompletionManager
     from opensquilla.gateway.event_bridge import EventBridge
-    from opensquilla.gateway.model_routing import capture_model_routing_config
+    from opensquilla.gateway.session_model_routing import (
+        capture_accepted_model_routing_config,
+    )
     from opensquilla.gateway.subagent_announce import set_background_completion_manager
     from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 
@@ -4013,6 +4448,18 @@ async def start_gateway_server(
             event_emitter=runtime_event_bridge.emit,
         )
 
+    async def _capture_task_accepted_config(
+        *,
+        session_key: str,
+        run_kind: str,
+    ) -> Any:
+        return await capture_accepted_model_routing_config(
+            config,
+            svc.session_manager,
+            session_key=session_key,
+            run_kind=run_kind,
+        )
+
     session_lifecycle_listener = _make_task_session_lifecycle_listener(
         session_manager=svc.session_manager,
         event_emitter=runtime_event_bridge.emit,
@@ -4029,7 +4476,7 @@ async def start_gateway_server(
             getattr(getattr(config, "subagents", None), "subagent_reserved_slots", 0)
         ),
         turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
-        accepted_config_provider=lambda: capture_model_routing_config(config),
+        accepted_config_provider=_capture_task_accepted_config,
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
@@ -4719,6 +5166,9 @@ async def start_gateway_server(
     register_channels_reconciler(_reconcile_runtime_channels)
 
     # ── ASGI app ─────────────────────────────────────────────────────
+    skill_management_state = getattr(svc, "skill_management_state", None)
+    if skill_management_state is None:
+        skill_management_state = {}
     app = create_gateway_app(
         config,
         session_manager=svc.session_manager,
@@ -4733,7 +5183,7 @@ async def start_gateway_server(
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         skill_loader=svc.skill_loader,
         skill_management_service=getattr(svc, "skill_management_service", None),
-        skill_management_state=getattr(svc, "skill_management_state", None) or {},
+        skill_management_state=skill_management_state,
         cron_scheduler=svc.cron_scheduler,
         turn_runner=turn_runner,
         task_runtime=task_runtime,
@@ -4821,7 +5271,25 @@ async def start_gateway_server(
 
     if run:
         preview_service = server_handle._preview_service
-        if preview_service is not None and config.control_ui.enabled:
+        # The isolated preview listener is also required by the Electron
+        # candidate loop.  Desktop-owned profiles intentionally disable the
+        # Control UI during startup, but browser verification still needs a
+        # loopback resource origin for the opaque candidate handle.  The
+        # process-local bridge client is the authority for this exception;
+        # ordinary headless gateways do not open a listener merely because
+        # the preview service was registered.
+        desktop_bridge_available = False
+        try:
+            from opensquilla.gateway.desktop_artifact_bridge import (
+                get_desktop_artifact_bridge_client,
+            )
+
+            desktop_bridge_available = get_desktop_artifact_bridge_client() is not None
+        except Exception:  # noqa: BLE001 - listener startup remains fail-closed
+            desktop_bridge_available = False
+        if preview_service is not None and (
+            config.control_ui.enabled or desktop_bridge_available
+        ):
             preview_socket: socket.socket | None = None
             try:
                 from opensquilla.gateway.artifact_preview import (

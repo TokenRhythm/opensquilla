@@ -24,6 +24,7 @@ export type AssistantActivityClusterState =
 export type AssistantActivityLifecycleCode =
   | 'chat.activity.lifecycle.working'
   | 'chat.activity.lifecycle.answering'
+  | 'chat.activity.lifecycle.answerPrepared'
   | 'chat.activity.lifecycle.settled'
   | 'chat.activity.lifecycle.interrupted'
   | 'chat.activity.lifecycle.failed'
@@ -110,6 +111,7 @@ export type AssistantActivityStatusCode =
   | AssistantActivityLifecycleCode
   | AssistantActivityPurposeCode
   | 'chat.activity.provider.waiting'
+  | 'chat.activity.provider.responded'
   | 'chat.activity.provider.reasoning'
   | 'chat.activity.provider.rateLimited'
   | 'chat.activity.provider.retryWait'
@@ -126,6 +128,8 @@ export interface AssistantActivityStatusStep {
   key: string
   label: AssistantActivityCodeDescriptor<AssistantActivityStatusCode>
   at: number
+  activityOrder?: number
+  endedAt?: number
   isCurrent: boolean
   id?: string
   category?: 'phase' | 'maintenance'
@@ -134,6 +138,8 @@ export interface AssistantActivityStatusStep {
   durability?: string
   detail?: string
   reason?: string
+  /** Whole seconds spent in this phase, bounded by the next phase or turn end. */
+  durationSeconds?: number
 }
 
 export interface AssistantActivityTimelineProjection {
@@ -154,6 +160,8 @@ export interface AssistantActivityTimelineProjection {
 export interface ProjectAssistantActivityOptions {
   lifecycle?: AssistantActivityLifecycle
   statusHistory?: readonly StatusPart[]
+  /** Presentation-time terminal/current boundary used to derive phase durations. */
+  endedAt?: number
 }
 
 export interface LiveAssistantTimelineSplit {
@@ -201,6 +209,19 @@ interface ActivitySemantic {
   footprintKind: 'web' | 'file' | 'command' | 'artifact' | 'memory' | 'tool'
 }
 
+const INTERNAL_MUTATION_PRESENTATION_MARKERS = [
+  'theuserinstructions',
+  'userinstructions',
+  'documentmutationoutcome',
+  'responseinstruction',
+  'responselocale',
+]
+
+function containsInternalMutationPresentation(text: string): boolean {
+  const compact = text.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  return INTERNAL_MUTATION_PRESENTATION_MARKERS.some(marker => compact.includes(marker))
+}
+
 const LIFECYCLE_CODES: Record<AssistantActivityLifecycle, AssistantActivityLifecycleCode> = {
   working: 'chat.activity.lifecycle.working',
   answering: 'chat.activity.lifecycle.answering',
@@ -225,6 +246,12 @@ const FILE_INSPECT_TOOLS = new Set([
   'list_directory',
   'glob_search',
   'grep_search',
+  'document_inspect',
+  'document_read',
+  'document_locate',
+  'document_browser_inspect',
+  'document_browser_screenshot',
+  'document_browser_reload',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -234,6 +261,10 @@ const FILE_CHANGE_TOOLS = new Set([
   'edit_file',
   'edit_source',
   'apply_patch',
+  'document_apply',
+  'document_patch',
+  'document_browser_act',
+  'document_finish',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',
@@ -498,22 +529,40 @@ function terminalTimelineAnswerCandidate(
     break
   }
 
-  if (index < 0 || timeline[index]?.type !== 'text') return null
+  const terminalItem = timeline[index]
+  if (
+    index < 0
+    || !terminalItem
+    || terminalItem.type !== 'text'
+    || terminalItem.presentation === 'intermediate'
+  ) return null
 
   const indexes = new Set<number>()
   const chunks: string[] = []
   while (index >= 0) {
     const item = timeline[index]
-    if (!item || item.type !== 'text') break
+    if (!item || item.type !== 'text' || item.presentation === 'intermediate') break
     if (typeof item.rawText !== 'string') return null
     indexes.add(index)
     chunks.unshift(item.rawText)
     index -= 1
   }
+  // A gateway-owned intermediate marker is an explicit semantic boundary.
+  // It is stronger than the legacy adjacency heuristic and keeps immediately
+  // preceding work narration inside Activity even when no tool separates it
+  // from the final answer span.
+  const boundaryItem = timeline[index]
+  const crossedPresentationBoundary = index >= 0
+    && boundaryItem?.type === 'text'
+    && boundaryItem.presentation === 'intermediate'
   const crossedOrdinaryToolBoundary = index >= 0
     && timeline[index]?.type === 'tool-group'
     && !isSuccessfulAnswerTransparentControlGroup(timeline[index])
-  if (!crossedControlBoundary && !crossedOrdinaryToolBoundary) return null
+  if (
+    !crossedControlBoundary
+    && !crossedOrdinaryToolBoundary
+    && !crossedPresentationBoundary
+  ) return null
 
   const compact = chunks.join('')
   if (!compact.trim()) return null
@@ -764,6 +813,7 @@ function descriptorCount(
 function statusLabelFor(
   entry: StatusPart,
   clusters: AssistantActivityCluster[],
+  lifecycle: AssistantActivityLifecycle,
 ): AssistantActivityCodeDescriptor<AssistantActivityStatusCode> | null {
   if (entry.category === 'maintenance') {
     if (entry.state === 'failed') return codeDescriptor('chat.compact.failed')
@@ -778,7 +828,13 @@ function statusLabelFor(
   const normalized = action.toLowerCase()
   if (normalized.startsWith('provider:')) {
     const [, phase = '', first = '0', second = '0'] = normalized.split(':')
-    if (phase === 'requesting') return codeDescriptor('chat.activity.provider.waiting')
+    if (phase === 'requesting') {
+      return codeDescriptor(
+        lifecycle === 'settled'
+          ? 'chat.activity.provider.responded'
+          : 'chat.activity.provider.waiting',
+      )
+    }
     if (phase === 'reasoning') return codeDescriptor('chat.activity.provider.reasoning')
     if (phase === 'rate_limited') {
       return codeDescriptor('chat.activity.provider.rateLimited', {
@@ -810,7 +866,11 @@ function statusLabelFor(
     return cluster ? null : codeDescriptor('chat.activity.purpose.use')
   }
   if (normalized.startsWith('write:') || normalized === 'writing reply') {
-    return codeDescriptor('chat.activity.lifecycle.answering')
+    return codeDescriptor(
+      lifecycle === 'settled'
+        ? 'chat.activity.lifecycle.answerPrepared'
+        : 'chat.activity.lifecycle.answering',
+    )
   }
   const purpose = STATUS_PURPOSE_CODES[normalized]
   if (purpose) return codeDescriptor(purpose)
@@ -824,9 +884,55 @@ function statusLabelFor(
  * by construction.
  */
 export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep): boolean {
+  const code = step.label.code
   return step.category !== 'maintenance'
     && !step.isCurrent
-    && !step.label.code.startsWith('chat.activity.lifecycle.')
+    && !code.startsWith('chat.activity.lifecycle.')
+    // Requesting and reasoning are live provider phases, not durable work
+    // items. The live disclosure header owns them; retaining them in the body
+    // produces empty-looking "Waiting / Thinking" rows during and after a
+    // turn. Retry, fallback and rate-limit phases remain inspectable because
+    // they explain exceptional execution behavior.
+    && code !== 'chat.activity.provider.waiting'
+    && code !== 'chat.activity.provider.reasoning'
+}
+
+/** Routine model phases shown as the small per-phase flow underneath the turn header. */
+export function isRoutineActivityPhaseStep(step: AssistantActivityStatusStep): boolean {
+  return step.category !== 'maintenance' && (
+    step.label.code === 'chat.activity.provider.waiting'
+    || step.label.code === 'chat.activity.provider.responded'
+    || step.label.code === 'chat.activity.provider.reasoning'
+    || step.label.code === 'chat.activity.lifecycle.answering'
+    || step.label.code === 'chat.activity.lifecycle.answerPrepared'
+  )
+}
+
+export function isBeforeReasoningActivityStatusStep(
+  step: AssistantActivityStatusStep,
+): boolean {
+  return step.category !== 'maintenance' && (
+    step.label.code === 'chat.activity.provider.waiting'
+    || step.label.code === 'chat.activity.provider.responded'
+  )
+}
+
+/**
+ * Status rows worth retaining in the finished activity record. Reasoning owns
+ * a richer disclosure, so its status boundary is used for timing but is not
+ * duplicated as an empty row.
+ */
+export function isVisibleActivityStatusStep(step: AssistantActivityStatusStep): boolean {
+  if (step.category === 'maintenance') return true
+  if (step.label.code === 'chat.activity.provider.reasoning') return false
+  if (
+    step.label.code === 'chat.activity.provider.waiting'
+    || step.label.code === 'chat.activity.provider.responded'
+    || step.label.code === 'chat.activity.lifecycle.answering'
+    || step.label.code === 'chat.activity.lifecycle.answerPrepared'
+  ) return true
+  if (step.label.code.startsWith('chat.activity.provider.')) return true
+  return isSemanticActivityStatusStep(step)
 }
 
 /**
@@ -898,17 +1004,20 @@ function projectStatusSteps(
   history: readonly StatusPart[],
   clusters: AssistantActivityCluster[],
   lifecycle: AssistantActivityLifecycle,
+  endedAt: number,
 ): AssistantActivityStatusStep[] {
   const steps: AssistantActivityStatusStep[] = []
   const maintenanceById = new Map<string, number>()
   for (const entry of history) {
-    const label = statusLabelFor(entry, clusters)
+    const label = statusLabelFor(entry, clusters, lifecycle)
     if (!label) continue
     if (entry.category === 'maintenance') {
       const step: AssistantActivityStatusStep = {
         key: `activity-maintenance:${entry.id || stableHash(`${entry.at}`)}`,
         label,
         at: entry.at,
+        activityOrder: entry.activityOrder,
+        endedAt: entry.endedAt,
         isCurrent: entry.state === 'running',
         id: entry.id,
         category: 'maintenance',
@@ -927,11 +1036,20 @@ function projectStatusSteps(
       continue
     }
     const previous = steps[steps.length - 1]
-    if (previous?.label.code === label.code) continue
+    // Legacy history has no authoritative order and keeps the old consecutive
+    // label de-duplication. Ordered live/v2 records keep distinct occurrences:
+    // a tool or narration can sit between equal phase labels even though it is
+    // not represented in this status-only projection.
+    if (
+      previous?.label.code === label.code
+      && previous.activityOrder === entry.activityOrder
+    ) continue
     steps.push({
       key: `activity-status:${stableHash(`${entry.action}\u001f${entry.at}`)}`,
       label,
       at: entry.at,
+      activityOrder: entry.activityOrder,
+      endedAt: entry.endedAt,
       isCurrent: false,
       category: 'phase',
     })
@@ -944,6 +1062,16 @@ function projectStatusSteps(
   ) {
     const lastPhase = [...mergedSteps].reverse().find(step => step.category !== 'maintenance')
     if (lastPhase) lastPhase.isCurrent = true
+  }
+  const phaseSteps = mergedSteps.filter(step => step.category !== 'maintenance')
+  for (const [index, step] of phaseSteps.entries()) {
+    const nextAt = phaseSteps[index + 1]?.at
+    const derivedBoundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const boundary = Number.isFinite(step.endedAt) && Number(step.endedAt) >= step.at
+      ? Number(step.endedAt)
+      : derivedBoundary
+    if (!Number.isFinite(boundary) || boundary < step.at) continue
+    step.durationSeconds = Math.max(0, Math.floor((boundary - step.at) / 1000))
   }
   return mergedSteps
 }
@@ -994,6 +1122,7 @@ export function projectAssistantActivityTimeline(
     options.statusHistory ?? [],
     activityClusters,
     lifecycle,
+    options.endedAt ?? Date.now(),
   )
   return {
     lifecycle,
@@ -1030,11 +1159,27 @@ export function projectAssistantActivity(
   fallbackToolItems: ChatStreamTimelineItem[] = [],
   options: ProjectAssistantActivityOptions = {},
 ): AssistantActivityProjection {
-  const timeline = message.timelineItems?.length
+  const sourceTimeline = message.timelineItems?.length
     ? message.timelineItems
     : fallbackToolItems
+  const mutationPresentationText = [
+    String(message.text || ''),
+    ...sourceTimeline.flatMap(item =>
+      item.type === 'text' && typeof item.rawText === 'string' ? [item.rawText] : [],
+    ),
+  ].join('\n')
+  const hideInternalMutationPresentation = Boolean(
+    message.turnOutcome?.documentMutationOutcome
+    && containsInternalMutationPresentation(mutationPresentationText),
+  )
+  const timeline = hideInternalMutationPresentation
+    ? sourceTimeline.filter(item => item.type !== 'text')
+    : sourceTimeline
+  const presentationMessage = hideInternalMutationPresentation
+    ? { ...message, text: '' }
+    : message
   const lifecycle = options.lifecycle ?? 'settled'
-  const answerResolution = resolveAssistantAnswer(message, timeline, lifecycle)
+  const answerResolution = resolveAssistantAnswer(presentationMessage, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
   const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText

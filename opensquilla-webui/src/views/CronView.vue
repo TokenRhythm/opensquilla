@@ -31,7 +31,12 @@
       </div>
     </header>
 
-    <section class="automation-launch">
+    <section
+      v-if="cronJobs.hasLoaded.value && !cronJobs.error.value"
+      class="automation-launch"
+      :class="{ 'automation-launch--compact': cronJobs.jobs.value.length > 0 }"
+      :aria-labelledby="cronJobs.jobs.value.length > 0 ? 'automation-status-title' : 'automation-empty-title'"
+    >
       <div class="automation-launch__clock" aria-hidden="true">
         <svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
           <defs><radialGradient id="automation-launch-glow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="color-mix(in srgb, var(--accent) 20%, transparent)" /><stop offset="60%" stop-color="color-mix(in srgb, var(--accent) 5%, transparent)" /><stop offset="100%" stop-color="transparent" /></radialGradient></defs>
@@ -44,9 +49,32 @@
           <circle cx="60" cy="60" r="3" fill="var(--accent)" />
         </svg>
       </div>
-      <h2 class="automation-launch__title">{{ t('cronSkills.view.heroTitle') }}</h2>
-      <p class="automation-launch__hint">{{ t('cronSkills.view.heroHint') }}</p>
-      <button class="automation-launch__button" type="button" @click="cronForm.openPanel(null)"><Icon name="plus" :size="15" />{{ t('cronSkills.view.addAutomation') }}</button>
+      <template v-if="cronJobs.jobs.value.length === 0">
+        <h2 id="automation-empty-title" class="automation-launch__title">{{ t('cronSkills.view.heroTitle') }}</h2>
+        <p class="automation-launch__hint">{{ t('cronSkills.view.heroHint') }}</p>
+        <button class="automation-launch__button" type="button" @click="cronForm.openPanel(null)"><Icon name="plus" :size="15" />{{ t('cronSkills.view.addAutomation') }}</button>
+      </template>
+      <template v-else>
+        <div class="automation-launch__status-copy">
+          <div class="automation-launch__status-line">
+            <span class="automation-launch__status-dot" aria-hidden="true" />
+            <h2 id="automation-status-title" class="automation-launch__status-title">{{ t('cronSkills.view.runningTitle') }}</h2>
+          </div>
+          <p class="automation-launch__status-summary">{{ t('cronSkills.view.runningSummary', { enabled: cronJobs.enabledCount.value, total: cronJobs.jobs.value.length }) }}</p>
+        </div>
+        <div class="automation-launch__metric">
+          <span>{{ t('cronSkills.view.nextRun') }}</span>
+          <strong>{{ cronJobs.nextCountdown.value }}</strong>
+        </div>
+        <div class="automation-launch__metric">
+          <span>{{ t('cronSkills.view.enabledLabel') }}</span>
+          <strong>{{ cronJobs.enabledCount.value }} / {{ cronJobs.jobs.value.length }}</strong>
+        </div>
+        <div class="automation-launch__metric automation-launch__metric--activity">
+          <span>{{ t('cronSkills.view.last24hRuns') }}</span>
+          <strong>{{ cronJobs.last24h.value.runs }}</strong>
+        </div>
+      </template>
     </section>
 
     <Transition name="modal">
@@ -92,18 +120,18 @@
         <Icon name="trash" :size="14" />{{ t('cronSkills.list.delete') }}
       </button>
     </div>
-    <div v-if="cronJobs.loading.value && cronJobs.jobs.value.length === 0" class="state">
-      <LoadingSpinner />
-    </div>
-
     <ErrorState
-      v-else-if="cronJobs.error.value"
+      v-if="cronJobs.error.value"
       :message="cronJobs.error.value"
       :on-retry="cronJobs.loadData"
     />
 
+    <div v-else-if="!cronJobs.hasLoaded.value || (cronJobs.loading.value && cronJobs.jobs.value.length === 0)" class="state">
+      <LoadingSpinner />
+    </div>
+
     <CronJobList
-      v-else
+      v-else-if="cronJobs.jobs.value.length > 0"
       :jobs="cronJobs.filteredSortedJobs.value"
       :total-jobs="cronJobs.jobs.value.length"
       :search-text="cronJobs.searchText.value"
@@ -996,6 +1024,79 @@ async function confirmDelete() {
 .automation-launch__clock svg {
   height: 100%;
   width: 100%;
+}
+
+.automation-launch--compact {
+  align-items: center;
+  background: color-mix(in srgb, var(--bg-surface) 82%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  display: grid;
+  gap: 20px;
+  grid-template-columns: auto minmax(180px, 1fr) repeat(3, minmax(88px, auto));
+  min-height: 88px;
+  padding: 16px 20px;
+  text-align: left;
+}
+
+.automation-launch--compact .automation-launch__clock {
+  height: 54px;
+  margin: 0;
+  width: 54px;
+}
+
+.automation-launch__status-copy {
+  min-width: 0;
+}
+
+.automation-launch__status-line {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.automation-launch__status-dot {
+  background: var(--ok);
+  border-radius: var(--radius-pill);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 14%, transparent);
+  flex: 0 0 auto;
+  height: 7px;
+  width: 7px;
+}
+
+.automation-launch__status-title {
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  margin: 0;
+}
+
+.automation-launch__status-summary {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  margin: 5px 0 0 15px;
+}
+
+.automation-launch__metric {
+  border-left: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  padding-left: 16px;
+}
+
+.automation-launch__metric > span {
+  color: var(--text-dim);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.automation-launch__metric > strong {
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  white-space: nowrap;
 }
 
 .automation-launch__title {
@@ -2391,6 +2492,14 @@ async function confirmDelete() {
 
 /* Responsive */
 @media (max-width: 980px) {
+  .automation-launch--compact {
+    grid-template-columns: auto minmax(180px, 1fr) repeat(2, minmax(88px, auto));
+  }
+
+  .automation-launch__metric--activity {
+    display: none;
+  }
+
   .automation-template-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2405,6 +2514,22 @@ async function confirmDelete() {
 }
 
 @media (max-width: 760px) {
+  .automation-launch--compact {
+    gap: 14px;
+    grid-template-columns: auto minmax(0, 1fr);
+    min-height: 78px;
+    padding: 14px 16px;
+  }
+
+  .automation-launch--compact .automation-launch__clock {
+    height: 46px;
+    width: 46px;
+  }
+
+  .automation-launch__metric {
+    display: none;
+  }
+
   .cron-toolbar {
     align-items: stretch;
   }

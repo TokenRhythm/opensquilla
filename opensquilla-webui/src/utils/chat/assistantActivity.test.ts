@@ -76,6 +76,55 @@ function toolGroup(
 }
 
 describe('projectAssistantActivity', () => {
+  it('hides persisted mutation protocol echoes while keeping structured activity', () => {
+    const leaked = (
+      'TheUserInstructions {"documentMutationOutcome":{"status":"applied"}} '
+      + 'User(internal control text)'
+    )
+    const projection = projectAssistantActivity(
+      message({
+        text: `${leaked}\n\nPage updated.`,
+        timelineItems: [
+          toolGroup([call('apply', { name: 'document_apply' })], 'apply'),
+          { type: 'text', key: 'leaked-answer', html: leaked, rawText: leaked },
+        ],
+        turnOutcome: {
+          turnId: 'turn-contained-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(JSON.stringify(projection)).not.toContain('TheUserInstructions')
+    expect(JSON.stringify(projection)).not.toContain('documentMutationOutcome')
+  })
+
+  it('keeps an ordinary localized mutation result visible', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Page updated.',
+        turnOutcome: {
+          turnId: 'turn-safe-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart?.rawText).toBe('Page updated.')
+  })
+
   it('fails open when an ordinary tool group did not settle successfully', () => {
     const failed = call('failed', {
       status: 'error',
@@ -218,6 +267,41 @@ describe('projectAssistantActivity', () => {
       'opening',
       'middle',
       'verify',
+    ])
+  })
+
+  it('keeps an explicit intermediate span out of the adjacent final answer', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting.Working note.Final answer.',
+        timelineItems: [
+          { type: 'text', key: 'opening', html: 'Inspecting.', rawText: 'Inspecting.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Working note.',
+            rawText: 'Working note.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'inspect',
+      'work',
     ])
   })
 
@@ -1015,6 +1099,45 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it('derives each phase duration from the next transition and terminal boundary', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 12_000,
+      statusHistory: [
+        { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+        { action: 'provider:reasoning', label: 'Reasoning', at: 4_000 },
+        { action: 'write:1', label: 'Writing', at: 9_000 },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([3, 5, 3])
+  })
+
+  it('uses authoritative v2 phase endings without sorting by timestamps', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 99_000,
+      statusHistory: [
+        {
+          action: 'provider:requesting',
+          label: 'Waiting',
+          at: 9_000,
+          endedAt: 9_000,
+          activityOrder: 1,
+        },
+        {
+          action: 'provider:fallback',
+          label: 'Fallback',
+          at: 1_000,
+          endedAt: 12_000,
+          activityOrder: 2,
+        },
+      ],
+    })
+    expect(projection.statusSteps.map(step => step.activityOrder)).toEqual([1, 2])
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([0, 11])
+  })
+
   it('counts down provider retry waits locally without changing other phases', () => {
     const statusStep = (
       overrides: Partial<AssistantActivityStatusStep>,
@@ -1233,6 +1356,21 @@ describe('isSemanticActivityStatusStep', () => {
     expect(isSemanticActivityStatusStep(statusStep({
       label: { code: 'chat.activity.lifecycle.answering', params: {} },
     }))).toBe(false)
+  })
+
+  it('rejects routine provider phases while preserving exceptional transitions', () => {
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.waiting', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.reasoning', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.fallback', params: {} },
+    }))).toBe(true)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.retryWait', params: { seconds: 3 } },
+    }))).toBe(true)
   })
 
   it('rejects maintenance rows so compaction does not inflate semantic step counts', () => {

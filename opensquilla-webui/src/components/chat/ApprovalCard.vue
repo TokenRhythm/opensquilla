@@ -302,6 +302,10 @@ const outcomeIcon = computed(() => {
 })
 
 const summary = computed(() => {
+  if (props.timeline && props.resolution) {
+    const safe = props.approval.toolName || props.approval.approvalKind
+    return safe.length > 60 ? safe.slice(0, 60) + '…' : safe
+  }
   const text = props.approval.displayKind === 'run_command'
     ? displayCommand.value
     : props.approval.displayTarget || ''

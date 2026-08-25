@@ -116,6 +116,7 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
+    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -161,6 +162,10 @@ class StorageConnectionPoisonedError(RuntimeError):
 
 class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
+
+
+class SessionRoutingConflictError(ValueError):
+    """Raised when a session routing compare-and-set fence is stale."""
 
 
 class PendingChatInputConflictError(ValueError):
@@ -507,8 +512,20 @@ def _serialized_read[**P, R](
 # and Goal command idempotency ledger. Version 20 added the durable Goal origin
 # message anchor used by reconnect-safe transcript presentation. Version 21
 # added the bounded durable pending-chat-input outbox.
-SCHEMA_VERSION = 21
+# Version 22 added durable ArtifactSession documents, immutable revisions,
+# change sets, editor sessions, anchors, and audit events. Version 23 added
+# prompt-annotation drafts atomically consumed by chat turns. Version 24 added
+# durable idempotency receipts for artifact mutation attempts. Version 25 added
+# the persistent per-session model-routing mode and its compare-and-set revision.
+SCHEMA_VERSION = 25
 MAX_PENDING_CHAT_INPUTS = 5
+
+# These fields have their own atomic resolver/CAS API.  Whole-session writes
+# may seed them when inserting a new row, but must never replace the value of
+# an existing row from a stale ``SessionNode`` snapshot.
+_SESSION_DEDICATED_WRITER_COLUMNS = frozenset(
+    {"model_routing_mode", "model_routing_revision"}
+)
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -538,6 +555,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     auth_profile_override TEXT,
     auth_profile_override_source TEXT,
     context_tokens INTEGER,
+    model_routing_mode TEXT,
+    model_routing_revision INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1540,6 +1559,10 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _decode_transcript_rows(rows: Sequence[Any]) -> list[TranscriptEntry]:
+    return [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
+
+
 def _py_lower(value: Any) -> Any:
     """Unicode-aware lowercase for the ``py_lower`` SQL function.
 
@@ -1672,6 +1695,24 @@ def _json_object_or_none(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionListCursor:
+    """Stable descending sort position for a session-list page."""
+
+    activity_at: int
+    updated_at: int
+    session_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionListPage:
+    """One keyset-paginated page of sessions."""
+
+    sessions: list[SessionNode]
+    next_cursor: SessionListCursor | None
+    has_more: bool
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -1683,8 +1724,12 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._connection_generation = 0
+        self._transcript_reader: Any | None = None
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
+        self._transcript_reader_lock = asyncio.Lock()
+        self._transcript_reader_fallback_warned = False
         self._usage_backfill_index_lock = asyncio.Lock()
         self._usage_backfill_indexes_ready = False
         self._legacy_project_adoption_lock = asyncio.Lock()
@@ -1742,7 +1787,15 @@ class SessionStorage:
         *,
         goal_pause_reason: str = "process_restart",
     ) -> None:
+        if (
+            self._conn is not None
+            or self._transcript_reader is not None
+            or self._meta_launch_draft_gc_task is not None
+        ):
+            await self.close()
+        self._poisoned = False
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
+        self._connection_generation += 1
         self._conn.row_factory = aiosqlite.Row
         # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
         # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
@@ -1760,10 +1813,17 @@ class SessionStorage:
             await self._conn.create_function(  # type: ignore[attr-defined]
                 name, arity, function, deterministic=True
             )
-        await self._conn.execute("PRAGMA journal_mode=WAL")
+        async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
+            journal_mode_row = await cur.fetchone()
+        journal_mode = (
+            str(journal_mode_row[0]).strip().lower()
+            if journal_mode_row is not None
+            else ""
+        )
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+        await self._open_transcript_reader(journal_mode)
         self._meta_launch_draft_gc_task = asyncio.create_task(
             self._run_meta_launch_draft_gc(),
             name="session-storage-meta-launch-draft-gc",
@@ -1782,9 +1842,96 @@ class SessionStorage:
             with contextlib.suppress(asyncio.CancelledError):
                 await gc_task
         async with self._operation_lock:
-            if self._conn:
-                await self._conn.close()
-                self._conn = None
+            async with self._transcript_reader_lock:
+                reader, self._transcript_reader = self._transcript_reader, None
+                conn, self._conn = self._conn, None
+                try:
+                    if reader is not None:
+                        await reader.close()
+                finally:
+                    if conn is not None:
+                        await conn.close()
+
+    def _warn_transcript_reader_fallback_once(
+        self,
+        reason: str,
+        journal_mode: str,
+    ) -> None:
+        if self._transcript_reader_fallback_warned:
+            return
+        self._transcript_reader_fallback_warned = True
+        safe_reason = (
+            reason
+            if reason in {"journal_mode_not_wal", "memory_database", "open_failed"}
+            else "unknown"
+        )
+        safe_journal_mode = (
+            journal_mode
+            if journal_mode in {"delete", "memory", "off", "persist", "truncate", "wal"}
+            else "unknown"
+        )
+        log.warning(
+            "session_storage.transcript_reader_fallback reason=%s journal_mode=%s",
+            safe_reason,
+            safe_journal_mode,
+            extra={
+                "event": "session_storage.transcript_reader_fallback",
+                "reason": safe_reason,
+                "journal_mode": safe_journal_mode,
+            },
+        )
+
+    async def _open_transcript_reader(self, journal_mode: str) -> None:
+        if self._db_path == ":memory:":
+            self._warn_transcript_reader_fallback_once("memory_database", journal_mode)
+            return
+        if journal_mode != "wal":
+            self._warn_transcript_reader_fallback_once(
+                "journal_mode_not_wal",
+                journal_mode,
+            )
+            return
+
+        reader: Any | None = None
+        try:
+            reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+            reader.row_factory = aiosqlite.Row
+            async with reader.execute("PRAGMA query_only=ON"):
+                pass
+            async with reader.execute(
+                f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}"
+            ):
+                pass
+            async with reader.execute("PRAGMA journal_mode") as cur:
+                reader_journal_mode_row = await cur.fetchone()
+            reader_journal_mode = (
+                str(reader_journal_mode_row[0]).strip().lower()
+                if reader_journal_mode_row is not None
+                else ""
+            )
+            if reader_journal_mode != "wal":
+                await reader.close()
+                self._warn_transcript_reader_fallback_once(
+                    "journal_mode_not_wal",
+                    reader_journal_mode,
+                )
+                return
+            async with reader.execute("PRAGMA query_only") as cur:
+                query_only_row = await cur.fetchone()
+            if query_only_row is None or int(query_only_row[0]) != 1:
+                raise RuntimeError("transcript reader query-only mode unavailable")
+        except asyncio.CancelledError:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            raise
+        except Exception:
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            self._warn_transcript_reader_fallback_once("open_failed", journal_mode)
+            return
+        self._transcript_reader = reader
 
     async def _run_meta_launch_draft_gc(self) -> None:
         """Physically enforce raw-draft retention while the Gateway stays up."""
@@ -1811,10 +1958,15 @@ class SessionStorage:
 
     async def _retire_poisoned_connection(self) -> None:
         self._poisoned = True
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            with contextlib.suppress(BaseException):
-                await conn.close()
+        async with self._transcript_reader_lock:
+            reader, self._transcript_reader = self._transcript_reader, None
+            conn, self._conn = self._conn, None
+            if reader is not None:
+                with contextlib.suppress(BaseException):
+                    await reader.close()
+            if conn is not None:
+                with contextlib.suppress(BaseException):
+                    await conn.close()
 
     async def _finish_sqlite_call(self, awaitable: Awaitable[Any]) -> Any:
         """Do not release the operation gate while a cancelled DB call is still queued."""
@@ -1977,6 +2129,35 @@ class SessionStorage:
             if acquired:
                 self._operation_lock.release()
 
+    @property
+    def connection_generation(self) -> int:
+        """Monotonic identity for consumers that cache per-connection setup."""
+
+        if self._conn is None:
+            raise RuntimeError("Storage not connected. Call connect() first.")
+        return self._connection_generation
+
+    @asynccontextmanager
+    async def read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Run a bounded read snapshot on the canonical connection.
+
+        The operation gate prevents interleaving transactions on the shared
+        aiosqlite connection.  A deferred ``BEGIN`` intentionally avoids
+        reserving SQLite's writer slot, so independent WAL writers remain
+        available while the short snapshot runs.
+        """
+
+        qualified_operation = f"read.{operation}"
+        async with self._operation_lock:
+            self._raise_if_poisoned()
+            conn = self.conn
+            try:
+                await self._finish_sqlite_call(conn.execute("BEGIN"))
+                yield conn
+            finally:
+                if bool(getattr(conn, "in_transaction", False)):
+                    await self._rollback_transaction(conn, qualified_operation)
+
     async def _initialize_schema(
         self,
         *,
@@ -2080,6 +2261,7 @@ class SessionStorage:
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
         await self._migrate_collaboration_columns()
+        await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
@@ -2310,6 +2492,27 @@ class SessionStorage:
             """
         )
         await self._conn.commit()
+
+    async def _migrate_model_routing_columns(self) -> None:
+        """Idempotently add durable per-session model-routing state."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        additions = {
+            "model_routing_mode": "ALTER TABLE sessions ADD COLUMN model_routing_mode TEXT",
+            "model_routing_revision": (
+                "ALTER TABLE sessions ADD COLUMN "
+                "model_routing_revision INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        changed = False
+        for column, sql in additions.items():
+            if column not in columns:
+                await self._conn.execute(sql)
+                changed = True
+        if changed:
+            await self._conn.commit()
 
     async def _migrate_derived_title_column(self) -> None:
         """Idempotently add the derived_title column to an existing sessions table.
@@ -3705,6 +3908,72 @@ class SessionStorage:
             }
         return projections
 
+    @_serialized_read
+    async def get_turn_ids_continuing_after_cursor(
+        self,
+        *,
+        session_id: str,
+        created_at: int,
+        entry_id: int,
+        turn_ids: Sequence[str],
+    ) -> set[str]:
+        """Return the turns whose assistant history continues past a page.
+
+        Canonical history pages are contiguous keyset slices over
+        ``(created_at, id)``, so a turn with no assistant row after the page's
+        last cursor already holds its terminal row inside that page. Only rows
+        beyond the cursor can move terminality onto a later page, and the
+        newest page has none, so the common read is one empty index seek
+        rather than a scan of the whole session.
+        """
+
+        stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
+        if not stable_turn_ids:
+            return set()
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE - 8:
+            raise ValueError("too many turn ids for one usage continuation probe")
+        requested_rows = ", ".join("(?)" for _ in stable_turn_ids)
+        sql = f"""
+            WITH requested(turn_id) AS (
+                VALUES {requested_rows}
+            ),
+            continuing AS (
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
+                UNION ALL
+                SELECT json_extract(turn_context, '$.turn_id') AS turn_id
+                FROM compacted_transcript_entries
+                WHERE session_id = ?
+                  AND (created_at > ? OR (created_at = ? AND original_entry_id > ?))
+                  AND role = 'assistant'
+                  AND json_valid(turn_context)
+            )
+            SELECT DISTINCT turn_id
+            FROM continuing
+            WHERE turn_id IN (SELECT turn_id FROM requested)
+        """  # noqa: S608 - placeholders are generated from a bounded list
+        async with self.conn.execute(
+            sql,
+            (
+                *stable_turn_ids,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+                session_id,
+                created_at,
+                created_at,
+                entry_id,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        return {str(row["turn_id"] or "") for row in rows if row["turn_id"]}
+
     async def reconcile_session_usage_totals_from_ledger(
         self,
         *,
@@ -4779,7 +5048,7 @@ class SessionStorage:
         placeholders = ", ".join("?" for _ in cols)
         update_columns = []
         for c in cols:
-            if c == "session_key":
+            if c == "session_key" or c in _SESSION_DEDICATED_WRITER_COLUMNS:
                 continue
             if c == "epoch":
                 # Hard guarantee: epoch can only increase, never roll back.
@@ -4794,10 +5063,21 @@ class SessionStorage:
         )
         async with self._write_transaction("upsert_session") as conn:
             async with conn.execute(
-                "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                """
+                SELECT session_id, epoch, model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
                 (node.session_key,),
             ) as cursor:
                 previous_identity = await cursor.fetchone()
+            if previous_identity is not None:
+                # Keep the caller-visible node coherent with the dedicated
+                # writer fields that this general-purpose UPSERT preserves.
+                node.model_routing_mode = previous_identity["model_routing_mode"]
+                node.model_routing_revision = max(
+                    0,
+                    int(previous_identity["model_routing_revision"] or 0),
+                )
             if expected_session_id is not None:
                 if node.session_id != expected_session_id:
                     raise KeyError(
@@ -4934,7 +5214,8 @@ class SessionStorage:
             {where}
             ORDER BY
                 max(sessions.updated_at, COALESCE(active_tasks.active_at, 0)) DESC,
-                sessions.updated_at DESC
+                sessions.updated_at DESC,
+                sessions.session_key DESC
             LIMIT ? OFFSET ?
         """
         query_params = [
@@ -4948,11 +5229,131 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_read
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        cursor: SessionListCursor | None = None,
+        guest_owner_id: str | None = None,
+    ) -> SessionListPage:
+        """Return a stable keyset page in the same order as ``list_sessions``."""
+
+        page_limit = max(1, int(limit))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return SessionListPage(sessions=[], next_cursor=None, has_more=False)
+            clauses.append(
+                "sessions.session_key GLOB ? "
+                "AND (length(sessions.session_key) - "
+                "length(replace(sessions.session_key, ':', ''))) = 5"
+            )
+            params.append(f"agent:?*:webchat:guest:{owner_id}:?*")
+        source_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        cursor_where = ""
+        cursor_params: list[Any] = []
+        if cursor is not None:
+            cursor_where = """
+                WHERE list_activity_at < ?
+                   OR (list_activity_at = ? AND updated_at < ?)
+                   OR (
+                       list_activity_at = ?
+                       AND updated_at = ?
+                       AND session_key < ?
+                   )
+            """
+            cursor_params = [
+                cursor.activity_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.session_key,
+            ]
+
+        sql = f"""
+            WITH active_tasks AS (
+                SELECT
+                    session_key,
+                    MAX(
+                        max(
+                            max(COALESCE(updated_at, 0), COALESCE(started_at, 0)),
+                            COALESCE(created_at, 0)
+                        )
+                    ) AS active_at
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                GROUP BY session_key
+            ), ordered_sessions AS (
+                SELECT
+                    sessions.*,
+                    max(
+                        sessions.updated_at,
+                        COALESCE(active_tasks.active_at, 0)
+                    ) AS list_activity_at
+                FROM sessions
+                LEFT JOIN active_tasks
+                    ON active_tasks.session_key = sessions.session_key
+                {source_where}
+            )
+            SELECT *
+            FROM ordered_sessions
+            {cursor_where}
+            ORDER BY list_activity_at DESC, updated_at DESC, session_key DESC
+            LIMIT ?
+        """
+        query_params = [
+            AgentTaskStatus.QUEUED.value,
+            AgentTaskStatus.RUNNING.value,
+            *params,
+            *cursor_params,
+            page_limit + 1,
+        ]
+        async with self.conn.execute(sql, query_params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > page_limit
+        page_rows = rows[:page_limit]
+        sessions: list[SessionNode] = []
+        positions: list[SessionListCursor] = []
+        for row in page_rows:
+            data = dict(row)
+            activity_at = int(data.pop("list_activity_at"))
+            session = SessionNode(**_deserialize_row(data))
+            sessions.append(session)
+            positions.append(
+                SessionListCursor(
+                    activity_at=activity_at,
+                    updated_at=int(session.updated_at),
+                    session_key=session.session_key,
+                )
+            )
+        next_cursor = positions[-1] if has_more and positions else None
+        return SessionListPage(
+            sessions=sessions,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
     async def _delete_session_rows(
         self,
         conn: aiosqlite.Connection,
         session: SessionNode,
     ) -> None:
+        from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+        # ArtifactSession state is fenced and removed inside the same durable
+        # boundary as the owning session.  A failure aborts the whole delete;
+        # post-commit filesystem cleanup is intentionally handled separately.
+        await purge_session_on_connection(
+            conn,
+            session_id=session.session_id,
+            boundary="session_delete",
+        )
         for table in (
             "transcript_entries",
             "compacted_transcript_entries",
@@ -5248,6 +5649,181 @@ class SessionStorage:
                 (normalized_key, normalized_value, _now_ms()),
             )
         return normalized_value
+
+    # ── Per-session model routing ──────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_model_routing_mode(value: str) -> str:
+        mode = value.strip().lower() if isinstance(value, str) else ""
+        if mode not in {"direct", "router", "ensemble"}:
+            raise ValueError("model routing mode must be direct, router, or ensemble")
+        return mode
+
+    @_serialized_read
+    async def _read_model_routing_state(self, session_key: str) -> Any:
+        async with self.conn.execute(
+            """
+            SELECT model_routing_mode, model_routing_revision
+            FROM sessions WHERE session_key = ?
+            """,
+            (session_key,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def resolve_model_routing_mode(
+        self,
+        session_key: str,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Read one session's mode, atomically materializing legacy NULL rows.
+
+        A NULL only represents a pre-feature (or not-yet-materialized) row.  It
+        is never returned to an execution caller: the fallback is persisted
+        under the write transaction so subsequent global changes cannot alter
+        the session's routing policy.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        fallback = self._normalize_model_routing_mode(fallback_mode)
+        row = await self._read_model_routing_state(session_key)
+        if row is None:
+            raise KeyError(f"Session not found: {session_key}")
+        raw_mode = row["model_routing_mode"]
+        revision = max(0, int(row["model_routing_revision"] or 0))
+        if raw_mode is not None:
+            return {
+                "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                "revision": revision,
+                "source": "session",
+                "initialized": False,
+            }
+
+        # Only legacy NULL rows require writer ownership. Re-read after taking
+        # that ownership because another process may have materialized the row
+        # between the read-only fast path and BEGIN IMMEDIATE.
+        async with self._write_transaction("resolve_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            raw_mode = row["model_routing_mode"]
+            revision = max(0, int(row["model_routing_revision"] or 0))
+            if raw_mode is not None:
+                return {
+                    "mode": self._normalize_model_routing_mode(str(raw_mode)),
+                    "revision": revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1
+                WHERE session_key = ? AND model_routing_mode IS NULL
+                """,
+                (fallback, session_key),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                # Another writer materialized the row after our read.  Read
+                # its authoritative choice rather than overwriting it.
+                async with conn.execute(
+                    """
+                    SELECT model_routing_mode, model_routing_revision
+                    FROM sessions WHERE session_key = ?
+                    """,
+                    (session_key,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    raise KeyError(f"Session not found: {session_key}")
+                return {
+                    "mode": self._normalize_model_routing_mode(
+                        str(row["model_routing_mode"])
+                    ),
+                    "revision": max(0, int(row["model_routing_revision"] or 0)),
+                    "source": "session",
+                    "initialized": False,
+                }
+            return {
+                "mode": fallback,
+                "revision": revision + 1,
+                "source": "legacy_initialized",
+                "initialized": True,
+            }
+
+    async def set_model_routing_mode(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set one persisted session routing mode."""
+
+        session_key = canonicalize_session_key(session_key)
+        normalized_mode = self._normalize_model_routing_mode(mode)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        async with self._write_transaction("set_model_routing_mode") as conn:
+            async with conn.execute(
+                """
+                SELECT model_routing_mode, model_routing_revision
+                FROM sessions WHERE session_key = ?
+                """,
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            current_mode = row["model_routing_mode"]
+            current_revision = max(0, int(row["model_routing_revision"] or 0))
+            if current_mode == normalized_mode:
+                # A lost acknowledgement may retry the same durable choice
+                # with the caller's older generation. Treat that as idempotent
+                # rather than forcing a needless UI reload.
+                return {
+                    "mode": normalized_mode,
+                    "revision": current_revision,
+                    "source": "session",
+                    "initialized": False,
+                }
+            if expected_revision is not None and current_revision != expected_revision:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET model_routing_mode = ?,
+                    model_routing_revision = model_routing_revision + 1,
+                    updated_at = ?
+                WHERE session_key = ? AND model_routing_revision = ?
+                """,
+                (normalized_mode, _now_ms(), session_key, current_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed != 1:
+                raise SessionRoutingConflictError(
+                    "model routing changed before the mode update"
+                )
+            return {
+                "mode": normalized_mode,
+                "revision": current_revision + 1,
+                "source": "session",
+                "initialized": current_mode is None,
+            }
 
     # ── Collaboration plans ────────────────────────────────────────────────
 
@@ -9467,6 +10043,116 @@ class SessionStorage:
                 expected_epoch=expected_epoch,
             )
 
+    @classmethod
+    async def _upsert_transcript_entry(
+        cls,
+        conn: Any,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int | None,
+    ) -> bool:
+        """Materialize or replace one row identified by session + message id.
+
+        ``message_id`` is not made a database-wide unique key: it is a
+        caller-supplied identity scoped to the current session.  The enclosing
+        write transaction serializes the select/update-or-insert decision, and
+        the epoch guard remains identical to ordinary transcript writes.
+        """
+
+        if expected_epoch is not None:
+            async with conn.execute(
+                "SELECT epoch FROM sessions WHERE session_key = ?",
+                (entry.session_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None or int(session_row[0]) != expected_epoch:
+                await cls._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+
+        async with conn.execute(
+            """
+            SELECT id, created_at
+            FROM transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (entry.session_id, entry.message_id),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing is None:
+            await cls._insert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            return True
+
+        entry.id = int(existing[0])
+        entry.created_at = int(existing[1])
+        data = entry.model_dump(exclude={"id", "created_at"})
+        assignments = [f"{column} = ?" for column in data]
+        values = [_serialize(data[column]) for column in data]
+        values.append(entry.id)
+        await conn.execute(
+            f"UPDATE transcript_entries SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
+        return False
+
+    async def upsert_transcript_entry_and_touch(
+        self,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int,
+        updated_at: int,
+        token_delta: int = 0,
+        mark_total_tokens_stale: bool = False,
+    ) -> bool:
+        """Upsert caller-identified content and touch its session once.
+
+        Returns ``True`` only when a new row was materialized.  Replaying the
+        same finalization therefore cannot add another transcript row or count
+        its token delta a second time.
+        """
+
+        entry.session_key = canonicalize_session_key(entry.session_key)
+        async with self._write_transaction("upsert_transcript_entry_and_touch") as conn:
+            inserted = await self._upsert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            effective_token_delta = token_delta if inserted else 0
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?,
+                    total_tokens = total_tokens + ?,
+                    total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    updated_at,
+                    effective_token_delta,
+                    int(mark_total_tokens_stale and inserted),
+                    entry.session_key,
+                    expected_epoch,
+                ),
+            ) as cur:
+                touched = cur.rowcount or 0
+            if touched == 0:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+        return inserted
+
     async def append_transcript_entry_and_touch(
         self,
         entry: TranscriptEntry,
@@ -11288,7 +11974,6 @@ class SessionStorage:
         if int(node.epoch or 0) != expected_epoch + 1:
             raise ValueError("reset epoch must advance exactly once")
 
-        session_data = node.model_dump()
         async with self._write_transaction("reset_session") as conn:
             async with conn.execute(
                 """
@@ -11307,6 +11992,9 @@ class SessionStorage:
                 )
             assert previous_row is not None
             previous_node = SessionNode(**_deserialize_row(dict(previous_row)))
+            node.model_routing_mode = previous_node.model_routing_mode
+            node.model_routing_revision = previous_node.model_routing_revision
+            session_data = node.model_dump()
             snapshot = ResetArchiveSnapshot(
                 node=previous_node,
                 entries=tuple(
@@ -11324,11 +12012,25 @@ class SessionStorage:
             )
             await archive_writer(snapshot)
 
-            assignments = [f"{column} = ?" for column in session_data if column != "session_key"]
+            from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+            await purge_session_on_connection(
+                conn,
+                session_id=expected_session_id,
+                boundary="session_reset",
+            )
+
+            assignments = [
+                f"{column} = ?"
+                for column in session_data
+                if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
+            ]
             values = [
                 _serialize(value)
                 for column, value in session_data.items()
                 if column != "session_key"
+                and column not in _SESSION_DEDICATED_WRITER_COLUMNS
             ]
             async with conn.execute(
                 f"UPDATE sessions SET {', '.join(assignments)} "
@@ -11406,6 +12108,9 @@ class SessionStorage:
             )
 
         _clear_pending_meta_launch_boundary(node.session_key)
+        from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+        await run_session_artifact_cleanup(expected_session_id, node.session_key)
 
     async def accept_turn(
         self,
@@ -11435,6 +12140,9 @@ class SessionStorage:
         goal_mutation: (
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
+        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
+        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
+        prompt_annotation_turn_id: str | None = None,
         pending_input_id: str | None = None,
         pending_input_fingerprint: str | None = None,
         pending_input_revision: int | None = None,
@@ -11478,6 +12186,24 @@ class SessionStorage:
             raise ValueError("Goal turns cannot start or claim a Plan run")
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
+        expected_prompt_annotations = tuple(expected_prompt_annotations)
+        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
+        if expected_prompt_annotations and prepared_prompt_annotation_targets:
+            raise ValueError(
+                "prompt annotation acceptance cannot use legacy and prepared inputs together"
+            )
+        prompt_annotation_acceptance = bool(
+            expected_prompt_annotations or prepared_prompt_annotation_targets
+        )
+        if prompt_annotation_acceptance:
+            if session_node is not None or merge_into_task:
+                raise ValueError(
+                    "prompt annotations require an existing session and a distinct turn"
+                )
+            if not isinstance(prompt_annotation_turn_id, str) or not (
+                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
+            ):
+                raise ValueError("prompt_annotation_turn_id is required")
         pending_guard_values = (
             pending_input_id,
             pending_input_fingerprint,
@@ -11748,6 +12474,35 @@ class SessionStorage:
                     ),
                 )
 
+            if prompt_annotation_acceptance:
+                from opensquilla.artifact_session import (
+                    consume_prepared_prompt_annotations_on_conn,
+                    consume_prompt_annotations_on_conn,
+                )
+
+                assert prompt_annotation_turn_id is not None
+                if prepared_prompt_annotation_targets:
+                    await consume_prepared_prompt_annotations_on_conn(
+                        conn,
+                        prepared_targets=prepared_prompt_annotation_targets,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+                else:
+                    await consume_prompt_annotations_on_conn(
+                        conn,
+                        expected_annotations=expected_prompt_annotations,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,
@@ -11965,6 +12720,10 @@ class SessionStorage:
                     previous_node = SessionNode(
                         **_deserialize_row(dict(previous_row))
                     )
+                    session_node.model_routing_mode = previous_node.model_routing_mode
+                    session_node.model_routing_revision = (
+                        previous_node.model_routing_revision
+                    )
                     reset_archive_snapshot = ResetArchiveSnapshot(
                         node=previous_node,
                         entries=tuple(
@@ -11983,15 +12742,26 @@ class SessionStorage:
                     if reset_archive_writer is not None:
                         await reset_archive_writer(reset_archive_snapshot)
                         reset_archive_snapshot = None
+                    from opensquilla.artifact_session.lifecycle import (
+                        purge_session_on_connection,
+                    )
+
+                    await purge_session_on_connection(
+                        conn,
+                        session_id=reset_from_session_id,
+                        boundary="session_reset",
+                    )
                     assignments = [
                         f"{column} = ?"
                         for column in session_data
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     values = [
                         _serialize(value)
                         for column, value in session_data.items()
                         if column != "session_key"
+                        and column not in _SESSION_DEDICATED_WRITER_COLUMNS
                     ]
                     async with conn.execute(
                         f"UPDATE sessions SET {', '.join(assignments)} "
@@ -12709,21 +13479,134 @@ class SessionStorage:
                 preserve_client_request_id=client_request_id,
                 preserve_message=entry.content,
             )
+            from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+            await run_session_artifact_cleanup(reset_from_session_id, entry.session_key)
         return acceptance_result
 
-    @_serialized_read
-    async def get_transcript(
-        self, session_id: str, limit: int | None = None, offset: int = 0
-    ) -> list[TranscriptEntry]:
+    async def _fetchall_transcript_rows(self, cursor: Any) -> list[Any]:
+        return cast(
+            list[Any],
+            await self._finish_sqlite_call(cursor.fetchall()),
+        )
+
+    async def _fetch_transcript_rows(
+        self,
+        conn: Any,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
         # SQLite requires LIMIT before OFFSET; use -1 for unlimited
         limit_val = limit if limit is not None else -1
         sql = (
             "SELECT * FROM transcript_entries WHERE session_id = ? "
             "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"
         )
-        async with self.conn.execute(sql, (session_id, limit_val, offset)) as cur:
-            rows = await cur.fetchall()
-        return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
+        async with conn.execute(sql, (session_id, limit_val, offset)) as cur:
+            return await self._fetchall_transcript_rows(cur)
+
+    async def _fetch_transcript_rows_on_writer(
+        self,
+        session_id: str,
+        limit: int | None,
+        offset: int,
+    ) -> list[Any]:
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            async with self._operation_lock:
+                self._raise_if_poisoned()
+                return cast(
+                    list[Any],
+                    await self._finish_sqlite_call(
+                        self._fetch_transcript_rows(
+                            self.conn,
+                            session_id,
+                            limit,
+                            offset,
+                        )
+                    )
+                )
+
+        started = self._monotonic()
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._operation_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_operation_lock",
+                ) from exc
+            acquired = True
+            self._raise_if_poisoned()
+            return cast(
+                list[Any],
+                await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        self.conn,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            )
+        finally:
+            if acquired:
+                self._operation_lock.release()
+
+    @asynccontextmanager
+    async def _transcript_reader_access(self) -> AsyncIterator[Any | None]:
+        acquired = False
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            await self._transcript_reader_lock.acquire()
+            acquired = True
+        else:
+            started = self._monotonic()
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._transcript_reader_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    "get_transcript",
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_transcript_reader_lock",
+                ) from exc
+            acquired = True
+        try:
+            self._raise_if_poisoned()
+            yield self._transcript_reader
+        finally:
+            if acquired:
+                self._transcript_reader_lock.release()
+
+    async def get_transcript(
+        self, session_id: str, limit: int | None = None, offset: int = 0
+    ) -> list[TranscriptEntry]:
+        async with self._transcript_reader_access() as reader:
+            if reader is not None:
+                rows = await self._finish_sqlite_call(
+                    self._fetch_transcript_rows(
+                        reader,
+                        session_id,
+                        limit,
+                        offset,
+                    )
+                )
+            else:
+                rows = None
+        if rows is None:
+            rows = await self._fetch_transcript_rows_on_writer(
+                session_id,
+                limit,
+                offset,
+            )
+        return await asyncio.to_thread(_decode_transcript_rows, rows)
 
     @_serialized_read
     async def get_canonical_transcript(
@@ -13989,7 +14872,7 @@ class SessionStorage:
                 node_placeholders = ", ".join("?" for _ in node_cols)
                 node_updates: list[str] = []
                 for col in node_cols:
-                    if col == "session_key":
+                    if col == "session_key" or col in _SESSION_DEDICATED_WRITER_COLUMNS:
                         continue
                     if col == "epoch":
                         node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")

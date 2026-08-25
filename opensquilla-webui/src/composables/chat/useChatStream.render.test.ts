@@ -164,6 +164,111 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps the turn elapsed clock running across phase transitions', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    expect(api.streamPhaseElapsed.value).toBe('5s')
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+
+    vi.advanceTimersByTime(3_000)
+    api.setStreamActivity('Thinking deeply', 'provider:reasoning')
+    expect(api.streamTurnElapsed.value).toBe('8s')
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
+  it('restores the turn elapsed clock from a replayed reasoning boundary', () => {
+    vi.setSystemTime(20_000)
+    const { api } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'replayed-reasoning',
+      blockIndex: 0,
+      at: 8_000,
+      contentKind: 'reasoning',
+    })
+    api.scheduleRender()
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+
+    expect(api.streamTurnElapsed.value).toBe('12s')
+    api.cleanup()
+  })
+
+  it('reconciles the turn clock from authoritative live-task hydration', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    expect(api.streamTurnElapsed.value).toBe('0s')
+    expect(api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: '90000',
+    })).toBe(true)
+    expect(api.streamTurnElapsed.value).toBe('30s')
+
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe('35s')
+    api.cleanup()
+  })
+
+  it('never moves the same task clock forward and resets for a successor task', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 100_000,
+    })
+    expect(api.streamTurnElapsed.value).toBe('30s')
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-successor',
+      startedAt: 115_000,
+    })
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    api.cleanup()
+  })
+
+  it('ignores invalid task timestamps and clears task identity on a live reset', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    expect(api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 'not-a-timestamp',
+    })).toBe(false)
+    expect(api.streamTurnElapsed.value).toBe('0s')
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
+    api.resetLiveTurnState()
+    api.startStreaming()
+    expect(api.streamTurnElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
   it('preserves the authoritative active-task steer capability when streaming starts late', () => {
     const { api, runStatus, applySessionRunState } = makeStream()
     runStatus.value = {
@@ -282,6 +387,51 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('persists a status-only turn when a terminal error ends the stream', () => {
+    const { api, messages } = makeStream()
+
+    api.startStreaming()
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    api.endStreaming()
+
+    expect(messages.value).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        text: '',
+        statusHistory: expect.arrayContaining([
+          expect.objectContaining({ action: 'provider:requesting' }),
+        ]),
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('merges durable activity occurrences without dropping repeated retry phases', () => {
+    const { api } = makeStream()
+
+    api.startStreaming()
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    api.restoreStatusHistory([
+      { action: 'provider:requesting', label: 'Waiting for model', at: 1_000 },
+      { action: 'provider:retry_wait:0', label: 'Waiting to retry', at: 2_000 },
+      { action: 'provider:retrying:0:0', label: 'Retrying', at: 3_000 },
+      { action: 'provider:retry_wait:0', label: 'Waiting to retry', at: 4_000 },
+    ])
+
+    expect(api.foldedTurn.value.statusHistory.map(entry => entry.action)).toEqual([
+      'Sending',
+      'provider:requesting',
+      'provider:retry_wait:0',
+      'provider:retrying:0:0',
+      'provider:retry_wait:0',
+    ])
+    api.cleanup()
+  })
+
   it('does not invalidate the activity surface for same-phase progress deltas', () => {
     const { api } = makeStream()
     let activityRuns = 0
@@ -387,10 +537,178 @@ describe('useChatStream render coalescing', () => {
 
     expect(messages.value[0]?.text).toBe(prefix + suffix)
     expect(messages.value[0]?.timeline).toEqual([
-      { type: 'text', raw: prefix },
+      { type: 'text', raw: prefix, presentation: 'answer' },
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: suffix },
+      { type: 'text', raw: suffix, presentation: 'answer' },
     ])
+    api.cleanup()
+  })
+
+  it('retains structured reasoning blocks on the completed assistant row', () => {
+    vi.setSystemTime(5_000)
+    const { api, messages } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      text: 'inspect',
+      at: 2_000,
+    })
+    api.appendFrame({
+      kind: 'thinking-end',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      status: 'completed',
+      at: 3_000,
+    })
+    api.appendDelta('answer')
+    vi.advanceTimersByTime(50)
+    rafCbs.shift()?.(0)
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.reasoningBlocks).toEqual([expect.objectContaining({
+      id: 'reasoning-1',
+      text: 'inspect',
+      status: 'completed',
+      startedAt: 1_000,
+      endedAt: 3_000,
+    })])
+    api.cleanup()
+  })
+
+  it('keeps an interrupted reasoning-only turn instead of dropping it as empty', () => {
+    vi.setSystemTime(5_000)
+    const { api, messages } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'reasoning-only',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'reasoning-only',
+      blockIndex: 0,
+      text: 'partial thought',
+      at: 2_000,
+    })
+    api.scheduleRender()
+    vi.advanceTimersByTime(50)
+    rafCbs.shift()?.(0)
+
+    api.endStreaming({ reason: 'aborted' })
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      text: '',
+      interrupted: true,
+      reasoningBlocks: [{
+        id: 'reasoning-only',
+        text: 'partial thought',
+        status: 'interrupted',
+      }],
+    })
+    api.cleanup()
+  })
+
+  it('hands an unfinished coarse reveal to the settled assistant row', () => {
+    const { api, messages } = makeStream()
+    const coarse = 'reasoning '.repeat(80)
+    api.startStreaming()
+    api.noteReasoningPresentationDelta(coarse)
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      text: coarse,
+      at: 1_000,
+    })
+    api.appendFrame({
+      kind: 'thinking-end',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      status: 'completed',
+      at: 2_000,
+    })
+    api.appendDelta('answer')
+    api.endStreaming()
+
+    expect(messages.value[0]?.reasoningPresentationPending).toBe(true)
+    expect(messages.value[0]?.reasoningBlocks?.[0]?.text).toBe(coarse)
+    api.cleanup()
+  })
+
+  it('replaces one answer generation while preserving completed tools and artifacts', () => {
+    const { api, messages } = makeStream()
+
+    api.startStreaming()
+    api.setAssistantMessageId('assistant-1')
+    api.appendDelta('partial old')
+    api.appendFrame({ kind: 'thinking', text: 'old reasoning', at: 1 })
+    api.appendToolCall({ tool_use_id: 'tool-completed', tool_name: 'web_search' })
+    api.appendToolResult({
+      tool_use_id: 'tool-completed',
+      tool_name: 'web_search',
+      result: 'completed result',
+    })
+    api.appendToolCall({ tool_use_id: 'tool-pending', tool_name: 'exec_command' })
+    api.appendArtifact({ id: 'artifact-1', name: 'kept.txt' })
+
+    api.resetAnswerGeneration({
+      textSnapshot: '',
+      preserveCompletedTools: true,
+    })
+
+    expect(api.isStreaming.value).toBe(true)
+    expect(api.foldedTurn.value.rawText).toBe('')
+    expect(api.foldedTurn.value.thinkingText).toBe('')
+    expect(api.foldedTurn.value.toolCalls).toEqual([
+      expect.objectContaining({
+        toolId: 'tool-completed',
+        isRunning: false,
+        result: 'completed result',
+      }),
+    ])
+    expect(api.foldedTurn.value.toolCalls.some(call => call.toolId === 'tool-pending')).toBe(false)
+    expect(api.foldedTurn.value.artifacts).toEqual([
+      expect.objectContaining({ id: 'artifact-1' }),
+    ])
+
+    api.appendDelta('fixed text')
+    api.reconcileFinalText('fixed text')
+    api.endStreaming()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      messageId: 'assistant-1',
+      text: 'fixed text',
+      artifacts: [expect.objectContaining({ id: 'artifact-1' })],
+      tool_calls: [expect.objectContaining({
+        tool_use_id: 'tool-completed',
+        result: 'completed result',
+      })],
+    })
+    expect(messages.value[0]?.tool_calls?.some(call => call.tool_use_id === 'tool-pending')).toBe(false)
     api.cleanup()
   })
 
@@ -470,7 +788,7 @@ describe('useChatStream render coalescing', () => {
   })
 
   it('keeps intermediate and answer text in separate live segments', () => {
-    const { api } = makeStream()
+    const { api, messages } = makeStream()
 
     api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
     api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
@@ -491,6 +809,14 @@ describe('useChatStream render coalescing', () => {
       presentation: item.type === 'text' ? item.presentation : undefined,
       rawText: item.type === 'text' ? item.rawText : undefined,
     })))
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.timeline).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      { type: 'text', raw: 'Checking.', presentation: 'intermediate' },
+      { type: 'text', raw: 'Verified answer.', presentation: 'answer' },
+    ])
     api.cleanup()
   })
 
@@ -521,14 +847,16 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('before')
-    api.checkpointForUserMessage('turn-steered')
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
     messages.value.push({
       role: 'user',
       text: 'adjust',
       ts: new Date().toISOString(),
+      clientId: 'steer-1',
       turnId: 'turn-steered',
       inputDisposition: 'steering',
     })
+    api.acknowledgeSteerBoundary('steer-1', '', 0)
     api.appendDelta('after')
     api.reconcileFinalText('beforeafter')
     api.endStreaming()
@@ -539,6 +867,249 @@ describe('useChatStream render coalescing', () => {
       ['assistant', 'after'],
     ])
     expect(messages.value.every(message => message.turnId === 'turn-steered')).toBe(true)
+    api.cleanup()
+  })
+
+  it('keeps late old-call tokens above the steer until it is applied', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    messages.value = messages.value.map(message => ({ ...message }))
+
+    api.appendDelta('仍属于第一段')
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段仍属于第一段'],
+      ['user', 'Use English'],
+    ])
+    expect(api.foldedTurn.value.rawText).toBe('')
+
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+    api.appendDelta('Second section.')
+    const prefix = '第一段仍属于第一段'
+    const finalText = `${prefix}Second section.`
+    api.reconcileFinalText(finalText, [{
+      model_call_id: '2.0',
+      iteration: 2,
+      start_codepoint: Array.from(prefix).length,
+      end_codepoint: Array.from(finalText).length,
+    }])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', prefix],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('keeps identified old-call tokens above the steer after applied evidence arrives', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+
+    api.appendDelta('迟到旧段', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.appendDelta('Second section.', 'answer', { modelCallId: '2.0', iteration: 2 })
+    const prefix = '第一段迟到旧段'
+    const finalText = `${prefix}Second section.`
+    api.reconcileFinalText(finalText, [{
+      model_call_id: '2.0',
+      iteration: 2,
+      start_codepoint: Array.from(prefix).length,
+      end_codepoint: Array.from(finalText).length,
+    }])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', prefix],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('routes late deltas across multiple steers and a same-iteration model retry', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('A', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'first adjustment',
+      ts: 2,
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+
+    api.appendDelta('B', 'answer', { modelCallId: '2.1', iteration: 2 })
+    api.checkpointForUserMessage('turn-steered', 'steer-2')
+    messages.value.push({
+      role: 'user',
+      text: 'second adjustment',
+      ts: 3,
+      clientId: 'steer-2',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-2', '3.0', 3)
+
+    api.appendDelta('a', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.appendDelta('b', 'answer', { modelCallId: '2.1', iteration: 2 })
+    api.appendDelta('C', 'answer', { modelCallId: '3.0', iteration: 3 })
+    api.reconcileFinalText('AaBbC', [
+      {
+        model_call_id: '2.0',
+        iteration: 2,
+        start_codepoint: 2,
+        end_codepoint: 4,
+      },
+      {
+        model_call_id: '3.0',
+        iteration: 3,
+        start_codepoint: 4,
+        end_codepoint: 5,
+      },
+    ])
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'Aa'],
+      ['user', 'first adjustment'],
+      ['assistant', 'Bb'],
+      ['user', 'second adjustment'],
+      ['assistant', 'C'],
+    ])
+    api.cleanup()
+  })
+
+  it('treats client and durable message ids as aliases for one steer boundary', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('before', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'client-steer')
+    messages.value.push({
+      role: 'user',
+      text: 'adjust',
+      ts: 2,
+      clientId: 'client-steer',
+      messageId: 'durable-steer',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+
+    api.checkpointForUserMessage('turn-steered', 'durable-steer')
+    api.acknowledgeSteerBoundary('durable-steer', '2.0', 2)
+    api.appendDelta('after', 'answer', { modelCallId: '2.0', iteration: 2 })
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'before'],
+      ['user', 'adjust'],
+      ['assistant', 'after'],
+    ])
+    api.cleanup()
+  })
+
+  it('closes an applied steer boundary when an old gateway omits model-call identity', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-legacy')
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      clientId: 'steer-legacy',
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    api.acknowledgeSteerBoundary('steer-legacy')
+    api.appendDelta('Second section.')
+    api.reconcileFinalText('第一段Second section.')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段'],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('rebuilds a checkpoint before an existing steer after live-state reset', () => {
+    const { api, messages } = makeStream()
+    messages.value.push({
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      messageId: 'steer-message-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+
+    api.appendDelta('第一段')
+    api.checkpointForUserMessage('turn-steered', 'steer-message-1')
+    api.acknowledgeSteerBoundary('steer-message-1')
+    api.appendDelta('Second section.')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', '第一段'],
+      ['user', 'Use English'],
+      ['assistant', 'Second section.'],
+    ])
+    api.cleanup()
+  })
+
+  it('reuses an orphan checkpoint when history hydrates the steer row later', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('First answer')
+    api.checkpointForUserMessage('turn-steered', 'steer-orphan')
+    api.acknowledgeSteerBoundary('steer-orphan')
+    api.appendDelta('Second answer')
+
+    // History replacement can arrive after the live snapshot and omit the
+    // optimistic assistant prefix. Replaying the same boundary must restore
+    // that stable row before the now-durable user message.
+    messages.value = [{
+      role: 'user',
+      text: 'Use English',
+      ts: 2,
+      messageId: 'steer-orphan',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    }]
+    api.checkpointForUserMessage('turn-steered', 'steer-orphan')
+    api.acknowledgeSteerBoundary('steer-orphan')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'First answer'],
+      ['user', 'Use English'],
+      ['assistant', 'Second answer'],
+    ])
     api.cleanup()
   })
 
@@ -553,7 +1124,7 @@ describe('useChatStream render coalescing', () => {
     })
     const phaseBeforeSteer = api.streamPhaseLabel.value
 
-    api.checkpointForUserMessage('turn-steered')
+    api.checkpointForUserMessage('turn-steered', 'steer-activity')
 
     expect(messages.value).toHaveLength(1)
     expect(messages.value[0]).toMatchObject({
@@ -584,6 +1155,7 @@ describe('useChatStream render coalescing', () => {
       tool_name: 'web_search',
       result: 'ok',
     })
+    api.acknowledgeSteerBoundary('steer-activity')
     api.appendDelta('after')
     api.reconcileFinalText('beforeafter')
     api.endStreaming()
@@ -696,7 +1268,7 @@ describe('useChatStream render coalescing', () => {
     expect(messages.value[0]?.text).toBe('Canonical answer')
     expect(messages.value[0]?.timeline).toEqual([
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: 'Canonical answer' },
+      { type: 'text', raw: 'Canonical answer', presentation: 'answer' },
     ])
     expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
       tool_use_id: 'tool-1',
@@ -712,10 +1284,11 @@ describe('useChatStream render coalescing', () => {
     api.appendDelta('before')
     expect(api.streamTimelineItems.value).toEqual([])
     expect(api.foldedTurn.value.rawText).toBe('before')
-    api.checkpointForUserMessage('turn-production-steer')
+    api.checkpointForUserMessage('turn-production-steer', 'steer-production')
     expect(messages.value[0]).toMatchObject({ role: 'assistant', text: 'before' })
     expect(api.foldedTurn.value.rawText).toBe('')
 
+    api.acknowledgeSteerBoundary('steer-production')
     api.appendDelta('stale')
     api.reconcileFinalText('canonical')
     expect(api.streamTimelineItems.value).toEqual([])
@@ -787,7 +1360,9 @@ describe('useChatStream render coalescing', () => {
     api.endStreaming()
 
     expect(messages.value[0]?.text).toBe('streamed fallback')
-    expect(messages.value[0]?.timeline).toEqual([{ type: 'text', raw: 'streamed fallback' }])
+    expect(messages.value[0]?.timeline).toEqual([
+      { type: 'text', raw: 'streamed fallback', presentation: 'answer' },
+    ])
     api.cleanup()
   })
 

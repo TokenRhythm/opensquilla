@@ -40,6 +40,26 @@ export type ArtifactGatewayOpenResult =
 
 const DEFAULT_BASE_ORIGIN = 'http://localhost'
 const BLOB_REVOKE_DELAY_MS = 60000
+const DESKTOP_RENDERER_PROTOCOL = 'opensquilla-app:'
+const DESKTOP_RENDERER_HOST = 'desktop'
+
+function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
+  if (candidate.origin !== 'null' || base.origin !== 'null') {
+    return candidate.origin === base.origin
+  }
+  // Opaque URL origins all serialize as "null". Compare the one supported
+  // custom transport by authority so an unrelated custom scheme is never
+  // mistaken for the privileged Desktop API proxy.
+  return candidate.protocol === DESKTOP_RENDERER_PROTOCOL
+    && base.protocol === DESKTOP_RENDERER_PROTOCOL
+    && candidate.hostname === DESKTOP_RENDERER_HOST
+    && base.hostname === DESKTOP_RENDERER_HOST
+    && candidate.port === base.port
+    && !candidate.username
+    && !candidate.password
+    && !base.username
+    && !base.password
+}
 
 function resolveBaseOrigin(baseOrigin?: string): string {
   if (baseOrigin) return baseOrigin
@@ -105,17 +125,23 @@ export function isActiveDocumentArtifact(artifact: ArtifactPayload, blob: Blob):
 
 export function isSameOriginArtifactUrl(url: string, baseOrigin: string): boolean {
   try {
-    return new URL(url, baseOrigin).origin === new URL(baseOrigin).origin
+    return urlsShareArtifactOrigin(new URL(url, baseOrigin), new URL(baseOrigin))
   } catch {
     return false
   }
 }
 
-function isSameOriginHttpArtifactUrl(url: string, baseOrigin: string): boolean {
+export function isTrustedArtifactTransportUrl(url: string, baseOrigin: string): boolean {
   try {
     const resolved = new URL(url, baseOrigin)
-    return (resolved.protocol === 'http:' || resolved.protocol === 'https:')
-      && resolved.origin === new URL(baseOrigin).origin
+    const base = new URL(baseOrigin)
+    if (!urlsShareArtifactOrigin(resolved, base)) return false
+    return resolved.protocol === 'http:'
+      || resolved.protocol === 'https:'
+      || (
+        resolved.protocol === DESKTOP_RENDERER_PROTOCOL
+        && resolved.hostname === DESKTOP_RENDERER_HOST
+      )
   } catch {
     return false
   }
@@ -148,7 +174,7 @@ export function artifactGatewayOpenUrl(artifact: ArtifactPayload, baseOrigin: st
   if (!accessUrl) return ''
   try {
     const url = new URL(accessUrl, baseOrigin)
-    if (url.origin !== new URL(baseOrigin).origin) return ''
+    if (!isSameOriginArtifactUrl(url.toString(), baseOrigin)) return ''
     const match = url.pathname.match(/^\/api\/v1\/artifacts\/([^/]+)$/)
     return match ? `/api/v1/artifacts/${match[1]}/open` : ''
   } catch {
@@ -219,7 +245,7 @@ export async function fetchArtifactBlob(
   }
 
   const sameOrigin = isSameOriginArtifactUrl(url, baseOrigin)
-  if (options.requireSameOrigin && !isSameOriginHttpArtifactUrl(url, baseOrigin)) {
+  if (options.requireSameOrigin && !isTrustedArtifactTransportUrl(url, baseOrigin)) {
     return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
   }
   try {

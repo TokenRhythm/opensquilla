@@ -5,6 +5,7 @@ import { join, normalize, resolve } from 'node:path'
 
 export const DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION = 1
 export const DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL = 'opensquilla-desktop-gateway-ownership-v1'
+const DESKTOP_GATEWAY_AUTH_CONTEXT = 'opensquilla-desktop-gateway-auth-v1'
 
 const OWNER_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/
 const PROFILE_FINGERPRINT_RE = /^[0-9a-f]{64}$/
@@ -38,6 +39,11 @@ export interface DesktopGatewayLaunchAuthority {
   port: number
 }
 
+export interface DesktopGatewayLaunchVerificationOptions {
+  load?: (ownershipDir: string) => DesktopGatewayOwnershipRecordLoad
+  verify?: (record: DesktopGatewayOwnershipRecord) => Promise<boolean>
+}
+
 /**
  * Bind a record to the launch secret and profile, not the immediate child PID.
  * In development `uv run` is the Electron ChildProcess while the Python
@@ -50,6 +56,24 @@ export function desktopGatewayOwnershipMatchesLaunch(
   return record.instance_nonce === authority.instanceNonce
     && record.profile_fingerprint === authority.profileFingerprint
     && record.port === authority.port
+}
+
+/**
+ * Prove that a ready loopback listener is the Gateway from this exact launch.
+ * A live launcher child and successful health/control probes are deliberately
+ * insufficient because another listener can win the probe-to-bind race.
+ */
+export async function verifyDesktopGatewayLaunchOwnership(
+  ownershipDir: string,
+  authority: DesktopGatewayLaunchAuthority,
+  options: DesktopGatewayLaunchVerificationOptions = {},
+): Promise<boolean> {
+  const loaded = (options.load ?? loadDesktopGatewayOwnershipRecord)(ownershipDir)
+  if (
+    loaded.status !== 'valid'
+    || !desktopGatewayOwnershipMatchesLaunch(loaded.record, authority)
+  ) return false
+  return await (options.verify ?? verifyDesktopGatewayOwnership)(loaded.record)
 }
 
 export interface DesktopGatewayIdentityPayload {
@@ -223,6 +247,12 @@ export function desktopGatewayIdentityProof(
 ): string {
   return createHmac('sha256', nonce)
     .update(canonicalDesktopGatewayIdentityPayload(payload), 'utf8')
+    .digest('hex')
+}
+
+export function desktopGatewayAuthToken(nonce: string): string {
+  return createHmac('sha256', nonce)
+    .update(DESKTOP_GATEWAY_AUTH_CONTEXT, 'ascii')
     .digest('hex')
 }
 

@@ -22,10 +22,15 @@ NORMALIZED_ERROR_KEYS = frozenset(
         "code",
         "error_id",
         "failure_kind",
+        "generation_epoch",
         "terminal_message",
         "terminal_reason",
         "error_message",
         "turn_outcome",
+        "retry_after_ms",
+        "usage_call_index",
+        "no_prior_provider_dispatch",
+        "replay_safe",
     }
 )
 
@@ -46,6 +51,7 @@ def test_error_event_dataclass_carries_error_id() -> None:
     payload = _synthetic_error_payload()
     assert payload["error_id"] == "abcd1234"
     assert payload["failure_kind"] == "transport_transient"
+    assert payload["generation_epoch"] == 0
 
 
 def test_normalized_error_payload_keys_are_frozen() -> None:

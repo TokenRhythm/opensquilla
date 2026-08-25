@@ -10,6 +10,7 @@ from typing import Any
 from opensquilla.router_tiers import (
     normalize_target_id,
     normalize_tier_mapping,
+    tier_ensemble_active,
 )
 
 # Zero means no turn-count cap; the hold expires after an idle TTL.
@@ -30,6 +31,17 @@ class RouterControlTarget:
     provider: str | None = None
     description: str | None = None
     thinking_level: str | None = None
+    uses_ensemble: bool = False
+
+    @property
+    def display_label(self) -> str:
+        if self.uses_ensemble:
+            return "multi-model fusion"
+        return self.model.rsplit("/", 1)[-1]
+
+    @property
+    def execution_kind(self) -> str:
+        return "ensemble" if self.uses_ensemble else "single_model"
 
 
 @dataclass
@@ -95,6 +107,7 @@ def build_router_control_targets(router_cfg: object | None) -> list[RouterContro
                 provider=provider,
                 description=str(cfg.get("description") or "").strip() or None,
                 thinking_level=str(thinking).strip() if thinking is not None else None,
+                uses_ensemble=tier_ensemble_active(text_tiers, tier),
             )
         )
 
@@ -128,7 +141,8 @@ def render_router_control_prompt_block(router_cfg: object | None) -> str:
     rows = [
         {
             "target_id": target.target_id,
-            "label": target.model.rsplit("/", 1)[-1],
+            "label": target.display_label,
+            "execution_kind": target.execution_kind,
         }
         for target in targets
     ]
@@ -141,7 +155,10 @@ def render_router_control_prompt_block(router_cfg: object | None) -> str:
         "not a user-facing recommendation list. Use labels only to map "
         "explicit model-name requests to the matching target_id; if a "
         "model-family request matches multiple labels, ask for the variant "
-        "instead of asking the user to choose a tier id.\n\n"
+        "instead of asking the user to choose a tier id. For user-facing "
+        "confirmations, use the selected menu label. When execution_kind is "
+        "ensemble, describe the selected route as multi-model fusion; do not "
+        "present its internal anchor model or provider as the selected model.\n\n"
         f"router_control_targets={menu}"
     )
 
@@ -232,6 +249,15 @@ def router_control_success_payload(
         "target_model": target.model if target else None,
         "target_provider": target.provider if target else None,
         "target_id": target.target_id if target else None,
+        "target_label": target.display_label if target else None,
+        "target_execution_kind": target.execution_kind if target else None,
+        "target_model_role": (
+            "ensemble_anchor"
+            if target is not None and target.uses_ensemble
+            else "selected_model"
+            if target is not None
+            else None
+        ),
         "replay_required": replay_required,
         "evidence": evidence,
     }

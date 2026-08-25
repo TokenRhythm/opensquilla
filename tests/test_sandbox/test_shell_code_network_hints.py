@@ -100,6 +100,7 @@ async def test_code_exec_exact_elevation_runs_host_once(
     host_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class _FakeProcess:
+        pid = 6201
         returncode = 0
 
         async def communicate(self) -> tuple[bytes, bytes]:
@@ -112,7 +113,7 @@ async def test_code_exec_exact_elevation_runs_host_once(
         host_calls.append((args, kwargs))
         return _FakeProcess()
 
-    monkeypatch.setattr(code_exec.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(code_exec, "create_owned_subprocess_exec", _fake_create_subprocess_exec)
     monkeypatch.setattr(code_exec, "_resolve_python_bin", lambda *, sandbox_enabled: sys.executable)
     monkeypatch.setattr(shell, "_host_execution_allowed", lambda: False)
     token = current_tool_context.set(
@@ -173,7 +174,7 @@ async def test_code_exec_changed_code_cannot_reuse_elevation(
     async def _host_must_not_run(*args: object, **kwargs: object) -> object:
         raise AssertionError("changed code must not execute on the host")
 
-    monkeypatch.setattr(code_exec.asyncio, "create_subprocess_exec", _host_must_not_run)
+    monkeypatch.setattr(code_exec, "create_owned_subprocess_exec", _host_must_not_run)
     monkeypatch.setattr(code_exec, "_resolve_python_bin", lambda *, sandbox_enabled: sys.executable)
     monkeypatch.setattr(shell, "_host_execution_allowed", lambda: False)
     token = current_tool_context.set(
@@ -1976,6 +1977,33 @@ async def test_uv_pip_install_uses_default_open_proxy_without_approval(
     assert get_approval_queue().list_pending("exec") == []
 
 
+def _assert_noop_profile_calls(
+    profile_calls: list[tuple[str, ...]],
+    command: str,
+) -> None:
+    assert len(profile_calls) == 2
+    assert profile_calls[0] == profile_calls[1]
+    argv = profile_calls[0]
+    if os.name != "nt":
+        assert argv == ("sh", "-lc", command)
+        return
+
+    from opensquilla.tools.builtin import shell
+
+    assert argv[:-1] == (
+        shell._trusted_windows_powershell_path(),
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    )
+    assert command in argv[-1]
+    assert "exit $global:LASTEXITCODE" in argv[-1]
+    assert "if (-not $?) { exit 1 }" in argv[-1]
+
+
 @pytest.mark.asyncio
 async def test_poetry_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
@@ -2023,10 +2051,7 @@ async def test_poetry_install_uses_default_open_proxy_without_approval(
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [
-        ("sh", "-lc", "poetry install"),
-        ("sh", "-lc", "poetry install"),
-    ]
+    _assert_noop_profile_calls(profile_calls, "poetry install")
     assert result == "exit_code=0\nok\n"
     assert get_approval_queue().list_pending("exec") == []
 
@@ -2078,10 +2103,7 @@ async def test_composer_install_uses_default_open_proxy_without_approval(
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [
-        ("sh", "-lc", "composer install"),
-        ("sh", "-lc", "composer install"),
-    ]
+    _assert_noop_profile_calls(profile_calls, "composer install")
     assert result == "exit_code=0\nok\n"
     assert get_approval_queue().list_pending("exec") == []
 
@@ -3516,7 +3538,15 @@ async def test_background_shell_network_spawn_receives_managed_proxy(
         seen["policy"] = request.policy
         seen["env"] = request.env
         assert request.policy.network_proxy is not None
-        return shell._SpawnedBackgroundProcess(process=_FakeProcess())  # type: ignore[arg-type]
+        process = _FakeProcess()
+        return shell._SpawnedBackgroundProcess(
+            process=process,  # type: ignore[arg-type]
+            process_tree=shell.ProcessTreeOwner(
+                process=process,
+                pid=6202,
+                ownership_error="synthetic test process",
+            ),
+        )
 
     monkeypatch.setattr(shell, "_spawn_sandboxed_background_process", _fake_spawn)
     monkeypatch.setattr(shell, "_host_execution_allowed", lambda: False)

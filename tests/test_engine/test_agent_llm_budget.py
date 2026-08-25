@@ -2888,6 +2888,18 @@ def test_configured_hidden_scratch_diff_is_not_source_progress(tmp_path) -> None
     assert observation.scratch_paths == [".artifacts/repro.py"]
 
 
+def test_final_diff_contract_skips_non_repository_workspace(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(workspace_dir=str(workspace)),
+    )
+
+    assert agent._workspace_diff_paths_for_final_diff_contract() is None
+    assert agent._final_diff_contract_observation() is None
+
+
 @pytest.mark.asyncio
 async def test_workspace_edit_gate_allows_real_configured_scratch_edit_file(
     tmp_path,
@@ -3107,6 +3119,7 @@ def test_workspace_edit_gate_rejects_configured_scratch_inside_workspace(
     workspace = tmp_path / "workspace"
     scratch = workspace / ".scratch"
     scratch.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
     tool_context = ToolContext(
         workspace_dir=str(workspace),
         scratch_dir=str(scratch),
@@ -5027,7 +5040,9 @@ async def test_large_tool_argument_stream_emits_progress_heartbeat() -> None:
         lambda event: (
             isinstance(event, RunHeartbeatEvent)
             and event.phase == "llm_tool_arguments"
-            and "write_file" in (event.message or "")
+            # Pending tool identity stays private until a legal DoneEvent
+            # commits the transactional tool timeline.
+            and event.message == "Receiving tool arguments"
         ),
     )
     done_index = _event_index(events, lambda event: isinstance(event, DoneEvent))

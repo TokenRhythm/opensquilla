@@ -60,13 +60,25 @@ def get_router_setup_profile(profile_id: str) -> RouterSetupProfile:
 
 
 def _tier_payload(tier: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "provider": tier.get("provider", ""),
         "model": tier.get("model", ""),
         "description": tier.get("description", ""),
         "thinkingLevel": tier.get("thinking_level", ""),
         "supportsImage": bool(tier.get("supports_image", False)),
     }
+    ensemble_enabled = tier.get("ensemble_enabled", tier.get("ensembleEnabled"))
+    if isinstance(ensemble_enabled, bool):
+        payload["ensembleEnabled"] = ensemble_enabled
+    if "ensemble_selection_mode" in tier or "ensembleSelectionMode" in tier:
+        payload["ensembleSelectionMode"] = str(
+            tier.get(
+                "ensemble_selection_mode",
+                tier.get("ensembleSelectionMode", ""),
+            )
+            or ""
+        )
+    return payload
 
 
 def router_catalog_payload() -> dict[str, Any]:

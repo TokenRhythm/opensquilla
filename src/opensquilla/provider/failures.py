@@ -202,7 +202,9 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
     # which would bypass Ensemble's text-only contract.
     FailureMatcher(
         ProviderFailureKind.BAD_REQUEST,
-        raw_codes=frozenset({"ensemble_multimodal_unsupported"}),
+        raw_codes=frozenset(
+            {"ensemble_multimodal_unsupported", "image_input_unsupported"}
+        ),
     ),
     FailureMatcher(
         ProviderFailureKind.CONTEXT_OVERFLOW,

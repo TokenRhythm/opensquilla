@@ -6,7 +6,8 @@ import {
   reconcileRunningHistoryMessages,
   rehomePromotedSteerRows,
 } from './historyMerge'
-import type { ChatMessage, ChatReasoning } from '@/types/chat'
+import type { ChatMessage, ChatReasoning, ChatRenderedMessage } from '@/types/chat'
+import { chatMessageKey } from './messageIdentity'
 
 function msg(overrides: Partial<ChatMessage>): ChatMessage {
   return { role: 'assistant', text: '', ts: null, ...overrides } as ChatMessage
@@ -47,12 +48,15 @@ describe('rehomePromotedSteerRows', () => {
 
 describe('mergeLiveOnlyFields', () => {
   it('keeps the optimistic identity across the first authoritative replacement', () => {
+    const optimistic = msg({ clientId: 'local-turn' })
     const merged = mergeLiveOnlyFields(
-      msg({ clientId: 'local-turn', messageId: 'server-turn' }),
+      optimistic,
       msg({ messageId: 'server-turn' }),
     )
 
     expect(merged.clientId).toBe('local-turn')
+    expect(chatMessageKey({ ...optimistic, id: 'assistant-0' } as ChatRenderedMessage, 0))
+      .toBe(chatMessageKey({ ...merged, id: 'assistant-0' } as ChatRenderedMessage, 0))
   })
 
   it('keeps live reasoning seconds when the server snapshot measured none', () => {
@@ -63,6 +67,25 @@ describe('mergeLiveOnlyFields', () => {
   it('lets the server win when it measured its own seconds', () => {
     const merged = mergeLiveOnlyFields(msg({ reasoning: reasoning(8) }), msg({ reasoning: reasoning(12) }))
     expect(merged.reasoning?.seconds).toBe(12)
+  })
+
+  it('keeps structured reasoning blocks when history only has flattened text', () => {
+    const reasoningBlocks = [{
+      id: 'reasoning-1',
+      index: 0,
+      text: 'inspect',
+      status: 'completed' as const,
+      startedAt: 1_000,
+      endedAt: 3_000,
+      contentKind: 'reasoning' as const,
+    }]
+    const merged = mergeLiveOnlyFields(
+      msg({ reasoning: { text: 'inspect', seconds: 2 }, reasoningBlocks }),
+      msg({ reasoning: { text: 'inspect', seconds: 0 } }),
+    )
+
+    expect(merged.reasoningBlocks).toEqual(reasoningBlocks)
+    expect(merged.reasoningBlocks).not.toBe(reasoningBlocks)
   })
 
   it('keeps the live activity snapshot when history has no persisted phases', () => {
@@ -141,6 +164,28 @@ describe('mergeLiveOnlyFields', () => {
     expect(mergeLiveOnlyFields(msg({ interrupted: true }), msg({ interrupted: undefined })).interrupted).toBe(true)
     // server defines it (even as false) → the server value wins
     expect(mergeLiveOnlyFields(msg({ interrupted: true }), msg({ interrupted: false })).interrupted).toBe(false)
+  })
+
+  it('keeps the ordered local timeline and matching calls for an older server row', () => {
+    const timeline = [
+      { type: 'text', raw: 'Working note.', presentation: 'intermediate' as const },
+      { type: 'tool-group', groupId: 'stream:tool-group:file.read:0' },
+      { type: 'text', raw: 'Final answer.', presentation: 'answer' as const },
+    ]
+    const toolCalls = [{
+      id: 'tool-1',
+      name: 'read_file',
+      groupId: 'stream:tool-group:file.read:0',
+      result: 'ok',
+    }]
+
+    const merged = mergeLiveOnlyFields(
+      msg({ timeline, tool_calls: toolCalls }),
+      msg({ timeline: [], tool_calls: [{ id: 'server-tool', name: 'read_file' }] }),
+    )
+
+    expect(merged.timeline).toEqual(timeline)
+    expect(merged.tool_calls).toEqual(toolCalls)
   })
 
   it('does not let stale history regress a terminal steer disposition', () => {

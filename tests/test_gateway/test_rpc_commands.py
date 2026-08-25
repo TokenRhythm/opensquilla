@@ -143,6 +143,10 @@ def test_cli_gateway_catalog_exposes_strategy_and_hides_compatibility_entries() 
         "kind": "local",
         "action": "model.routing.strategy",
     }
+    assert by_name["/routing"]["execution"] == {
+        "kind": "local",
+        "action": "session.routing",
+    }
     assert [choice["value"] for choice in by_name["/strategy"]["argument_choices"]] == [
         "direct",
         "router",
@@ -169,6 +173,11 @@ def test_cli_gateway_catalog_exposes_strategy_and_hides_compatibility_entries() 
 
     standalone = asyncio.run(_list_for_surface("cli_standalone"))
     assert "/strategy" not in {cmd["name"] for cmd in standalone["commands"]}
+    standalone_by_name = {cmd["name"]: cmd for cmd in standalone["commands"]}
+    assert standalone_by_name["/routing"]["execution"] == {
+        "kind": "local",
+        "action": "session.routing",
+    }
 
 
 def test_dynamic_meta_choices_refresh_once_then_use_one_snapshot() -> None:

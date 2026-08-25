@@ -188,6 +188,9 @@ interface ApprovalPushPayload {
   irreversible?: boolean
   backup_state?: string
   backupState?: string
+  stream_seq?: number
+  emitted_at?: number
+  created_at?: number
 }
 
 type ApprovalsRpcClient = {
@@ -207,6 +210,7 @@ export interface ApprovalsStreamSurface {
     approvalId: string
     data: InterruptApprovalData | InterruptClarifyData
     at: number
+    activityOrder?: number
   }) => void
   ensureInterruptBubble: () => void
 }
@@ -841,7 +845,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // the namespace for resolve, seeds an empty interruptState entry, and dedups in
   // the fold by approvalId — so a re-broadcast or hydration backfill merges richer
   // args/warning rather than duplicating the part.
-  function appendApprovalInterrupt(data: InterruptApprovalData) {
+  function appendApprovalInterrupt(
+    data: InterruptApprovalData,
+    payload?: ApprovalPushPayload,
+  ) {
     interruptNamespaces.set(data.approvalId, data.namespace)
     // A lean push (or backfill) may omit the legacy deadline (0); keep any
     // explicit deadline already received for compatibility.
@@ -859,7 +866,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       interruptKind: 'approval',
       approvalId: merged.approvalId,
       data: merged,
-      at: Date.now(),
+      at: Number(payload?.emitted_at || payload?.created_at) || Date.now(),
+      activityOrder: (
+        Number.isSafeInteger(payload?.stream_seq) && Number(payload?.stream_seq) > 0
+          ? Number(payload?.stream_seq)
+          : undefined
+      ),
     })
   }
 
@@ -902,7 +914,16 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       interruptKind: 'clarify',
       approvalId: key,
       data: clarifyData,
-      at: Date.now(),
+      at: Number(
+        (payload as Record<string, unknown>).emitted_at
+        || (payload as Record<string, unknown>).started_at,
+      ) || Date.now(),
+      activityOrder: (
+        Number.isSafeInteger((payload as Record<string, unknown>).stream_seq)
+        && Number((payload as Record<string, unknown>).stream_seq) > 0
+          ? Number((payload as Record<string, unknown>).stream_seq)
+          : undefined
+      ),
     })
   }
 
@@ -917,7 +938,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   function handleApprovalRequested(payload: ApprovalPushPayload) {
     const data = pushPayloadToInterruptData(payload)
     if (data && (!sessionKey.value || data.sessionKey === sessionKey.value)) {
-      appendApprovalInterrupt(data)
+      appendApprovalInterrupt(data, payload)
       const hasDisplayArgs = Object.prototype.hasOwnProperty.call(payload, 'args')
       const hasWarning = Object.prototype.hasOwnProperty.call(payload, 'warning')
       // New Gateways always include both additive fields, including the explicit
@@ -935,7 +956,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const data = pushPayloadToInterruptData(payload)
     if (data) {
       if (sessionKey.value && data.sessionKey !== sessionKey.value) return
-      appendApprovalInterrupt(data)
+      appendApprovalInterrupt(data, payload)
     }
     applyApprovalDeadline(id, payload.deadline)
   }

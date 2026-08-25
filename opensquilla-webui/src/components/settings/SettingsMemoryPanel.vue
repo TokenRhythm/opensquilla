@@ -109,7 +109,7 @@ const rpc = useRpcStore()
 const state = ref<PanelState>('loading')
 const phase = ref<AnalysisPhase>('reading')
 const rawText = ref('')
-const promptOpen = ref(false)
+const promptOpen = ref(true)
 const promptCopied = ref(false)
 const submitAttempted = ref(false)
 const busy = ref(false)
@@ -893,7 +893,11 @@ onUnmounted(() => {
 <template>
   <section class="memory-import" data-testid="settings-memory-panel">
     <header class="memory-import__head">
-      <h3 class="memory-import__title">{{ t('settings.memoryImport.title') }}</h3>
+      <h3
+        class="memory-import__title"
+        data-testid="memory-import-heading"
+        tabindex="-1"
+      >{{ t('settings.memoryImport.title') }}</h3>
       <p class="memory-import__description">{{ t('settings.memoryImport.description') }}</p>
     </header>
 
@@ -963,60 +967,92 @@ onUnmounted(() => {
         key="input"
         class="memory-import__state memory-import__input-state"
       >
-        <div class="memory-import__prompt-row">
-          <div>
-            <strong>{{ t('settings.memoryImport.helper') }}</strong>
-            <button
-              type="button"
-              class="memory-import__prompt-toggle"
-              :aria-expanded="promptOpen ? 'true' : 'false'"
-              aria-controls="memory-import-export-prompt"
-              @click="promptOpen = !promptOpen"
-            >
-              {{ promptOpen ? t('settings.memoryImport.hidePrompt') : t('settings.memoryImport.showPrompt') }}
-              <Icon :name="promptOpen ? 'chevronDown' : 'chevronRight'" :size="14" aria-hidden="true" />
-            </button>
-          </div>
-          <button
-            type="button"
-            class="btn btn--ghost memory-import__copy"
-            data-testid="memory-import-copy-prompt"
-            @click="copyPrompt"
+        <ol
+          class="memory-import__steps"
+          :aria-label="t('settings.memoryImport.stepsLabel')"
+        >
+          <li
+            class="memory-import__step"
+            data-testid="memory-import-source-step"
           >
-            <Icon :name="promptCopied ? 'check' : 'copy'" :size="15" aria-hidden="true" />
-            <span>{{ promptCopied ? t('settings.memoryImport.copiedPrompt') : t('settings.memoryImport.copyPrompt') }}</span>
-          </button>
-        </div>
+            <div class="memory-import__step-head">
+              <span class="memory-import__step-number" aria-hidden="true">1</span>
+              <div>
+                <h4>{{ t('settings.memoryImport.sourceStepTitle') }}</h4>
+                <p>{{ t('settings.memoryImport.sourceStepDescription') }}</p>
+              </div>
+            </div>
 
-        <pre
-          v-show="promptOpen"
-          id="memory-import-export-prompt"
-          class="memory-import__prompt"
-          data-testid="memory-import-export-prompt"
-        >{{ exportPrompt }}</pre>
+            <div class="memory-import__step-body">
+              <div class="memory-import__prompt-actions">
+                <button
+                  type="button"
+                  class="memory-import__prompt-toggle"
+                  :aria-expanded="promptOpen ? 'true' : 'false'"
+                  aria-controls="memory-import-export-prompt"
+                  @click="promptOpen = !promptOpen"
+                >
+                  {{ promptOpen ? t('settings.memoryImport.hidePrompt') : t('settings.memoryImport.showPrompt') }}
+                  <Icon :name="promptOpen ? 'chevronDown' : 'chevronRight'" :size="14" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  class="btn btn--ghost memory-import__copy"
+                  data-testid="memory-import-copy-prompt"
+                  @click="copyPrompt"
+                >
+                  <Icon :name="promptCopied ? 'check' : 'copy'" :size="15" aria-hidden="true" />
+                  <span>{{ promptCopied ? t('settings.memoryImport.copiedPrompt') : t('settings.memoryImport.copyPrompt') }}</span>
+                </button>
+              </div>
 
-        <label class="memory-import__input-label" for="memory-import-raw-text">
-          {{ t('settings.memoryImport.textareaLabel') }}
-        </label>
-        <textarea
-          id="memory-import-raw-text"
-          v-model="rawText"
-          class="memory-import__textarea"
-          data-testid="memory-import-textarea"
-          :placeholder="t('settings.memoryImport.textareaPlaceholder')"
-          :aria-invalid="inputError ? 'true' : 'false'"
-          aria-describedby="memory-import-input-meta memory-import-input-error memory-import-privacy"
-          @input="handleRawInput"
-        ></textarea>
-        <div id="memory-import-input-meta" class="memory-import__input-meta">
-          <span>{{ t('settings.memoryImport.inputSize', {
-            size: formatBytes(inputBytes),
-            limit: formatBytes(maxInputBytes),
-          }) }}</span>
-          <span v-if="inputError" id="memory-import-input-error" class="memory-import__input-error" role="alert">
-            {{ inputError }}
-          </span>
-        </div>
+              <pre
+                v-show="promptOpen"
+                id="memory-import-export-prompt"
+                class="memory-import__prompt"
+                data-testid="memory-import-export-prompt"
+              >{{ exportPrompt }}</pre>
+            </div>
+          </li>
+
+          <li
+            class="memory-import__step"
+            data-testid="memory-import-paste-step"
+          >
+            <div class="memory-import__step-head">
+              <span class="memory-import__step-number" aria-hidden="true">2</span>
+              <div>
+                <h4>{{ t('settings.memoryImport.pasteStepTitle') }}</h4>
+                <p>{{ t('settings.memoryImport.pasteStepDescription') }}</p>
+              </div>
+            </div>
+
+            <div class="memory-import__step-body">
+              <label class="memory-import__input-label" for="memory-import-raw-text">
+                {{ t('settings.memoryImport.textareaLabel') }}
+              </label>
+              <textarea
+                id="memory-import-raw-text"
+                v-model="rawText"
+                class="memory-import__textarea"
+                data-testid="memory-import-textarea"
+                :placeholder="t('settings.memoryImport.textareaPlaceholder')"
+                :aria-invalid="inputError ? 'true' : 'false'"
+                aria-describedby="memory-import-input-meta memory-import-input-error memory-import-privacy"
+                @input="handleRawInput"
+              ></textarea>
+              <div id="memory-import-input-meta" class="memory-import__input-meta">
+                <span>{{ t('settings.memoryImport.inputSize', {
+                  size: formatBytes(inputBytes),
+                  limit: formatBytes(maxInputBytes),
+                }) }}</span>
+                <span v-if="inputError" id="memory-import-input-error" class="memory-import__input-error" role="alert">
+                  {{ inputError }}
+                </span>
+              </div>
+            </div>
+          </li>
+        </ol>
 
         <div
           v-if="previewErrorVisible"
@@ -1028,7 +1064,11 @@ onUnmounted(() => {
           <div>
             <h4>{{ t('settings.memoryImport.errorTitle') }}</h4>
             <p>{{ errorMessage }}</p>
-            <button type="button" class="btn btn--primary" @click="requestPreview">
+            <button
+              type="button"
+              class="btn btn--primary"
+              @click="requestPreview"
+            >
               {{ t('settings.memoryImport.retry') }}
             </button>
           </div>
@@ -1489,26 +1529,70 @@ onUnmounted(() => {
   min-height: 220px;
 }
 
-.memory-import__prompt-row {
-  align-items: center;
+.memory-import__steps {
+  display: grid;
+  gap: var(--sp-3);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.memory-import__step {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   display: flex;
-  gap: var(--sp-4);
-  justify-content: space-between;
-  padding: var(--sp-3) var(--sp-4);
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-4);
 }
 
-.memory-import__prompt-row > div {
+.memory-import__step-head {
+  align-items: flex-start;
+  display: flex;
+  gap: var(--sp-3);
+}
+
+.memory-import__step-head > div {
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
+  min-width: 0;
 }
 
-.memory-import__prompt-row strong {
-  color: var(--text);
+.memory-import__step-head h4 {
   font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+
+.memory-import__step-number {
+  align-items: center;
+  background: var(--accent);
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  display: inline-flex;
+  flex: 0 0 24px;
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  width: 24px;
+}
+
+.memory-import__step-body {
+  display: grid;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.memory-import__prompt-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
 }
 
 .memory-import__prompt-toggle {
@@ -1534,7 +1618,7 @@ onUnmounted(() => {
 }
 
 .memory-import__prompt {
-  background: var(--bg-elevated);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text-muted);
@@ -1542,7 +1626,7 @@ onUnmounted(() => {
   font-size: var(--fs-xs);
   line-height: 1.55;
   margin: 0;
-  max-height: 260px;
+  max-height: 180px;
   overflow: auto;
   padding: var(--sp-4);
   white-space: pre-wrap;
@@ -1552,7 +1636,6 @@ onUnmounted(() => {
   color: var(--text);
   font-size: var(--fs-sm);
   font-weight: 600;
-  margin-bottom: calc(-1 * var(--sp-2));
 }
 
 .memory-import__textarea {
@@ -1563,7 +1646,7 @@ onUnmounted(() => {
   font: inherit;
   font-size: var(--fs-sm);
   line-height: 1.55;
-  min-height: 220px;
+  min-height: 190px;
   padding: var(--sp-4);
   resize: vertical;
   transition:
@@ -1591,7 +1674,6 @@ onUnmounted(() => {
   display: flex;
   font-size: var(--fs-xs);
   justify-content: space-between;
-  margin-top: calc(-1 * var(--sp-3));
 }
 
 .memory-import__input-error,
@@ -2040,10 +2122,17 @@ onUnmounted(() => {
     gap: var(--sp-4);
   }
 
-  .memory-import__prompt-row,
   .memory-import__recent-head {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .memory-import__step {
+    padding: var(--sp-3);
+  }
+
+  .memory-import__prompt {
+    max-height: 150px;
   }
 
   .memory-import__copy {
@@ -2051,7 +2140,7 @@ onUnmounted(() => {
   }
 
   .memory-import__textarea {
-    min-height: 180px;
+    min-height: 160px;
   }
 
   .memory-import__input-meta,

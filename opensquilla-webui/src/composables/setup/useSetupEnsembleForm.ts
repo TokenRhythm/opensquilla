@@ -1,4 +1,36 @@
 import { computed, ref, type ComputedRef } from 'vue'
+import {
+  CUSTOM_B5_MAX_PROPOSERS,
+  CUSTOM_B5_MIN_PROPOSERS,
+  CUSTOM_B5_RECOMMENDED_MAX,
+  CUSTOM_B5_RECOMMENDED_MIN,
+  CUSTOM_B5_SELECTION_MODE,
+  DEFAULT_ENSEMBLE_SELECTION_MODE,
+  ENSEMBLE_SELECTION_MODES,
+  LEGACY_OPENROUTER_MODEL_OPTIONS,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+  STATIC_B5_PROFILES,
+  staticB5ModeForProvider,
+  type StaticB5Profile,
+} from '@/types/generated/router_tier_contract'
+
+export {
+  CUSTOM_B5_MAX_PROPOSERS,
+  CUSTOM_B5_MIN_PROPOSERS,
+  CUSTOM_B5_RECOMMENDED_MAX,
+  CUSTOM_B5_RECOMMENDED_MIN,
+  CUSTOM_B5_SELECTION_MODE,
+  ENSEMBLE_SELECTION_MODES,
+  LEGACY_OPENROUTER_MODEL_OPTIONS,
+  OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR,
+  OPENROUTER_FIXED_ENSEMBLE_PROPOSERS,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+  STATIC_B5_PROFILES,
+  TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR,
+  TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS,
+  staticB5ModeForProvider,
+} from '@/types/generated/router_tier_contract'
+export type { StaticB5Profile } from '@/types/generated/router_tier_contract'
 
 // Settings form for the [llm_ensemble] routing surface, saved through
 // onboarding.ensemble.configure. That RPC has partial-payload semantics (the
@@ -13,104 +45,27 @@ import { computed, ref, type ComputedRef } from 'vue'
 // The legacy "router_dynamic" mode is read-compatible but hidden: stored
 // configs surface a migration banner that converts them to a custom lineup.
 
-export const CUSTOM_B5_SELECTION_MODE = 'custom_b5'
-
-export const ENSEMBLE_SELECTION_MODES = [
-  'static_openrouter_b5',
-  'static_tokenrhythm_b5',
-  CUSTOM_B5_SELECTION_MODE,
-  'router_dynamic',
-] as const
 export const ENSEMBLE_ALL_FAILED_POLICIES = ['fallback_single', 'error'] as const
 
 export type EnsembleCandidateRole =
-  | ''
-  | 'primary'
-  | 'contrast'
-  | 'fast_check'
-  | 'critic'
+  | 'proposer'
   | 'aggregator'
 
-export const ENSEMBLE_PROPOSER_ROLES = ['primary', 'contrast', 'fast_check', 'critic'] as const
-
-// Custom lineup bounds. Mirrors the gateway's CUSTOM_B5_* constants: 2 is the
-// smallest lineup where fusion means anything, 3-4 is the value sweet spot
-// (the preset lineups run 4), 6 is the hard ceiling before aggregator-context
-// and cost pressure outweigh the marginal draft.
-export const CUSTOM_B5_MIN_PROPOSERS = 2
-export const CUSTOM_B5_MAX_PROPOSERS = 6
-export const CUSTOM_B5_RECOMMENDED_MIN = 3
-export const CUSTOM_B5_RECOMMENDED_MAX = 4
-
-export const OPENROUTER_FIXED_ENSEMBLE_PROPOSERS = [
-  'deepseek/deepseek-v4-pro',
-  'z-ai/glm-5.2',
-  'moonshotai/kimi-k2.7-code',
-  'qwen/qwen3.7-max',
-] as const
-export const OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR = 'z-ai/glm-5.2'
-export const TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS = [
-  'deepseek-v4-pro',
-  'glm-5.2',
-  'kimi-k2.7-code',
-  'qwen3.7-max',
-] as const
-export const TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR = 'glm-5.2'
-
-// Static B5 lineups keyed by selection mode. Mirrors the gateway's
-// STATIC_B5_SELECTION_MODE_PROVIDERS + provider.ensemble.STATIC_B5_PROFILES.
-export interface StaticB5Profile {
-  provider: string
-  label: string
-  proposers: readonly string[]
-  aggregator: string
-}
-
-export const STATIC_B5_PROFILES: Record<string, StaticB5Profile> = {
-  static_openrouter_b5: {
-    provider: 'openrouter',
-    label: 'OpenRouter',
-    proposers: OPENROUTER_FIXED_ENSEMBLE_PROPOSERS,
-    aggregator: OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR,
-  },
-  static_tokenrhythm_b5: {
-    provider: 'tokenrhythm',
-    label: 'TokenRhythm',
-    proposers: TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS,
-    aggregator: TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR,
-  },
-}
-
-export function staticB5ModeForProvider(provider: unknown): string | null {
-  const id = String(provider || '').trim().toLowerCase()
-  if (!id) return null
-  for (const [mode, profile] of Object.entries(STATIC_B5_PROFILES)) {
-    if (profile.provider === id) return mode
-  }
-  return null
-}
-export const LEGACY_OPENROUTER_MODEL_OPTIONS = [
-  'deepseek/deepseek-v4-pro',
-  'z-ai/glm-5.2',
-  'qwen/qwen3.7-plus',
-  'deepseek/deepseek-v4-flash',
-  'qwen/qwen3.7-max',
-  'moonshotai/kimi-k2.6',
-  'moonshotai/kimi-k2.7-code',
-  'minimax/minimax-m3',
-] as const
-
-const DEFAULT_SELECTION_MODE = 'static_openrouter_b5'
+const DEFAULT_SELECTION_MODE = DEFAULT_ENSEMBLE_SELECTION_MODE
 const DEFAULT_MIN_SUCCESSFUL_PROPOSERS = 1
 const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
+// The persisted/global Ensemble contract remains single-attempt by default.
+// Tier-local C3 activation projects its separate effective default (1) from
+// the Gateway's tier runtime status in SetupModelStrategyPanel.
+const DEFAULT_PROPOSER_MAX_RETRIES = 0
 
 // Runtime default replacements applied by the ensemble builder when the
 // stored value still equals the legacy default. The panel surfaces EFFECTIVE
 // values so what the user reads matches what actually runs.
-const STATIC_B5_EFFECTIVE_QUORUM = 3
-const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
-const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
-const STATIC_B5_QUORUM_GRACE_SECONDS = 10
+const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 120
+const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 180
+const CUSTOM_B5_PROPOSER_TIMEOUT_SECONDS = 300
+const CUSTOM_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
 // The gateway builder substitutes the static-B5 timeout defaults above ONLY
 // when the stored value still equals this legacy default; an explicit
 // operator override (e.g. proposer_timeout_seconds = 600 in TOML) runs as
@@ -126,7 +81,15 @@ export interface EnsembleCandidateConfig {
   model: string
   source?: 'custom' | 'legacy_model_options'
   enabled?: boolean
-  role?: EnsembleCandidateRole
+  role?: string
+}
+
+export interface EnsembleRoutingModeState {
+  enabled: boolean
+  selectionMode: string
+  modelOptions: string[]
+  candidates: EnsembleCandidateConfig[]
+  lineupDirty: boolean
 }
 
 export interface EnsembleCredentialStatus {
@@ -156,11 +119,11 @@ export interface EnsembleFixedProfileView {
 
 export interface EnsembleEffectiveFacts {
   perTurnCalls: number
-  quorum: number
   proposerCount: number
+  proposerMaxRetries: number
   proposerTimeoutSeconds: number
+  configuredAggregatorTimeoutSeconds: number
   aggregatorTimeoutSeconds: number
-  quorumGraceSeconds: number
 }
 
 export type EnsembleCapacityState = 'ok' | 'warn' | 'full'
@@ -196,6 +159,10 @@ export interface EnsembleConfigSlice {
   candidates?: EnsembleCandidateConfig[]
   min_successful_proposers?: number
   all_failed_policy?: string
+  configured_all_failed_policy?: string
+  effective_all_failed_policy?: string
+  policy_deprecated?: boolean
+  proposer_max_retries?: number
   // Read-only in this form (no editor yet): consumed so effectiveFacts can
   // report an explicit operator override instead of the static default.
   proposer_timeout_seconds?: number
@@ -240,6 +207,11 @@ function normalizeStoredTimeoutSeconds(value: unknown): number {
   return Number.isFinite(num) && num > 0 ? num : LEGACY_ENSEMBLE_TIMEOUT_SECONDS
 }
 
+function normalizeProposerMaxRetries(value: unknown): number {
+  const num = Math.trunc(Number(value))
+  return Number.isFinite(num) && num >= 0 ? Math.min(num, 10) : DEFAULT_PROPOSER_MAX_RETRIES
+}
+
 function normalizeModelOptions(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   const seen = new Set<string>()
@@ -268,9 +240,7 @@ function normalizeCandidateSource(value: unknown): 'custom' | 'legacy_model_opti
 export function normalizeCandidateRole(value: unknown): EnsembleCandidateRole {
   const raw = String(value || '').trim().toLowerCase()
   if (raw === 'aggregator') return 'aggregator'
-  return (ENSEMBLE_PROPOSER_ROLES as readonly string[]).includes(raw)
-    ? raw as EnsembleCandidateRole
-    : ''
+  return 'proposer'
 }
 
 function normalizeCandidates(value: unknown): EnsembleCandidateConfig[] {
@@ -319,19 +289,6 @@ function legacyDefaultModelOptions(options: readonly string[]): boolean {
   return options.every((option, index) => option === LEGACY_OPENROUTER_MODEL_OPTIONS[index])
 }
 
-// Seed roles for lineup rows in display order (advisory labels only).
-function seedRoleForIndex(index: number): EnsembleCandidateRole {
-  return (ENSEMBLE_PROPOSER_ROLES[index] ?? '') as EnsembleCandidateRole
-}
-
-export function roleForTier(tier: unknown): EnsembleCandidateRole {
-  const raw = String(tier || '').trim().toLowerCase()
-  if (raw === 'c0' || raw === 'c1' || raw === 't0' || raw === 't1') return 'fast_check'
-  if (raw === 'c2' || raw === 't2') return 'contrast'
-  if (raw === 'c3' || raw === 't3') return 'critic'
-  return ''
-}
-
 // Model-family key used for the diversity hint; mirrors the backend's model
 // identity split (vendor prefix stripped, first two hyphen tokens).
 export function modelFamilyKey(model: string): string {
@@ -342,12 +299,12 @@ export function modelFamilyKey(model: string): string {
 }
 
 function customSeedFromProfile(profile: StaticB5Profile): EnsembleCandidateConfig[] {
-  const rows: EnsembleCandidateConfig[] = profile.proposers.map((model, index) => ({
+  const rows: EnsembleCandidateConfig[] = profile.proposers.map(model => ({
     provider: profile.provider,
     model,
     source: 'custom',
     enabled: true,
-    role: seedRoleForIndex(index),
+    role: 'proposer',
   }))
   rows.push({
     provider: profile.provider,
@@ -375,7 +332,7 @@ function withCredential(
   source: EnsembleCandidateSource,
   status: readonly EnsembleCredentialStatus[],
   enabled = true,
-  role: EnsembleCandidateRole = '',
+  role: EnsembleCandidateRole = 'proposer',
 ): EnsembleCandidateView {
   const normalizedProvider = normalizeProvider(provider)
   const cleanModel = normalizeModel(model)
@@ -413,6 +370,9 @@ export function useSetupEnsembleForm() {
   const candidates = ref<EnsembleCandidateConfig[]>([])
   const minSuccessfulProposers = ref(DEFAULT_MIN_SUCCESSFUL_PROPOSERS)
   const allFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
+  const configuredAllFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
+  const policyDeprecated = ref(false)
+  const proposerMaxRetries = ref(DEFAULT_PROPOSER_MAX_RETRIES)
   // Stored timeout values mirrored from config (read-only here — the panel
   // has no editor for them, but effectiveFacts must reflect explicit
   // operator overrides instead of always claiming the static defaults).
@@ -429,6 +389,7 @@ export function useSetupEnsembleForm() {
     candidates: JSON.stringify(candidates.value),
     minSuccessfulProposers: minSuccessfulProposers.value,
     allFailedPolicy: allFailedPolicy.value,
+    proposerMaxRetries: proposerMaxRetries.value,
   })
 
   const enabledDirty = computed(() => enabled.value !== baseline.value.enabled)
@@ -438,12 +399,15 @@ export function useSetupEnsembleForm() {
   // Candidate/model-option inputs only drive the lineup-based modes; static
   // preset saves must not carry stale editor state.
   const dynamicCandidateInputsActive = computed(() => (
-    selectionMode.value === 'router_dynamic' || selectionMode.value === CUSTOM_B5_SELECTION_MODE
+    selectionMode.value === ROUTER_DYNAMIC_SELECTION_MODE || selectionMode.value === CUSTOM_B5_SELECTION_MODE
   ))
   const effectiveModelOptionsDirty = computed(() => dynamicCandidateInputsActive.value && modelOptionsDirty.value)
   const effectiveCandidatesDirty = computed(() => dynamicCandidateInputsActive.value && candidatesDirty.value)
   const minSuccessfulDirty = computed(() => minSuccessfulProposers.value !== baseline.value.minSuccessfulProposers)
   const allFailedPolicyDirty = computed(() => allFailedPolicy.value !== baseline.value.allFailedPolicy)
+  const proposerMaxRetriesDirty = computed(() => (
+    proposerMaxRetries.value !== baseline.value.proposerMaxRetries
+  ))
   const isDirty = computed(() => (
     enabledDirty.value
     || selectionModeDirty.value
@@ -451,6 +415,7 @@ export function useSetupEnsembleForm() {
     || effectiveCandidatesDirty.value
     || minSuccessfulDirty.value
     || allFailedPolicyDirty.value
+    || proposerMaxRetriesDirty.value
   ))
 
   const enabledProposerConfigs = computed(() => candidates.value.filter(candidate => (
@@ -465,6 +430,7 @@ export function useSetupEnsembleForm() {
       candidates: JSON.stringify(candidates.value),
       minSuccessfulProposers: minSuccessfulProposers.value,
       allFailedPolicy: allFailedPolicy.value,
+      proposerMaxRetries: proposerMaxRetries.value,
     }
   }
 
@@ -490,7 +456,20 @@ export function useSetupEnsembleForm() {
     minSuccessfulProposers.value = normalizeMinSuccessful(
       config.min_successful_proposers ?? DEFAULT_MIN_SUCCESSFUL_PROPOSERS,
     )
-    allFailedPolicy.value = normalizeAllFailedPolicy(config.all_failed_policy)
+    configuredAllFailedPolicy.value = normalizeAllFailedPolicy(
+      config.configured_all_failed_policy ?? config.all_failed_policy,
+    )
+    // Prefer the gateway's effective value when available. Once a policy is
+    // visible here it must be the policy the provider actually executes.
+    allFailedPolicy.value = normalizeAllFailedPolicy(
+      config.effective_all_failed_policy
+      ?? config.all_failed_policy
+      ?? config.configured_all_failed_policy,
+    )
+    policyDeprecated.value = config.policy_deprecated === true
+    proposerMaxRetries.value = normalizeProposerMaxRetries(
+      config.proposer_max_retries,
+    )
     storedProposerTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
       config.proposer_timeout_seconds,
     )
@@ -502,6 +481,90 @@ export function useSetupEnsembleForm() {
 
   function setEnabled(value: boolean) {
     enabled.value = Boolean(value)
+  }
+
+  function captureRoutingModeState(): EnsembleRoutingModeState {
+    return {
+      enabled: enabled.value,
+      selectionMode: selectionMode.value,
+      modelOptions: [...modelOptions.value],
+      candidates: candidates.value.map(candidate => ({ ...candidate })),
+      lineupDirty: (
+        selectionModeDirty.value
+        || modelOptionsDirty.value
+        || candidatesDirty.value
+      ),
+    }
+  }
+
+  function routingModeDetailsMatch(state: EnsembleRoutingModeState): boolean {
+    return selectionMode.value === state.selectionMode
+      && JSON.stringify(modelOptions.value) === JSON.stringify(state.modelOptions)
+      && JSON.stringify(candidates.value) === JSON.stringify(state.candidates)
+  }
+
+  function restoreRoutingModeDetails(state: EnsembleRoutingModeState) {
+    selectionMode.value = state.selectionMode
+    modelOptions.value = [...state.modelOptions]
+    candidates.value = state.candidates.map(candidate => ({ ...candidate }))
+  }
+
+  function restoreRoutingModeState(state: EnsembleRoutingModeState) {
+    const detailsUnchanged = routingModeDetailsMatch(state)
+    enabled.value = state.enabled
+    if (detailsUnchanged) restoreRoutingModeDetails(state)
+  }
+
+  /**
+   * `models.routing.set` owns the global mode transition and may materialize a
+   * first-use Ensemble plan. Rebase clean lineup fields from that response,
+   * while retaining any lineup draft that existed before the switch.
+   */
+  function acceptRoutingModeChange(
+    state: EnsembleRoutingModeState,
+    serverSnapshot: unknown,
+  ) {
+    const response = serverSnapshot && typeof serverSnapshot === 'object'
+      ? serverSnapshot as Record<string, unknown>
+      : null
+    const responseMode = String(response?.mode || '').trim()
+    const responseSelectionMode = String(response?.selection_mode || '').trim()
+    const hasResponseSelectionMode = (
+      responseMode === 'ensemble'
+      && (ENSEMBLE_SELECTION_MODES as readonly string[]).includes(responseSelectionMode)
+    )
+    const preview = response?.activation_preview
+    const previewRecord = preview && typeof preview === 'object'
+      ? preview as Record<string, unknown>
+      : null
+    const previewCandidates = (
+      responseMode === 'ensemble'
+      && responseSelectionMode === CUSTOM_B5_SELECTION_MODE
+      && Array.isArray(previewRecord?.candidates)
+    )
+      ? normalizeCandidates(previewRecord.candidates)
+      : null
+
+    const detailsUnchanged = routingModeDetailsMatch(state)
+    const nextBaseline = {
+      ...baseline.value,
+      enabled: enabled.value,
+    }
+    if (hasResponseSelectionMode) {
+      nextBaseline.selectionMode = responseSelectionMode
+    }
+    if (previewCandidates !== null) {
+      nextBaseline.candidates = JSON.stringify(previewCandidates)
+    }
+    baseline.value = nextBaseline
+
+    if (state.lineupDirty || !detailsUnchanged) return
+    if (hasResponseSelectionMode) {
+      selectionMode.value = responseSelectionMode
+    }
+    if (previewCandidates !== null) {
+      candidates.value = previewCandidates
+    }
   }
 
   function setSelectionMode(value: string) {
@@ -526,15 +589,14 @@ export function useSetupEnsembleForm() {
   function ensureCustomMode() {
     if (
       selectionMode.value !== CUSTOM_B5_SELECTION_MODE
-      && selectionMode.value !== 'router_dynamic'
+      && selectionMode.value !== ROUTER_DYNAMIC_SELECTION_MODE
     ) {
       selectionMode.value = CUSTOM_B5_SELECTION_MODE
     }
   }
 
-  // Keep an explicit quorum consistent with the lineup: quorum > N can never
-  // succeed and the gateway rejects it. The legacy default (1) means "auto"
-  // (the runtime derives N-1), so it is never clamped.
+  // Keep the configured threshold within the enabled lineup so the value the
+  // user sees and saves remains a valid authoritative runtime quorum.
   function clampQuorumToLineup() {
     const count = enabledProposerConfigs.value.length
     if (
@@ -546,7 +608,7 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  function addCandidate(provider: string, model: string, role: EnsembleCandidateRole = '') {
+  function addCandidate(provider: string, model: string, role: EnsembleCandidateRole = 'proposer') {
     const cleanProvider = normalizeProvider(provider)
     const cleanModel = normalizeModel(model)
     if (!cleanProvider || !cleanModel) return
@@ -563,7 +625,7 @@ export function useSetupEnsembleForm() {
     if (cleanRole === 'aggregator') {
       next = next.map((candidate, index) => (
         index < next.length - 1 && normalizeCandidateRole(candidate.role) === 'aggregator'
-          ? { ...candidate, role: '' as EnsembleCandidateRole }
+          ? { ...candidate, role: 'proposer' as EnsembleCandidateRole }
           : candidate
       ))
     }
@@ -677,35 +739,6 @@ export function useSetupEnsembleForm() {
     candidates.value = normalizeCandidates(next)
   }
 
-  function setCandidateRole(
-    candidate: { provider: string; model: string; source?: string; role?: string },
-    role: EnsembleCandidateRole,
-  ) {
-    const provider = normalizeProvider(candidate.provider)
-    const model = normalizeModel(candidate.model)
-    const source = normalizeCandidateSource(candidate.source)
-    const currentSlot = normalizeCandidateRole(candidate.role) === 'aggregator' ? 'aggregator' : 'proposer'
-    const nextRole = normalizeCandidateRole(role)
-    ensureCustomMode()
-    const next = candidates.value.map((entry) => {
-      const matches = (
-        normalizeProvider(entry.provider) === provider
-        && normalizeModel(entry.model) === model
-        && normalizeCandidateSource(entry.source) === source
-        && (normalizeCandidateRole(entry.role) === 'aggregator' ? 'aggregator' : 'proposer') === currentSlot
-      )
-      if (matches) return { ...entry, role: nextRole }
-      // The aggregator is structurally single: promoting a row demotes any
-      // previous aggregator to an unassigned proposer.
-      if (nextRole === 'aggregator' && normalizeCandidateRole(entry.role) === 'aggregator') {
-        return { ...entry, role: '' as EnsembleCandidateRole }
-      }
-      return entry
-    })
-    candidates.value = normalizeCandidates(next)
-    clampQuorumToLineup()
-  }
-
   function importTierCandidates(
     tierCandidates: readonly EnsembleTierCandidate[],
     providerRestriction?: unknown,
@@ -729,7 +762,7 @@ export function useSetupEnsembleForm() {
       count += 1
       added = [
         ...added,
-        { provider, model, source: 'custom' as const, enabled: true, role: roleForTier(row.tier) },
+        { provider, model, source: 'custom' as const, enabled: true, role: 'proposer' },
       ]
     }
     candidates.value = normalizeCandidates(added)
@@ -754,8 +787,8 @@ export function useSetupEnsembleForm() {
   }
 
   // Scheme switching between the provider preset and the explicit custom
-  // lineup. Switching to custom seeds the lineup from the preset (roles
-  // included) when the editor is empty, so the user starts from a working
+  // lineup. Switching to custom seeds the lineup from the preset when the
+  // editor is empty, so the user starts from a working
   // configuration instead of a blank pool.
   function setScheme(scheme: 'preset' | 'custom', staticMode?: string | null) {
     const presetMode = staticMode && staticMode in STATIC_B5_PROFILES ? staticMode : null
@@ -774,11 +807,15 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Default activation when the ensemble strategy is switched on: every
-  // provider lands on the single editable custom path. Providers with a
-  // curated static profile use that profile only as the initial seed; other
-  // providers seed from the router tiers the user already configured.
+  // Enabling the ensemble strategy changes its scope, not the shared plan.
+  // Preserve any ready static/custom plan already loaded from the gateway;
+  // only the hidden legacy mode or an empty custom draft needs materializing.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
+    if (selectionMode.value in STATIC_B5_PROFILES) return
+    if (
+      selectionMode.value === CUSTOM_B5_SELECTION_MODE
+      && candidates.value.some(candidate => candidate.enabled !== false)
+    ) return
     const presetMode = staticB5ModeForProvider(provider)
     selectionMode.value = CUSTOM_B5_SELECTION_MODE
     if (candidates.value.some(candidate => candidate.enabled !== false)) return
@@ -801,7 +838,7 @@ export function useSetupEnsembleForm() {
     const seen = new Set<string>()
     let proposerCount = 0
     const legacyProvider = normalizeProvider(activeProvider)
-    const push = (provider: string, model: string, role: EnsembleCandidateRole = '') => {
+    const push = (provider: string, model: string, role: EnsembleCandidateRole = 'proposer') => {
       const cleanProvider = normalizeProvider(provider)
       const cleanModel = normalizeModel(model)
       if (!cleanProvider || !cleanModel) return
@@ -832,7 +869,7 @@ export function useSetupEnsembleForm() {
       }
     }
     for (const row of tierCandidates || []) {
-      push(row.provider, row.model, roleForTier(row.tier))
+      push(row.provider, row.model)
     }
     selectionMode.value = CUSTOM_B5_SELECTION_MODE
     modelOptions.value = []
@@ -854,6 +891,10 @@ export function useSetupEnsembleForm() {
     allFailedPolicy.value = normalizeAllFailedPolicy(value)
   }
 
+  function setProposerMaxRetries(value: number) {
+    proposerMaxRetries.value = normalizeProposerMaxRetries(value)
+  }
+
   // Partial by design: only user-changed keys are sent; the gateway keeps the
   // current value for every omitted key.
   function payload(): Record<string, unknown> {
@@ -870,40 +911,37 @@ export function useSetupEnsembleForm() {
     }))
     if (minSuccessfulDirty.value) params.minSuccessfulProposers = minSuccessfulProposers.value
     if (allFailedPolicyDirty.value) params.allFailedPolicy = allFailedPolicy.value
+    if (proposerMaxRetriesDirty.value) params.proposerMaxRetries = proposerMaxRetries.value
     return params
   }
 
   function effectiveFacts(proposerCount: number, isPreset: boolean): EnsembleEffectiveFacts {
-    const configuredQuorum = minSuccessfulProposers.value
-    const autoQuorum = isPreset
-      ? STATIC_B5_EFFECTIVE_QUORUM
-      : Math.max(1, proposerCount - 1)
-    const quorum = Math.min(
-      configuredQuorum === DEFAULT_MIN_SUCCESSFUL_PROPOSERS ? autoQuorum : configuredQuorum,
-      Math.max(1, proposerCount),
-    )
     // Mirrors the gateway builder: static presets and custom_b5 lineups get
     // the static defaults only while the stored value still equals the legacy
     // default; an explicit override runs (and reads) as configured. The
-    // hidden legacy router_dynamic mode runs the stored values untouched and
-    // has no quorum grace.
-    const staticDefaultsApply = isPreset || selectionMode.value !== 'router_dynamic'
+    // hidden legacy router_dynamic mode runs the stored timeout values
+    // untouched.
+    const staticDefaultsApply = isPreset || selectionMode.value !== ROUTER_DYNAMIC_SELECTION_MODE
     const substituteLegacy = (stored: number, staticDefault: number): number => (
       staticDefaultsApply && stored === LEGACY_ENSEMBLE_TIMEOUT_SECONDS ? staticDefault : stored
     )
     return {
       perTurnCalls: proposerCount + 1,
-      quorum,
       proposerCount,
+      proposerMaxRetries: proposerMaxRetries.value,
       proposerTimeoutSeconds: substituteLegacy(
         storedProposerTimeoutSeconds.value,
-        STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
+        isPreset
+          ? STATIC_B5_PROPOSER_TIMEOUT_SECONDS
+          : CUSTOM_B5_PROPOSER_TIMEOUT_SECONDS,
       ),
+      configuredAggregatorTimeoutSeconds: storedAggregatorTimeoutSeconds.value,
       aggregatorTimeoutSeconds: substituteLegacy(
         storedAggregatorTimeoutSeconds.value,
-        STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
+        isPreset
+          ? STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS
+          : CUSTOM_B5_AGGREGATOR_TIMEOUT_SECONDS,
       ),
-      quorumGraceSeconds: staticDefaultsApply ? STATIC_B5_QUORUM_GRACE_SECONDS : 0,
     }
   }
 
@@ -922,7 +960,7 @@ export function useSetupEnsembleForm() {
         : null
 
       const scheme: EnsembleScheme = (
-        selectionMode.value === 'router_dynamic'
+        selectionMode.value === ROUTER_DYNAMIC_SELECTION_MODE
           ? 'legacy'
           : selectionMode.value === CUSTOM_B5_SELECTION_MODE
             ? 'custom'
@@ -1037,12 +1075,16 @@ export function useSetupEnsembleForm() {
         staticSelectionMode: providerStaticMode,
         minSuccessfulProposers: minSuccessfulProposers.value,
         allFailedPolicy: allFailedPolicy.value,
+        configuredAllFailedPolicy: configuredAllFailedPolicy.value,
+        effectiveAllFailedPolicy: allFailedPolicy.value,
+        policyDeprecated: policyDeprecated.value,
         showModelOptions: scheme !== 'preset',
         showCandidateEditor: scheme === 'custom' || scheme === 'legacy',
         showOpenrouterHint: false,
         advancedOpen: (
           minSuccessfulProposers.value !== DEFAULT_MIN_SUCCESSFUL_PROPOSERS
           || allFailedPolicy.value !== DEFAULT_ALL_FAILED_POLICY
+          || proposerMaxRetries.value !== DEFAULT_PROPOSER_MAX_RETRIES
         ),
         statusText: context.statusText.value,
       }
@@ -1056,15 +1098,23 @@ export function useSetupEnsembleForm() {
     candidates,
     minSuccessfulProposers,
     allFailedPolicy,
+    proposerMaxRetries,
+    configuredAllFailedPolicy,
+    policyDeprecated,
     enabledDirty,
     selectionModeDirty,
     modelOptionsDirty,
     candidatesDirty,
     minSuccessfulDirty,
     allFailedPolicyDirty,
+    proposerMaxRetriesDirty,
     isDirty,
     initFromConfig,
     setEnabled,
+    captureRoutingModeState,
+    restoreRoutingModeDetails,
+    restoreRoutingModeState,
+    acceptRoutingModeChange,
     setSelectionMode,
     addModelOption,
     removeModelOption,
@@ -1072,7 +1122,6 @@ export function useSetupEnsembleForm() {
     removeCandidate,
     replaceCandidate,
     setAggregator,
-    setCandidateRole,
     importTierCandidates,
     resetModelOptions,
     setScheme,
@@ -1080,6 +1129,7 @@ export function useSetupEnsembleForm() {
     migrateLegacyToCustom,
     setMinSuccessfulProposers,
     setAllFailedPolicy,
+    setProposerMaxRetries,
     payload,
     createPanel,
   }

@@ -56,7 +56,10 @@ export function buildChatMarkdown(options: BuildChatMarkdownOptions): string {
   for (const message of options.messages) {
     if (message.isRouterStrip) {
       const winner = message.gridCells?.[message.winnerIdx ?? -1]
-      if (winner) lines.push(`> Router selected ${winner.displayName || winner.model || winner.tier}`)
+      const selectedModel = String(message.routerSelectedModel || '').trim()
+      if (selectedModel || winner) {
+        lines.push(`> Router selected ${selectedModel || winner?.model || winner?.displayName || winner?.tier}`)
+      }
       continue
     }
     if (!['user', 'assistant', 'system', 'subagent', 'error'].includes(message.displayRole || message.role)) continue

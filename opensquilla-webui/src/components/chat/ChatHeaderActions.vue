@@ -53,6 +53,12 @@
         <Icon name="fileText" :size="14" />
         <span class="chat-share-btn__label">{{ t('chat.deliverables') }}</span>
         <span class="chat-header__count-badge" aria-hidden="true">{{ deliverableBadge }}</span>
+        <span
+          v-if="hasNewDeliverable"
+          class="chat-header__new-badge"
+          data-testid="chat-deliverables-new-badge"
+          aria-hidden="true"
+        >New</span>
       </button>
       <button
         v-if="!shareMode"
@@ -86,12 +92,17 @@
         data-testid="chat-header-primary-action"
         @click="invoke(primaryAction)"
       >
-        <Icon :name="primaryAction === 'deliverables' ? 'fileText' : 'share'" :size="16" />
+        <Icon :name="primaryActionIcon" :size="16" />
         <span
           v-if="primaryAction === 'deliverables'"
           class="chat-header__count-badge chat-header__count-badge--corner"
           aria-hidden="true"
         >{{ deliverableBadge }}</span>
+        <span
+          v-if="primaryAction === 'deliverables' && hasNewDeliverable"
+          class="chat-header__new-dot"
+          aria-hidden="true"
+        ></span>
       </button>
 
       <button
@@ -141,6 +152,7 @@
         >
           <Icon name="fileText" :size="16" />
           <span>{{ t('chat.deliverables') }}</span>
+          <span v-if="hasNewDeliverable" class="chat-header__new-badge" aria-hidden="true">New</span>
           <span class="chat-header__count-badge" aria-hidden="true">{{ deliverableBadge }}</span>
         </button>
         <button
@@ -204,6 +216,7 @@ const props = defineProps<{
   deliverableCount: number
   /** Live context-window reading, or null while the gateway has no window. */
   contextUsage?: ContextUsage | null
+  hasNewDeliverable: boolean
   shareMode: boolean
   shareableMessageCount: number
 }>()
@@ -244,7 +257,10 @@ let layoutFrame: number | null = null
 let hasMeasuredLayout = false
 
 const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
-const deliverablesLabel = computed(() => t('chat.deliverablesCount', { count: props.deliverableCount }))
+const deliverablesLabel = computed(() => {
+  const label = t('chat.deliverablesCount', { count: props.deliverableCount })
+  return props.hasNewDeliverable ? `${label}, New` : label
+})
 const deliverableBadge = computed(() => props.deliverableCount > 99
   ? '99+'
   : String(props.deliverableCount))
@@ -263,9 +279,14 @@ const primaryAction = computed<Action | null>(() => {
   return null
 })
 
-const primaryActionLabel = computed(() => primaryAction.value === 'deliverables'
-  ? deliverablesLabel.value
-  : shareAriaLabel.value)
+const primaryActionLabel = computed(() => {
+  if (primaryAction.value === 'deliverables') return deliverablesLabel.value
+  return shareAriaLabel.value
+})
+const primaryActionIcon = computed<IconName>(() => {
+  if (primaryAction.value === 'deliverables') return 'fileText'
+  return 'share'
+})
 
 const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []
@@ -648,6 +669,32 @@ defineExpose({ focusAction, closeMenu })
   position: absolute;
 }
 
+.chat-header__new-badge {
+  align-items: center;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: var(--radius-full);
+  color: var(--accent);
+  display: inline-flex;
+  font-size: 0.5625rem;
+  font-weight: 750;
+  height: 16px;
+  letter-spacing: 0.02em;
+  line-height: 14px;
+  padding-inline: 5px;
+}
+
+.chat-header__new-dot {
+  background: var(--accent);
+  border: 2px solid var(--bg-elevated);
+  border-radius: 50%;
+  height: 8px;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  position: absolute;
+  width: 8px;
+}
+
 .topbar-state--deliverables .chat-header__count-badge,
 .chat-header__count-badge.topbar-state--deliverables {
   background: var(--topbar-state-fill);
@@ -700,6 +747,14 @@ defineExpose({ focusAction, closeMenu })
 
 .chat-header__menu-item > .chat-header__count-badge {
   margin-inline-start: auto;
+}
+
+.chat-header__menu-item > .chat-header__new-badge {
+  margin-inline-start: auto;
+}
+
+.chat-header__menu-item > .chat-header__new-badge + .chat-header__count-badge {
+  margin-inline-start: 0;
 }
 
 .chat-header__menu-divider {

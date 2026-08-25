@@ -11,6 +11,7 @@ from opensquilla.sandbox import destructive_backup
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
+from opensquilla.sandbox.types import SecurityLevel
 from opensquilla.tools.builtin import code_exec, shell
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
@@ -42,7 +43,7 @@ async def test_shell_warnlist_uses_sandbox_gate_without_exec_approval(
 
     async def _fake_gate_action(**kwargs):
         calls.append(("gate", kwargs))
-        policy = SimpleNamespace()
+        policy = SimpleNamespace(level=SecurityLevel.STANDARD)
         request = SimpleNamespace(cwd="/tmp", action_kind="shell.exec", policy=policy)
         return object(), policy, request
 

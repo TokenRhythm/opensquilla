@@ -14,8 +14,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect:
+    name: Detect Skill Hub contract changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_contract: ${{ steps.decision.outputs.run_contract }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          if [[ "${{ github.event_name }}" == "pull_request" ]] \
+            && git cat-file -e "${{ github.event.pull_request.base.sha }}^{commit}" \
+            && git cat-file -e "${{ github.event.pull_request.head.sha }}^{commit}" \
+            && git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" > "${changed_files}" \
+            && [[ -s "${changed_files}" ]]; then
+            :
+          else
+            printf '.ci/run-all\n' > "${changed_files}"
+          fi
+          printf 'CHANGED_FILES=%s\n' "${changed_files}" >> "${GITHUB_ENV}"
+
+      - name: Classify changed files
+        id: classify
+        shell: bash
+        run: bash .github/scripts/classify-ci-changes.sh "${CHANGED_FILES}"
+
+      - name: Decide whether to run Skill Hub contracts
+        id: decision
+        env:
+          PYTHON_CHANGED: ${{ steps.classify.outputs.python_changed }}
+        shell: bash
+        run: echo "run_contract=${PYTHON_CHANGED}" >> "${GITHUB_OUTPUT}"
+
   skill-hub-contract:
     name: skill-hub-contract (${{ matrix.os }})
+    needs: detect
+    if: ${{ needs.detect.outputs.run_contract == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:

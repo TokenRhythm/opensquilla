@@ -82,16 +82,16 @@ const window = await createMainWindow()
 const gateway = await startGateway()
 ```
 
-The initial window should display a boot/loading state. If gateway startup succeeds, it loads the gateway URL. If gateway startup fails, it renders the existing startup error state with log details and retry actions.
+The initial window loads the local Desktop renderer. Gateway startup runs behind it and publishes a revisioned connection descriptor to the trusted main frame, including an instance-scoped token for Desktop-owned runtimes. The renderer connects its RPC client only after `/readyz` succeeds. If Gateway startup fails, the same local renderer stays visible with log and retry actions; it is never replaced by a dead Gateway origin.
 
 ### Idempotent Gateway Startup
 
 `startGateway()` should become explicitly idempotent:
 
 - If an owned gateway process is already healthy, return the existing `gatewayState`.
-- If startup is already in progress, do not spawn another gateway. Focus or keep the boot window visible.
+- If startup is already in progress, do not spawn another gateway. Focus or keep the local renderer visible.
 - If the owned process exited, clear stale owned state before starting a new process.
-- If a gateway URL is present, health-check it before deciding to reuse it.
+- If a gateway URL is present, verify `/readyz` before deciding to reuse it.
 
 This prevents Dock activation, second-instance activation, and retry actions from racing into duplicate gateway processes.
 
@@ -99,10 +99,10 @@ This prevents Dock activation, second-instance activation, and retry actions fro
 
 The `activate` handler should call a single helper that:
 
-1. Focuses an existing non-destroyed main window, or creates a new boot window.
-2. If `gatewayState.status === "ready"` and the URL passes health check, loads that URL.
-3. If startup is in progress, keeps the boot window visible.
-4. Otherwise starts gateway once and then loads or shows an error state.
+1. Focuses an existing non-destroyed main window, or creates a new local renderer window.
+2. If `gatewayState.status === "ready"` and `/readyz` passes, republishes the current descriptor without navigating.
+3. If startup is in progress, keeps the local renderer visible.
+4. Otherwise starts Gateway once and publishes either a ready descriptor or a recoverable error state.
 
 The same helper should be used by `second-instance` handling so a second launch focuses the original instance and does not start another gateway against the same state directory.
 

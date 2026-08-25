@@ -6,8 +6,8 @@ import { createI18n } from 'vue-i18n'
 import ChatHeaderActions from './ChatHeaderActions.vue'
 import type { ContextUsage } from '@/composables/chat/useChatUsageWidget'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key'
 type LayoutName = 'wide' | 'compact' | 'tight'
+type Action = 'deliverables' | 'share' | 'copy-session-key'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -20,6 +20,7 @@ const BASE_PROPS = {
   copyLiveText: '',
   deliverableCount: 2,
   contextUsage: null as ContextUsage | null,
+  hasNewDeliverable: false,
   shareMode: false,
   shareableMessageCount: 3,
 }
@@ -284,6 +285,29 @@ describe('ChatHeaderActions', () => {
     expect(title.nextElementSibling).toBe(copy)
     expect(identity.nextElementSibling).toBe(spacer)
     expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
+  })
+
+  it('keeps internal workbench resources out of the session header', async () => {
+    const { el } = await mountHeader(800)
+    const deliverables = el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )
+    expect(el.querySelector('[data-testid="chat-session-action-workbench"]')).toBeNull()
+    expect(el.textContent).not.toContain('Workbench')
+    expect(deliverables?.getAttribute('aria-label')).toBe('Deliverables (2)')
+    expect(deliverables?.querySelector('.chat-header__count-badge')?.textContent).toBe('2')
+  })
+
+  it('shows a small New marker without replacing the deliverable count', async () => {
+    const { el } = await mountHeader(800, { hasNewDeliverable: true })
+    const deliverables = el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )!
+
+    expect(deliverables.querySelector('[data-testid="chat-deliverables-new-badge"]')?.textContent)
+      .toBe('New')
+    expect(deliverables.querySelector('.chat-header__count-badge')?.textContent).toBe('2')
+    expect(deliverables.getAttribute('aria-label')).toBe('Deliverables (2), New')
   })
 
   it.each([

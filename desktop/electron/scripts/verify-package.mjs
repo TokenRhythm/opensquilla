@@ -1,26 +1,21 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
-import { readdir, readFile, stat } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { lstat, readdir, readFile, stat } from 'node:fs/promises'
+import { dirname, join, resolve, sep } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import {
-  assertRuntimeSetReady,
-  currentRuntimeTarget,
-  loadRuntimeManifest,
-  packagedRuntimeTarget,
-} from './fetch-bundled-runtimes.mjs'
+
+import { verifyInstallerProgressPolicy } from './installer-progress-policy.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
-const runtimeDeveloperDir = join(packageRoot, 'runtime', 'developer')
-const runtimeManifestPath = join(packageRoot, 'runtime', 'runtime-manifest.json')
 const sourceMainPath = join(packageRoot, 'src', 'main.ts')
 const compiledMainPath = join(packageRoot, 'dist', 'main.js')
 const packageJsonPath = join(packageRoot, 'package.json')
 const desktopOutputDir = join(repoRoot, 'dist', 'desktop-electron')
+const controlUiVerifierPath = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 
 const failures = []
 
@@ -33,6 +28,56 @@ function pathIsFileSync(path) {
     return statSync(path).isFile()
   } catch {
     return false
+  }
+}
+
+async function pathExists(path) {
+  return (await lstat(path).catch(() => null)) !== null
+}
+
+async function readJsonFile(path, label) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch (error) {
+    fail(`${label} could not be read as JSON: ${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
+}
+
+async function verifyRuntimeMetadata(runtimeRoot, label) {
+  const manifestPath = join(runtimeRoot, 'runtime-manifest.json')
+  const catalogPath = join(runtimeRoot, 'runtime-pack-catalog.json')
+  const manifest = await readJsonFile(manifestPath, `${label} runtime manifest`)
+  const catalog = await readJsonFile(catalogPath, `${label} runtime-pack catalog`)
+
+  if (manifest && manifest.schemaVersion !== 1) {
+    fail(`${label} runtime manifest must use schemaVersion 1`)
+  }
+  if (catalog) {
+    if (catalog.schemaVersion !== 1) {
+      fail(`${label} runtime-pack catalog must use schemaVersion 1`)
+    }
+    if (typeof catalog.catalogVersion !== 'string' || !catalog.catalogVersion.trim()) {
+      fail(`${label} runtime-pack catalog is missing catalogVersion`)
+    }
+    if (typeof catalog.releaseTag !== 'string' || !/^v[A-Za-z0-9._-]+$/.test(catalog.releaseTag)) {
+      fail(`${label} runtime-pack catalog has an invalid releaseTag`)
+    }
+    if (!catalog.targets || typeof catalog.targets !== 'object' || Array.isArray(catalog.targets)) {
+      fail(`${label} runtime-pack catalog is missing targets`)
+    }
+    if (catalog.finalized !== true && catalog.finalized !== false) {
+      fail(`${label} runtime-pack catalog must declare a boolean finalized flag`)
+    } else if (catalog.finalized === false && Object.keys(catalog.targets).length !== 0) {
+      fail(`${label} runtime-pack catalog must not carry partial targets while finalized=false`)
+    }
+  }
+}
+
+async function verifyDeveloperRuntimeAbsent(runtimeRoot, label) {
+  const developerRoot = join(runtimeRoot, 'developer')
+  if (await pathExists(developerRoot)) {
+    fail(`${label} must not contain bundled developer runtimes: ${developerRoot}`)
   }
 }
 
@@ -187,6 +232,35 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
     return
   }
 
+  const sharedControlUiDir = join(root, 'control-ui-dist')
+  for (const entry of ['index.html', 'desktop.html', 'webui-artifact-manifest.json']) {
+    if (!files.includes(join(sharedControlUiDir, entry))) {
+      fail(`${label} runtime is missing shared Control UI ${entry}`)
+    }
+  }
+  const webuiManifests = files.filter((path) => path.endsWith('webui-artifact-manifest.json'))
+  if (
+    webuiManifests.length !== 1
+    || dirname(webuiManifests[0]) !== sharedControlUiDir
+  ) {
+    fail(`${label} runtime must contain exactly one shared Web UI artifact; found ${webuiManifests.join(', ')}`)
+  }
+  const embeddedControlUiMarker = `${join('opensquilla', 'gateway', 'static', 'dist')}${sep}`
+  const embeddedControlUiFiles = files.filter((path) => path.includes(embeddedControlUiMarker))
+  if (embeddedControlUiFiles.length > 0) {
+    fail(`${label} runtime still contains an embedded Control UI dist: ${embeddedControlUiFiles.join(', ')}`)
+  }
+  const controlUiVerification = spawnSync(
+    process.execPath,
+    [controlUiVerifierPath, sharedControlUiDir],
+    { encoding: 'utf8', windowsHide: true },
+  )
+  if (controlUiVerification.error || controlUiVerification.status !== 0) {
+    fail(
+      `${label} shared Control UI failed artifact verification: ${controlUiVerification.error?.message || controlUiVerification.stderr || controlUiVerification.stdout}`,
+    )
+  }
+
   const compatFile = files.find((path) => path.endsWith(join('opensquilla', 'compat', 'aiosqlite.py')))
   if (!compatFile) {
     fail(`${label} runtime is missing opensquilla/compat/aiosqlite.py`)
@@ -212,21 +286,40 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   }
 }
 
+function sourceBetweenMarkers(source, startMarker, endMarker) {
+  const startIndex = source.indexOf(startMarker)
+  if (startIndex === -1) return ''
+  const endIndex = source.indexOf(endMarker, startIndex + startMarker.length)
+  if (endIndex === -1) return ''
+  return source.slice(startIndex, endIndex)
+}
+
 function verifyMainProcess(source, label) {
   for (const expected of [
     'gatewayStartPromise',
     'openOrResumeDesktopApp',
     'ensureGatewayStarted',
-    'isCurrentWindowAtControlUi',
+    'DESKTOP_RENDERER_URL',
+    'isCurrentWindowAtDesktopRenderer',
+    'desktopGatewayConnectionSnapshot',
+    'readinessCheck',
   ]) {
     if (!source.includes(expected)) fail(`${label} main process is missing ${expected}`)
   }
 
   const helperIndex = source.indexOf('async function openOrResumeDesktopApp')
   const createIndex = source.indexOf('await createMainWindow()', helperIndex)
+  const localRendererIndex = source.indexOf('loadDesktopRendererIntoCurrentWindow()', helperIndex)
   const ensureIndex = source.indexOf('ensureGatewayStarted()', helperIndex)
-  if (helperIndex === -1 || createIndex === -1 || ensureIndex === -1 || createIndex > ensureIndex) {
-    fail(`${label} main process does not create the desktop window before gateway startup`)
+  if (
+    helperIndex === -1
+    || createIndex === -1
+    || localRendererIndex === -1
+    || ensureIndex === -1
+    || createIndex > localRendererIndex
+    || localRendererIndex > ensureIndex
+  ) {
+    fail(`${label} main process does not load the local Desktop renderer before gateway startup`)
   }
 
   const activateIndex = source.indexOf('async function activateMainWindow')
@@ -252,30 +345,61 @@ function verifyMainProcess(source, label) {
     fail(`${label} main process second-instance handler does not route through openOrResumeDesktopApp`)
   }
 
-  const loadCurrentIndex = source.indexOf('async function loadControlUiIntoCurrentWindow')
-  const controlGuardIndex = source.indexOf('isCurrentWindowAtControlUi(window, gatewayUrl)', loadCurrentIndex)
-  const controlLoadIndex = source.indexOf('loadControlUi(window, gatewayUrl)', loadCurrentIndex)
-  if (
-    loadCurrentIndex === -1
-    || controlGuardIndex === -1
-    || controlLoadIndex === -1
-    || controlGuardIndex > controlLoadIndex
-  ) {
-    fail(`${label} main process reloads the Control UI before checking whether it is already loaded`)
+  if (source.includes('/control/chat/new') || source.includes('waitForControlUi')) {
+    fail(`${label} main process still makes the Desktop document depend on Gateway Control UI`)
+  }
+  const createWindowSource = sourceBetweenMarkers(
+    source,
+    'async function createMainWindow',
+    'function currentMainWindow',
+  )
+  if (!createWindowSource.includes('loadURL(DESKTOP_RENDERER_URL)')) {
+    fail(`${label} main window does not load the local Desktop renderer`)
+  }
+  const waitSource = sourceBetweenMarkers(
+    source,
+    'async function waitForGateway',
+    'function hasGatewayProcessExited',
+  )
+  const usesReadinessProbe = /readinessCheck\(\s*url(?:\s*,[^)]*)?\)/.test(waitSource)
+  const usesHealthProbe = /healthCheck\(\s*url(?:\s*,[^)]*)?\)/.test(waitSource)
+  if (!usesReadinessProbe || usesHealthProbe) {
+    fail(`${label} gateway startup does not use the readiness endpoint`)
   }
 
   const onboardingIndex = source.indexOf('async function runOnboarding')
-  const onboardingWindowIndex = source.indexOf('onboardingWindow = new BrowserWindow', onboardingIndex)
-  const parentIndex = source.indexOf('const parentWindow = currentMainWindow()', onboardingIndex)
-  const parentOptionIndex = source.indexOf('parent: parentWindow ?? undefined', onboardingWindowIndex)
-  const modalOptionIndex = source.indexOf('modal: Boolean(parentWindow)', onboardingWindowIndex)
+  const onboardingEndIndex = source.indexOf('async function pathExists', onboardingIndex)
+  const onboardingSource =
+    onboardingIndex === -1 || onboardingEndIndex === -1
+      ? ''
+      : source.slice(onboardingIndex, onboardingEndIndex)
+  const parentIndex = onboardingSource.search(
+    /const\s+parentWindow\s*=\s*currentMainWindow\(\)/,
+  )
+  const onboardingWindowIndex = onboardingSource.search(
+    /const\s+window\s*=\s*new\s+(?:[A-Za-z_$][\w$]*\.)*BrowserWindow\s*\(\s*\{/,
+  )
+  const parentOptionIndex = onboardingSource.search(
+    /parent\s*:\s*parentWindow\s*\?\?\s*undefined/,
+  )
+  const modalOptionIndex = onboardingSource.search(
+    /modal\s*:\s*Boolean\(parentWindow\)/,
+  )
+  const onboardingWindowAssignmentIndex = onboardingSource.search(
+    /onboardingWindow\s*=\s*window\b/,
+  )
   if (
     onboardingIndex === -1
+    || onboardingEndIndex === -1
     || onboardingWindowIndex === -1
     || parentIndex === -1
     || parentOptionIndex === -1
     || modalOptionIndex === -1
+    || onboardingWindowAssignmentIndex === -1
     || parentIndex > onboardingWindowIndex
+    || parentOptionIndex < onboardingWindowIndex
+    || modalOptionIndex < parentOptionIndex
+    || onboardingWindowAssignmentIndex < modalOptionIndex
   ) {
     fail(`${label} main process does not make first-run onboarding an owned modal child window`)
   }
@@ -311,6 +435,9 @@ async function verifyInstallerDataPolicy() {
   if (packageJson.build?.nsis?.deleteAppDataOnUninstall !== false) {
     fail('NSIS uninstall must preserve Desktop profile data (deleteAppDataOnUninstall=false)')
   }
+  for (const installerProgressFailure of await verifyInstallerProgressPolicy(packageRoot, packageJson)) {
+    fail(installerProgressFailure)
+  }
   const protocols = packageJson.build?.protocols
   if (
     !Array.isArray(protocols)
@@ -321,6 +448,32 @@ async function verifyInstallerDataPolicy() {
     || protocols[0].schemes[0] !== 'opensquilla'
   ) {
     fail('electron-builder must register only the opensquilla URL protocol')
+  }
+
+  const extraResources = packageJson.build?.extraResources
+  const expectedRuntimeResources = new Map([
+    ['runtime/gateway', 'runtime/gateway'],
+    ['runtime/runtime-manifest.json', 'runtime/runtime-manifest.json'],
+    ['runtime/runtime-pack-catalog.json', 'runtime/runtime-pack-catalog.json'],
+  ])
+  if (!Array.isArray(extraResources)) {
+    fail('electron-builder extraResources must be an explicit allowlist')
+    return
+  }
+  for (const [from, to] of expectedRuntimeResources) {
+    if (!extraResources.some((entry) => entry?.from === from && entry?.to === to)) {
+      fail(`electron-builder extraResources is missing ${from}`)
+    }
+  }
+  for (const entry of extraResources) {
+    const from = typeof entry?.from === 'string' ? entry.from.replaceAll('\\', '/') : ''
+    const to = typeof entry?.to === 'string' ? entry.to.replaceAll('\\', '/') : ''
+    if (from === 'runtime' || to === 'runtime') {
+      fail('electron-builder must not copy the entire runtime directory')
+    }
+    if (to.startsWith('runtime/') && expectedRuntimeResources.get(from) !== to) {
+      fail(`electron-builder has an unexpected runtime resource mapping: ${from} -> ${to}`)
+    }
   }
 }
 
@@ -397,28 +550,13 @@ async function verifyAsarPackageVersion(asarPath, label) {
 }
 
 async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
-  await verifyRuntime(join(resourcesDir, 'runtime', 'gateway'), label, {
+  const runtimeRoot = join(resourcesDir, 'runtime')
+  await verifyRuntime(join(runtimeRoot, 'gateway'), label, {
     platform,
     executeCommands: platform === process.platform,
   })
-  try {
-    const manifest = await loadRuntimeManifest(
-      join(resourcesDir, 'runtime', 'runtime-manifest.json'),
-    )
-    const target = packagedRuntimeTarget(resourcesDir, platform)
-    if (!(target in manifest.assets)) {
-      fail(`${label} runtime manifest has no target for ${platform}`)
-    } else {
-      await assertRuntimeSetReady({
-        manifest,
-        runtimeRoot: join(resourcesDir, 'runtime', 'developer'),
-        target,
-        executeCommands: platform === process.platform,
-      })
-    }
-  } catch (error) {
-    fail(`${label} bundled runtimes failed verification: ${error instanceof Error ? error.message : String(error)}`)
-  }
+  await verifyRuntimeMetadata(runtimeRoot, label)
+  await verifyDeveloperRuntimeAbsent(runtimeRoot, label)
 
   const asarPath = join(resourcesDir, 'app.asar')
   if (!existsSync(asarPath)) {
@@ -435,16 +573,7 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
 }
 
 await verifyRuntime(runtimeGatewayDir, 'source', { platform: process.platform, executeCommands: true })
-try {
-  await assertRuntimeSetReady({
-    manifest: await loadRuntimeManifest(runtimeManifestPath),
-    runtimeRoot: runtimeDeveloperDir,
-    target: currentRuntimeTarget(),
-    executeCommands: true,
-  })
-} catch (error) {
-  fail(`source bundled runtimes failed verification: ${error instanceof Error ? error.message : String(error)}`)
-}
+await verifyRuntimeMetadata(join(packageRoot, 'runtime'), 'source')
 await verifyInstallerDataPolicy()
 await verifySourceMain()
 await verifyCompiledMain()

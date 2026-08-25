@@ -210,7 +210,12 @@ function resetLabel(capabilityId: CapabilityId): string {
 
 <template>
   <div class="setup-capabilities">
-    <p class="setup-capabilities__intro">{{ t('setup.capabilities.intro') }}</p>
+    <div class="control-section__head">
+      <h3 class="control-section__title">{{ t('settings.rail.capabilities') }}</h3>
+      <p class="control-section__desc setup-capabilities__intro">
+        {{ t('setup.capabilities.intro') }}
+      </p>
+    </div>
 
     <section
       v-for="capability in ([

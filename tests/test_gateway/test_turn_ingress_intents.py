@@ -17,6 +17,9 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.session_model_routing import (
+    capture_accepted_model_routing_config,
+)
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import PlanRunRecord, SessionContextState, SessionSummary
@@ -312,6 +315,80 @@ async def test_chat_send_atomically_creates_first_plan_turn(tmp_path: Path) -> N
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_chat_send_atomically_snapshots_initial_routing_mode(tmp_path: Path) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        async def production_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                stack.context.config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        # Match Gateway boot: a provider that resolves durable Session state
+        # would fail for this not-yet-committed node unless ingress supplies
+        # the prepared-node snapshot to the pre-commit freeze.
+        stack.runtime._accepted_config_provider = production_provider
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "route this first turn",
+            "intent": "new_chat",
+            "initialRoutingMode": "router",
+            "clientRequestId": "new-chat-routing-success",
+        }
+
+        response = await get_dispatcher().dispatch(
+            "rpc-new-chat-routing",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        await stack.wait_until_running()
+
+        assert response.ok is True
+        assert response.payload["acceptedRouting"] == {"mode": "router"}
+        assert response.payload["routing"] == {
+            "mode": "router",
+            "revision": 0,
+            "source": "session",
+            "initialized": False,
+            "appliesTo": "next_accepted_turn",
+        }
+        created = await stack.storage.get_session(SESSION_KEY)
+        assert created is not None
+        assert created.model_routing_mode == "router"
+        assert created.model_routing_revision == 0
+        tasks = await stack.storage.list_agent_tasks(session_key=SESSION_KEY)
+        assert len(tasks) == 1
+        assert tasks[0].details is not None
+        accepted_audit = tasks[0].details["accepted_model_routing"]
+        assert accepted_audit["effective_mode"] == "router"
+        assert accepted_audit["session_revision"] == 0
+        assert accepted_audit["source"] == "session"
+        assert stack.handler_runs[0].accepted_config.session_mode == "router"
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-new-chat-routing-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["acceptedRouting"] == {"mode": "router"}
+
+        conflict = await get_dispatcher().dispatch(
+            "rpc-new-chat-routing-conflict",
+            "chat.send",
+            {**params, "initialRoutingMode": "direct"},
+            stack.context,
+        )
+        assert conflict.ok is False
+        assert conflict.error is not None
+        assert conflict.error.code == "IDEMPOTENCY_CONFLICT"
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,16 @@ import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
+const MAX_PROMPT_ANNOTATION_IDS = 16
+
+function normalizePromptAnnotationIds(
+  ids: unknown,
+): string[] {
+  return (Array.isArray(ids) ? ids : [])
+    .map(value => String(value || '').trim())
+    .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
+    .slice(0, MAX_PROMPT_ANNOTATION_IDS)
+}
 
 type PendingReorderMode = 'local' | 'server'
 
@@ -83,6 +93,10 @@ export interface PendingQueueOwner {
   ownerRequestId?: string
 }
 
+export interface PendingCancelOptions {
+  retainAfterCancel?: boolean
+}
+
 export interface PendingQueueOwnerContext {
   sessionKey: string
   ownerRequestId: string
@@ -90,8 +104,10 @@ export interface PendingQueueOwnerContext {
 
 export interface PendingQueuePayload {
   text: string
+  promptAnnotationIds?: readonly string[]
   attachments?: Attachment[]
   intent?: string | null
+  confirmedPlainText?: boolean
 }
 
 export interface PendingSteerPayload {
@@ -250,11 +266,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       clientRequestId: item.pendingClientRequestId!,
       clientMessageId: item.pendingClientMessageId!,
       text: item.text,
+      ...(item.promptAnnotationIds?.length
+        ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
+        : {}),
       attachments: (item.attachments || []).map(attachment => ({ ...attachment })),
       intent: item.intent,
+      ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ...(item.ownerRequestId ? { ownerRequestId: item.ownerRequestId } : {}),
       state,
       mayHaveServerCopy: item.pendingMayHaveServerCopy === true,
+      ...(item.pendingRetainAfterCancel ? { retainAfterCancel: true } : {}),
       ...(item.pendingRequestFingerprint
         ? { requestFingerprint: item.pendingRequestFingerprint }
         : {}),
@@ -282,8 +303,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return {
       pendingUiId: record.pendingInputId,
       text: record.text,
+      ...(normalizePromptAnnotationIds(record.promptAnnotationIds).length
+        ? { promptAnnotationIds: normalizePromptAnnotationIds(record.promptAnnotationIds) }
+        : {}),
       attachments: record.attachments.map(attachment => ({ ...attachment })),
       intent: record.intent,
+      ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: record.sessionKey,
       ...(record.ownerRequestId ? { ownerRequestId: record.ownerRequestId } : {}),
       pendingInputId: record.pendingInputId,
@@ -291,6 +316,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingClientMessageId: record.clientMessageId,
       pendingPersistenceState: record.state,
       pendingMayHaveServerCopy: mayHaveServerCopy,
+      ...(record.retainAfterCancel ? { pendingRetainAfterCancel: true } : {}),
       ...(record.requestFingerprint
         ? { pendingRequestFingerprint: record.requestFingerprint }
         : {}),
@@ -452,7 +478,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return
     if (item.ownerRequestId) return
-    if (item.pendingPersistenceState === 'cancelling') return
+    if (
+      item.pendingPersistenceState === 'cancelling'
+      || item.pendingRetainAfterCancel === true
+    ) return
     const sessionKey = item.ownerSessionKey || options.sessionKey.value
     if (wasRemoved(sessionKey, pendingInputId)) return
     const existing = stagingOperations.get(pendingInputId)
@@ -491,6 +520,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             return
           }
           try {
+            const queuedText = item.text.trim()
+            const literalSlashEscape = !item.hiddenControl && queuedText.startsWith('//')
+            const providerMessage = literalSlashEscape
+              ? queuedText.slice(1)
+              : queuedText
             // Write the cross-boundary provenance before sending.  A crash or
             // lost ACK can then distinguish this identity from a genuinely
             // IndexedDB-only draft when the next Gateway is older/offline.
@@ -503,9 +537,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
-                message: item.text.trim() || 'Describe these attachments',
+                message: providerMessage || 'Describe these attachments',
                 attachments: sendable.map(serializeSendableAttachment),
-                ...(sendable.length > 0 ? { displayText: item.text } : {}),
+                ...(item.promptAnnotationIds?.length
+                  ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
+                  : {}),
+                ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
+                ...(sendable.length > 0 || literalSlashEscape
+                  ? { displayText: queuedText }
+                  : {}),
                 ...(item.intent ? { intent: item.intent } : {}),
                 ...(Number.isSafeInteger(item.pendingPosition)
                   ? { position: item.pendingPosition }
@@ -594,17 +634,29 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function mergeWalRecords(records: PendingInputWalRecord[], sessionKey: string) {
-    const existingIds = new Set(
-      pendingQueue.value.map(item => item.pendingInputId).filter(Boolean),
+    const existingById = new Map(
+      pendingQueue.value
+        .filter(item => item.pendingInputId)
+        .map(item => [item.pendingInputId!, item]),
     )
     for (const record of records) {
+      const existing = existingById.get(record.pendingInputId)
+      if (existing && record.retainAfterCancel === true) {
+        Object.assign(existing, itemFromWalRecord(record))
+        delete existing.deliveryState
+        delete existing.pendingRequestFingerprint
+        delete existing.pendingServerRevision
+        delete existing.pendingPosition
+        continue
+      }
       if (
         record.sessionKey !== sessionKey
-        || existingIds.has(record.pendingInputId)
+        || existing
         || wasRemoved(sessionKey, record.pendingInputId)
       ) continue
-      pendingQueue.value.push(itemFromWalRecord(record))
-      existingIds.add(record.pendingInputId)
+      const added = itemFromWalRecord(record)
+      pendingQueue.value.push(added)
+      existingById.set(record.pendingInputId, added)
     }
     sortOrdinaryPendingItems()
   }
@@ -644,7 +696,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         // A cancellation WAL is a durable delete intent, never a draft to
         // downgrade or re-enqueue. Keep it intact until a queue-capable
         // Gateway can accept the idempotent tombstone.
-        if (item.pendingPersistenceState === 'cancelling') continue
+        if (
+          item.pendingPersistenceState === 'cancelling'
+          || item.pendingRetainAfterCancel === true
+        ) continue
         if (item.pendingPersistenceState !== 'local_only') {
           void writeWalItem(item, 'local_only')
         }
@@ -696,9 +751,21 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         if (!item) {
           item = {
             pendingUiId: pendingInputId,
-            text: String(serverItem.message || ''),
+            text: typeof serverItem.displayText === 'string'
+              ? serverItem.displayText
+              : String(serverItem.message || ''),
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
+            ...(normalizePromptAnnotationIds(
+              serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
+            ).length
+              ? {
+                  promptAnnotationIds: normalizePromptAnnotationIds(
+                    serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
+                  ),
+                }
+              : {}),
+            ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
             ownerSessionKey: sessionKey,
             pendingInputId,
             pendingClientRequestId: clientRequestId,
@@ -718,6 +785,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           // transport response was lost. Replace the WAL's File/base64/upload
           // snapshot with safe server-owned metadata before marking it staged.
           item.attachments = serverAttachments
+        }
+        const serverPromptAnnotationIds = normalizePromptAnnotationIds(
+          serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
+        )
+        if (serverPromptAnnotationIds.length > 0) {
+          item.promptAnnotationIds = serverPromptAnnotationIds
         }
         item.pendingRequestFingerprint = String(
           serverItem.requestFingerprint || serverItem.request_fingerprint || '',
@@ -749,6 +822,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           void retryCancellingItem(item)
           continue
         }
+        if (item.pendingRetainAfterCancel === true) continue
         if (item.pendingPersistenceState === 'staged') {
           // Another tab either cancelled or dispatched the server row. Both
           // outcomes are terminal for this WAL entry.
@@ -816,11 +890,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return false
     }
     const ownerRequestId = resolveOwnerRequestId(owner)
+    const promptAnnotationIds = normalizePromptAnnotationIds(payload.promptAnnotationIds)
     const item: ChatPendingItem = {
       pendingUiId: createClientRequestId(),
       text: payload.text,
+      ...(promptAnnotationIds.length ? { promptAnnotationIds } : {}),
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
+      ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: options.sessionKey.value,
       ...(ownerRequestId ? { ownerRequestId } : {}),
     }
@@ -858,15 +935,23 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function enqueuePendingInput(
     text: string,
     owner?: PendingQueueOwner,
+    enqueueOptions?: {
+      confirmedPlainText?: boolean
+      promptAnnotationIds?: readonly string[]
+    },
   ): boolean | Promise<boolean> {
-    if (isControlInput(text)) return false
+    if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
     const composerText = options.inputText.value
     const composerAttachments = snapshotComposerAttachments(options.pendingAttachments.value)
     const composerIntent = options.pendingSessionIntent.value
     const queued = enqueuePendingPayload({
       text,
+      ...(enqueueOptions?.promptAnnotationIds?.length
+        ? { promptAnnotationIds: enqueueOptions.promptAnnotationIds }
+        : {}),
       attachments: options.pendingAttachments.value,
       intent: composerIntent,
+      ...(enqueueOptions?.confirmedPlainText ? { confirmedPlainText: true } : {}),
     }, owner)
     const clearMatchingComposer = () => {
       if (
@@ -994,10 +1079,54 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     broadcastChange(sessionKey, item.pendingInputId, action)
   }
 
-  async function cancelDurableItem(item: ChatPendingItem): Promise<boolean> {
+  async function retainCancelledDraft(
+    item: ChatPendingItem,
+    sessionKey: string,
+  ): Promise<boolean> {
+    const previousMayHaveServerCopy = item.pendingMayHaveServerCopy
+    const previousFingerprint = item.pendingRequestFingerprint
+    const previousServerRevision = item.pendingServerRevision
+    const previousPosition = item.pendingPosition
+    item.pendingMayHaveServerCopy = false
+    delete item.deliveryState
+    delete item.pendingRequestFingerprint
+    delete item.pendingServerRevision
+    delete item.pendingPosition
+    try {
+      await writeWalItem(item, 'local_only')
+      broadcastChange(sessionKey, item.pendingInputId, 'changed')
+      return true
+    } catch {
+      item.pendingPersistenceState = 'cancelling'
+      item.pendingMayHaveServerCopy = previousMayHaveServerCopy
+      if (previousFingerprint) item.pendingRequestFingerprint = previousFingerprint
+      if (previousServerRevision) item.pendingServerRevision = previousServerRevision
+      if (Number.isSafeInteger(previousPosition)) item.pendingPosition = previousPosition
+      broadcastChange(sessionKey, item.pendingInputId, 'changed')
+      return false
+    }
+  }
+
+  async function cancelDurableItem(
+    item: ChatPendingItem,
+    cancelOptions: PendingCancelOptions = {},
+  ): Promise<boolean> {
     if (!durableItem(item)) return true
     const previousState = item.pendingPersistenceState || 'saving'
     const sessionKey = item.ownerSessionKey || options.sessionKey.value
+    const retainAfterCancel = cancelOptions.retainAfterCancel === true
+    if (item.pendingRetainAfterCancel === true && !retainAfterCancel) {
+      try {
+        await forgetDurableItem(item, 'removed')
+        return true
+      } catch {
+        broadcastChange(sessionKey, item.pendingInputId, 'changed')
+        return false
+      }
+    }
+    const previousRetainAfterCancel = item.pendingRetainAfterCancel
+    if (retainAfterCancel) item.pendingRetainAfterCancel = true
+    else delete item.pendingRetainAfterCancel
     rememberRemoval(sessionKey, item.pendingInputId!)
     try {
       await writeWalItem(item, 'cancelling')
@@ -1005,6 +1134,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // The delete intent never became durable, so the composer/queue must keep
       // owning the previous state. No cancellation RPC was sent.
       forgetRemoval(sessionKey, item.pendingInputId!)
+      if (previousRetainAfterCancel) item.pendingRetainAfterCancel = true
+      else delete item.pendingRetainAfterCancel
       await writeWalItem(item, previousState).catch(() => {})
       broadcastChange(sessionKey, item.pendingInputId, 'changed')
       return false
@@ -1019,6 +1150,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         return false
       }
       try {
+        if (retainAfterCancel) return retainCancelledDraft(item, sessionKey)
         await forgetDurableItem(item, 'removed')
         return true
       } catch {
@@ -1042,6 +1174,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           ? { expectedRevision: item.pendingServerRevision }
           : {}),
       })
+      if (retainAfterCancel) return retainCancelledDraft(item, sessionKey)
       await forgetDurableItem(item, 'removed')
       return true
     } catch {
@@ -1060,8 +1193,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
     const existing = cancellationOperations.get(pendingInputId)
     if (existing) return existing
-    const operation = cancelDurableItem(item).then(cancelled => {
+    const operation = cancelDurableItem(item, {
+      retainAfterCancel: item.pendingRetainAfterCancel === true,
+    }).then(cancelled => {
       if (!cancelled) return false
+      if (
+        item.pendingPersistenceState === 'local_only'
+        && item.pendingRetainAfterCancel === true
+      ) return true
       removePendingIdentity(
         item.ownerSessionKey || options.sessionKey.value,
         pendingInputId,
@@ -1378,6 +1517,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
+      // Annotation IDs refer to durable drafts owned by the annotation store.
+      // This queue only has the IDs, not enough snapshot data to reconstruct
+      // those drafts in the composer. Never turn such a queued batch into a
+      // plain-text edit and silently drop its annotation context.
+      || item.promptAnnotationIds?.length
       || item.pendingPersistenceState === 'saving'
       || item.pendingPersistenceState === 'cancelling'
       || hasUneditablePendingAttachments(item)
@@ -1880,6 +2024,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     removePendingChip,
     beginPendingDelivery,
     settlePendingDelivery,
+    cancelDurableItem,
     clearPendingQueue,
     switchPendingQueue,
     adoptPendingQueue,

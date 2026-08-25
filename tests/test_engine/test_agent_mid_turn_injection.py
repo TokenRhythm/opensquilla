@@ -513,8 +513,14 @@ async def test_done_event_records_unicode_model_call_segment_for_applied_steer()
         event async for event in agent.run_turn("原始问题", pending_input_provider=pending)
     ]
     done = next(event for event in events if event.kind == "done")
+    text_events = [event for event in events if event.kind == "text_delta"]
 
     assert done.text == "前😀后续"
+    assert done.router_model_call_id == "1.0"
+    assert done.router_iteration == 1
+    assert [
+        (event.text, event.model_call_id, event.iteration) for event in text_events
+    ] == [("前😀", "1.0", 1), ("后续", "2.0", 2)]
     assert done.model_call_segments == [
         {
             "model_call_id": "2.0",

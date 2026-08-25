@@ -43,7 +43,7 @@ from opensquilla.tools.policy import apply_tool_policy_from_config
 from opensquilla.tools.types import ToolContext
 
 
-def test_fresh_tokenrhythm_ensemble_activation_materializes_custom_lineup() -> None:
+def test_fresh_tokenrhythm_ensemble_activation_materializes_recommended_plan() -> None:
     cfg = GatewayConfig(
         llm={
             "provider": "tokenrhythm",
@@ -54,14 +54,10 @@ def test_fresh_tokenrhythm_ensemble_activation_materializes_custom_lineup() -> N
     changed = upsert_llm_ensemble(cfg, enabled=True).config
 
     assert changed.llm_ensemble.enabled is True
-    assert changed.llm_ensemble.selection_mode == "custom_b5"
-    assert len(changed.llm_ensemble.candidates) == 5
-    assert {
-        candidate.provider for candidate in changed.llm_ensemble.candidates
-    } == {"tokenrhythm"}
-    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+    assert changed.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert changed.llm_ensemble.candidates == []
     assert "llm_ensemble.selection_mode" in changed.force_persist_paths()
-    assert "llm_ensemble.candidates" in changed.force_persist_paths()
+    assert "llm_ensemble.candidates" not in changed.force_persist_paths()
 
 
 def test_fresh_openrouter_ensemble_activation_materializes_custom_lineup() -> None:
@@ -124,7 +120,7 @@ def test_reenable_preserves_first_generated_ensemble_selection() -> None:
 
     reenabled = upsert_llm_ensemble(disabled, enabled=True).config
 
-    assert reenabled.llm_ensemble.selection_mode == "custom_b5"
+    assert reenabled.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
     assert [
         candidate.model_dump(mode="python")
         for candidate in reenabled.llm_ensemble.candidates
@@ -240,12 +236,11 @@ def test_other_provider_activation_preview_reports_non_runtime_candidates_as_blo
 def test_unconfigured_ensemble_preview_does_not_present_openrouter_default() -> None:
     preview = ensemble_activation_preview(GatewayConfig())
 
-    assert preview["selection_mode"] == "custom_b5"
+    assert preview["selection_mode"] == "static_tokenrhythm_b5"
     assert preview["selection_configured"] is False
     assert preview["proposer_count"] == 4
     assert preview["member_providers"] == ["tokenrhythm"]
-    assert len(preview["candidates"]) == 5
-    assert preview["candidates"][-1]["role"] == "aggregator"
+    assert preview["candidates"] == []
 
 
 def _ctx(config: GatewayConfig) -> RpcContext:
@@ -358,6 +353,101 @@ def test_model_routing_snapshot_maps_config_to_one_public_mode(
     assert model_routing_snapshot(config)["mode"] == expected
 
 
+def test_model_routing_snapshot_exposes_direct_image_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            return "unsupported"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        llm={"provider": "openrouter", "model": "text-only"},
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+        llm_ensemble={"enabled": False},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["image_input"] == {
+        "admission": "blocked",
+        "reason": "model_vision_unsupported",
+    }
+    assert "api_key" not in str(snapshot)
+    assert "proxy" not in str(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("tiers", "vision_support", "expected"),
+    [
+        (
+            {"image_model": {"model": "vision-model", "supports_image": True}},
+            "supported",
+            {
+                "admission": "allowed",
+                "reason": "router_image_route_available",
+            },
+        ),
+        (
+            {"image_model": {"model": "text-only-model", "supports_image": True}},
+            "unsupported",
+            {
+                "admission": "blocked",
+                "reason": "model_vision_unsupported",
+            },
+        ),
+        (
+            {"image_model": {"model": "unlisted-model", "supports_image": True}},
+            "unknown",
+            {
+                "admission": "unknown",
+                "reason": "capability_unknown",
+            },
+        ),
+        (
+            {"image_model": {"model": "", "supports_image": True}},
+            "supported",
+            {
+                "admission": "blocked",
+                "reason": "router_image_route_unavailable",
+            },
+        ),
+    ],
+)
+def test_model_routing_snapshot_applies_image_route_in_observe(
+    tiers: dict[str, Any],
+    vision_support: str,
+    expected: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            return vision_support
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        squilla_router={
+            "enabled": True,
+            "rollout_phase": "observe",
+            "tiers": tiers,
+        },
+        llm_ensemble={"enabled": False},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["mode"] == "direct"
+    assert snapshot["image_input"] == expected
+
+
 @pytest.mark.parametrize(
     ("selection_mode", "router_enabled"),
     [
@@ -419,15 +509,15 @@ async def test_models_routing_set_first_tokenrhythm_activation_persists_plan(
     result = await _handle_models_routing_set({"mode": "ensemble"}, _ctx(config))
 
     assert result["mode"] == "ensemble"
-    assert result["selection_mode"] == "custom_b5"
+    assert result["selection_mode"] == "static_tokenrhythm_b5"
     assert result["selection_configured"] is True
-    assert len(config.llm_ensemble.candidates) == 5
+    assert config.llm_ensemble.candidates == []
     persisted = tomllib.loads(path.read_text())
-    assert persisted["llm_ensemble"]["selection_mode"] == "custom_b5"
-    assert len(persisted["llm_ensemble"]["candidates"]) == 5
+    assert persisted["llm_ensemble"]["selection_mode"] == "static_tokenrhythm_b5"
+    assert "candidates" not in persisted["llm_ensemble"]
     reloaded = GatewayConfig.load(str(path))
-    assert reloaded.llm_ensemble.selection_mode == "custom_b5"
-    assert len(reloaded.llm_ensemble.candidates) == 5
+    assert reloaded.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert reloaded.llm_ensemble.candidates == []
 
 
 async def test_models_routing_get_is_read_only() -> None:
@@ -501,6 +591,37 @@ async def test_router_configure_ladder_maintenance_preserves_observe_rollout(
     assert config.squilla_router.rollout_phase == "observe"
     reloaded = GatewayConfig.load(str(path))
     assert reloaded.squilla_router.rollout_phase == "observe"
+
+
+async def test_router_configure_persists_explicit_single_c3_across_reload(
+    tmp_path,
+) -> None:
+    path = tmp_path / "router-c3-single.toml"
+    config = GatewayConfig(config_path=str(path))
+
+    await _router_configure(
+        {
+            "mode": "custom",
+            "tiers": {
+                "c3": {
+                    "provider": "tokenrhythm",
+                    "model": "glm-5.2",
+                    "thinkingLevel": "",
+                    "supportsImage": False,
+                    "ensembleEnabled": False,
+                    "ensembleSelectionMode": "",
+                }
+            },
+        },
+        _ctx(config),
+    )
+
+    assert config.squilla_router.tiers["c3"]["ensemble_enabled"] is False
+    reloaded = GatewayConfig.load(str(path))
+    assert reloaded.squilla_router.tiers["c3"]["ensemble_enabled"] is False
+    assert not reloaded.squilla_router.tiers["c3"].get(
+        "ensemble_selection_mode"
+    )
 
 
 async def test_router_configure_ladder_maintenance_keeps_live_ensemble(

@@ -37,6 +37,8 @@ export interface RawSessionTask {
   finishedAt?: number | string
   turn_outcome?: Record<string, unknown>
   turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
   steer_capability?: import('./chat').ChatSteerCapability
   steerCapability?: import('./chat').ChatSteerCapability
 }
@@ -130,6 +132,12 @@ export interface SessionsListResponse {
   /** Exact number of sessions visible to the caller, independent of page size. */
   totalCount?: number
   total_count?: number
+  /** Whether another stable session-list page is available. */
+  hasMore?: boolean
+  has_more?: boolean
+  /** Opaque keyset cursor for the next session-list page. */
+  nextCursor?: string | null
+  next_cursor?: string | null
 }
 
 export interface ProjectWorkspaceItem {
@@ -204,6 +212,8 @@ export interface ArtifactPayload {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  generation_epoch?: number
+  generationEpoch?: number
   stream_seq?: number
   name?: string
   mime?: string
@@ -242,6 +252,10 @@ export interface StreamEventEnvelope {
   epoch?: number
   stream_generation?: string
   streamGeneration?: string
+  generation_epoch?: number
+  generationEpoch?: number
+  assistant_message_id?: string
+  assistantMessageId?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -269,9 +283,36 @@ export interface SessionEventPayload extends StreamEventEnvelope {
   [key: string]: unknown
 }
 
+export interface AnswerGenerationResetPayload extends SessionEventPayload {
+  kind?: 'answer_generation_reset'
+  old_generation_epoch?: number
+  oldGenerationEpoch?: number
+  new_generation_epoch?: number
+  newGenerationEpoch?: number
+  preserve_completed_tools?: boolean
+  preserveCompletedTools?: boolean
+  authoritative_text_snapshot?: string
+  authoritativeTextSnapshot?: string
+  authoritative_reasoning_snapshot?: string
+  authoritativeReasoningSnapshot?: string
+  sequence?: number
+  terminal?: boolean
+  terminal_text_snapshot?: string | null
+  terminalTextSnapshot?: string | null
+}
+
 export interface WarningPayload extends SessionEventPayload {
   message?: string
   code?: string
+}
+
+/** Content-free invalidation signal for one stable Artifact IDE document. */
+export interface ArtifactStateEventPayload extends SessionEventPayload {
+  artifactEventSeq?: number
+  documentId?: string
+  revisionId?: string | null
+  changeSetId?: string | null
+  action?: string
 }
 
 export type ProviderActivityPhase =
@@ -348,6 +389,9 @@ export interface TextDeltaPayload extends SessionEventPayload {
   text?: string
   /** Gateway-owned semantic role for this text span. */
   presentation?: 'intermediate' | 'answer'
+  model_call_id?: string
+  modelCallId?: string
+  iteration?: number
 }
 
 export type AssistantDelivery = 'visible' | 'suppressed'
@@ -369,6 +413,21 @@ export interface SessionDonePayload extends SessionEventPayload {
   inputMode?: string
   run_kind?: string
   runKind?: string
+}
+
+/** Durable-success receipt emitted only after transcript and task commits. */
+export interface TurnCommittedPayload extends SessionEventPayload {
+  schema_version: 1
+  session_key: string
+  session_id?: string
+  task_id: string
+  turn_id: string
+  status: 'succeeded'
+  terminal_reason: 'completed'
+  finished_at: number
+  client_message_id?: string
+  user_message_id?: string
+  surface_id?: string
 }
 
 export interface ToolUsePayload extends SessionEventPayload {
@@ -395,6 +454,11 @@ export interface ToolUsePayload extends SessionEventPayload {
 export interface ToolDeltaPayload extends ToolUsePayload {
   delta?: string
   input_delta?: string
+}
+
+export interface ToolEndPayload extends ToolUsePayload {
+  arguments?: Record<string, unknown>
+  synthetic_from_text?: boolean
 }
 
 export interface ToolResultPayload extends ToolUsePayload {
@@ -437,6 +501,16 @@ export interface SessionProjectWorkspaceSnapshot {
   availabilityReason?: string
 }
 
+/** Durable, session-owned model routing selection. */
+export interface SessionRoutingSnapshot {
+  key?: string
+  sessionKey?: string
+  session_key?: string
+  mode?: import('./modelRouting').GatewayModelRoutingMode
+  revision?: number
+  source?: 'session' | 'legacy_initialized' | string
+}
+
 export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
   hydration_complete?: boolean
@@ -461,6 +535,9 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   }
   workspaceId?: string
   projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+  routing?: SessionRoutingSnapshot
+  modelRouting?: SessionRoutingSnapshot
+  model_routing?: SessionRoutingSnapshot
   collaboration?: import('./plans').CollaborationSnapshot
   currentPlan?: import('./plans').PlanRevisionSnapshot | null
   current_plan?: unknown
@@ -481,6 +558,12 @@ export interface ChatSendAttachmentPayload {
   file_uuid?: string
 }
 
+/** Exact editable document head bound to one chat send attempt. */
+export interface ChatDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
 export interface ChatSendParams {
   message: string
   sessionKey: string
@@ -488,10 +571,16 @@ export interface ChatSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
+  /** Ordered durable drafts consumed atomically with this chat ingress. */
+  promptAnnotationIds?: string[]
+  /** Current editable document head made available only to this turn. */
+  documentContext?: ChatDocumentContext
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
   workspaceId?: string
   collaborationMode?: import('./plans').CollaborationMode
+  /** Session routing mode atomically captured when a new chat is materialized. */
+  initialRoutingMode?: import('./modelRouting').GatewayModelRoutingMode
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]
@@ -500,6 +589,8 @@ export interface ChatSendParams {
 
 export interface ChatSendResponse {
   sessionKey?: string
+  /** Snake-case alias returned by older Gateway/WebSocket serializers. */
+  session_key?: string
   message_id?: string
   user_message_id?: string
   client_message_id?: string
@@ -514,6 +605,8 @@ export interface ChatSendResponse {
   terminal_message?: string
   terminalMessage?: string
   reason?: string
+  acceptedPromptAnnotationIds?: string[]
+  accepted_prompt_annotation_ids?: string[]
 }
 
 /** Server-owned recovery record for one unaccepted manual MetaSkill launch. */
@@ -545,6 +638,9 @@ export interface SessionSteerV2Params {
   expected_turn_id: string
   client_request_id: string
   client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
   surface_id?: string
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
 }
@@ -599,6 +695,8 @@ export interface ChatHistoryAttachmentPayload {
   dataUrl?: unknown
   data_url?: unknown
   sha256_ref?: unknown
+  attachmentId?: unknown
+  attachment_id?: unknown
   download_url?: unknown
   kind?: unknown
   [key: string]: unknown
@@ -612,6 +710,8 @@ export interface ChatHistoryMessage {
   id?: string
   message_id?: string
   attachments?: ChatHistoryAttachmentPayload[]
+  promptAnnotations?: unknown[]
+  prompt_annotations?: unknown[]
   artifacts?: ArtifactPayload[]
   router_decision?: RouterDecisionPayload | null
   routerDecision?: RouterDecisionPayload | null
@@ -673,6 +773,19 @@ export interface ChatHistoryTurnOutcome {
   started_at?: string | number
   finished_at?: string | number
   outcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
+  code?: string
+  error_class?: string
+  retryable?: boolean
+  retry_after_ms?: number
+  terminal_message?: string
+  activity_snapshot?: Record<string, unknown>
+  usage_call_index?: number
+  no_prior_provider_dispatch?: boolean
+  replay_safe?: boolean
+  user_message_id?: string
+  accepted_routing_mode?: 'direct' | 'router' | 'ensemble'
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -682,6 +795,8 @@ export interface RouterDecisionPayload extends SessionEventPayload {
   source?: string
   routing_applied?: boolean
   decision?: unknown
+  router_tier_snapshot?: unknown
+  routerTierSnapshot?: unknown
 }
 
 /* ── LLM ensemble progress ─────────────────────────────────────────────
@@ -829,11 +944,14 @@ export interface MetaRunCompletedPayload extends SessionEventPayload {
 }
 
 export interface RpcEventMap {
+  'session.event.answer_generation_reset': AnswerGenerationResetPayload
   'session.event.text_delta': TextDeltaPayload
   'session.event.tool_use_start': ToolUsePayload
   'session.event.tool_use_delta': ToolDeltaPayload
+  'session.event.tool_use_end': ToolEndPayload
   'session.event.tool_result': ToolResultPayload
   'session.event.artifact': ArtifactPayload
+  'session.event.artifact_state': ArtifactStateEventPayload
   'session.event.router_decision': RouterDecisionPayload
   'session.event.ensemble_progress': EnsembleProgressPayload
   'session.event.router_control_replay': SessionEventPayload
@@ -857,4 +975,5 @@ export interface RpcEventMap {
   'session.event.meta_step_state': MetaStepStatePayload
   'session.event.meta_run_completed': MetaRunCompletedPayload
   'session.event.done': SessionDonePayload
+  'session.event.turn_committed': TurnCommittedPayload
 }

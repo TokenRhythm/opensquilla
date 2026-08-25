@@ -5,33 +5,19 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
+from opensquilla.runtime_target import runtime_target
 from opensquilla.sandbox.policy_models import RuntimePolicySettings
 from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUNTIME_KEYS = ("python", "node", "gitBash")
 _PORTABLE_RUNTIME_KEYS = ("python", "node")
-_PLATFORM_NAMES = {
-    "win32": "windows",
-    "windows": "windows",
-    "linux": "linux",
-    "darwin": "darwin",
-    "macos": "darwin",
-}
-_ARCH_NAMES = {
-    "amd64": "x64",
-    "x86_64": "x64",
-    "x64": "x64",
-    "aarch64": "arm64",
-    "arm64": "arm64",
-}
 
 
 class RuntimeManifestError(ValueError):
@@ -190,22 +176,6 @@ class RuntimeManifest:
                 f"could not read runtime manifest {manifest_path}: {exc}"
             ) from exc
         return cls.model_validate(payload)
-
-
-def runtime_target(
-    platform: str | None = None,
-    arch: str | None = None,
-) -> str:
-    raw_platform = (platform or sys.platform).strip().lower()
-    if arch is None:
-        import platform as platform_module
-
-        raw_arch = platform_module.machine().strip().lower()
-    else:
-        raw_arch = str(arch).strip().lower()
-    platform_name = _PLATFORM_NAMES.get(raw_platform, raw_platform)
-    arch_name = _ARCH_NAMES.get(raw_arch, raw_arch)
-    return f"{platform_name}-{arch_name}"
 
 
 def _runtime_policy(

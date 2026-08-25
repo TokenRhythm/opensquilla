@@ -20,12 +20,17 @@ export interface PendingInputWalRecord {
   clientRequestId: string
   clientMessageId: string
   text: string
+  /** Annotation batch retained across IndexedDB/WAL queue recovery. */
+  promptAnnotationIds?: string[]
   attachments: Attachment[]
   intent: string | null
+  confirmedPlainText?: boolean
   ownerRequestId?: string
   state: PendingInputWalState
   /** True once enqueue may have crossed the browser/Gateway boundary. */
   mayHaveServerCopy?: boolean
+  /** Complete an in-flight tombstone by preserving the text as a local draft. */
+  retainAfterCancel?: boolean
   requestFingerprint?: string
   serverRevision?: number
   position?: number
@@ -34,7 +39,7 @@ export interface PendingInputWalRecord {
   updatedAt: number
 }
 
-export type ResponseHandoffWalState = 'submitting' | 'accepted' | 'failed'
+export type ResponseHandoffWalState = 'preparing' | 'submitting' | 'accepted' | 'failed'
 
 export interface ResponseHandoffWalRecord {
   schemaVersion: 1
@@ -45,6 +50,14 @@ export interface ResponseHandoffWalRecord {
   params: ChatSendParams
   composerText: string
   recoveryAttachments: Attachment[]
+  /** A protocol-owned replay must never be restored into the user composer. */
+  restoreComposerOnFailure?: boolean
+  /** Stable source-session + barrier identity used for cross-tab coordination. */
+  replayCoordinationKey?: string
+  /** Identifies the live dispatcher allowed to arm an unsubmitted handoff. */
+  walOwnerId?: string
+  /** Monotonic compare-and-swap revision for handoff state transitions. */
+  walRevision?: number
   state: ResponseHandoffWalState
   acceptedSessionKey?: string
   errorCode?: string
@@ -61,6 +74,11 @@ export interface AcceptedHandoffCommit {
   records: PendingInputWalRecord[]
 }
 
+export interface ResponseHandoffWalMutation {
+  applied: boolean
+  record: ResponseHandoffWalRecord | null
+}
+
 export interface PendingInputWal {
   put: (record: PendingInputWalRecord) => Promise<void>
   list: (sessionKey: string) => Promise<PendingInputWalRecord[]>
@@ -72,6 +90,17 @@ export interface PendingInputWal {
     expectedWalRevisions: Record<string, number>,
   ) => Promise<PendingInputOrderCommit>
   putHandoff?: (record: ResponseHandoffWalRecord) => Promise<void>
+  /** Atomically create a handoff without replacing another dispatcher's record. */
+  prepareHandoff?: (
+    record: ResponseHandoffWalRecord,
+  ) => Promise<ResponseHandoffWalMutation>
+  /** Atomically replace/delete a handoff only while its owner and revision match. */
+  compareAndSwapHandoff?: (
+    ownerRequestId: string,
+    expectedWalOwnerId: string,
+    expectedWalRevision: number,
+    record: ResponseHandoffWalRecord | null,
+  ) => Promise<ResponseHandoffWalMutation>
   listHandoffs?: (requestSessionKey?: string) => Promise<ResponseHandoffWalRecord[]>
   acceptHandoff?: (
     ownerRequestId: string,
@@ -89,6 +118,16 @@ const WAL_STATES = new Set<PendingInputWalState>([
   'cancelling',
 ])
 
+function validPromptAnnotationIds(value: unknown): boolean {
+  if (value === undefined) return true
+  if (!Array.isArray(value) || value.length > 16) return false
+  return value.every((item, index) => (
+    typeof item === 'string'
+    && item.trim().length > 0
+    && value.indexOf(item) === index
+  ))
+}
+
 function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord {
   if (!value || typeof value !== 'object') return false
   const record = value as Partial<PendingInputWalRecord>
@@ -102,16 +141,25 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
+    && validPromptAnnotationIds(record.promptAnnotationIds)
     && Array.isArray(record.attachments)
     && record.attachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
     ))
     && (record.intent === null || typeof record.intent === 'string')
+    && (
+      record.confirmedPlainText === undefined
+      || typeof record.confirmedPlainText === 'boolean'
+    )
     && typeof record.state === 'string'
     && WAL_STATES.has(record.state as PendingInputWalState)
     && (
       record.mayHaveServerCopy === undefined
       || typeof record.mayHaveServerCopy === 'boolean'
+    )
+    && (
+      record.retainAfterCancel === undefined
+      || typeof record.retainAfterCancel === 'boolean'
     )
     && (
       record.position === undefined
@@ -149,7 +197,35 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
     && record.recoveryAttachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
     ))
-    && ['submitting', 'accepted', 'failed'].includes(String(record.state || ''))
+    && (
+      record.restoreComposerOnFailure === undefined
+      || typeof record.restoreComposerOnFailure === 'boolean'
+    )
+    && (
+      record.replayCoordinationKey === undefined
+      || (
+        typeof record.replayCoordinationKey === 'string'
+        && record.replayCoordinationKey.length > 0
+      )
+    )
+    && (
+      record.walOwnerId === undefined
+      || (typeof record.walOwnerId === 'string' && record.walOwnerId.length > 0)
+    )
+    && (
+      record.walRevision === undefined
+      || (Number.isSafeInteger(record.walRevision) && record.walRevision >= 1)
+    )
+    && ['preparing', 'submitting', 'accepted', 'failed'].includes(String(record.state || ''))
+    && (
+      record.state !== 'preparing'
+      || (
+        typeof record.walOwnerId === 'string'
+        && record.walOwnerId.length > 0
+        && Number.isSafeInteger(record.walRevision)
+        && record.walRevision! >= 1
+      )
+    )
     && typeof record.createdAt === 'number'
     && Number.isFinite(record.createdAt)
     && typeof record.updatedAt === 'number'
@@ -159,6 +235,9 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
 function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
   return {
     ...record,
+    ...(record.promptAnnotationIds
+      ? { promptAnnotationIds: [...record.promptAnnotationIds] }
+      : {}),
     attachments: record.attachments.map(attachment => ({ ...attachment })),
   }
 }
@@ -314,6 +393,63 @@ class BrowserPendingInputWal implements PendingInputWal {
     await transactionDone(transaction)
   }
 
+  async prepareHandoff(
+    record: ResponseHandoffWalRecord,
+  ): Promise<ResponseHandoffWalMutation> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const current = await requestResult(store.get(record.ownerRequestId))
+    if (isResponseHandoffWalRecord(current)) {
+      await transactionDone(transaction)
+      return { applied: false, record: cloneHandoffRecord(current) }
+    }
+    const prepared = cloneHandoffRecord(record)
+    store.put(prepared)
+    await transactionDone(transaction)
+    return { applied: true, record: prepared }
+  }
+
+  async compareAndSwapHandoff(
+    ownerRequestId: string,
+    expectedWalOwnerId: string,
+    expectedWalRevision: number,
+    record: ResponseHandoffWalRecord | null,
+  ): Promise<ResponseHandoffWalMutation> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const current = await requestResult(store.get(ownerRequestId))
+    if (
+      !isResponseHandoffWalRecord(current)
+      || current.walOwnerId !== expectedWalOwnerId
+      || current.walRevision !== expectedWalRevision
+    ) {
+      await transactionDone(transaction)
+      return {
+        applied: false,
+        record: isResponseHandoffWalRecord(current) ? cloneHandoffRecord(current) : null,
+      }
+    }
+    if (!record) {
+      store.delete(ownerRequestId)
+      await transactionDone(transaction)
+      return { applied: true, record: null }
+    }
+    if (
+      record.ownerRequestId !== ownerRequestId
+      || record.walOwnerId !== expectedWalOwnerId
+      || record.walRevision !== expectedWalRevision + 1
+    ) {
+      transaction.abort()
+      throw new Error('Invalid response handoff compare-and-swap transition')
+    }
+    const next = cloneHandoffRecord(record)
+    store.put(next)
+    await transactionDone(transaction)
+    return { applied: true, record: next }
+  }
+
   async listHandoffs(requestSessionKey?: string): Promise<ResponseHandoffWalRecord[]> {
     const database = await this.database()
     const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
@@ -341,6 +477,10 @@ class BrowserPendingInputWal implements PendingInputWal {
     if (!isResponseHandoffWalRecord(rawHandoff)) {
       transaction.abort()
       throw new Error('Response handoff no longer exists')
+    }
+    if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
+      transaction.abort()
+      throw new Error('Response handoff is not durably accepted')
     }
     const handoff = cloneHandoffRecord({
       ...rawHandoff,

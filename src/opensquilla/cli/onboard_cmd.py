@@ -53,7 +53,11 @@ from opensquilla.onboarding.setup_engine import (
 )
 from opensquilla.onboarding.setup_paths import web_setup_url
 from opensquilla.onboarding.status import OnboardingStatus, get_onboarding_status
-from opensquilla.router_tiers import DEFAULT_TEXT_TIER, TEXT_TIERS
+from opensquilla.router_tiers import (
+    DEFAULT_TEXT_TIER,
+    ENSEMBLE_SELECTION_MODE_ORDER,
+    TEXT_TIERS,
+)
 
 # Exit code for a user-initiated cancellation (Esc/Ctrl+C in the wizard).
 # 130 = 128 + SIGINT, the conventional shell exit status for an interrupt;
@@ -1457,8 +1461,8 @@ def configure_command(
         "",
         "--selection-mode",
         help=(
-            "Ensemble selection mode: router_dynamic, static_openrouter_b5, "
-            "static_tokenrhythm_b5, or custom_b5."
+            "Ensemble selection mode: "
+            f"{', '.join(ENSEMBLE_SELECTION_MODE_ORDER)}."
         ),
         rich_help_panel="LLM ensemble",
     ),
@@ -1477,7 +1481,11 @@ def configure_command(
     all_failed_policy: str = typer.Option(
         "",
         "--all-failed-policy",
-        help="Policy when all proposers fail: fallback_single or error.",
+        # Kept as a hidden compatibility input for older automation. Explicit
+        # values remain authoritative even though new C3 setups use the
+        # resilient fallback_single default.
+        hidden=True,
+        help="Compatibility option for the stored ensemble failure policy.",
         rich_help_panel="LLM ensemble",
     ),
     search_provider: str = typer.Option(
@@ -1666,7 +1674,7 @@ def configure_command(
                     if piece.strip()
                 ]
                 engine = SetupEngine(path=config_path)
-                engine.apply(
+                mutation = engine.apply(
                     "ensemble",
                     {
                         "enabled": enabled,
@@ -1677,6 +1685,8 @@ def configure_command(
                     },
                 )
                 result = engine.persist()
+                for warning in mutation.warnings:
+                    console.print(warning_panel(warning))
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)
                 return

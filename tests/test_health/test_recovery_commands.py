@@ -575,6 +575,7 @@ def test_llm_ensemble_custom_b5_health_findings_cover_ready_and_blocked() -> Non
     assert [finding.id for finding in blocked] == ["llm_ensemble.custom_b5.not_ready"]
     assert blocked[0].severity == "warn"
     assert "openrouter" in blocked[0].detail
+    assert "configured fixed/direct fallback model" in blocked[0].detail
     # The lineup is fixable live from settings; no restart demanded.
     assert blocked[0].restart_required is False
 
@@ -588,3 +589,123 @@ def test_llm_ensemble_custom_b5_health_findings_cover_ready_and_blocked() -> Non
         }
     )
     assert "no enabled proposer" in empty[0].detail
+
+
+def test_llm_ensemble_unknown_selection_mode_is_diagnosed() -> None:
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "static_tokenrhythm_typo",
+            "blockedReason": "unknown_selection_mode",
+        }
+    )
+
+    assert [finding.id for finding in findings] == [
+        "llm_ensemble.unknown_selection_mode"
+    ]
+    assert findings[0].severity == "warn"
+    assert findings[0].evidence["blockedReason"] == "unknown_selection_mode"
+    assert "static_tokenrhythm_typo" in findings[0].detail
+
+
+def test_llm_ensemble_missing_fixed_fallback_is_reported_before_lineup() -> None:
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "static_openrouter_b5",
+            "runtimeStatus": "blocked",
+            "configurationReady": False,
+            "credentialAvailable": True,
+            "fixedFallbackReady": False,
+            "fixedFallbackProvider": "openrouter",
+            "fixedFallbackModel": "",
+            "fixedFallbackBlockedReason": "missing_fixed_fallback",
+        }
+    )
+
+    assert [finding.id for finding in findings] == [
+        "llm_ensemble.fixed_fallback.not_ready"
+    ]
+    assert findings[0].severity == "error"
+    assert "blocks the turn before fusion starts" in findings[0].detail
+
+
+def test_llm_ensemble_dynamic_blocker_is_actionable() -> None:
+    blocked_candidates = [
+        {
+            "source": "router_tier:c0",
+            "provider": "openrouter",
+            "model": "example/model",
+            "reason": "missing_credential",
+        }
+    ]
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "router_dynamic",
+            "runtimeStatus": "blocked",
+            "configurationReady": False,
+            "blockedReason": "router_dynamic_not_ready:missing_credential",
+            "blockedTierCandidates": blocked_candidates,
+            "fixedFallbackReady": True,
+        }
+    )
+
+    assert [finding.id for finding in findings] == [
+        "llm_ensemble.router_dynamic.not_ready"
+    ]
+    assert findings[0].evidence["blockedTierCandidates"] == blocked_candidates
+
+
+def test_tier_managed_ensemble_health_explains_c3_activation_and_fallback() -> None:
+    base_payload = {
+        "enabled": True,
+        "globalEnabled": False,
+        "selectionMode": "static_tokenrhythm_b5",
+        "activationSource": "router_tier",
+        "activationTiers": ["c3"],
+        "activeProvider": "tokenrhythm",
+        "apiKeyEnv": "TOKENRHYTHM_API_KEY",
+    }
+    ready = evaluate_llm_ensemble(
+        {**base_payload, "credentialAvailable": True}
+    )
+    assert ready[0].severity == "ok"
+    assert "router tier C3" in ready[0].detail
+    assert ready[0].evidence["activationSource"] == "router_tier"
+
+    blocked = evaluate_llm_ensemble(
+        {**base_payload, "credentialAvailable": False}
+    )
+    assert blocked[0].severity == "warn"
+    assert "configured fixed/direct fallback model" in blocked[0].detail
+    commands = [step.command for step in blocked[0].fix_steps if step.command]
+    assert "opensquilla config set llm_ensemble.enabled false" not in commands
+
+
+def test_supported_ensemble_error_policy_has_no_migration_warning() -> None:
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": False,
+            "selectionMode": "static_openrouter_b5",
+            "configuredAllFailedPolicy": "error",
+            "effectiveAllFailedPolicy": "error",
+            "policyDeprecated": False,
+        }
+    )
+
+    assert findings == []
+
+    enabled = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "static_openrouter_b5",
+            "credentialAvailable": True,
+            "configuredAllFailedPolicy": "error",
+            "effectiveAllFailedPolicy": "error",
+            "policyDeprecated": False,
+        }
+    )
+    assert [finding.id for finding in enabled] == [
+        "llm_ensemble.static_openrouter_b5.ready",
+    ]

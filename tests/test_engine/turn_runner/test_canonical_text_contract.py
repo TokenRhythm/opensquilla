@@ -10,6 +10,7 @@ import pytest
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
     StreamConsumerStageInput,
     _DoneHandler,
+    _flush_current_text_segment,
     _StreamState,
     _TextDeltaHandler,
     _ToolUseStartHandler,
@@ -193,7 +194,11 @@ async def test_literal_protocol_like_text_is_canonical_across_stream_done_and_pe
     assert streamed_text == literal_text
     assert done_event.text == literal_text
     assert "".join(state.final_text_parts) == literal_text
-    assert state.turn_segments[0] == {"type": "text", "text": literal_text}
+    assert state.turn_segments[0] == {
+        "type": "text",
+        "text": literal_text,
+        "presentation": "answer",
+    }
 
     final_text, transcript = await _finalize(state, done_event)
 
@@ -202,7 +207,79 @@ async def test_literal_protocol_like_text_is_canonical_across_stream_done_and_pe
     assert transcript.calls[0]["tool_calls"][0] == {
         "type": "text",
         "text": literal_text,
+        "presentation": "answer",
     }
+
+
+@pytest.mark.asyncio
+async def test_text_presentation_survives_segment_flush_and_transcript_persistence() -> None:
+    state = _make_state()
+    text_handler = _TextDeltaHandler()
+
+    text_handler.handle(
+        TextDeltaEvent(text="I will inspect the source.", presentation="intermediate"),
+        state,
+    )
+    _ToolUseStartHandler().handle(
+        ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file"),
+        state,
+    )
+    state.turn_segments.append(
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "name": "read_file",
+            "content": "ok",
+        }
+    )
+    text_handler.handle(
+        TextDeltaEvent(text="The source is valid.", presentation="answer"),
+        state,
+    )
+    _flush_current_text_segment(state)
+
+    done = DoneEvent(text="I will inspect the source.The source is valid.")
+    final_text, transcript = await _finalize(state, done)
+
+    assert final_text == "I will inspect the source.\n\nThe source is valid."
+    persisted_text = [
+        segment
+        for segment in transcript.calls[0]["tool_calls"]
+        if segment.get("type") == "text"
+    ]
+    assert persisted_text == [
+        {
+            "type": "text",
+            "text": "I will inspect the source.",
+            "presentation": "intermediate",
+        },
+        {
+            "type": "text",
+            "text": "The source is valid.",
+            "presentation": "answer",
+        },
+    ]
+
+
+def test_presentation_change_splits_adjacent_text_runs_without_a_tool_boundary() -> None:
+    state = _make_state()
+    handler = _TextDeltaHandler()
+
+    handler.handle(TextDeltaEvent(text="answer-shaped prefix"), state)
+    handler.handle(
+        TextDeltaEvent(text="work narration", presentation="intermediate"),
+        state,
+    )
+
+    assert state.turn_segments == [
+        {
+            "type": "text",
+            "text": "answer-shaped prefix",
+            "presentation": "answer",
+        }
+    ]
+    assert state.current_text_parts == ["work narration"]
+    assert state.current_text_presentation == "intermediate"
 
 
 def test_partial_protocol_like_suffix_is_immediately_available_for_cancellation() -> None:
@@ -358,6 +435,65 @@ def test_conflicting_done_snapshot_preserves_tool_events_and_replaces_only_text(
         "tool_result",
     ]
     assert "".join(state.current_text_parts) == "canonical successful answer"
+
+
+def test_conflicting_done_snapshot_keeps_intermediate_activity_segments() -> None:
+    state = _make_state()
+    text_handler = _TextDeltaHandler()
+    text_handler.handle(
+        TextDeltaEvent(text="Inspecting the repository.", presentation="intermediate"),
+        state,
+    )
+    _ToolUseStartHandler().handle(
+        ToolUseStartEvent(tool_use_id="tool-1", tool_name="search"),
+        state,
+    )
+    state.turn_segments.append(
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "name": "search",
+            "content": "ok",
+        }
+    )
+    text_handler.handle(TextDeltaEvent(text="stale answer"), state)
+
+    done_event, extra = _DoneHandler().handle(
+        DoneEvent(text="canonical answer"),
+        _make_stream_input(state),
+        state,
+    )
+
+    assert extra == []
+    assert done_event.text == "canonical answer"
+    assert state.turn_segments[0] == {
+        "type": "text",
+        "text": "Inspecting the repository.",
+        "presentation": "intermediate",
+    }
+    assert [segment["type"] for segment in state.turn_segments] == [
+        "text",
+        "tool_use",
+        "tool_result",
+    ]
+    assert state.current_text_parts == ["canonical answer"]
+    assert state.current_text_presentation == "answer"
+
+
+def test_legacy_text_segment_without_presentation_defaults_to_answer() -> None:
+    state = _make_state()
+    state.final_text_parts = ["legacy streamed answer"]
+    state.turn_segments = [{"type": "text", "text": "legacy streamed answer"}]
+
+    done_event, extra = _DoneHandler().handle(
+        DoneEvent(text="canonical answer"),
+        _make_stream_input(state),
+        state,
+    )
+
+    assert extra == []
+    assert done_event.text == "canonical answer"
+    assert state.turn_segments == []
 
 
 def test_cumulative_meta_final_snapshot_does_not_duplicate_streamed_prefix() -> None:

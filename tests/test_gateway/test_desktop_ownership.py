@@ -13,6 +13,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from opensquilla.gateway.app import create_gateway_app
+from opensquilla.gateway.auth import resolve_auth
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.desktop_ownership import (
     DESKTOP_GATEWAY_INSTANCE_NONCE_ENV,
@@ -22,8 +23,10 @@ from opensquilla.gateway.desktop_ownership import (
     DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL,
     DesktopGatewayOwnership,
     activate_desktop_gateway_ownership,
+    active_desktop_gateway_auth_token_matches,
     canonical_identity_payload,
     canonical_shutdown_payload,
+    desktop_gateway_auth_token,
     release_active_desktop_gateway_ownership,
 )
 from opensquilla.recovery.locking import profile_lock_key
@@ -234,6 +237,10 @@ def test_desktop_identity_proof_has_cross_language_golden_vector() -> None:
     challenge = "0123456789abcdef0123456789abcdef"
     nonce = "abcdefghijklmnopqrstuvwxyzABCDEFG"
 
+    assert desktop_gateway_auth_token(nonce) == (
+        "fe0aa74bf86e4f81f2e752de1f4fd6c40441fa83e53289825d3051c414f15e2c"
+    )
+
     canonical = canonical_identity_payload(public_record, challenge)
 
     assert canonical.decode("ascii") == (
@@ -435,6 +442,65 @@ def test_active_desktop_record_cleanup_is_ownership_safe(
     release_active_desktop_gateway_ownership()
 
     assert not record_path.exists()
+
+
+def test_active_desktop_auth_token_owns_only_its_loopback_token_gateway(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
+    monkeypatch.setenv(DESKTOP_GATEWAY_INSTANCE_NONCE_ENV, _NONCE)
+    monkeypatch.setenv(
+        DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV,
+        str(tmp_path / "gateway-ownership" / profile_lock_key(profile_home)),
+    )
+    owner = activate_desktop_gateway_ownership(
+        profile_home=profile_home,
+        port=18791,
+    )
+    assert owner is not None
+    credential = desktop_gateway_auth_token(_NONCE)
+    config = GatewayConfig(
+        host="127.0.0.1",
+        auth={"mode": "token", "token": "configured-operator-token"},
+    )
+
+    try:
+        principal = resolve_auth(
+            config,
+            {"token": credential},
+            "operator",
+            peer_ip="127.0.0.1",
+        )
+        remote = resolve_auth(
+            config,
+            {"token": credential},
+            "operator",
+            peer_ip="192.168.1.20",
+        )
+
+        assert active_desktop_gateway_auth_token_matches(credential) is True
+        assert principal is not None
+        assert principal.authenticated is True
+        assert principal.is_owner is True
+        assert "operator.admin" in principal.scopes
+        assert remote is not None
+        assert remote.authenticated is False
+        assert remote.is_owner is False
+
+        app = create_gateway_app(config)
+        with TestClient(app, client=_OWNER_PEER) as client:
+            upload = client.post(
+                "/api/v1/files/upload",
+                headers={"Authorization": f"Bearer {credential}"},
+                files={"file": ("note.txt", b"desktop token", "text/plain")},
+            )
+        assert upload.status_code == 200, upload.text
+    finally:
+        release_active_desktop_gateway_ownership()
+
+    assert active_desktop_gateway_auth_token_matches(credential) is False
 
 
 def test_gateway_cli_removes_record_after_profile_writer_lock_exits(

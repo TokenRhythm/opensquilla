@@ -100,7 +100,7 @@
 
 [llm]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro"
+model = "deepseek-v4-pro-0813"
 # api_key = ""          # TokenRhythm API key; env TOKENRHYTHM_API_KEY also works
 base_url = "https://tokenrhythm.studio/v1"
 # proxy = ""            # e.g. http://127.0.0.1:7890
@@ -147,7 +147,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # reasoning_content, and reasoning tokens count against max_tokens — keep
 # max_tokens = 0 (auto) rather than setting small caps:
 # provider = "tokenrhythm"
-# model = "deepseek-v4-pro"
+# model = "deepseek-v4-pro-0813"
 # api_key = ""          # env TOKENRHYTHM_API_KEY also works
 # base_url = "https://tokenrhythm.studio/v1"
 #
@@ -159,6 +159,8 @@ base_url = "https://tokenrhythm.studio/v1"
 # # api_key is optional: set env CUSTOM_LLM_API_KEY (or api_key here) only if
 # # your endpoint enforces one. Declare the endpoint's real context window via
 # # [models.custom."qwen3-32b-awq"] — see the per-model overrides section below.
+# # Generic custom endpoints default to a zero token-cost estimate; that does
+# # not mean the server, GPU, or remote gateway has no infrastructure cost.
 #
 # Example custom Anthropic Messages endpoint:
 # provider = "custom_anthropic"
@@ -183,53 +185,39 @@ base_url = "https://tokenrhythm.studio/v1"
 "z-ai/glm-5.1" = "z-ai"
 "z-ai/glm-5.2" = "z-ai"
 
-# LLM ensemble routing — the DEFAULT routing surface.
-# A fresh install ships enabled = true with selection_mode =
-# "static_openrouter_b5": each turn fans out to a fixed five-member
-# OpenRouter proposer set and fuses their candidates into one answer.
-#
-# Upgrade note (0.5.0rc1 → current):
-#   * static_openrouter_b5 is the default for FRESH installs only. Configs
-#     saved by earlier versions keep their stored `enabled` value.
-#   * Enabling the ensemble now selects "static_openrouter_b5", where
-#     0.5.0rc1's enable toggle gave "router_dynamic". Set
-#     selection_mode = "router_dynamic" to restore the rc1 behavior.
-#
-# Credential requirement: static_openrouter_b5 runs its members on
-# OpenRouter, so it needs a resolvable OpenRouter credential — the [llm]
-# api_key when the active provider is "openrouter", or OPENROUTER_API_KEY
-# in the environment otherwise. Without one the ensemble is inactive and
-# every turn falls back to the single configured provider —
-# `opensquilla doctor` reports this as the llm_ensemble finding
-# "LLM ensemble is enabled but cannot run".
-# "static_tokenrhythm_b5" is the TokenRhythm mirror of the same lineup
+# LLM ensemble routing. The recommended TokenRhythm router lets C3 reuse this
+# shared plan through squilla_router.tiers.c3.ensemble_enabled below. Keep this
+# global switch off when C0-C2 should remain single-model routes. Enabling it
+# applies the same plan to every request; C3 never stores a second plan.
+# C3 fusion itself does not handle images. The dedicated image_model route stays
+# enabled and is preferred; another non-C3 tier with supports_image=true is used
+# only when the dedicated image route is unavailable.
+# The static_tokenrhythm_b5 profile is the TokenRhythm mirror of B5
 # (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
-# aggregator) and needs a TokenRhythm credential the same way (the [llm]
-# api_key when the active provider is "tokenrhythm", or
-# TOKENRHYTHM_API_KEY in the environment).
+# aggregator). It needs a TokenRhythm credential: the [llm] api_key when
+# TokenRhythm is active, or TOKENRHYTHM_API_KEY in the environment. Without
+# one, or whenever fusion cannot complete, requests use the fixed/direct
+# provider and model configured under [llm].
 #
 # The keys below are also writable at runtime via the Web UI / the
 # `onboarding.ensemble.configure` RPC; omitted keys keep their current
 # values. Changes take effect on the next turn without a gateway restart.
 [llm_ensemble]
-enabled = true
+enabled = false
 # "static_openrouter_b5": fixed five-member OpenRouter proposer set (default).
 # "static_tokenrhythm_b5": the same lineup served through TokenRhythm.
 # "custom_b5": an explicit user-authored lineup from [[llm_ensemble.candidates]]
-#   — 2-6 enabled proposer rows plus at most one role = "aggregator" row (the
+#   — 2-6 enabled role = "proposer" rows plus at most one role = "aggregator" row (the
 #   member that fuses drafts into the final answer; omitted = the current chat
-#   model fuses). The Web UI presents only Proposer and Aggregator. Released
-#   proposer role values ("primary", "contrast", "fast_check", "critic")
-#   remain accepted and preserved as advisory decision-trace labels; they all
-#   run and appear in the settings panel as Proposer.
+#   model fuses). Older advisory role values are migrated to "proposer".
 # "router_dynamic": legacy automatic selection; kept readable for existing
 #   configs but no longer offered in the Web UI.
-selection_mode = "static_openrouter_b5"
+selection_mode = "static_tokenrhythm_b5"
 # Explicit lineup for custom_b5 (ignored by the static profiles):
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "doubao-2.0-pro"
-# No role is needed for a proposer.
+# role = "proposer"
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "deepseek-v4-pro"
@@ -251,7 +239,10 @@ model_options = [
 # with their own quorum at runtime: 3-of-4 for the static profiles, N-1 for a
 # custom lineup of N proposers.
 min_successful_proposers = 1
-# When aggregation cannot proceed: "fallback_single" (single-provider turn) or "error".
+# When aggregation cannot proceed, the effective policy is always
+# "fallback_single": use the fixed/direct provider and model under [llm]. Legacy
+# "error" values remain loadable but are deprecated, behave as fallback_single,
+# and are normalized the next time the ensemble settings are saved.
 all_failed_policy = "fallback_single"
 
 # Advanced knobs — TOML-only (not on the configure RPC surface). Defaults:
@@ -259,7 +250,7 @@ all_failed_policy = "fallback_single"
 # proposer_tools = false              # expose tool schemas as non-executable advice
 # candidate_max_chars = 24000         # per-candidate transcript budget (0 = unlimited)
 # proposer_timeout_seconds = 3600.0
-# aggregator_timeout_seconds = 3600.0
+# aggregator_timeout_seconds = 3600.0 # idle/stall budget; outer turn deadline is separate
 # shuffle_candidates = true           # shuffle candidate order before aggregation
 # record_candidates = false           # persist per-proposer candidates for replay/debug
 
@@ -294,11 +285,16 @@ all_failed_policy = "fallback_single"
 # The generic `custom` and `custom_anthropic` providers use the same override
 # table shape, keyed by the served model id. Unknown custom models retain the
 # conservative 8k fallback for upgrade compatibility; both remote gateways
-# and local servers should declare their actual window:
+# and local servers should declare their actual window. Their token estimate
+# defaults to zero; to estimate a paid endpoint, set BOTH main price fields.
+# Cache-read and cache-write prices are optional and the same rule applies to
+# `custom_anthropic`:
 # [models.custom."qwen3-32b-awq"]
 # context_window = 131072
 # max_output_tokens = 8192
 # supports_tools = true
+# input_cost_per_mtok = 0.5
+# output_cost_per_mtok = 2.0
 #
 # [models.custom_anthropic."vendor-model"]
 # context_window = 131072
@@ -435,18 +431,19 @@ upgrade_to_c3_compaction_enabled = true
 # that executes on the active provider (or the default tier).
 # tier_provider_mismatch = "route"  # route | veto
 
-# TokenRhythm serves every model in reasoning-streaming mode and rejects
-# thinking-toggle request fields, so these tiers set no thinking_level.
+# This mixed-family TokenRhythm ladder intentionally sets no thinking_level.
+# SquillaRouter auto-thinking can still choose a per-turn level (normally low
+# on C1), and explicit turn settings remain available for compatible models.
 [squilla_router.tiers.c0]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash"
-description = "Fast DeepSeek V4 Flash route for trivial chat, short rewrites, extraction, and low-risk simple Q&A"
+model = "deepseek-v4-flash-0731"
+description = "Fast DeepSeek V4 Flash 0731 route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
 supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro"
-description = "Default balanced text model for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-v4-pro-0813"
+description = "Default DeepSeek V4 Pro 0813 route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
@@ -458,8 +455,9 @@ supports_image = false
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
 model = "glm-5.2"
-description = "Highest-tier GLM 5.2 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+description = "Highest tier: shared static TokenRhythm B5 fusion; this provider/model is retained for single-model C3 mode"
 supports_image = false
+ensemble_enabled = true
 
 [squilla_router.tiers.image_model]
 provider = "tokenrhythm"

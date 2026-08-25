@@ -707,11 +707,13 @@ test.describe('Live assistant activity lifecycle', () => {
     expect(await draftCandidate.evaluate(element =>
       element.closest('.assistant-activity') === null,
     )).toBe(true)
-    await expect(liveStatus).toHaveText('Writing the answer')
+    // The parent remains a turn-wide working indicator while only the child
+    // phase changes as the model moves from tools into answer composition.
+    await expect(liveStatus).toHaveText('Working')
     await expect(
       liveActivity.getByText('Writing the answer', { exact: true }),
     ).toHaveCount(1)
-    await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
+    await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_use_start', {
       tool_use_id: 'activity-verify',

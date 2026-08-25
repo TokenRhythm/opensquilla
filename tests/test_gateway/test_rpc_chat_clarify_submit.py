@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.gateway import rpc_chat as rpc_chat_module
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_chat import (
     _clarify_fields_to_text,
@@ -244,11 +245,17 @@ async def test_clarify_submit_logs_safe_entry_metadata(monkeypatch):
         captured["event"] = event
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._handle_chat_send",
-        _fake_send,
-    )
-    monkeypatch.setattr("opensquilla.gateway.rpc_chat.log.info", _fake_info)
+    monkeypatch.setattr(rpc_chat_module, "_handle_chat_send", _fake_send)
+    real_log = rpc_chat_module.log
+
+    class _InfoLog:
+        def info(self, event, **kwargs):
+            _fake_info(event, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(rpc_chat_module, "log", _InfoLog())
 
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
     await _handle_chat_clarify_submit(

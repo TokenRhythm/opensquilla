@@ -2,9 +2,9 @@
 
 The normalizer owns the boundary between literal model text and executable
 tool events.  It is deliberately independent from UI/display filtering.
-Legacy compatibility dialects preserve rejected candidates as literal text;
-recognized DeepSeek DSML is instead returned as a payload-free rejection so
-the provider can fail explicitly without exposing machine protocol.
+Recognized machine protocol is either converted into a fully validated tool
+lifecycle or returned as a payload-free rejection. Rejected arguments never
+cross the provider boundary as display text or executable tool input.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from .compat_policy import (
     TEXT_TOOL_DIALECT_QWEN_TAG,
     TextToolDialect,
 )
-from .stream_assembly import DEFAULT_MAX_TOOL_CALLS
+from .stream_assembly import DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_NAME_CHARS
 from .types import ToolDefinition
 
 log = structlog.get_logger(__name__)
@@ -101,19 +101,21 @@ def _strict_json_loads(value: str) -> Any:
     return json.loads(value, parse_constant=_reject_nonstandard_json_constant)
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = item
+    return result
+
+
 def _strict_dsml_json_loads(value: str) -> Any:
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError("duplicate JSON object key")
-            result[key] = item
-        return result
 
     return json.loads(
         value,
         parse_constant=_reject_nonstandard_json_constant,
-        object_pairs_hook=unique_object,
+        object_pairs_hook=_unique_json_object,
     )
 
 
@@ -177,6 +179,9 @@ TextToolRejectionReason = Literal[
     "dsml_oversized",
     "dsml_unknown_tool",
     "dsml_schema_invalid",
+    "text_malformed",
+    "text_unknown_tool",
+    "text_schema_invalid",
 ]
 
 
@@ -192,6 +197,18 @@ class RejectedTextToolSegment:
     dialect: TextToolDialect
     reason: TextToolRejectionReason
     call_count: int = 0
+    recognized_tool_names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.recognized_tool_names) > DEFAULT_MAX_TOOL_CALLS:
+            raise ValueError("rejected text tool names exceeded the call limit")
+        if any(
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name) > DEFAULT_MAX_TOOL_NAME_CHARS
+            for name in self.recognized_tool_names
+        ):
+            raise ValueError("rejected text tool name is invalid")
 
 
 @dataclass(frozen=True)
@@ -935,6 +952,7 @@ def _qwen_protocol_span_at(text: str, start: int) -> _ProtocolSpan | None:
         try:
             value, body_end = json.JSONDecoder(
                 parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_unique_json_object,
             ).raw_decode(text, cursor)
         except (json.JSONDecodeError, ValueError, RecursionError):
             return None
@@ -1334,6 +1352,25 @@ def _schema_validation_errors(
     return []
 
 
+def _bounded_allowlisted_tool_names(
+    names: Iterator[str] | Sequence[str],
+    tools_by_name: Mapping[str, ToolDefinition],
+) -> tuple[str, ...]:
+    """Retain only bounded names already authorized by the request tool surface."""
+
+    recognized: list[str] = []
+    for name in names:
+        if (
+            name in tools_by_name
+            and name.strip()
+            and len(name) <= DEFAULT_MAX_TOOL_NAME_CHARS
+        ):
+            recognized.append(name)
+            if len(recognized) >= DEFAULT_MAX_TOOL_CALLS:
+                break
+    return tuple(recognized)
+
+
 def _validated_call(
     *,
     tool_name: str,
@@ -1343,7 +1380,11 @@ def _validated_call(
     tools_by_name: dict[str, ToolDefinition],
     provider_kind: str,
     model: str,
-) -> SyntheticTextToolCall | None:
+) -> tuple[
+    SyntheticTextToolCall | None,
+    TextToolRejectionReason | None,
+    tuple[str, ...],
+]:
     # Keep provider import order side-effect free; these modules transitively
     # import the built-in tool registry.
     from opensquilla.tools.argument_normalization import (
@@ -1364,7 +1405,7 @@ def _validated_call(
             tool=tool_name,
             dialect=dialect,
         )
-        return None
+        return None, "text_unknown_tool", ()
 
     normalization = canonicalize_tool_arguments(tool_name, raw_arguments)
     arguments = normalization.arguments
@@ -1404,7 +1445,7 @@ def _validated_call(
             parse_format=parse_format,
             errors=errors,
         )
-        return None
+        return None, "text_schema_invalid", (tool_name,)
     if normalization.aliases_applied:
         log.warning(
             "provider.tool_arguments_aliases_applied",
@@ -1413,11 +1454,15 @@ def _validated_call(
             tool=tool_name,
             aliases=normalization.aliases_applied,
         )
-    return SyntheticTextToolCall(
-        tool_name=tool_name,
-        arguments=arguments,
-        dialect=dialect,
-        parse_format=parse_format,
+    return (
+        SyntheticTextToolCall(
+            tool_name=tool_name,
+            arguments=arguments,
+            dialect=dialect,
+            parse_format=parse_format,
+        ),
+        None,
+        (),
     )
 
 
@@ -1459,6 +1504,7 @@ def _dsml_rejection_segments(
     end: int,
     reason: TextToolRejectionReason,
     call_count: int,
+    recognized_tool_names: tuple[str, ...] = (),
 ) -> list[TextToolSegment]:
     segments: list[TextToolSegment] = []
     if start > 0:
@@ -1468,6 +1514,7 @@ def _dsml_rejection_segments(
             dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
             reason=reason,
             call_count=call_count,
+            recognized_tool_names=recognized_tool_names,
         )
     )
     if end < len(full_text):
@@ -1484,15 +1531,28 @@ def _classify_dsml_candidate(
         return None
     if result.status == "rejected":
         assert result.reason is not None
+        rejected_text = full_text[result.start : result.end]
+        recognized_tool_names = _bounded_allowlisted_tool_names(
+            (
+                match.group("name")
+                for match in _DSML_INVOKE_OPEN_RE.finditer(rejected_text)
+            ),
+            tools_by_name,
+        )
         return _dsml_rejection_segments(
             full_text,
             start=result.start,
             end=result.end,
             reason=result.reason,
             call_count=result.call_count,
+            recognized_tool_names=recognized_tool_names,
         )
 
     calls: list[SyntheticTextToolCall] = []
+    recognized_tool_names = _bounded_allowlisted_tool_names(
+        (raw_call.tool_name for raw_call in result.calls),
+        tools_by_name,
+    )
     for raw_call in result.calls:
         call, rejection = _validated_dsml_call(
             raw_call=raw_call,
@@ -1506,6 +1566,7 @@ def _classify_dsml_candidate(
                 end=result.end,
                 reason=rejection,
                 call_count=result.call_count,
+                recognized_tool_names=recognized_tool_names,
             )
         calls.append(call)
 
@@ -1545,6 +1606,186 @@ def _classify_inert_dsml_candidate(full_text: str) -> list[TextToolSegment]:
     if result.end < len(full_text):
         segments.append(LiteralTextSegment(full_text[result.end :]))
     return segments
+
+
+def _text_rejection_segments(
+    full_text: str,
+    *,
+    start: int,
+    dialect: TextToolDialect,
+    reason: TextToolRejectionReason,
+    recognized_tool_names: tuple[str, ...] = (),
+    call_count: int = 1,
+) -> list[TextToolSegment]:
+    segments: list[TextToolSegment] = []
+    if start > 0:
+        segments.append(LiteralTextSegment(full_text[:start]))
+    segments.append(
+        RejectedTextToolSegment(
+            dialect=dialect,
+            reason=reason,
+            call_count=max(0, call_count),
+            recognized_tool_names=recognized_tool_names,
+        )
+    )
+    return segments
+
+
+def _qwen_invalid_json_arguments_at(
+    text: str,
+    start: int,
+    tools_by_name: Mapping[str, ToolDefinition],
+) -> tuple[int, tuple[str, ...]] | None:
+    """Recognize one complete Qwen JSON envelope with invalid arguments.
+
+    The permissive decode is used only to prove the envelope boundary and an
+    unambiguous allowlisted identity.  Its value is never executed.  Duplicate
+    keys and arbitrary structural junk remain literal because neither proves
+    which tool call the provider intended.
+    """
+
+    wrapper = _QWEN_TOOL_CALL_OPEN_RE.match(text, start)
+    if wrapper is None:
+        return None
+    cursor = _skip_whitespace(text, wrapper.end())
+    if cursor >= len(text) or text[cursor] != "{":
+        return None
+    try:
+        value, body_end = json.JSONDecoder(
+            object_pairs_hook=_unique_json_object,
+        ).raw_decode(text, cursor)
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str):
+        return None
+    names = _bounded_allowlisted_tool_names((name.strip(),), tools_by_name)
+    if not names:
+        return None
+
+    arguments = value.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = _strict_json_loads(arguments)
+        except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+            arguments_are_invalid = True
+        else:
+            arguments_are_invalid = not isinstance(arguments, dict) or not (
+                _is_strict_json_value(arguments)
+            )
+    else:
+        arguments_are_invalid = not isinstance(arguments, dict) or not (
+            _is_strict_json_value(arguments)
+        )
+    if not arguments_are_invalid:
+        return None
+
+    wrapper_close = _QWEN_TOOL_CALL_CLOSE_RE.match(
+        text,
+        _skip_whitespace(text, body_end),
+    )
+    if wrapper_close is None:
+        return None
+    return wrapper_close.end(), names
+
+
+def _plain_invalid_json_arguments_at(
+    text: str,
+    start: int,
+    tool_name: str,
+) -> int | None:
+    """Return the end of a complete bare call whose JSON is non-finite.
+
+    Plain compatibility syntax has no owned wrapper, so only an exact
+    allowlisted name followed by a completely decoded object is strong enough
+    to claim it.  Syntax errors, partial objects, duplicate keys, and trailing
+    prose remain ordinary assistant text.
+    """
+
+    pattern = re.compile(
+        rf"(?<![{_TOOL_NAME_CHARS}]){re.escape(tool_name)}"
+        rf"[ \t]{{0,{PLAIN_TOOL_INTERSTITIAL_WHITESPACE_MAX}}}(?=\{{)",
+    )
+    match = pattern.match(text, start)
+    if match is None:
+        return None
+    try:
+        value, end = json.JSONDecoder(
+            object_pairs_hook=_unique_json_object,
+        ).raw_decode(text, match.end())
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict) or _is_strict_json_value(value):
+        return None
+    return end
+
+
+def _rejected_argument_candidate(
+    full_text: str,
+    *,
+    dialects: frozenset[TextToolDialect],
+    tools_by_name: Mapping[str, ToolDefinition],
+) -> tuple[int, int, TextToolDialect, tuple[str, ...]] | None:
+    """Find a complete, unambiguous call whose arguments are invalid.
+
+    This intentionally does not recognize partial wrappers, XML structural
+    junk, or unknown names.  Those inputs cannot authorize even a synthetic
+    start event and therefore retain the legacy literal-text behavior.
+    """
+
+    code_ranges = _markdown_code_ranges(full_text)
+    candidates: list[tuple[int, int, TextToolDialect, tuple[str, ...]]] = []
+
+    def accepted_start(position: int) -> bool:
+        return not _position_is_in_code(
+            position, code_ranges
+        ) and _candidate_starts_on_standalone_line(full_text, position)
+
+    if TEXT_TOOL_DIALECT_QWEN_TAG in dialects:
+        for match in _QWEN_TOOL_CALL_OPEN_RE.finditer(full_text):
+            if not accepted_start(match.start()):
+                continue
+            rejected = _qwen_invalid_json_arguments_at(
+                full_text,
+                match.start(),
+                tools_by_name,
+            )
+            if rejected is None:
+                continue
+            end, names = rejected
+            candidates.append(
+                (match.start(), end, TEXT_TOOL_DIALECT_QWEN_TAG, names)
+            )
+            break
+    if TEXT_TOOL_DIALECT_PLAIN_JSON in dialects:
+        for tool_name in tools_by_name:
+            pattern = re.compile(
+                rf"(?<![{_TOOL_NAME_CHARS}]){re.escape(tool_name)}"
+                rf"[ \t]{{0,{PLAIN_TOOL_INTERSTITIAL_WHITESPACE_MAX}}}\{{"
+            )
+            for match in pattern.finditer(full_text):
+                if not accepted_start(match.start()):
+                    continue
+                plain_end = _plain_invalid_json_arguments_at(
+                    full_text,
+                    match.start(),
+                    tool_name,
+                )
+                if plain_end is None:
+                    continue
+                names = _bounded_allowlisted_tool_names((tool_name,), tools_by_name)
+                candidates.append(
+                    (
+                        match.start(),
+                        plain_end,
+                        TEXT_TOOL_DIALECT_PLAIN_JSON,
+                        names,
+                    )
+                )
+                break
+    return min(candidates, key=lambda candidate: candidate[0]) if candidates else None
 
 
 def _plain_text_tool_match(
@@ -1611,6 +1852,29 @@ def classify_text_tool_segments(
         return [LiteralTextSegment(full_text)]
 
     matches: list[tuple[int, int, tuple[SyntheticTextToolCall, ...]]] = []
+    rejected_reason: TextToolRejectionReason | None = None
+    rejected_dialect: TextToolDialect | None = None
+    rejected_start: int | None = None
+    rejected_spans: list[tuple[int, int]] = []
+    recognized_tool_names: list[str] = []
+
+    def observe_rejection(
+        *,
+        start: int,
+        end: int,
+        dialect: TextToolDialect,
+        reason: TextToolRejectionReason,
+        names: tuple[str, ...],
+    ) -> None:
+        nonlocal rejected_reason, rejected_dialect, rejected_start
+        if rejected_reason is None:
+            rejected_reason = reason
+            rejected_dialect = dialect
+        rejected_start = start if rejected_start is None else min(rejected_start, start)
+        span = (start, end)
+        if span not in rejected_spans:
+            rejected_spans.append(span)
+        recognized_tool_names.extend(names)
 
     if TEXT_TOOL_DIALECT_QWEN_TAG in dialects:
         protocol_spans = _scan_protocol_spans(
@@ -1620,7 +1884,7 @@ def classify_text_tool_segments(
         )
         for protocol_span in protocol_spans:
             raw_call = protocol_span.calls[0]
-            call = _validated_call(
+            call, rejection, rejected_names = _validated_call(
                 tool_name=raw_call.tool_name,
                 raw_arguments=raw_call.arguments,
                 dialect=TEXT_TOOL_DIALECT_QWEN_TAG,
@@ -1630,7 +1894,18 @@ def classify_text_tool_segments(
                 model=model,
             )
             if call is None:
-                return [LiteralTextSegment(full_text)]
+                assert rejection is not None
+                if rejection == "text_unknown_tool":
+                    return [LiteralTextSegment(full_text)]
+                observe_rejection(
+                    start=protocol_span.start,
+                    end=protocol_span.end,
+                    dialect=TEXT_TOOL_DIALECT_QWEN_TAG,
+                    reason=rejection,
+                    names=rejected_names,
+                )
+                continue
+            recognized_tool_names.append(call.tool_name)
             span = (protocol_span.start, protocol_span.end)
             matches.append((*span, (call,)))
 
@@ -1642,8 +1917,9 @@ def classify_text_tool_segments(
         )
         for protocol_span in protocol_spans:
             calls: list[SyntheticTextToolCall] = []
+            span_rejected = False
             for raw_call in protocol_span.calls:
-                call = _validated_call(
+                call, rejection, rejected_names = _validated_call(
                     tool_name=raw_call.tool_name,
                     raw_arguments=raw_call.arguments,
                     dialect=TEXT_TOOL_DIALECT_MINIMAX_XML,
@@ -1653,17 +1929,30 @@ def classify_text_tool_segments(
                     model=model,
                 )
                 if call is None:
-                    return [LiteralTextSegment(full_text)]
+                    assert rejection is not None
+                    if rejection == "text_unknown_tool":
+                        return [LiteralTextSegment(full_text)]
+                    observe_rejection(
+                        start=protocol_span.start,
+                        end=protocol_span.end,
+                        dialect=TEXT_TOOL_DIALECT_MINIMAX_XML,
+                        reason=rejection,
+                        names=rejected_names,
+                    )
+                    span_rejected = True
+                    continue
+                recognized_tool_names.append(call.tool_name)
                 calls.append(call)
-            span = (protocol_span.start, protocol_span.end)
-            matches.append((*span, tuple(calls)))
+            if calls and not span_rejected:
+                span = (protocol_span.start, protocol_span.end)
+                matches.append((*span, tuple(calls)))
 
     if TEXT_TOOL_DIALECT_PLAIN_JSON in dialects:
         plain_match = _plain_text_tool_match(full_text)
         plain_spans: list[tuple[int, int]] = []
         if plain_match is not None:
             start, end, tool_name, raw_arguments = plain_match
-            call = _validated_call(
+            call, rejection, rejected_names = _validated_call(
                 tool_name=tool_name,
                 raw_arguments=raw_arguments,
                 dialect=TEXT_TOOL_DIALECT_PLAIN_JSON,
@@ -1673,17 +1962,84 @@ def classify_text_tool_segments(
                 model=model,
             )
             if call is None:
-                return [LiteralTextSegment(full_text)]
-            plain_spans.append((start, end))
-            matches.append((start, end, (call,)))
+                assert rejection is not None
+                if rejection == "text_unknown_tool":
+                    return [LiteralTextSegment(full_text)]
+                observe_rejection(
+                    start=start,
+                    end=end,
+                    dialect=TEXT_TOOL_DIALECT_PLAIN_JSON,
+                    reason=rejection,
+                    names=rejected_names,
+                )
+            else:
+                recognized_tool_names.append(call.tool_name)
+                plain_spans.append((start, end))
+                matches.append((start, end, (call,)))
         for tool_name in tools_by_name:
             pattern = re.compile(
                 rf"(?<![{_TOOL_NAME_CHARS}]){re.escape(tool_name)}"
                 rf"[ \t]{{0,{PLAIN_TOOL_INTERSTITIAL_WHITESPACE_MAX}}}\{{"
             )
             openings = _outside_code_openings(pattern, full_text, [])
-            if not _all_openings_are_covered(openings, plain_spans):
-                return [LiteralTextSegment(full_text)]
+            if rejected_reason is None and not _all_openings_are_covered(
+                openings, plain_spans
+            ):
+                malformed = _rejected_argument_candidate(
+                    full_text,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_PLAIN_JSON}),
+                    tools_by_name=tools_by_name,
+                )
+                if malformed is not None:
+                    start, end, dialect, names = malformed
+                    observe_rejection(
+                        start=start,
+                        end=end,
+                        dialect=dialect,
+                        reason="text_malformed",
+                        names=names,
+                    )
+
+    if rejected_reason is None:
+        malformed = _rejected_argument_candidate(
+            full_text,
+            dialects=dialects,
+            tools_by_name=tools_by_name,
+        )
+        if malformed is not None:
+            start, end, dialect, names = malformed
+            observe_rejection(
+                start=start,
+                end=end,
+                dialect=dialect,
+                reason="text_malformed",
+                names=names,
+            )
+
+    if rejected_reason is not None:
+        assert rejected_dialect is not None and rejected_start is not None
+        candidate_spans = [
+            *(span for span in rejected_spans),
+            *((start, end) for start, end, _calls in matches),
+        ]
+        if not _standalone_candidate_layout(full_text, candidate_spans):
+            return [LiteralTextSegment(full_text)]
+        return _text_rejection_segments(
+            full_text,
+            start=min(
+                rejected_start,
+                *(start for start, _end, _calls in matches),
+            )
+            if matches
+            else rejected_start,
+            dialect=rejected_dialect,
+            reason=rejected_reason,
+            recognized_tool_names=_bounded_allowlisted_tool_names(
+                recognized_tool_names,
+                tools_by_name,
+            ),
+            call_count=max(1, len(recognized_tool_names)),
+        )
 
     matches.sort(key=lambda item: (item[0], item[1]))
     cursor = 0

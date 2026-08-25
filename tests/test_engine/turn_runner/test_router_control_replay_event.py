@@ -245,7 +245,9 @@ async def test_replayed_turn_keeps_user_message_binding(monkeypatch) -> None:
     replay_events = [event for event in events if isinstance(event, RouterControlReplayEvent)]
     assert len(replay_events) == 1
     assert len(provider.message_calls) == 2
-    assert captured_assistant == [("m4", "new final")]
+    assert len(captured_assistant) == 1
+    assert captured_assistant[0][0]
+    assert captured_assistant[0][1] == "new final"
 
     for call in provider.message_calls:
         users = [m.content for m in call if m.role == "user" and isinstance(m.content, str)]
