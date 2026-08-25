@@ -63,6 +63,7 @@ COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
 COPY opensquilla-webui/ ./opensquilla-webui/
 COPY src/ ./src/
 COPY migrations/ ./migrations/
+COPY desktop/electron/runtime/runtime-pack-catalog.json ./desktop/electron/runtime/runtime-pack-catalog.json
 COPY --from=webui-builder \
     /build/src/opensquilla/gateway/static/dist/ \
     ./src/opensquilla/gateway/static/dist/
