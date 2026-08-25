@@ -1714,18 +1714,200 @@ def test_owner_registry_supports_concurrent_process_writers(tmp_path) -> None:
     )
 
     def write(index: int) -> None:
-        subprocess.run(
+        completed = subprocess.run(
             [sys.executable, "-c", worker, str(state_dir), f"{index + 1:032x}"],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             timeout=15.0,
+        )
+        assert completed.returncode == 0, (
+            f"owner registry writer {index} exited with {completed.returncode}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         list(executor.map(write, range(12)))
 
     assert len(process_tree._load_owner_records(state_dir)) == 12
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        sqlite3.OperationalError("database is locked"),
+        sqlite3.OperationalError("database table is locked"),
+    ],
+)
+def test_owner_registry_classifies_sqlite_lock_messages_as_transient(error) -> None:
+    assert process_tree._is_transient_owner_registry_write_error(error) is True
+
+
+@pytest.mark.parametrize("error_code", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED])
+def test_owner_registry_classifies_sqlite_lock_codes_as_transient(error_code: int) -> None:
+    error = sqlite3.OperationalError("synthetic sqlite contention")
+    error.sqlite_errorcode = error_code
+
+    assert process_tree._is_transient_owner_registry_write_error(error) is True
+
+
+def test_owner_registry_retries_transient_insert_contention(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[float] = []
+    delays: list[float] = []
+    executed: list[tuple[str, tuple[object, ...]]] = []
+
+    class SyntheticConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, statement: str, parameters: tuple[object, ...]) -> None:
+            executed.append((statement, parameters))
+
+    def connect(_path, *, timeout_seconds: float):
+        attempts.append(timeout_seconds)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return SyntheticConnection()
+
+    scope = process_tree._TaskProcessScope(
+        state_dir=tmp_path,
+        session_digest="a" * 64,
+        task_digest="b" * 64,
+    )
+    monkeypatch.setattr(
+        process_tree,
+        "_strict_process_start_identity",
+        lambda _pid: "synthetic-start-identity",
+    )
+    monkeypatch.setattr(process_tree, "_connect_owner_database", connect)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    reference = process_tree._insert_owner_record(
+        scope,
+        owner_id="c" * 32,
+        platform="windows",
+        controller_pid=4242,
+    )
+
+    assert attempts == [process_tree._OWNER_DATABASE_INSERT_TIMEOUT_SECONDS] * 3
+    assert delays == list(process_tree._OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS[:2])
+    assert len(executed) == 1
+    assert reference.record.owner_id == "c" * 32
+
+
+def test_owner_registry_insert_contention_exhaustion_remains_fail_closed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def connect(_path, *, timeout_seconds: float):
+        nonlocal attempts
+        assert timeout_seconds == process_tree._OWNER_DATABASE_INSERT_TIMEOUT_SECONDS
+        attempts += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    scope = process_tree._TaskProcessScope(
+        state_dir=tmp_path,
+        session_digest="a" * 64,
+        task_digest="b" * 64,
+    )
+    monkeypatch.setattr(
+        process_tree,
+        "_strict_process_start_identity",
+        lambda _pid: "synthetic-start-identity",
+    )
+    monkeypatch.setattr(process_tree, "_connect_owner_database", connect)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="could not be persisted before launch",
+    ) as exc_info:
+        process_tree._insert_owner_record(
+            scope,
+            owner_id="c" * 32,
+            platform="windows",
+            controller_pid=4242,
+        )
+
+    assert isinstance(exc_info.value.__cause__, sqlite3.OperationalError)
+    assert attempts == len(process_tree._OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS) + 1
+    assert delays == list(process_tree._OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS)
+
+
+def test_owner_registry_does_not_retry_nontransient_insert_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def connect(_path, *, timeout_seconds: float):
+        nonlocal attempts
+        assert timeout_seconds == process_tree._OWNER_DATABASE_INSERT_TIMEOUT_SECONDS
+        attempts += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    scope = process_tree._TaskProcessScope(
+        state_dir=tmp_path,
+        session_digest="a" * 64,
+        task_digest="b" * 64,
+    )
+    monkeypatch.setattr(
+        process_tree,
+        "_strict_process_start_identity",
+        lambda _pid: "synthetic-start-identity",
+    )
+    monkeypatch.setattr(process_tree, "_connect_owner_database", connect)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="could not be persisted before launch",
+    ) as exc_info:
+        process_tree._insert_owner_record(
+            scope,
+            owner_id="c" * 32,
+            platform="windows",
+            controller_pid=4242,
+        )
+
+    assert isinstance(exc_info.value.__cause__, sqlite3.DatabaseError)
+    assert attempts == 1
+    assert delays == []
+
+
+def test_windows_owner_registry_classifies_only_known_sharing_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transient = PermissionError("synthetic sharing violation")
+    transient.winerror = 32
+    permanent = PermissionError("synthetic permanent failure")
+    permanent.winerror = 87
+    dacl_verification = private_paths._WindowsPrivateDaclVerificationError(
+        0,
+        "synthetic DACL verification race",
+    )
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+
+    assert process_tree._is_transient_owner_registry_write_error(transient) is True
+    assert process_tree._is_transient_owner_registry_write_error(dacl_verification) is True
+    assert process_tree._is_transient_owner_registry_write_error(permanent) is False
+    assert (
+        process_tree._is_transient_owner_registry_write_error(
+            OSError("synthetic unknown ACL failure")
+        )
+        is False
+    )
 
 
 def test_windows_registry_retries_only_transient_file_sharing_failures(
@@ -1749,6 +1931,76 @@ def test_windows_registry_retries_only_transient_file_sharing_failures(
     process_tree._prepare_private_file(tmp_path / "synthetic-registry.sqlite3")
 
     assert attempts == 3
+
+
+def test_windows_registry_retries_main_file_identity_change(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def prepare(_path: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise process_tree._OwnerRegistryFileChangedError(
+                "task process owner registry changed during privacy hardening"
+            )
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_private_file(tmp_path / "synthetic-registry.sqlite3")
+
+    assert attempts == 3
+
+
+def test_windows_registry_retries_disappearing_main_file(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def prepare(_path: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise FileNotFoundError("synthetic first-writer cleanup race")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_private_file(tmp_path / "synthetic-registry.sqlite3")
+
+    assert attempts == 3
+
+
+def test_windows_registry_main_file_identity_churn_remains_fail_closed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def prepare(_path: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise process_tree._OwnerRegistryFileChangedError(
+            "task process owner registry changed during privacy hardening"
+        )
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "_prepare_private_file_once", prepare)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(
+        process_tree.ProcessTreeOwnershipError,
+        match="registry changed during privacy hardening",
+    ):
+        process_tree._prepare_private_file(tmp_path / "synthetic-registry.sqlite3")
+
+    assert attempts == len(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS) + 1
 
 
 def test_windows_registry_retries_transient_directory_acl_sharing_failures(
@@ -1814,6 +2066,32 @@ def test_windows_registry_retries_sidecar_identity_change(
 
     assert attempts == 2
     assert sidecar.read_bytes() == b"replacement"
+
+
+def test_windows_registry_retries_sidecar_dacl_verification_race(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "synthetic-registry.sqlite3-journal"
+    sidecar.write_bytes(b"synthetic")
+    attempts = 0
+
+    def verify_dacl(*_args: object, **_kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise private_paths._WindowsPrivateDaclVerificationError(
+                0,
+                "synthetic DACL verification race",
+            )
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", verify_dacl)
+    monkeypatch.setattr(process_tree.time, "sleep", lambda _delay: None)
+
+    process_tree._prepare_existing_private_file(sidecar)
+
+    assert attempts == 3
 
 
 def test_windows_registry_retries_sidecar_identity_change_before_acl(

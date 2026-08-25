@@ -2333,6 +2333,15 @@ def _windows_direct_powershell_argv(command: str) -> tuple[str, ...]:
     )
 
 
+def _windows_powershell_with_final_exit_code(command: str) -> str:
+    return (
+        f"{command}; "
+        "if ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) "
+        "{ exit $global:LASTEXITCODE }; "
+        "if (-not $?) { exit 1 }"
+    )
+
+
 def _windows_shell_host_argv(
     command: str,
     *,
@@ -3204,6 +3213,10 @@ def _sandbox_shell_backend_argv(
     backend_name = getattr(backend, "name", "")
     if backend_name.startswith("windows_"):
         return _windows_shell_host_argv(command, cwd=cwd)
+    if os.name == "nt" and backend_name == "noop":
+        return _windows_direct_powershell_argv(
+            _windows_powershell_with_final_exit_code(command)
+        )
     return ("sh", "-lc", command)
 
 
