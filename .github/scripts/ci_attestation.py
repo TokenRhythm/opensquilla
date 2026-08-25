@@ -268,10 +268,8 @@ def create_attestation(
 
     if plan_basis not in {"change_set", "full_fallback"}:
         raise AttestationError("evidence plan basis is invalid")
-    if plan_basis == "full_fallback" and (
-        source_event != "merge_group" or evidence_kind != "root"
-    ):
-        raise AttestationError("full-fallback evidence must be a root merge-group run")
+    if plan_basis == "full_fallback" and evidence_kind != "root":
+        raise AttestationError("full-fallback evidence must be a root run")
 
     suites = sorted({item for item in successful_suites if item}) or ["ci-result"]
     execution_digests = dict(sorted((suite_execution_digests or {}).items()))
@@ -739,10 +737,8 @@ def _validate_canonical_source_plan(
     plan_basis = attestation.get("plan_basis")
     evidence_kind = attestation.get("evidence_kind")
     if plan_basis == "full_fallback":
-        if source_event != "merge_group" or evidence_kind != "root":
-            raise AttestationError(
-                "full-fallback evidence must be a root merge-group run"
-            )
+        if evidence_kind != "root":
+            raise AttestationError("full-fallback evidence must be a root run")
         changed_paths = [".ci/run-all"]
     elif plan_basis != "change_set":
         raise AttestationError("evidence plan basis is invalid")
@@ -896,6 +892,8 @@ def validate_candidate(
     if match_kind == "exact":
         if tested_tree_sha != queue_tree_sha:
             raise AttestationError("attestation tested tree does not match the queue")
+        if tested_base_sha != queue_base_sha:
+            raise AttestationError("attestation tested base does not match the queue")
     elif match_kind == "composed":
         if reconstructed_queue_tree != queue_tree_sha:
             raise AttestationError("pull request head and queue base do not reconstruct queue tree")
@@ -1017,23 +1015,6 @@ def verify_queue(
         if queue_policy != base_policy:
             raise AttestationError("CI policy changed relative to the queue base")
 
-        nightly_details: dict[str, object] = {}
-        nightly_healthy, nightly_reason = verify_nightly_health(
-            repo=repo,
-            repository=repository,
-            token=token,
-            api_url=api_url,
-            details=nightly_details,
-        )
-        details.update(
-            nightly_healthy=str(nightly_healthy).lower(),
-            nightly_reason=nightly_reason,
-            nightly_run_id=nightly_details.get("source_run_id", ""),
-            nightly_age_seconds=nightly_details.get("age_seconds", ""),
-        )
-        if not nightly_healthy:
-            raise AttestationError(f"nightly health check failed: {nightly_reason}")
-
         pull_request_number = _queue_pr_number(merge_group)
         current_pull_request = _request_json(
             f"{api_url}/repos/{repository}/pulls/{pull_request_number}", token
@@ -1125,7 +1106,16 @@ def verify_queue(
                 tested_tree = _require_sha(
                     attestation.get("tested_tree_sha"), "attested tree SHA"
                 )
-                match_kind = "exact" if tested_tree == queue_tree_sha else "composed"
+                if tested_tree != queue_tree_sha:
+                    raise AttestationError(
+                        "only exact-tree pull request evidence may be reused"
+                    )
+                if attestation.get("source_event") != "pull_request":
+                    raise AttestationError(
+                        "only pull request evidence may be reused by the queue"
+                    )
+                if attestation.get("evidence_kind") != "root":
+                    raise AttestationError("only root evidence may be reused by the queue")
                 validate_candidate(
                     attestation=attestation,
                     run=run,
@@ -1133,61 +1123,33 @@ def verify_queue(
                     queue_tree_sha=queue_tree_sha,
                     queue_base_sha=queue_base_sha,
                     queue_policy_digest=queue_policy,
-                    match_kind=match_kind,
+                    match_kind="exact",
                     current_pull_request=current_pull_request,
                     reconstructed_queue_tree=reconstructed_tree,
                     repo=repo,
                 )
-                if attestation.get("source_event") == "pull_request":
-                    attested_number = attestation.get("pull_request_number")
-                    attested_head = _require_sha(
-                        attestation.get("head_sha"), "attested head SHA"
+                attested_number = attestation.get("pull_request_number")
+                attested_head = _require_sha(
+                    attestation.get("head_sha"), "attested head SHA"
+                )
+                if attested_number != pull_request_number:
+                    raise AttestationError("evidence belongs to another pull request")
+                latest_run_id = _latest_pr_run_id(
+                    api_url=api_url,
+                    repository=repository,
+                    token=token,
+                    pull_request_number=pull_request_number,
+                    head_sha=attested_head,
+                    head_ref=str(attestation.get("head_ref", "")),
+                )
+                if latest_run_id != run_id:
+                    raise AttestationError(
+                        "evidence workflow run is not the latest authoritative PR run"
                     )
-                    if attested_number != pull_request_number:
-                        raise AttestationError("evidence belongs to another pull request")
-                    latest_run_id = _latest_pr_run_id(
-                        api_url=api_url,
-                        repository=repository,
-                        token=token,
-                        pull_request_number=pull_request_number,
-                        head_sha=attested_head,
-                        head_ref=str(attestation.get("head_ref", "")),
-                    )
-                    if latest_run_id != run_id:
-                        raise AttestationError(
-                            "evidence workflow run is not the latest authoritative PR run"
-                        )
-                combined_smoke_suites: tuple[str, ...] = ()
-                if match_kind == "composed":
-                    if attestation.get("source_event") != "pull_request":
-                        raise AttestationError(
-                            "only pull request evidence may be composed across a base advance"
-                        )
-                    if not _wait_for_base_successful_ci(
-                        api_url=api_url,
-                        repository=repository,
-                        token=token,
-                        queue_base_sha=queue_base_sha,
-                    ):
-                        raise AttestationError("queue base evidence is not green")
-                    safe, composition_reason, combined_smoke_suites = _composition_is_safe(
-                        repo=repo,
-                        attestation=attestation,
-                        queue_base_sha=queue_base_sha,
-                    )
-                    if not safe:
-                        raise AttestationError(composition_reason)
-                    details["reason_code"] = "reusable_base_advance"
-                    reason = f"composed trusted PR/base evidence: {composition_reason}"
-                else:
-                    details["reason_code"] = "reusable_exact"
-                    reason = "matching trusted exact-tree CI evidence"
+                details["reason_code"] = "reusable_exact"
+                reason = "matching trusted exact-base, exact-tree PR CI evidence"
                 details.update(
-                    artifact_name=(
-                        f"ci-evidence-v2-tree-{queue_tree_sha}"
-                        if match_kind == "exact"
-                        else f"ci-evidence-v2-pr-{pull_request_number}-{current_head_sha}"
-                    ),
+                    artifact_name=f"ci-evidence-v2-tree-{queue_tree_sha}",
                     source_root_issued_at=attestation.get("root_issued_at", ""),
                     source_lineage=json.dumps(
                         attestation.get("lineage", []), separators=(",", ":")
@@ -1201,9 +1163,7 @@ def verify_queue(
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
-                    combined_smoke_suites=_canonical_suite_json(
-                        combined_smoke_suites
-                    ),
+                    combined_smoke_suites=_canonical_suite_json(),
                 )
                 return True, reason, run_id
             except (AttestationError, OSError, ValueError, zipfile.BadZipFile) as exc:
@@ -1513,10 +1473,6 @@ def _verify_queue_command(args: argparse.Namespace) -> int:
                 "source_suite_execution_digests", "{}"
             ),
             "combined_smoke_suites": details.get("combined_smoke_suites", "[]"),
-            "nightly_healthy": details.get("nightly_healthy", "false"),
-            "nightly_reason": details.get("nightly_reason", ""),
-            "nightly_run_id": details.get("nightly_run_id", ""),
-            "nightly_age_seconds": details.get("nightly_age_seconds", ""),
         },
     )
     print(f"reusable={str(reusable).lower()} reason={reason}")

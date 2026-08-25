@@ -99,7 +99,7 @@ def test_verify_queue_details_default_combined_smoke_to_empty_json(
     assert details["combined_smoke_suites"] == "[]"
 
 
-def test_verify_queue_command_emits_canonical_combined_smoke_output(
+def test_verify_queue_command_emits_fail_closed_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -109,10 +109,10 @@ def test_verify_queue_command_emits_canonical_combined_smoke_output(
 
     def fake_verify_queue(**kwargs: Any) -> tuple[bool, str, int]:
         kwargs["details"].update(
-            reason_code="reusable_base_advance",
-            combined_smoke_suites='["python-targeted"]',
+            reason_code="reusable_exact",
+            combined_smoke_suites="[]",
         )
-        return True, "trusted overlap", 123
+        return True, "trusted exact evidence", 123
 
     monkeypatch.setenv("GH_TOKEN", "synthetic-token")
     monkeypatch.setitem(
@@ -136,8 +136,10 @@ def test_verify_queue_command_emits_canonical_combined_smoke_output(
         for line in output_path.read_text(encoding="utf-8").splitlines()
     )
     assert outputs["reusable"] == "true"
-    assert outputs["reason_code"] == "reusable_base_advance"
-    assert outputs["combined_smoke_suites"] == '["python-targeted"]'
+    assert outputs["reason_code"] == "reusable_exact"
+    assert outputs["combined_smoke_suites"] == "[]"
+    assert "nightly_healthy" not in outputs
+    assert "nightly_reason" not in outputs
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -199,7 +201,12 @@ def _seed_suite_execution_input_fixtures(repo: Path) -> None:
 
 
 def _merge_preview_repo(
-    tmp_path: Path, *, advance_base: bool = False, change_ci_executor: bool = False
+    tmp_path: Path,
+    *,
+    advance_base: bool = False,
+    change_ci_executor: bool = False,
+    full_plan_change: bool = False,
+    feature_path: str = "src/example.py",
 ) -> tuple[Path, str, str, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -216,13 +223,18 @@ def _merge_preview_repo(
         _write(repo, relative, Path(relative).read_text(encoding="utf-8"))
     _write(repo, "pyproject.toml", "[project]\nname='fixture'\nversion='0'\n")
     _write(repo, "src/example.py", "BASE = True\n")
+    if feature_path != "src/example.py":
+        _write(repo, feature_path, "BASE = True\n")
     _seed_suite_execution_input_fixtures(repo)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "base")
 
     _git(repo, "switch", "-c", "feature")
-    _write(repo, "src/example.py", "BASE = True\nFEATURE = True\n")
-    _git(repo, "add", "src/example.py")
+    _write(repo, feature_path, "BASE = True\nFEATURE = True\n")
+    _git(repo, "add", feature_path)
+    if full_plan_change:
+        _write(repo, "pyproject.toml", "[project]\nname='fixture'\nversion='1'\n")
+        _git(repo, "add", "pyproject.toml")
     if change_ci_executor:
         _write(repo, ".github/scripts/windows_test_shards.py", "TEST_SHARDS = 2\n")
         _git(repo, "add", ".github/scripts/windows_test_shards.py")
@@ -402,6 +414,45 @@ def test_create_command_records_full_merge_group_root_plan(tmp_path: Path) -> No
     )
 
 
+def test_pull_request_root_evidence_records_planner_full_fallback(
+    tmp_path: Path,
+) -> None:
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(
+        tmp_path,
+        feature_path="docs/feature.md",
+        full_plan_change=True,
+    )
+    event = _event(base_sha, head_sha, merge_sha)
+    full_plan = _evidence_metadata(repo, [".ci/run-all"])
+
+    attestation = create_attestation(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        workflow_run_id=123,
+        workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce",
+        plan_basis="full_fallback",
+        **full_plan,
+    )
+
+    assert attestation["source_event"] == "pull_request"
+    assert attestation["evidence_kind"] == "root"
+    assert attestation["plan_basis"] == "full_fallback"
+    assert attestation["successful_suites"] == full_plan["successful_suites"]
+    validate_candidate(
+        attestation=attestation,
+        run=_run(attestation),
+        repository="opensquilla/opensquilla",
+        queue_tree_sha=str(attestation["tested_tree_sha"]),
+        queue_base_sha=base_sha,
+        queue_policy_digest=str(attestation["trust_policy_digest"]),
+        current_pull_request={"number": 42, **event["pull_request"]},
+        repo=repo,
+    )
+
+
 def test_create_attestation_uses_tested_base_when_event_base_is_stale(
     tmp_path: Path,
 ) -> None:
@@ -537,6 +588,65 @@ def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize(
+    ("mismatch", "expected_reason"),
+    (
+        ("policy", "trust_policy_digest"),
+        ("run-attempt", "run_attempt"),
+        ("planner-digest", "planner digest"),
+        ("execution-digest", "execution digest"),
+        ("platform-matrix", "platform matrix"),
+    ),
+)
+def test_validate_candidate_rejects_independent_evidence_contract_mismatches(
+    tmp_path: Path,
+    mismatch: str,
+    expected_reason: str,
+) -> None:
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+    event = _event(base_sha, head_sha, merge_sha)
+    attestation = create_attestation(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        workflow_run_id=123,
+        workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce",
+        **_evidence_metadata(repo),
+    )
+    tampered = json.loads(json.dumps(attestation))
+    run = _run(tampered)
+    queue_policy_digest = str(attestation["trust_policy_digest"])
+
+    if mismatch == "policy":
+        queue_policy_digest = "f" * 64
+    elif mismatch == "run-attempt":
+        run["run_attempt"] = 2
+    elif mismatch == "planner-digest":
+        tampered["planner_digest"] = "f" * 64
+    elif mismatch == "execution-digest":
+        suite = next(iter(tampered["suite_execution_digests"]))
+        tampered["suite_execution_digests"][suite] = "f" * 64
+    elif mismatch == "platform-matrix":
+        assert tampered["platform_matrix"]
+        tampered["platform_matrix"] = tampered["platform_matrix"][:-1]
+    else:  # pragma: no cover - the parametrization is exhaustive
+        raise AssertionError(f"unknown mismatch: {mismatch}")
+
+    with pytest.raises(AttestationError, match=expected_reason):
+        validate_candidate(
+            attestation=tampered,
+            run=run,
+            repository="opensquilla/opensquilla",
+            queue_tree_sha=str(tampered["tested_tree_sha"]),
+            queue_base_sha=base_sha,
+            queue_policy_digest=queue_policy_digest,
+            current_pull_request={"number": 42, **event["pull_request"]},
+            repo=repo,
+        )
+
+
 def test_validate_candidate_rejects_self_reported_incomplete_suite_coverage(
     tmp_path: Path,
 ) -> None:
@@ -606,6 +716,85 @@ def test_validate_candidate_rejects_expired_root_evidence(tmp_path: Path) -> Non
                 "number": 42,
                 **_event(base_sha, head_sha, merge_sha)["pull_request"],
             },
+        )
+
+
+def test_validate_candidate_accepts_ttl_boundary_and_rejects_future_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+    event = _event(base_sha, head_sha, merge_sha)
+    attestation = create_attestation(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        workflow_run_id=123,
+        workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce",
+        **_evidence_metadata(repo),
+    )
+    fixed_now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setitem(validate_candidate.__globals__, "datetime", FrozenDateTime)
+    current_pr = {"number": 42, **event["pull_request"]}
+    attestation["root_issued_at"] = (fixed_now - timedelta(hours=72)).isoformat()
+
+    validate_candidate(
+        attestation=attestation,
+        run=_run(attestation),
+        repository="opensquilla/opensquilla",
+        queue_tree_sha=str(attestation["tested_tree_sha"]),
+        queue_base_sha=base_sha,
+        queue_policy_digest=str(attestation["trust_policy_digest"]),
+        current_pull_request=current_pr,
+    )
+
+    attestation["root_issued_at"] = (fixed_now + timedelta(seconds=301)).isoformat()
+    with pytest.raises(AttestationError, match="future"):
+        validate_candidate(
+            attestation=attestation,
+            run=_run(attestation),
+            repository="opensquilla/opensquilla",
+            queue_tree_sha=str(attestation["tested_tree_sha"]),
+            queue_base_sha=base_sha,
+            queue_policy_digest=str(attestation["trust_policy_digest"]),
+            current_pull_request=current_pr,
+        )
+
+
+def test_validate_candidate_rejects_exact_tree_from_different_base(
+    tmp_path: Path,
+) -> None:
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+    event = _event(base_sha, head_sha, merge_sha)
+    attestation = create_attestation(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        workflow_run_id=123,
+        workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce",
+        **_evidence_metadata(repo),
+    )
+
+    with pytest.raises(AttestationError, match="tested base"):
+        validate_candidate(
+            attestation=attestation,
+            run=_run(attestation),
+            repository="opensquilla/opensquilla",
+            queue_tree_sha=str(attestation["tested_tree_sha"]),
+            queue_base_sha="f" * 40,
+            queue_policy_digest=str(attestation["trust_policy_digest"]),
+            current_pull_request={"number": 42, **event["pull_request"]},
         )
 
 
@@ -900,7 +1089,19 @@ def _verify_composed_fixture(
     monkeypatch.setitem(
         verify_queue.__globals__,
         "verify_nightly_health",
-        lambda **_kwargs: (True, "latest full nightly is green and fresh"),
+        lambda **_kwargs: pytest.fail(
+            "queue verification must not inspect nightly health"
+        ),
+    )
+    monkeypatch.setitem(
+        verify_queue.__globals__,
+        "_wait_for_base_successful_ci",
+        lambda **_kwargs: pytest.fail("queue verification must not compose base evidence"),
+    )
+    monkeypatch.setitem(
+        verify_queue.__globals__,
+        "_composition_is_safe",
+        lambda **_kwargs: pytest.fail("queue verification must not compose evidence"),
     )
     details: dict[str, object] = {}
     reusable, reason, source_run = verify_queue(
@@ -915,7 +1116,7 @@ def _verify_composed_fixture(
     return reusable, reason, source_run, details
 
 
-def test_verify_queue_rejects_python_targeted_overlap(
+def test_verify_queue_rejects_composed_python_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -931,12 +1132,12 @@ def test_verify_queue_rejects_python_targeted_overlap(
     )
 
     assert reusable is False
-    assert "unsupported source suites: python-targeted" in reason
+    assert "only exact-tree pull request evidence" in reason
     assert source_run is None
     assert details["combined_smoke_suites"] == "[]"
 
 
-def test_verify_queue_disjoint_composition_has_no_combined_smoke_suites(
+def test_verify_queue_rejects_disjoint_base_advance_composition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -944,20 +1145,20 @@ def test_verify_queue_disjoint_composition_has_no_combined_smoke_suites(
         tmp_path, base_delta_path="docs/queue.md"
     )
 
-    reusable, _reason, source_run, details = _verify_composed_fixture(
+    reusable, reason, source_run, details = _verify_composed_fixture(
         repo=repo,
         attestation=attestation,
         queue_base=queue_base,
         monkeypatch=monkeypatch,
     )
 
-    assert reusable is True
-    assert source_run == 123
-    assert details["reason_code"] == "reusable_base_advance"
+    assert reusable is False
+    assert "only exact-tree pull request evidence" in reason
+    assert source_run is None
     assert details["combined_smoke_suites"] == "[]"
 
 
-def test_verify_queue_rejects_overlap_outside_combined_smoke_trust_root(
+def test_verify_queue_rejects_composed_full_python_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -975,7 +1176,7 @@ def test_verify_queue_rejects_overlap_outside_combined_smoke_trust_root(
     )
 
     assert reusable is False
-    assert "unsupported source suites: python-full" in reason
+    assert "only exact-tree pull request evidence" in reason
     assert source_run is None
     assert details["combined_smoke_suites"] == "[]"
 
@@ -988,10 +1189,26 @@ def test_squash_binding_reconstructs_the_tested_tree(tmp_path: Path) -> None:
     ) == _git(repo, "rev-parse", "HEAD^{tree}")
 
 
-def test_verify_queue_reuses_only_exact_trusted_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("full_plan_change", "paths", "plan_basis"),
+    (
+        (False, ["docs/feature.md"], "change_set"),
+        (True, [".ci/run-all"], "full_fallback"),
+    ),
+    ids=("targeted", "full"),
+)
+def test_verify_queue_reuses_only_exact_trusted_evidence_without_nightly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full_plan_change: bool,
+    paths: list[str],
+    plan_basis: str,
 ) -> None:
-    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(
+        tmp_path,
+        feature_path="docs/feature.md",
+        full_plan_change=full_plan_change,
+    )
     event = _event(base_sha, head_sha, merge_sha)
     attestation = create_attestation(
         repo=repo,
@@ -1001,13 +1218,17 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
         workflow_run_attempt=1,
         workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
         optimization_mode="shadow",
-        **_evidence_metadata(repo),
+        plan_basis=plan_basis,
+        **_evidence_metadata(repo, paths),
     )
     run = _run(attestation)
     run["created_at"] = "2026-08-20T00:00:00Z"
     current_pr = {"number": 42, **event["pull_request"]}
+    api_calls: list[str] = []
+    latest_runs = [run]
 
     def fake_json(url: str, _token: str) -> dict[str, Any]:
+        api_calls.append(url)
         if "actions/artifacts" in url:
             return {
                 "artifacts": [
@@ -1024,7 +1245,7 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
         if "/pulls/42" in url:
             return current_pr
         if "actions/workflows/ci.yml/runs" in url:
-            return {"workflow_runs": [run]}
+            return {"workflow_runs": latest_runs}
         return run
 
     monkeypatch.setitem(verify_queue.__globals__, "_request_json", fake_json)
@@ -1034,7 +1255,9 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
     monkeypatch.setitem(
         verify_queue.__globals__,
         "verify_nightly_health",
-        lambda **_kwargs: (True, "latest full nightly is green and fresh"),
+        lambda **_kwargs: pytest.fail(
+            "queue verification must not inspect nightly health"
+        ),
     )
 
     details: dict[str, object] = {}
@@ -1049,12 +1272,29 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
     )
 
     assert reusable is True
-    assert reason == "matching trusted exact-tree CI evidence"
+    assert reason == "matching trusted exact-base, exact-tree PR CI evidence"
     assert source_run == 123
     assert details["reason_code"] == "reusable_exact"
     assert details["candidate_count"] == 1
     assert details["artifact_name"].startswith("ci-evidence-v2-tree-")
     assert details["combined_smoke_suites"] == "[]"
+    assert all("event=schedule" not in url for url in api_calls)
+
+    newer_run = {**run, "id": 124, "created_at": "2026-08-21T00:00:00Z"}
+    latest_runs.insert(0, newer_run)
+    reusable, reason, source_run = verify_queue(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        token="synthetic-token",
+        api_url="https://api.github.com",
+        current_run_id=1000,
+    )
+
+    assert reusable is False
+    assert "latest authoritative PR run" in reason
+    assert source_run is None
+    latest_runs[:] = [run]
 
     _write(repo, ".github/workflows/ci.yml", "name: Changed CI\n")
     _git(repo, "add", ".github/workflows/ci.yml")
@@ -1071,6 +1311,90 @@ def test_verify_queue_reuses_only_exact_trusted_evidence(
 
     assert reusable is False
     assert "CI policy changed" in reason
+    assert source_run is None
+
+
+@pytest.mark.parametrize(
+    ("evidence_kind", "source_event", "lineage", "expected_reason"),
+    (
+        ("derived", "pull_request", [456], "only root evidence"),
+        ("root", "pull_request", [456], "root evidence must not have lineage"),
+        ("root", "merge_group", [], "only pull request evidence"),
+    ),
+    ids=("derived", "root-with-lineage", "merge-group-source"),
+)
+def test_verify_queue_rejects_non_root_pr_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_kind: str,
+    source_event: str,
+    lineage: list[int],
+    expected_reason: str,
+) -> None:
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+    event = _event(base_sha, head_sha, merge_sha)
+    attestation = create_attestation(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        workflow_run_id=123,
+        workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce",
+        **_evidence_metadata(repo),
+    )
+    attestation.update(
+        evidence_kind=evidence_kind,
+        source_event=source_event,
+        lineage=lineage,
+    )
+    archive = _archive(attestation)
+    run = _run(attestation)
+    current_pr = {"number": 42, **event["pull_request"]}
+
+    def fake_json(url: str, _token: str) -> dict[str, Any]:
+        if "actions/artifacts" in url:
+            return {
+                "artifacts": [
+                    {
+                        "id": 1,
+                        "expired": False,
+                        "size_in_bytes": len(archive),
+                        "created_at": "2026-08-20T00:00:00Z",
+                        "archive_download_url": "https://api.github.com/artifact.zip",
+                        "workflow_run": {"id": 123},
+                    }
+                ]
+            }
+        if "/pulls/42" in url:
+            return current_pr
+        if url.endswith("/actions/runs/123"):
+            return run
+        raise AssertionError(f"unexpected API request: {url}")
+
+    monkeypatch.setitem(verify_queue.__globals__, "_request_json", fake_json)
+    monkeypatch.setitem(
+        verify_queue.__globals__, "_request_bytes", lambda _url, _token: archive
+    )
+    monkeypatch.setitem(
+        verify_queue.__globals__,
+        "verify_nightly_health",
+        lambda **_kwargs: pytest.fail(
+            "queue verification must not inspect nightly health"
+        ),
+    )
+
+    reusable, reason, source_run = verify_queue(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=event,
+        token="synthetic-token",
+        api_url="https://api.github.com",
+        current_run_id=999,
+    )
+
+    assert reusable is False
+    assert expected_reason in reason
     assert source_run is None
 
 
@@ -1142,7 +1466,9 @@ def test_verify_queue_skips_full_depth_lineage_and_uses_root_candidate(
     monkeypatch.setitem(
         verify_queue.__globals__,
         "verify_nightly_health",
-        lambda **_kwargs: (True, "latest full nightly is green and fresh"),
+        lambda **_kwargs: pytest.fail(
+            "queue verification must not inspect nightly health"
+        ),
     )
 
     reusable, reason, source_run = verify_queue(
@@ -1155,7 +1481,7 @@ def test_verify_queue_skips_full_depth_lineage_and_uses_root_candidate(
     )
 
     assert reusable is True
-    assert reason == "matching trusted exact-tree CI evidence"
+    assert reason == "matching trusted exact-base, exact-tree PR CI evidence"
     assert source_run == 123
 
 
