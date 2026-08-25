@@ -39,12 +39,8 @@ DIGEST_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 PR_QUEUE_REF_RE: Final = re.compile(r"(?:^|/)pr-(?P<number>[1-9][0-9]*)-")
 COMPOSITION_BASELINE_SUITES: Final = frozenset({"readme-locale", "workflow-lint"})
 COMPOSITION_COMBINED_SMOKE_TRUST_ROOT: Final = frozenset()
-TRUST_POLICY_PATHS: Final = (
-    ".github/CODEOWNERS",
-    ".github/ci/suites.v1.json",
-    ".github/scripts",
-    ".github/workflows",
-)
+TRUST_POLICY_MANIFEST: Final = ".github/ci/trust-policy.v1.json"
+TRUST_POLICY_SCHEMA_VERSION: Final = 1
 
 
 class AttestationError(RuntimeError):
@@ -105,13 +101,68 @@ def _require_sha(value: object, label: str) -> str:
     return value
 
 
+def _trust_policy_paths(repo: Path, ref: str) -> tuple[str, ...]:
+    completed = subprocess.run(
+        ["git", "show", f"{ref}:{TRUST_POLICY_MANIFEST}"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise AttestationError(f"CI trust policy manifest is missing at {ref}")
+    try:
+        manifest = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AttestationError(f"CI trust policy manifest is invalid at {ref}") from exc
+    if not isinstance(manifest, dict):
+        raise AttestationError("CI trust policy manifest must be a JSON object")
+    if manifest.get("schema_version") != TRUST_POLICY_SCHEMA_VERSION:
+        raise AttestationError("CI trust policy manifest schema is unsupported")
+    configured_paths = manifest.get("merge_critical_inputs")
+    if not isinstance(configured_paths, list) or not configured_paths:
+        raise AttestationError("CI trust policy inputs are missing")
+    if any(not isinstance(path, str) or not path for path in configured_paths):
+        raise AttestationError("CI trust policy inputs must be non-empty strings")
+
+    paths = tuple(configured_paths)
+    if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+        raise AttestationError("CI trust policy inputs must be unique and sorted")
+    for path in paths:
+        parts = path.split("/")
+        if (
+            not path.startswith(".github/")
+            or path.endswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(marker in path for marker in ("*", "?", "["))
+        ):
+            raise AttestationError(f"CI trust policy input is not an exact .github path: {path}")
+    if TRUST_POLICY_MANIFEST not in paths:
+        raise AttestationError("CI trust policy manifest must include itself")
+    return paths
+
+
 def _policy_entries(repo: Path, ref: str) -> bytes:
-    return subprocess.run(
-        ["git", "ls-tree", "-r", "-z", ref, "--", *TRUST_POLICY_PATHS],
+    paths = _trust_policy_paths(repo, ref)
+    entries = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", ref, "--", *paths],
         cwd=repo,
         check=True,
         capture_output=True,
     ).stdout
+    found_paths: set[str] = set()
+    try:
+        for record in entries.rstrip(b"\0").split(b"\0") if entries else ():
+            _metadata, raw_path = record.split(b"\t", 1)
+            found_paths.add(raw_path.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AttestationError(f"CI trust policy tree is invalid at {ref}") from exc
+    missing = sorted(set(paths) - found_paths)
+    if missing:
+        raise AttestationError(
+            f"CI trust policy inputs are missing at {ref}: {', '.join(missing)}"
+        )
+    return entries
 
 
 def policy_digest(repo: Path, ref: str = "HEAD") -> str:

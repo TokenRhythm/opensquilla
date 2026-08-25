@@ -11308,10 +11308,26 @@ ipcMain.handle('desktop:workbench:artifact:reload-surface', async (event, payloa
 })
 ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  if (appExitPhase !== 'running') {
+    return {
+      ok: false,
+      status: 503,
+      code: 'OWNED_GATEWAY_UNAVAILABLE',
+      message: 'OpenSquilla Desktop is shutting down.',
+    }
+  }
   return await artifactPreviewLeaseBroker.create(payload)
 })
 ipcMain.handle('desktop:workbench:preview-lease:renew', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  if (appExitPhase !== 'running') {
+    return {
+      ok: false,
+      status: 503,
+      code: 'OWNED_GATEWAY_UNAVAILABLE',
+      message: 'OpenSquilla Desktop is shutting down.',
+    }
+  }
   return await artifactPreviewLeaseBroker.renew(payload)
 })
 ipcMain.handle('desktop:workbench:preview-lease:revoke', async (event, payload: unknown) => {
@@ -11320,6 +11336,9 @@ ipcMain.handle('desktop:workbench:preview-lease:revoke', async (event, payload: 
 })
 ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  if (appExitPhase !== 'running') {
+    return { ok: false, message: 'OpenSquilla Desktop is shutting down.' }
+  }
   try {
     const request = parseNativeWorkbenchCreateRequest(payload)
     let activePreviewArtifactId: string | null = null
@@ -11341,6 +11360,9 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
 })
 ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  if (appExitPhase !== 'running') {
+    return { ok: false, message: 'OpenSquilla Desktop is shutting down.' }
+  }
   try {
     return await nativeWorkbenchSurfaces.navigateSurface(
       parseNativeWorkbenchNavigationRequest(payload),
@@ -13805,16 +13827,14 @@ async function drainOwnedGatewayForQuit(
 
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
-  artifactPreviewLeaseBroker.clear()
-  // Remove native child views immediately so they cannot outlive the trusted
-  // Control UI while the gateway/writer shutdown drain keeps Electron alive.
-  void nativeWorkbenchSurfaces.destroyAll()
   // Windows session shutdown cannot wait on our normal asynchronous quit
   // drain. Let the OS-owned close proceed and synchronously signal the current
   // child so the window can never be converted back into background mode.
   if (systemSessionEnding) {
     isQuitting = true
     setAppExitPhase('committed', 'Windows session ending')
+    artifactPreviewLeaseBroker.clear()
+    void nativeWorkbenchSurfaces.destroyAll()
     destroyWindowsTray()
     void desktopArtifactBridgeLoopback.close()
     stopGateway()
@@ -13827,6 +13847,8 @@ app.on('before-quit', (event) => {
   if (updateApplying) {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')
+      artifactPreviewLeaseBroker.clear()
+      void nativeWorkbenchSurfaces.destroyAll()
       destroyWindowsTray()
       void desktopArtifactBridgeLoopback.close()
       return
@@ -13876,11 +13898,17 @@ app.on('before-quit', (event) => {
   if (children.length > 0) {
     event.preventDefault()
     setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
-    const drain = Promise.all(children.map((child) => drainOwnedGatewayForQuit(
-      child,
-      currentChild === child ? gatewayState.url || '' : '',
-      currentChild === child,
-    )))
+    // Fence new preview work and join creates already in flight before making
+    // the Gateway unavailable. Native surface teardown stays best-effort: its
+    // candidate cleanup can depend on the Gateway and must not block shutdown.
+    const previewCleanup = artifactPreviewLeaseBroker.revokeAll()
+    void nativeWorkbenchSurfaces.destroyAll()
+    const drain = previewCleanup
+      .then(() => Promise.all(children.map((child) => drainOwnedGatewayForQuit(
+        child,
+        currentChild === child ? gatewayState.url || '' : '',
+        currentChild === child,
+      ))))
       .then((results) => results.every(Boolean))
       .catch((error) => {
         desktopLog('quit_gateway_drain_failed', {
@@ -13918,6 +13946,8 @@ app.on('before-quit', (event) => {
     return
   }
   setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
+  artifactPreviewLeaseBroker.clear()
+  void nativeWorkbenchSurfaces.destroyAll()
   destroyWindowsTray()
   void desktopArtifactBridgeLoopback.close()
   stopGateway()

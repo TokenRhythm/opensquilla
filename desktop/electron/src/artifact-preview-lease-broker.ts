@@ -360,6 +360,9 @@ export class ArtifactPreviewLeaseBroker {
   private readonly now: () => number
   private readonly timeoutMs: number
   private readonly issued = new Map<string, IssuedArtifactPreview>()
+  private readonly inFlightCreates = new Set<
+    Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>>
+  >()
   private generation = 0
 
   constructor(private readonly options: ArtifactPreviewLeaseBrokerOptions) {
@@ -380,10 +383,13 @@ export class ArtifactPreviewLeaseBroker {
    * Local authority is removed synchronously before any network request. The
    * snapshot also keeps leases created by a replacement renderer out of this
    * cleanup, even while the old Gateway DELETE requests are still pending.
+   * Creates admitted before this call are joined so their stale-lease DELETE
+   * completes while the owned Gateway is still available.
    */
   async revokeAll(): Promise<void> {
     this.generation += 1
     const issued = [...this.issued.entries()]
+    const inFlightCreates = [...this.inFlightCreates]
     for (const [leaseId, lease] of issued) {
       if (lease.bindingPins > 0) {
         lease.revokePending = true
@@ -392,7 +398,7 @@ export class ArtifactPreviewLeaseBroker {
         this.issued.delete(leaseId)
       }
     }
-    await Promise.allSettled(issued.map(([leaseId, lease]) => {
+    const revocations = issued.map(([leaseId, lease]) => {
       if (lease.bindingPins > 0) return Promise.resolve()
       if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== lease.gatewayOrigin) {
         return Promise.resolve()
@@ -406,10 +412,21 @@ export class ArtifactPreviewLeaseBroker {
         lease.scopeId,
         lease.authToken,
       )
-    }))
+    })
+    await Promise.allSettled([...revocations, ...inFlightCreates])
   }
 
-  async create(
+  create(
+    value: unknown,
+  ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
+    const create = this.createNow(value)
+    this.inFlightCreates.add(create)
+    return create.finally(() => {
+      this.inFlightCreates.delete(create)
+    })
+  }
+
+  private async createNow(
     value: unknown,
   ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
     const generation = this.generation

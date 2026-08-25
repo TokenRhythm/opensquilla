@@ -9,356 +9,200 @@ import pytest
 GATE_MODULE: dict[str, Any] = runpy.run_path(
     ".github/scripts/check_ci_results.py", run_name="check_ci_results"
 )
-BOOLEAN_FLAGS: tuple[str, ...] = GATE_MODULE["BOOLEAN_FLAGS"]
+JOB_RESULT_LABELS: dict[str, str] = GATE_MODULE["JOB_RESULT_LABELS"]
+KNOWN_SUITES: frozenset[str] = GATE_MODULE["KNOWN_SUITES"]
+SUITE_RESULT_REQUIREMENTS: dict[str, tuple[str, ...]] = GATE_MODULE[
+    "SUITE_RESULT_REQUIREMENTS"
+]
 check_ci_results = GATE_MODULE["check_ci_results"]
 
-
-def _flag_env(name: str) -> str:
-    return f"FLAG_{name.upper()}"
+BASELINE_SUITES = {"readme-locale", "workflow-lint"}
 
 
-def _base_env() -> dict[str, str]:
-    env = {
-        "RESULT_CLASSIFY": "success",
-        "RESULT_WORKFLOW_LINT": "success",
-        "RESULT_README_LOCALE": "success",
-        "RESULT_FRONTEND": "skipped",
-        "RESULT_TUI": "skipped",
-        "RESULT_DESKTOP": "skipped",
-        "RESULT_UBUNTU": "skipped",
-        "RESULT_UBUNTU_FULL": "skipped",
-        "RESULT_WINDOWS_SMOKE": "skipped",
-        "RESULT_WINDOWS_FULL": "skipped",
-        "RESULT_MACOS_RECOVERY": "skipped",
-        "RESULT_DESKTOP_RECOVERY_E2E": "skipped",
-        "RESULT_WEBUI_CHAT_RECOVERY": "skipped",
-        "RESULT_RELEASE": "skipped",
-        "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS": "skipped",
+def _env_for(suites: set[str]) -> dict[str, str]:
+    required_results = {
+        variable
+        for suite in suites
+        for variable in SUITE_RESULT_REQUIREMENTS[suite]
     }
-    env.update({_flag_env(name): "false" for name in BOOLEAN_FLAGS})
-    env[_flag_env("docs_only")] = "true"
+    env = {
+        "RESULT_PLANNER": "success",
+        "REQUIRED_SUITES": json.dumps(sorted(suites)),
+    }
+    env.update(
+        {
+            variable: "success" if variable in required_results else "skipped"
+            for variable in JOB_RESULT_LABELS
+        }
+    )
     return env
 
 
-def _full_env() -> dict[str, str]:
-    env = _base_env()
-    env.update({_flag_env(name): "true" for name in BOOLEAN_FLAGS})
-    env[_flag_env("docs_only")] = "false"
-    for key in tuple(env):
-        if key.startswith("RESULT_"):
-            env[key] = "success"
-    env["RESULT_WINDOWS_SMOKE"] = "skipped"
-    return env
+def test_ci_result_gate_accepts_baseline_plan() -> None:
+    assert check_ci_results(_env_for(BASELINE_SUITES)) == []
 
 
-def test_ci_result_gate_accepts_intentional_docs_only_skips() -> None:
-    assert check_ci_results(_base_env()) == []
+def test_ci_result_gate_accepts_complete_full_plan() -> None:
+    assert check_ci_results(_env_for(set(KNOWN_SUITES))) == []
 
 
-def test_ci_result_gate_accepts_complete_full_matrix() -> None:
-    assert check_ci_results(_full_env()) == []
+@pytest.mark.parametrize("suite", sorted(KNOWN_SUITES))
+def test_ci_result_gate_has_an_executable_mapping_for_every_suite(suite: str) -> None:
+    suites = BASELINE_SUITES | {suite}
+
+    assert check_ci_results(_env_for(suites)) == []
 
 
-def test_ci_result_gate_rejects_failed_smoke_even_when_full_matrix_is_required() -> None:
-    env = _full_env()
-    env["RESULT_WINDOWS_SMOKE"] = "failure"
-
-    errors = check_ci_results(env)
-
-    assert any("Windows compatibility smoke tests" in error for error in errors)
-
-
-def test_ci_result_gate_rejects_missing_or_invalid_classifier_outputs() -> None:
-    missing = _base_env()
-    missing.pop(_flag_env("windows_full_required"))
-    invalid = _base_env()
-    invalid[_flag_env("python_changed")] = "yes"
-
-    assert any("windows_full_required" in error for error in check_ci_results(missing))
-    assert any("python_changed" in error for error in check_ci_results(invalid))
-
-
-def test_ci_result_gate_rejects_required_windows_matrix_skip() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("platform_sensitive_changed")] = "true"
-    env[_flag_env("windows_full_required")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_UBUNTU"] = "success"
-    env["RESULT_WINDOWS_SMOKE"] = "success"
-
-    errors = check_ci_results(env)
-
-    assert any("Windows high-risk matrix" in error and "skipped" in error for error in errors)
-
-
-def test_ci_result_gate_rejects_python_full_without_python_change() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("python_full_required")] = "true"
-    env["RESULT_UBUNTU_FULL"] = "success"
-
-    errors = check_ci_results(env)
-
-    assert any("must also be classified as Python changes" in error for error in errors)
-
-
-def test_ci_result_gate_accepts_windows_full_in_place_of_duplicate_smoke() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("platform_sensitive_changed")] = "true"
-    env[_flag_env("windows_full_required")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_FRONTEND"] = "success"
-    env["RESULT_UBUNTU"] = "success"
-    env["RESULT_WINDOWS_FULL"] = "success"
-    env["RESULT_MACOS_RECOVERY"] = "success"
-    env["RESULT_DESKTOP_RECOVERY_E2E"] = "success"
-    env["RESULT_WEBUI_CHAT_RECOVERY"] = "success"
-
-    assert check_ci_results(env) == []
-
-
-def test_ci_result_gate_requires_smoke_for_targeted_python_without_full_matrix() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_FRONTEND"] = "success"
-    env["RESULT_UBUNTU"] = "success"
-
-    errors = check_ci_results(env)
-
-    assert any("Windows compatibility smoke tests" in error for error in errors)
-
-
-def test_ci_result_gate_requires_ubuntu_full_matrix_for_shared_core_or_full_ci() -> None:
-    targeted = _base_env()
-    targeted[_flag_env("docs_only")] = "false"
-    targeted[_flag_env("runtime_changed")] = "true"
-    targeted[_flag_env("python_changed")] = "true"
-    targeted[_flag_env("build_wheel_required")] = "true"
-    targeted["RESULT_FRONTEND"] = "success"
-    targeted["RESULT_UBUNTU"] = "success"
-    targeted["RESULT_WINDOWS_SMOKE"] = "success"
-    assert check_ci_results(targeted) == []
-
+def test_ci_result_gate_requires_successful_planner_job() -> None:
     for result in ("skipped", "failure", "cancelled", ""):
-        env = dict(targeted)
-        env[_flag_env("python_full_required")] = "true"
-        env["RESULT_UBUNTU_FULL"] = result
+        env = _env_for(BASELINE_SUITES)
+        env["RESULT_PLANNER"] = result
 
         errors = check_ci_results(env)
 
-        assert any("Ubuntu full test matrix" in error for error in errors)
-
-    python_full = dict(targeted)
-    python_full[_flag_env("python_full_required")] = "true"
-    python_full["RESULT_UBUNTU_FULL"] = "success"
-    assert check_ci_results(python_full) == []
-
-    for result in ("skipped", "failure", "cancelled", ""):
-        env = _full_env()
-        env["RESULT_UBUNTU_FULL"] = result
-
-        errors = check_ci_results(env)
-
-        assert any("Ubuntu full test matrix" in error for error in errors)
+        assert any("Plan CI suites" in error and "success" in error for error in errors)
 
 
-def test_ci_result_gate_requires_verified_frontend_for_wheel_builds() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_UBUNTU"] = "success"
-    env["RESULT_WINDOWS_SMOKE"] = "success"
-
-    errors = check_ci_results(env)
-
-    assert any("Frontend tests and package validation" in error for error in errors)
-
-
-def test_ci_result_gate_requires_real_toolchain_artifacts_when_classified() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("toolchain_artifact_changed")] = "true"
-
-    errors = check_ci_results(env)
-
-    assert any("Managed Toolchain Artifact E2E" in error and "skipped" in error for error in errors)
-
-
-def test_ci_result_gate_accepts_successful_real_toolchain_artifacts() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("toolchain_artifact_changed")] = "true"
-    env["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] = "success"
-
-    assert check_ci_results(env) == []
-
-
-def test_ci_result_gate_rejects_failed_cancelled_or_missing_real_artifacts() -> None:
-    for result in ("failure", "cancelled", ""):
-        env = _base_env()
-        env[_flag_env("docs_only")] = "false"
-        env[_flag_env("toolchain_artifact_changed")] = "true"
-        env["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] = result
-
-        errors = check_ci_results(env)
-
-        assert any("Managed Toolchain Artifact E2E" in error for error in errors)
-
-
-def test_ci_result_gate_allows_toolchain_artifacts_to_skip_when_unrelated() -> None:
-    assert check_ci_results(_base_env()) == []
-
-
-def test_ci_result_gate_rejects_failure_cancellation_and_missing_results() -> None:
-    for result in ("failure", "cancelled", ""):
-        env = _full_env()
-        env["RESULT_WINDOWS_FULL"] = result
-
-        errors = check_ci_results(env)
-
-        assert any("Windows high-risk matrix" in error for error in errors)
-
-
-def test_ci_result_gate_requires_macos_recovery_for_platform_sensitive_changes() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("platform_sensitive_changed")] = "true"
-    env[_flag_env("windows_full_required")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_UBUNTU"] = "success"
-    env["RESULT_WINDOWS_SMOKE"] = "success"
-    env["RESULT_WINDOWS_FULL"] = "success"
-
-    errors = check_ci_results(env)
-
-    assert any(
-        "macOS profile recovery and native no-replace tests" in error
-        and "skipped" in error
-        for error in errors
-    )
-
-
-def test_ci_result_gate_rejects_failed_or_missing_required_macos_recovery() -> None:
-    for result in ("failure", "cancelled", ""):
-        env = _full_env()
-        env["RESULT_MACOS_RECOVERY"] = result
-
-        errors = check_ci_results(env)
-
-        assert any(
-            "macOS profile recovery and native no-replace tests" in error
-            for error in errors
-        )
-
-
-def test_ci_result_gate_requires_desktop_recovery_e2e_for_desktop_changes() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("desktop_changed")] = "true"
-    env[_flag_env("platform_sensitive_changed")] = "true"
-    env[_flag_env("windows_full_required")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_DESKTOP"] = "success"
-    env["RESULT_UBUNTU"] = "success"
-    env["RESULT_WINDOWS_SMOKE"] = "success"
-    env["RESULT_WINDOWS_FULL"] = "success"
-    env["RESULT_MACOS_RECOVERY"] = "success"
-
-    errors = check_ci_results(env)
-
-    assert any("Desktop recovery E2E matrix" in error and "skipped" in error for error in errors)
-
-
-def test_ci_result_gate_uses_focused_browser_checks_for_frontend_changes() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("frontend_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("build_wheel_required")] = "true"
-    env["RESULT_FRONTEND"] = "success"
-    env["RESULT_UBUNTU"] = "success"
-    env["RESULT_WINDOWS_SMOKE"] = "success"
-    env["RESULT_WEBUI_CHAT_RECOVERY"] = "success"
-
-    assert check_ci_results(env) == []
-
-
-def test_ci_result_gate_rejects_failed_or_missing_desktop_recovery_e2e() -> None:
-    for result in ("failure", "cancelled", ""):
-        env = _full_env()
-        env["RESULT_DESKTOP_RECOVERY_E2E"] = result
-
-        errors = check_ci_results(env)
-
-        assert any("Desktop recovery E2E matrix" in error for error in errors)
-
-
-def test_ci_result_gate_rejects_inconsistent_full_and_platform_flags() -> None:
-    incomplete_full = _full_env()
-    incomplete_full[_flag_env("release_changed")] = "false"
-    unsafe_platform = _base_env()
-    unsafe_platform[_flag_env("docs_only")] = "false"
-    unsafe_platform[_flag_env("platform_sensitive_changed")] = "true"
-
-    assert any("release_changed=true" in error for error in check_ci_results(incomplete_full))
-    assert any("Platform-sensitive" in error for error in check_ci_results(unsafe_platform))
-
-
-def test_ci_result_gate_uses_planner_suites_instead_of_legacy_matrix_flags() -> None:
-    env = _base_env()
-    env[_flag_env("docs_only")] = "false"
-    env[_flag_env("runtime_changed")] = "true"
-    env[_flag_env("python_changed")] = "true"
-    env[_flag_env("platform_sensitive_changed")] = "true"
-    env[_flag_env("windows_full_required")] = "true"
-    env["REQUIRED_SUITES"] = json.dumps(
-        ["python-targeted", "readme-locale", "workflow-lint"]
-    )
-    env["RESULT_UBUNTU"] = "success"
-
-    assert check_ci_results(env) == []
-
-
-def test_ci_result_gate_requires_planner_selected_browser_recovery() -> None:
-    env = _base_env()
-    env["REQUIRED_SUITES"] = json.dumps(
-        ["readme-locale", "webui-chat-recovery", "workflow-lint"]
+def test_ci_result_gate_rejects_missing_required_suites_without_legacy_fallback() -> None:
+    env = _env_for(BASELINE_SUITES)
+    env.pop("REQUIRED_SUITES")
+    env.update(
+        {
+            "FLAG_FULL_REQUIRED": "true",
+            "FLAG_DOCS_ONLY": "false",
+            "FLAG_PYTHON_CHANGED": "true",
+        }
     )
 
     errors = check_ci_results(env)
 
-    assert any("WebUI chat recovery browser contracts" in error for error in errors)
-    env["RESULT_WEBUI_CHAT_RECOVERY"] = "success"
-    assert check_ci_results(env) == []
+    assert any("required_suites is missing" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "suites",
+    [set(), {"workflow-lint"}, {"readme-locale"}],
+    ids=("empty", "missing-readme", "missing-workflow-lint"),
+)
+def test_ci_result_gate_requires_every_baseline_suite(suites: set[str]) -> None:
+    env = _env_for(suites)
+
+    errors = check_ci_results(env)
+
+    assert any("omitted baseline suites" in error for error in errors)
 
 
 @pytest.mark.parametrize(
     ("raw", "message"),
     [
         ("not-json", "valid JSON"),
+        (json.dumps({"workflow-lint": True}), "list of strings"),
+        (json.dumps(["workflow-lint", 1]), "list of strings"),
         (json.dumps(["unknown-suite"]), "unknown suites"),
         (json.dumps(["workflow-lint", "workflow-lint"]), "duplicate-free"),
+        (json.dumps(["workflow-lint", "readme-locale"]), "sorted"),
     ],
 )
 def test_ci_result_gate_rejects_invalid_planner_suite_contract(
     raw: str, message: str
 ) -> None:
-    env = _base_env()
+    env = _env_for(BASELINE_SUITES)
     env["REQUIRED_SUITES"] = raw
 
     assert any(message in error for error in check_ci_results(env))
+
+
+@pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", ""])
+def test_ci_result_gate_rejects_incomplete_selected_job(result: str) -> None:
+    env = _env_for(BASELINE_SUITES | {"skill-hub"})
+    env["RESULT_SKILL_HUB"] = result
+
+    errors = check_ci_results(env)
+
+    assert any("Skill Hub contract matrix" in error and "success" in error for error in errors)
+
+
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled", ""])
+def test_ci_result_gate_rejects_unplanned_job_execution_or_missing_result(result: str) -> None:
+    env = _env_for(BASELINE_SUITES)
+    env["RESULT_SKILL_HUB"] = result
+
+    errors = check_ci_results(env)
+
+    assert any("Skill Hub contract matrix" in error and "skipped" in error for error in errors)
+
+
+def test_ci_result_gate_requires_both_python_full_jobs() -> None:
+    env = _env_for(BASELINE_SUITES | {"python-full"})
+    env["RESULT_UBUNTU"] = "skipped"
+    env["RESULT_UBUNTU_FULL"] = "failure"
+
+    errors = check_ci_results(env)
+
+    assert any("Ubuntu quality gate" in error for error in errors)
+    assert any("Ubuntu full test matrix" in error for error in errors)
+
+
+@pytest.mark.parametrize("suite", ["frontend-validation", "wheel-webui-roundtrip"])
+def test_ci_result_gate_requires_shared_frontend_check_for_each_consumer(suite: str) -> None:
+    env = _env_for(BASELINE_SUITES | {suite})
+    env["RESULT_FRONTEND"] = "skipped"
+
+    errors = check_ci_results(env)
+
+    assert any("Frontend validation and wheel WebUI roundtrip" in error for error in errors)
+
+
+def test_ci_result_gate_accepts_one_shared_frontend_check_for_both_suites() -> None:
+    env = _env_for(
+        BASELINE_SUITES | {"frontend-validation", "wheel-webui-roundtrip"}
+    )
+
+    assert env["RESULT_FRONTEND"] == "success"
+    assert check_ci_results(env) == []
+
+
+def test_ci_result_gate_checks_frontend_artifact_independently() -> None:
+    env = _env_for(
+        BASELINE_SUITES | {"frontend-artifact", "webui-chat-recovery"}
+    )
+    env["RESULT_FRONTEND_ARTIFACT"] = "skipped"
+
+    errors = check_ci_results(env)
+
+    assert any("Frontend artifact" in error and "success" in error for error in errors)
+    assert not any("WebUI chat recovery" in error for error in errors)
+
+
+def test_ci_result_gate_rejects_missing_suite_result_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = check_ci_results.__globals__["SUITE_RESULT_REQUIREMENTS"]
+    monkeypatch.delitem(mapping, "tui")
+
+    errors = check_ci_results(_env_for(BASELINE_SUITES))
+
+    assert any("mappings are missing suites: tui" in error for error in errors)
+
+
+def test_ci_result_gate_rejects_unknown_job_result_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping = check_ci_results.__globals__["SUITE_RESULT_REQUIREMENTS"]
+    monkeypatch.setitem(mapping, "tui", ("RESULT_NOT_A_JOB",))
+
+    errors = check_ci_results(_env_for(BASELINE_SUITES))
+
+    assert any("unknown job results: RESULT_NOT_A_JOB" in error for error in errors)
+
+
+def test_ci_result_gate_contract_has_no_legacy_or_dead_lane() -> None:
+    assert "BOOLEAN_FLAGS" not in GATE_MODULE
+    assert "windows-compat" not in KNOWN_SUITES
+    assert "RESULT_WINDOWS_SMOKE" not in JOB_RESULT_LABELS
+    assert set(SUITE_RESULT_REQUIREMENTS) == set(KNOWN_SUITES)
+    assert {
+        variable
+        for variables in SUITE_RESULT_REQUIREMENTS.values()
+        for variable in variables
+    } == set(JOB_RESULT_LABELS)

@@ -648,9 +648,11 @@ async def test_implement_keeps_explicit_message_visible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: list[TaskRun] = []
+    handler_entered = asyncio.Event()
 
     async def handler(run: TaskRun) -> None:
         captured.append(run)
+        handler_entered.set()
 
     monkeypatch.setattr(
         "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
@@ -661,7 +663,7 @@ async def test_implement_keeps_explicit_message_visible(
         handler=handler,
     ) as stack:
         explicit_message = "Implement this plan while preserving the public compatibility note."
-        response = await _handle_plans_implement(
+        await _handle_plans_implement(
             {
                 "sessionKey": SOURCE_KEY,
                 "planRevisionId": stack.source_revision.revision_id,
@@ -671,7 +673,9 @@ async def test_implement_keeps_explicit_message_visible(
             },
             stack.context,
         )
-        await stack.runtime.wait(response["turn_id"], timeout=2.0)
+        # This contract ends at handler ingress; full task settlement includes
+        # unrelated terminal persistence and lifecycle notification work.
+        await asyncio.wait_for(handler_entered.wait(), timeout=5.0)
 
         assert captured[0].message == explicit_message
         assert captured[0].no_memory_capture is True
