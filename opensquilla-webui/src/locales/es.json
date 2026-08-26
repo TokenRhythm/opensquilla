@@ -3313,7 +3313,10 @@
   "chat": {
     "sessionCreated": {
       "title": "Chat creado",
-      "open": "Abrir chat"
+      "open": "Abrir chat",
+      "fallbackTitle": "Chat {suffix}",
+      "deleted": "Eliminado",
+      "missing": "La sesión se eliminó o no existe"
     },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",

@@ -7067,6 +7067,40 @@ class TestSessionsDelete:
         } == set(matching_ids)
 
     @pytest.mark.asyncio
+    async def test_delete_evicts_only_the_deleted_session_stream(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        sibling_key = "agent:main:subagent:delete-stream-sibling"
+        streams = SessionStreamRegistry()
+        streams.record(
+            session.session_key,
+            "task.failed",
+            {"task_id": "task-deleted", "status": "failed"},
+        )
+        streams.record(
+            sibling_key,
+            "task.failed",
+            {"task_id": "task-sibling", "status": "failed"},
+        )
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        res = await dispatcher.dispatch(
+            "delete-stream-eviction",
+            "sessions.delete",
+            {"key": session.session_key},
+            make_ctx(session_manager=FakeSessionManager([session])),
+        )
+
+        assert res.ok is True
+        assert streams.replay(session.session_key, 0).events == []
+        assert [
+            event.event_name for event in streams.replay(sibling_key, 0).events
+        ] == ["task.failed"]
+
+    @pytest.mark.asyncio
     async def test_delete_holds_lifecycle_fences_through_cleanup(
         self,
         dispatcher,
@@ -8764,6 +8798,36 @@ class TestSessionsSubscribe:
 
 
 class TestSessionsMessagesSubscribe:
+    @pytest.mark.asyncio
+    async def test_missing_subagent_is_rejected_before_replaying_failed_task(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:subagent:missing-replay"
+        streams = get_session_streams()
+        streams.record(
+            key,
+            "task.failed",
+            {"task_id": "task-missing", "status": "failed"},
+        )
+        subscriptions = SubscriptionManager()
+        try:
+            response = await dispatcher.dispatch(
+                "missing-subagent-subscribe",
+                "sessions.messages.subscribe",
+                {"key": key, "since_stream_seq": 0},
+                make_ctx(
+                    session_manager=FakeSessionManager([]),
+                    subscription_manager=subscriptions,
+                ),
+            )
+
+            assert response.ok is False
+            assert response.error.code == "SESSION_NOT_FOUND"
+            assert subscriptions.get_message_subscribers(key) == set()
+        finally:
+            streams.evict(key)
+
     @pytest.mark.asyncio
     async def test_messages_hydrate_uses_bounded_interactive_storage_scope(
         self,

@@ -3313,7 +3313,10 @@
   "chat": {
     "sessionCreated": {
       "title": "チャットを作成しました",
-      "open": "チャットを開く"
+      "open": "チャットを開く",
+      "fallbackTitle": "チャット {suffix}",
+      "deleted": "削除済み",
+      "missing": "セッションは削除されたか存在しません"
     },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",

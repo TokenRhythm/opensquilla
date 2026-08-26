@@ -139,7 +139,12 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && visibleHistoryRecoveryState"
+          v-if="!forkTransition && historyState.sessionMissing"
+          :key="`${sessionKey}:missing`"
+          state="session-missing"
+        />
+        <ChatSessionRecoveryStatus
+          v-else-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
@@ -157,7 +162,7 @@
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding && !forkTransition"
+          v-if="!isNewChatLanding && !forkTransition && !historyState.sessionMissing"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -172,6 +177,7 @@
         />
 
         <div
+          v-if="!historyState.sessionMissing"
           class="chat-message-surface"
           :class="{ 'chat-message-surface--preview': forkTransition }"
           :inert="forkTransition ? true : undefined"
@@ -214,6 +220,7 @@
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
+          :resolve-session-availability="resolveCreatedSessionAvailability"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @edit-attachment="editAttachmentResource"
@@ -653,7 +660,9 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
-      :input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"
+      :input-disabled="Boolean(dockedPlanQuestionnaire)
+        || Boolean(forkTransition)
+        || historyState.sessionMissing"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
       :safe-setup-available="composerSafeSetupAvailable"
@@ -904,7 +913,10 @@ import {
   type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
 import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
-import { autoSendDraftIsUnchanged } from '@/composables/chat/sessionBootstrapContract'
+import {
+  autoSendDraftIsUnchanged,
+  rpcErrorCode,
+} from '@/composables/chat/sessionBootstrapContract'
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
@@ -1142,6 +1154,17 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+
+async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
+  try {
+    await rpc.call('sessions.resolve', { key: sessionKey })
+    return true
+  } catch (error: unknown) {
+    const code = rpcErrorCode(error)
+    if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') return false
+    throw error
+  }
+}
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
@@ -4202,6 +4225,7 @@ watch(isNewChatLanding, landing => {
 }, { flush: 'post' })
 
 const historyRecoveryState = computed(() => {
+  if (historyState.value.sessionMissing) return null
   return resolveChatHistoryRecoveryState({
     isDraftLanding: isNewChatLanding.value,
     initialHistoryStatus: historyState.value.initialLoadStatus,
@@ -4215,6 +4239,7 @@ const visibleHistoryRecoveryState = computed(() => (
 ))
 
 const liveRecoveryState = computed(() => {
+  if (historyState.value.sessionMissing) return null
   if (livePhase.value === 'degraded') return 'live-degraded' as const
   if (
     livePhase.value === 'connecting'

@@ -93,6 +93,20 @@ describe('created session tool results', () => {
     ])
   })
 
+  it('keeps an optional normalized title without changing legacy results', () => {
+    expect(createdSessionFromToolCall(call({
+      result: JSON.stringify({
+        session_key: 'agent:main:subagent:abc12345',
+        title: '  Inspect session cleanup  ',
+      }),
+    }))).toEqual({
+      callId: 'spawn-1',
+      sessionKey: 'agent:main:subagent:abc12345',
+      title: 'Inspect session cleanup',
+    })
+    expect(createdSessionFromToolCall(call())).not.toHaveProperty('title')
+  })
+
   it('restores links from legacy messages that only carry toolCalls', () => {
     expect(createdSessionsFromMessage(message({ toolCalls: [call()] }))).toEqual([
       { callId: 'spawn-1', sessionKey: 'agent:main:subagent:abc12345' },

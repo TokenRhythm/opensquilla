@@ -830,6 +830,21 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('classifies a missing session separately from a retryable history failure', async () => {
+    const { api, rpc } = makeHistory()
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('missing'), {
+      code: 'NOT_FOUND',
+    }))
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      recoveryError: true,
+      sessionMissing: true,
+    })
+  })
+
   it('keeps loaded messages visible and exposes an inline recovery error after refresh fails', async () => {
     const { api, rpc, messages } = makeHistory()
     await api.loadHistory()
