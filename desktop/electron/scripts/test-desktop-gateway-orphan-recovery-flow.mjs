@@ -411,28 +411,19 @@ try {
     orphanRecoveryStartup,
   )
   assert.equal(secondOwnershipDir, firstOwnershipDir)
-  const secondRecord = await waitFor(() => {
+  const secondRecord = await waitFor(async () => {
     assertAppRunning(secondApp, orphanRecoveryStartup, 'replacement-ownership-record')
     const loaded = loadDesktopGatewayOwnershipRecord(secondOwnershipDir)
-    return loaded.status === 'valid' && loaded.record.pid !== firstRecord.pid
+    if (loaded.status !== 'valid' || loaded.record.pid === firstRecord.pid) return null
+    return await verifyDesktopGatewayOwnership(loaded.record)
       ? loaded.record
       : null
-  }, 'replacement Desktop Gateway ownership record', orphanRecoveryStartup.remainingMs(
+  }, 'verified replacement Desktop Gateway ownership record', orphanRecoveryStartup.remainingMs(
     'replacement-ownership-record',
   ), () => phaseDiagnostics(secondApp, userDataDir, orphanRecoveryStartup))
   ownedInstances.push({ ownershipDir: secondOwnershipDir, record: secondRecord })
 
   assert.notEqual(secondRecord.pid, firstRecord.pid)
-  assert.equal(
-    await withPhaseDeadline(
-      verifyDesktopGatewayOwnership(secondRecord),
-      orphanRecoveryStartup,
-      'verify-replacement-gateway-ownership',
-      secondApp,
-      userDataDir,
-    ),
-    true,
-  )
   await waitFor(() => {
     assertAppRunning(secondApp, orphanRecoveryStartup, 'orphan-process-exit')
     return !processAlive(firstRecord.pid)
