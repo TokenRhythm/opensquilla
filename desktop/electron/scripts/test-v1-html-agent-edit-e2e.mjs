@@ -1445,7 +1445,7 @@ const evidence = {
   changesAfterAgentPatch: '',
   previewHeading: '',
   annotationModeExitedAfterAcceptance: false,
-  annotationUnknownSendPreserved: false,
+  annotationUnknownSendSettledWithoutDuplicates: false,
   annotationReplayIdentityMatched: false,
   annotationAcceptanceEvents: [],
   annotationModeAfterAcceptance: null,
@@ -1772,13 +1772,8 @@ try {
   )
   assert.equal(
     await page.locator('.msg-user').count(),
-    annotationUserMessageStart + 1,
-    'an unknown send must retain exactly one optimistic user message',
-  )
-  assert.equal(
-    await page.locator('.msg-user').last().locator('.msg-user-bubble').innerText(),
-    ANNOTATION_MESSAGE,
-    'the optimistic user message must retain the submitted text',
+    annotationUserMessageStart,
+    'an unaccepted synthetic send must not leave a duplicate user message in history',
   )
   assert.equal(
     await page.getByTestId('sent-prompt-annotation').count(),
@@ -1802,7 +1797,7 @@ try {
     0,
     'a disconnected send must not publish an acceptance event',
   )
-  evidence.annotationUnknownSendPreserved = true
+  evidence.annotationUnknownSendSettledWithoutDuplicates = true
 
   await submitChatComposer(page)
   await page.waitForFunction(
@@ -1874,15 +1869,13 @@ try {
     0,
     'all accepted annotations must leave the composer together',
   )
-  assert.equal(
-    await page.locator('.msg-user').count(),
-    annotationUserMessageStart + 1,
-    'the exact replay must not append a second optimistic user message',
-  )
-  assert.equal(
-    await page.getByTestId('sent-prompt-annotation').count(),
-    sentAnnotationStart + 2,
-    'the exact replay must materialize each accepted annotation exactly once',
+  await waitFor(
+    async () => (
+      await page.locator('.msg-user').count() === annotationUserMessageStart + 1
+      && await page.getByTestId('sent-prompt-annotation').count() === sentAnnotationStart + 2
+    ),
+    'one accepted annotation user message with two unique annotations',
+    TIMEOUT_MS,
   )
   evidence.annotationModeExitedAfterAcceptance = true
   assert.match(await versionsTab.innerText(), /3/)
