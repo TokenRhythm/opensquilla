@@ -15,6 +15,13 @@ Times are operational targets, not timeouts. High-risk pull requests intentional
 slower. Provider-live, credential, and external-network tests remain excluded from required
 CI and retain their existing live markers.
 
+Pull-request path selection compares the PR head with its merge base, not directly with the
+current base tree. A branch that is behind `main` therefore does not inherit base-only changes
+as if the PR introduced them. This affects suite selection only: merge-queue reuse remains bound
+to the exact current base and tested tree, so a base advance still triggers the full fail-closed
+queue matrix. For an otherwise eligible non-policy PR, refreshing the branch and completing a
+new green PR CI run can make a later queue entry exact; reuse is decided again at queue time.
+
 ## Modes
 
 Set the Actions repository variable `CI_OPTIMIZATION_MODE` to one of:
