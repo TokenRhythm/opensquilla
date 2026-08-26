@@ -108,6 +108,9 @@ jobs:
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
+            if [[ "${REASON_CODE}" == "tree_mismatch" ]]; then
+              echo "- Fast-path note: the PR evidence does not match this queue tree, so this entry runs the full fail-closed matrix. If main advanced, refresh the PR against the latest main and wait for a new green PR CI run before requeueing. Reuse is always decided against the future entry's exact base and tree."
+            fi
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
@@ -167,9 +170,15 @@ jobs:
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
               else
-                git diff --no-renames --name-only \
-                  "${{ github.event.pull_request.base.sha }}" \
-                  "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+                base_sha="${{ github.event.pull_request.base.sha }}"
+                head_sha="${{ github.event.pull_request.head.sha }}"
+                if git diff --merge-base --no-renames --name-only \
+                  "${base_sha}" "${head_sha}" -- > "${changed_files}"; then
+                  echo "Planning PR-owned changes from the merge base."
+                else
+                  echo "Unable to derive the PR-owned change set; running the full fail-closed matrix." >&2
+                  printf '.ci/run-all\n' > "${changed_files}"
+                fi
               fi
               ;;
             merge_group)
