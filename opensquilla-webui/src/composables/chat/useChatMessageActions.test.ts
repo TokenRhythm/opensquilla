@@ -113,6 +113,118 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.focusComposer).toHaveBeenCalledOnce()
   })
 
+  it('puts the transcript and the draft back when the edit is cancelled', () => {
+    // #1372: entering edit mode empties the transcript on the first click.
+    // Without a way back, Escape cleared the composer and left the empty state
+    // on screen, which reads as the conversation having been deleted.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+    options.inputText.value = 'half-written draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+
+    expect(api.cancelEdit()).toBe(true)
+
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    // The draft the edit overwrote is part of what was lost, so it comes back
+    // too rather than the composer being left holding the edited message.
+    expect(options.inputText.value).toBe('half-written draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('reports nothing to cancel when no edit is in flight', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    options.inputText.value = 'just a draft'
+
+    // Escape distinguishes the two: a false here is what lets it fall through
+    // to clearing the composer instead of swallowing the key.
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.inputText.value).toBe('just a draft')
+    expect(options.messages.value.map(message => message.text)).toEqual(['A'])
+  })
+
+  it('cancels only once, so a later Escape cannot resurrect the transcript', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    expect(api.cancelEdit()).toBe(true)
+    options.messages.value = [{ role: 'user', text: 'sent since', ts: null, messageId: 'msg-C' }]
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['sent since'])
+  })
+
+  it('drops the restore point once the fork id has been consumed', () => {
+    // Sending makes the truncation real. `pendingForkBeforeMessageId` moving
+    // off the edit's id is the evidence, and restoring past it would put back
+    // messages the fork has already replaced.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    pendingForkBeforeMessageId.value = null
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+  })
+
+  it('keeps the newer edit when a second one replaces the first', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 0, messageId: 'msg-A', text: 'A',
+    }))
+
+    expect(pendingForkBeforeMessageId.value).toBe('msg-A')
+    expect(api.cancelEdit()).toBe(true)
+    // The second edit's restore point wins: back to what the first edit left,
+    // not to the untouched transcript. Cancelling one edit must not undo the
+    // other.
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+  })
+
   it('records the previous user message id before regenerating', async () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
