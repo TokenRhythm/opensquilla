@@ -645,7 +645,6 @@
    visible without overlapping the absolute plan-run dock. */
 .goal-run-dock {
   position: relative;
-  z-index: 3;
   width: 100%;
   max-width: var(--composer-col, 860px);
   margin: 0 auto 8px;

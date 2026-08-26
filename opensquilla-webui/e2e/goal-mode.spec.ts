@@ -99,7 +99,10 @@ async function installStableHttpStubs(page: Page): Promise<void> {
   }))
 }
 
-async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
+async function installFakeGoalGateway(
+  page: Page,
+  options: { sessionRouting?: boolean } = {},
+): Promise<MockGoalGateway> {
   const methods: string[] = []
   const setParams: Array<Record<string, unknown>> = []
   let sendFrame: ((frame: string) => void) | null = null
@@ -133,12 +136,26 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
           protocol: 3,
           server: { version: 'e2e', conn_id: 'goal-mode-fake-gateway' },
           features: {
-            methods: ['goals.capabilities', 'goals.set'],
-            events: ['session.event.goal'],
+            methods: [
+              'goals.capabilities',
+              'goals.set',
+              ...(options.sessionRouting
+                ? ['sessions.routing.get', 'sessions.routing.set']
+                : []),
+            ],
+            events: [
+              'session.event.goal',
+              ...(options.sessionRouting ? ['sessions.routing.changed'] : []),
+            ],
           },
           snapshot: {},
           policy: { tick_interval_ms: 30_000 },
-          auth: { principal: { isOwner: true } },
+          auth: {
+            principal: {
+              isOwner: true,
+              ...(options.sessionRouting ? { authState: 'authenticated' } : {}),
+            },
+          },
         }))
         return
       }
@@ -212,6 +229,11 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
           run_status: 'idle',
           goal: null,
           goalSnapshotStreamSeq: 0,
+        },
+        'sessions.routing.get': {
+          sessionKey: SESSION_KEY,
+          mode: 'direct',
+          revision: 0,
         },
         'usage.status': { sessions: [] },
       }
@@ -514,6 +536,66 @@ test('Composer Add menu stays above active Goal progress across responsive layou
     if (!menu || !button) return 1
     return Math.ceil(menu.getBoundingClientRect().bottom - button.getBoundingClientRect().top)
   })).toBeLessThanOrEqual(-7)
+})
+
+test('Session model routing stays above active Goal progress across responsive layouts', async ({ page }) => {
+  const gateway = await installFakeGoalGateway(page, { sessionRouting: true })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+
+  gateway.emitGoal(goalSnapshot({
+    stateRevision: 2,
+    objective: 'Verify that this active Goal remains usable while the session model routing panel overlaps it across responsive layouts.',
+  }))
+  const goalDock = page.locator('.goal-run-dock')
+  await expect(goalDock).toBeVisible()
+
+  const routingButton = page.getByRole('button', {
+    name: "This chat's model routing",
+    exact: true,
+  })
+  const routingPanel = page.locator('.composer-model-routing')
+
+  for (const viewport of [
+    { width: 1368, height: 546 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport)
+    await routingButton.click()
+    await expect(routingPanel).toBeVisible()
+
+    await expect.poll(async () => page.evaluate(() => {
+      const panel = document.querySelector<HTMLElement>('.composer-model-routing')
+      const goal = document.querySelector<HTMLElement>('.goal-run-dock')
+      if (!panel || !goal) return 'missing-panel-or-goal'
+      const panelRect = panel.getBoundingClientRect()
+      const goalRect = goal.getBoundingClientRect()
+      const left = Math.max(panelRect.left, goalRect.left)
+      const top = Math.max(panelRect.top, goalRect.top)
+      const right = Math.min(panelRect.right, goalRect.right)
+      const bottom = Math.min(panelRect.bottom, goalRect.bottom)
+      if (right <= left || bottom <= top) return 'no-overlap'
+      const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2)
+      if (hit !== null && panel.contains(hit)) return 'routing-panel'
+      return JSON.stringify({
+        hit: hit instanceof HTMLElement ? `${hit.tagName.toLowerCase()}.${hit.className}` : null,
+        goalZIndex: getComputedStyle(goal).zIndex,
+        panelZIndex: getComputedStyle(panel).zIndex,
+        inputBackdropFilter: getComputedStyle(panel.closest('.chat-input-panel')!).backdropFilter,
+      })
+    })).toBe('routing-panel')
+
+    await routingButton.click()
+    await expect(routingPanel).toHaveCount(0)
+    await expect(goalDock).toBeVisible()
+
+    await goalDock.getByRole('button', { name: 'Goal actions', exact: true }).click()
+    const goalMenu = goalDock.getByRole('menu', { name: 'Goal actions', exact: true })
+    await expect(goalMenu).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(goalMenu).toHaveCount(0)
+  }
 })
 
 test('Goal mode continues through a real Gateway, refresh, and deterministic provider', async ({
