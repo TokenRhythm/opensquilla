@@ -187,6 +187,7 @@
     "tests/test_cli/test_chat_file_command.py": 0.328,
     "tests/test_cli/test_chat_path_command.py": 0.113,
     "tests/test_cli/test_cli_product_completeness.py": 8.86,
+    "tests/test_cli/test_config_set_key_validation.py": 8.3,
     "tests/test_cli/test_cron_cmd.py": 0.088,
     "tests/test_cli/test_diagnostics_cmd.py": 0.448,
     "tests/test_cli/test_doctor_cmd.py": 3.381,
