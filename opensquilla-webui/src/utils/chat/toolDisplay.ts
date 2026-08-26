@@ -3,6 +3,7 @@ import type {
   ChatToolCall,
   ChatToolCallGroup,
   ChatToolCallRenderItem,
+  ToolPresentation,
 } from '@/types/chat'
 import type { IconName } from '@/utils/icons'
 
@@ -96,6 +97,112 @@ export function normalizeToolInputText(raw: unknown): string {
   return isEmptyToolPreview(text) ? '' : text
 }
 
+const TOOL_PRESENTATION_CATEGORIES = new Set<ToolPresentation['category']>([
+  'search',
+  'file_read',
+  'network_read',
+  'command',
+  'subagent',
+  'mutation',
+  'generic',
+])
+const RESTRICTED_TOOL_PRESENTATION: ToolPresentation = {
+  category: 'generic',
+  primaryArguments: [],
+  argumentDisplay: 'primary',
+  lifecycleDisplay: 'boundary',
+}
+const TOOL_PRESENTATION_STATUS_KEYS = {
+  search: {
+    running: 'chat.tool.searchRunning',
+    done: 'chat.tool.searchDone',
+    failed: 'chat.tool.searchFailed',
+  },
+  file_read: {
+    running: 'chat.tool.fileReadRunning',
+    done: 'chat.tool.fileReadDone',
+    failed: 'chat.tool.fileReadFailed',
+  },
+  network_read: {
+    running: 'chat.tool.networkReadRunning',
+    done: 'chat.tool.networkReadDone',
+    failed: 'chat.tool.networkReadFailed',
+  },
+  command: {
+    running: 'chat.tool.commandRunning',
+    done: 'chat.tool.commandDone',
+    failed: 'chat.tool.commandFailed',
+  },
+  subagent: {
+    running: 'chat.tool.subagentRunning',
+    done: 'chat.tool.subagentDone',
+    failed: 'chat.tool.subagentFailed',
+  },
+  mutation: {
+    running: 'chat.tool.mutationRunning',
+    done: 'chat.tool.mutationDone',
+    failed: 'chat.tool.mutationFailed',
+  },
+  generic: {
+    running: 'chat.tool.genericRunning',
+    done: 'chat.tool.genericDone',
+    failed: 'chat.tool.genericFailed',
+  },
+} as const
+const TOOL_MUTATION_STATUS_KEYS = {
+  'file.write': {
+    running: 'chat.tool.fileWriteRunning',
+    done: 'chat.tool.fileWriteDone',
+    failed: 'chat.tool.fileWriteFailed',
+  },
+  'file.edit': {
+    running: 'chat.tool.fileEditRunning',
+    done: 'chat.tool.fileEditDone',
+    failed: 'chat.tool.fileEditFailed',
+  },
+} as const
+
+export function normalizeToolPresentation(raw: unknown): ToolPresentation | undefined {
+  const record = asRecord(raw)
+  if (!record || !Object.prototype.hasOwnProperty.call(record, 'tool_presentation')) return undefined
+  const value = asRecord(record.tool_presentation)
+  if (!value) return RESTRICTED_TOOL_PRESENTATION
+  const category = value.category
+  const primaryArguments = value.primaryArguments
+  const argumentDisplay = value.argumentDisplay
+  const lifecycleDisplay = value.lifecycleDisplay
+  if (
+    typeof category !== 'string'
+    || !TOOL_PRESENTATION_CATEGORIES.has(category as ToolPresentation['category'])
+    || !Array.isArray(primaryArguments)
+    || !primaryArguments.every(key => typeof key === 'string')
+    || !['primary', 'all'].includes(String(argumentDisplay))
+    || !['boundary', 'default'].includes(String(lifecycleDisplay))
+  ) return RESTRICTED_TOOL_PRESENTATION
+  return {
+    category: category as ToolPresentation['category'],
+    primaryArguments: [...primaryArguments],
+    argumentDisplay: argumentDisplay as ToolPresentation['argumentDisplay'],
+    lifecycleDisplay: lifecycleDisplay as ToolPresentation['lifecycleDisplay'],
+  }
+}
+
+export function toolDisplayInputText(
+  raw: unknown,
+  presentation = normalizeToolPresentation(raw),
+): string {
+  const input = normalizeToolInputText(raw)
+  if (!input || presentation?.argumentDisplay !== 'primary') return input
+  const parsed = parseToolInput(input)
+  if (!parsed) return ''
+  const projected = Object.fromEntries(
+    presentation.primaryArguments
+      .filter(key => Object.prototype.hasOwnProperty.call(parsed, key))
+      .map(key => [key, parsed[key]]),
+  )
+  return Object.keys(projected).length ? JSON.stringify(projected, null, 2) : ''
+}
+
 export function toolDisplayName(name: string, input: unknown): string {
   const key = toolOperationKey(name)
   if (key === 'document.read') return i18n.global.t('chat.tool.readPage')
@@ -136,6 +243,8 @@ export function toolOperationKey(name: string): string {
   if (n.includes('web_fetch') || n.includes('http') || n.includes('fetch') || n.includes('curl') || n.includes('wget')) return 'web.read'
   if (n.includes('python') || n === 'py') return 'code.python'
   if (n.includes('bash') || n.includes('shell') || n.includes('exec')) return 'command.run'
+  if (['create_file', 'create_source', 'write_scratch'].some(tool => hasToolNameSuffix(n, tool))) return 'file.write'
+  if (['edit_file', 'edit_source', 'apply_patch'].some(tool => hasToolNameSuffix(n, tool))) return 'file.edit'
   if (n.includes('write')) return 'file.write'
   if (n.includes('edit') || n.includes('patch')) return 'file.edit'
   if (n.includes('read') || n.includes('cat') || n.includes('list') || n === 'ls' || n.includes('glob') || n.includes('find') || n.includes('file')) return 'file.inspect'
@@ -163,7 +272,21 @@ export function toolActionLabel(name: string): string {
 }
 
 export function toolSecondaryText(toolCall: ChatToolCall): string {
-  if (toolOperationKey(toolCall.name).startsWith('document.')) return ''
+  const operation = toolOperationKey(toolCall.name)
+  if (operation.startsWith('document.')) return ''
+  // Network-search queries are invocation parameters. Result URLs are rendered
+  // as resource targets, so the query must not leak back through a legacy or
+  // persisted secondary-text path.
+  if (operation === 'web.search' || operation === 'web.discover') return ''
+  if (toolCall.presentation?.argumentDisplay === 'primary') {
+    const input = parseToolInput(toolCall.inputRaw || toolCall.inputPreview)
+    const primary = toolCall.presentation.primaryArguments.flatMap((key) => {
+      const value = input?.[key]
+      if (Array.isArray(value)) return value.map(item => String(item)).filter(Boolean)
+      return value == null ? [] : [String(value)]
+    })
+    return primary.length ? truncateToolText(primary.join(' · '), 86) : ''
+  }
   const source = String(toolCall.inputPreview || toolCall.resultPreview || '').replace(/\s+/g, ' ').trim()
   if (isEmptyToolPreview(source)) return ''
   return truncateToolText(source.replace(/^"|"$/g, ''), 86)
@@ -304,6 +427,11 @@ export function toolResultIsError(payload: unknown): boolean {
 
 export function toolStatusText(toolCall: ChatToolCall): string {
   const t = i18n.global.t
+  const presentationStatus = toolPresentationStatusText(
+    toolCall,
+    toolCall.isRunning ? 'running' : toolCall.status === 'error' ? 'failed' : toolCall.status === 'success' ? 'done' : null,
+  )
+  if (presentationStatus) return presentationStatus
   if (toolCall.isRunning) return t('chat.tool.running')
   if (toolCall.status === 'error') return t('chat.tool.failed')
   const count = toolResultCount(toolCall.result, toolCall.name)
@@ -314,6 +442,12 @@ export function toolStatusText(toolCall: ChatToolCall): string {
 
 export function toolGroupStatusText(group: ChatToolCallGroup): string {
   const t = i18n.global.t
+  const presentationCall = group.calls.find(call => call.presentation)
+  const presentationStatus = presentationCall && toolPresentationStatusText(
+    presentationCall,
+    group.isRunning ? 'running' : group.isError ? 'failed' : group.status === 'success' ? 'done' : null,
+  )
+  if (presentationStatus) return presentationStatus
   if (group.isRunning) return t('chat.tool.running')
   if (group.isError) return t('chat.tool.failed')
   const counts = group.calls
@@ -323,4 +457,21 @@ export function toolGroupStatusText(group: ChatToolCallGroup): string {
   if (counts.length) return t('chat.tool.results', { count: counts.reduce((sum, count) => sum + count, 0) })
   if (group.status === 'success') return t('chat.tool.done')
   return t('chat.tool.pending')
+}
+
+function toolPresentationStatusText(
+  toolCall: ChatToolCall,
+  state: 'running' | 'done' | 'failed' | null,
+): string {
+  if (!state || !toolCall.presentation) return ''
+  if (toolCall.presentation.category === 'mutation') {
+    const mutationKeys = TOOL_MUTATION_STATUS_KEYS[
+      toolOperationKey(toolCall.name) as keyof typeof TOOL_MUTATION_STATUS_KEYS
+    ]
+    if (mutationKeys) return i18n.global.t(mutationKeys[state])
+  }
+  const keys = TOOL_PRESENTATION_STATUS_KEYS[
+    toolCall.presentation.category as keyof typeof TOOL_PRESENTATION_STATUS_KEYS
+  ]
+  return keys ? i18n.global.t(keys[state]) : ''
 }

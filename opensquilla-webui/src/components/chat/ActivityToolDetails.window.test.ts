@@ -139,12 +139,53 @@ describe('ActivityToolDetails adaptive detail window', () => {
 
     viewFull?.click()
     expect(onShowResult).toHaveBeenCalledWith(
-      `INPUT\n${inputRaw}\n\nRESULT\n${result}`,
+      redactActivityDetail(`INPUT\n${inputRaw}\n\nRESULT\n${result}`),
       'Run command · details',
       {
         toolName: 'shell',
-        inputRaw,
+        inputRaw: redactActivityDetail(inputRaw),
         section: undefined,
+        format: undefined,
+      },
+    )
+  })
+
+  it('shows file edits as a changes section without exposing raw invocation parameters', async () => {
+    const inputRaw = JSON.stringify({
+      path: 'src/App.vue',
+      old_text: 'const value = 1',
+      new_text: 'const value = 2',
+      justification: 'private invocation metadata',
+    })
+    const { el, onShowResult } = await mountDetails(call({
+      name: 'edit_file',
+      inputRaw,
+      inputPreview: inputRaw,
+      result: 'Edited src/App.vue: replaced 15 chars with 15 chars',
+    }), 'file.edit')
+
+    const window = el.querySelector('.activity-tool-details__window')
+    expect(window?.textContent).toContain('changes')
+    expect(window?.textContent).toContain('-const value = 1')
+    expect(window?.textContent).toContain('+const value = 2')
+    expect(window?.textContent).not.toContain('justification')
+    expect(window?.textContent).not.toContain('Edited src/App.vue')
+
+    el.querySelector<HTMLButtonElement>('.activity-tool-details__view')?.click()
+    expect(onShowResult).toHaveBeenCalledWith(
+      [
+        '--- before',
+        '+++ after',
+        '@@',
+        '-const value = 1',
+        '+const value = 2',
+      ].join('\n'),
+      'Run command · details',
+      {
+        toolName: 'edit_file',
+        inputRaw,
+        section: 'input',
+        format: 'diff',
       },
     )
   })

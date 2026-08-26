@@ -3086,6 +3086,28 @@ class Agent:
                 agent_id=getattr(tool_context, "agent_id", None) if tool_context else None,
             )
 
+    def tool_presentation_payload(self, tool_name: str) -> dict[str, Any]:
+        """Resolve public display metadata from the active tool surface."""
+
+        from opensquilla.tools.presentation import resolve_tool_presentation
+        from opensquilla.tools.types import ToolSpec
+
+        registered = self._tool_registry.get(tool_name) if self._tool_registry else None
+        if registered is not None:
+            spec = registered.spec
+        else:
+            definition = self._tool_definition_by_name.get(tool_name)
+            spec = ToolSpec(
+                name=tool_name,
+                description=(definition.description if definition else ""),
+                parameters=(
+                    dict(definition.input_schema.properties)
+                    if definition is not None
+                    else {}
+                ),
+            )
+        return resolve_tool_presentation(spec).to_payload()
+
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
         if reason == "memory_flush_timeout_before_compaction":

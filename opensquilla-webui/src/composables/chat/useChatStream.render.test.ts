@@ -1344,6 +1344,76 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('ignores provisional deltas for primary-only tools and commits the end snapshot', () => {
+    const { api } = makeStream()
+    api.useReducer.value = true
+    const presentation = {
+      category: 'network_read' as const,
+      primaryArguments: ['url'],
+      argumentDisplay: 'primary' as const,
+      lifecycleDisplay: 'boundary' as const,
+    }
+
+    api.appendToolCall({
+      tool_use_id: 'fetch-1',
+      tool_name: 'http_request',
+      tool_presentation: presentation,
+    })
+    expect(api.foldedTurn.value.toolCalls[0]?.presentation).toEqual(presentation)
+    for (let index = 0; index < 1_000; index += 1) {
+      api.appendToolDelta({
+        tool_use_id: 'fetch-1',
+        tool_name: 'http_request',
+        fragment: 'private',
+      })
+    }
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toBe('')
+
+    api.appendToolEnd({
+      tool_use_id: 'fetch-1',
+      tool_name: 'http_request',
+      arguments: {
+        url: 'https://example.test/report',
+        headers: { Authorization: 'secret' },
+      },
+      tool_presentation: presentation,
+    })
+
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toBe(
+      JSON.stringify({ url: 'https://example.test/report' }, null, 2),
+    )
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).not.toContain('secret')
+    api.cleanup()
+  })
+
+  it('clears legacy full input when a late primary-only rule has no public fields', () => {
+    const { api } = makeStream()
+    const presentation = {
+      category: 'network_read' as const,
+      primaryArguments: ['url'],
+      argumentDisplay: 'primary' as const,
+      lifecycleDisplay: 'boundary' as const,
+    }
+
+    api.appendToolCall({
+      tool_use_id: 'fetch-legacy',
+      tool_name: 'http_request',
+      input: { headers: { Authorization: 'secret' } },
+    })
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toContain('secret')
+
+    api.appendToolResult({
+      tool_use_id: 'fetch-legacy',
+      tool_name: 'http_request',
+      arguments: {},
+      result: 'ok',
+      tool_presentation: presentation,
+    })
+
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toBe('')
+    api.cleanup()
+  })
+
   it('clears stale text on an authoritative empty snapshot but keeps tools', () => {
     const { api, messages } = makeStream()
 

@@ -107,7 +107,7 @@ const DETAIL_PREVIEW_CHAR_LIMIT = 6_000
 const DETAIL_PREVIEW_LINE_LIMIT = 80
 
 type ActivityDetailSection = {
-  kind: 'input' | 'result' | 'error'
+  kind: 'input' | 'result' | 'error' | 'changes'
   label: string
   content: string
   preview: string
@@ -130,44 +130,9 @@ const projection = computed(() =>
 const copyState = ref<'idle' | 'copied' | 'error'>('idle')
 let copyResetId: number | null = null
 
-function asRecord(value: string): Record<string, unknown> | null {
-  const source = String(value || '').trim()
-  if (!source.startsWith('{')) return null
-  try {
-    const parsed = JSON.parse(source)
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null
-  } catch {
-    return null
-  }
-}
-
-function recordString(
-  record: Record<string, unknown> | null,
-  keys: string[],
-): string {
-  if (!record) return ''
-  for (const key of keys) {
-    const value = record[key]
-    if (typeof value === 'string' && value.trim()) return value.trim()
-  }
-  return ''
-}
-
 function detailInputText(): string {
   const raw = String(props.call.inputRaw || props.call.inputPreview || '').trim()
-  if (!raw) return ''
-  if (props.operationKey === 'command.run' || props.operationKey === 'code.python') {
-    const executable = recordString(asRecord(raw), [
-      'command',
-      'cmd',
-      'code',
-      'script',
-    ])
-    if (executable) return redactActivityDetail(executable)
-  }
-  return redactActivityDetail(raw)
+  return raw ? redactActivityDetail(raw) : ''
 }
 
 function detailResultText(): string {
@@ -192,6 +157,35 @@ function boundedPreview(value: string): string {
 }
 
 const detailSections = computed<ActivityDetailSection[]>(() => {
+  if (projection.value.detailMode === 'changes') {
+    const content = projection.value.rawContent
+    return content
+      ? [{
+          kind: 'changes',
+          label: t('shared.runTrace.sectionChanges'),
+          content,
+          preview: boundedPreview(content),
+        }]
+      : []
+  }
+  if (projection.value.detailMode === 'result') {
+    const content = projection.value.rawContent
+    const kind = props.call.isError || props.call.status === 'error'
+      ? 'error'
+      : 'result'
+    return content
+      ? [{
+          kind,
+          label: t(
+            kind === 'error'
+              ? 'shared.runTrace.sectionError'
+              : 'shared.runTrace.sectionResult',
+          ),
+          content,
+          preview: boundedPreview(content),
+        }]
+      : []
+  }
   const sections: ActivityDetailSection[] = []
   const input = detailInputText()
   const result = detailResultText()
@@ -223,6 +217,7 @@ const detailSections = computed<ActivityDetailSection[]>(() => {
 
 const isBoundedDetail = computed(() => {
   if (!projection.value.rawContent) return false
+  if (projection.value.detailMode) return true
   const sections = detailSections.value
   const characters = sections.reduce(
     (total, section) => total + section.content.length,
@@ -267,7 +262,7 @@ function scheduleCopyReset() {
 
 async function copyDetails() {
   try {
-    await copyTextWithFallback(redactActivityDetail(projection.value.rawContent))
+    await copyTextWithFallback(projection.value.rawContent)
     copyState.value = 'copied'
   } catch {
     copyState.value = 'error'
@@ -364,8 +359,9 @@ function showRawDetails() {
     `${props.label} · ${t('shared.runTrace.activityDetailsTitle')}`,
     {
       toolName: props.call.name,
-      inputRaw: props.call.inputRaw || props.call.inputPreview,
+      inputRaw: redactActivityDetail(props.call.inputRaw || props.call.inputPreview),
       section: detail.rawSection,
+      format: detail.detailMode === 'changes' ? 'diff' : undefined,
     },
   )
 }

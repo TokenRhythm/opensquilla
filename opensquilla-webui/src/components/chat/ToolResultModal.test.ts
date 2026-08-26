@@ -115,6 +115,21 @@ describe('ToolResultModal', () => {
     app.unmount()
   })
 
+  it('renders file change details as a diff', async () => {
+    const { app, el } = await mountToolResultModal({
+      content: '--- before\n+++ after\n@@\n-old\n+new',
+      context: {
+        toolName: 'edit_file',
+        section: 'input',
+        format: 'diff',
+      },
+    })
+
+    expect(el.querySelector('.tool-sheet__meta')?.textContent).toContain('Diff · 5 lines')
+    expect(el.querySelector('.tool-sheet__pre .language-diff')).not.toBeNull()
+    app.unmount()
+  })
+
   it('copies the complete raw content and updates the button state', async () => {
     const content = 'first\nsecond'
     const { app, el } = await mountToolResultModal({ content })

@@ -17,8 +17,8 @@ function toolCall(): ChatToolCallRenderItem {
   return {
     toolId: 'shared-tool',
     renderKey: 'shared-tool',
-    name: 'web_search',
-    displayName: 'Search',
+    name: 'custom_tool',
+    displayName: 'Custom tool',
     inputRaw: '{}',
     inputPreview: '{}',
     isRunning: false,
@@ -36,9 +36,9 @@ function timelineItems(): ChatStreamTimelineItem[] {
     key: 'shared-group',
     group: {
       groupId: 'shared-group',
-      operationKey: 'web.search',
-      label: 'Search',
-      iconName: 'search',
+      operationKey: 'tool.custom',
+      label: 'Custom tool',
+      iconName: 'gear',
       calls: [toolCall()],
       secondary: '',
       isRunning: false,
