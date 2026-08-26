@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import {
   CUSTOM_B5_MAX_PROPOSERS,
   CUSTOM_B5_SELECTION_MODE,
+  FOUR_TIER_MAPPING_SELECTION_MODE,
   LEGACY_OPENROUTER_MODEL_OPTIONS,
   OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR,
   OPENROUTER_FIXED_ENSEMBLE_PROPOSERS,
@@ -96,6 +97,34 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(panel.legacyMigratable).toBe(false)
     expect(panel.showCandidateEditor).toBe(false)
     expect(panel.customCandidates).toHaveLength(LEGACY_OPENROUTER_MODEL_OPTIONS.length)
+  })
+
+  it('keeps the config-only four-tier mapping route readable and untouched', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: true,
+      selection_mode: FOUR_TIER_MAPPING_SELECTION_MODE,
+    })
+
+    const panel = makePanel(f, 'openrouter').value
+    expect(f.selectionMode.value).toBe(FOUR_TIER_MAPPING_SELECTION_MODE)
+    expect(f.isDirty.value).toBe(false)
+    expect(f.payload()).toEqual({})
+    expect(panel.scheme).toBe('legacy')
+    expect(panel.legacyMigratable).toBe(false)
+    expect(panel.showCandidateEditor).toBe(false)
+  })
+
+  it.each([
+    'fixed_four_tier_v2',
+    'fixed-four-tier-v2',
+  ])('does not accept the removed selection mode %s as an alias', (removedMode) => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ ...SAVED, selection_mode: removedMode })
+
+    expect(f.selectionMode.value).toBe('static_openrouter')
+    expect(f.isDirty.value).toBe(false)
+    expect(f.payload()).toEqual({})
   })
 
   it('shows the tree baseline runtime defaults when model options are empty', () => {

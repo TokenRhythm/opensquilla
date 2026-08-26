@@ -14,7 +14,12 @@ from typing import Any, Literal
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
 
 _INDEPENDENT_ENSEMBLE_MODES = frozenset(
-    {"static_openrouter", "static_tokenrhythm", "custom"}
+    {
+        "static_openrouter",
+        "static_tokenrhythm",
+        "custom",
+        "four_tier_mapping",
+    }
 )
 
 
@@ -174,12 +179,8 @@ def model_routing_mode_for_write(
     advanced ``rollout_phase`` back to ``full``.
     """
 
-    ensemble_enabled_written = _path_was_written(
-        explicit_paths, "llm_ensemble.enabled"
-    )
-    router_enabled_written = _path_was_written(
-        explicit_paths, "squilla_router.enabled"
-    )
+    ensemble_enabled_written = _path_was_written(explicit_paths, "llm_ensemble.enabled")
+    router_enabled_written = _path_was_written(explicit_paths, "squilla_router.enabled")
     ensemble_enabled_toggled = ensemble_enabled_written and _control_leaf_changed(
         config, previous, "llm_ensemble", "enabled"
     )
@@ -191,26 +192,18 @@ def model_routing_mode_for_write(
     ):
         return None
     if ensemble_enabled_written and router_enabled_written:
-        ensemble_enabled = bool(
-            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-        )
-        router_enabled = bool(
-            getattr(getattr(config, "squilla_router", None), "enabled", False)
-        )
+        ensemble_enabled = bool(getattr(getattr(config, "llm_ensemble", None), "enabled", False))
+        router_enabled = bool(getattr(getattr(config, "squilla_router", None), "enabled", False))
         if ensemble_enabled:
             return "ensemble"
         if router_enabled:
             return "router"
         return "direct"
     if ensemble_enabled_written:
-        enabled = bool(
-            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-        )
+        enabled = bool(getattr(getattr(config, "llm_ensemble", None), "enabled", False))
         return "ensemble" if enabled else "direct"
     if router_enabled_written:
-        enabled = bool(
-            getattr(getattr(config, "squilla_router", None), "enabled", False)
-        )
+        enabled = bool(getattr(getattr(config, "squilla_router", None), "enabled", False))
         return "router" if enabled else "direct"
     return None
 
@@ -258,9 +251,8 @@ def reconcile_model_routing_write(
     if mode is not None:
         return apply_model_routing_mode(config, mode)
 
-    if (
-        "llm_ensemble.selection_mode" not in explicit_paths
-        or not bool(getattr(getattr(config, "llm_ensemble", None), "enabled", False))
+    if "llm_ensemble.selection_mode" not in explicit_paths or not bool(
+        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
     ):
         return {}
 

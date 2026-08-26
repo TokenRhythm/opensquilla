@@ -2955,6 +2955,8 @@
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
+      "waitBranchIdle": "Espera a que termine la respuesta, la compactación o la cola antes de crear una rama.",
+      "attachmentBranchUnsupported": "Los mensajes con archivos adjuntos aún no se pueden regenerar ni editar en una rama.",
       "artifactOpenFailed": "No se pudo abrir el artefacto. Usa Descargar en su lugar."
     },
     "stream": {

@@ -659,9 +659,48 @@ async def test_prepared_prefix_branch_preserves_parent_canonical_coverage(
     page = await manager.get_canonical_transcript_page(plan.node.session_key, limit=10)
 
     assert [entry.content for entry in page.entries] == ["message 0", "message 1"]
+    source_entries = (await manager.get_transcript(parent.session_key))[: len(page.entries)]
+    assert plan.source_to_child_message_ids == tuple(
+        (source.message_id, copied.message_id)
+        for source, copied in zip(source_entries, page.entries, strict=True)
+    )
+    assert all(source_id != child_id for source_id, child_id in plan.source_to_child_message_ids)
     assert plan.node.compaction_count == (0 if parent_complete else 1)
     assert plan.node.schema_version >= CANONICAL_FORK_PROOF_SCHEMA_VERSION
     assert page.canonical_complete is parent_complete
+
+
+@pytest.mark.asyncio
+async def test_prepared_nested_prefix_branch_rebinds_to_immediate_parent(manager):
+    parent = await manager.create("agent:main:nested-prefix-parent")
+    original_start = await manager.append_message(parent.session_key, "user", "start")
+    await manager.append_message(parent.session_key, "assistant", "answer")
+    fork_target = await manager.append_message(parent.session_key, "user", "next")
+
+    first_plan = await manager.prepare_prefix_branch(
+        parent.session_key,
+        "agent:main:nested-prefix-child",
+        fork_before_message_id=fork_target.message_id,
+    )
+    await manager._storage.upsert_session(first_plan.node)
+    for entry in first_plan.initial_transcript_entries:
+        await manager._storage.append_transcript_entry(entry)
+    first_child_entries = await manager.get_transcript(first_plan.node.session_key)
+
+    nested_plan = await manager.prepare_prefix_branch(
+        first_plan.node.session_key,
+        "agent:main:nested-prefix-grandchild",
+        fork_before_message_id=first_child_entries[1].message_id,
+    )
+
+    assert len(nested_plan.initial_transcript_entries) == 1
+    assert nested_plan.source_to_child_message_ids == (
+        (
+            first_child_entries[0].message_id,
+            nested_plan.initial_transcript_entries[0].message_id,
+        ),
+    )
+    assert first_child_entries[0].message_id != original_start.message_id
 
 
 @pytest.mark.asyncio
@@ -1200,9 +1239,7 @@ async def test_storage_adds_compaction_lookup_index_to_existing_database(tmp_pat
     upgraded = SessionStorage(str(db_path))
     await upgraded.connect()
     try:
-        async with upgraded.conn.execute(
-            "PRAGMA index_list(compacted_transcript_entries)"
-        ) as cur:
+        async with upgraded.conn.execute("PRAGMA index_list(compacted_transcript_entries)") as cur:
             index_names = {str(row[1]) for row in await cur.fetchall()}
         assert "idx_compacted_transcript_session_compaction" in index_names
 
@@ -1213,10 +1250,7 @@ async def test_storage_adds_compaction_lookup_index_to_existing_database(tmp_pat
             ("session", "compaction"),
         ) as cur:
             query_plan = [str(row[3]) for row in await cur.fetchall()]
-        assert any(
-            "idx_compacted_transcript_session_compaction" in detail
-            for detail in query_plan
-        )
+        assert any("idx_compacted_transcript_session_compaction" in detail for detail in query_plan)
     finally:
         await upgraded.close()
 
@@ -2260,8 +2294,7 @@ async def test_canonical_transcript_page_reports_incomplete_legacy_archive(manag
         compaction_id="cmp-legacy",
     )
     await manager._storage.conn.execute(
-        "DELETE FROM compacted_transcript_entries "
-        "WHERE session_id = ? AND compaction_id = ?",
+        "DELETE FROM compacted_transcript_entries WHERE session_id = ? AND compaction_id = ?",
         (node.session_id, "cmp-legacy"),
     )
     await manager._storage.conn.commit()

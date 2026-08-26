@@ -5,6 +5,7 @@ import { useChatSend, type UseChatSendOptions } from './useChatSend'
 import { useChatMessageActions } from './useChatMessageActions'
 import type { FoldLiveTurnMode } from './useChatTurnLog'
 import type { Attachment, ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type { ChatRoutingControl } from '@/types/rpc'
 import {
   useChatPendingQueue,
   type BusySendMode,
@@ -332,6 +333,106 @@ describe('useChatSend attachment payloads', () => {
       forkBeforeMessageId: 'msg-B',
     }))
     expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('keeps a four-tier mapping branch draft intact if the session becomes busy before send', async () => {
+    const pendingForkBeforeMessageId = ref<string | null>('msg-B')
+    const pendingRoutingControl = ref<ChatRoutingControl | null>({
+      mode: 'four_tier_mapping' as const,
+      intent: 'redo' as const,
+      redoOfMessageId: 'msg-B',
+    })
+    const enqueuePendingInput = vi.fn(() => true)
+    const { api, options, rpc, stream } = makeOptions({
+      pendingForkBeforeMessageId,
+      pendingRoutingControl,
+      enqueuePendingInput,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+      llmEnsembleSelectionMode: ref('four_tier_mapping'),
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(enqueuePendingInput).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+    expect(pendingRoutingControl.value).toEqual({
+      mode: 'four_tier_mapping',
+      intent: 'redo',
+      redoOfMessageId: 'msg-B',
+    })
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('does not attach a composer file to a pending four-tier mapping branch', async () => {
+    const ready: Attachment = {
+      kind: 'staged',
+      local_id: 81,
+      name: 'unrelated.png',
+      mime: 'image/png',
+      file_uuid: 'file-unrelated',
+    }
+    const pendingAttachments = ref<Attachment[]>([ready])
+    const pendingForkBeforeMessageId = ref<string | null>('msg-B')
+    const pendingRoutingControl = ref<ChatRoutingControl | null>({
+      mode: 'four_tier_mapping',
+      intent: 'redo',
+      redoOfMessageId: 'msg-B',
+    })
+    const { api, options, rpc } = makeOptions({
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingRoutingControl,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+      llmEnsembleSelectionMode: ref('four_tier_mapping'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(pendingAttachments.value).toEqual([ready])
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+    expect(pendingRoutingControl.value).toEqual(expect.objectContaining({ intent: 'redo' }))
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('rechecks four-tier mapping branch queue state after async send preparation', async () => {
+    const pendingForkBeforeMessageId = ref<string | null>('msg-B')
+    const pendingRoutingControl = ref<ChatRoutingControl | null>({
+      mode: 'four_tier_mapping' as const,
+      intent: 'redo' as const,
+      redoOfMessageId: 'msg-B',
+    })
+    let branchBlocked = false
+    const prepareAttachmentsForSend = vi.fn(async () => {
+      branchBlocked = true
+      return true
+    })
+    const { api, options, rpc, stream } = makeOptions({
+      pendingForkBeforeMessageId,
+      pendingRoutingControl,
+      prepareAttachmentsForSend,
+      isFourTierMappingBranchActionBlocked: () => branchBlocked,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+      llmEnsembleSelectionMode: ref('four_tier_mapping'),
+    })
+
+    await api.onSend()
+
+    expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(stream.startStreaming).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+    expect(pendingRoutingControl.value).toEqual({
+      mode: 'four_tier_mapping',
+      intent: 'redo',
+      redoOfMessageId: 'msg-B',
+    })
+    expect(options.messages.value).toEqual([])
   })
 
   it('switches the session lifecycle when a stopped turn is edited into a child session', async () => {
@@ -722,6 +823,45 @@ describe('useChatSend attachment payloads', () => {
     const secondParams = rpc.call.mock.calls[1]?.[1]
     expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
     expect(secondParams).toMatchObject({ message: 'edited', _source: { runMode: 'trusted' } })
+  })
+
+  it('turns an edited recovered redo into an ordinary prefix-fork send', async () => {
+    const inputText = ref('original')
+    const pendingForkBeforeMessageId = ref<string | null>('msg-original')
+    const pendingRoutingControl = ref<ChatRoutingControl | null>({
+      mode: 'four_tier_mapping' as const,
+      intent: 'redo' as const,
+      redoOfMessageId: 'msg-original',
+    })
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:child', task_id: 'task-child' }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingRoutingControl,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+      llmEnsembleSelectionMode: ref('four_tier_mapping'),
+    })
+
+    await api.onSend()
+    expect(pendingRoutingControl.value).toEqual(expect.objectContaining({ intent: 'redo' }))
+
+    inputText.value = 'edited prompt'
+    await api.onSend()
+
+    expect(rpc.call.mock.calls[1]?.[1]).toMatchObject({
+      message: 'edited prompt',
+      forkBeforeMessageId: 'msg-original',
+    })
+    expect(rpc.call.mock.calls[1]?.[1]).not.toHaveProperty('routingControl')
+    expect(pendingRoutingControl.value).toBeNull()
   })
 
   it('does not restore an attempt explicitly reported as accepted', async () => {
@@ -1813,6 +1953,22 @@ describe('useChatSend Ensemble image guard', () => {
     expect(options.pendingSessionIntent.value).toBeNull()
     expect(options.closeSlashMenu).not.toHaveBeenCalled()
     expect(stream.startStreaming).not.toHaveBeenCalled()
+  })
+
+  it('keeps the legacy image restriction out of four-tier mapping', async () => {
+    const image = readyAttachment('image/png', { name: 'photo.png' })
+    const pendingAttachments = ref<Attachment[]>([image])
+    const { api, rpc } = makeOptions({
+      pendingAttachments,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+      llmEnsembleSelectionMode: ref('four_tier_mapping'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      attachments: [expect.objectContaining({ mime: 'image/png' })],
+    }))
   })
 
   it('blocks image sends while routing settings are being written', async () => {

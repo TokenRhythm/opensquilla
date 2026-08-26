@@ -42,7 +42,7 @@ cache-friendly system-prompt-rebuild contract.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -145,6 +145,8 @@ class HistoryLoaderPort(Protocol):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
+        suppress_compaction_context: bool = False,
+        history_start_message_id: str | None = None,
     ) -> str | None: ...
 
 
@@ -257,6 +259,11 @@ class CompactionAndHistoryStage:
     Hook invocation discriminates t3 vs preflight via
     ``CompactionState.extra["phase"]``.
 
+    Fixed-four-tier v2 is a task-scoped exception to that four-port
+    sequence. Compaction is skipped, only the exact durable interval from
+    the active task boundary through the bound input is loaded, and durable
+    summaries/provider compaction context are suppressed.
+
     Exception model: re-raises ``asyncio.CancelledError`` from any
     port. Other exceptions from t3/preflight ports are swallowed
     internally by the helpers (no surrounding
@@ -288,6 +295,84 @@ class CompactionAndHistoryStage:
         # Local imports keep the module import-cycle-free.
         from opensquilla.engine.hooks.types import CompactionState
         from opensquilla.engine.turn_runner.outcome import StageOutcome
+
+        metadata_value = getattr(inp.turn, "metadata", {})
+        metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+        fixed_route_id = str(metadata.get("fixed_four_tier_v2_decision_id") or "").strip()
+        fixed_history_turns_value = metadata.get("fixed_four_tier_v2_history_turns_to_keep")
+        fixed_history_turns = (
+            max(0, fixed_history_turns_value)
+            if isinstance(fixed_history_turns_value, int)
+            and not isinstance(fixed_history_turns_value, bool)
+            else None
+        )
+        if fixed_route_id:
+            context_action = str(metadata.get("fixed_four_tier_v2_context_action") or "").strip()
+            if fixed_history_turns is None:
+                raise ValueError("four_tier_mapping history scope is missing a valid turn count")
+            if context_action not in {"keep", "reset"}:
+                raise ValueError("four_tier_mapping history scope has an invalid context action")
+            if context_action == "reset" and fixed_history_turns != 0:
+                raise ValueError(
+                    "four_tier_mapping history scope has an inconsistent task boundary"
+                )
+            if context_action == "reset":
+                inp.agent.clear_history()
+                scoped_status = "skipped_fixed_task_reset"
+            else:
+                task_start_message_id = str(
+                    metadata.get("fixed_four_tier_v2_task_start_input_message_id") or ""
+                ).strip()
+                if not task_start_message_id or not str(inp.bound_user_message_id or "").strip():
+                    raise ValueError(
+                        "four_tier_mapping keep context requires durable task boundaries"
+                    )
+                # Never let a pre-populated/reused Agent leak history outside
+                # the durable task slice when the loader reconstructs no rows.
+                inp.agent.clear_history()
+                if fixed_history_turns == 0:
+                    # Regenerating the first turn is still a ``keep`` action:
+                    # it preserves the task id/tier while replacing that
+                    # turn.  There is intentionally no prior model-visible
+                    # history, and both durable boundaries must identify the
+                    # newly persisted replacement input.
+                    if task_start_message_id != str(inp.bound_user_message_id).strip():
+                        raise ValueError(
+                            "four_tier_mapping zero-history keep has mismatched task boundaries"
+                        )
+                else:
+                    await self._history_loader.load(
+                        agent=inp.agent,
+                        session_key=inp.session_key,
+                        # The fixed resolver already requires and verifies the
+                        # durable current-input anchor.  Always slice at that
+                        # anchor here, even if a stale upstream hint says the
+                        # input was not persisted; positional/no-trim fallback
+                        # would duplicate the current prompt or expose queued
+                        # future inputs.
+                        trim_last_user=True,
+                        bound_user_message_id=inp.bound_user_message_id,
+                        suppress_compaction_context=True,
+                        history_start_message_id=task_start_message_id,
+                    )
+                # The loader already applies the exact durable task-start and
+                # current-input boundaries.  ``task_turn_count`` counts routed
+                # executions, whereas collect mode may persist several user
+                # rows in one execution, so applying ``limit_turns`` here can
+                # silently drop part of the same task input.
+                scoped_status = "skipped_fixed_task_scope"
+            final_request_context_prompt = self._request_context_prepender.prepend(
+                existing=inp.agent.config.request_context_prompt,
+                prepended=None,
+            )
+            return StageOutcome.success(
+                CompactionAndHistoryStageOutput(
+                    t3_upgrade_status=scoped_status,
+                    preflight_invoked=False,
+                    compaction_summary_context=None,
+                    final_request_context_prompt=final_request_context_prompt,
+                )
+            )
 
         compaction_context_window_tokens = (
             inp.compaction_context_window_tokens or inp.context_window_tokens

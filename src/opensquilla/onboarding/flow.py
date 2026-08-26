@@ -1702,7 +1702,12 @@ def run_interactive_router_configure(
 def _ensemble_selection_modes() -> tuple[str, ...]:
     from opensquilla.onboarding.mutations import _LLM_ENSEMBLE_SELECTION_MODES
 
-    return _LLM_ENSEMBLE_SELECTION_MODES
+    # four_tier_mapping is an operator-authored, config-only route.  The
+    # generic onboarding form cannot configure its required single-model
+    # topology or frozen tier contract, so exposing the Literal here would
+    # offer a choice that cannot be saved safely.  Keep accepting the mode at
+    # config/RPC boundaries while leaving this legacy ensemble form unchanged.
+    return tuple(mode for mode in _LLM_ENSEMBLE_SELECTION_MODES if mode != "four_tier_mapping")
 
 
 def _ensemble_all_failed_policies() -> tuple[str, ...]:

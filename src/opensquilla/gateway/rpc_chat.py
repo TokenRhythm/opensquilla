@@ -385,9 +385,7 @@ async def _enforce_context_overflow(
             transcript=transcript,
             session_key=session_key,
             session_manager=ctx.session_manager,
-            compaction_config=await _build_context_overflow_compaction_config(
-                ctx, session_key
-            ),
+            compaction_config=await _build_context_overflow_compaction_config(ctx, session_key),
             flush_service=getattr(ctx, "flush_service", None),
             compaction_marker=getattr(ctx, "turn_runner", None),
             policy_override=policy_override,
@@ -449,9 +447,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                     if await get_session(session_key) is None:
                         intent = "new_chat"
                 except Exception as exc:
-                    raise RpcUnavailableError(
-                        f"Failed to inspect chat session: {exc}"
-                    ) from exc
+                    raise RpcUnavailableError(f"Failed to inspect chat session: {exc}") from exc
             else:
                 # Compatibility for minimal test/simulator managers that do
                 # not expose storage: retain the historical initializer.
@@ -462,9 +458,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                         display_name="WebChat",
                     )
                 except Exception as exc:
-                    raise RpcUnavailableError(
-                        f"Failed to initialize chat session: {exc}"
-                    ) from exc
+                    raise RpcUnavailableError(f"Failed to initialize chat session: {exc}") from exc
 
         from opensquilla.gateway.rpc_sessions import _handle_sessions_send
 
@@ -490,6 +484,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("queue_mode", "queue_mode"),
             ("forkBeforeMessageId", "forkBeforeMessageId"),
             ("fork_before_message_id", "fork_before_message_id"),
+            ("routingControl", "routingControl"),
+            ("routing_control", "routing_control"),
             ("clientRequestId", "clientRequestId"),
             ("client_request_id", "client_request_id"),
             ("clientMessageId", "clientMessageId"),
@@ -532,6 +528,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             send_params,
             ctx,
             fingerprint_params=fingerprint_params,
+            allow_fixed_routing_control=True,
         )
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}
@@ -600,9 +597,7 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     try:
         history_lock = get_session_lock(ctx.turn_runner, session_key)
         if history_lock is None:
-            page_entries, has_more, canonical_available, canonical_complete = (
-                await _load_page()
-            )
+            page_entries, has_more, canonical_available, canonical_complete = await _load_page()
         else:
             # Canonical reads and compaction rewrites share one aiosqlite
             # connection.  SQLite statements are snapshots, but a statement on
@@ -611,9 +606,7 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
             # mutation lock so the page and its coverage metadata are read only
             # before or after a rewrite, never from its intermediate state.
             async with history_lock:
-                page_entries, has_more, canonical_available, canonical_complete = (
-                    await _load_page()
-                )
+                page_entries, has_more, canonical_available, canonical_complete = await _load_page()
     except KeyError:
         if _is_webchat_session_key(session_key):
             return _empty_chat_history_payload(limit)

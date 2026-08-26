@@ -2955,6 +2955,8 @@
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
       "queueFull": "キューがいっぱいです — 現在の応答が完了するまでお待ちください。",
       "messageStillSaving": "このメッセージはまだ保存が完了していません — しばらくしてからもう一度お試しください。",
+      "waitBranchIdle": "返信、コンパクション、またはキュー処理が完了してから分岐してください。",
+      "attachmentBranchUnsupported": "添付ファイル付きメッセージの再生成や分岐編集にはまだ対応していません。",
       "artifactOpenFailed": "成果物を開けませんでした。代わりにダウンロードを使用してください。"
     },
     "stream": {

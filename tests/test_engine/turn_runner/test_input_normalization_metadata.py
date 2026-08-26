@@ -103,9 +103,7 @@ async def test_prompt_assembler_passes_normalization_metadata_to_pipeline() -> N
     executor = _RecordingPipelineExecutor(turn=_make_turn())
     stage = _make_stage(executor=executor)
 
-    await stage.run(
-        _make_prompt_input(normalization_metadata=normalization_metadata)
-    )
+    await stage.run(_make_prompt_input(normalization_metadata=normalization_metadata))
 
     assert executor.requests[0].normalization_metadata == normalization_metadata
     assert executor.requests[0].normalization_metadata is normalization_metadata
@@ -137,6 +135,31 @@ async def test_pipeline_execution_adapter_forwards_normalization_metadata() -> N
 
 
 @pytest.mark.asyncio
+async def test_pipeline_execution_adapter_forwards_trusted_route_metadata() -> None:
+    runner = _RecordingRunner()
+    adapter = _TurnRunnerPipelineExecutionAdapter(cast(TurnRunner, runner))
+    trusted = {
+        "fixed_four_tier_v2_control_event": "redo",
+        "fixed_four_tier_v2_redo_parent_session_id": "parent-session",
+    }
+
+    await adapter.run_pipeline(
+        RunPipelineRequest(
+            runtime_message="runtime",
+            session_key="agent:main:s1",
+            provider="provider",
+            cloned_selector=None,
+            tool_defs=[],
+            base_prompt="base",
+            attachments=[],
+            trusted_route_metadata=trusted,
+        )
+    )
+
+    assert runner.calls[0]["trusted_route_metadata"] == trusted
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_seeds_turn_context_with_normalization_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -149,9 +172,7 @@ async def test_run_pipeline_seeds_turn_context_with_normalization_metadata(
     monkeypatch.setattr("opensquilla.engine.pipeline.run_pipeline", fake_run_pipeline)
     runner = TurnRunner(
         provider_selector=None,
-        config=SimpleNamespace(
-            squilla_router=SimpleNamespace(routing_timeout_seconds=5.0)
-        ),
+        config=SimpleNamespace(squilla_router=SimpleNamespace(routing_timeout_seconds=5.0)),
     )
     normalization_metadata = {
         "guard_action": "generated_text_attachment",
@@ -187,9 +208,7 @@ async def test_run_pipeline_ignores_non_positive_material_token_metadata(
     monkeypatch.setattr("opensquilla.engine.pipeline.run_pipeline", fake_run_pipeline)
     runner = TurnRunner(
         provider_selector=None,
-        config=SimpleNamespace(
-            squilla_router=SimpleNamespace(routing_timeout_seconds=5.0)
-        ),
+        config=SimpleNamespace(squilla_router=SimpleNamespace(routing_timeout_seconds=5.0)),
     )
 
     await runner._run_pipeline(
@@ -203,9 +222,7 @@ async def test_run_pipeline_ignores_non_positive_material_token_metadata(
         normalization_metadata={"material_estimated_tokens": True},
     )
 
-    assert captured["metadata"]["input_normalization"] == {
-        "material_estimated_tokens": True
-    }
+    assert captured["metadata"]["input_normalization"] == {"material_estimated_tokens": True}
     assert "material_estimated_tokens" not in captured["metadata"]
 
 
@@ -239,7 +256,11 @@ class _RecordingPromptAssembler(PromptAssemblerPort):
 
 class _RecordingRouterContext(RouterContextPort):
     async def fetch_router_context(
-        self, session_key, *, exclude_last_user, bound_user_message_id=None  # noqa: ANN001, ARG002
+        self,
+        session_key,
+        *,
+        exclude_last_user,
+        bound_user_message_id=None,  # noqa: ANN001, ARG002
     ):
         return {}
 

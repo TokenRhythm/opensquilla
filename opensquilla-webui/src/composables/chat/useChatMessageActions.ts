@@ -5,6 +5,7 @@ import type {
   ChatStreamTimelineItem,
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import type { ChatRoutingControl } from '@/types/rpc'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -16,6 +17,10 @@ export interface UseChatMessageActionsOptions {
   sendCurrentInput: () => void
   focusComposer: () => void
   pendingForkBeforeMessageId: Ref<string | null>
+  pendingRoutingControl?: Ref<ChatRoutingControl | null>
+  isFourTierMapping?: () => boolean
+  isBranchActionBlocked?: () => boolean
+  hasPendingBranchAttachments?: () => boolean
   aiGeneratedLabel?: () => string
   /**
    * User-visible feedback when regenerate/edit cannot run because the anchor
@@ -24,6 +29,8 @@ export interface UseChatMessageActionsOptions {
    * only trace of the refusal would be a console warning.
    */
   notifyMessagePending?: () => void
+  notifyBranchBusy?: () => void
+  notifyAttachmentBranchUnsupported?: () => void
 }
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
@@ -77,8 +84,18 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   function regenerateMessage(message: ChatRenderedMessage) {
-    if (options.isStreaming.value) {
+    const fourTierMapping = options.isFourTierMapping?.() === true
+    if (fourTierMapping && options.hasPendingBranchAttachments?.()) {
+      console.warn('Composer attachments cannot be added to a regenerate branch')
+      options.notifyAttachmentBranchUnsupported?.()
+      return
+    }
+    if (
+      options.isStreaming.value
+      || (fourTierMapping && options.isBranchActionBlocked?.())
+    ) {
       console.warn('Wait for the current response to finish')
+      if (fourTierMapping) options.notifyBranchBusy?.()
       return
     }
     const assistantIndex = sourceMessageIndex(message)
@@ -89,6 +106,11 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     }
 
     const userMessage = options.messages.value[userMsgIndex]
+    if (fourTierMapping && (userMessage?.attachments?.length || 0) > 0) {
+      console.warn('Messages with attachments cannot be regenerated safely yet')
+      options.notifyAttachmentBranchUnsupported?.()
+      return
+    }
     const forkBeforeMessageId = userMessage?.messageId || ''
     if (!forkBeforeMessageId) {
       console.warn('Wait for the message to finish saving before regenerating')
@@ -97,6 +119,15 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     }
     const userText = userMessage?.text || ''
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
+    if (options.pendingRoutingControl && fourTierMapping) {
+      options.pendingRoutingControl.value = {
+        mode: 'four_tier_mapping',
+        intent: 'redo',
+        redoOfMessageId: forkBeforeMessageId,
+      }
+    } else if (options.pendingRoutingControl) {
+      options.pendingRoutingControl.value = null
+    }
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     options.inputText.value = userText
     options.autoResizeTextarea()
@@ -104,14 +135,29 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   function editMessage(message: ChatRenderedMessage) {
-    if (options.isStreaming.value) {
+    const fourTierMapping = options.isFourTierMapping?.() === true
+    if (fourTierMapping && options.hasPendingBranchAttachments?.()) {
+      console.warn('Composer attachments cannot be added to an edit branch')
+      options.notifyAttachmentBranchUnsupported?.()
+      return
+    }
+    if (
+      options.isStreaming.value
+      || (fourTierMapping && options.isBranchActionBlocked?.())
+    ) {
       console.warn('Wait for the current response to finish')
+      if (fourTierMapping) options.notifyBranchBusy?.()
       return
     }
     const msgIndex = sourceMessageIndex(message)
     if (msgIndex < 0) return
     if (options.messages.value[msgIndex]?.role !== 'user') return
     const sourceMessage = options.messages.value[msgIndex]
+    if (fourTierMapping && (sourceMessage?.attachments?.length || 0) > 0) {
+      console.warn('Messages with attachments cannot be branched safely yet')
+      options.notifyAttachmentBranchUnsupported?.()
+      return
+    }
     const forkBeforeMessageId = sourceMessage?.messageId || ''
     if (!forkBeforeMessageId) {
       console.warn('Wait for the message to finish saving before editing')
@@ -120,6 +166,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     }
     const text = sourceMessage.text || ''
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
+    if (options.pendingRoutingControl) options.pendingRoutingControl.value = null
     options.messages.value = options.messages.value.slice(0, msgIndex)
     options.inputText.value = text
     options.autoResizeTextarea()

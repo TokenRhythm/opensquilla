@@ -25,6 +25,7 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TurnFinalizerStageInput,
 )
 from opensquilla.engine.types import DoneEvent, ErrorEvent
+from opensquilla.session.turn_context import current_turn_context, turn_context_scope
 
 # ---------------------------------------------------------------------------
 # Recording fakes
@@ -62,6 +63,7 @@ class _RecordingTranscriptAppend:
                 "reasoning_content": reasoning_content,
                 "turn_usage": turn_usage,
                 "token_count": token_count,
+                "turn_context": current_turn_context(),
             }
         )
         if self.raises is not None:
@@ -195,6 +197,7 @@ def _make_input(
     run_kind: str = "default",
     heartbeat_ack_max_chars: int = 300,
     no_memory_capture: bool = False,
+    assistant_turn_context_patch: dict[str, Any] | None = None,
 ) -> TurnFinalizerStageInput:
     return TurnFinalizerStageInput(
         final_text_parts=final_text_parts if final_text_parts is not None else [],
@@ -213,6 +216,7 @@ def _make_input(
         run_kind=run_kind,
         heartbeat_ack_max_chars=heartbeat_ack_max_chars,
         no_memory_capture=no_memory_capture,
+        assistant_turn_context_patch=assistant_turn_context_patch,
     )
 
 
@@ -246,6 +250,38 @@ async def test_simple_text_no_done_event_appends_and_captures() -> None:
     assert len(recs["turn_memory_capture"].calls) == 1
     assert recs["turn_error_persist"].calls == []
     assert recs["session_totals"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_assistant_context_patch_is_present_on_first_append_only() -> None:
+    stage, recs = _make_stage()
+    binding = {
+        "schema": "fixed_four_tier_v2_response_binding_v1",
+        "execution_id": "execution-1",
+        "route_id": "route-1",
+        "request_id": "request-1",
+        "execution_status": "succeeded",
+    }
+
+    with turn_context_scope({"turn_id": "causal-turn", "surface_id": "web"}):
+        outcome = await stage.run(
+            _make_input(
+                final_text_parts=["bound response"],
+                assistant_turn_context_patch=binding,
+            )
+        )
+        assert current_turn_context() == {
+            "turn_id": "causal-turn",
+            "surface_id": "web",
+        }
+
+    assert outcome.output.transcript_appended is True
+    assert recs["transcript_append"].calls[0]["turn_context"] == {
+        "turn_id": "causal-turn",
+        "surface_id": "web",
+        **binding,
+    }
+    assert recs["turn_memory_capture"].calls
 
 
 @pytest.mark.asyncio
@@ -616,9 +652,7 @@ async def test_heartbeat_think_block_is_removed_from_real_alert() -> None:
     outcome = await stage.run(inp)
 
     assert outcome.output.final_text == "Disk usage reached 95%."
-    assert outcome.output.turn_segments == [
-        {"type": "text", "text": "Disk usage reached 95%."}
-    ]
+    assert outcome.output.turn_segments == [{"type": "text", "text": "Disk usage reached 95%."}]
     assert recs["transcript_append"].calls[0]["content"] == "Disk usage reached 95%."
     assert recs["transcript_append"].calls[0]["tool_calls"] == [
         {"type": "text", "text": "Disk usage reached 95%."}

@@ -17,6 +17,7 @@ from opensquilla.gateway.model_routing import (
     model_routing_mode_for_write,
     model_routing_patches,
     model_routing_snapshot,
+    reconcile_model_routing_write,
 )
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
@@ -135,9 +136,7 @@ async def _apply_admin_routing_write(
     [
         (GatewayConfig(squilla_router={"enabled": False}), "direct"),
         (
-            GatewayConfig(
-                squilla_router={"enabled": True, "rollout_phase": "observe"}
-            ),
+            GatewayConfig(squilla_router={"enabled": True, "rollout_phase": "observe"}),
             "direct",
         ),
         (GatewayConfig(), "router"),
@@ -160,6 +159,9 @@ def test_model_routing_snapshot_maps_config_to_one_public_mode(
         ("static_openrouter_b5", False),
         ("static_tokenrhythm_b5", False),
         ("custom_b5", False),
+        ("four_tier_mapping", False),
+        ("fixed_four_tier_v2", True),
+        ("fixed-four-tier-v2", True),
         ("router_dynamic", True),
         ("future_mode", True),
     ],
@@ -170,13 +172,57 @@ def test_ensemble_patch_preserves_router_dependency_compatibility(
 ) -> None:
     # Use a config-like object so canonical values, released aliases, and
     # unknown future values exercise the same compatibility branch.
-    config = SimpleNamespace(
-        llm_ensemble=SimpleNamespace(selection_mode=selection_mode)
-    )
+    config = SimpleNamespace(llm_ensemble=SimpleNamespace(selection_mode=selection_mode))
     patches = model_routing_patches(config, "ensemble")
     assert patches["squilla_router.enabled"] is router_enabled
     assert patches["llm_ensemble.enabled"] is True
     assert patches["squilla_router.rollout_phase"] == "full"
+
+
+def test_fixed_four_tier_snapshot_is_an_independent_ensemble_strategy() -> None:
+    config = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+        },
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["mode"] == "ensemble"
+    assert snapshot["selection_mode"] == "four_tier_mapping"
+    assert snapshot["router_required_by_ensemble"] is False
+
+
+def test_live_switch_to_fixed_four_tier_disables_only_legacy_router_dependency() -> None:
+    previous = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "router_dynamic",
+        },
+        squilla_router={"enabled": True, "rollout_phase": "prompt_only"},
+    )
+    config = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+        },
+        squilla_router={"enabled": True, "rollout_phase": "prompt_only"},
+    )
+
+    changed = reconcile_model_routing_write(
+        config,
+        {"llm_ensemble.selection_mode"},
+        previous=previous,
+    )
+
+    assert changed == {"squilla_router.enabled": False}
+    assert config.squilla_router.enabled is False
+    assert config.squilla_router.rollout_phase == "prompt_only"
 
 
 async def test_models_routing_set_persists_and_returns_canonical_snapshot(tmp_path) -> None:
@@ -563,12 +609,7 @@ def test_unchanged_boolean_writes_select_no_mode_with_previous_snapshot() -> Non
         squilla_router={"enabled": True, "rollout_phase": "observe"},
     )
 
-    assert (
-        model_routing_mode_for_write(
-            config, {"llm_ensemble.enabled"}, previous=previous
-        )
-        is None
-    )
+    assert model_routing_mode_for_write(config, {"llm_ensemble.enabled"}, previous=previous) is None
     assert (
         model_routing_mode_for_write(
             config,

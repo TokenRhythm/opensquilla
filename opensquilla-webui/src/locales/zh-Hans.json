@@ -2955,6 +2955,8 @@
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
       "queueFull": "队列已满 — 请等待当前回复结束。",
       "messageStillSaving": "这条消息尚未保存完成 — 请稍后再试。",
+      "waitBranchIdle": "请等待当前回复、压缩或排队任务结束后再分支。",
+      "attachmentBranchUnsupported": "带附件的消息暂不支持重新生成或编辑分支。",
       "artifactOpenFailed": "产物打开失败。请改为下载。"
     },
     "stream": {

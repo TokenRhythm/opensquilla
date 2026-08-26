@@ -28,6 +28,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("attachments", ("attachments",)),
     ("intent", ("intent",)),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
+    ("routing_control", ("routingControl", "routing_control")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),
     ("input_provenance", ("inputProvenance", "input_provenance")),

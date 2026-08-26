@@ -89,8 +89,8 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
         usd_to_nanos("10000000000")
 
 
-def test_session_schema_version_includes_native_billing_receipts() -> None:
-    assert SCHEMA_VERSION == 11
+def test_session_schema_version_includes_fixed_four_tier_ledger() -> None:
+    assert SCHEMA_VERSION == 12
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:
@@ -173,15 +173,11 @@ async def test_initialize_cutover_is_set_based_and_repairs_legacy_components(
         assert baseline.cost_nanos == 10_000_000
         assert baseline.billed_cost_nanos == 4_000_000
         assert baseline.estimated_cost_nanos == 6_000_000
-        assert baseline.cost_nanos == (
-            baseline.billed_cost_nanos + baseline.estimated_cost_nanos
-        )
+        assert baseline.cost_nanos == (baseline.billed_cost_nanos + baseline.estimated_cost_nanos)
         assert baseline.missing_cost_entries >= 2
         assert state.anomaly_count >= 2
         baseline_inserts = [
-            statement
-            for statement in traced
-            if "INSERT INTO usage_legacy_baselines" in statement
+            statement for statement in traced if "INSERT INTO usage_legacy_baselines" in statement
         ]
         assert len(baseline_inserts) == 1
     finally:
@@ -197,23 +193,17 @@ async def test_event_lifecycle_is_atomic_idempotent_and_half_open(tmp_path: Path
 
         completion = _completion()
         item = _item()
-        finalized = await storage.finalize_usage_event(
-            "event-1", completion, items=(item,)
-        )
+        finalized = await storage.finalize_usage_event("event-1", completion, items=(item,))
         assert finalized.status == "finalized"
         assert finalized.cost_nanos == 9_200_000
-        assert await storage.finalize_usage_event(
-            "event-1", completion, items=(item,)
-        ) == finalized
+        assert await storage.finalize_usage_event("event-1", completion, items=(item,)) == finalized
         assert await storage.query_usage_event_items(["event-1", "event-1"]) == [item]
 
         assert await storage.query_usage_events(200, 201) == [finalized]
         assert await storage.query_usage_events(0, 200) == []
         assert await storage.query_usage_events(201, None) == []
 
-        await storage.start_usage_event(
-            _start(event_id="event-2", execution_id="execution-2")
-        )
+        await storage.start_usage_event(_start(event_id="event-2", execution_id="execution-2"))
         with pytest.raises(ValueError, match="reconcile exactly"):
             await storage.finalize_usage_event(
                 "event-2",
@@ -232,9 +222,7 @@ async def test_event_lifecycle_is_atomic_idempotent_and_half_open(tmp_path: Path
                 _start(event_id="event-other", execution_id="execution-1")
             )
         with pytest.raises(UsageLedgerConflictError):
-            await storage.finalize_usage_event(
-                "event-1", _completion(cost_nanos=1), items=()
-            )
+            await storage.finalize_usage_event("event-1", _completion(cost_nanos=1), items=())
     finally:
         await storage.close()
 
@@ -278,15 +266,16 @@ async def test_native_billing_receipts_are_atomic_idempotent_and_cascaded(
             items=(item,),
             receipts=(receipt,),
         )
-        assert await storage.finalize_usage_event(
-            "event-1",
-            completion,
-            items=(item,),
-            receipts=(receipt,),
-        ) == finalized
-        assert await storage.query_usage_item_billing_receipts(
-            ["event-1", "event-1"]
-        ) == [receipt]
+        assert (
+            await storage.finalize_usage_event(
+                "event-1",
+                completion,
+                items=(item,),
+                receipts=(receipt,),
+            )
+            == finalized
+        )
+        assert await storage.query_usage_item_billing_receipts(["event-1", "event-1"]) == [receipt]
 
         with pytest.raises(UsageLedgerConflictError, match="billing receipts"):
             await storage.finalize_usage_event(
@@ -366,9 +355,7 @@ async def test_billing_receipt_settlement_contracts_preserve_half_open_event(
         )
         assert await storage.query_usage_item_billing_receipts(["event-1"]) == [pending]
 
-        await storage.start_usage_event(
-            _start(event_id="event-2", execution_id="execution-2")
-        )
+        await storage.start_usage_event(_start(event_id="event-2", execution_id="execution-2"))
         zero_completion = replace(
             completion,
             cost_nanos=0,
@@ -399,9 +386,7 @@ async def test_billing_receipt_settlement_contracts_preserve_half_open_event(
             items=(zero_item,),
             receipts=(zero_receipt,),
         )
-        assert await storage.query_usage_item_billing_receipts(["event-2"]) == [
-            zero_receipt
-        ]
+        assert await storage.query_usage_item_billing_receipts(["event-2"]) == [zero_receipt]
     finally:
         await storage.close()
 
@@ -504,10 +489,13 @@ async def test_live_start_resolves_session_attribution_and_boot_recovers_started
         assert started.agent_id == "worker"
         assert started.session_epoch == 4
 
-        assert await storage.recover_started_usage_events(
-            completed_at_ms=600,
-            reason="process_restarted",
-        ) == 1
+        assert (
+            await storage.recover_started_usage_events(
+                completed_at_ms=600,
+                reason="process_restarted",
+            )
+            == 1
+        )
         recovered = await storage.query_usage_events(
             0,
             None,

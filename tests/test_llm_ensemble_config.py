@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import json
@@ -10,9 +11,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
-from opensquilla.gateway.config import GatewayConfig, LlmEnsembleConfig, LlmProviderProfile
+from opensquilla.gateway.config import (
+    FixedFourTierV2Config,
+    GatewayConfig,
+    LlmEnsembleConfig,
+    LlmProviderProfile,
+)
 from opensquilla.provider import ranking_router
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
@@ -136,6 +143,13 @@ def test_llm_ensemble_multiple_serialization_golden_is_canonical() -> None:
     assert canonical_json_bytes(explicit_public) == canonical_json_bytes(default_dump)
 
 
+def test_fixed_four_tier_config_is_absent_from_legacy_default_serialization() -> None:
+    ensemble = GatewayConfig().llm_ensemble
+
+    assert ensemble.four_tier_mapping is None
+    assert "four_tier_mapping" not in ensemble.model_dump(mode="json")
+
+
 @pytest.mark.parametrize(
     ("legacy", "expected_mode", "expected_selection_mode"),
     [
@@ -186,6 +200,38 @@ def test_llm_ensemble_released_values_parse_as_canonical_values(
     assert serialized["selection_mode"] == expected_selection_mode
 
 
+@pytest.mark.parametrize("legacy_mode", ["fixed_four_tier_v2", "fixed-four-tier-v2"])
+def test_four_tier_mapping_rejects_development_selection_mode_names(
+    legacy_mode: str,
+) -> None:
+    with pytest.raises(ValidationError, match="selection_mode"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": legacy_mode,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "removed_subtree",
+    ["fixed_four_tier_v2", "fixed-four-tier-v2"],
+)
+def test_four_tier_mapping_rejects_development_config_subtree_name(
+    removed_subtree: str,
+) -> None:
+    with pytest.raises(ValueError, match="unsupported llm_ensemble configuration"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": "four_tier_mapping",
+                removed_subtree: {"mock_seed": 7},
+            }
+        )
+
+
 def test_llm_ensemble_released_mode_aliases_canonicalize_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,6 +263,207 @@ def test_router_single_requires_enabled_router_dynamic(
         GatewayConfig(llm_ensemble=llm_ensemble)
 
 
+def test_fixed_four_tier_v2_defaults_match_the_frozen_ladder() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {"mock_seed": 20260826},
+        }
+    )
+
+    route = cfg.llm_ensemble.four_tier_mapping
+    assert route is not None
+    assert route.mock_seed == 20260826
+    assert route.schema_version == "fixed-four-tier-v2-mock-v2"
+    assert route.default_new_task_tier == "c1"
+    assert {
+        tier: (
+            deployment.provider,
+            deployment.model,
+            deployment.reasoning,
+            deployment.deployment_version,
+        )
+        for tier, deployment in route.tiers.items()
+    } == {
+        "c0": (
+            "openrouter",
+            "qwen/qwen3.7-flash",
+            "thinking",
+            "qwen3.7-flash-thinking",
+        ),
+        "c1": (
+            "openrouter",
+            "deepseek/deepseek-v4-flash",
+            "max",
+            "deepseek-v4-flash-0731",
+        ),
+        "c2": (
+            "openrouter",
+            "deepseek/deepseek-v4-pro",
+            "max",
+            "deepseek-v4-pro-0813",
+        ),
+        "c3": ("openrouter", "z-ai/glm-5.3", "max", "glm-5.3"),
+    }
+
+
+def test_fixed_four_tier_v2_can_be_parked_without_losing_its_mode() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": False,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+        }
+    )
+
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.mode == "single"
+    assert cfg.llm_ensemble.selection_mode == "four_tier_mapping"
+    assert cfg.llm_ensemble.four_tier_mapping is not None
+
+
+def test_fixed_four_tier_v2_requires_single_execution_topology() -> None:
+    with pytest.raises(ValueError, match=r"four_tier_mapping.*single"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "multiple",
+                "selection_mode": "four_tier_mapping",
+            }
+        )
+
+
+@pytest.mark.parametrize("mock_seed", [True, -1, 1 << 64])
+def test_fixed_four_tier_v2_rejects_invalid_mock_seed(mock_seed: object) -> None:
+    with pytest.raises(ValueError, match="mock_seed"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": "four_tier_mapping",
+                "four_tier_mapping": {"mock_seed": mock_seed},
+            }
+        )
+
+
+def test_fixed_four_tier_v2_requires_exactly_four_tiers() -> None:
+    with pytest.raises(ValueError, match="exactly c0, c1, c2, and c3"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": "four_tier_mapping",
+                "four_tier_mapping": {
+                    "tiers": {
+                        "c0": {
+                            "provider": "openrouter",
+                            "model": "qwen/qwen3.7-flash",
+                            "reasoning": "thinking",
+                            "deployment_version": "qwen3.7-flash-thinking",
+                        }
+                    }
+                },
+            }
+        )
+
+
+def test_fixed_four_tier_v2_rejects_ladder_override() -> None:
+    defaults = FixedFourTierV2Config().model_dump(mode="json")
+    defaults["tiers"]["c3"]["model"] = "some/other-model"
+
+    with pytest.raises(ValueError, match="frozen ladder"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": "four_tier_mapping",
+                "four_tier_mapping": defaults,
+            }
+        )
+
+
+def test_fixed_four_tier_v2_rejects_explicit_null_config() -> None:
+    with pytest.raises(ValueError, match="four_tier_mapping must be an object"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": "four_tier_mapping",
+                "four_tier_mapping": None,
+            }
+        )
+
+
+def test_fixed_four_tier_v1_config_migrates_without_mutating_input() -> None:
+    legacy = FixedFourTierV2Config().model_dump(mode="json")
+    legacy["schema_version"] = "fixed-four-tier-v2-mock-v1"
+    legacy["max_session_states"] = 128
+    for deployment in legacy["tiers"].values():
+        deployment.pop("deployment_version")
+    original = copy.deepcopy(legacy)
+
+    gateway = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": legacy,
+        }
+    )
+    migrated = gateway.llm_ensemble.four_tier_mapping
+
+    assert legacy == original
+    assert migrated is not None
+    assert migrated.schema_version == "fixed-four-tier-v2-mock-v2"
+    assert {tier: deployment.deployment_version for tier, deployment in migrated.tiers.items()} == {
+        "c0": "qwen3.7-flash-thinking",
+        "c1": "deepseek-v4-flash-0731",
+        "c2": "deepseek-v4-pro-0813",
+        "c3": "glm-5.3",
+    }
+    serialized = migrated.model_dump(mode="json")
+    assert "max_session_states" not in serialized
+
+
+def test_fixed_four_tier_config_and_nested_ladder_are_deeply_immutable() -> None:
+    route = FixedFourTierV2Config(mock_seed=7)
+    detached_dump = route.model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="frozen"):
+        route.default_new_task_tier = "c2"
+    with pytest.raises(TypeError, match="immutable"):
+        route.tiers["c0"] = route.tiers["c1"]
+    with pytest.raises(ValidationError, match="frozen"):
+        route.tiers["c0"].model = "other/model"
+
+    deep_copy = route.model_copy(deep=True)
+    with pytest.raises(TypeError, match="immutable"):
+        deep_copy.tiers.clear()
+    detached_dump["tiers"]["c0"]["model"] = "other/model"
+    assert route.tiers["c0"].model == "qwen/qwen3.7-flash"
+
+
+@pytest.mark.parametrize(
+    "selection_mode",
+    [
+        "static_openrouter",
+        "static_tokenrhythm",
+        "router_dynamic",
+        "router_tree_baseline",
+    ],
+)
+def test_legacy_selection_modes_do_not_materialize_fixed_v2_config(
+    selection_mode: str,
+) -> None:
+    ensemble = LlmEnsembleConfig(selection_mode=selection_mode)
+
+    assert ensemble.selection_mode == selection_mode
+    assert ensemble.four_tier_mapping is None
+    assert "four_tier_mapping" not in ensemble.model_dump(mode="json")
+
+
 def test_router_single_ignores_fusion_only_aggregator_cross_validation() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
@@ -227,9 +474,7 @@ def test_router_single_ignores_fusion_only_aggregator_cross_validation() -> None
             "aggregator_visible_answer_reserve_tokens": 2,
             "aggregator_recovery_mode": "off",
             "aggregator_recovery_top_k": 1,
-            "ranking_config_override": {
-                "aggregator": {"candidate_count": 3}
-            },
+            "ranking_config_override": {"aggregator": {"candidate_count": 3}},
             "candidates": [
                 {"provider": "a", "model": "m1", "role": "aggregator"},
                 {"provider": "b", "model": "m2", "role": "aggregator"},
@@ -241,9 +486,7 @@ def test_router_single_ignores_fusion_only_aggregator_cross_validation() -> None
     assert ensemble.mode == "single"
     assert ensemble.aggregator_visible_answer_reserve_tokens == 2
     assert len(ensemble.candidates) == 2
-    assert ensemble.ranking_config_effective_snapshot()["aggregator"][
-        "candidate_count"
-    ] == 3
+    assert ensemble.ranking_config_effective_snapshot()["aggregator"]["candidate_count"] == 3
 
 
 @pytest.mark.parametrize(
@@ -417,11 +660,7 @@ def test_llm_ensemble_rejects_unsafe_persistent_canary_auto_rollback(
 
 def test_llm_ensemble_rejects_auto_rollback_without_live_rollout() -> None:
     with pytest.raises(ValueError, match="requires the live rollout"):
-        GatewayConfig(
-            llm_ensemble={
-                "canary_rollout": {"auto_rollback": {"enabled": True}}
-            }
-        )
+        GatewayConfig(llm_ensemble={"canary_rollout": {"auto_rollback": {"enabled": True}}})
 
 
 @pytest.mark.parametrize(
@@ -513,14 +752,12 @@ def test_router_dynamic_legacy_backup_count_must_match_ranking_config() -> None:
             "enabled": True,
             "selection_mode": "router_dynamic",
             "proposer_backup_count": 1,
-            "ranking_config_override": {
-                "proposer_count": {"backup_count": 1}
-            },
+            "ranking_config_override": {"proposer_count": {"backup_count": 1}},
         }
     )
-    assert cfg.llm_ensemble.ranking_config_effective_snapshot()["proposer_count"][
-        "backup_count"
-    ] == 1
+    assert (
+        cfg.llm_ensemble.ranking_config_effective_snapshot()["proposer_count"]["backup_count"] == 1
+    )
 
 
 @pytest.mark.parametrize(
@@ -545,9 +782,7 @@ def test_router_dynamic_rejects_ranked_aggregator_chain_runtime_would_truncate(
                 "selection_mode": "router_dynamic",
                 "aggregator_recovery_mode": recovery_mode,
                 "aggregator_recovery_top_k": recovery_top_k,
-                "ranking_config_override": {
-                    "aggregator": {"candidate_count": candidate_count}
-                },
+                "ranking_config_override": {"aggregator": {"candidate_count": candidate_count}},
             }
         )
 
@@ -570,15 +805,14 @@ def test_router_dynamic_accepts_fully_executable_ranked_aggregator_chain(
             "selection_mode": "router_dynamic",
             "aggregator_recovery_mode": recovery_mode,
             "aggregator_recovery_top_k": recovery_top_k,
-            "ranking_config_override": {
-                "aggregator": {"candidate_count": candidate_count}
-            },
+            "ranking_config_override": {"aggregator": {"candidate_count": candidate_count}},
         }
     )
 
-    assert cfg.llm_ensemble.ranking_config_effective_snapshot()["aggregator"][
-        "candidate_count"
-    ] == candidate_count
+    assert (
+        cfg.llm_ensemble.ranking_config_effective_snapshot()["aggregator"]["candidate_count"]
+        == candidate_count
+    )
 
 
 def test_router_dynamic_runtime_validates_actual_ranking_input_chain() -> None:
@@ -592,9 +826,7 @@ def test_router_dynamic_runtime_validates_actual_ranking_input_chain() -> None:
             "enabled": True,
             "selection_mode": "router_dynamic",
             "aggregator_recovery_top_k": 3,
-            "ranking_config_override": {
-                "aggregator": {"candidate_count": 3}
-            },
+            "ranking_config_override": {"aggregator": {"candidate_count": 3}},
         },
     )
     actual_ranking_config = cfg.llm_ensemble.ranking_config_effective_snapshot()
@@ -701,9 +933,7 @@ def test_llm_ensemble_ranking_override_enables_thinking_and_freezes_resolution()
     cfg = GatewayConfig(
         llm_ensemble={
             "selection_mode": "router_dynamic",
-            "ranking_config_override": {
-                "thinking_assignment": {"enabled": True}
-            },
+            "ranking_config_override": {"thinking_assignment": {"enabled": True}},
         }
     )
 
@@ -717,17 +947,11 @@ def test_llm_ensemble_ranking_override_enables_thinking_and_freezes_resolution()
 
 
 def test_llm_ensemble_can_refreeze_an_allowlisted_historical_ranking_base() -> None:
-    cfg = GatewayConfig(
-        llm_ensemble={"selection_mode": "router_dynamic"}
-    )
+    cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
 
-    historical = cfg.llm_ensemble.freeze_ranking_config(
-        base_version="step2-ranking-2026-08-02.2"
-    )
+    historical = cfg.llm_ensemble.freeze_ranking_config(base_version="step2-ranking-2026-08-02.2")
 
-    assert historical["base_config"]["config_version"] == (
-        "step2-ranking-2026-08-02.2"
-    )
+    assert historical["base_config"]["config_version"] == ("step2-ranking-2026-08-02.2")
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
@@ -757,9 +981,7 @@ def test_llm_ensemble_prepared_ranking_cache_reuses_only_authenticated_graphs(
         assert (
             _prepare_effective_ranking_config(
                 cached,
-                thinking_assignment_enabled=(
-                    ensemble.ranking_thinking_assignment_enabled
-                ),
+                thinking_assignment_enabled=(ensemble.ranking_thinking_assignment_enabled),
             )
             is prepared
         )
@@ -810,13 +1032,9 @@ def test_router_single_freezes_the_authenticated_prepared_ranking_cache(
     single_resolution = single.ranking_config_resolution_snapshot()
     fusion_resolution = fusion.ranking_config_resolution_snapshot()
     prepared = single.prepared_ranking_config()
-    assert single_resolution["effective_sha256"] == fusion_resolution[
-        "effective_sha256"
-    ]
+    assert single_resolution["effective_sha256"] == fusion_resolution["effective_sha256"]
     assert canonical_json_sha256(prepared) == single_resolution["effective_sha256"]
-    assert json.loads(canonical_json_bytes(prepared)) == single_resolution[
-        "effective_config"
-    ]
+    assert json.loads(canonical_json_bytes(prepared)) == single_resolution["effective_config"]
     assert _is_validated_ranking_config(prepared) is True
 
     original_validate = ranking_router._validate_ranking_config
@@ -853,10 +1071,13 @@ def test_llm_ensemble_prepared_ranking_cache_refreeze_evicts_without_turn_drift(
     assert canonical_json_sha256(new_prepared) == new_resolution["effective_sha256"]
     assert canonical_json_sha256(new_prepared) != old_sha256
     assert canonical_json_sha256(old_prepared) == old_sha256
-    assert _prepare_effective_ranking_config(
-        old_prepared,
-        thinking_assignment_enabled=False,
-    ) is old_prepared
+    assert (
+        _prepare_effective_ranking_config(
+            old_prepared,
+            thinking_assignment_enabled=False,
+        )
+        is old_prepared
+    )
 
     del old_prepared
     gc.collect()
@@ -884,9 +1105,7 @@ def test_llm_ensemble_prepared_ranking_cache_concurrent_refreeze_pairs_state() -
     cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
     ensemble = cfg.llm_ensemble
     current = ensemble.freeze_ranking_config()
-    historical = ensemble.freeze_ranking_config(
-        base_version="step2-ranking-2026-08-02.2"
-    )
+    historical = ensemble.freeze_ranking_config(base_version="step2-ranking-2026-08-02.2")
     allowed_hashes = {current["effective_sha256"], historical["effective_sha256"]}
 
     def refreeze(base_version: str | None) -> None:
@@ -900,8 +1119,9 @@ def test_llm_ensemble_prepared_ranking_cache_concurrent_refreeze_pairs_state() -
             resolution, prepared = state
             assert _is_validated_ranking_config(prepared) is True
             assert resolution["effective_sha256"] in allowed_hashes
-            assert canonical_json_sha256(resolution["effective_config"]) == (
-                resolution["effective_sha256"]
+            assert (
+                canonical_json_sha256(resolution["effective_config"])
+                == (resolution["effective_sha256"])
             )
             assert canonical_json_sha256(prepared) == resolution["effective_sha256"]
 
@@ -925,9 +1145,7 @@ def test_llm_ensemble_explicit_legacy_thinking_switch_conflict_fails_closed() ->
             llm_ensemble={
                 "selection_mode": "router_dynamic",
                 "ranking_thinking_assignment_enabled": False,
-                "ranking_config_override": {
-                    "thinking_assignment": {"enabled": True}
-                },
+                "ranking_config_override": {"thinking_assignment": {"enabled": True}},
             }
         )
 
@@ -1045,6 +1263,7 @@ def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
         "router_dynamic",
         "router_tree_baseline",
         "custom",
+        "four_tier_mapping",
         *STATIC_B5_SELECTION_MODE_PROVIDERS,
     }
 
@@ -1247,8 +1466,7 @@ def test_router_dynamic_registry_all_uses_every_frozen_source_model() -> None:
         base_version=experiment.g1_routing.source_registry_snapshot_version
     )
     expected = {
-        f"openrouter:{row['registry_facts']['model_id']}"
-        for row in source_registry["models"]
+        f"openrouter:{row['registry_facts']['model_id']}" for row in source_registry["models"]
     }
     assert plan["candidate_pool_size"] == len(expected)
     assert {row["identity"] for row in plan["candidate_pool"]} == expected
@@ -2545,12 +2763,7 @@ async def test_selector_fallback_cannot_bypass_live_canary_governance(
         health_ledger=_Ledger(),
     )
 
-    events = [
-        event
-        async for event in wrapper.chat(
-            [Message(role="user", content="synthetic")]
-        )
-    ]
+    events = [event async for event in wrapper.chat([Message(role="user", content="synthetic")])]
 
     assert calls == ["primary"]
     assert len(events) == 1
@@ -2659,12 +2872,7 @@ async def test_selector_fallback_rechecks_canary_status_at_physical_dispatch(
         turn_metadata=metadata,
     )
 
-    events = [
-        event
-        async for event in wrapper.chat(
-            [Message(role="user", content="synthetic")]
-        )
-    ]
+    events = [event async for event in wrapper.chat([Message(role="user", content="synthetic")])]
 
     assert calls == ["primary"]
     assert len(events) == 1

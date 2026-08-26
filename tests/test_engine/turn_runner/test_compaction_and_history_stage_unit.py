@@ -111,14 +111,32 @@ class _RecordingCompactionHook:
 # ---------------------------------------------------------------------------
 
 
+class _AgentStub:
+    def __init__(self, request_context_prompt: str | None = None) -> None:
+        self.config = SimpleNamespace(request_context_prompt=request_context_prompt)
+        self._history = [
+            SimpleNamespace(role="user", content="loaded history sentinel"),
+            SimpleNamespace(role="assistant", content="loaded answer sentinel"),
+        ]
+        self.clear_history_calls = 0
+
+    def clear_history(self) -> None:
+        self.clear_history_calls += 1
+        self._history = []
+
+    def set_history(self, messages: list[Any]) -> None:
+        self._history = list(messages)
+
+    def history_snapshot(self) -> list[Any]:
+        return list(self._history)
+
+
 def _make_agent_stub(
     *,
     request_context_prompt: str | None = None,
 ) -> Any:
     """Build a minimal Agent-shape with the attributes the stage reads."""
-    return SimpleNamespace(
-        config=SimpleNamespace(request_context_prompt=request_context_prompt),
-    )
+    return _AgentStub(request_context_prompt)
 
 
 def _make_input(
@@ -197,6 +215,172 @@ async def test_t3_not_applicable_falls_through_to_preflight() -> None:
     assert len(preflight.calls) == 1
     assert len(history.calls) == 1
     assert len(prepender.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fixed_four_tier_new_task_clears_only_model_visible_context() -> None:
+    agent = _make_agent_stub(request_context_prompt="current request context")
+    stage, t3, preflight, history, prepender = _make_stage(
+        history=_RecordingHistoryLoader(return_value="old durable summary"),
+    )
+    inp = replace(
+        _make_input(agent=agent),
+        turn=SimpleNamespace(
+            metadata={
+                "fixed_four_tier_v2_decision_id": "route-new",
+                "fixed_four_tier_v2_context_action": "reset",
+                "fixed_four_tier_v2_history_turns_to_keep": 0,
+            },
+            model="",
+        ),
+    )
+
+    outcome = await stage.run(inp)
+
+    assert agent.clear_history_calls == 1
+    assert agent._history == []
+    assert outcome.output.compaction_summary_context is None
+    assert outcome.output.t3_upgrade_status == "skipped_fixed_task_reset"
+    assert t3.calls == []
+    assert preflight.calls == []
+    assert history.calls == []
+    assert outcome.output.final_request_context_prompt == "current request context"
+    assert prepender.calls == [{"existing": "current request context", "prepended": None}]
+
+
+@pytest.mark.asyncio
+async def test_fixed_four_tier_continue_reloads_only_durable_task_context() -> None:
+    agent = _make_agent_stub(request_context_prompt="current request context")
+    stage, t3, preflight, history, prepender = _make_stage(
+        history=_RecordingHistoryLoader(return_value="durable summary"),
+    )
+    inp = replace(
+        _make_input(agent=agent),
+        turn=SimpleNamespace(
+            metadata={
+                "fixed_four_tier_v2_decision_id": "route-continue",
+                "fixed_four_tier_v2_context_action": "keep",
+                "fixed_four_tier_v2_history_turns_to_keep": 1,
+                "fixed_four_tier_v2_task_start_input_message_id": "task-start",
+            },
+            model="",
+        ),
+        bound_user_message_id="current-input",
+        # Fixed-v2 must trust its verified durable anchor rather than this
+        # legacy hint when choosing the history boundary.
+        history_has_persisted_user=False,
+    )
+
+    outcome = await stage.run(inp)
+
+    assert agent.clear_history_calls == 1
+    assert agent._history == []
+    assert outcome.output.compaction_summary_context is None
+    assert outcome.output.final_request_context_prompt == "current request context"
+    assert outcome.output.t3_upgrade_status == "skipped_fixed_task_scope"
+    assert t3.calls == []
+    assert preflight.calls == []
+    assert history.calls[0]["suppress_compaction_context"] is True
+    assert history.calls[0]["history_start_message_id"] == "task-start"
+    assert history.calls[0]["bound_user_message_id"] == "current-input"
+    assert history.calls[0]["trim_last_user"] is True
+    assert prepender.calls == [{"existing": "current request context", "prepended": None}]
+
+
+@pytest.mark.asyncio
+async def test_fixed_four_tier_first_turn_redo_keeps_task_with_empty_history() -> None:
+    agent = _make_agent_stub(request_context_prompt="current request context")
+    stage, t3, preflight, history, prepender = _make_stage()
+    inp = replace(
+        _make_input(agent=agent),
+        turn=SimpleNamespace(
+            metadata={
+                "fixed_four_tier_v2_decision_id": "route-first-redo",
+                "fixed_four_tier_v2_context_action": "keep",
+                "fixed_four_tier_v2_history_turns_to_keep": 0,
+                "fixed_four_tier_v2_task_start_input_message_id": "replacement-input",
+            },
+            model="",
+        ),
+        bound_user_message_id="replacement-input",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert agent.clear_history_calls == 1
+    assert agent._history == []
+    assert outcome.output.t3_upgrade_status == "skipped_fixed_task_scope"
+    assert outcome.output.compaction_summary_context is None
+    assert t3.calls == []
+    assert preflight.calls == []
+    assert history.calls == []
+    assert prepender.calls == [{"existing": "current request context", "prepended": None}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata,bound_user_message_id",
+    [
+        (
+            {
+                "fixed_four_tier_v2_decision_id": "route",
+                "fixed_four_tier_v2_context_action": "keep",
+            },
+            "current-input",
+        ),
+        (
+            {
+                "fixed_four_tier_v2_decision_id": "route",
+                "fixed_four_tier_v2_context_action": "invalid",
+                "fixed_four_tier_v2_history_turns_to_keep": 1,
+            },
+            "current-input",
+        ),
+        (
+            {
+                "fixed_four_tier_v2_decision_id": "route",
+                "fixed_four_tier_v2_context_action": "keep",
+                "fixed_four_tier_v2_history_turns_to_keep": 1,
+            },
+            None,
+        ),
+        (
+            {
+                "fixed_four_tier_v2_decision_id": "route",
+                "fixed_four_tier_v2_context_action": "keep",
+                "fixed_four_tier_v2_history_turns_to_keep": 0,
+                "fixed_four_tier_v2_task_start_input_message_id": "different-input",
+            },
+            "current-input",
+        ),
+        (
+            {
+                "fixed_four_tier_v2_decision_id": "route",
+                "fixed_four_tier_v2_context_action": "reset",
+                "fixed_four_tier_v2_history_turns_to_keep": 1,
+            },
+            "current-input",
+        ),
+    ],
+)
+async def test_fixed_four_tier_incomplete_scope_fails_closed(
+    metadata: dict[str, Any],
+    bound_user_message_id: str | None,
+) -> None:
+    stage, t3, preflight, history, prepender = _make_stage()
+    inp = replace(
+        _make_input(),
+        turn=SimpleNamespace(metadata=metadata, model=""),
+        bound_user_message_id=bound_user_message_id,
+    )
+
+    with pytest.raises(ValueError, match="four_tier_mapping"):
+        await stage.run(inp)
+
+    assert t3.calls == []
+    assert preflight.calls == []
+    assert history.calls == []
+    assert prepender.calls == []
 
 
 @pytest.mark.asyncio

@@ -311,9 +311,7 @@ class TaskRuntimeConfig(BaseModel):
             PendingOverflowPolicy(value)
         except ValueError as exc:
             valid = ", ".join(member.value for member in PendingOverflowPolicy)
-            raise ValueError(
-                f"pending_overflow_policy must be one of {{{valid}}}"
-            ) from exc
+            raise ValueError(f"pending_overflow_policy must be one of {{{valid}}}") from exc
         return value
 
     @field_validator("pending_overflow_policy_per_channel")
@@ -327,8 +325,7 @@ class TaskRuntimeConfig(BaseModel):
                 PendingOverflowPolicy(policy)
             except ValueError as exc:
                 raise ValueError(
-                    f"pending_overflow_policy_per_channel[{channel!r}] "
-                    f"must be one of {{{valid}}}"
+                    f"pending_overflow_policy_per_channel[{channel!r}] must be one of {{{valid}}}"
                 ) from exc
         return value
 
@@ -433,6 +430,7 @@ _LLM_ENSEMBLE_MODE_INPUT_ALIASES = {
     "b5_fusion": "multiple",
     "router_single": "single",
 }
+FOUR_TIER_MAPPING_SELECTION_MODE = "four_tier_mapping"
 _LLM_ENSEMBLE_SELECTION_MODE_INPUT_ALIASES = {
     "static_openrouter_b5": "static_openrouter",
     "static_tokenrhythm_b5": "static_tokenrhythm",
@@ -519,9 +517,7 @@ class LlmEnsembleAdmissionConfig(BaseModel):
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
         ):
-            raise ValueError(
-                "admission queue_timeout_seconds must be finite and numeric"
-            )
+            raise ValueError("admission queue_timeout_seconds must be finite and numeric")
         return float(value)
 
     @field_validator("provider_limits", mode="before")
@@ -555,17 +551,11 @@ class LlmEnsembleAdmissionConfig(BaseModel):
             key = str(raw_key or "").strip().casefold()
             provider, separator, model = key.partition("/")
             if not separator or not provider or not model:
-                raise ValueError(
-                    "deployment admission keys must use '<provider>/<model>'"
-                )
+                raise ValueError("deployment admission keys must use '<provider>/<model>'")
             if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
-                raise ValueError(
-                    "deployment admission values must be positive integers"
-                )
+                raise ValueError("deployment admission values must be positive integers")
             if raw_limit <= 0:
-                raise ValueError(
-                    "deployment admission values must be positive integers"
-                )
+                raise ValueError("deployment admission values must be positive integers")
             normalized[f"{provider}/{model}"] = raw_limit
         return normalized
 
@@ -694,9 +684,7 @@ class LlmEnsembleCanaryRolloutConfig(BaseModel):
     allowed_risks: list[Literal["low"]] = Field(default_factory=lambda: ["low"])
     require_schema_valid_analysis: bool = True
     min_analyzer_confidence: float = Field(default=0.8, ge=0.8, le=1.0)
-    proposer: LlmEnsembleCanaryRoleConfig = Field(
-        default_factory=LlmEnsembleCanaryRoleConfig
-    )
+    proposer: LlmEnsembleCanaryRoleConfig = Field(default_factory=LlmEnsembleCanaryRoleConfig)
     aggregator: LlmEnsembleCanaryRoleConfig = Field(
         default_factory=_default_llm_ensemble_canary_aggregator
     )
@@ -719,9 +707,7 @@ class LlmEnsembleCanaryRolloutConfig(BaseModel):
         try:
             normalized = float(value)
         except (OverflowError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "canary min_analyzer_confidence must be finite and numeric"
-            ) from exc
+            raise ValueError("canary min_analyzer_confidence must be finite and numeric") from exc
         if not math.isfinite(normalized):
             raise ValueError("canary min_analyzer_confidence must be finite and numeric")
         return normalized
@@ -732,43 +718,202 @@ class LlmEnsembleCanaryRolloutConfig(BaseModel):
             raise ValueError("router-canary-v1 only permits low-risk tasks")
         if self.require_schema_valid_analysis is not True:
             raise ValueError("router-canary-v1 requires schema-valid task analysis")
-        if (
-            self.aggregator.basis_points != 0
-            or self.aggregator.max_candidates_per_decision != 0
-        ):
+        if self.aggregator.basis_points != 0 or self.aggregator.max_candidates_per_decision != 0:
             raise ValueError("router-canary-v1 does not permit aggregator canaries")
-        if (
-            self.aggregator.min_observations < 50
-            or self.aggregator.max_failure_basis_points > 200
-        ):
+        if self.aggregator.min_observations < 50 or self.aggregator.max_failure_basis_points > 200:
             raise ValueError(
                 "router-canary-v1 aggregator gates require at least 50 observations "
                 "and at most 200 failure basis points"
             )
         for role, policy in (("proposer", self.proposer), ("aggregator", self.aggregator)):
             if policy.basis_points > self.global_basis_points:
-                raise ValueError(
-                    f"canary {role}.basis_points cannot exceed global_basis_points"
-                )
+                raise ValueError(f"canary {role}.basis_points cannot exceed global_basis_points")
         if self.enabled and self.proposer.basis_points == 0:
-            raise ValueError(
-                "enabled router-canary-v1 requires a non-zero proposer cohort"
-            )
+            raise ValueError("enabled router-canary-v1 requires a non-zero proposer cohort")
         if self.auto_rollback.enabled and not self.enabled:
             raise ValueError("canary auto rollback requires the live rollout to be enabled")
         if (
             self.auto_rollback.enabled
-            and self.auto_rollback.window_max_attempts
-            < self.proposer.min_observations
+            and self.auto_rollback.window_max_attempts < self.proposer.min_observations
         ):
-            raise ValueError(
-                "canary auto rollback window must cover proposer min_observations"
-            )
+            raise ValueError("canary auto rollback window must cover proposer min_observations")
         return self
 
 
 _RANKING_CONFIG_FROZEN_STATE_LOCK = threading.RLock()
 _RankingConfigFrozenState = tuple[dict[str, Any], Mapping[str, Any]]
+
+
+class FixedFourTierV2TierConfig(BaseModel):
+    """One deployment in the fixed four-tier single-model ladder."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str = "openrouter"
+    model: str
+    reasoning: Literal["thinking", "max"]
+    deployment_version: str
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: object) -> str:
+        return str(value or "").strip().casefold()
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def _normalize_model(cls, value: object) -> str:
+        return str(value or "").strip()
+
+    @model_validator(mode="after")
+    def _validate_deployment(self) -> FixedFourTierV2TierConfig:
+        if not self.provider:
+            raise ValueError("four_tier_mapping tier provider must be non-empty")
+        if not self.model:
+            raise ValueError("four_tier_mapping tier model must be non-empty")
+        if not self.deployment_version.strip():
+            raise ValueError("four_tier_mapping tier deployment_version must be non-empty")
+        return self
+
+
+def _default_fixed_four_tier_v2_tiers() -> dict[
+    Literal["c0", "c1", "c2", "c3"],
+    FixedFourTierV2TierConfig,
+]:
+    return {
+        "c0": FixedFourTierV2TierConfig(
+            provider="openrouter",
+            model="qwen/qwen3.7-flash",
+            reasoning="thinking",
+            deployment_version="qwen3.7-flash-thinking",
+        ),
+        "c1": FixedFourTierV2TierConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-flash",
+            reasoning="max",
+            deployment_version="deepseek-v4-flash-0731",
+        ),
+        "c2": FixedFourTierV2TierConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            reasoning="max",
+            deployment_version="deepseek-v4-pro-0813",
+        ),
+        "c3": FixedFourTierV2TierConfig(
+            provider="openrouter",
+            model="z-ai/glm-5.3",
+            reasoning="max",
+            deployment_version="glm-5.3",
+        ),
+    }
+
+
+class _FrozenFixedTierMap(dict[Literal["c0", "c1", "c2", "c3"], FixedFourTierV2TierConfig]):
+    """A JSON-serializable mapping that rejects post-validation mutation."""
+
+    @staticmethod
+    def _immutable() -> None:
+        raise TypeError("four_tier_mapping.tiers is immutable")
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        del key, value
+        self._immutable()
+
+    def __delitem__(self, key: Any) -> None:
+        del key
+        self._immutable()
+
+    def clear(self) -> None:
+        self._immutable()
+
+    def pop(self, key: Any, default: Any = None) -> Any:
+        del key, default
+        self._immutable()
+
+    def popitem(self) -> tuple[Any, Any]:
+        self._immutable()
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        del key, default
+        self._immutable()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        self._immutable()
+
+    def __ior__(self, other: Any) -> _FrozenFixedTierMap:
+        del other
+        self._immutable()
+
+    def __copy__(self) -> _FrozenFixedTierMap:
+        return type(self)(dict(self))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenFixedTierMap:
+        return type(self)(copy.deepcopy(dict(self), memo))
+
+
+class FixedFourTierV2Config(BaseModel):
+    """Configuration for the isolated fixed-four-tier v2 mock route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["fixed-four-tier-v2-mock-v2"] = "fixed-four-tier-v2-mock-v2"
+    mock_seed: int | None = Field(default=None, ge=0, le=(1 << 64) - 1)
+    default_new_task_tier: Literal["c0", "c1", "c2", "c3"] = "c1"
+    intent_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    tier_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_margin: float = Field(default=0.05, ge=0.0, le=1.0)
+    tiers: dict[
+        Literal["c0", "c1", "c2", "c3"],
+        FixedFourTierV2TierConfig,
+    ] = Field(default_factory=_default_fixed_four_tier_v2_tiers)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_mock_v1(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        payload = copy.deepcopy(dict(value))
+        if payload.get("schema_version") != "fixed-four-tier-v2-mock-v1":
+            return payload
+        payload["schema_version"] = "fixed-four-tier-v2-mock-v2"
+        payload.pop("max_session_states", None)
+        tiers = payload.get("tiers")
+        if isinstance(tiers, Mapping):
+            migrated_tiers: dict[str, Any] = copy.deepcopy(dict(tiers))
+            defaults = _default_fixed_four_tier_v2_tiers()
+            for tier, deployment in migrated_tiers.items():
+                if isinstance(deployment, Mapping) and tier in defaults:
+                    migrated = dict(deployment)
+                    migrated.setdefault(
+                        "deployment_version",
+                        defaults[cast(Any, tier)].deployment_version,
+                    )
+                    migrated_tiers[tier] = migrated
+            payload["tiers"] = migrated_tiers
+        return payload
+
+    @field_validator("mock_seed", mode="before")
+    @classmethod
+    def _reject_boolean_mock_seed(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("mock_seed must be an unsigned 64-bit integer")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_fixed_ladder(self) -> FixedFourTierV2Config:
+        if set(self.tiers) != {"c0", "c1", "c2", "c3"}:
+            raise ValueError("four_tier_mapping.tiers must define exactly c0, c1, c2, and c3")
+        expected = {
+            tier: deployment.model_dump(mode="json")
+            for tier, deployment in _default_fixed_four_tier_v2_tiers().items()
+        }
+        actual = {
+            tier: deployment.model_dump(mode="json") for tier, deployment in self.tiers.items()
+        }
+        if actual != expected:
+            raise ValueError("four_tier_mapping.tiers is a frozen ladder and cannot be overridden")
+        object.__setattr__(self, "tiers", _FrozenFixedTierMap(self.tiers))
+        return self
 
 
 class LlmEnsembleConfig(BaseSettings):
@@ -789,7 +934,14 @@ class LlmEnsembleConfig(BaseSettings):
         "static_openrouter",
         "static_tokenrhythm",
         "custom",
+        "four_tier_mapping",
     ] = "static_openrouter"
+    # Isolated single-model route. Only its classifier implementations are
+    # mocked; the state machine and direct execution constraints are real.
+    four_tier_mapping: FixedFourTierV2Config | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     # Expose tool schemas to proposers as advisory vocabulary only. Proposer
     # output is never dispatched; only the aggregator owns an executable tool
     # boundary.
@@ -808,9 +960,7 @@ class LlmEnsembleConfig(BaseSettings):
     # One atomic, per-config cache slot. The plain resolution remains the
     # public serialization/replay surface while the second member is the
     # factory-authenticated immutable graph reused by live turns.
-    _ranking_config_frozen_state: _RankingConfigFrozenState | None = PrivateAttr(
-        default=None
-    )
+    _ranking_config_frozen_state: _RankingConfigFrozenState | None = PrivateAttr(default=None)
     proposer_tools: bool = False
     aggregator_tools: bool = True
     min_successful_proposers: int = Field(default=1, ge=1)
@@ -830,15 +980,11 @@ class LlmEnsembleConfig(BaseSettings):
     # Selects the fraction of the caller's absolute request budget reserved
     # for final aggregation.  Explicit proposer/aggregator caps remain upper
     # bounds, so benchmark configurations keep their frozen role budgets.
-    latency_class: Literal["interactive", "normal", "batch", "experiment"] = (
-        "normal"
-    )
+    latency_class: Literal["interactive", "normal", "batch", "experiment"] = "normal"
     # Process-local runtime backpressure. Experiment latency class and all
     # non-dynamic/static modes deliberately bypass it so frozen DRACO/replay
     # scheduling remains byte-for-byte compatible.
-    admission: LlmEnsembleAdmissionConfig = Field(
-        default_factory=LlmEnsembleAdmissionConfig
-    )
+    admission: LlmEnsembleAdmissionConfig = Field(default_factory=LlmEnsembleAdmissionConfig)
     # Live-only, fail-closed admission for registry rows marked ``canary``.
     # Frozen replay, formal allowlists, and experiment scheduling bypass this
     # mutable serving policy so their historical rosters remain reproducible.
@@ -868,6 +1014,26 @@ class LlmEnsembleConfig(BaseSettings):
     def _canonicalize_mode(cls, value: object) -> object:
         return canonicalize_llm_ensemble_mode(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _materialize_fixed_four_tier_config(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        removed_subtree_names = {"fixed_four_tier_v2", "fixed-four-tier-v2"}
+        if removed_subtree_names.intersection(value):
+            raise ValueError(
+                "unsupported llm_ensemble configuration; "
+                "use llm_ensemble.four_tier_mapping"
+            )
+        selection_mode = canonicalize_llm_ensemble_selection_mode(
+            value.get("selection_mode", "static_openrouter")
+        )
+        if selection_mode != FOUR_TIER_MAPPING_SELECTION_MODE or "four_tier_mapping" in value:
+            return value
+        materialized = dict(value)
+        materialized["four_tier_mapping"] = {}
+        return materialized
+
     @field_validator("selection_mode", mode="before")
     @classmethod
     def _canonicalize_selection_mode(cls, value: object) -> object:
@@ -895,17 +1061,35 @@ class LlmEnsembleConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_execution_topology(self) -> LlmEnsembleConfig:
+        if self.selection_mode == FOUR_TIER_MAPPING_SELECTION_MODE and self.mode != "single":
+            raise ValueError(
+                "llm_ensemble.selection_mode='four_tier_mapping' requires "
+                "llm_ensemble.mode='single'"
+            )
+        if (
+            self.selection_mode == FOUR_TIER_MAPPING_SELECTION_MODE
+            and self.four_tier_mapping is None
+        ):
+            raise ValueError(
+                "llm_ensemble.four_tier_mapping must be an object when "
+                "four_tier_mapping selection is enabled"
+            )
         if self.mode != "single":
             return self
         if not self.enabled:
+            if self.selection_mode == FOUR_TIER_MAPPING_SELECTION_MODE:
+                # Preserve the exact fixed-v2 subtree while direct/router mode
+                # temporarily parks it. Re-enabling restores the same route.
+                return self
+            raise ValueError("llm_ensemble.mode='single' requires llm_ensemble.enabled=true")
+        if self.selection_mode not in {
+            "router_dynamic",
+            FOUR_TIER_MAPPING_SELECTION_MODE,
+        }:
             raise ValueError(
                 "llm_ensemble.mode='single' requires "
-                "llm_ensemble.enabled=true"
-            )
-        if self.selection_mode != "router_dynamic":
-            raise ValueError(
-                "llm_ensemble.mode='single' requires "
-                "llm_ensemble.selection_mode='router_dynamic'"
+                "llm_ensemble.selection_mode='router_dynamic' or "
+                "'four_tier_mapping'"
             )
         return self
 
@@ -991,7 +1175,9 @@ class LlmEnsembleConfig(BaseSettings):
         # graph. Only its aggregator recovery-chain cross-check is skipped
         # later; resolution, hash binding, preparation, and cache publication
         # remain identical to router_dynamic fusion.
-        if self.selection_mode == "router_dynamic" or self.ranking_config_override:
+        if self.selection_mode != FOUR_TIER_MAPPING_SELECTION_MODE and (
+            self.selection_mode == "router_dynamic" or self.ranking_config_override
+        ):
             self.freeze_ranking_config()
         return self
 
@@ -1024,14 +1210,10 @@ class LlmEnsembleConfig(BaseSettings):
         if "proposer_backup_count" in self.model_fields_set:
             effective = resolution.get("effective_config")
             proposer_count = (
-                effective.get("proposer_count")
-                if isinstance(effective, dict)
-                else None
+                effective.get("proposer_count") if isinstance(effective, dict) else None
             )
             ranking_backup_count = (
-                proposer_count.get("backup_count")
-                if isinstance(proposer_count, dict)
-                else None
+                proposer_count.get("backup_count") if isinstance(proposer_count, dict) else None
             )
             if self.proposer_backup_count != ranking_backup_count:
                 raise ValueError(
@@ -1045,17 +1227,13 @@ class LlmEnsembleConfig(BaseSettings):
         )
         effective = resolution.get("effective_config")
         expected_sha256 = resolution.get("effective_sha256")
-        thinking_assignment_enabled = (
-            resolution.get("thinking_assignment_enabled") is True
-        )
+        thinking_assignment_enabled = resolution.get("thinking_assignment_enabled") is True
         if (
             not isinstance(effective, Mapping)
             or not isinstance(expected_sha256, str)
             or _canonical_hash(effective) != expected_sha256
         ):
-            raise ValueError(
-                "frozen router_dynamic ranking config hash binding is invalid"
-            )
+            raise ValueError("frozen router_dynamic ranking config hash binding is invalid")
         prepared = _prepare_effective_ranking_config(
             effective,
             thinking_assignment_enabled=thinking_assignment_enabled,
@@ -1064,9 +1242,7 @@ class LlmEnsembleConfig(BaseSettings):
             not _is_validated_ranking_config(prepared)
             or _canonical_hash(prepared) != expected_sha256
         ):
-            raise ValueError(
-                "prepared router_dynamic ranking config differs from its frozen hash"
-            )
+            raise ValueError("prepared router_dynamic ranking config differs from its frozen hash")
         frozen_resolution = copy.deepcopy(resolution)
         state = (frozen_resolution, prepared)
         with _RANKING_CONFIG_FROZEN_STATE_LOCK:
@@ -1104,31 +1280,19 @@ class LlmEnsembleConfig(BaseSettings):
                 state = self._ranking_config_frozen_state
             resolution = state[0] if state is not None else None
             effective = (
-                resolution.get("effective_config")
-                if isinstance(resolution, Mapping)
-                else None
+                resolution.get("effective_config") if isinstance(resolution, Mapping) else None
             )
-        aggregator = (
-            effective.get("aggregator")
-            if isinstance(effective, Mapping)
-            else None
-        )
+        aggregator = effective.get("aggregator") if isinstance(effective, Mapping) else None
         candidate_count = (
-            aggregator.get("candidate_count")
-            if isinstance(aggregator, Mapping)
-            else None
+            aggregator.get("candidate_count") if isinstance(aggregator, Mapping) else None
         )
         if isinstance(candidate_count, bool) or not isinstance(
             candidate_count,
             int,
         ):
-            raise ValueError(
-                "router_dynamic ranking aggregator.candidate_count is invalid"
-            )
+            raise ValueError("router_dynamic ranking aggregator.candidate_count is invalid")
         execution_top_k = (
-            1
-            if self.aggregator_recovery_mode == "off"
-            else self.aggregator_recovery_top_k
+            1 if self.aggregator_recovery_mode == "off" else self.aggregator_recovery_top_k
         )
         if candidate_count > execution_top_k:
             raise ValueError(
@@ -1233,12 +1397,8 @@ def static_b5_ensemble_active(config: Any) -> bool:
         return False
     from opensquilla.provider.ensemble import static_b5_credential_available
 
-    selection_mode = str(
-        getattr(getattr(config, "llm_ensemble", None), "selection_mode", "") or ""
-    )
-    return static_b5_credential_available(
-        config, getattr(config, "llm", None), selection_mode
-    )
+    selection_mode = str(getattr(getattr(config, "llm_ensemble", None), "selection_mode", "") or "")
+    return static_b5_credential_available(config, getattr(config, "llm", None), selection_mode)
 
 
 def effective_agent_stream_idle_timeout_seconds(config: Any) -> float:
@@ -1536,9 +1696,7 @@ class MemoryConfig(BaseSettings):
 
     # Flush (pre-compaction memory save)
     flush_enabled: bool = False
-    flush_triggers: list[FlushTrigger] = Field(
-        default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS)
-    )
+    flush_triggers: list[FlushTrigger] = Field(default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS))
     flush_pre_compaction: bool = False
     flush_timeout_seconds: float = 15.0
     flush_background_timeout_seconds: float = 120.0
@@ -1833,9 +1991,7 @@ class SquillaRouterConfig(BaseSettings):
             "upgrade_to_c3_compaction_enabled" not in values
             and "upgrade_to_t3_compaction_enabled" in values
         ):
-            values["upgrade_to_c3_compaction_enabled"] = values[
-                "upgrade_to_t3_compaction_enabled"
-            ]
+            values["upgrade_to_c3_compaction_enabled"] = values["upgrade_to_t3_compaction_enabled"]
         if "default_tier" in values:
             values["default_tier"] = normalize_text_tier(values.get("default_tier")) or values.get(
                 "default_tier"
@@ -2031,9 +2187,7 @@ class AudioElevenLabsProviderConfig(BaseModel):
 
 
 class AudioProvidersConfig(BaseModel):
-    elevenlabs: AudioElevenLabsProviderConfig = Field(
-        default_factory=AudioElevenLabsProviderConfig
-    )
+    elevenlabs: AudioElevenLabsProviderConfig = Field(default_factory=AudioElevenLabsProviderConfig)
 
 
 class AudioTTSConfig(BaseModel):
@@ -2088,15 +2242,14 @@ class ConfiguredChannelEntry(BaseModel):
             value = value.split(",")
         if not isinstance(value, list | tuple | set | frozenset):
             return value
-        return list(
-            dict.fromkeys(str(item).strip() for item in value if str(item).strip())
-        )
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
     @model_validator(mode="after")
     def _validate_dm_access(self) -> ConfiguredChannelEntry:
         if self.dm_access == "allowlist" and not self.allowed_senders:
             raise ValueError("dm_access=allowlist requires allowed_senders")
         return self
+
     # Group conversations are isolated by sender by default. Deployments that
     # intentionally want one transcript shared by the whole room can opt in.
     group_session_scope: Literal["per_sender", "shared_room"] = "per_sender"
@@ -2161,9 +2314,7 @@ class FeishuChannelEntry(ConfiguredChannelEntry):
             and not self.verification_token.strip()
             and not self.encrypt_key.strip()
         ):
-            raise ValueError(
-                "feishu webhook channels require verification_token or encrypt_key"
-            )
+            raise ValueError("feishu webhook channels require verification_token or encrypt_key")
         return self
 
 
@@ -2209,9 +2360,7 @@ class WeComChannelEntry(ConfiguredChannelEntry):
     def validate_wecom_mode(self) -> WeComChannelEntry:
         if self.connection_mode == "websocket":
             missing = [
-                field
-                for field in ("bot_id", "bot_secret")
-                if not str(getattr(self, field)).strip()
+                field for field in ("bot_id", "bot_secret") if not str(getattr(self, field)).strip()
             ]
             if missing:
                 raise ValueError(
@@ -2293,9 +2442,7 @@ class TelegramChannelEntry(ConfiguredChannelEntry):
             if not self.webhook_url:
                 raise ValueError("webhook_url is required for telegram webhook mode")
             if not self.webhook_secret_token:
-                raise ValueError(
-                    "webhook_secret_token is required for telegram webhook mode"
-                )
+                raise ValueError("webhook_secret_token is required for telegram webhook mode")
         return self
 
 
@@ -2672,8 +2819,7 @@ class ModelOverrideConfig(BaseModel):
         if normalized not in KNOWN_REASONING_FORMATS:
             allowed = ", ".join(sorted(KNOWN_REASONING_FORMATS))
             raise ValueError(
-                f"reasoning_format {value!r} is not a known dialect; "
-                f"expected one of {allowed}"
+                f"reasoning_format {value!r} is not a known dialect; expected one of {allowed}"
             )
         return normalized
 
@@ -2814,9 +2960,10 @@ class GatewayConfig(BaseSettings):
         provider = str(llm.provider or "").strip().lower()
         if "provider" not in fields_set:
             profile = str(getattr(self.squilla_router, "tier_profile", "") or "")
-            legacy_intent = bool(
-                {"model", "base_url", "api_key", "api_key_env"} & fields_set
-            ) or profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+            legacy_intent = (
+                bool({"model", "base_url", "api_key", "api_key_env"} & fields_set)
+                or profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+            )
             env_openrouter = bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
             env_tokenrhythm = bool(os.environ.get("TOKENRHYTHM_API_KEY", "").strip())
             if legacy_intent or (env_openrouter and not env_tokenrhythm):
@@ -2990,9 +3137,7 @@ class GatewayConfig(BaseSettings):
     search_provider: str = "duckduckgo"
     search_api_key: str = ""
     search_api_key_env: str = ""
-    search_max_results: int = Field(
-        default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS
-    )
+    search_max_results: int = Field(default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS)
     search_proxy: str = ""
     search_use_env_proxy: bool = False
     search_fallback_policy: Literal["off", "network"] = "off"
@@ -3147,6 +3292,7 @@ class GatewayConfig(BaseSettings):
             "capture_roll_max_chars": str(self.memory.capture_roll_max_chars),
             "dream_enabled": str(self.memory.dream.enabled).lower(),
         }
+
     _runtime_secret_paths: set[str] = PrivateAttr(default_factory=set)
     # Paths whose secret value was explicitly entered by the operator (set by
     # ``clear_runtime_secret``): value-coincidence redaction heuristics in
@@ -3248,8 +3394,8 @@ class GatewayConfig(BaseSettings):
                 network_observability_disabled,
             )
 
-            privacy["network_observability_disabled_effective"] = (
-                network_observability_disabled(config=self)
+            privacy["network_observability_disabled_effective"] = network_observability_disabled(
+                config=self
             )
         return data
 
@@ -3505,9 +3651,7 @@ class GatewayConfig(BaseSettings):
 
         cfg = cls()
         default_config_path = (
-            candidates[0]
-            if candidates
-            else default_opensquilla_home().expanduser() / "config.toml"
+            candidates[0] if candidates else default_opensquilla_home().expanduser() / "config.toml"
         )
         cls._apply_profile_path_overrides(cfg, default_config_path)
         cfg._mark_env_absorbed_secrets(None)
@@ -3558,6 +3702,7 @@ def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:
             path,
             error,
         )
+
 
 # Wildcard addresses that expose the gateway on every interface. Used by the
 # boot banner and the install-script post-install message.

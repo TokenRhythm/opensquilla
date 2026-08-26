@@ -31,6 +31,9 @@ from opensquilla.session.compaction_state import (
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
 from opensquilla.session.models import (
+    FixedFourTierDecisionRecord,
+    FixedFourTierRequestClaim,
+    FixedFourTierState,
     MemoryDurableReceipt,
     SessionContextState,
     SessionIntent,
@@ -118,6 +121,10 @@ class PreparedSessionIntent:
     previous_session_id: str | None = None
     previous_node: SessionNode | None = None
     initial_transcript_entries: tuple[TranscriptEntry, ...] = ()
+    # In-memory-only canonical source→child ids for an atomic prefix fork.
+    # The RPC layer may consume this to bind fixed-v2 regenerate state without
+    # persisting parent identifiers in the user-visible child transcript.
+    source_to_child_message_ids: tuple[tuple[str, str], ...] = ()
 
 
 @contextlib.asynccontextmanager
@@ -916,9 +923,7 @@ class SessionManager:
                     # a durable unmatched count so this child cannot claim completeness
                     # after the missing rows have already been discarded.
                     child.compaction_count = (
-                        0
-                        if parent_canonical_complete
-                        else max(1, parent_compaction_count)
+                        0 if parent_canonical_complete else max(1, parent_compaction_count)
                     )
                 else:
                     # Full forks copy summaries and compacted rows verbatim. Preserve
@@ -1027,9 +1032,7 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
-        parent_coverage = await self._storage.get_canonical_transcript_coverage(
-            parent.session_id
-        )
+        parent_coverage = await self._storage.get_canonical_transcript_coverage(parent.session_id)
         canonical_entries = await self._storage.get_canonical_transcript(parent.session_id)
         fork_index = next(
             (
@@ -1041,8 +1044,7 @@ class SessionManager:
         )
         if fork_index is None:
             raise KeyError(
-                f"Transcript message not found in {parent_session_key}: "
-                f"{fork_before_message_id}"
+                f"Transcript message not found in {parent_session_key}: {fork_before_message_id}"
             )
 
         now = _now_ms()
@@ -1065,14 +1067,13 @@ class SessionManager:
             forked_from_parent=True,
         )
         child.compaction_count = (
-            0
-            if parent_coverage.canonical_complete
-            else max(1, parent_coverage.compaction_count)
+            0 if parent_coverage.canonical_complete else max(1, parent_coverage.compaction_count)
         )
         child.schema_version = max(
             child.schema_version,
             CANONICAL_FORK_PROOF_SCHEMA_VERSION,
         )
+        source_entries = tuple(canonical_entries[:fork_index])
         copied_entries = tuple(
             TranscriptEntry(
                 session_id=child.session_id,
@@ -1092,7 +1093,7 @@ class SessionManager:
                 provenance_source_channel=entry.provenance_source_channel,
                 provenance_source_tool=entry.provenance_source_tool,
             )
-            for entry in canonical_entries[:fork_index]
+            for entry in source_entries
         )
         return PreparedSessionIntent(
             node=child,
@@ -1101,6 +1102,10 @@ class SessionManager:
             previous_session_id=parent.session_id,
             previous_node=parent,
             initial_transcript_entries=copied_entries,
+            source_to_child_message_ids=tuple(
+                (source.message_id, copied.message_id)
+                for source, copied in zip(source_entries, copied_entries, strict=True)
+            ),
         )
 
     async def _copy_fork_materials(
@@ -1285,6 +1290,20 @@ class SessionManager:
             turn_context,
         )
 
+    async def merge_message_turn_context(
+        self,
+        session_key: str,
+        message_id: str,
+        turn_context_patch: dict[str, Any],
+    ) -> bool:
+        """Atomically add causal fields while retaining the existing snapshot."""
+
+        return await self._storage.merge_transcript_turn_context(
+            canonicalize_session_key(session_key),
+            message_id,
+            turn_context_patch,
+        )
+
     async def get_transcript(
         self, session_key: str, limit: int | None = None
     ) -> list[TranscriptEntry]:
@@ -1339,18 +1358,13 @@ class SessionManager:
         event_body_hash = checkpoint_event_hash(
             "\n".join(serialize_checkpoint_event(event) for event in events)
         )
-        failure_key = (
-            f"checkpoint:{session_key}:{resolved_turn_id}:"
-            f"{event_body_hash}"
-        )
+        failure_key = f"checkpoint:{session_key}:{resolved_turn_id}:{event_body_hash}"
         try:
             if workspace is None:
                 raise RuntimeError("checkpoint workspace_dir is not configured")
             result = await asyncio.to_thread(append_checkpoint_events, workspace, events)
         except Exception as exc:
-            failure_key = (
-                f"{failure_key}:failed:{checkpoint_event_hash(str(exc))[:16]}"
-            )
+            failure_key = f"{failure_key}:failed:{checkpoint_event_hash(str(exc))[:16]}"
             receipt = MemoryDurableReceipt(
                 session_key=session_key,
                 session_id=node.session_id,
@@ -1381,9 +1395,7 @@ class SessionManager:
             coverage_turn_id=coverage_turn_id,
             coverage_hash=coverage_hash,
             coverage_entry_count=coverage_entry_count,
-            idempotency_key=(
-                f"checkpoint:{session_key}:{resolved_turn_id}:{result.content_hash}"
-            ),
+            idempotency_key=(f"checkpoint:{session_key}:{resolved_turn_id}:{result.content_hash}"),
             status="checkpoint_saved",
             attempt_count=1,
         )
@@ -1398,6 +1410,35 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
         return await self._storage.get_canonical_transcript(node.session_id, limit=limit)
+
+    async def is_canonical_transcript_complete(self, session_key: str) -> bool:
+        """Return whether the canonical archive fully covers this session."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.is_canonical_transcript_complete(node.session_id)
+
+    async def get_canonical_transcript_by_session_id(
+        self,
+        session_id: str,
+    ) -> list[TranscriptEntry]:
+        """Read canonical rows by immutable identity for fixed-v2 recovery."""
+
+        if not str(session_id or "").strip():
+            raise ValueError("session_id is required")
+        return await self._storage.get_canonical_transcript(session_id)
+
+    async def is_canonical_transcript_complete_by_session_id(
+        self,
+        session_id: str,
+    ) -> bool:
+        """Check canonical coverage by immutable identity."""
+
+        if not str(session_id or "").strip():
+            raise ValueError("session_id is required")
+        return await self._storage.is_canonical_transcript_complete(session_id)
 
     async def get_canonical_transcript_page(
         self,
@@ -1477,6 +1518,129 @@ class SessionManager:
     async def save_context_state(self, state: SessionContextState) -> SessionContextState:
         """Persist portable or provider-specific context state."""
         return await self._storage.save_context_state(state)
+
+    async def get_fixed_four_tier_state(
+        self,
+        session_id: str,
+    ) -> FixedFourTierState | None:
+        return await self._storage.get_fixed_four_tier_state(session_id)
+
+    async def reconcile_stale_fixed_four_tier_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        now_ms: int | None = None,
+    ) -> FixedFourTierRequestClaim | None:
+        return await self._storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session_id,
+            request_id=request_id,
+            now_ms=now_ms,
+        )
+
+    async def claim_fixed_four_tier_request(
+        self,
+        claim: FixedFourTierRequestClaim,
+    ) -> tuple[bool, FixedFourTierRequestClaim]:
+        return await self._storage.claim_fixed_four_tier_request(claim)
+
+    async def settle_fixed_four_tier_request_claim(
+        self,
+        *,
+        claim_id: str,
+        execution_status: str,
+        error_code: str | None = None,
+        updated_at_ms: int | None = None,
+    ) -> bool:
+        return await self._storage.settle_fixed_four_tier_request_claim(
+            claim_id=claim_id,
+            execution_status=execution_status,
+            error_code=error_code,
+            updated_at_ms=updated_at_ms,
+        )
+
+    async def get_usage_event_ids_for_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> list[str]:
+        return await self._storage.get_usage_event_ids_for_turn(
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+
+    async def get_fixed_four_tier_decision_by_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+    ) -> FixedFourTierDecisionRecord | None:
+        return await self._storage.get_fixed_four_tier_decision_by_request(
+            session_id=session_id,
+            request_id=request_id,
+        )
+
+    async def get_fixed_four_tier_decision_by_route(
+        self,
+        route_id: str,
+    ) -> FixedFourTierDecisionRecord | None:
+        return await self._storage.get_fixed_four_tier_decision_by_route(route_id)
+
+    async def get_fixed_four_tier_decision_by_input_message(
+        self,
+        *,
+        session_id: str,
+        input_message_id: str,
+    ) -> FixedFourTierDecisionRecord | None:
+        return await self._storage.get_fixed_four_tier_decision_by_input_message(
+            session_id=session_id,
+            input_message_id=input_message_id,
+        )
+
+    async def stage_fixed_four_tier_decision(
+        self,
+        record: FixedFourTierDecisionRecord,
+    ) -> FixedFourTierDecisionRecord:
+        return await self._storage.stage_fixed_four_tier_decision(record)
+
+    async def commit_fixed_four_tier_decision(
+        self,
+        *,
+        route_id: str,
+        state: FixedFourTierState,
+        expected_version: int | None,
+        route_trace: dict[str, Any],
+        updated_at_ms: int,
+    ) -> FixedFourTierState:
+        return await self._storage.commit_fixed_four_tier_decision(
+            route_id=route_id,
+            state=state,
+            expected_version=expected_version,
+            route_trace=route_trace,
+            updated_at_ms=updated_at_ms,
+        )
+
+    async def settle_fixed_four_tier_decision(
+        self,
+        *,
+        route_id: str,
+        execution_status: str,
+        preflight_status: str | None = None,
+        response_id: str | None = None,
+        error_code: str | None = None,
+        route_trace: dict[str, Any] | None = None,
+        updated_at_ms: int | None = None,
+    ) -> bool:
+        return await self._storage.settle_fixed_four_tier_decision(
+            route_id=route_id,
+            execution_status=execution_status,
+            preflight_status=preflight_status,
+            response_id=response_id,
+            error_code=error_code,
+            route_trace=route_trace,
+            updated_at_ms=updated_at_ms,
+        )
 
     async def get_context_states(
         self,
@@ -1655,9 +1819,7 @@ class SessionManager:
                 removed_count=result.removed_count,
                 kept_count=len(kept_entries),
                 chunk_count=result.chunks_processed,
-                flush_receipt_status=_compaction_flush_status_for_persistence(
-                    flush_receipt_status
-                ),
+                flush_receipt_status=_compaction_flush_status_for_persistence(flush_receipt_status),
                 covered_through_id=max((entry.id or 0) for entry in removed_entries)
                 if removed_entries
                 else 0,
@@ -1746,9 +1908,7 @@ class SessionManager:
                 critical_carry_forward=coverage.critical_carry_forward,
                 removed_count=len(removed_entries),
                 kept_count=len(kept_entries),
-                flush_receipt_status=_compaction_flush_status_for_persistence(
-                    flush_receipt_status
-                ),
+                flush_receipt_status=_compaction_flush_status_for_persistence(flush_receipt_status),
                 covered_through_id=max((entry.id or 0) for entry in removed_entries)
                 if removed_entries
                 else 0,

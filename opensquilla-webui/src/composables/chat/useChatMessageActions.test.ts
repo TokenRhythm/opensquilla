@@ -6,6 +6,7 @@ import { nextTick, ref } from 'vue'
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
 import type { ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type { ChatRoutingControl } from '@/types/rpc'
 import { copyTextWithFallback } from '@/utils/browser'
 
 vi.mock('@/utils/browser', () => ({
@@ -28,8 +29,10 @@ function makeOptions(
   messages: ChatMessage[],
   sanitizeCopyText: (text: string) => string = text => text,
   aiGeneratedLabel?: () => string,
+  overrides: Partial<UseChatMessageActionsOptions> = {},
 ) {
   const pendingForkBeforeMessageId = ref<string | null>(null)
+  const pendingRoutingControl = ref<ChatRoutingControl | null>(null)
   const options: UseChatMessageActionsOptions = {
     messages: ref(messages),
     inputText: ref(''),
@@ -40,10 +43,19 @@ function makeOptions(
     sendCurrentInput: vi.fn(),
     focusComposer: vi.fn(),
     pendingForkBeforeMessageId,
+    pendingRoutingControl,
     aiGeneratedLabel,
     notifyMessagePending: vi.fn(),
+    notifyBranchBusy: vi.fn(),
+    notifyAttachmentBranchUnsupported: vi.fn(),
+    ...overrides,
   }
-  return { api: useChatMessageActions(options), options, pendingForkBeforeMessageId }
+  return {
+    api: useChatMessageActions(options),
+    options,
+    pendingForkBeforeMessageId,
+    pendingRoutingControl,
+  }
 }
 
 beforeEach(() => {
@@ -160,6 +172,243 @@ describe('useChatMessageActions branching edits', () => {
 
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
     expect(options.notifyMessagePending).not.toHaveBeenCalled()
+  })
+
+  it('attaches a one-shot redo control only in four-tier mapping mode', async () => {
+    const fixed = makeOptions(
+      [
+        { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+        { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      ],
+      text => text,
+      undefined,
+      { isFourTierMapping: () => true },
+    )
+
+    fixed.api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+    }))
+    await nextTick()
+
+    expect(fixed.pendingRoutingControl.value).toEqual({
+      mode: 'four_tier_mapping',
+      intent: 'redo',
+      redoOfMessageId: 'msg-A',
+    })
+
+    const legacy = makeOptions(
+      [
+        { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+        { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+      ],
+      text => text,
+      undefined,
+      { isFourTierMapping: () => false },
+    )
+    legacy.pendingRoutingControl.value = {
+      mode: 'four_tier_mapping',
+      intent: 'redo',
+      redoOfMessageId: 'stale',
+    }
+
+    legacy.api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-b1',
+    }))
+    await nextTick()
+
+    expect(legacy.pendingRoutingControl.value).toBeNull()
+  })
+
+  it('keeps four-tier mapping branch state unchanged when work becomes busy', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(
+      messages,
+      text => text,
+      undefined,
+      {
+        isFourTierMapping: () => true,
+        isBranchActionBlocked: () => true,
+      },
+    )
+
+    api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+    }))
+
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.notifyBranchBusy).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the legacy streaming refusal free of four-tier mapping feedback', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ]
+    const { api, options } = makeOptions(
+      messages,
+      text => text,
+      undefined,
+      {
+        isStreaming: ref(true),
+        isFourTierMapping: () => false,
+      },
+    )
+
+    api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+    }))
+
+    expect(options.messages.value).toEqual(messages)
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.notifyBranchBusy).not.toHaveBeenCalled()
+  })
+
+  it('fails closed on four-tier mapping attachment branches without changing legacy behavior', async () => {
+    const attached: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'inspect image',
+        ts: null,
+        messageId: 'msg-image',
+        attachments: [{
+          kind: 'file',
+          displayId: 'photo-1',
+          renderKey: 'photo-1',
+          name: 'photo.png',
+          mime: 'image/png',
+        }],
+      },
+      { role: 'assistant', text: 'answer', ts: null, messageId: 'msg-answer' },
+    ]
+    const fixed = makeOptions(
+      attached,
+      text => text,
+      undefined,
+      { isFourTierMapping: () => true },
+    )
+
+    fixed.api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-answer',
+    }))
+    await nextTick()
+
+    expect(fixed.options.messages.value).toEqual(attached)
+    expect(fixed.options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(fixed.options.notifyAttachmentBranchUnsupported).toHaveBeenCalledOnce()
+
+    const legacy = makeOptions(
+      attached,
+      text => text,
+      undefined,
+      { isFourTierMapping: () => false },
+    )
+    legacy.api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-answer',
+    }))
+    await nextTick()
+
+    expect(legacy.options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(legacy.options.notifyAttachmentBranchUnsupported).not.toHaveBeenCalled()
+  })
+
+  it('does not add composer attachments to a four-tier mapping branch', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(
+      messages,
+      text => text,
+      undefined,
+      {
+        isFourTierMapping: () => true,
+        hasPendingBranchAttachments: () => true,
+      },
+    )
+
+    api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+    }))
+
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.notifyAttachmentBranchUnsupported).toHaveBeenCalledOnce()
+
+    const edited = makeOptions(
+      messages,
+      text => text,
+      undefined,
+      {
+        isFourTierMapping: () => true,
+        hasPendingBranchAttachments: () => true,
+      },
+    )
+    edited.api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+    }))
+
+    expect(edited.options.messages.value).toEqual(messages)
+    expect(edited.options.inputText.value).toBe('')
+    expect(edited.pendingForkBeforeMessageId.value).toBeNull()
+    expect(edited.options.focusComposer).not.toHaveBeenCalled()
+    expect(edited.options.notifyAttachmentBranchUnsupported).toHaveBeenCalledOnce()
+  })
+
+  it('always clears redo control when editing a four-tier mapping user turn', () => {
+    const harness = makeOptions(
+      [{ role: 'user', text: 'A', ts: null, messageId: 'msg-A' }],
+      text => text,
+      undefined,
+      { isFourTierMapping: () => true },
+    )
+    harness.pendingRoutingControl.value = {
+      mode: 'four_tier_mapping',
+      intent: 'redo',
+      redoOfMessageId: 'msg-A',
+    }
+
+    harness.api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    expect(harness.pendingRoutingControl.value).toBeNull()
+    expect(harness.pendingForkBeforeMessageId.value).toBe('msg-A')
   })
 })
 

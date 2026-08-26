@@ -119,7 +119,7 @@ async def test_reserve_is_inert_until_activation(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_reserve_preserves_task_id_without_capturing_accepted_config() -> None:
+async def test_reserve_preserves_task_id_and_captures_accepted_config() -> None:
     storage = _TrackingStorage()
     config_captures: list[dict[str, str]] = []
 
@@ -145,15 +145,15 @@ async def test_reserve_preserves_task_id_without_capturing_accepted_config() -> 
 
     assert reservation.task_id == "turn-preallocated"
     assert reservation.task_record.task_id == "turn-preallocated"
-    assert reservation.runtime_task.accepted_config is None
-    assert config_captures == []
+    assert reservation.runtime_task.accepted_config == {"strategy": "router"}
+    assert config_captures == [{"strategy": "router"}]
 
     await runtime.abort_reservation(reservation)
-    assert config_captures == []
+    assert config_captures == [{"strategy": "router"}]
 
 
 @pytest.mark.asyncio
-async def test_activate_captures_accepted_config_once() -> None:
+async def test_activate_uses_the_config_captured_at_reservation_once() -> None:
     storage = _TrackingStorage()
     handler_started = asyncio.Event()
     release_handler = asyncio.Event()
@@ -177,7 +177,7 @@ async def test_activate_captures_accepted_config_once() -> None:
     )
     reservation = await runtime.reserve(_envelope(), "accepted")
 
-    assert config_captures == []
+    assert config_captures == [{"strategy": "router-1"}]
     storage.accept(reservation.task_record)
 
     first = await runtime.activate(reservation)
@@ -189,9 +189,7 @@ async def test_activate_captures_accepted_config_once() -> None:
     assert seen_configs == [{"strategy": "router-1"}]
 
     release_handler.set()
-    assert (await runtime.wait(first.task_id, timeout=1.0)).status == (
-        AgentTaskStatus.SUCCEEDED
-    )
+    assert (await runtime.wait(first.task_id, timeout=1.0)).status == (AgentTaskStatus.SUCCEEDED)
 
 
 @pytest.mark.asyncio
@@ -326,9 +324,7 @@ async def test_try_collect_atomically_mutates_only_after_persist_and_skips_repla
     assert candidate.message == "first\nsecond"
 
     release_running.set()
-    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (
-        AgentTaskStatus.SUCCEEDED
-    )
+    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (AgentTaskStatus.SUCCEEDED)
     assert (await runtime.wait(candidate_handle.task_id, timeout=1.0)).status == (
         AgentTaskStatus.SUCCEEDED
     )
@@ -650,9 +646,7 @@ async def test_direct_enqueue_cancellation_after_task_commit_still_activates() -
     assert task_id in runtime._tasks
 
     release_handler.set()
-    assert (await runtime.wait(task_id, timeout=1.0)).status == (
-        AgentTaskStatus.SUCCEEDED
-    )
+    assert (await runtime.wait(task_id, timeout=1.0)).status == (AgentTaskStatus.SUCCEEDED)
 
 
 @pytest.mark.asyncio
@@ -682,10 +676,7 @@ async def test_activate_settles_overflow_victim_when_terminal_persistence_fails(
     original_update = storage.update_agent_task
 
     async def fail_victim_terminal(task_id: str, **fields: Any) -> None:
-        if (
-            task_id == victim_handle.task_id
-            and fields.get("status") == AgentTaskStatus.CANCELLED
-        ):
+        if task_id == victim_handle.task_id and fields.get("status") == AgentTaskStatus.CANCELLED:
             raise RuntimeError("synthetic terminal persistence failure")
         await original_update(task_id, **fields)
 
@@ -748,9 +739,7 @@ async def test_activate_does_not_drop_reserved_victim_after_it_starts_running() 
     replacement = await runtime.reserve(envelope, "replacement")
     storage.accept(replacement.task_record)
     release_running.set()
-    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (
-        AgentTaskStatus.SUCCEEDED
-    )
+    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (AgentTaskStatus.SUCCEEDED)
     await asyncio.wait_for(victim_started.wait(), timeout=1.0)
     assert (await runtime.status(victim_handle.task_id)).status == AgentTaskStatus.RUNNING
 
@@ -856,12 +845,8 @@ async def test_queue_full_is_rejected_before_reserve_side_effects() -> None:
     assert runtime._reservations_by_session == {}
 
     release_first.set()
-    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (
-        AgentTaskStatus.SUCCEEDED
-    )
-    assert (await runtime.wait(pending.task_id, timeout=1.0)).status == (
-        AgentTaskStatus.SUCCEEDED
-    )
+    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (AgentTaskStatus.SUCCEEDED)
+    assert (await runtime.wait(pending.task_id, timeout=1.0)).status == (AgentTaskStatus.SUCCEEDED)
 
 
 @pytest.mark.asyncio

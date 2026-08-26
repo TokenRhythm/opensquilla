@@ -294,6 +294,12 @@ export interface ChatSendAttachmentPayload {
   file_uuid?: string
 }
 
+export interface ChatRoutingControl {
+  mode: 'four_tier_mapping'
+  intent: 'redo'
+  redoOfMessageId: string
+}
+
 export interface ChatSendParams {
   message: string
   sessionKey: string
@@ -304,6 +310,7 @@ export interface ChatSendParams {
   _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
   intent?: string
   forkBeforeMessageId?: string
+  routingControl?: ChatRoutingControl
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]
   [key: string]: unknown

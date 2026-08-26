@@ -2955,6 +2955,8 @@
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
       "queueFull": "La file d'attente est pleine — attendez la fin de la réponse actuelle.",
       "messageStillSaving": "Ce message n'est pas encore enregistré — réessayez dans un instant.",
+      "waitBranchIdle": "Attendez la fin de la réponse, du compactage ou de la file avant de créer une branche.",
+      "attachmentBranchUnsupported": "Les messages avec pièces jointes ne peuvent pas encore être régénérés ou modifiés en branche.",
       "artifactOpenFailed": "Échec de l'ouverture de l'artefact. Utilisez Télécharger à la place."
     },
     "stream": {

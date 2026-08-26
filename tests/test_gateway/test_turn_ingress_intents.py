@@ -18,6 +18,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionContextState, SessionSummary
 from opensquilla.session.storage import SessionStorage
@@ -30,6 +31,38 @@ _PRINCIPAL = Principal(
     is_owner=True,
     authenticated=True,
 )
+
+
+def test_routing_control_is_bound_into_turn_idempotency_fingerprint() -> None:
+    base = {
+        "message": "same prompt",
+        "routingControl": {
+            "mode": "four_tier_mapping",
+            "intent": "redo",
+            "redoOfMessageId": "message-a",
+        },
+    }
+    changed = {
+        **base,
+        "routingControl": {
+            **base["routingControl"],
+            "redoOfMessageId": "message-b",
+        },
+    }
+
+    assert request_fingerprint(base) != request_fingerprint(changed)
+
+
+def test_routing_control_aliases_have_one_canonical_fingerprint() -> None:
+    control = {
+        "mode": "four_tier_mapping",
+        "intent": "redo",
+        "redoOfMessageId": "message-a",
+    }
+
+    assert request_fingerprint(
+        {"message": "same prompt", "routingControl": control}
+    ) == request_fingerprint({"message": "same prompt", "routing_control": control})
 
 
 @dataclass
@@ -496,15 +529,11 @@ async def test_reset_archive_snapshot_includes_append_committed_before_acceptanc
         assert len(archive_files) == 1
         archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
         assert archived["session_id"] == old_session_id
-        assert [
-            entry["content"] for entry in archived["transcript_entries"]
-        ] == [
+        assert [entry["content"] for entry in archived["transcript_entries"]] == [
             "old transcript",
             "append committed before reset acceptance",
         ]
-        assert [summary["summary_text"] for summary in archived["summaries"]] == [
-            "old summary"
-        ]
+        assert [summary["summary_text"] for summary in archived["summaries"]] == ["old summary"]
         assert archived["session"]["total_tokens"] == 7
 
 
@@ -636,8 +665,7 @@ async def test_reset_cannot_overtake_a_committed_continue_before_activation(
             assert before_reset is not None
             assert before_reset.session_id == old_session_id
             assert [
-                entry.content
-                for entry in await stack.storage.get_transcript(old_session_id)
+                entry.content for entry in await stack.storage.get_transcript(old_session_id)
             ] == ["old transcript", "continue before reset"]
         finally:
             release_continue_activation.set()

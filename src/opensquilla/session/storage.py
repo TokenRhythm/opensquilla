@@ -22,6 +22,9 @@ from opensquilla.session.keys import canonicalize_session_key, normalize_agent_i
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
+    FixedFourTierDecisionRecord,
+    FixedFourTierRequestClaim,
+    FixedFourTierState,
     MemoryDurableReceipt,
     SessionContextState,
     SessionNode,
@@ -63,6 +66,10 @@ log = logging.getLogger(__name__)
 
 class StaleEpochError(Exception):
     """Raised when a write is rejected because the session epoch has advanced."""
+
+
+class FixedFourTierStateConflictError(RuntimeError):
+    """Raised when a four_tier_mapping state CAS observes a different durable version."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +167,8 @@ def _serialized_read[**P, R](
 # Version 9 added durable turn-ingress receipts.
 # Version 10 added the durable provider usage ledger and content-free daily usage
 # telemetry aggregates. Version 11 added per-item provider-native billing receipts.
-SCHEMA_VERSION = 11
+# Version 12 added four_tier_mapping v2 state, request claims, and route decisions.
+SCHEMA_VERSION = 12
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -499,6 +507,166 @@ _CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE = (
     ")"
 )
 
+_CREATE_FIXED_FOUR_TIER_STATES = """
+CREATE TABLE IF NOT EXISTS fixed_four_tier_states (
+    session_id          TEXT PRIMARY KEY,
+    session_key         TEXT NOT NULL,
+    session_epoch       INTEGER NOT NULL DEFAULT 0 CHECK (session_epoch >= 0),
+    version             INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+    task_id             TEXT NOT NULL,
+    tier                TEXT NOT NULL CHECK (tier IN ('c0', 'c1', 'c2', 'c3')),
+    task_turn_count     INTEGER NOT NULL DEFAULT 0 CHECK (task_turn_count >= 0),
+    task_start_input_message_id TEXT,
+    last_request_id     TEXT,
+    last_route_id       TEXT,
+    updated_at_ms       INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    schema_version      INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+    UNIQUE (session_key, session_epoch)
+)
+"""
+
+_CREATE_FIXED_FOUR_TIER_REQUEST_CLAIMS = """
+CREATE TABLE IF NOT EXISTS fixed_four_tier_request_claims (
+    claim_id             TEXT PRIMARY KEY,
+    session_id           TEXT NOT NULL,
+    session_key          TEXT NOT NULL,
+    session_epoch        INTEGER NOT NULL DEFAULT 0 CHECK (session_epoch >= 0),
+    request_id           TEXT NOT NULL,
+    execution_id         TEXT NOT NULL,
+    input_message_id     TEXT NOT NULL,
+    claimed_at_ms        INTEGER NOT NULL CHECK (claimed_at_ms >= 0),
+    updated_at_ms        INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    lease_expires_at_ms  INTEGER NOT NULL CHECK (lease_expires_at_ms >= claimed_at_ms),
+    status               TEXT NOT NULL DEFAULT 'claimed'
+                         CHECK (status IN
+                                ('claimed', 'materialized', 'succeeded', 'failed', 'cancelled')),
+    route_id             TEXT,
+    terminal_at_ms       INTEGER CHECK (terminal_at_ms IS NULL OR terminal_at_ms >= 0),
+    error_code           TEXT,
+    schema_version       INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+    UNIQUE (session_id, request_id)
+)
+"""
+
+_CREATE_FIXED_FOUR_TIER_DECISIONS = """
+CREATE TABLE IF NOT EXISTS fixed_four_tier_decisions (
+    route_id             TEXT PRIMARY KEY,
+    session_id           TEXT NOT NULL,
+    session_key          TEXT NOT NULL,
+    session_epoch        INTEGER NOT NULL DEFAULT 0 CHECK (session_epoch >= 0),
+    claim_id             TEXT NOT NULL UNIQUE,
+    request_id           TEXT NOT NULL,
+    execution_id         TEXT NOT NULL,
+    input_message_id     TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    redo_parent_route_id TEXT,
+    decided_at_ms        INTEGER NOT NULL CHECK (decided_at_ms >= 0),
+    updated_at_ms        INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    intent               TEXT NOT NULL,
+    tier                 TEXT NOT NULL,
+    previous_tier        TEXT CHECK (
+                            previous_tier IS NULL
+                            OR previous_tier IN ('c0', 'c1', 'c2', 'c3')
+                         ),
+    final_tier           TEXT NOT NULL CHECK (final_tier IN ('c0', 'c1', 'c2', 'c3')),
+    task_turn_index      INTEGER NOT NULL DEFAULT 0 CHECK (task_turn_index >= 0),
+    task_start_input_message_id TEXT,
+    context_action       TEXT NOT NULL CHECK (context_action IN ('keep', 'reset')),
+    state_version_before INTEGER CHECK (
+                            state_version_before IS NULL OR state_version_before >= 0
+                         ),
+    state_version_after  INTEGER CHECK (
+                            state_version_after IS NULL OR state_version_after >= 0
+                         ),
+    selected_provider    TEXT,
+    selected_model       TEXT,
+    reasoning            TEXT,
+    deployment_version   TEXT,
+    config_version       TEXT,
+    executed_provider    TEXT,
+    executed_model       TEXT,
+    executed_deployment_version TEXT,
+    usage_summary        TEXT,
+    preflight_status     TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (preflight_status IN ('pending', 'passed', 'failed')),
+    state_committed      INTEGER NOT NULL DEFAULT 0 CHECK (state_committed IN (0, 1)),
+    execution_status     TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (execution_status IN
+                                ('pending', 'succeeded', 'failed', 'cancelled')),
+    response_id          TEXT,
+    error_code           TEXT,
+    terminal_at_ms       INTEGER CHECK (terminal_at_ms IS NULL OR terminal_at_ms >= 0),
+    route_trace          TEXT NOT NULL,
+    schema_version       INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+    UNIQUE (session_id, request_id)
+)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_STATES_KEY = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_states_key
+ON fixed_four_tier_states(session_key, session_epoch)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_SESSION_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_claims_session_status
+ON fixed_four_tier_request_claims(session_id, status, updated_at_ms)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_LEASE = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_claims_lease
+ON fixed_four_tier_request_claims(status, lease_expires_at_ms)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_EXECUTION = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_claims_execution
+ON fixed_four_tier_request_claims(execution_id)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_ROUTE = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_claims_route
+ON fixed_four_tier_request_claims(route_id)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_SESSION_TIME = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_session_time
+ON fixed_four_tier_decisions(session_id, decided_at_ms, route_id)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_INPUT = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_input
+ON fixed_four_tier_decisions(session_id, input_message_id, decided_at_ms)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_REQUEST = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_request
+ON fixed_four_tier_decisions(request_id)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_EXECUTION = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_execution
+ON fixed_four_tier_decisions(execution_id)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_KEY = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_key
+ON fixed_four_tier_decisions(session_key, session_epoch, decided_at_ms)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_TASK_TIME = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_task_time
+ON fixed_four_tier_decisions(session_id, task_id, decided_at_ms)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_RESPONSE = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_response
+ON fixed_four_tier_decisions(response_id)
+"""
+
+_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_STATUS_TIME = """
+CREATE INDEX IF NOT EXISTS idx_fixed_four_tier_decisions_status_time
+ON fixed_four_tier_decisions(execution_status, updated_at_ms)
+"""
+
 _CREATE_TELEMETRY_DAILY_USAGE = """
 CREATE TABLE IF NOT EXISTS telemetry_daily_usage (
     day TEXT PRIMARY KEY,
@@ -743,11 +911,7 @@ def _ordered_detail_message_ids(*values: Any) -> list[str]:
     for value in values:
         candidates = value if isinstance(value, list | tuple) else (value,)
         for candidate in candidates:
-            if (
-                isinstance(candidate, str)
-                and candidate
-                and candidate not in ordered
-            ):
+            if isinstance(candidate, str) and candidate and candidate not in ordered:
                 ordered.append(candidate)
     return ordered
 
@@ -773,6 +937,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "portable",
         "cacheable",
         "valid",
+        "state_committed",
     }
     result = {}
     for k, v in row.items():
@@ -786,6 +951,71 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         else:
             result[k] = v
     return result
+
+
+def _deserialize_fixed_four_tier_decision_row(
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    """Deserialize JSON fields unique to the four_tier_mapping decision table."""
+
+    result = _deserialize_row(row)
+    for field in ("intent", "tier", "route_trace", "usage_summary"):
+        value = row.get(field)
+        if not isinstance(value, str):
+            result[field] = value
+            continue
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            decoded = None
+        result[field] = decoded
+    return result
+
+
+def _validate_fixed_four_tier_decision_trace(
+    trace: object,
+    *,
+    route_id: object,
+    request_id: object,
+    task_id: object,
+) -> dict[str, Any]:
+    """Validate one persisted core trace and its duplicated row identity."""
+
+    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierDecision
+
+    persisted_route_id = str(route_id or "")
+    if not isinstance(trace, dict):
+        raise ValueError(
+            f"persisted four_tier_mapping route trace is incompatible: {persisted_route_id}"
+        )
+    try:
+        decision = FixedFourTierDecision.from_trace(trace)
+        if (
+            decision.route_id != persisted_route_id
+            or decision.request_id != str(request_id or "")
+            or decision.task_id != str(task_id or "")
+        ):
+            raise ValueError("four_tier_mapping decision trace identity is inconsistent")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"persisted four_tier_mapping route trace is incompatible: {persisted_route_id}"
+        ) from exc
+    return trace
+
+
+def _rehydrate_fixed_four_tier_decision_row(
+    row: dict[str, Any],
+) -> FixedFourTierDecisionRecord:
+    """Rehydrate one four_tier_mapping record only after validating its core trace."""
+
+    record = FixedFourTierDecisionRecord(**_deserialize_fixed_four_tier_decision_row(row))
+    _validate_fixed_four_tier_decision_trace(
+        record.route_trace,
+        route_id=record.route_id,
+        request_id=record.request_id,
+        task_id=record.task_id,
+    )
+    return record
 
 
 def _py_lower(value: Any) -> Any:
@@ -1193,6 +1423,22 @@ class SessionStorage:
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
         await self._conn.execute(_CREATE_MEMORY_DURABLE_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_SESSION)
+        await self._conn.execute(_CREATE_FIXED_FOUR_TIER_STATES)
+        await self._conn.execute(_CREATE_FIXED_FOUR_TIER_REQUEST_CLAIMS)
+        await self._conn.execute(_CREATE_FIXED_FOUR_TIER_DECISIONS)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_STATES_KEY)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_SESSION_STATUS)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_LEASE)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_EXECUTION)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_CLAIMS_ROUTE)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_SESSION_TIME)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_INPUT)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_REQUEST)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_EXECUTION)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_KEY)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_TASK_TIME)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_RESPONSE)
+        await self._conn.execute(_CREATE_IDX_FIXED_FOUR_TIER_DECISIONS_STATUS_TIME)
         await self._conn.execute(_CREATE_TELEMETRY_DAILY_USAGE)
         await self._conn.execute(_CREATE_USAGE_EVENTS)
         await self._conn.execute(_CREATE_USAGE_EVENT_ITEMS)
@@ -1223,6 +1469,11 @@ class SessionStorage:
         await self._conn.execute(_CREATE_FTS_TRIGGER_UPDATE)
         # Hard DB-level guarantee: epoch can never decrease via UPDATE.
         await self._conn.execute(_CREATE_EPOCH_ROLLBACK_TRIGGER)
+        await self._conn.commit()
+        await self._reconcile_stale_fixed_four_tier_claims_on_connection(
+            self._conn,
+            now_ms=time.time_ns() // 1_000_000,
+        )
         await self._conn.commit()
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
@@ -1379,15 +1630,11 @@ class SessionStorage:
             )
             await self._conn.commit()
         # Defensive: zero-out any NULL epoch rows left by a partial migration.
-        async with self._conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE epoch IS NULL"
-        ) as cur:
+        async with self._conn.execute("SELECT COUNT(*) FROM sessions WHERE epoch IS NULL") as cur:
             row = await cur.fetchone()
         null_count = row[0] if row else 0
         if null_count > 0:
-            await self._conn.execute(
-                "UPDATE sessions SET epoch = 0 WHERE epoch IS NULL"
-            )
+            await self._conn.execute("UPDATE sessions SET epoch = 0 WHERE epoch IS NULL")
             await self._conn.commit()
 
     async def _migrate_derived_title_column(self) -> None:
@@ -1401,9 +1648,7 @@ class SessionStorage:
         async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
             columns = [row[1] for row in await cur.fetchall()]
         if "derived_title" not in columns:
-            await self._conn.execute(
-                "ALTER TABLE sessions ADD COLUMN derived_title TEXT"
-            )
+            await self._conn.execute("ALTER TABLE sessions ADD COLUMN derived_title TEXT")
             await self._conn.commit()
 
     async def _migrate_transcript_reasoning_content_column(self) -> None:
@@ -1423,9 +1668,7 @@ class SessionStorage:
         async with self._conn.execute("PRAGMA table_info(transcript_entries)") as cur:
             columns = [row[1] for row in await cur.fetchall()]
         if "turn_usage" not in columns:
-            await self._conn.execute(
-                "ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT"
-            )
+            await self._conn.execute("ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT")
             await self._conn.commit()
 
     async def _migrate_transcript_turn_context_column(self) -> None:
@@ -1435,9 +1678,7 @@ class SessionStorage:
             async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
                 columns = {row[1] for row in await cur.fetchall()}
             if "turn_context" not in columns:
-                await self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN turn_context TEXT"
-                )
+                await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN turn_context TEXT")
         await self._conn.commit()
 
     async def _migrate_summary_metadata_columns(self) -> None:
@@ -1470,8 +1711,7 @@ class SessionStorage:
             "tokens_before": "ALTER TABLE session_summaries ADD COLUMN tokens_before INTEGER",
             "tokens_after": "ALTER TABLE session_summaries ADD COLUMN tokens_after INTEGER",
             "removed_count": (
-                "ALTER TABLE session_summaries ADD COLUMN "
-                "removed_count INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE session_summaries ADD COLUMN removed_count INTEGER NOT NULL DEFAULT 0"
             ),
             "kept_count": (
                 "ALTER TABLE session_summaries ADD COLUMN kept_count INTEGER NOT NULL DEFAULT 0"
@@ -1501,9 +1741,7 @@ class SessionStorage:
             "coverage_turn_id": (
                 "ALTER TABLE memory_durable_receipts ADD COLUMN coverage_turn_id TEXT"
             ),
-            "coverage_hash": (
-                "ALTER TABLE memory_durable_receipts ADD COLUMN coverage_hash TEXT"
-            ),
+            "coverage_hash": ("ALTER TABLE memory_durable_receipts ADD COLUMN coverage_hash TEXT"),
             "coverage_entry_count": (
                 "ALTER TABLE memory_durable_receipts ADD COLUMN coverage_entry_count INTEGER"
             ),
@@ -1844,9 +2082,7 @@ class SessionStorage:
                 raise ValueError("usage item ordinals must be unique per event")
             seen_ordinals.add(item.ordinal)
         if items and not self._usage_items_match_completion(items, completion):
-            raise ValueError(
-                "usage items must reconcile exactly with their event envelope"
-            )
+            raise ValueError("usage items must reconcile exactly with their event envelope")
         self._validate_usage_billing_receipts(event_id, items, receipts)
 
         if persisted.status == "finalized":
@@ -1856,9 +2092,7 @@ class SessionStorage:
                 raise UsageLedgerConflictError(
                     "usage event was finalized again with different model items"
                 )
-            persisted_receipts = await self._get_usage_billing_receipts_on_conn(
-                conn, event_id
-            )
+            persisted_receipts = await self._get_usage_billing_receipts_on_conn(conn, event_id)
             if persisted_receipts != sorted(receipts, key=lambda receipt: receipt.ordinal):
                 raise UsageLedgerConflictError(
                     "usage event was finalized again with different billing receipts"
@@ -2375,21 +2609,15 @@ class SessionStorage:
         if after is not None:
             if after.created_at_ms < 0 or not after.session_id or not after.message_id:
                 raise ValueError("backfill cursor fields must be valid")
-            cursor_clause = (
-                "AND (created_at, session_id, message_id) > (?, ?, ?)"
-            )
-            cursor_params.extend(
-                (after.created_at_ms, after.session_id, after.message_id)
-            )
+            cursor_clause = "AND (created_at, session_id, message_id) > (?, ?, ?)"
+            cursor_params.extend((after.created_at_ms, after.session_id, after.message_id))
 
         # Read at most one page from each indexed canonical source, then merge
         # and deduplicate in memory. This keeps every page O(log N + limit)
         # instead of rerunning ROW_NUMBER over the complete history.
         source_rows: list[tuple[int, dict[str, Any]]] = []
         source_full = False
-        for priority, table in enumerate(
-            ("transcript_entries", "compacted_transcript_entries")
-        ):
+        for priority, table in enumerate(("transcript_entries", "compacted_transcript_entries")):
             params = [before_ms, *cursor_params, limit + 1]
             sql = f"""
                 SELECT session_id, message_id, created_at, turn_usage, turn_context
@@ -2453,12 +2681,8 @@ class SessionStorage:
                     message_id=str(row["message_id"]),
                 ),
                 agent_id=metadata.get(str(row["session_id"]), ("main", 0, False))[0],
-                session_epoch=metadata.get(
-                    str(row["session_id"]), ("main", 0, False)
-                )[1],
-                forked_from_parent=metadata.get(
-                    str(row["session_id"]), ("main", 0, False)
-                )[2],
+                session_epoch=metadata.get(str(row["session_id"]), ("main", 0, False))[1],
+                forked_from_parent=metadata.get(str(row["session_id"]), ("main", 0, False))[2],
                 turn_usage=_json_object_or_none(row["turn_usage"]),
                 turn_context=_json_object_or_none(row["turn_context"]),
                 session_metadata_missing=str(row["session_id"]) not in metadata,
@@ -2497,9 +2721,7 @@ class SessionStorage:
         updated_at_ms = _now_ms() if now_ms is None else now_ms
         if updated_at_ms < 0:
             raise ValueError("now_ms must be non-negative")
-        if last_error_code is not None and (
-            not last_error_code or len(last_error_code) > 128
-        ):
+        if last_error_code is not None and (not last_error_code or len(last_error_code) > 128):
             raise ValueError("last_error_code must be a stable code up to 128 characters")
         async with self._write_transaction("update_usage_backfill_progress") as conn:
             state = await self._get_usage_state_on_conn(conn)
@@ -2535,9 +2757,7 @@ class SessionStorage:
             return updated
 
     async def _get_usage_state_on_conn(self, conn: Any) -> UsageLedgerState | None:
-        async with conn.execute(
-            "SELECT * FROM usage_ledger_state WHERE singleton_id = 1"
-        ) as cur:
+        async with conn.execute("SELECT * FROM usage_ledger_state WHERE singleton_id = 1") as cur:
             row = await cur.fetchone()
         return None if row is None else _usage_state_from_row(row)
 
@@ -2615,9 +2835,7 @@ class SessionStorage:
                 ):
                     implicit_anomalies += 1
                     continue
-                existing = await self._get_usage_event_on_conn(
-                    conn, event_id=write.start.event_id
-                )
+                existing = await self._get_usage_event_on_conn(conn, event_id=write.start.event_id)
                 if (
                     existing is not None
                     and existing.origin == "backfilled_turn"
@@ -2628,15 +2846,11 @@ class SessionStorage:
                 ):
                     if existing.status == "finalized":
                         try:
-                            self._assert_usage_completion_matches(
-                                existing, write.completion
-                            )
+                            self._assert_usage_completion_matches(existing, write.completion)
                             existing_items = await self._get_usage_items_on_conn(
                                 conn, existing.event_id
                             )
-                            if existing_items != sorted(
-                                write.items, key=lambda item: item.ordinal
-                            ):
+                            if existing_items != sorted(write.items, key=lambda item: item.ordinal):
                                 raise UsageLedgerConflictError(
                                     "fork copy has different model usage items"
                                 )
@@ -2804,6 +3018,21 @@ class SessionStorage:
                 "DELETE FROM session_context_states WHERE session_id = ?",
                 (session.session_id,),
             )
+            for table in (
+                "fixed_four_tier_states",
+                "fixed_four_tier_request_claims",
+                "fixed_four_tier_decisions",
+            ):
+                async with conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                    (table,),
+                ) as cur:
+                    exists = await cur.fetchone() is not None
+                if exists:
+                    await conn.execute(
+                        f"DELETE FROM {table} WHERE session_key = ?",  # noqa: S608
+                        (session_key,),
+                    )
             for table in ("router_decisions", "turn_errors"):
                 async with conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
@@ -2984,8 +3213,7 @@ class SessionStorage:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params += [limit, offset]
         sql = (
-            f"SELECT * FROM agent_tasks {where} "
-            "ORDER BY created_at ASC, rowid ASC LIMIT ? OFFSET ?"
+            f"SELECT * FROM agent_tasks {where} ORDER BY created_at ASC, rowid ASC LIMIT ? OFFSET ?"
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
@@ -3113,7 +3341,7 @@ class SessionStorage:
         async with self.conn.execute(
             f"""
             SELECT * FROM memory_durable_receipts
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY
                 next_retry_at_ms IS NOT NULL ASC,
                 next_retry_at_ms ASC,
@@ -3173,7 +3401,7 @@ class SessionStorage:
         async with self.conn.execute(
             f"""
             SELECT 1 FROM memory_durable_receipts
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             LIMIT 1
             """,
             params,
@@ -3264,9 +3492,7 @@ class SessionStorage:
         allowed = set(MemoryDurableReceipt.model_fields) - {"receipt_id", "created_at"}
         unknown = sorted(set(fields) - allowed)
         if unknown:
-            raise ValueError(
-                f"Unknown memory durable receipt fields: {', '.join(unknown)}"
-            )
+            raise ValueError(f"Unknown memory durable receipt fields: {', '.join(unknown)}")
         if "session_key" in fields:
             fields["session_key"] = canonicalize_session_key(fields["session_key"])
         fields.setdefault("updated_at", _now_ms())
@@ -3380,7 +3606,7 @@ class SessionStorage:
                 chunk = session_keys[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
                 placeholders = ", ".join("?" for _ in chunk)
                 await conn.execute(
-                f"""
+                    f"""
                 UPDATE sessions
                 SET status = ?,
                     updated_at = ?,
@@ -3394,16 +3620,16 @@ class SessionStorage:
                 WHERE session_key IN ({placeholders})
                   AND status NOT IN (?, ?, ?, ?)
                 """,
-                (
-                    SessionStatus.FAILED,
-                    ts,
-                    ts,
-                    ts,
-                    ts,
-                    *chunk,
-                    *terminal_session_statuses,
-                ),
-            )
+                    (
+                        SessionStatus.FAILED,
+                        ts,
+                        ts,
+                        ts,
+                        ts,
+                        *chunk,
+                        *terminal_session_statuses,
+                    ),
+                )
         return count
 
     # ── Transcript CRUD ──────────────────────────────────────────────────────
@@ -3440,8 +3666,7 @@ class SessionStorage:
 
         if expected_epoch is None:
             await conn.execute(
-                f"INSERT INTO transcript_entries ({', '.join(cols)}) "
-                f"VALUES ({placeholders})",
+                f"INSERT INTO transcript_entries ({', '.join(cols)}) VALUES ({placeholders})",
                 values,
             )
             return
@@ -3594,8 +3819,7 @@ class SessionStorage:
         """Read all summaries on an existing operation/transaction connection."""
 
         async with conn.execute(
-            "SELECT * FROM session_summaries WHERE session_id = ? "
-            "ORDER BY compaction_index ASC",
+            "SELECT * FROM session_summaries WHERE session_id = ? ORDER BY compaction_index ASC",
             (session_id,),
         ) as cur:
             rows = await cur.fetchall()
@@ -3627,9 +3851,7 @@ class SessionStorage:
         raw = dict(row)
         task_status_raw = raw.pop("accepted_task_status", None)
         task_details_raw = raw.pop("accepted_task_details", None)
-        task_status = (
-            AgentTaskStatus(task_status_raw) if task_status_raw is not None else None
-        )
+        task_status = AgentTaskStatus(task_status_raw) if task_status_raw is not None else None
         task_details: dict[str, Any] = {}
         if isinstance(task_details_raw, str):
             with contextlib.suppress(json.JSONDecodeError, TypeError):
@@ -3727,8 +3949,7 @@ class SessionStorage:
         unknown_session_updates = sorted(set(session_updates) - allowed_session_updates)
         if unknown_session_updates:
             raise ValueError(
-                "Unsupported atomic session updates: "
-                + ", ".join(unknown_session_updates)
+                "Unsupported atomic session updates: " + ", ".join(unknown_session_updates)
             )
 
         async with self._write_transaction("accept_turn") as conn:
@@ -3784,9 +4005,7 @@ class SessionStorage:
                             expected_epoch=previous_epoch,
                         )
                     assert previous_row is not None
-                    previous_node = SessionNode(
-                        **_deserialize_row(dict(previous_row))
-                    )
+                    previous_node = SessionNode(**_deserialize_row(dict(previous_row)))
                     reset_archive_snapshot = ResetArchiveSnapshot(
                         node=previous_node,
                         entries=tuple(
@@ -3803,9 +4022,7 @@ class SessionStorage:
                         ),
                     )
                     assignments = [
-                        f"{column} = ?"
-                        for column in session_data
-                        if column != "session_key"
+                        f"{column} = ?" for column in session_data if column != "session_key"
                     ]
                     values = [
                         _serialize(value)
@@ -3846,18 +4063,24 @@ class SessionStorage:
                         """,
                         (session_node.session_key,),
                     )
+                    async with conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='fixed_four_tier_states'"
+                    ) as cur:
+                        fixed_state_table_exists = await cur.fetchone() is not None
+                    if fixed_state_table_exists:
+                        await conn.execute(
+                            "DELETE FROM fixed_four_tier_states WHERE session_id = ?",
+                            (reset_from_session_id,),
+                        )
 
             for initial_entry in initial_transcript_entries:
-                initial_entry.session_key = canonicalize_session_key(
-                    initial_entry.session_key
-                )
+                initial_entry.session_key = canonicalize_session_key(initial_entry.session_key)
                 if (
                     initial_entry.session_key != entry.session_key
                     or initial_entry.session_id != entry.session_id
                 ):
-                    raise ValueError(
-                        "initial transcript entries must target the accepted session"
-                    )
+                    raise ValueError("initial transcript entries must target the accepted session")
                 await self._insert_transcript_entry(
                     conn,
                     initial_entry,
@@ -3918,9 +4141,7 @@ class SessionStorage:
                 deserialized = _deserialize_row({"details": existing_row["details"]})
                 existing_details_raw = deserialized.get("details")
                 existing_details = (
-                    dict(existing_details_raw)
-                    if isinstance(existing_details_raw, dict)
-                    else {}
+                    dict(existing_details_raw) if isinstance(existing_details_raw, dict) else {}
                 )
                 details = {**existing_details, **incoming_details}
                 message_ids = _ordered_detail_message_ids(
@@ -3933,14 +4154,10 @@ class SessionStorage:
                 existing_count = existing_details.get("message_count")
                 incoming_count = incoming_details.get("message_count")
                 existing_count = (
-                    existing_count
-                    if isinstance(existing_count, int) and existing_count > 0
-                    else 0
+                    existing_count if isinstance(existing_count, int) and existing_count > 0 else 0
                 )
                 incoming_count = (
-                    incoming_count
-                    if isinstance(incoming_count, int) and incoming_count > 0
-                    else 0
+                    incoming_count if isinstance(incoming_count, int) and incoming_count > 0 else 0
                 )
                 details["persisted_user_message_id"] = (
                     message_ids[0] if message_ids else entry.message_id
@@ -3986,9 +4203,7 @@ class SessionStorage:
                 details["persisted_user_message_id"] = entry.message_id
                 details["persisted_user_message_ids"] = message_ids
                 details["message_count"] = (
-                    incoming_count
-                    if isinstance(incoming_count, int) and incoming_count > 0
-                    else 1
+                    incoming_count if isinstance(incoming_count, int) and incoming_count > 0 else 1
                 )
                 details["fresh_user_session"] = fresh_user_session
                 task_record.details = details
@@ -4008,8 +4223,7 @@ class SessionStorage:
             cols = list(data.keys())
             placeholders = ", ".join("?" for _ in cols)
             await conn.execute(
-                f"INSERT INTO turn_ingress_receipts ({', '.join(cols)}) "
-                f"VALUES ({placeholders})",
+                f"INSERT INTO turn_ingress_receipts ({', '.join(cols)}) VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
             return TurnAcceptanceResult(
@@ -4114,8 +4328,7 @@ class SessionStorage:
         if cursor is not None:
             created_at, entry_id = cursor
             active_cursor_clause = (
-                f"AND (created_at {comparator} ? "
-                f"OR (created_at = ? AND id {comparator} ?))"
+                f"AND (created_at {comparator} ? OR (created_at = ? AND id {comparator} ?))"
             )
             active_params.extend((created_at, created_at, entry_id))
         active_params.append(fetch_size)
@@ -4273,8 +4486,7 @@ class SessionStorage:
             # current row—or the child's later compactions—retroactively prove
             # that an ambiguous inherited prefix retained every original row.
             fork_coverage_proven = (
-                int(row["schema_version"] or 0)
-                >= CANONICAL_FORK_PROOF_SCHEMA_VERSION
+                int(row["schema_version"] or 0) >= CANONICAL_FORK_PROOF_SCHEMA_VERSION
             )
         compaction_count_matches = (
             summary_count >= expected_compactions
@@ -4373,9 +4585,7 @@ class SessionStorage:
         return row[0] if row else 0
 
     @_serialized_read
-    async def count_transcript_entries_batch(
-        self, session_ids: list[str]
-    ) -> dict[str, int]:
+    async def count_transcript_entries_batch(self, session_ids: list[str]) -> dict[str, int]:
         """Count transcript entries for many sessions in one round trip.
 
         Used by ``sessions.list`` (rpc_sessions.py) to avoid the N+1 pattern
@@ -4452,9 +4662,7 @@ class SessionStorage:
 
     async def delete_transcript(self, session_id: str) -> None:
         async with self._write_transaction("delete_transcript") as conn:
-            await conn.execute(
-                "DELETE FROM transcript_entries WHERE session_id = ?", (session_id,)
-            )
+            await conn.execute("DELETE FROM transcript_entries WHERE session_id = ?", (session_id,))
             await conn.execute(
                 "DELETE FROM compacted_transcript_entries WHERE session_id = ?",
                 (session_id,),
@@ -4493,18 +4701,57 @@ class SessionStorage:
         async with self._write_transaction("update_transcript_turn_context") as conn:
             for table in ("transcript_entries", "compacted_transcript_entries"):
                 async with conn.execute(
-                    f"UPDATE {table} SET turn_context = ? "
-                    "WHERE session_key = ? AND message_id = ?",
+                    f"UPDATE {table} SET turn_context = ? WHERE session_key = ? AND message_id = ?",
                     (encoded, session_key, message_id),
+                ) as cur:
+                    changed += cur.rowcount or 0
+        return changed > 0
+
+    async def merge_transcript_turn_context(
+        self,
+        session_key: str,
+        message_id: str,
+        turn_context_patch: dict[str, Any],
+    ) -> bool:
+        """Atomically merge additive causal fields without dropping identity."""
+
+        session_key = canonicalize_session_key(session_key)
+        changed = 0
+        async with self._write_transaction("merge_transcript_turn_context") as conn:
+            for table in ("transcript_entries", "compacted_transcript_entries"):
+                async with conn.execute(
+                    f"SELECT turn_context FROM {table} "  # noqa: S608 - fixed literals
+                    "WHERE session_key = ? AND message_id = ?",
+                    (session_key, message_id),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    continue
+                raw_context = row["turn_context"]
+                try:
+                    existing = (
+                        json.loads(raw_context)
+                        if isinstance(raw_context, str)
+                        else dict(raw_context)
+                        if isinstance(raw_context, dict)
+                        else {}
+                    )
+                except (TypeError, ValueError):
+                    existing = {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                merged = {**existing, **turn_context_patch}
+                async with conn.execute(
+                    f"UPDATE {table} SET turn_context = ? "  # noqa: S608 - fixed literals
+                    "WHERE session_key = ? AND message_id = ?",
+                    (_serialize(merged), session_key, message_id),
                 ) as cur:
                     changed += cur.rowcount or 0
         return changed > 0
 
     async def delete_summaries(self, session_id: str) -> None:
         async with self._write_transaction("delete_summaries") as conn:
-            await conn.execute(
-                "DELETE FROM session_summaries WHERE session_id = ?", (session_id,)
-            )
+            await conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
 
     @_serialized_read
     async def get_recent_transcript(self, session_id: str, n: int) -> list[TranscriptEntry]:
@@ -4603,9 +4850,7 @@ class SessionStorage:
                 node=node,
                 entries=archived_entries or [],
                 compaction_id=summary.compaction_id if summary is not None else None,
-                compaction_index=summary.compaction_index
-                if summary is not None
-                else None,
+                compaction_index=summary.compaction_index if summary is not None else None,
             )
 
             await conn.execute(
@@ -4776,11 +5021,1100 @@ class SessionStorage:
             count = int(cur.rowcount or 0)
         return count
 
+    # ── Fixed-four-tier v2 routing state / decision ledger ──────────────────
+
+    @staticmethod
+    async def _fixed_four_tier_crash_recovery_evidence(
+        conn: Any,
+        *,
+        claim: dict[str, Any],
+        decision: dict[str, Any],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Reconstruct content-free terminal evidence after a crashed worker."""
+
+        execution_id = str(claim.get("execution_id") or "")
+        session_id = str(claim.get("session_id") or "")
+        async with conn.execute(
+            """
+            SELECT * FROM usage_events
+            WHERE session_id = ? AND (turn_id = ? OR execution_id = ?)
+            ORDER BY call_index ASC, started_at_ms ASC, event_id ASC
+            """,
+            (session_id, execution_id, execution_id),
+        ) as cur:
+            usage_rows = [dict(row) for row in await cur.fetchall()]
+        finalized_rows = [row for row in usage_rows if str(row.get("status")) == "finalized"]
+        usage_item_rows: list[dict[str, Any]] = []
+        if finalized_rows:
+            event_ids = [str(row["event_id"]) for row in finalized_rows]
+            async with conn.execute(
+                "SELECT * FROM usage_event_items WHERE event_id IN ("
+                + ", ".join("?" for _ in event_ids)
+                + ") ORDER BY event_id ASC, ordinal ASC",
+                event_ids,
+            ) as cur:
+                usage_item_rows = [dict(row) for row in await cur.fetchall()]
+        physical_request_count = 0
+        for row in finalized_rows:
+            item_count = sum(
+                1
+                for item in usage_item_rows
+                if str(item.get("event_id")) == str(row.get("event_id"))
+            )
+            physical_request_count += max(1, item_count)
+
+        input_message_id = str(claim.get("input_message_id") or "")
+        async with conn.execute(
+            """
+            SELECT id FROM transcript_entries
+            WHERE session_id = ? AND message_id = ? AND role = 'user'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (session_id, input_message_id),
+        ) as cur:
+            input_row = await cur.fetchone()
+        response_row = None
+        response_binding: dict[str, Any] | None = None
+        if input_row is not None:
+            async with conn.execute(
+                """
+                SELECT message_id, created_at, turn_context FROM transcript_entries
+                WHERE session_id = ? AND role = 'assistant' AND id > ?
+                  AND created_at >= ? AND created_at <= ?
+                  AND turn_context IS NOT NULL
+                ORDER BY id ASC
+                """,
+                (
+                    session_id,
+                    int(input_row["id"]),
+                    int(decision.get("decided_at_ms") or 0),
+                    now_ms,
+                ),
+            ) as cur:
+                response_candidates = await cur.fetchall()
+            for candidate in response_candidates:
+                raw_context = candidate["turn_context"]
+                try:
+                    candidate_context = (
+                        json.loads(raw_context)
+                        if isinstance(raw_context, str)
+                        else dict(raw_context)
+                        if isinstance(raw_context, dict)
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    candidate_context = None
+                if not isinstance(candidate_context, dict):
+                    continue
+                if (
+                    str(candidate_context.get("schema") or "")
+                    != "fixed_four_tier_v2_response_binding_v1"
+                ):
+                    continue
+                bound_execution_id = str(
+                    candidate_context.get("execution_id") or candidate_context.get("turn_id") or ""
+                )
+                if bound_execution_id != execution_id:
+                    continue
+                if str(candidate_context.get("route_id") or "") != str(
+                    decision.get("route_id") or ""
+                ):
+                    continue
+                if str(candidate_context.get("request_id") or "") != str(
+                    claim.get("request_id") or ""
+                ):
+                    continue
+                response_row = candidate
+                response_binding = candidate_context
+                break
+
+        turn_error = None
+        async with conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'turn_errors'"
+        ) as cur:
+            has_turn_errors = await cur.fetchone() is not None
+        if has_turn_errors:
+            async with conn.execute(
+                """
+                SELECT error_id, error_class, ts_ms FROM turn_errors
+                WHERE turn_id = ?
+                ORDER BY ts_ms ASC, error_id ASC LIMIT 1
+                """,
+                (execution_id,),
+            ) as cur:
+                raw_error = await cur.fetchone()
+            if raw_error is not None:
+                turn_error = dict(raw_error)
+
+        attempt_ids = [str(row["event_id"]) for row in usage_rows]
+        actual_provider = next(
+            (
+                str(row.get("provider") or "").strip()
+                for row in reversed(usage_item_rows or finalized_rows)
+                if str(row.get("provider") or "").strip()
+            ),
+            None,
+        )
+        actual_model = next(
+            (
+                str(row.get("model") or "").strip()
+                for row in reversed(usage_item_rows or finalized_rows)
+                if str(row.get("model") or "").strip()
+            ),
+            None,
+        )
+        usage_summary: dict[str, Any] | None = None
+        if finalized_rows:
+            input_tokens = sum(int(row.get("input_tokens") or 0) for row in finalized_rows)
+            output_tokens = sum(int(row.get("output_tokens") or 0) for row in finalized_rows)
+            reasoning_tokens = sum(int(row.get("reasoning_tokens") or 0) for row in finalized_rows)
+            cache_read_tokens = sum(
+                int(row.get("cache_read_tokens") or 0) for row in finalized_rows
+            )
+            cache_write_tokens = sum(
+                int(row.get("cache_write_tokens") or 0) for row in finalized_rows
+            )
+            normal_input_tokens = max(
+                0,
+                input_tokens - cache_read_tokens - cache_write_tokens,
+            )
+            cost_nanos = sum(int(row.get("cost_nanos") or 0) for row in finalized_rows)
+            billed_cost_nanos = sum(
+                int(row.get("billed_cost_nanos") or 0) for row in finalized_rows
+            )
+            sources = {str(row.get("cost_source") or "none") for row in finalized_rows}
+            usage_summary = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "cost_usd": cost_nanos / 1_000_000_000,
+                "billed_cost_usd": billed_cost_nanos / 1_000_000_000,
+                "cost_source": next(iter(sources)) if len(sources) == 1 else "mixed",
+                "provider": actual_provider,
+                "model": actual_model,
+                "normalized_billing_buckets": {
+                    "normal_input_tokens": normal_input_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens,
+                    "output_tokens": output_tokens,
+                    "reasoning_tokens_detail": reasoning_tokens,
+                    "input_tokens_total": input_tokens,
+                    "input_buckets_reconcile": (
+                        cache_read_tokens + cache_write_tokens <= input_tokens
+                    ),
+                    "normalization_anomaly": (
+                        cache_read_tokens + cache_write_tokens > input_tokens
+                    ),
+                },
+                "physical_ledger": [
+                    {
+                        "event_id": str(row["event_id"]),
+                        "call_index": int(row.get("call_index") or 0),
+                        "status": str(row.get("status") or "unknown"),
+                        "provider": row.get("provider"),
+                        "model": row.get("model"),
+                        "input_tokens": int(row.get("input_tokens") or 0),
+                        "output_tokens": int(row.get("output_tokens") or 0),
+                        "reasoning_tokens": int(row.get("reasoning_tokens") or 0),
+                        "cache_read_tokens": int(row.get("cache_read_tokens") or 0),
+                        "cache_write_tokens": int(row.get("cache_write_tokens") or 0),
+                        "cost_nanos": int(row.get("cost_nanos") or 0),
+                        "billed_cost_nanos": int(row.get("billed_cost_nanos") or 0),
+                        "cost_source": str(row.get("cost_source") or "none"),
+                    }
+                    for row in finalized_rows
+                ],
+            }
+
+        return {
+            "attempt_ids": attempt_ids,
+            "finalized_count": len(finalized_rows),
+            "physical_request_count": physical_request_count,
+            "actual_provider": actual_provider,
+            "actual_model": actual_model,
+            "usage_summary": usage_summary,
+            "response_id": (str(response_row["message_id"]) if response_row is not None else None),
+            "response_status": (
+                str(response_binding.get("execution_status") or "")
+                if response_binding is not None
+                else None
+            ),
+            "response_error_code": (
+                str(response_binding.get("error_code") or "") or None
+                if response_binding is not None
+                else None
+            ),
+            "turn_error": turn_error,
+        }
+
+    @staticmethod
+    async def _terminalize_expired_fixed_four_tier_claim(
+        conn: Any,
+        row: Any,
+        *,
+        now_ms: int,
+    ) -> None:
+        """Atomically fail one expired claim and its pending decision."""
+
+        claim = dict(row)
+        claim_id = str(claim["claim_id"])
+        route_id = str(claim.get("route_id") or "").strip() or None
+        if route_id is None:
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET status = 'failed', terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                    error_code = 'execution_lease_expired', updated_at_ms = ?
+                WHERE claim_id = ? AND status IN ('claimed', 'materialized')
+                  AND lease_expires_at_ms <= ?
+                """,
+                (now_ms, now_ms, claim_id, now_ms),
+            )
+            return
+        async with conn.execute(
+            "SELECT * FROM fixed_four_tier_decisions WHERE route_id = ?",
+            (route_id,),
+        ) as cur:
+            decision_row = await cur.fetchone()
+        if decision_row is None:
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET status = 'failed', terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                    error_code = 'execution_decision_missing', updated_at_ms = ?
+                WHERE claim_id = ? AND status IN ('claimed', 'materialized')
+                  AND lease_expires_at_ms <= ?
+                """,
+                (now_ms, now_ms, claim_id, now_ms),
+            )
+            return
+        decoded = _deserialize_fixed_four_tier_decision_row(dict(decision_row))
+        route_trace = _validate_fixed_four_tier_decision_trace(
+            decoded.get("route_trace"),
+            route_id=decoded.get("route_id"),
+            request_id=decoded.get("request_id"),
+            task_id=decoded.get("task_id"),
+        )
+        decision_status = str(decision_row["execution_status"])
+        if decision_status != "pending":
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET status = ?, terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                    error_code = ?, updated_at_ms = ?
+                WHERE claim_id = ? AND status IN ('claimed', 'materialized')
+                  AND lease_expires_at_ms <= ?
+                """,
+                (
+                    decision_status,
+                    int(decision_row["terminal_at_ms"] or now_ms),
+                    decision_row["error_code"],
+                    now_ms,
+                    claim_id,
+                    now_ms,
+                ),
+            )
+            return
+        evidence = await SessionStorage._fixed_four_tier_crash_recovery_evidence(
+            conn,
+            claim=claim,
+            decision=decoded,
+            now_ms=now_ms,
+        )
+        if evidence["turn_error"] is not None:
+            execution_status = "failed"
+            error_code = "execution_failed_before_route_settlement"
+            recovery_outcome = "durable_turn_error"
+        elif evidence["response_status"] in {"succeeded", "failed", "cancelled"}:
+            execution_status = str(evidence["response_status"])
+            error_code = (
+                None
+                if execution_status == "succeeded"
+                else evidence["response_error_code"]
+                or (
+                    "cancelled"
+                    if execution_status == "cancelled"
+                    else "execution_failed_before_route_settlement"
+                )
+            )
+            recovery_outcome = "durable_response_binding"
+        elif evidence["attempt_ids"]:
+            execution_status = "failed"
+            error_code = "execution_outcome_unknown_after_crash"
+            recovery_outcome = "provider_attempt_outcome_unknown"
+        else:
+            execution_status = "failed"
+            error_code = "execution_lease_expired"
+            recovery_outcome = "no_execution_evidence"
+        await conn.execute(
+            """
+            UPDATE fixed_four_tier_request_claims
+            SET status = ?, terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                error_code = ?, updated_at_ms = ?
+            WHERE claim_id = ? AND status IN ('claimed', 'materialized')
+              AND lease_expires_at_ms <= ?
+            """,
+            (execution_status, now_ms, error_code, now_ms, claim_id, now_ms),
+        )
+        route_trace["execution_status"] = execution_status
+        if error_code is None:
+            route_trace.pop("error_code", None)
+        else:
+            route_trace["error_code"] = error_code
+        route_trace["attempt_ids"] = list(evidence["attempt_ids"])
+        route_trace["attempt_id"] = evidence["attempt_ids"][0] if evidence["attempt_ids"] else None
+        if evidence["response_id"] is not None:
+            route_trace["response_id"] = evidence["response_id"]
+        dispatch_value = route_trace.get("dispatch")
+        dispatch = dict(dispatch_value) if isinstance(dispatch_value, dict) else {}
+        if evidence["finalized_count"]:
+            dispatch.update(
+                {
+                    "physical_request_started": True,
+                    "physical_request_count": evidence["physical_request_count"],
+                    "execution_evidence": "recovered_finalized_usage_ledger",
+                    "executed_provider": evidence["actual_provider"],
+                    "executed_model": evidence["actual_model"],
+                }
+            )
+        elif evidence["attempt_ids"]:
+            dispatch.update(
+                {
+                    "physical_request_started": None,
+                    "physical_request_count": None,
+                    "execution_evidence": "recovered_started_usage_ledger",
+                    "executed_provider": None,
+                    "executed_model": None,
+                }
+            )
+        route_trace["dispatch"] = dispatch
+        route_trace["executed_provider"] = evidence["actual_provider"]
+        route_trace["executed_model"] = evidence["actual_model"]
+        if evidence["usage_summary"] is not None:
+            route_trace["provider_usage"] = evidence["usage_summary"]
+        route_trace["lease_reconciliation"] = {
+            "status": "expired",
+            "outcome": recovery_outcome,
+            "claim_id": claim_id,
+            "lease_expires_at_ms": int(claim["lease_expires_at_ms"]),
+            "reconciled_at_ms": now_ms,
+            "turn_error": evidence["turn_error"],
+        }
+        if not bool(decision_row["state_committed"]):
+            preflight_value = route_trace.get("preflight")
+            preflight = dict(preflight_value) if isinstance(preflight_value, dict) else {}
+            if str(preflight.get("status") or "pending") == "pending":
+                preflight["status"] = "failed"
+                preflight["error_code"] = error_code
+            route_trace["preflight"] = preflight
+        await conn.execute(
+            """
+            UPDATE fixed_four_tier_decisions
+            SET execution_status = ?,
+                preflight_status = CASE
+                    WHEN state_committed = 0 AND preflight_status = 'pending'
+                    THEN 'failed' ELSE preflight_status END,
+                error_code = ?, response_id = COALESCE(response_id, ?),
+                executed_provider = COALESCE(executed_provider, ?),
+                executed_model = COALESCE(executed_model, ?),
+                usage_summary = COALESCE(usage_summary, ?),
+                terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                route_trace = ?, updated_at_ms = ?
+            WHERE route_id = ? AND execution_status = 'pending'
+            """,
+            (
+                execution_status,
+                error_code,
+                evidence["response_id"],
+                evidence["actual_provider"],
+                evidence["actual_model"],
+                _serialize(evidence["usage_summary"]),
+                now_ms,
+                _serialize(route_trace),
+                now_ms,
+                route_id,
+            ),
+        )
+
+    @classmethod
+    async def _reconcile_stale_fixed_four_tier_claims_on_connection(
+        cls,
+        conn: Any,
+        *,
+        now_ms: int,
+        session_id: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Reconcile expired leases and legacy pending rows without a claim."""
+
+        filters = ["status IN ('claimed', 'materialized')", "lease_expires_at_ms <= ?"]
+        params: list[Any] = [now_ms]
+        if session_id is not None:
+            filters.append("session_id = ?")
+            params.append(session_id)
+        if request_id is not None:
+            filters.append("request_id = ?")
+            params.append(request_id)
+        async with conn.execute(
+            "SELECT * FROM fixed_four_tier_request_claims WHERE " + " AND ".join(filters),
+            params,
+        ) as cur:
+            stale_rows = await cur.fetchall()
+        for row in stale_rows:
+            await cls._terminalize_expired_fixed_four_tier_claim(
+                conn,
+                row,
+                now_ms=now_ms,
+            )
+
+        terminal_filters = [
+            "decision.execution_status = 'pending'",
+            "claim.status IN ('succeeded', 'failed', 'cancelled')",
+        ]
+        terminal_params: list[Any] = []
+        if session_id is not None:
+            terminal_filters.append("decision.session_id = ?")
+            terminal_params.append(session_id)
+        if request_id is not None:
+            terminal_filters.append("decision.request_id = ?")
+            terminal_params.append(request_id)
+        async with conn.execute(
+            """
+            SELECT decision.*, claim.status AS claim_status,
+                   claim.error_code AS claim_error_code,
+                   claim.terminal_at_ms AS claim_terminal_at_ms
+            FROM fixed_four_tier_decisions AS decision
+            JOIN fixed_four_tier_request_claims AS claim
+              ON claim.claim_id = decision.claim_id
+            WHERE
+            """
+            + " AND ".join(terminal_filters),
+            terminal_params,
+        ) as cur:
+            terminal_claim_rows = await cur.fetchall()
+        for row in terminal_claim_rows:
+            decoded = _deserialize_fixed_four_tier_decision_row(dict(row))
+            route_trace = _validate_fixed_four_tier_decision_trace(
+                decoded.get("route_trace"),
+                route_id=decoded.get("route_id"),
+                request_id=decoded.get("request_id"),
+                task_id=decoded.get("task_id"),
+            )
+            claim_status = str(row["claim_status"])
+            claim_error_code = row["claim_error_code"]
+            terminal_at_ms = int(row["claim_terminal_at_ms"] or now_ms)
+            route_trace["execution_status"] = claim_status
+            if claim_error_code is not None:
+                route_trace["error_code"] = str(claim_error_code)
+            route_trace["claim_reconciliation"] = {
+                "status": "terminal_claim",
+                "reconciled_at_ms": now_ms,
+            }
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_decisions
+                SET execution_status = ?,
+                    preflight_status = CASE
+                        WHEN ? != 'succeeded' AND state_committed = 0
+                        THEN 'failed' ELSE preflight_status END,
+                    error_code = COALESCE(error_code, ?),
+                    terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                    route_trace = ?, updated_at_ms = ?
+                WHERE route_id = ? AND execution_status = 'pending'
+                """,
+                (
+                    claim_status,
+                    claim_status,
+                    claim_error_code,
+                    terminal_at_ms,
+                    _serialize(route_trace),
+                    max(now_ms, terminal_at_ms),
+                    str(row["route_id"]),
+                ),
+            )
+
+        orphan_filters = [
+            "decision.execution_status = 'pending'",
+            "claim.claim_id IS NULL",
+        ]
+        orphan_params: list[Any] = []
+        if session_id is not None:
+            orphan_filters.append("decision.session_id = ?")
+            orphan_params.append(session_id)
+        if request_id is not None:
+            orphan_filters.append("decision.request_id = ?")
+            orphan_params.append(request_id)
+        async with conn.execute(
+            """
+            SELECT decision.*
+            FROM fixed_four_tier_decisions AS decision
+            LEFT JOIN fixed_four_tier_request_claims AS claim
+              ON claim.claim_id = decision.claim_id
+            WHERE
+            """
+            + " AND ".join(orphan_filters),
+            orphan_params,
+        ) as cur:
+            orphan_rows = await cur.fetchall()
+        for row in orphan_rows:
+            decoded = _deserialize_fixed_four_tier_decision_row(dict(row))
+            route_trace = _validate_fixed_four_tier_decision_trace(
+                decoded.get("route_trace"),
+                route_id=decoded.get("route_id"),
+                request_id=decoded.get("request_id"),
+                task_id=decoded.get("task_id"),
+            )
+            error_code = "execution_claim_missing"
+            route_trace["execution_status"] = "failed"
+            route_trace["error_code"] = error_code
+            route_trace["claim_reconciliation"] = {
+                "status": "missing",
+                "reconciled_at_ms": now_ms,
+            }
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_decisions
+                SET execution_status = 'failed', error_code = ?,
+                    terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                    route_trace = ?, updated_at_ms = ?
+                WHERE route_id = ? AND execution_status = 'pending'
+                """,
+                (
+                    error_code,
+                    now_ms,
+                    _serialize(route_trace),
+                    now_ms,
+                    str(row["route_id"]),
+                ),
+            )
+
+    async def reconcile_stale_fixed_four_tier_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        now_ms: int | None = None,
+    ) -> FixedFourTierRequestClaim | None:
+        """Settle an expired duplicate before reporting its idempotent outcome."""
+
+        reconciled_at_ms = now_ms if now_ms is not None else time.time_ns() // 1_000_000
+        async with self._write_transaction("reconcile_stale_fixed_four_tier_request") as conn:
+            await self._reconcile_stale_fixed_four_tier_claims_on_connection(
+                conn,
+                now_ms=reconciled_at_ms,
+                session_id=session_id,
+                request_id=request_id,
+            )
+            async with conn.execute(
+                """
+                SELECT * FROM fixed_four_tier_request_claims
+                WHERE session_id = ? AND request_id = ?
+                """,
+                (session_id, request_id),
+            ) as cur:
+                row = await cur.fetchone()
+        return FixedFourTierRequestClaim(**_deserialize_row(dict(row))) if row else None
+
+    async def claim_fixed_four_tier_request(
+        self,
+        claim: FixedFourTierRequestClaim,
+    ) -> tuple[bool, FixedFourTierRequestClaim]:
+        """Acquire the durable pre-classification lease for one request."""
+
+        claim.session_key = canonicalize_session_key(claim.session_key)
+        if claim.status != "claimed":
+            raise ValueError("a new four_tier_mapping request claim must be claimed")
+        for field in (
+            "claim_id",
+            "session_id",
+            "session_key",
+            "request_id",
+            "execution_id",
+            "input_message_id",
+        ):
+            if not str(getattr(claim, field, "") or "").strip():
+                raise ValueError(f"{field} is required for a four_tier_mapping request claim")
+        if claim.lease_expires_at_ms <= claim.claimed_at_ms:
+            raise ValueError("four_tier_mapping request lease must expire after it is claimed")
+        async with self._write_transaction("claim_fixed_four_tier_request") as conn:
+            async with conn.execute(
+                "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                (claim.session_key,),
+            ) as cur:
+                live_session = await cur.fetchone()
+            if (
+                live_session is None
+                or str(live_session["session_id"]) != claim.session_id
+                or int(live_session["epoch"] or 0) != claim.session_epoch
+            ):
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping session identity changed before request claim"
+                )
+            await self._reconcile_stale_fixed_four_tier_claims_on_connection(
+                conn,
+                now_ms=claim.claimed_at_ms,
+                session_id=claim.session_id,
+                request_id=claim.request_id,
+            )
+            async with conn.execute(
+                """
+                SELECT * FROM fixed_four_tier_request_claims
+                WHERE session_id = ? AND request_id = ?
+                """,
+                (claim.session_id, claim.request_id),
+            ) as cur:
+                existing = await cur.fetchone()
+            if existing is not None:
+                return False, FixedFourTierRequestClaim(**_deserialize_row(dict(existing)))
+            data = claim.model_dump()
+            columns = list(data)
+            try:
+                await conn.execute(
+                    "INSERT INTO fixed_four_tier_request_claims "
+                    f"({', '.join(columns)}) VALUES "
+                    f"({', '.join('?' for _ in columns)})",
+                    [_serialize(data[column]) for column in columns],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping request claim raced with another execution"
+                ) from exc
+        return True, claim
+
+    async def settle_fixed_four_tier_request_claim(
+        self,
+        *,
+        claim_id: str,
+        execution_status: str,
+        error_code: str | None = None,
+        updated_at_ms: int | None = None,
+    ) -> bool:
+        """Terminalize a claim when no materialized decision can do it."""
+
+        if execution_status not in {"succeeded", "failed", "cancelled"}:
+            raise ValueError("invalid four_tier_mapping claim terminal status")
+        terminal_at_ms = updated_at_ms if updated_at_ms is not None else time.time_ns() // 1_000_000
+        async with self._write_transaction("settle_fixed_four_tier_request_claim") as conn:
+            async with conn.execute(
+                "SELECT status FROM fixed_four_tier_request_claims WHERE claim_id = ?",
+                (claim_id,),
+            ) as cur:
+                existing = await cur.fetchone()
+            if existing is None:
+                return False
+            existing_status = str(existing["status"])
+            if existing_status not in {"claimed", "materialized"}:
+                return existing_status == execution_status
+            async with conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET status = ?, error_code = COALESCE(?, error_code),
+                    terminal_at_ms = COALESCE(terminal_at_ms, ?), updated_at_ms = ?
+                WHERE claim_id = ?
+                  AND status IN ('claimed', 'materialized')
+                """,
+                (
+                    execution_status,
+                    error_code,
+                    terminal_at_ms,
+                    terminal_at_ms,
+                    claim_id,
+                ),
+            ) as cur:
+                return (cur.rowcount or 0) == 1
+
+    @_serialized_read
+    async def get_fixed_four_tier_state(
+        self,
+        session_id: str,
+    ) -> FixedFourTierState | None:
+        """Return the authoritative semantic state for one session identity."""
+
+        async with self.conn.execute(
+            "SELECT * FROM fixed_four_tier_states WHERE session_id = ?",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return FixedFourTierState(**_deserialize_row(dict(row))) if row is not None else None
+
+    @_serialized_read
+    async def get_usage_event_ids_for_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> list[str]:
+        """Return physical provider attempt ids in call order for one turn."""
+
+        async with self.conn.execute(
+            """
+            SELECT event_id FROM usage_events
+            WHERE session_id = ? AND turn_id = ?
+            ORDER BY call_index ASC, started_at_ms ASC, event_id ASC
+            """,
+            (session_id, turn_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [str(row["event_id"]) for row in rows]
+
+    @_serialized_read
+    async def get_fixed_four_tier_decision_by_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+    ) -> FixedFourTierDecisionRecord | None:
+        """Resolve an idempotent four_tier_mapping route by its durable turn id."""
+
+        async with self.conn.execute(
+            """
+            SELECT * FROM fixed_four_tier_decisions
+            WHERE session_id = ? AND request_id = ?
+            ORDER BY decided_at_ms DESC, route_id DESC
+            LIMIT 1
+            """,
+            (session_id, request_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _rehydrate_fixed_four_tier_decision_row(dict(row)) if row is not None else None
+
+    @_serialized_read
+    async def get_fixed_four_tier_decision_by_route(
+        self,
+        route_id: str,
+    ) -> FixedFourTierDecisionRecord | None:
+        """Resolve one four_tier_mapping decision by its immutable route identity."""
+
+        async with self.conn.execute(
+            "SELECT * FROM fixed_four_tier_decisions WHERE route_id = ?",
+            (route_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _rehydrate_fixed_four_tier_decision_row(dict(row)) if row is not None else None
+
+    @_serialized_read
+    async def get_fixed_four_tier_decision_by_input_message(
+        self,
+        *,
+        session_id: str,
+        input_message_id: str,
+    ) -> FixedFourTierDecisionRecord | None:
+        """Return the committed route for a Web regenerate anchor message."""
+
+        async with self.conn.execute(
+            """
+            SELECT * FROM fixed_four_tier_decisions
+            WHERE session_id = ? AND input_message_id = ? AND state_committed = 1
+            ORDER BY decided_at_ms DESC, route_id DESC
+            LIMIT 1
+            """,
+            (session_id, input_message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _rehydrate_fixed_four_tier_decision_row(dict(row)) if row is not None else None
+
+    async def stage_fixed_four_tier_decision(
+        self,
+        record: FixedFourTierDecisionRecord,
+    ) -> FixedFourTierDecisionRecord:
+        """Persist classification before deployment/context preflight begins."""
+
+        record.session_key = canonicalize_session_key(record.session_key)
+        for field in (
+            "route_id",
+            "claim_id",
+            "session_id",
+            "session_key",
+            "request_id",
+            "execution_id",
+            "input_message_id",
+            "task_id",
+        ):
+            if not str(getattr(record, field, "") or "").strip():
+                raise ValueError(f"{field} is required for a four_tier_mapping decision")
+        data = record.model_dump()
+        cols = list(data.keys())
+        placeholders = ", ".join("?" for _ in cols)
+        try:
+            async with self._write_transaction("stage_fixed_four_tier_decision") as conn:
+                async with conn.execute(
+                    "SELECT * FROM fixed_four_tier_request_claims WHERE claim_id = ?",
+                    (record.claim_id,),
+                ) as cur:
+                    claim_row = await cur.fetchone()
+                if claim_row is None:
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping decision has no durable request claim"
+                    )
+                claim = FixedFourTierRequestClaim(**_deserialize_row(dict(claim_row)))
+                if (
+                    claim.status != "claimed"
+                    or claim.session_id != record.session_id
+                    or claim.session_key != record.session_key
+                    or claim.session_epoch != record.session_epoch
+                    or claim.request_id != record.request_id
+                    or claim.execution_id != record.execution_id
+                    or claim.input_message_id != record.input_message_id
+                ):
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping decision does not own its request claim"
+                    )
+                if claim.lease_expires_at_ms <= record.updated_at_ms:
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping request claim expired before classification persisted"
+                    )
+                await conn.execute(
+                    "INSERT INTO fixed_four_tier_decisions "
+                    f"({', '.join(cols)}) VALUES ({placeholders})",
+                    [_serialize(data[col]) for col in cols],
+                )
+                async with conn.execute(
+                    """
+                    UPDATE fixed_four_tier_request_claims
+                    SET status = 'materialized', route_id = ?, updated_at_ms = ?
+                    WHERE claim_id = ? AND status = 'claimed'
+                    """,
+                    (record.route_id, record.updated_at_ms, record.claim_id),
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        raise FixedFourTierStateConflictError(
+                            "four_tier_mapping request claim could not be materialized"
+                        )
+        except sqlite3.IntegrityError as exc:
+            raise FixedFourTierStateConflictError(
+                "four_tier_mapping request was already classified"
+            ) from exc
+        return record
+
+    async def commit_fixed_four_tier_decision(
+        self,
+        *,
+        route_id: str,
+        state: FixedFourTierState,
+        expected_version: int | None,
+        route_trace: dict[str, Any],
+        updated_at_ms: int,
+    ) -> FixedFourTierState:
+        """CAS-commit semantic state only after fixed route preflight passes."""
+
+        state.session_key = canonicalize_session_key(state.session_key)
+        async with self._write_transaction("commit_fixed_four_tier_decision") as conn:
+            async with conn.execute(
+                """
+                SELECT claim.*
+                FROM fixed_four_tier_decisions AS decision
+                JOIN fixed_four_tier_request_claims AS claim
+                  ON claim.claim_id = decision.claim_id
+                WHERE decision.route_id = ? AND decision.session_id = ?
+                """,
+                (route_id, state.session_id),
+            ) as cur:
+                claim_row = await cur.fetchone()
+            if claim_row is None or str(claim_row["status"]) != "materialized":
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping staged decision has no active request claim"
+                )
+            if int(claim_row["lease_expires_at_ms"]) <= updated_at_ms:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping request claim expired before route commit"
+                )
+            async with conn.execute(
+                "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                (state.session_key,),
+            ) as cur:
+                live_session = await cur.fetchone()
+            if (
+                live_session is None
+                or str(live_session["session_id"]) != state.session_id
+                or int(live_session["epoch"] or 0) != state.session_epoch
+            ):
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping session identity changed before route commit"
+                )
+            async with conn.execute(
+                "SELECT version, session_epoch FROM fixed_four_tier_states WHERE session_id = ?",
+                (state.session_id,),
+            ) as cur:
+                current = await cur.fetchone()
+            actual_version = int(current["version"]) if current is not None else None
+            if actual_version != expected_version:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping task state changed before route commit"
+                )
+            if current is not None and int(current["session_epoch"] or 0) != state.session_epoch:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping task state belongs to another session epoch"
+                )
+            expected_next_version = 1 if expected_version is None else expected_version + 1
+            if state.version != expected_next_version:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping next state version is not monotonic"
+                )
+
+            data = state.model_dump()
+            if current is None:
+                cols = list(data.keys())
+                await conn.execute(
+                    "INSERT INTO fixed_four_tier_states "
+                    f"({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                    [_serialize(data[col]) for col in cols],
+                )
+            else:
+                assignments = [f"{column} = ?" for column in data if column != "session_id"]
+                values = [
+                    _serialize(value) for column, value in data.items() if column != "session_id"
+                ]
+                async with conn.execute(
+                    f"UPDATE fixed_four_tier_states SET {', '.join(assignments)} "
+                    "WHERE session_id = ? AND version = ?",
+                    [*values, state.session_id, expected_version],
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        raise FixedFourTierStateConflictError(
+                            "four_tier_mapping task state CAS failed"
+                        )
+
+            async with conn.execute(
+                """
+                UPDATE fixed_four_tier_decisions
+                SET preflight_status = 'passed', state_committed = 1,
+                    state_version_after = ?, route_trace = ?, updated_at_ms = ?
+                WHERE route_id = ? AND session_id = ? AND state_committed = 0
+                """,
+                (
+                    state.version,
+                    _serialize(route_trace),
+                    updated_at_ms,
+                    route_id,
+                    state.session_id,
+                ),
+            ) as cur:
+                if (cur.rowcount or 0) != 1:
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping staged decision was not available to commit"
+                    )
+        return state
+
+    async def settle_fixed_four_tier_decision(
+        self,
+        *,
+        route_id: str,
+        execution_status: str,
+        preflight_status: str | None = None,
+        response_id: str | None = None,
+        error_code: str | None = None,
+        route_trace: dict[str, Any] | None = None,
+        updated_at_ms: int | None = None,
+    ) -> bool:
+        """Record a preflight or terminal outcome without changing task state."""
+
+        if execution_status not in {"pending", "succeeded", "failed", "cancelled"}:
+            raise ValueError("invalid four_tier_mapping execution status")
+        if preflight_status not in {None, "pending", "passed", "failed"}:
+            raise ValueError("invalid four_tier_mapping preflight status")
+        settled_at_ms = updated_at_ms if updated_at_ms is not None else time.time_ns() // 1_000_000
+        fields: dict[str, Any] = {
+            "execution_status": execution_status,
+            "updated_at_ms": settled_at_ms,
+        }
+        if response_id is not None:
+            fields["response_id"] = response_id
+        if error_code is not None:
+            fields["error_code"] = error_code
+        if preflight_status is not None:
+            fields["preflight_status"] = preflight_status
+        if route_trace is not None:
+            fields["route_trace"] = route_trace
+            physical_started = bool(
+                isinstance(route_trace.get("dispatch"), dict)
+                and route_trace["dispatch"].get("physical_request_started") is True
+            )
+            if physical_started:
+                executed_provider = str(
+                    route_trace.get("executed_provider")
+                    or route_trace["dispatch"].get("executed_provider")
+                    or ""
+                ).strip()
+                executed_model = str(
+                    route_trace.get("executed_model")
+                    or route_trace["dispatch"].get("executed_model")
+                    or ""
+                ).strip()
+                if executed_provider:
+                    fields["executed_provider"] = executed_provider
+                if executed_model:
+                    fields["executed_model"] = executed_model
+                if route_trace.get("deployment_version_attested") is True:
+                    executed_version = str(
+                        route_trace.get("executed_deployment_version") or ""
+                    ).strip()
+                    if executed_version:
+                        fields["executed_deployment_version"] = executed_version
+            usage_summary = route_trace.get("provider_usage")
+            if isinstance(usage_summary, dict):
+                fields["usage_summary"] = usage_summary
+        terminal = execution_status in {"succeeded", "failed", "cancelled"}
+        if terminal:
+            fields["terminal_at_ms"] = settled_at_ms
+        assignments = ", ".join(
+            (
+                "terminal_at_ms = COALESCE(terminal_at_ms, ?)"
+                if name == "terminal_at_ms"
+                else f"{name} = ?"
+            )
+            for name in fields
+        )
+        async with self._write_transaction("settle_fixed_four_tier_decision") as conn:
+            async with conn.execute(
+                "SELECT claim_id, execution_status FROM fixed_four_tier_decisions "
+                "WHERE route_id = ?",
+                (route_id,),
+            ) as cur:
+                existing = await cur.fetchone()
+            if existing is None:
+                return False
+            existing_status = str(existing["execution_status"])
+            if existing_status != "pending":
+                # A terminal route is an immutable audit fact.  Exact-status
+                # retries are idempotent no-ops; a conflicting terminal retry
+                # is rejected.  In particular, a late duplicate must not
+                # overwrite response/trace/usage or move updated_at backwards.
+                return existing_status == execution_status
+            async with conn.execute(
+                f"UPDATE fixed_four_tier_decisions SET {assignments} "
+                "WHERE route_id = ? AND execution_status = 'pending'",
+                [
+                    *[_serialize(value) for value in fields.values()],
+                    route_id,
+                ],
+            ) as cur:
+                updated = (cur.rowcount or 0) == 1
+            if updated and terminal:
+                await conn.execute(
+                    """
+                    UPDATE fixed_four_tier_request_claims
+                    SET status = ?, error_code = COALESCE(?, error_code),
+                        terminal_at_ms = COALESCE(terminal_at_ms, ?), updated_at_ms = ?
+                    WHERE claim_id = ?
+                      AND (status IN ('claimed', 'materialized') OR status = ?)
+                    """,
+                    (
+                        execution_status,
+                        error_code,
+                        settled_at_ms,
+                        settled_at_ms,
+                        str(existing["claim_id"]),
+                        execution_status,
+                    ),
+                )
+            return updated
+
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
-    async def save_context_state(
-        self, state: SessionContextState
-    ) -> SessionContextState:
+    async def save_context_state(self, state: SessionContextState) -> SessionContextState:
         """Persist portable or provider-native context state for later replay."""
         state.session_key = canonicalize_session_key(state.session_key)
         data = state.model_dump(exclude={"id"})
@@ -4789,8 +6123,7 @@ class SessionStorage:
         values = [_serialize(data[c]) for c in cols]
         async with self._write_transaction("save_context_state") as conn:
             async with conn.execute(
-                "INSERT INTO session_context_states "
-                f"({', '.join(cols)}) VALUES ({placeholders})",
+                f"INSERT INTO session_context_states ({', '.join(cols)}) VALUES ({placeholders})",
                 values,
             ) as cur:
                 state.id = cur.lastrowid
@@ -4818,8 +6151,7 @@ class SessionStorage:
             clauses.append("valid = 1")
         where = " AND ".join(clauses)
         async with self.conn.execute(
-            "SELECT * FROM session_context_states "
-            f"WHERE {where} ORDER BY created_at ASC, id ASC",
+            f"SELECT * FROM session_context_states WHERE {where} ORDER BY created_at ASC, id ASC",
             params,
         ) as cur:
             rows = await cur.fetchall()
@@ -4981,8 +6313,7 @@ class SessionStorage:
             params.extend([token] * len(cols))
         params.append(limit)
         sql = (
-            f"SELECT * FROM sessions WHERE {' AND '.join(clauses)} "
-            "ORDER BY updated_at DESC LIMIT ?"
+            f"SELECT * FROM sessions WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC LIMIT ?"
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()

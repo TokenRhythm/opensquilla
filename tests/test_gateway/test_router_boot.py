@@ -35,7 +35,11 @@ from opensquilla.gateway.model_routing import (
     capture_model_routing_config,
     model_routing_snapshot,
 )
-from opensquilla.gateway.routing import build_cli_route_envelope, build_cron_route_envelope
+from opensquilla.gateway.routing import (
+    SourceKind,
+    build_cli_route_envelope,
+    build_cron_route_envelope,
+)
 from opensquilla.onboarding.mutations import upsert_channel
 from opensquilla.provider import Message
 from opensquilla.scheduler.types import CronJob, JobStatus
@@ -301,6 +305,94 @@ def test_build_task_runtime_run_kwargs_omits_bound_id_when_absent() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert "bound_user_message_id" not in kwargs
+
+
+def test_build_task_runtime_run_kwargs_forwards_only_trusted_fixed_redo_metadata() -> None:
+    envelope = SimpleNamespace(
+        source_kind=SourceKind.WEB,
+        metadata={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_id": "parent-session",
+            "fixed_four_tier_v2_redo_of_message_id": "parent-input",
+            "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child-start",
+            "principal_is_owner": True,
+            "unrelated": "must-not-cross",
+        },
+    )
+    run = SimpleNamespace(
+        agent_id="main",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_id": "forged-parent",
+        },
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="child-input",
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["trusted_route_metadata"] == {
+        "fixed_four_tier_v2_control_event": "redo",
+        "fixed_four_tier_v2_redo_parent_session_id": "parent-session",
+        "fixed_four_tier_v2_redo_of_message_id": "parent-input",
+        "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child-start",
+    }
+    assert "unrelated" not in kwargs["trusted_route_metadata"]
+
+
+def test_build_task_runtime_run_kwargs_rejects_non_web_fixed_redo_metadata() -> None:
+    run = SimpleNamespace(
+        agent_id="main",
+        envelope=SimpleNamespace(
+            source_kind=SourceKind.CLI,
+            metadata={
+                "fixed_four_tier_v2_control_event": "redo",
+                "fixed_four_tier_v2_redo_parent_session_id": "parent",
+                "fixed_four_tier_v2_redo_of_message_id": "input",
+                "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child",
+            },
+        ),
+        attachments=[],
+        input_provenance={},
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="child",
+    )
+
+    with pytest.raises(ValueError, match="Web envelope"):
+        build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+
+def test_build_task_runtime_run_kwargs_does_not_trust_fixed_redo_provenance() -> None:
+    run = SimpleNamespace(
+        agent_id="main",
+        envelope=SimpleNamespace(metadata={}),
+        attachments=[],
+        input_provenance={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_id": "forged-parent",
+            "fixed_four_tier_v2_redo_of_message_id": "forged-input",
+        },
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="child-input",
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert "trusted_route_metadata" not in kwargs
 
 
 def test_build_task_runtime_run_kwargs_forwards_exact_assistant_sink() -> None:
@@ -1183,12 +1275,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1205,10 +1293,7 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         )
         # The wire must register DeliveryChain.dispatch_failure_alert
         # (a bound method), not some unrelated callable.
-        assert (
-            getattr(captured["dispatcher"], "__name__", "")
-            == "dispatch_failure_alert"
-        )
+        assert getattr(captured["dispatcher"], "__name__", "") == "dispatch_failure_alert"
         # Handler factories ran, confirming the wire ran inside the cron-init
         # branch (not just by coincidence).
         assert set(cron_sched.registered) >= {
@@ -1356,27 +1441,15 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
         "make_memory_dream_handler",
         fake_make_memory_dream_handler,
     )
-    monkeypatch.setattr(
-        runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context
-    )
+    monkeypatch.setattr(runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context)
     monkeypatch.setattr(
         proposer_mod, "reset_smoke_fixture_context", fake_reset_smoke_fixture_context
     )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1488,6 +1561,7 @@ async def test_build_flush_service_archive_workspace_falls_back_to_main_workspac
     assert receipt.mode == "raw"
     assert (main_workspace / receipt.flushed_paths[0]).exists()
     assert not (matching_memory_dir / receipt.flushed_paths[0]).exists()
+
 
 @pytest.mark.asyncio
 async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) -> None:
@@ -1739,9 +1813,7 @@ async def test_build_services_registers_session_search_tool(
     )
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
 
     captured_memory_kwargs: dict[str, Any] = {}
@@ -1776,9 +1848,7 @@ async def test_build_services_registers_session_search_tool(
         assert "Full-text search across persisted session transcripts" in (
             session_search.spec.description
         )
-        assert "defaults to curated memory source files" in (
-            session_search.spec.description
-        )
+        assert "defaults to curated memory source files" in (session_search.spec.description)
         assert "use source=sessions or source=all" in session_search.spec.description
         owner_names = {
             tool["name"]
@@ -1880,9 +1950,7 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -643,6 +645,68 @@ def _optional_string_param(params: dict | None, *names: str) -> str | None:
     return None
 
 
+def _fixed_four_tier_routing_control(
+    params: dict[str, Any],
+    *,
+    fork_before_message_id: str | None,
+) -> dict[str, str] | None:
+    """Validate the one-shot Web regenerate control owned by the Gateway."""
+
+    raw = params.get("routingControl", params.get("routing_control"))
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("params.routingControl must be an object")
+    mode = str(raw.get("mode") or "").strip().casefold()
+    intent = str(raw.get("intent") or "").strip().casefold()
+    redo_of = str(raw.get("redoOfMessageId", raw.get("redo_of_message_id")) or "").strip()
+    if mode != "four_tier_mapping" or intent != "redo" or not redo_of:
+        raise ValueError("params.routingControl is not a supported four_tier_mapping redo control")
+    if fork_before_message_id is None or redo_of != fork_before_message_id:
+        raise ValueError(
+            "four_tier_mapping redo requires routingControl.redoOfMessageId "
+            "to match forkBeforeMessageId"
+        )
+    return {
+        "mode": "four_tier_mapping",
+        "intent": "redo",
+        "redo_of_message_id": redo_of,
+    }
+
+
+def _fixed_four_tier_v2_enabled(config: Any) -> bool:
+    ensemble = getattr(config, "llm_ensemble", None)
+    selection_mode = str(getattr(ensemble, "selection_mode", "") or "").strip().casefold()
+    return bool(
+        getattr(ensemble, "enabled", False) is True
+        and str(getattr(ensemble, "mode", "") or "").strip().casefold() == "single"
+        and selection_mode == "four_tier_mapping"
+    )
+
+
+def _fixed_redo_anchor_payload(content: Any) -> tuple[str, bool]:
+    """Return canonical anchor text and whether it carried attachments."""
+
+    from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
+
+    text = str(content or "")
+    has_attachments = False
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if (
+        isinstance(parsed, Mapping)
+        and isinstance(parsed.get("text"), str)
+        and isinstance(parsed.get("attachments"), list)
+    ):
+        raw_text = parsed.get("text")
+        text = raw_text
+        attachments = parsed.get("attachments")
+        has_attachments = bool(attachments)
+    return TIME_PREFIX_RE.sub("", text, count=1).strip(), has_attachments
+
+
 def _effective_agent_id_for_session(session: Any | None, session_key: str) -> str:
     """Prefer the explicit agent encoded in modern session keys.
 
@@ -734,9 +798,7 @@ def _workspace_metadata_for_session(session: Any, config: Any) -> dict[str, str]
     origin = getattr(session, "origin", None)
     origin_map = origin if isinstance(origin, dict) else {}
     context_payload = origin_map.get(RUN_CONTEXT_ORIGIN_KEY)
-    workspace = (
-        context_payload.get("workspace") if isinstance(context_payload, dict) else None
-    )
+    workspace = context_payload.get("workspace") if isinstance(context_payload, dict) else None
     workspace_path = _normalize_workspace_display_path(workspace)
 
     if workspace_path is None:
@@ -1694,10 +1756,18 @@ async def _handle_sessions_send(
     ctx: RpcContext,
     *,
     fingerprint_params: dict[str, Any] | None = None,
+    allow_fixed_routing_control: bool = False,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
         raise ValueError("params.message is required")
+    task_runtime_at_acceptance = getattr(ctx, "task_runtime", None)
+    accepted_routing_config = None
+    if task_runtime_at_acceptance is not None:
+        from opensquilla.gateway.model_routing import capture_model_routing_config
+
+        accepted_routing_config = capture_model_routing_config(ctx.config)
+    routing_config_at_acceptance = accepted_routing_config or ctx.config
 
     message_text: str = params["message"]
     source_hint = _normalize_session_send_source_hint(params)
@@ -1735,6 +1805,21 @@ async def _handle_sessions_send(
     )
     if fork_before_message_id is not None and session_intent is not SessionIntent.CONTINUE:
         raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
+    fixed_routing_control = _fixed_four_tier_routing_control(
+        params,
+        fork_before_message_id=fork_before_message_id,
+    )
+    if fixed_routing_control is not None:
+        # This capability bit is set only by the private chat.send delegation
+        # seam. Source metadata is request-controlled on public sessions.send
+        # and therefore cannot prove that the browser initiated a regenerate.
+        if not allow_fixed_routing_control:
+            raise ValueError("four_tier_mapping redo control is only supported by Web regenerate")
+        if not _fixed_four_tier_v2_enabled(routing_config_at_acceptance):
+            # A newer/older Web client may race a settings change.  Keep the
+            # ordinary prefix-fork regenerate behavior for every legacy route
+            # and ignore the mode-specific one-shot control.
+            fixed_routing_control = None
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -1774,7 +1859,7 @@ async def _handle_sessions_send(
                 storage=storage,
             )
 
-    task_runtime_candidate = cast("TaskRuntime | None", getattr(ctx, "task_runtime", None))
+    task_runtime_candidate = cast("TaskRuntime | None", task_runtime_at_acceptance)
     prepare_intent = getattr(ctx.session_manager, "prepare_intent", None)
     create_kwargs: dict[str, Any] = {}
     if source_hint.get("caller_kind") == "web":
@@ -1821,20 +1906,156 @@ async def _handle_sessions_send(
         async with intent_lock:
             session, atomic_intent_plan = await _prepare_or_apply_intent()
 
+    fixed_routing_parent_key: str | None = None
+    fixed_routing_parent_session_id: str | None = None
+    fixed_routing_parent_task_turn_index: int | None = None
+    fixed_routing_parent_task_start_message_id: str | None = None
+    fixed_routing_child_task_start_input_message_id: str | None = None
     if fork_before_message_id is not None:
         parent_key = key
+        if fixed_routing_control is not None:
+            parent_session_id = str(getattr(session, "session_id", "") or "")
+            canonical_entries = await storage.get_canonical_transcript(parent_session_id)
+            anchor = next(
+                (
+                    entry
+                    for entry in canonical_entries
+                    if entry.message_id == fork_before_message_id
+                ),
+                None,
+            )
+            if anchor is None or str(getattr(anchor, "role", "")) != "user":
+                raise ValueError("four_tier_mapping redo anchor must be a durable user message")
+            anchor_text, anchor_has_attachments = _fixed_redo_anchor_payload(
+                getattr(anchor, "content", "")
+            )
+            if anchor_has_attachments or bool(combined_attachments):
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_ATTACHMENTS_UNSUPPORTED",
+                    "four_tier_mapping redo does not yet support attachment anchors",
+                    retryable=False,
+                    accepted=False,
+                )
+            if anchor_text != str(semantic_message_text or message_text).strip():
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_TEXT_MISMATCH",
+                    "four_tier_mapping redo text must exactly match its durable anchor",
+                    retryable=False,
+                    accepted=False,
+                )
+            parent_route = await storage.get_fixed_four_tier_decision_by_input_message(
+                session_id=parent_session_id,
+                input_message_id=fork_before_message_id,
+            )
+            parent_route_trace = (
+                getattr(parent_route, "route_trace", None) if parent_route is not None else None
+            )
+            if (
+                parent_route is None
+                or getattr(parent_route, "state_committed", False) is not True
+                or str(getattr(parent_route, "preflight_status", "") or "").strip().casefold()
+                != "passed"
+                or not isinstance(parent_route_trace, Mapping)
+                or parent_route_trace.get("state_committed") is not True
+            ):
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_ROUTE_UNAVAILABLE",
+                    "four_tier_mapping redo anchor has no committed route",
+                    retryable=False,
+                    accepted=False,
+                )
+            parent_execution_status = (
+                str(getattr(parent_route, "execution_status", "") or "").strip().casefold()
+            )
+            if parent_execution_status == "pending":
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_PARENT_BUSY",
+                    "four_tier_mapping redo must wait for its committed parent route to finish",
+                    retryable=True,
+                    accepted=False,
+                )
+            if parent_execution_status not in {"succeeded", "failed", "cancelled"}:
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_ROUTE_UNAVAILABLE",
+                    "four_tier_mapping redo anchor has no settled committed route",
+                    retryable=False,
+                    accepted=False,
+                )
+            parent_task_turn_index = getattr(parent_route, "task_turn_index", None)
+            if (
+                isinstance(parent_task_turn_index, bool)
+                or not isinstance(parent_task_turn_index, int)
+                or parent_task_turn_index < 0
+            ):
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_ROUTE_UNAVAILABLE",
+                    "four_tier_mapping redo anchor has an invalid task position",
+                    retryable=False,
+                    accepted=False,
+                )
+            parent_task_start_message_id = str(
+                getattr(parent_route, "task_start_input_message_id", None)
+                or (
+                    getattr(parent_route, "input_message_id", None)
+                    if parent_task_turn_index == 0
+                    else ""
+                )
+                or ""
+            ).strip()
+            if not parent_task_start_message_id or (
+                parent_task_turn_index == 0
+                and parent_task_start_message_id != fork_before_message_id
+            ):
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_ROUTE_UNAVAILABLE",
+                    "four_tier_mapping redo anchor has an invalid task boundary",
+                    retryable=False,
+                    accepted=False,
+                )
+            if task_runtime_candidate is not None and await _active_task_runtime_ids(
+                task_runtime_candidate,
+                parent_key,
+            ):
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_PARENT_BUSY",
+                    "four_tier_mapping redo must wait for all parent work to finish",
+                    retryable=True,
+                    accepted=False,
+                )
+            fixed_routing_parent_key = parent_key
+            fixed_routing_parent_session_id = parent_session_id
+            fixed_routing_parent_task_turn_index = parent_task_turn_index
+            fixed_routing_parent_task_start_message_id = parent_task_start_message_id
         parent_display_name = getattr(session, "display_name", None)
         agent_id = _effective_agent_id_for_session(session, parent_key)
         child_key = _create_session_key(agent_id, "webchat")
         prepare_prefix_branch = getattr(ctx.session_manager, "prepare_prefix_branch", None)
-        if (
+        supports_atomic_prefix = (
             callable(prepare_prefix_branch)
             and task_runtime_candidate is not None
             and callable(getattr(storage, "accept_turn", None))
             and callable(getattr(task_runtime_candidate, "reserve", None))
             and callable(getattr(task_runtime_candidate, "activate", None))
             and callable(getattr(task_runtime_candidate, "abort_reservation", None))
-        ):
+        )
+        supports_fixed_redo_atomic_acceptance = (
+            supports_atomic_prefix
+            and callable(getattr(task_runtime_candidate, "collect_admission", None))
+            and callable(getattr(task_runtime_candidate, "try_collect_atomically", None))
+            and callable(getattr(ctx.session_manager, "prepare_message", None))
+        )
+        if fixed_routing_control is not None and not supports_fixed_redo_atomic_acceptance:
+            # A four_tier_mapping redo must not create a child or return accepted=true
+            # unless the prefix copy, input row, task record, and ingress
+            # receipt can commit as one durable acceptance transaction.
+            raise RpcHandlerError(
+                "FOUR_TIER_MAPPING_REDO_ATOMIC_UNAVAILABLE",
+                "four_tier_mapping redo requires atomic prefix-fork turn acceptance",
+                retryable=False,
+                accepted=False,
+            )
+        if supports_atomic_prefix:
+            assert callable(prepare_prefix_branch)
 
             async def _prepare_prefix_intent() -> Any:
                 return await prepare_prefix_branch(
@@ -1850,6 +2071,48 @@ async def _handle_sessions_send(
             else:
                 async with parent_lock:
                     atomic_intent_plan = await _prepare_prefix_intent()
+            if (
+                fixed_routing_control is not None
+                and fixed_routing_parent_task_turn_index is not None
+                and fixed_routing_parent_task_turn_index > 0
+            ):
+                source_task_start_id = fixed_routing_parent_task_start_message_id
+                source_to_child = getattr(
+                    atomic_intent_plan,
+                    "source_to_child_message_ids",
+                    (),
+                )
+                mapped_ids = [
+                    child_id
+                    for source_id, child_id in source_to_child
+                    if source_id == source_task_start_id
+                    and isinstance(child_id, str)
+                    and child_id.strip()
+                ]
+                copied_entries = tuple(
+                    getattr(atomic_intent_plan, "initial_transcript_entries", ())
+                )
+                mapped_entries = [
+                    entry
+                    for entry in copied_entries
+                    if getattr(entry, "message_id", None) in mapped_ids
+                    and str(getattr(entry, "role", "") or "").strip().casefold() == "user"
+                ]
+                if (
+                    len(mapped_ids) != 1
+                    or len(mapped_entries) != 1
+                    or mapped_entries[0].message_id != mapped_ids[0]
+                ):
+                    raise RpcHandlerError(
+                        "FOUR_TIER_MAPPING_REDO_TASK_BOUNDARY_UNAVAILABLE",
+                        (
+                            "four_tier_mapping redo cannot map its task boundary into the "
+                            "child session"
+                        ),
+                        retryable=False,
+                        accepted=False,
+                    )
+                fixed_routing_child_task_start_input_message_id = mapped_ids[0]
             session = atomic_intent_plan.node
             key = child_key
         else:
@@ -1878,7 +2141,12 @@ async def _handle_sessions_send(
         if isinstance(canonical_session_id, str) and canonical_session_id
         else key.split(":")[-1] or key
     )
-    generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
+    # The four_tier_mapping contract permits exactly one selected-model invocation per
+    # request. Session naming is itself an LLM call, so this isolated mode must
+    # never schedule it; every legacy route keeps the existing naming gate.
+    generate_title = False
+    if not _fixed_four_tier_v2_enabled(routing_config_at_acceptance):
+        generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
     disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
     opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
     try:
@@ -2019,6 +2287,35 @@ async def _handle_sessions_send(
         run_context,
         principal_is_owner=ctx.principal.is_owner,
     )
+    if fixed_routing_control is not None:
+        # Parent identity is derived after validating the prefix-fork anchor;
+        # the browser never gets to choose a parent session/task/tier.
+        route_envelope.metadata.update(
+            {
+                "fixed_four_tier_v2_control_event": "redo",
+                "fixed_four_tier_v2_redo_parent_session_key": fixed_routing_parent_key,
+                "fixed_four_tier_v2_redo_parent_session_id": (fixed_routing_parent_session_id),
+                "fixed_four_tier_v2_redo_of_message_id": fixed_routing_control[
+                    "redo_of_message_id"
+                ],
+            }
+        )
+        if fixed_routing_child_task_start_input_message_id is not None:
+            route_envelope.metadata["fixed_four_tier_v2_redo_child_task_start_input_message_id"] = (
+                fixed_routing_child_task_start_input_message_id
+            )
+        route_envelope = replace(
+            route_envelope,
+            input_provenance={
+                **route_envelope.input_provenance,
+                "action": "redo",
+                "source": "web_regenerate",
+                "fixed_four_tier_v2_redo_parent_session_id": (fixed_routing_parent_session_id),
+                "fixed_four_tier_v2_redo_of_message_id": fixed_routing_control[
+                    "redo_of_message_id"
+                ],
+            },
+        )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
@@ -2029,6 +2326,19 @@ async def _handle_sessions_send(
         input_provenance = dict(input_provenance)
     else:
         input_provenance = dict(route_envelope.input_provenance)
+    if fixed_routing_control is not None:
+        input_provenance.update(
+            {
+                "action": "redo",
+                "source": "web_regenerate",
+                # Re-apply server-derived identities after capture-control
+                # merging so request provenance cannot replace them.
+                "fixed_four_tier_v2_redo_parent_session_id": (fixed_routing_parent_session_id),
+                "fixed_four_tier_v2_redo_of_message_id": fixed_routing_control[
+                    "redo_of_message_id"
+                ],
+            }
+        )
     if normalization_metadata is not None:
         input_provenance["input_normalization"] = normalization_metadata
     if input_provenance != route_envelope.input_provenance:
@@ -2125,6 +2435,34 @@ async def _handle_sessions_send(
             turn_context=ingress_turn_context,
             session_node=session,
         )
+        if fixed_routing_control is not None:
+            if fixed_routing_child_task_start_input_message_id is None:
+                if fixed_routing_parent_task_turn_index != 0:
+                    raise RpcHandlerError(
+                        "FOUR_TIER_MAPPING_REDO_TASK_BOUNDARY_UNAVAILABLE",
+                        "four_tier_mapping redo has no child task boundary",
+                        retryable=False,
+                        accepted=False,
+                    )
+                fixed_routing_child_task_start_input_message_id = str(
+                    persisted_entry.message_id or ""
+                ).strip()
+            if not fixed_routing_child_task_start_input_message_id:
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_TASK_BOUNDARY_UNAVAILABLE",
+                    "four_tier_mapping redo has no durable child task boundary",
+                    retryable=False,
+                    accepted=False,
+                )
+            route_envelope = replace(
+                route_envelope,
+                metadata={
+                    **route_envelope.metadata,
+                    "fixed_four_tier_v2_redo_child_task_start_input_message_id": (
+                        fixed_routing_child_task_start_input_message_id
+                    ),
+                },
+            )
         if (
             not raw_attachments
             and display_text is None
@@ -2207,6 +2545,7 @@ async def _handle_sessions_send(
                     semantic_message=semantic_message_text,
                     persisted_user_message_id=persisted_entry.message_id,
                     message_count=1,
+                    accepted_config=accepted_routing_config,
                     persist=_persist_collection,
                 )
                 if collected is not None:
@@ -2223,6 +2562,7 @@ async def _handle_sessions_send(
                 no_memory_capture=bool(capture_controls["no_memory_capture"]),
                 semantic_message=semantic_message_text,
                 turn_id=turn_id,
+                accepted_config=accepted_routing_config,
             )
             try:
                 acceptance = await _accept_task_record(reservation.task_record)
@@ -2550,6 +2890,7 @@ async def _handle_sessions_send(
                 persisted_user_message_id=getattr(legacy_persisted_entry, "message_id", None),
                 fresh_user_session=fresh_user_session,
                 turn_id=turn_id,
+                accepted_config=accepted_routing_config,
             )
         except Exception as exc:
             # Ensure the uuid eviction does NOT fire on this
@@ -2741,6 +3082,7 @@ async def _handle_sessions_send(
                 no_memory_capture=capture_controls["no_memory_capture"],
                 semantic_message=semantic_message_text,
                 fresh_user_session=fresh_user_session,
+                bound_user_message_id=user_message_id,
             )
             raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(ctx.config)
             stream_idle_timeout: float | None = (
@@ -3240,9 +3582,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
             tree_keys = await _session_tree_keys(ctx.session_manager, key)
             new_keys = [
-                session_key
-                for session_key in tree_keys
-                if session_key not in processed_keys
+                session_key for session_key in tree_keys if session_key not in processed_keys
             ]
             drains: list[tuple[str, tuple[str, ...]]] = []
             cancelled_this_pass = 0
@@ -3250,9 +3590,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 first_visit = session_key in new_keys
                 if first_visit:
                     processed_keys.add(session_key)
-                    cancelled_groups += await cancel_background_completion_for_session(
-                        session_key
-                    )
+                    cancelled_groups += await cancel_background_completion_for_session(session_key)
                 active_task_ids = await _active_task_runtime_ids(task_runtime, session_key)
                 new_active_task_ids = tuple(
                     task_id

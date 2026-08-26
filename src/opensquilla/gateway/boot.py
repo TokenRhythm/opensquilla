@@ -1160,9 +1160,7 @@ async def dispatch_task_runtime_turn(
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
                 session_id=getattr(run.envelope, "session_id", None),
-                client_message_id=getattr(run.envelope, "metadata", {}).get(
-                    "client_message_id"
-                ),
+                client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
             )
@@ -1180,11 +1178,7 @@ async def dispatch_task_runtime_turn(
                 getattr(run, "persisted_user_message_id", None),
                 *(raw_message_ids if isinstance(raw_message_ids, list | tuple) else ()),
             ):
-                if (
-                    isinstance(message_id, str)
-                    and message_id
-                    and message_id not in message_ids
-                ):
+                if isinstance(message_id, str) and message_id and message_id not in message_ids:
                     message_ids.append(message_id)
 
             async def _remove_persisted_messages() -> None:
@@ -1289,6 +1283,34 @@ def build_task_runtime_run_kwargs(
         "ingress_pipeline_steps": ingress_steps,
         "pending_input_provider": getattr(run, "pending_input_provider", None),
     }
+    envelope_metadata = getattr(getattr(run, "envelope", None), "metadata", None)
+    if isinstance(envelope_metadata, Mapping):
+        control_event = str(envelope_metadata.get("fixed_four_tier_v2_control_event") or "").strip()
+        if control_event == "redo":
+            from opensquilla.gateway.routing import SourceKind
+
+            if getattr(run.envelope, "source_kind", None) is not SourceKind.WEB:
+                raise ValueError("trusted four_tier_mapping redo metadata requires a Web envelope")
+            trusted_route_metadata: dict[str, str] = {
+                "fixed_four_tier_v2_control_event": "redo",
+            }
+            for field in (
+                "fixed_four_tier_v2_redo_parent_session_id",
+                "fixed_four_tier_v2_redo_of_message_id",
+            ):
+                value = envelope_metadata.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"trusted four_tier_mapping redo metadata is missing {field}")
+                trusted_route_metadata[field] = value.strip()
+            child_boundary = envelope_metadata.get(
+                "fixed_four_tier_v2_redo_child_task_start_input_message_id"
+            )
+            if not isinstance(child_boundary, str) or not child_boundary.strip():
+                raise ValueError("trusted four_tier_mapping redo child task boundary is invalid")
+            trusted_route_metadata["fixed_four_tier_v2_redo_child_task_start_input_message_id"] = (
+                child_boundary.strip()
+            )
+            kwargs["trusted_route_metadata"] = trusted_route_metadata
     if run.semantic_message is not None:
         # Prefetch query shape: channels carry the raw user text
         # separately from the (potentially stamped) persisted message.
@@ -2790,9 +2812,7 @@ async def build_services(
         router_cfg_for_decisions = getattr(config, "squilla_router", None)
         decisions_storage = get_session_storage(session_manager)
         decisions_db_path = (
-            getattr(decisions_storage, "_db_path", None)
-            if decisions_storage is not None
-            else None
+            getattr(decisions_storage, "_db_path", None) if decisions_storage is not None else None
         )
         if decisions_db_path and decisions_db_path != ":memory:":
             from opensquilla.engine.steps.router_decision_record import (
@@ -2806,8 +2826,7 @@ async def build_services(
             router_decision_writer = open_router_decision_writer(
                 decisions_db_path,
                 retention_days=int(
-                    getattr(router_cfg_for_decisions, "decision_retention_days", 30)
-                    or 30
+                    getattr(router_cfg_for_decisions, "decision_retention_days", 30) or 30
                 ),
             )
             set_decision_writer(router_decision_writer)
@@ -4035,7 +4054,5 @@ async def start_gateway_server(
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill
 
-        svc.usage_backfill_task = create_background_task(
-            run_usage_backfill(usage_storage)
-        )
+        svc.usage_backfill_task = create_background_task(run_usage_backfill(usage_storage))
     return server_handle

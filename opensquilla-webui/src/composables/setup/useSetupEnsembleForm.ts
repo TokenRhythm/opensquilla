@@ -10,12 +10,14 @@ import { computed, ref, type ComputedRef } from 'vue'
 // - "preset": the provider's fixed B5 lineup (OpenRouter / TokenRhythm only).
 // - "custom": an explicit user-authored lineup saved as selection_mode
 //   "custom" (roles per candidate, single aggregator).
-// The legacy dynamic modes are read-compatible but hidden. router_dynamic can
-// be migrated to a custom lineup; the frozen tree baseline is config-only and
-// remains read-only in Settings.
+// The legacy dynamic modes and four-tier mapping single route are read-compatible
+// but hidden. router_dynamic can be migrated to a custom lineup; the frozen
+// tree baseline and four-tier mapping route are config-only and remain read-only
+// in Settings.
 
 export const CUSTOM_B5_SELECTION_MODE = 'custom'
 export const TREE_BASELINE_SELECTION_MODE = 'router_tree_baseline'
+export const FOUR_TIER_MAPPING_SELECTION_MODE = 'four_tier_mapping'
 
 export const ENSEMBLE_SELECTION_MODES = [
   'static_openrouter',
@@ -23,6 +25,7 @@ export const ENSEMBLE_SELECTION_MODES = [
   CUSTOM_B5_SELECTION_MODE,
   'router_dynamic',
   TREE_BASELINE_SELECTION_MODE,
+  FOUR_TIER_MAPPING_SELECTION_MODE,
 ] as const
 // Input-only compatibility for a cached older Web UI, an older gateway, or a
 // locally stored setup snapshot. State and RPC payloads always use the
@@ -771,6 +774,11 @@ export function useSetupEnsembleForm() {
   // custom lineup seeded from the router tiers (the models the user already
   // configured), never the hidden legacy dynamic mode.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
+    if (selectionMode.value === FOUR_TIER_MAPPING_SELECTION_MODE) {
+      // The config-only mapping route is operator-authored and read-only here.
+      // Re-enabling a parked config must change only ``enabled``.
+      return
+    }
     const presetMode = staticB5ModeForProvider(provider)
     if (presetMode) {
       selectionMode.value = presetMode
@@ -916,6 +924,7 @@ export function useSetupEnsembleForm() {
       const scheme: EnsembleScheme = (
         selectionMode.value === 'router_dynamic'
         || selectionMode.value === TREE_BASELINE_SELECTION_MODE
+        || selectionMode.value === FOUR_TIER_MAPPING_SELECTION_MODE
           ? 'legacy'
           : selectionMode.value === CUSTOM_B5_SELECTION_MODE
             ? 'custom'

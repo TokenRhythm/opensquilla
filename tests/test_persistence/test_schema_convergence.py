@@ -25,12 +25,21 @@ TABLES = (
     "sessions",
     "transcript_entries",
     "session_summaries",
+    "fixed_four_tier_states",
+    "fixed_four_tier_request_claims",
+    "fixed_four_tier_decisions",
     "usage_events",
     "usage_event_items",
     "usage_item_billing_receipts",
     "usage_billing_receipt_state",
     "usage_ledger_state",
     "usage_legacy_baselines",
+)
+
+FIXED_FOUR_TIER_TABLES = (
+    "fixed_four_tier_states",
+    "fixed_four_tier_request_claims",
+    "fixed_four_tier_decisions",
 )
 
 # Synthetic approximation of the oldest supported on-disk shape. It is the
@@ -157,6 +166,39 @@ def _table_shape(db_path: Path, table: str) -> dict[str, str | None]:
     return {row[1]: row[4] for row in rows}
 
 
+def _table_contract(db_path: Path, table: str) -> dict[str, object]:
+    """Full table/index contract, including checks and uniqueness."""
+
+    conn = sqlite3.connect(db_path)
+    try:
+        table_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        assert table_sql_row is not None
+        table_sql = " ".join(str(table_sql_row[0]).split()).casefold()
+        columns = [tuple(row) for row in conn.execute(f"PRAGMA table_info({table})")]
+        indexes: dict[str, object] = {}
+        for row in conn.execute(f"PRAGMA index_list({table})"):
+            index_name = str(row[1])
+            indexes[index_name] = {
+                "unique": int(row[2]),
+                "origin": str(row[3]),
+                "partial": int(row[4]),
+                "columns": [
+                    (int(info[0]), int(info[1]), str(info[2]))
+                    for info in conn.execute(f'PRAGMA index_info("{index_name}")')
+                ],
+            }
+        return {
+            "table_sql": table_sql,
+            "columns": columns,
+            "indexes": indexes,
+        }
+    finally:
+        conn.close()
+
+
 async def _boot_db(db_path: Path) -> None:
     """The production boot order: apply_pending, then SessionStorage.connect."""
     applied = apply_pending(str(db_path), MIGRATIONS_DIR)
@@ -196,3 +238,20 @@ async def test_fresh_and_upgraded_legacy_session_schemas_converge(tmp_path: Path
         assert fresh_shape == legacy_shape, (
             f"{table}: column defaults diverge between fresh and upgraded DBs"
         )
+
+
+async def test_fixed_four_tier_storage_only_and_migration_only_contracts_match(
+    tmp_path: Path,
+) -> None:
+    storage_db = tmp_path / "storage-only.db"
+    storage = await SessionStorage.open(str(storage_db))
+    await storage.close()
+
+    migration_db = tmp_path / "migration-only.db"
+    assert apply_pending(str(migration_db), MIGRATIONS_DIR)
+
+    for table in FIXED_FOUR_TIER_TABLES:
+        assert _table_contract(storage_db, table) == _table_contract(
+            migration_db,
+            table,
+        ), f"{table}: SessionStorage and V025 contracts diverge"

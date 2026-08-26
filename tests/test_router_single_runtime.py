@@ -131,6 +131,157 @@ def _router_single_config() -> GatewayConfig:
     )
 
 
+def _fixed_four_tier_v2_config(*, mock_seed: int = 7) -> GatewayConfig:
+    return GatewayConfig(
+        squilla_router=SquillaRouterConfig(enabled=True, rollout_phase="full"),
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {"mock_seed": mock_seed},
+        },
+    )
+
+
+class _FixedRouteSessionManager:
+    def __init__(self, session_id: str = "fixed-session") -> None:
+        self.session_id = session_id
+        self.state: Any | None = None
+        self.decisions: dict[str, Any] = {}
+        self.claims: dict[tuple[str, str], Any] = {}
+        self.transcript: list[Any] = []
+        self.settlements: list[dict[str, Any]] = []
+        self.response_bindings: dict[str, dict[str, Any]] = {}
+
+    async def get_session(self, session_key: str) -> Any:
+        del session_key
+        return SimpleNamespace(session_id=self.session_id, epoch=0)
+
+    async def get_fixed_four_tier_state(self, session_id: str) -> Any | None:
+        assert session_id == self.session_id
+        return self.state
+
+    async def get_transcript(self, session_key: str) -> list[Any]:
+        del session_key
+        return list(self.transcript)
+
+    async def merge_message_turn_context(
+        self,
+        session_key: str,
+        message_id: str,
+        turn_context_patch: dict[str, Any],
+    ) -> bool:
+        del session_key
+        self.response_bindings[message_id] = {
+            **self.response_bindings.get(message_id, {}),
+            **turn_context_patch,
+        }
+        return True
+
+    async def reconcile_stale_fixed_four_tier_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        now_ms: int | None = None,
+    ) -> Any | None:
+        assert session_id == self.session_id
+        claim = self.claims.get((session_id, request_id))
+        if (
+            claim is not None
+            and claim.status in {"claimed", "materialized"}
+            and now_ms is not None
+            and claim.lease_expires_at_ms <= now_ms
+        ):
+            claim.status = "failed"
+            claim.error_code = "execution_lease_expired"
+        return claim
+
+    async def claim_fixed_four_tier_request(self, claim: Any) -> tuple[bool, Any]:
+        key = (claim.session_id, claim.request_id)
+        existing = self.claims.get(key)
+        if existing is not None:
+            return False, existing
+        self.claims[key] = claim
+        return True, claim
+
+    async def settle_fixed_four_tier_request_claim(self, **kwargs: Any) -> bool:
+        for claim in self.claims.values():
+            if claim.claim_id == kwargs["claim_id"]:
+                claim.status = kwargs["execution_status"]
+                claim.error_code = kwargs.get("error_code")
+                return True
+        return False
+
+    async def get_fixed_four_tier_decision_by_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+    ) -> Any | None:
+        assert session_id == self.session_id
+        return next(
+            (
+                decision
+                for decision in self.decisions.values()
+                if getattr(decision, "request_id", None) == request_id
+            ),
+            None,
+        )
+
+    async def get_fixed_four_tier_decision_by_route(self, route_id: str) -> Any | None:
+        return self.decisions.get(route_id)
+
+    async def get_fixed_four_tier_decision_by_input_message(
+        self,
+        *,
+        session_id: str,
+        input_message_id: str,
+    ) -> Any | None:
+        del input_message_id
+        assert session_id == self.session_id
+        return None
+
+    async def stage_fixed_four_tier_decision(self, record: Any) -> Any:
+        self.decisions[record.route_id] = record
+        claim = self.claims[(record.session_id, record.request_id)]
+        claim.status = "materialized"
+        claim.route_id = record.route_id
+        return record
+
+    async def commit_fixed_four_tier_decision(
+        self,
+        *,
+        route_id: str,
+        state: Any,
+        expected_version: int | None,
+        route_trace: dict[str, Any],
+        updated_at_ms: int,
+    ) -> Any:
+        del expected_version, route_trace, updated_at_ms
+        assert route_id in self.decisions
+        self.state = state
+        return state
+
+    async def settle_fixed_four_tier_decision(self, **kwargs: Any) -> bool:
+        assert kwargs["route_id"] in self.decisions
+        self.settlements.append(dict(kwargs))
+        record = self.decisions[kwargs["route_id"]]
+        record.execution_status = kwargs["execution_status"]
+        if kwargs.get("route_trace") is not None:
+            record.route_trace = kwargs["route_trace"]
+        await self.settle_fixed_four_tier_request_claim(
+            claim_id=record.claim_id,
+            execution_status=kwargs["execution_status"],
+            error_code=kwargs.get("error_code"),
+        )
+        return True
+
+    async def get_usage_event_ids_for_turn(self, **kwargs: Any) -> list[str]:
+        del kwargs
+        return []
+
+
 async def test_explicit_model_returns_before_router_single_analyzer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -294,6 +445,188 @@ async def test_router_single_early_return_never_enters_fusion_block(
     assert "ensemble_enabled" not in turn.metadata
 
 
+async def test_fixed_four_tier_v2_uses_only_its_isolated_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    direct = object()
+    fixed_calls: list[dict[str, Any]] = []
+
+    async def resolve_fixed(**kwargs: Any) -> Any:
+        fixed_calls.append(kwargs)
+        return direct
+
+    async def fail_legacy(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("fixed_four_tier_v2 touched the legacy Analyzer route")
+
+    monkeypatch.setattr(runner, "_resolve_fixed_four_tier_v2_provider", resolve_fixed)
+    monkeypatch.setattr(runner, "_resolve_router_single_provider", fail_legacy)
+
+    turn, provider = await runner._run_pipeline(
+        "hello",
+        "agent:main:fixed-four-tier",
+        _NoChatProvider(),
+        _Selector(),
+        [],
+        "system",
+        [],
+    )
+
+    assert provider is direct
+    assert len(fixed_calls) == 1
+    assert fixed_calls[0]["ensemble_cfg"].selection_mode == "four_tier_mapping"
+    assert turn.metadata["fixed_four_tier_v2_legacy_router_skipped"] is True
+    assert "ensemble_decision_id" not in turn.metadata
+    assert "ensemble_enabled" not in turn.metadata
+
+
+async def test_fixed_four_tier_pipeline_forwards_only_trusted_route_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    captured_metadata: list[dict[str, Any]] = []
+
+    async def resolve_fixed(**kwargs: Any) -> Any:
+        captured_metadata.append(dict(kwargs["turn"].metadata))
+        return object()
+
+    monkeypatch.setattr(runner, "_resolve_fixed_four_tier_v2_provider", resolve_fixed)
+    trusted = {
+        "fixed_four_tier_v2_control_event": "redo",
+        "fixed_four_tier_v2_redo_parent_session_key": "agent:main:parent",
+        "fixed_four_tier_v2_redo_parent_session_id": "parent-id",
+        "fixed_four_tier_v2_redo_of_message_id": "parent-input",
+        "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child-start",
+        "untrusted_extra": "must-not-cross",
+    }
+
+    turn, _ = await runner._run_pipeline(
+        "hello",
+        "agent:main:trusted-fixed-route",
+        _NoChatProvider(),
+        _Selector(),
+        [],
+        "system",
+        [],
+        trusted_route_metadata=trusted,
+    )
+
+    assert len(captured_metadata) == 1
+    for key, value in trusted.items():
+        if key not in {
+            "fixed_four_tier_v2_redo_parent_session_key",
+            "untrusted_extra",
+        }:
+            assert captured_metadata[0][key] == value
+    assert "fixed_four_tier_v2_redo_parent_session_key" not in captured_metadata[0]
+    assert "untrusted_extra" not in captured_metadata[0]
+    assert "untrusted_extra" not in turn.metadata
+
+
+async def test_legacy_pipeline_ignores_trusted_fixed_route_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    captured_metadata: list[dict[str, Any]] = []
+
+    async def resolve_legacy(**kwargs: Any) -> Any:
+        captured_metadata.append(dict(kwargs["turn"].metadata))
+        return object()
+
+    monkeypatch.setattr(runner, "_resolve_router_single_provider", resolve_legacy)
+    turn, _ = await runner._run_pipeline(
+        "hello",
+        "agent:main:legacy-route-metadata",
+        _NoChatProvider(),
+        _Selector(),
+        [],
+        "system",
+        [],
+        trusted_route_metadata={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_id": "parent-id",
+        },
+    )
+
+    assert len(captured_metadata) == 1
+    assert "fixed_four_tier_v2_control_event" not in captured_metadata[0]
+    assert "fixed_four_tier_v2_redo_parent_session_id" not in turn.metadata
+
+
+async def test_router_dynamic_never_calls_fixed_four_tier_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    direct = object()
+
+    async def resolve_legacy(**kwargs: Any) -> Any:
+        del kwargs
+        return direct
+
+    async def fail_fixed(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("router_dynamic touched fixed_four_tier_v2")
+
+    monkeypatch.setattr(runner, "_resolve_router_single_provider", resolve_legacy)
+    monkeypatch.setattr(runner, "_resolve_fixed_four_tier_v2_provider", fail_fixed)
+
+    turn, provider = await runner._run_pipeline(
+        "hello",
+        "agent:main:router-dynamic-control",
+        _NoChatProvider(),
+        _Selector(),
+        [],
+        "system",
+        [],
+    )
+
+    assert provider is direct
+    assert "fixed_four_tier_v2_legacy_router_skipped" not in turn.metadata
+
+
+async def test_explicit_model_cannot_bypass_fixed_four_tier_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    fixed_calls: list[dict[str, Any]] = []
+    direct = object()
+
+    async def resolve_fixed(**kwargs: Any) -> Any:
+        fixed_calls.append(kwargs)
+        return direct
+
+    async def fail_legacy(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("fixed mode touched the legacy routing classifier")
+
+    async def fail_prompt_cache(turn: Any) -> Any:
+        del turn
+        raise AssertionError("fixed mode applied a pre-route legacy prompt cache policy")
+
+    monkeypatch.setattr(runner, "_resolve_fixed_four_tier_v2_provider", resolve_fixed)
+    monkeypatch.setattr(runner, "_resolve_router_single_provider", fail_legacy)
+    monkeypatch.setattr("opensquilla.engine.steps.apply_prompt_cache", fail_prompt_cache)
+
+    turn, provider = await runner._run_pipeline(
+        "hello",
+        "agent:main:fixed-explicit",
+        _NoChatProvider(),
+        _Selector(),
+        [],
+        "system",
+        [],
+        explicit_model="openai/gpt-5.6",
+    )
+
+    assert provider is direct
+    assert len(fixed_calls) == 1
+    # resolve_model may write a temporary turn.model, but the fixed resolver
+    # receives the untouched selector and remains the only model authority.
+    assert fixed_calls[0]["cloned_selector"].current_config.model == "openai/gpt-5.5"
+    assert turn.metadata["fixed_four_tier_v2_prompt_cache_skipped"] is True
+
+
 def test_fusion_gate_remains_the_original_unqualified_block() -> None:
     source = inspect.getsource(TurnRunner._run_pipeline)
     original_gate = 'if provider is not None and getattr(ensemble_cfg, "enabled", False):'
@@ -312,6 +645,16 @@ def test_router_single_does_not_read_or_write_b5_last_route_memory() -> None:
     # The pre-existing B5 branch retains its continuity lookup and commit path.
     assert "_previous_router_dynamic_route" in pipeline_source
     assert "router_dynamic_pending_route_plan" in pipeline_source
+
+
+def test_fixed_four_tier_resolver_has_no_legacy_analyzer_or_fusion_dependency() -> None:
+    source = inspect.getsource(TurnRunner._resolve_fixed_four_tier_v2_provider)
+
+    assert "_resolve_router_single_provider" not in source
+    assert "resolve_router_single_route" not in source
+    assert "analyze_task" not in source
+    assert "build_ensemble_provider_from_config" not in source
+    assert "fallbacks=[]" in source
 
 
 def _ranked_model(
@@ -345,10 +688,18 @@ class _Catalog:
         self.output = {
             "openai/gpt-5.5": 4_096,
             "anthropic/claude-sonnet-4.5": 8_192,
+            "qwen/qwen3.7-flash": 8_192,
+            "deepseek/deepseek-v4-flash": 8_192,
+            "deepseek/deepseek-v4-pro": 8_192,
+            "z-ai/glm-5.3": 8_192,
         }
         self.context = {
             "openai/gpt-5.5": 128_000,
             "anthropic/claude-sonnet-4.5": 200_000,
+            "qwen/qwen3.7-flash": 128_000,
+            "deepseek/deepseek-v4-flash": 128_000,
+            "deepseek/deepseek-v4-pro": 128_000,
+            "z-ai/glm-5.3": 128_000,
         }
 
     def resolve_max_tokens(
@@ -391,7 +742,1010 @@ class _Catalog:
         from opensquilla.provider import ModelCapabilities
 
         del model_id, provider_name, base_url
-        return ModelCapabilities()
+        return ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            supports_vision=True,
+        )
+
+
+async def test_fixed_four_tier_resolver_materializes_exactly_one_model() -> None:
+    from opensquilla.engine.pipeline import TurnContext
+
+    config = _fixed_four_tier_v2_config(mock_seed=19)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="input-fixed-1",
+            role="user",
+            content="build a small parser",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    turn = TurnContext(
+        message="build a small parser",
+        raw_message="build a small parser",
+        session_key="agent:main:fixed-materialize",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "request-fixed-1"},
+    )
+
+    provider = await runner._resolve_fixed_four_tier_v2_provider(
+        turn=turn,
+        provider=turn.provider,
+        cloned_selector=selector,
+        turn_config=config,
+        ensemble_cfg=config.llm_ensemble,
+        turn_absolute_deadline=None,
+        bound_user_message_id="input-fixed-1",
+    )
+
+    fixed_models = {
+        "qwen/qwen3.7-flash",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+        "z-ai/glm-5.3",
+    }
+    assert isinstance(provider, _SelectorFallbackProvider)
+    assert selector.current_config.model in fixed_models
+    assert turn.model == selector.current_config.model
+    assert turn.metadata["fixed_four_tier_v2_selected_provider"] == "openrouter"
+    assert turn.metadata["fixed_four_tier_v2_selected_model"] == turn.model
+    assert turn.metadata["baseline_model"] == inherited.model
+    assert turn.metadata["router_fallback_chain"] == []
+    assert turn.metadata["route_max_history_turns"] == 0
+    assert turn.metadata["fixed_four_tier_v2_context_action"] == "reset"
+    trace = turn.metadata["fixed_four_tier_v2_decision"]
+    assert trace["mode"] == "four_tier_mapping"
+    assert trace["request_id"] == "request-fixed-1"
+    assert trace["execution_id"] != trace["request_id"]
+    assert trace["claim_id"]
+    assert trace["intent"]["run_status"] == "not_run"
+    assert trace["intent"]["prediction"] is None
+    assert trace["intent"]["probabilities"] is None
+    assert trace["tier"]["run_status"] == "ran"
+    assert trace["model"] == turn.model
+
+
+async def _persist_fixed_redo_parent_route(
+    manager: Any,
+    *,
+    parent: Any,
+    task_start_input_message_id: str,
+    input_message_id: str,
+    response_id: str,
+    task_turn_index: int,
+) -> Any:
+    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+        FixedFourTierTaskState,
+        FixedFourTierV2Router,
+        RoutingRequest,
+    )
+    from opensquilla.session.models import (
+        FixedFourTierDecisionRecord,
+        FixedFourTierRequestClaim,
+        FixedFourTierState,
+    )
+
+    now_ms = time.time_ns() // 1_000_000
+    route_id = f"parent-route-{task_turn_index}"
+    request_id = f"parent-request-{task_turn_index}"
+    execution_id = f"parent-execution-{task_turn_index}"
+    claim = FixedFourTierRequestClaim(
+        claim_id=f"parent-claim-{task_turn_index}",
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        request_id=request_id,
+        execution_id=execution_id,
+        input_message_id=input_message_id,
+        claimed_at_ms=now_ms,
+        updated_at_ms=now_ms,
+        lease_expires_at_ms=now_ms + 300_000,
+    )
+    acquired, _ = await manager.claim_fixed_four_tier_request(claim)
+    assert acquired is True
+    prior_state = (
+        FixedFourTierTaskState(
+            task_id="parent-task",
+            tier="c2",
+            turn_count=task_turn_index,
+            version=0,
+            task_start_input_message_id=task_start_input_message_id,
+        )
+        if task_turn_index > 0
+        else None
+    )
+    core_decision, next_state = FixedFourTierV2Router(
+        mock_seed=41,
+        route_id_factory=lambda: route_id,
+        task_id_factory=lambda: "parent-task",
+        clock_ms=lambda: now_ms,
+    ).decide(
+        RoutingRequest(
+            session_id=parent.session_id,
+            request_id=request_id,
+            message="repeat exactly",
+            input_message_id=input_message_id,
+            control_event="redo" if prior_state is not None else "new_task",
+        ),
+        prior_state,
+    )
+    route_trace = core_decision.trace(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+    )
+    route_trace["state_committed"] = False
+    record = FixedFourTierDecisionRecord(
+        route_id=core_decision.route_id,
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        claim_id=claim.claim_id,
+        request_id=request_id,
+        execution_id=execution_id,
+        input_message_id=input_message_id,
+        task_id=core_decision.task_id,
+        decided_at_ms=core_decision.decided_at_ms,
+        updated_at_ms=now_ms,
+        intent=core_decision.intent.trace(),
+        tier=core_decision.tier.trace(),
+        previous_tier=core_decision.previous_tier,
+        final_tier=core_decision.final_tier,
+        task_turn_index=core_decision.task_turn_index,
+        task_start_input_message_id=next_state.task_start_input_message_id,
+        context_action=core_decision.context_action,
+        selected_provider="openrouter",
+        selected_model="deepseek/deepseek-v4-flash",
+        config_version=core_decision.schema_version,
+        route_trace=route_trace,
+    )
+    await manager.stage_fixed_four_tier_decision(record)
+    committed_trace = {**route_trace, "state_committed": True}
+    await manager.commit_fixed_four_tier_decision(
+        route_id=route_id,
+        state=FixedFourTierState(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            version=1,
+            task_id=core_decision.task_id,
+            tier=core_decision.final_tier,
+            task_turn_count=task_turn_index + 1,
+            task_start_input_message_id=task_start_input_message_id,
+            last_request_id=request_id,
+            last_route_id=route_id,
+            updated_at_ms=now_ms,
+        ),
+        expected_version=None,
+        route_trace=committed_trace,
+        updated_at_ms=now_ms,
+    )
+    assert await manager.settle_fixed_four_tier_decision(
+        route_id=route_id,
+        execution_status="succeeded",
+        preflight_status="passed",
+        response_id=response_id,
+        route_trace=committed_trace,
+        updated_at_ms=now_ms + 1,
+    )
+    return await manager.get_fixed_four_tier_decision_by_route(route_id)
+
+
+@pytest.mark.parametrize(
+    ("task_turn_index", "canonical_incomplete"),
+    [(0, False), (1, False), (1, True)],
+)
+async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
+    tmp_path: Any,
+    task_turn_index: int,
+    canonical_incomplete: bool,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierRoutingError
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.models import SessionSummary
+    from opensquilla.session.storage import SessionStorage
+
+    storage = SessionStorage(str(tmp_path / f"redo-{task_turn_index}-{canonical_incomplete}.db"))
+    await storage.connect()
+    try:
+        manager = SessionManager(storage, inject_time_prefix=False)
+        parent = await manager.create(f"agent:main:redo-parent-{task_turn_index}")
+        task_start = await manager.append_message(
+            parent.session_key,
+            "user",
+            "first task request",
+        )
+        if task_turn_index == 1:
+            await manager.append_message(parent.session_key, "assistant", "first final answer")
+            target_input = await manager.append_message(
+                parent.session_key,
+                "user",
+                "second task request",
+            )
+        else:
+            target_input = task_start
+        original_response = await manager.append_message(
+            parent.session_key,
+            "assistant",
+            "original answer to regenerate",
+        )
+        parent_route = await _persist_fixed_redo_parent_route(
+            manager,
+            parent=parent,
+            task_start_input_message_id=task_start.message_id,
+            input_message_id=target_input.message_id,
+            response_id=original_response.message_id,
+            task_turn_index=task_turn_index,
+        )
+        assert parent_route is not None
+        if task_turn_index == 1:
+            parent_entries = await manager.get_transcript(parent.session_key)
+            removed_entries = parent_entries[:2]
+            kept_entries = parent_entries[2:]
+            parent.compaction_count = 1
+            await storage.rewrite_compacted_session(
+                node=parent,
+                summary=SessionSummary(
+                    session_id=parent.session_id,
+                    session_key=parent.session_key,
+                    compaction_id="redo-parent-compaction",
+                    summary_text="archived first task turn",
+                    removed_count=len(removed_entries),
+                    kept_count=len(kept_entries),
+                    covered_through_id=max(entry.id or 0 for entry in removed_entries),
+                ),
+                entries=kept_entries,
+                archived_entries=removed_entries,
+            )
+            assert task_start.message_id not in {
+                entry.message_id for entry in await manager.get_transcript(parent.session_key)
+            }
+            if canonical_incomplete:
+                await storage.conn.execute(
+                    "DELETE FROM session_summaries WHERE session_id = ?",
+                    (parent.session_id,),
+                )
+                await storage.conn.commit()
+            assert (
+                await manager.is_canonical_transcript_complete(parent.session_key)
+            ) is not canonical_incomplete
+
+        child_key = f"agent:main:redo-child-{task_turn_index}"
+        plan = await manager.prepare_prefix_branch(
+            parent.session_key,
+            child_key,
+            fork_before_message_id=target_input.message_id,
+        )
+        await storage.upsert_session(plan.node)
+        for entry in plan.initial_transcript_entries:
+            await storage.append_transcript_entry(entry)
+        replacement = await manager.append_message(
+            child_key,
+            "user",
+            str(target_input.content),
+        )
+        if task_turn_index == 0:
+            expected_child_task_start = replacement.message_id
+        else:
+            source_to_child = dict(plan.source_to_child_message_ids)
+            expected_child_task_start = source_to_child[task_start.message_id]
+            assert expected_child_task_start != task_start.message_id
+
+        config = _fixed_four_tier_v2_config(mock_seed=53 + task_turn_index)
+        inherited = ProviderConfig(
+            provider="openrouter",
+            model="openai/gpt-5.5",
+            api_key="synthetic",
+        )
+        selector = _Selector(inherited)
+        runner = TurnRunner(
+            provider_selector=selector,
+            session_manager=manager,
+            config=config,
+            model_catalog=_Catalog(),
+        )
+        turn = TurnContext(
+            message=str(target_input.content),
+            raw_message=str(target_input.content),
+            session_key=child_key,
+            config=config,
+            provider=_NoChatProvider(),
+            model=inherited.model,
+            tool_defs=[],
+            system_prompt="system",
+            attachments=[],
+            metadata={
+                "fixed_four_tier_v2_request_id": f"redo-request-{task_turn_index}",
+                "fixed_four_tier_v2_control_event": "redo",
+                "fixed_four_tier_v2_redo_parent_session_id": parent.session_id,
+                "fixed_four_tier_v2_redo_of_message_id": target_input.message_id,
+                "fixed_four_tier_v2_redo_child_task_start_input_message_id": (
+                    expected_child_task_start
+                ),
+            },
+        )
+
+        if canonical_incomplete:
+            with pytest.raises(FixedFourTierRoutingError) as exc_info:
+                await runner._resolve_fixed_four_tier_v2_provider(
+                    turn=turn,
+                    provider=turn.provider,
+                    cloned_selector=selector,
+                    turn_config=config,
+                    ensemble_cfg=config.llm_ensemble,
+                    turn_absolute_deadline=None,
+                    bound_user_message_id=replacement.message_id,
+                )
+            assert exc_info.value.reason == "redo_parent_canonical_transcript_incomplete"
+            assert await manager.get_fixed_four_tier_state(plan.node.session_id) is None
+            return
+
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id=replacement.message_id,
+        )
+
+        child_state = await manager.get_fixed_four_tier_state(plan.node.session_id)
+        assert child_state is not None
+        assert child_state.task_start_input_message_id == expected_child_task_start
+        trace = turn.metadata["fixed_four_tier_v2_decision"]
+        assert trace["task_start_input_message_id"] == expected_child_task_start
+        assert trace["feature_input"]["transcript_refs"] == {
+            "input_message_id": target_input.message_id,
+            "task_start_input_message_id": task_start.message_id,
+        }
+        assert trace["history_turns_to_keep"] == task_turn_index
+        assert trace["context_action"] == "keep"
+    finally:
+        await storage.close()
+
+
+async def test_fixed_four_tier_context_failure_never_switches_tier() -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+        FixedFourTierRoutingError,
+    )
+
+    config = _fixed_four_tier_v2_config(mock_seed=23)
+    config.llm.context_window_tokens = 8
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="input-fixed-context",
+            role="user",
+            content="this request is intentionally much longer than eight tokens",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    turn = TurnContext(
+        message="this request is intentionally much longer than eight tokens",
+        raw_message="this request is intentionally much longer than eight tokens",
+        session_key="agent:main:fixed-context-failure",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "request-fixed-context"},
+    )
+
+    with pytest.raises(FixedFourTierRoutingError) as exc_info:
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="input-fixed-context",
+        )
+
+    assert exc_info.value.reason == "context_length_exceeded"
+    assert selector.current_config == inherited
+    trace = turn.metadata["fixed_four_tier_v2_decision"]
+    assert trace["preflight"]["status"] == "failed"
+    assert trace["execution_status"] == "failed"
+    assert next(iter(manager.claims.values())).status == "failed"
+
+
+async def test_fixed_four_tier_rejects_request_controlled_redo_provenance() -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierRoutingError
+
+    config = _fixed_four_tier_v2_config(mock_seed=29)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="forged-redo-input",
+            role="user",
+            content="ordinary request",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    turn = TurnContext(
+        message="ordinary request",
+        raw_message="ordinary request",
+        session_key="agent:main:forged-redo",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={
+            "fixed_four_tier_v2_request_id": "forged-redo-request",
+            "input_provenance": {
+                "action": "redo",
+                "fixed_four_tier_v2_redo_parent_session_id": "known-parent",
+                "fixed_four_tier_v2_redo_of_message_id": "known-message",
+            },
+        },
+    )
+
+    with pytest.raises(FixedFourTierRoutingError) as exc_info:
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="forged-redo-input",
+        )
+
+    assert exc_info.value.reason == "redo_provenance_untrusted"
+    assert manager.claims == {}
+
+
+async def test_fixed_four_tier_classifier_snapshot_excludes_envelopes_and_queued_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+
+    config = _fixed_four_tier_v2_config(mock_seed=31)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    secret_base64 = "c2VjcmV0LWJpbmFyeS1wYXlsb2Fk"
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="history-1",
+            role="user",
+            content=(
+                '{"text":"[2026-08-26T10:30+08:00 Wed Asia/Shanghai]\\n'
+                'visible history","attachments":[{"type":"image/png","data":"'
+                + secret_base64
+                + '"}]}'
+            ),
+            turn_usage=None,
+        ),
+        SimpleNamespace(
+            message_id="assistant-artifact",
+            role="assistant",
+            content='{"text":"visible answer","artifacts":[{"bytes":"binary"}]}',
+            turn_usage=None,
+        ),
+        SimpleNamespace(
+            message_id="input-current",
+            role="user",
+            content="current request",
+            turn_usage=None,
+        ),
+        SimpleNamespace(
+            message_id="input-future",
+            role="user",
+            content="QUEUED_FUTURE_SECRET",
+            turn_usage=None,
+        ),
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    real_router = runner._fixed_four_tier_v2_router_for_config(config.llm_ensemble)
+    captured: list[Any] = []
+
+    class CaptureRouter:
+        def decide(self, request: Any, state: Any) -> Any:
+            captured.append(request)
+            return real_router.decide(request, state)
+
+    monkeypatch.setattr(
+        runner,
+        "_fixed_four_tier_v2_router_for_config",
+        lambda _ensemble: CaptureRouter(),
+    )
+    turn = TurnContext(
+        message="current request",
+        raw_message="current request",
+        session_key="agent:main:fixed-feature-snapshot",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[
+            {
+                "mime": "application/pdf",
+                "name": "customer-private-name.pdf",
+                "content": "ATTACHMENT_PRIVATE_CONTENT",
+            },
+            {
+                "mime_type": "image/png",
+                "data": "ATTACHMENT_PRIVATE_BASE64",
+            },
+        ],
+        metadata={"fixed_four_tier_v2_request_id": "request-feature-snapshot"},
+    )
+
+    await runner._resolve_fixed_four_tier_v2_provider(
+        turn=turn,
+        provider=turn.provider,
+        cloned_selector=selector,
+        turn_config=config,
+        ensemble_cfg=config.llm_ensemble,
+        turn_absolute_deadline=None,
+        bound_user_message_id="input-current",
+    )
+
+    assert len(captured) == 1
+    assert captured[0].user_history == ("visible history",)
+    assert captured[0].previous_assistant_text is None
+    assert captured[0].attachment_count == 2
+    assert captured[0].attachment_modalities == ("document", "image")
+    feature_input = turn.metadata["fixed_four_tier_v2_decision"]["feature_input"]
+    assert feature_input["attachment_count"] == 2
+    assert feature_input["attachment_modalities"] == ["document", "image"]
+    assert feature_input["missing"]["attachment_metadata"] is False
+    trace_text = repr(turn.metadata["fixed_four_tier_v2_decision"])
+    assert secret_base64 not in trace_text
+    assert "QUEUED_FUTURE_SECRET" not in trace_text
+    assert "binary" not in trace_text
+    assert "customer-private-name.pdf" not in trace_text
+    assert "ATTACHMENT_PRIVATE_CONTENT" not in trace_text
+    assert "ATTACHMENT_PRIVATE_BASE64" not in trace_text
+
+
+async def test_fixed_four_tier_missing_current_feature_anchor_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierRoutingError
+
+    config = _fixed_four_tier_v2_config(mock_seed=37)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="different-input",
+            role="user",
+            content="different",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_fixed_four_tier_v2_router_for_config",
+        lambda _ensemble: (_ for _ in ()).throw(
+            AssertionError("missing input anchor reached the classifier")
+        ),
+    )
+    turn = TurnContext(
+        message="current",
+        raw_message="current",
+        session_key="agent:main:fixed-missing-anchor",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "request-missing-anchor"},
+    )
+
+    with pytest.raises(FixedFourTierRoutingError) as exc_info:
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="missing-input",
+        )
+
+    assert exc_info.value.reason == "current_feature_boundary_unavailable"
+    assert manager.claims == {}
+
+
+async def test_fixed_four_tier_previous_response_is_bound_by_route_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+
+    config = _fixed_four_tier_v2_config(mock_seed=41)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.state = SimpleNamespace(
+        schema_version=1,
+        task_id="task-existing",
+        tier="c1",
+        task_turn_count=1,
+        version=1,
+        task_start_input_message_id="task-start",
+        last_route_id="route-previous",
+    )
+    manager.decisions["route-previous"] = SimpleNamespace(
+        route_id="route-previous",
+        task_id="task-existing",
+        final_tier="c1",
+        task_turn_index=0,
+        task_start_input_message_id="task-start",
+        input_message_id="task-start",
+        response_id="response-final",
+        execution_status="succeeded",
+        error_code=None,
+        route_trace={"attempt_ids": ["attempt-1"]},
+    )
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="task-start",
+            role="user",
+            content="[2026-08-26T10:30+08:00 Wed Asia/Shanghai]\nstart task",
+            turn_usage=None,
+        ),
+        SimpleNamespace(
+            message_id="response-final",
+            role="assistant",
+            content='{"text":"exact final answer","artifacts":[{"secret":"omit-me"}]}',
+            turn_usage={"input_tokens": 10, "output_tokens": 20},
+        ),
+        SimpleNamespace(
+            message_id="assistant-intermediate",
+            role="assistant",
+            content="WRONG_INTERMEDIATE_ASSISTANT",
+            turn_usage={"input_tokens": 999},
+        ),
+        SimpleNamespace(
+            message_id="input-current",
+            role="user",
+            content="continue",
+            turn_usage=None,
+        ),
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    captured: list[Any] = []
+
+    class CaptureAndStopRouter:
+        def decide(self, request: Any, state: Any) -> Any:
+            del state
+            captured.append(request)
+            raise RuntimeError("capture complete")
+
+    monkeypatch.setattr(
+        runner,
+        "_fixed_four_tier_v2_router_for_config",
+        lambda _ensemble: CaptureAndStopRouter(),
+    )
+    turn = TurnContext(
+        message="continue",
+        raw_message="continue",
+        session_key="agent:main:fixed-previous-response",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "request-continue"},
+    )
+
+    with pytest.raises(RuntimeError, match="capture complete"):
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="input-current",
+        )
+
+    assert captured[0].user_history == ("start task",)
+    assert captured[0].previous_assistant_text == "exact final answer"
+    assert captured[0].previous_assistant_usage["input_tokens"] == 10
+    assert captured[0].previous_assistant_usage["route_id"] == "route-previous"
+    assert next(iter(manager.claims.values())).status == "failed"
+
+
+async def test_fixed_four_tier_classifier_cancellation_terminalizes_request_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+
+    config = _fixed_four_tier_v2_config(mock_seed=43)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="input-cancel",
+            role="user",
+            content="cancel",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+
+    class CancelRouter:
+        def decide(self, request: Any, state: Any) -> Any:
+            del request, state
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        runner,
+        "_fixed_four_tier_v2_router_for_config",
+        lambda _ensemble: CancelRouter(),
+    )
+    turn = TurnContext(
+        message="cancel",
+        raw_message="cancel",
+        session_key="agent:main:fixed-classifier-cancel",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "request-cancel"},
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="input-cancel",
+        )
+
+    claim = next(iter(manager.claims.values()))
+    assert claim.status == "cancelled"
+    assert claim.error_code == "CancelledError"
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    ["router_factory", "decision_trace", "state_commit_conflict"],
+)
+async def test_fixed_four_tier_all_post_claim_failures_terminalize_claim(
+    failure_site: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.session.storage import FixedFourTierStateConflictError
+
+    config = _fixed_four_tier_v2_config(mock_seed=47)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="input-post-claim-failure",
+            role="user",
+            content="route me",
+            turn_usage=None,
+        )
+    ]
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    real_router = runner._fixed_four_tier_v2_router_for_config(config.llm_ensemble)
+    if failure_site == "router_factory":
+        monkeypatch.setattr(
+            runner,
+            "_fixed_four_tier_v2_router_for_config",
+            lambda _ensemble: (_ for _ in ()).throw(RuntimeError("factory failed")),
+        )
+    elif failure_site == "decision_trace":
+
+        class BrokenTraceRouter:
+            def decide(self, request: Any, state: Any) -> Any:
+                decision, next_state = real_router.decide(request, state)
+
+                class BrokenDecision:
+                    def __getattr__(self, name: str) -> Any:
+                        return getattr(decision, name)
+
+                    def trace(self, **kwargs: Any) -> Any:
+                        del kwargs
+                        raise RuntimeError("trace failed")
+
+                return BrokenDecision(), next_state
+
+        monkeypatch.setattr(
+            runner,
+            "_fixed_four_tier_v2_router_for_config",
+            lambda _ensemble: BrokenTraceRouter(),
+        )
+    else:
+
+        async def fail_commit(**kwargs: Any) -> Any:
+            del kwargs
+            raise FixedFourTierStateConflictError("synthetic state race")
+
+        monkeypatch.setattr(manager, "commit_fixed_four_tier_decision", fail_commit)
+
+    turn = TurnContext(
+        message="route me",
+        raw_message="route me",
+        session_key="agent:main:fixed-post-claim-failure",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": f"request-{failure_site}"},
+    )
+
+    with pytest.raises(Exception):
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="input-post-claim-failure",
+        )
+
+    assert len(manager.claims) == 1
+    claim = next(iter(manager.claims.values()))
+    assert claim.status == "failed"
+    if failure_site == "state_commit_conflict":
+        assert claim.error_code == "task_state_conflict"
+
+
+@pytest.mark.parametrize(
+    ("history_start_message_id", "bound_user_message_id", "expected_reason"),
+    [
+        ("missing-start", "input-current", "task_history_boundary_unavailable"),
+        ("task-start", "missing-current", "current_history_boundary_unavailable"),
+    ],
+)
+async def test_fixed_four_tier_history_reload_missing_anchor_fails_closed(
+    history_start_message_id: str,
+    bound_user_message_id: str,
+    expected_reason: str,
+) -> None:
+    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierRoutingError
+
+    manager = _FixedRouteSessionManager()
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="task-start",
+            role="user",
+            content="start",
+            tool_calls=None,
+            reasoning_content=None,
+        ),
+        SimpleNamespace(
+            message_id="input-current",
+            role="user",
+            content="current",
+            tool_calls=None,
+            reasoning_content=None,
+        ),
+    ]
+    runner = TurnRunner(
+        provider_selector=None,
+        session_manager=manager,
+        config=_fixed_four_tier_v2_config(),
+    )
+    agent = SimpleNamespace(config=SimpleNamespace())
+
+    with pytest.raises(FixedFourTierRoutingError) as exc_info:
+        await runner._load_history(
+            agent,
+            "agent:main:fixed-history-anchor",
+            bound_user_message_id=bound_user_message_id,
+            suppress_compaction_context=True,
+            history_start_message_id=history_start_message_id,
+        )
+
+    assert exc_info.value.reason == expected_reason
 
 
 def _resolver_inputs() -> tuple[Any, ProviderConfig, dict[str, Any]]:
@@ -2503,6 +3857,305 @@ async def test_provider_error_zero_request_cancels_probe_but_started_error_bench
     assert facts["state"] == ("benched" if request_started else "half_open")
 
 
+async def test_fixed_route_zero_request_error_never_claims_executed_identity() -> None:
+    config = _direct_config_for("test/fixed-zero-request")
+    event = ProviderError(
+        message="local credential resolution failed",
+        code="auth_unavailable",
+        request_started=False,
+        physical_request_count=0,
+    )
+    metadata: dict[str, Any] = {
+        "fixed_four_tier_v2_decision": {
+            "dispatch": {
+                "physical_request_started": False,
+                "physical_request_count": 0,
+            }
+        }
+    }
+    provider = _RouterSingleDirectProvider(
+        _ErrorEventProvider(event),
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        turn_metadata=metadata,
+        deployment_version="frozen-revision",
+    )
+
+    observed = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert observed == [event]
+    dispatch = metadata["fixed_four_tier_v2_decision"]["dispatch"]
+    assert dispatch["physical_request_started"] is False
+    assert dispatch["physical_request_count"] == 0
+    assert dispatch["execution_evidence"] == "provider_zero_request_error"
+    assert dispatch["executed_provider"] is None
+    assert dispatch["executed_model"] is None
+    assert "executed_provider" not in metadata
+    assert "executed_model" not in metadata
+
+
+async def test_fixed_route_physical_audit_accumulates_and_never_regresses() -> None:
+    config = _direct_config_for("test/fixed-multi-call")
+
+    class SequencedProvider:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages: list[Any], tools: Any = None, config: Any = None) -> Any:
+            del messages, tools, config
+            self.calls += 1
+            call = self.calls
+
+            async def stream() -> AsyncIterator[Any]:
+                if call <= 2:
+                    yield ProviderDone(
+                        stop_reason="stop",
+                        provider="openrouter",
+                        model="test/fixed-multi-call",
+                    )
+                else:
+                    yield ProviderError(
+                        message="local preflight rejected the third call",
+                        code="local_rejection",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+
+            return stream()
+
+    metadata: dict[str, Any] = {
+        "fixed_four_tier_v2_decision": {
+            "dispatch": {
+                "physical_request_started": False,
+                "physical_request_count": 0,
+            }
+        }
+    }
+    provider = _RouterSingleDirectProvider(
+        SequencedProvider(),
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        turn_metadata=metadata,
+        deployment_version="frozen-revision",
+    )
+
+    assert (await _collect(provider.chat([], config=ChatConfig(timeout=30.0))))[-1].kind == ("done")
+    assert (await _collect(provider.chat([], config=ChatConfig(timeout=30.0))))[-1].kind == ("done")
+    assert (await _collect(provider.chat([], config=ChatConfig(timeout=30.0))))[-1].kind == (
+        "error"
+    )
+
+    dispatch = metadata["fixed_four_tier_v2_decision"]["dispatch"]
+    assert dispatch["physical_request_started"] is True
+    assert dispatch["physical_request_count"] == 2
+    assert dispatch["last_call_request_started"] is False
+    assert dispatch["last_call_physical_request_count"] == 0
+    assert dispatch["executed_provider"] == "openrouter"
+    assert dispatch["executed_model"] == "test/fixed-multi-call"
+
+
+async def test_fixed_route_terminal_usage_has_mutually_exclusive_billing_buckets() -> None:
+    manager = _FixedRouteSessionManager()
+    claim = SimpleNamespace(
+        claim_id="claim-usage",
+        status="materialized",
+        error_code=None,
+    )
+    manager.claims[(manager.session_id, "request-usage")] = claim
+    manager.decisions["route-usage"] = SimpleNamespace(
+        route_id="route-usage",
+        claim_id=claim.claim_id,
+        execution_status="pending",
+        route_trace={},
+    )
+    turn = SimpleNamespace(
+        metadata={
+            "fixed_four_tier_v2_decision_id": "route-usage",
+            "fixed_four_tier_v2_decision": {
+                "session_id": manager.session_id,
+                "request_id": "request-usage",
+                "execution_id": "execution-usage",
+                "dispatch": {
+                    "physical_request_started": True,
+                    "physical_request_count": 1,
+                    "executed_provider": "openrouter",
+                    "executed_model": "deepseek/deepseek-v4-flash",
+                },
+            },
+        }
+    )
+    runner = TurnRunner(provider_selector=None, session_manager=manager)
+    done = EngineDone(
+        input_tokens=100,
+        output_tokens=30,
+        reasoning_tokens=7,
+        cached_tokens=20,
+        cache_write_tokens=5,
+        cost_usd=0.02,
+        billed_cost=0.015,
+        cost_source="provider_billed",
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        requested_provider="openrouter",
+        requested_model="deepseek/deepseek-v4-flash",
+    )
+    done.provider_usage = {
+        "provider_reported_cost": 0.015,
+        "response_ids": ["upstream-response"],
+        "api_key": "must-not-persist",
+        "request": {"prompt": "must-not-persist-either"},
+    }
+
+    await runner._settle_fixed_four_tier_v2_route(
+        turn,
+        execution_status="succeeded",
+        response_id="response-usage",
+        done_event=done,
+    )
+
+    usage = turn.metadata["fixed_four_tier_v2_decision"]["provider_usage"]
+    assert usage["input_tokens"] == 100
+    assert usage["cache_read_tokens"] == 20
+    assert usage["cache_write_tokens"] == 5
+    assert usage["normalized_billing_buckets"] == {
+        "normal_input_tokens": 75,
+        "cache_read_tokens": 20,
+        "cache_write_tokens": 5,
+        "output_tokens": 30,
+        "reasoning_tokens_detail": 7,
+        "input_tokens_total": 100,
+        "input_buckets_reconcile": True,
+        "normalization_anomaly": False,
+    }
+    assert usage["provider_native_usage"] == {
+        "provider_reported_cost": 0.015,
+        "response_ids": ["upstream-response"],
+    }
+    assert "must-not-persist" not in repr(usage)
+    assert manager.settlements[-1]["response_id"] == "response-usage"
+
+
+async def test_fixed_route_terminal_usage_preserves_anomalous_raw_cache_counters() -> None:
+    manager = _FixedRouteSessionManager()
+    claim = SimpleNamespace(
+        claim_id="claim-usage-anomaly",
+        status="materialized",
+        error_code=None,
+    )
+    manager.claims[(manager.session_id, "request-usage-anomaly")] = claim
+    manager.decisions["route-usage-anomaly"] = SimpleNamespace(
+        route_id="route-usage-anomaly",
+        claim_id=claim.claim_id,
+        execution_status="pending",
+        route_trace={},
+    )
+    turn = SimpleNamespace(
+        metadata={
+            "fixed_four_tier_v2_decision_id": "route-usage-anomaly",
+            "fixed_four_tier_v2_decision": {
+                "session_id": manager.session_id,
+                "request_id": "request-usage-anomaly",
+                "execution_id": "execution-usage-anomaly",
+                "dispatch": {
+                    "physical_request_started": True,
+                    "physical_request_count": 1,
+                    "executed_provider": "openrouter",
+                    "executed_model": "deepseek/deepseek-v4-flash",
+                },
+            },
+        }
+    )
+    runner = TurnRunner(provider_selector=None, session_manager=manager)
+
+    await runner._settle_fixed_four_tier_v2_route(
+        turn,
+        execution_status="succeeded",
+        done_event=EngineDone(
+            input_tokens=100,
+            output_tokens=30,
+            cached_tokens=120,
+            cache_write_tokens=5,
+            provider="openrouter",
+            model="deepseek/deepseek-v4-flash",
+        ),
+    )
+
+    usage = turn.metadata["fixed_four_tier_v2_decision"]["provider_usage"]
+    assert usage["cache_read_tokens"] == 120
+    assert usage["cache_write_tokens"] == 5
+    assert usage["normalized_billing_buckets"] == {
+        "normal_input_tokens": 0,
+        "cache_read_tokens": 100,
+        "cache_write_tokens": 0,
+        "output_tokens": 30,
+        "reasoning_tokens_detail": 0,
+        "input_tokens_total": 100,
+        "input_buckets_reconcile": False,
+        "normalization_anomaly": True,
+    }
+
+
+async def test_required_fixed_route_terminal_settlement_retries_then_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FixedRouteSessionManager()
+    calls = 0
+
+    async def fail_settlement(**kwargs: Any) -> bool:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        raise RuntimeError("synthetic storage outage")
+
+    monkeypatch.setattr(manager, "settle_fixed_four_tier_decision", fail_settlement)
+    turn = SimpleNamespace(
+        metadata={
+            "fixed_four_tier_v2_decision_id": "route-required-settlement",
+            "fixed_four_tier_v2_decision": {
+                "session_id": manager.session_id,
+                "request_id": "request-required-settlement",
+                "execution_id": "execution-required-settlement",
+                "dispatch": {
+                    "physical_request_started": False,
+                    "physical_request_count": 0,
+                },
+            },
+        }
+    )
+    runner = TurnRunner(provider_selector=None, session_manager=manager)
+
+    with pytest.raises(
+        RuntimeError,
+        match="terminal audit persistence failed",
+    ):
+        await runner._settle_fixed_four_tier_v2_route(
+            turn,
+            execution_status="succeeded",
+            response_id="response-required-settlement",
+            required=True,
+        )
+
+    assert calls == 3
+    pending = turn.metadata["fixed_four_tier_v2_terminal_settlement_pending"]
+    assert {
+        key: pending[key] for key in ("route_id", "execution_status", "response_id", "error_code")
+    } == {
+        "route_id": "route-required-settlement",
+        "execution_status": "succeeded",
+        "response_id": "response-required-settlement",
+        "error_code": None,
+    }
+    assert isinstance(pending["recorded_at_ms"], int)
+
+
 class _MissingTerminalStream:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
@@ -4198,6 +5851,7 @@ async def test_cache_affinity_state_is_not_shared_with_a_new_runner() -> None:
         policy=policy,
     )[0]
 
+
 async def test_single_affinity_failed_turn_and_missing_batch_clear_previous() -> None:
     runner = TurnRunner(provider_selector=None, config=_router_single_config())
     policy = _RouterDynamicCacheAffinityPolicy(
@@ -4370,9 +6024,7 @@ async def test_affinity_analyzer_failure_before_materialization_clears_previous(
                 ensemble_cfg=config.llm_ensemble,
                 turn_absolute_deadline=None,
             )
-        assert bool(turn.metadata.get("router_single_decision_id")) is (
-            session_epoch_available
-        )
+        assert bool(turn.metadata.get("router_single_decision_id")) is (session_epoch_available)
         cleanup_turn: object | None = turn
     else:
         await _seed_multiple_affinity_state(
@@ -4411,6 +6063,7 @@ async def test_affinity_analyzer_failure_before_materialization_clears_previous(
         session_epoch=session_epoch,
         policy=policy,
     )[0]
+
 
 @pytest.mark.parametrize("topology", ["single", "multiple"])
 async def test_successful_selector_fallback_clears_old_and_earlier_chat_affinity(

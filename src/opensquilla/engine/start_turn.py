@@ -70,6 +70,7 @@ async def reserve_turn_via_runtime(
     stream_event_sink: Callable[[Any], Awaitable[None]] | None = None,
     turn_id: str | None = None,
     overflow_policy: Any = None,
+    accepted_config: Any | None = None,
 ) -> TaskReservation:
     """Reserve runtime admission while preserving shared ingress metadata."""
 
@@ -86,6 +87,8 @@ async def reserve_turn_via_runtime(
     )
     if overflow_policy is not None:
         kwargs["overflow_policy"] = overflow_policy
+    if accepted_config is not None:
+        kwargs["accepted_config"] = accepted_config
     return await runtime.reserve(envelope, message, **kwargs)
 
 
@@ -103,6 +106,7 @@ async def start_turn_via_runtime(
     fresh_user_session: bool | None = None,
     stream_event_sink: Callable[[Any], Awaitable[None]] | None = None,
     turn_id: str | None = None,
+    accepted_config: Any | None = None,
 ) -> TaskHandle:
     """Enqueue a turn. Exceptions propagate — recovery is surface-specific.
 
@@ -132,4 +136,6 @@ async def start_turn_via_runtime(
         stream_event_sink=stream_event_sink,
         turn_id=turn_id,
     )
+    if accepted_config is not None:
+        kwargs["accepted_config"] = accepted_config
     return await runtime.enqueue(envelope, message, **kwargs)

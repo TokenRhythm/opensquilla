@@ -15,6 +15,7 @@ import gc
 import tracemalloc
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -29,6 +30,7 @@ from opensquilla.session.turn_context import current_turn_context
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_envelope(session_key: str = "agent-1::sess-1") -> RouteEnvelope:
     return RouteEnvelope(
@@ -97,9 +99,20 @@ def _make_runtime(
     )
 
 
+def _fixed_v2_accepted_config() -> Any:
+    return SimpleNamespace(
+        llm_ensemble=SimpleNamespace(
+            enabled=True,
+            mode="single",
+            selection_mode="four_tier_mapping",
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # terminal_clears_all_dicts
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_terminal_clears_all_dicts() -> None:
@@ -120,6 +133,72 @@ async def test_terminal_clears_all_dicts() -> None:
     # _session_locks is intentionally retained: never pop while _execute may
     # still hold the lock; prevents split-brain on rapid re-enqueue.
     assert sk not in rt._last_envelope_by_session
+
+
+@pytest.mark.asyncio
+async def test_fixed_redo_cache_scrubs_one_shot_identity_without_breaking_owner_eviction() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    followup_started = asyncio.Event()
+    release_followup = asyncio.Event()
+    observed: dict[str, RouteEnvelope] = {}
+
+    async def _handler(run: Any) -> None:
+        observed[run.message] = run.envelope
+        if run.message == "redo turn":
+            first_started.set()
+            await release_first.wait()
+        elif run.message == "runtime followup":
+            followup_started.set()
+            await release_followup.wait()
+
+    rt = _make_runtime(turn_handler=_handler)
+    session_key = "agent-1::fixed-redo-cache"
+    redo_envelope = replace(
+        _make_envelope(session_key),
+        metadata={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_key": "agent-1::parent",
+            "fixed_four_tier_v2_redo_parent_session_id": "parent-id",
+            "fixed_four_tier_v2_redo_of_message_id": "message-parent",
+            "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child-start",
+        },
+        input_provenance={
+            "kind": "webchat",
+            "action": "redo",
+            "source": "web_regenerate",
+            "fixed_four_tier_v2_redo_parent_session_id": "parent-id",
+            "fixed_four_tier_v2_redo_of_message_id": "message-parent",
+        },
+    )
+
+    first = await rt.enqueue(redo_envelope, "redo turn")
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    cached_redo = rt._last_envelope_by_session[session_key]
+    assert not any(key.startswith("fixed_four_tier_v2_") for key in cached_redo.metadata)
+    assert rt._tasks[first.task_id].envelope.metadata["fixed_four_tier_v2_control_event"] == "redo"
+
+    followup = await rt.send(session_key, "runtime followup")
+    followup_task = rt._tasks[followup.task_id]
+    cached_followup = rt._last_envelope_by_session[session_key]
+    assert cached_followup is followup_task.envelope
+    assert not any(key.startswith("fixed_four_tier_v2_") for key in followup_task.envelope.metadata)
+    assert not any(
+        key.startswith("fixed_four_tier_v2_") for key in followup_task.envelope.input_provenance
+    )
+    assert "action" not in followup_task.envelope.input_provenance
+    assert "source" not in followup_task.envelope.input_provenance
+
+    release_first.set()
+    await rt.wait(first.task_id, timeout=2.0)
+    await asyncio.wait_for(followup_started.wait(), timeout=2.0)
+    # The old task compares against its original cached-envelope identity, so
+    # it cannot evict the newer safe follow-up owner at terminal.
+    assert rt._last_envelope_by_session[session_key] is followup_task.envelope
+
+    release_followup.set()
+    await rt.wait(followup.task_id, timeout=2.0)
+    assert session_key not in rt._last_envelope_by_session
 
 
 @pytest.mark.asyncio
@@ -431,6 +510,115 @@ async def test_identity_free_collect_preserves_legacy_coalescing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fixed_redo_collect_candidate_never_absorbs_another_prompt() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    runs: list[str] = []
+
+    async def _handler(run: Any) -> None:
+        runs.append(run.message)
+        if run.message == "blocker":
+            started.set()
+            await release.wait()
+
+    rt = _make_runtime(turn_handler=_handler, max_concurrency=1)
+    session_key = "agent-1::fixed-redo-collect"
+    base = _make_envelope(session_key)
+    blocker = await rt.enqueue(base, "blocker")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    fixed_redo = replace(
+        base,
+        metadata={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_id": "parent-id",
+            "fixed_four_tier_v2_redo_of_message_id": "parent-input",
+            "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child-input",
+        },
+    )
+
+    redo = await rt.enqueue(fixed_redo, "exact redo prompt", mode="collect")
+    followup = await rt.enqueue(base, "separate followup", mode="collect")
+
+    assert followup.task_id != redo.task_id
+    release.set()
+    await rt.wait(blocker.task_id, timeout=2.0)
+    await rt.wait(redo.task_id, timeout=2.0)
+    await rt.wait(followup.task_id, timeout=2.0)
+    assert runs == ["blocker", "exact redo prompt", "separate followup"]
+
+
+@pytest.mark.asyncio
+async def test_fixed_v2_incoming_collect_runs_as_independent_followup() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    runs: list[tuple[str, str]] = []
+
+    async def _handler(run: Any) -> None:
+        runs.append((run.message, run.queue_mode))
+        if run.message == "blocker":
+            started.set()
+            await release.wait()
+
+    rt = TaskRuntime(
+        storage=_make_storage(),
+        turn_handler=_handler,
+        max_concurrency=1,
+    )
+    env = _make_envelope("agent-1::fixed-v2-incoming-collect")
+    blocker = await rt.enqueue(env, "blocker")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    legacy = await rt.enqueue(env, "legacy candidate", mode="collect")
+    fixed = await rt.enqueue(
+        env,
+        "fixed request",
+        mode="collect",
+        accepted_config=_fixed_v2_accepted_config(),
+    )
+
+    assert fixed.task_id != legacy.task_id
+    assert rt._tasks[fixed.task_id].queue_mode == "followup"
+    release.set()
+    await rt.wait(blocker.task_id, timeout=2.0)
+    await rt.wait(legacy.task_id, timeout=2.0)
+    await rt.wait(fixed.task_id, timeout=2.0)
+    assert runs == [
+        ("blocker", "followup"),
+        ("legacy candidate", "collect"),
+        ("fixed request", "followup"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fixed_v2_collect_candidate_never_absorbs_legacy_input() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    runs: list[str] = []
+
+    async def _handler(run: Any) -> None:
+        runs.append(run.message)
+        if run.message == "blocker":
+            started.set()
+            await release.wait()
+
+    rt = _make_runtime(turn_handler=_handler, max_concurrency=1)
+    env = _make_envelope("agent-1::fixed-v2-candidate-collect")
+    blocker = await rt.enqueue(env, "blocker")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    fixed_candidate = await rt.enqueue(env, "fixed candidate", mode="collect")
+    # Exercise the candidate-side guard directly. This also protects a queued
+    # task accepted by an older process that still recorded queue_mode=collect.
+    rt._tasks[fixed_candidate.task_id].accepted_config = _fixed_v2_accepted_config()
+    legacy = await rt.enqueue(env, "legacy request", mode="collect")
+
+    assert legacy.task_id != fixed_candidate.task_id
+    release.set()
+    await rt.wait(blocker.task_id, timeout=2.0)
+    await rt.wait(fixed_candidate.task_id, timeout=2.0)
+    await rt.wait(legacy.task_id, timeout=2.0)
+    assert runs == ["blocker", "fixed candidate", "legacy request"]
+
+
+@pytest.mark.asyncio
 async def test_prestart_cancel_closes_primary_input_disposition() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -638,11 +826,14 @@ async def test_undrained_late_steer_is_promoted_to_followup() -> None:
     env = _make_envelope("agent-1::steer-fallback")
     handle = await rt.enqueue(env, "first")
     await first_started.wait()
-    assert await rt.steer(
-        env.session_key,
-        "too late for a tool boundary",
-        persisted_user_message_id="msg-late",
-    ) == handle.task_id
+    assert (
+        await rt.steer(
+            env.session_key,
+            "too late for a tool boundary",
+            persisted_user_message_id="msg-late",
+        )
+        == handle.task_id
+    )
 
     release_first.set()
     await rt.wait(handle.task_id, timeout=2.0)
@@ -656,6 +847,61 @@ async def test_undrained_late_steer_is_promoted_to_followup() -> None:
     assert len(promoted) == 1
     assert promoted[0]["turn_id"] != handle.task_id
     assert promoted[0]["promoted_from_turn_id"] == handle.task_id
+
+
+@pytest.mark.asyncio
+async def test_fixed_redo_late_steer_promotion_scrubs_one_shot_control() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    followup_seen = asyncio.Event()
+    runs: list[Any] = []
+
+    async def _handler(run: Any) -> None:
+        runs.append(run)
+        if run.message == "exact redo prompt":
+            first_started.set()
+            await release_first.wait()
+            return
+        followup_seen.set()
+
+    rt = _make_runtime(turn_handler=_handler)
+    session_key = "agent-1::fixed-redo-steer-promotion"
+    envelope = replace(
+        _make_envelope(session_key),
+        metadata={
+            "fixed_four_tier_v2_control_event": "redo",
+            "fixed_four_tier_v2_redo_parent_session_key": "agent-1::parent",
+            "fixed_four_tier_v2_redo_parent_session_id": "parent-id",
+            "fixed_four_tier_v2_redo_of_message_id": "parent-input",
+            "fixed_four_tier_v2_redo_child_task_start_input_message_id": "child-input",
+        },
+        input_provenance={
+            "kind": "webchat",
+            "action": "redo",
+            "source": "web_regenerate",
+        },
+    )
+    handle = await rt.enqueue(envelope, "exact redo prompt")
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    assert (
+        await rt.steer(
+            session_key,
+            "late followup",
+            persisted_user_message_id="late-input",
+        )
+        == handle.task_id
+    )
+
+    release_first.set()
+    await rt.wait(handle.task_id, timeout=2.0)
+    await asyncio.wait_for(followup_seen.wait(), timeout=2.0)
+
+    assert [run.message for run in runs] == ["exact redo prompt", "late followup"]
+    promoted = runs[1].envelope
+    assert not any(key.startswith("fixed_four_tier_v2_") for key in promoted.metadata)
+    assert not any(key.startswith("fixed_four_tier_v2_") for key in promoted.input_provenance)
+    assert "action" not in promoted.input_provenance
+    assert "source" not in promoted.input_provenance
 
 
 @pytest.mark.asyncio
@@ -677,11 +923,14 @@ async def test_undrained_steer_survives_failed_active_turn_as_followup() -> None
     env = _make_envelope("agent-1::steer-error-fallback")
     handle = await rt.enqueue(env, "first")
     await first_started.wait()
-    assert await rt.steer(
-        env.session_key,
-        "continue despite provider failure",
-        persisted_user_message_id="msg-after-error",
-    ) == handle.task_id
+    assert (
+        await rt.steer(
+            env.session_key,
+            "continue despite provider failure",
+            persisted_user_message_id="msg-after-error",
+        )
+        == handle.task_id
+    )
 
     fail_first.set()
     await rt.wait(handle.task_id, timeout=2.0)
@@ -724,13 +973,16 @@ async def test_failed_late_steer_promotion_is_durable_and_emits_recovery_state()
     first = await rt.enqueue(env, "first")
     await first_started.wait()
     queued = await rt.enqueue(env, "already queued")
-    assert await rt.steer(
-        env.session_key,
-        "accepted but cannot promote",
-        persisted_user_message_id="msg-rejected",
-        client_message_id="client-rejected",
-        surface_id="tui:test",
-    ) == first.task_id
+    assert (
+        await rt.steer(
+            env.session_key,
+            "accepted but cannot promote",
+            persisted_user_message_id="msg-rejected",
+            client_message_id="client-rejected",
+            surface_id="tui:test",
+        )
+        == first.task_id
+    )
 
     release_first.set()
     await asyncio.wait_for(rejected_seen.wait(), timeout=2.0)
@@ -768,6 +1020,7 @@ async def test_failed_late_steer_promotion_is_durable_and_emits_recovery_state()
 # ---------------------------------------------------------------------------
 # cancel_clears_dicts
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_cancel_clears_dicts() -> None:
@@ -828,31 +1081,40 @@ async def test_cancel_closes_steer_window_before_disposition_persistence() -> No
     handle = await rt.enqueue(env, "first")
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
-    assert await rt.steer(
-        env.session_key,
-        "accepted before cancellation",
-        persisted_user_message_id="msg-before-cancel",
-    ) == handle.task_id
+    assert (
+        await rt.steer(
+            env.session_key,
+            "accepted before cancellation",
+            persisted_user_message_id="msg-before-cancel",
+        )
+        == handle.task_id
+    )
     runtime_task = rt._tasks[handle.task_id]
 
     assert await rt.cancel(task_id=handle.task_id) == 1
     # cancel() is the acknowledgement boundary. Even before the cancelled
     # task gets another event-loop slice, steer must already reject input.
-    assert await rt.steer(
-        env.session_key,
-        "racing immediately after cancel acknowledgement",
-        persisted_user_message_id="msg-after-cancel-ack",
-    ) is None
+    assert (
+        await rt.steer(
+            env.session_key,
+            "racing immediately after cancel acknowledgement",
+            persisted_user_message_id="msg-after-cancel-ack",
+        )
+        is None
+    )
     await asyncio.wait_for(cleanup_persisting.wait(), timeout=2.0)
 
     # Cancellation has reclaimed the earlier input and is waiting on storage.
     # The acceptance window must already be closed, so this cannot become an
     # orphaned pending item after the task is marked terminal.
-    assert await rt.steer(
-        env.session_key,
-        "racing during cancellation cleanup",
-        persisted_user_message_id="msg-during-cancel",
-    ) is None
+    assert (
+        await rt.steer(
+            env.session_key,
+            "racing during cancellation cleanup",
+            persisted_user_message_id="msg-during-cancel",
+        )
+        is None
+    )
 
     release_cleanup.set()
     await rt.wait(handle.task_id, timeout=2.0)
@@ -879,6 +1141,7 @@ async def test_cancel_closes_steer_window_before_disposition_persistence() -> No
 # ---------------------------------------------------------------------------
 # session_lock_kept_during_pending
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_session_lock_kept_during_pending() -> None:
@@ -967,6 +1230,7 @@ async def test_older_terminal_task_keeps_newer_route_envelope_cached() -> None:
 # exception path cleans up
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_exception_path_clears_dicts() -> None:
     """Even when the turn handler raises, cleanup must run for 4 tracking dicts.
@@ -998,6 +1262,7 @@ async def test_exception_path_clears_dicts() -> None:
 # ---------------------------------------------------------------------------
 # no_leak_under_load (tracemalloc quantitative)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1074,6 +1339,4 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     # Task/Future/Event objects; allow up to 200 MB of incidental growth.
     top_stats = snap_after.compare_to(snap_before, "lineno")
     total_added = sum(s.size_diff for s in top_stats if s.size_diff > 0)
-    assert total_added < 200 * 1024 * 1024, (
-        f"Unexpected memory growth: {total_added / 1024:.1f} KB"
-    )
+    assert total_added < 200 * 1024 * 1024, f"Unexpected memory growth: {total_added / 1024:.1f} KB"

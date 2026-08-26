@@ -25,7 +25,7 @@ import inspect
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, TypeVar, cast
@@ -77,6 +77,72 @@ TERMINAL_STATUSES = frozenset(
 
 TaskStreamEventSink = Callable[[Any], Awaitable[None]]
 _CollectResult = TypeVar("_CollectResult")
+_ACCEPTED_CONFIG_UNSET = object()
+
+_FIXED_FOUR_TIER_ONE_SHOT_KEYS = frozenset(
+    {
+        "fixed_four_tier_v2_control_event",
+        "fixed_four_tier_v2_redo_parent_session_key",
+        "fixed_four_tier_v2_redo_parent_session_id",
+        "fixed_four_tier_v2_redo_of_message_id",
+        "fixed_four_tier_v2_redo_child_task_start_input_message_id",
+    }
+)
+
+
+def _cache_safe_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
+    """Drop fixed-v2 regenerate controls from the reusable session envelope."""
+
+    metadata = dict(envelope.metadata)
+    for key in _FIXED_FOUR_TIER_ONE_SHOT_KEYS:
+        metadata.pop(key, None)
+    provenance = dict(envelope.input_provenance)
+    for key in _FIXED_FOUR_TIER_ONE_SHOT_KEYS:
+        provenance.pop(key, None)
+    if (
+        str(provenance.get("action") or "").strip().casefold() == "redo"
+        and str(provenance.get("source") or "").strip().casefold() == "web_regenerate"
+    ):
+        provenance.pop("action", None)
+        provenance.pop("source", None)
+    if metadata == envelope.metadata and provenance == envelope.input_provenance:
+        return envelope
+    return replace(
+        envelope,
+        metadata=metadata,
+        input_provenance=provenance,
+    )
+
+
+def _has_fixed_four_tier_one_shot_control(envelope: RouteEnvelope) -> bool:
+    metadata = envelope.metadata
+    return any(key in metadata for key in _FIXED_FOUR_TIER_ONE_SHOT_KEYS)
+
+
+def _uses_fixed_four_tier_v2(config: Any) -> bool:
+    """Return whether an acceptance snapshot owns an independent fixed-v2 turn."""
+
+    if config is None or config is _ACCEPTED_CONFIG_UNSET:
+        return False
+    ensemble = (
+        config.get("llm_ensemble")
+        if isinstance(config, Mapping)
+        else getattr(config, "llm_ensemble", None)
+    )
+    if ensemble is None:
+        return False
+
+    def _field(name: str, default: Any = None) -> Any:
+        if isinstance(ensemble, Mapping):
+            return ensemble.get(name, default)
+        return getattr(ensemble, name, default)
+
+    selection_mode = str(_field("selection_mode", "") or "").strip().casefold()
+    return (
+        bool(_field("enabled", False))
+        and str(_field("mode", "") or "").strip().casefold() == "single"
+        and selection_mode == "four_tier_mapping"
+    )
 
 
 def _task_identity_payload(
@@ -263,6 +329,7 @@ class _RuntimeTask:
     stream_event_sink: TaskStreamEventSink | None = None
     accepted_config: Any | None = None
     accepted_config_captured: bool = False
+    cached_envelope_owner: RouteEnvelope | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_emitted: bool = False
     cancel_requested: bool = False
@@ -568,6 +635,7 @@ class TaskRuntime:
         task_id: str | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
+        accepted_config: Any = _ACCEPTED_CONFIG_UNSET,
     ) -> TaskHandle:
         envelope = replace(
             envelope,
@@ -578,6 +646,12 @@ class TaskRuntime:
         if not self.supports_queue_mode(queue_mode):
             valid = ", ".join(sorted(self.supported_queue_modes))
             raise ValueError(f"mode must be one of {{{valid}}}")
+        if accepted_config is _ACCEPTED_CONFIG_UNSET:
+            accepted_config = (
+                self._accepted_config_provider()
+                if self._accepted_config_provider is not None
+                else None
+            )
         if queue_mode == "collect":
             async with self.collect_admission(envelope.session_key):
                 collected = await self._try_collect(
@@ -590,6 +664,7 @@ class TaskRuntime:
                     persisted_user_message_id=persisted_user_message_id,
                     persisted_user_message_ids=persisted_user_message_ids,
                     message_count=message_count,
+                    accepted_config=accepted_config,
                 )
                 if collected is not None:
                     return collected
@@ -610,6 +685,7 @@ class TaskRuntime:
                     task_id=task_id,
                     update_envelope_cache=update_envelope_cache,
                     overflow_policy=overflow_policy,
+                    accepted_config=accepted_config,
                 )
         return await self._reserve_persist_and_activate(
             envelope,
@@ -628,6 +704,7 @@ class TaskRuntime:
             task_id=task_id,
             update_envelope_cache=update_envelope_cache,
             overflow_policy=overflow_policy,
+            accepted_config=accepted_config,
         )
 
     @contextlib.asynccontextmanager
@@ -665,6 +742,7 @@ class TaskRuntime:
         task_id: str | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
+        accepted_config: Any = _ACCEPTED_CONFIG_UNSET,
     ) -> TaskHandle:
         """Persist and activate one direct enqueue without cancellation drift."""
 
@@ -685,6 +763,7 @@ class TaskRuntime:
             task_id=task_id,
             update_envelope_cache=update_envelope_cache,
             overflow_policy=overflow_policy,
+            accepted_config=accepted_config,
         )
         try:
             await self._storage.create_agent_task(reservation.task_record)
@@ -751,6 +830,7 @@ class TaskRuntime:
         task_id: str | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
+        accepted_config: Any = _ACCEPTED_CONFIG_UNSET,
     ) -> TaskReservation:
         """Reserve queue admission without persistence, cancellation, or execution."""
 
@@ -764,19 +844,26 @@ class TaskRuntime:
             persisted_user_message_id,
             persisted_user_message_ids,
         )
-        persisted_user_message_id = (
-            normalized_message_ids[0] if normalized_message_ids else None
-        )
+        persisted_user_message_id = normalized_message_ids[0] if normalized_message_ids else None
         message_count = max(1, int(message_count))
+        if accepted_config is _ACCEPTED_CONFIG_UNSET:
+            accepted_config = (
+                self._accepted_config_provider()
+                if self._accepted_config_provider is not None
+                else None
+            )
+        if queue_mode == QueueMode.COLLECT.value and _uses_fixed_four_tier_v2(accepted_config):
+            # Fixed-v2 owns one classification, durable request identity and
+            # provider execution per accepted input. Coalescing would bind a
+            # combined semantic prompt to only the first input anchor.
+            queue_mode = QueueMode.FOLLOWUP.value
         effective_policy = self._pending_overflow_policy
         if overflow_policy is not None:
             try:
                 effective_policy = PendingOverflowPolicy(overflow_policy)
             except ValueError as exc:
                 valid = ", ".join(member.value for member in PendingOverflowPolicy)
-                raise ValueError(
-                    f"overflow_policy must be one of {{{valid}}}"
-                ) from exc
+                raise ValueError(f"overflow_policy must be one of {{{valid}}}") from exc
 
         record_kwargs: dict[str, Any] = {}
         if task_id is not None:
@@ -823,6 +910,8 @@ class TaskRuntime:
             message_count=message_count,
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
+            accepted_config=accepted_config,
+            accepted_config_captured=True,
             primary_input_pending=bool(
                 (persisted_user_message_id or envelope.metadata.get("client_message_id"))
                 and envelope.metadata.get("turn_context_disposition", "queued") == "queued"
@@ -850,11 +939,7 @@ class TaskRuntime:
                     victim: _RuntimeTask | None = None
                     if effective_policy is PendingOverflowPolicy.DROP_OLDEST:
                         victim = next(
-                            (
-                                task
-                                for task in pending
-                                if task.status == AgentTaskStatus.QUEUED
-                            ),
+                            (task for task in pending if task.status == AgentTaskStatus.QUEUED),
                             None,
                         )
                     if victim is None:
@@ -870,9 +955,7 @@ class TaskRuntime:
                         )
                     reservation.overflow_victim = victim
                     self._reserved_overflow_victims.add(victim.task_id)
-            self._reservations_by_session.setdefault(envelope.session_key, []).append(
-                reservation
-            )
+            self._reservations_by_session.setdefault(envelope.session_key, []).append(reservation)
         return reservation
 
     async def abort_reservation(self, reservation: TaskReservation) -> None:
@@ -887,9 +970,7 @@ class TaskRuntime:
             if not reservations:
                 self._reservations_by_session.pop(reservation.session_key, None)
             if reservation.overflow_victim is not None:
-                self._reserved_overflow_victims.discard(
-                    reservation.overflow_victim.task_id
-                )
+                self._reserved_overflow_victims.discard(reservation.overflow_victim.task_id)
             reservation.aborted = True
 
     async def _emit_queued_activation(
@@ -955,14 +1036,6 @@ class TaskRuntime:
                 raise RuntimeError("Unknown task reservation")
 
             runtime_task = reservation.runtime_task
-            if not runtime_task.accepted_config_captured:
-                accepted_config = (
-                    self._accepted_config_provider()
-                    if self._accepted_config_provider is not None
-                    else None
-                )
-                runtime_task.accepted_config = accepted_config
-                runtime_task.accepted_config_captured = True
 
             reservations.remove(reservation)
             if not reservations:
@@ -988,9 +1061,7 @@ class TaskRuntime:
                     runtime_task.persisted_user_message_id
                     or runtime_task.envelope.metadata.get("client_message_id")
                 )
-                and runtime_task.envelope.metadata.get(
-                    "turn_context_disposition", "queued"
-                )
+                and runtime_task.envelope.metadata.get("turn_context_disposition", "queued")
                 == "queued"
             ):
                 runtime_task.primary_input_pending = True
@@ -1014,10 +1085,7 @@ class TaskRuntime:
             if victim is not None:
                 self._reserved_overflow_victims.discard(victim.task_id)
                 pending = self._pending_by_session.get(reservation.session_key, [])
-                if (
-                    victim.status != AgentTaskStatus.QUEUED
-                    or victim not in pending
-                ):
+                if victim.status != AgentTaskStatus.QUEUED or victim not in pending:
                     # The durable acceptance window may be long enough for the
                     # reserved victim to start running. DROP_OLDEST only evicts
                     # waiting work; once the victim has left the pending queue,
@@ -1028,9 +1096,7 @@ class TaskRuntime:
                     victim.overflow_dropped = True
 
             self._tasks[reservation.task_id] = runtime_task
-            self._pending_by_session.setdefault(reservation.session_key, []).append(
-                runtime_task
-            )
+            self._pending_by_session.setdefault(reservation.session_key, []).append(runtime_task)
             agent_id = runtime_task.envelope.agent_id
             session_key = runtime_task.envelope.session_key
             if agent_id not in self._agent_session_rr:
@@ -1042,7 +1108,9 @@ class TaskRuntime:
                 active.add(session_key)
                 rr.append(session_key)
             if reservation.update_envelope_cache:
-                self._last_envelope_by_session[session_key] = runtime_task.envelope
+                cached_envelope = _cache_safe_route_envelope(runtime_task.envelope)
+                runtime_task.cached_envelope_owner = cached_envelope
+                self._last_envelope_by_session[session_key] = cached_envelope
             runtime_task.asyncio_task = asyncio.create_task(self._execute(runtime_task))
             reservation.activated = True
             queue_depth = len(self._pending_by_session.get(session_key, []))
@@ -1233,10 +1301,7 @@ class TaskRuntime:
                 if self._tasks.get(task.task_id) is task and task.status not in TERMINAL_STATUSES
             ]
             for task in tasks:
-                if (
-                    task.status == AgentTaskStatus.QUEUED
-                    and not task.execution_started
-                ):
+                if task.status == AgentTaskStatus.QUEUED and not task.execution_started:
                     queued_tasks.append(task)
                 task.cancel_requested = True
                 task.cancel_source = _clean_cancel_detail(source, "unknown")
@@ -1282,6 +1347,7 @@ class TaskRuntime:
                 run_kind="runtime_send",
                 stream_event_sink=stream_event_sink,
             )
+        cached = _cache_safe_route_envelope(cached)
         if provenance is None:
             return await self.enqueue(
                 cached,
@@ -1521,6 +1587,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None = None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
         message_count: int = 1,
+        accepted_config: Any = _ACCEPTED_CONFIG_UNSET,
     ) -> TaskHandle | None:
         async def persist(
             handle: TaskHandle,
@@ -1587,6 +1654,7 @@ class TaskRuntime:
                 persisted_user_message_id=persisted_user_message_id,
                 persisted_user_message_ids=persisted_user_message_ids,
                 message_count=message_count,
+                accepted_config=accepted_config,
                 persist=persist,
             )
         except _CollectIdentityRebindError:
@@ -1605,9 +1673,8 @@ class TaskRuntime:
         persisted_user_message_id: str | None = None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
         message_count: int = 1,
-        persist: Callable[
-            [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
-        ],
+        accepted_config: Any = _ACCEPTED_CONFIG_UNSET,
+        persist: Callable[[TaskHandle, dict[str, Any]], Awaitable[_CollectResult]],
     ) -> tuple[TaskHandle, _CollectResult] | None:
         """Persist and apply one collect while the candidate remains queued.
 
@@ -1618,6 +1685,9 @@ class TaskRuntime:
         unchanged. Receipt replays are returned without applying the input a
         second time.
         """
+
+        if _uses_fixed_four_tier_v2(accepted_config):
+            return None
 
         operation = asyncio.create_task(
             self._try_collect_atomically_impl(
@@ -1653,9 +1723,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None,
         message_count: int,
-        persist: Callable[
-            [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
-        ],
+        persist: Callable[[TaskHandle, dict[str, Any]], Awaitable[_CollectResult]],
     ) -> tuple[TaskHandle, _CollectResult] | None:
         """Claim, persist, then apply one collection operation."""
 
@@ -1670,7 +1738,10 @@ class TaskRuntime:
                 (
                     task
                     for task in reversed(pending)
-                    if task.queue_mode == "collect" and task.status == AgentTaskStatus.QUEUED
+                    if task.queue_mode == "collect"
+                    and task.status == AgentTaskStatus.QUEUED
+                    and not _has_fixed_four_tier_one_shot_control(task.envelope)
+                    and not _uses_fixed_four_tier_v2(task.accepted_config)
                 ),
                 None,
             )
@@ -1703,9 +1774,7 @@ class TaskRuntime:
                         if candidate.semantic_message is not None
                         else candidate.message
                     )
-                    next_semantic = (
-                        semantic_message if semantic_message is not None else message
-                    )
+                    next_semantic = semantic_message if semantic_message is not None else message
                     collected_semantic_message = f"{first_semantic}\n\n{next_semantic}"
                 else:
                     collected_semantic_message = None
@@ -1713,17 +1782,11 @@ class TaskRuntime:
                     candidate.persisted_user_message_id,
                     (
                         *candidate.persisted_user_message_ids,
-                        *(
-                            [persisted_user_message_id]
-                            if persisted_user_message_id
-                            else []
-                        ),
+                        *([persisted_user_message_id] if persisted_user_message_id else []),
                         *(persisted_user_message_ids or ()),
                     ),
                 )
-                collected_message_count = candidate.message_count + max(
-                    1, int(message_count)
-                )
+                collected_message_count = candidate.message_count + max(1, int(message_count))
                 metadata = envelope.metadata
                 collected_identity: _CollectedPrimaryInput | None = None
                 if persisted_user_message_id or metadata.get("client_message_id"):
@@ -1835,8 +1898,7 @@ class TaskRuntime:
                     # follow-up can acquire the same-session execution lock.
                     # Do not publish the same transition twice at start.
                     identity_tracked = bool(
-                        task.persisted_user_message_id
-                        or metadata.get("client_message_id")
+                        task.persisted_user_message_id or metadata.get("client_message_id")
                     )
                     if turn_context["disposition"] != "promoted" and identity_tracked:
                         await self._update_transcript_turn_context(
@@ -1866,9 +1928,7 @@ class TaskRuntime:
                         ingress_pipeline_steps=task.ingress_pipeline_steps,
                         semantic_message=task.semantic_message,
                         persisted_user_message_id=task.persisted_user_message_id,
-                        persisted_user_message_ids=tuple(
-                            task.persisted_user_message_ids
-                        ),
+                        persisted_user_message_ids=tuple(task.persisted_user_message_ids),
                         fresh_user_session=task.fresh_user_session,
                         stream_event_sink=task.stream_event_sink,
                         pending_input_provider=task.pending_input_provider,
@@ -1996,7 +2056,8 @@ class TaskRuntime:
         if not items:
             return
         last = items[-1]
-        metadata = dict(completed_task.envelope.metadata)
+        base_envelope = _cache_safe_route_envelope(completed_task.envelope)
+        metadata = dict(base_envelope.metadata)
         if last.client_message_id:
             metadata["client_message_id"] = last.client_message_id
         if last.surface_id:
@@ -2010,11 +2071,9 @@ class TaskRuntime:
                 "turn_context_revision": 2,
             }
         )
-        envelope = replace(completed_task.envelope, metadata=metadata)
+        envelope = replace(base_envelope, metadata=metadata)
         message = "\n\n".join(item.text for item in items if item.text.strip())
-        semantic_parts = [
-            item.semantic_message or item.text for item in items if item.text.strip()
-        ]
+        semantic_parts = [item.semantic_message or item.text for item in items if item.text.strip()]
         try:
             handle = await self.enqueue(
                 envelope,
@@ -2404,11 +2463,7 @@ class TaskRuntime:
 
     async def _mark_running_claimed(self, task: _RuntimeTask) -> bool:
         async with self._state_lock:
-            if (
-                task.terminal_emitted
-                or task.status in TERMINAL_STATUSES
-                or task.cancel_requested
-            ):
+            if task.terminal_emitted or task.status in TERMINAL_STATUSES or task.cancel_requested:
                 return False
             task.status = AgentTaskStatus.RUNNING
             self._remove_pending(task)
@@ -2487,7 +2542,11 @@ class TaskRuntime:
             self._remove_pending(task)
             if self._running_by_session.get(task.envelope.session_key) is task:
                 self._running_by_session.pop(task.envelope.session_key, None)
-            if self._last_envelope_by_session.get(task.envelope.session_key) is task.envelope:
+            if (
+                task.cached_envelope_owner is not None
+                and self._last_envelope_by_session.get(task.envelope.session_key)
+                is task.cached_envelope_owner
+            ):
                 self._last_envelope_by_session.pop(task.envelope.session_key, None)
             # Keep the short write lock stable for this session. Popping it can
             # split callers across old/new lock objects while callbacks or
@@ -2523,9 +2582,7 @@ class TaskRuntime:
             await self._record_collected_primary_input_disposition(
                 task,
                 collected_input,
-                disposition=(
-                    "cancelled" if status == AgentTaskStatus.CANCELLED else "rejected"
-                ),
+                disposition=("cancelled" if status == AgentTaskStatus.CANCELLED else "rejected"),
                 terminal_reason=terminal_reason,
             )
         terminal_payload = {
@@ -2891,9 +2948,7 @@ class TaskRuntime:
                     task.terminal_assistant_message_content
                 )
                 if task.terminal_assistant_message_id is not None:
-                    details["terminal_assistant_message_id"] = (
-                        task.terminal_assistant_message_id
-                    )
+                    details["terminal_assistant_message_id"] = task.terminal_assistant_message_id
         else:
             turn_outcome = outcome_from_error(
                 code=terminal_reason if terminal_reason != "error" else error_class,

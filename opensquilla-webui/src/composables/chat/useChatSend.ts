@@ -3,12 +3,16 @@ import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { RpcClientError } from '@/lib/rpc'
 import type { Attachment, ChatMessage } from '@/types/chat'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import {
+  isFourTierMappingSelectionMode,
+  type ModelRoutingMode,
+} from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
 import type {
   ChatSendParams,
   ChatSendResponse,
+  ChatRoutingControl,
 } from '@/types/rpc'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type {
@@ -47,6 +51,7 @@ interface SendAttempt {
   attachments: SendableAttachment[]
   intent: string | null
   forkBeforeMessageId: string | null
+  routingControl: ChatRoutingControl | null
   params: ChatSendParams
 }
 
@@ -175,6 +180,7 @@ function matchesRecoveredDraft(
     attachments: SendableAttachment[]
     intent: string | null
     forkBeforeMessageId: string | null
+    routingControl: ChatRoutingControl | null
   },
 ): boolean {
   return (
@@ -182,6 +188,7 @@ function matchesRecoveredDraft(
     attempt.text === input.text &&
     attempt.intent === input.intent &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
+    JSON.stringify(attempt.routingControl) === JSON.stringify(input.routingControl) &&
     sameSendableAttachments(input.attachments, attempt)
   )
 }
@@ -202,12 +209,15 @@ export interface UseChatSendOptions {
   pendingQueueOwnerContext: Ref<PendingQueueOwnerContext | null>
   busySendMode: Ref<BusySendMode>
   modelRoutingMode: Readonly<Ref<ModelRoutingMode>>
+  llmEnsembleSelectionMode?: Readonly<Ref<string>>
   modelRoutingSettingsBusy: Readonly<Ref<boolean>>
   elevatedMode: Ref<string>
   runMode: Ref<SandboxRunMode>
   pendingAttachments: Ref<Attachment[]>
   pendingSessionIntent: Ref<string | null>
   pendingForkBeforeMessageId: Ref<string | null>
+  pendingRoutingControl?: Ref<ChatRoutingControl | null>
+  isFourTierMappingBranchActionBlocked?: () => boolean
   aborted: Ref<boolean>
   // Task id rendered by the live stream; a fresh turn binds it from the
   // chat.send response so a prior task's late events can't leak in (issue #344).
@@ -253,7 +263,45 @@ export function useChatSend(options: UseChatSendOptions) {
   function modelImageSendBlocked(attachments: readonly Attachment[]): boolean {
     if (!hasSendableModelInputImageAttachment(attachments)) return false
     return options.modelRoutingSettingsBusy.value
-      || options.modelRoutingMode.value === 'llm_ensemble'
+      || (
+        options.modelRoutingMode.value === 'llm_ensemble'
+        && !isFourTierMappingSelectionMode(
+          options.llmEnsembleSelectionMode?.value,
+        )
+      )
+  }
+
+  function fourTierMappingBranchPending(): boolean {
+    return Boolean(
+      options.pendingForkBeforeMessageId.value
+      && options.modelRoutingMode.value === 'llm_ensemble'
+      && isFourTierMappingSelectionMode(options.llmEnsembleSelectionMode?.value),
+    )
+  }
+
+  function fourTierMappingBranchBlocked(): boolean {
+    return Boolean(
+      fourTierMappingBranchPending()
+      && (
+        options.stream.isStreaming.value
+        || options.isCompactInFlightForCurrentSession()
+        || responseHandoffBlocksCurrentSession()
+        || options.isFourTierMappingBranchActionBlocked?.()
+      ),
+    )
+  }
+
+  function preserveBlockedFourTierMappingBranch(): boolean {
+    if (
+      fourTierMappingBranchPending()
+      && options.pendingAttachments.value.length > 0
+    ) {
+      pushToast(i18n.global.t('chat.toast.attachmentBranchUnsupported'), { tone: 'info' })
+      return true
+    }
+    if (!fourTierMappingBranchBlocked()) return false
+    pushToast(i18n.global.t('chat.toast.waitBranchIdle'), { tone: 'info' })
+    return true
   }
 
   function beginFreshStream(requestSessionKey: string): FreshSendToken {
@@ -507,6 +555,8 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
+    if (preserveBlockedFourTierMappingBranch()) return
+
     if (text.startsWith('//')) {
       isLiteralSlash = true
       text = text.slice(1)
@@ -527,6 +577,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: sendableAttachments,
         intent: options.pendingSessionIntent.value,
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
+        routingControl: options.pendingRoutingControl?.value ?? null,
       })
     ) {
       await dispatchSend(text, {
@@ -534,6 +585,30 @@ export function useChatSend(options: UseChatSendOptions) {
         queueMode: recoveredAttempt.queueMode,
       })
       return
+    }
+
+    if (recoveredAttempt) {
+      const stillMatchesRecoveredAttempt = matchesRecoveredDraft(recoveredAttempt, {
+        requestSessionKey: options.sessionKey.value,
+        text,
+        attachments: sendableAttachments,
+        intent: options.pendingSessionIntent.value,
+        forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
+        routingControl: options.pendingRoutingControl?.value ?? null,
+      })
+      if (!stillMatchesRecoveredAttempt) {
+        const staleRoutingControl = recoveredAttempt.routingControl
+        recoveredAttempt = null
+        if (
+          options.pendingRoutingControl
+          && JSON.stringify(options.pendingRoutingControl.value)
+            === JSON.stringify(staleRoutingControl)
+        ) {
+          // An edited restored redo becomes an ordinary prefix-fork edit. It
+          // must not carry the one-shot redo control to a different prompt.
+          options.pendingRoutingControl.value = null
+        }
+      }
     }
 
     const compactInFlight = options.isCompactInFlightForCurrentSession()
@@ -546,6 +621,11 @@ export function useChatSend(options: UseChatSendOptions) {
         return
       }
       if (!hasPayload) return
+      // A four-tier mapping branch is meaningful only as a direct prefix-fork send.
+      // If the session became busy between the action click and this send,
+      // queueing just the text would silently discard both the fork anchor and
+      // the one-shot redo control. Keep the complete draft intact instead.
+      if (preserveBlockedFourTierMappingBranch()) return
       // Ensemble is text-only in P0. Do not consume the draft into Queue or
       // Steer while the selected routing mode cannot accept its image blocks.
       if (modelImageSendBlocked(sendableAttachments)) return
@@ -582,6 +662,7 @@ export function useChatSend(options: UseChatSendOptions) {
   ) {
     const requestSessionKey = options.sessionKey.value
     if (!requestSessionKey) return
+    if (preserveBlockedFourTierMappingBranch()) return
     const initialSendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
@@ -595,6 +676,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: initialSendableAttachments,
         intent: options.pendingSessionIntent.value,
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
+        routingControl: options.pendingRoutingControl?.value ?? null,
       }) &&
       retryCandidate.queueMode === sendOpts?.queueMode,
     )
@@ -612,6 +694,10 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!ready) return
       if (options.sessionKey.value !== requestSessionKey) return
     }
+    // Attachment refresh and other async preparation yield to queue/session
+    // events. Recheck the complete four-tier mapping branch gate immediately before
+    // optimistic rendering or consuming any one-shot fork/control state.
+    if (preserveBlockedFourTierMappingBranch()) return
     const attachmentsToSend = retryAttempt?.attachments || options.pendingAttachments.value.filter((a): a is SendableAttachment => sendAttachmentIds.has(a.local_id) && isSendableAttachment(a))
     // Routing can change while an expiring staged upload is refreshed. Recheck
     // the authoritative live state before any visible or RPC mutation.
@@ -629,6 +715,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const userText = text
     const intent = options.pendingSessionIntent.value
     const forkBeforeMessageId = options.pendingForkBeforeMessageId.value
+    const routingControl = options.pendingRoutingControl?.value ?? null
     let attempt = retryAttempt
     if (!attempt) {
       const clientMessageId = createClientMessageId()
@@ -642,6 +729,7 @@ export function useChatSend(options: UseChatSendOptions) {
       params._source = chatSourceMetadata(options)
       if (intent) params.intent = intent
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
+      if (routingControl) params.routingControl = { ...routingControl }
       if (attachmentsToSend.length > 0) {
         params.displayText = userText
         params.attachments = attachmentsToSend.map(serializeSendableAttachment)
@@ -656,6 +744,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
         intent,
         forkBeforeMessageId,
+        routingControl,
         params,
       }
       const now = new Date().toISOString()
@@ -678,6 +767,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (options.pendingSessionIntent.value === intent) options.pendingSessionIntent.value = null
     if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
       options.pendingForkBeforeMessageId.value = null
+    }
+    if (options.pendingRoutingControl?.value === routingControl) {
+      options.pendingRoutingControl.value = null
     }
 
     // A steer send rides an already-active stream; restarting it would wipe
@@ -872,6 +964,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!options.pendingSessionIntent.value) options.pendingSessionIntent.value = attempt.intent
     if (!options.pendingForkBeforeMessageId.value) {
       options.pendingForkBeforeMessageId.value = attempt.forkBeforeMessageId
+    }
+    if (options.pendingRoutingControl && !options.pendingRoutingControl.value) {
+      options.pendingRoutingControl.value = attempt.routingControl
     }
     recoveredAttempt = attempt
     options.autoResizeTextarea()

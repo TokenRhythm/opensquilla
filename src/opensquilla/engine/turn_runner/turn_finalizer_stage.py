@@ -128,11 +128,7 @@ def _field_flag_text(field: Any, *, language: str = "zh") -> str:
     if field.required:
         return "[必填]" if language == "zh" else "[required]"
     if field.default is not None:
-        return (
-            f"（默认 {field.default}）"
-            if language == "zh"
-            else f"(default {field.default})"
-        )
+        return f"（默认 {field.default}）" if language == "zh" else f"(default {field.default})"
     return "[可选]" if language == "zh" else "[optional]"
 
 
@@ -217,6 +213,7 @@ def _field_sample_value(field: Any) -> str:
 # Ports -- four narrow Protocols
 # ---------------------------------------------------------------------------
 
+
 @runtime_checkable
 class TranscriptAppendPort(Protocol):
     """Persist the assistant turn via ``SessionManager.append_message(...)``.
@@ -244,6 +241,7 @@ class TranscriptAppendPort(Protocol):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
     ) -> TranscriptAppendResult | bool: ...
+
 
 @runtime_checkable
 class TurnMemoryCapturePort(Protocol):
@@ -349,9 +347,7 @@ def _turn_usage_payload(
     model_usage_breakdown = getattr(done_event, "model_usage_breakdown", None)
     if isinstance(model_usage_breakdown, list) and model_usage_breakdown:
         payload["model_usage_breakdown"] = [
-            dict(row)
-            for row in model_usage_breakdown
-            if isinstance(row, dict)
+            dict(row) for row in model_usage_breakdown if isinstance(row, dict)
         ]
     ensemble_trace = getattr(done_event, "ensemble_trace", None)
     if isinstance(ensemble_trace, dict) and ensemble_trace:
@@ -371,12 +367,11 @@ def _turn_usage_payload(
         payload["ensemble_calls"] = [
             deepcopy(call) for call in ensemble_calls if isinstance(call, dict)
         ]
-    physical_audit_schema = str(
-        getattr(done_event, "physical_audit_schema", "") or ""
-    ).strip()
+    physical_audit_schema = str(getattr(done_event, "physical_audit_schema", "") or "").strip()
     if physical_audit_schema:
         payload["physical_audit_schema"] = physical_audit_schema
     return payload
+
 
 @runtime_checkable
 class SessionTotalsPort(Protocol):
@@ -403,6 +398,7 @@ class SessionTotalsPort(Protocol):
         done_event: DoneEvent,
         resolved_model: str,
     ) -> CostRollupResult | None: ...
+
 
 @runtime_checkable
 class TurnErrorPersistPort(Protocol):
@@ -433,9 +429,11 @@ class _NullUsageTelemetryPort:
     async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None:
         return None
 
+
 # ---------------------------------------------------------------------------
 # Finalizer result values
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class TranscriptAppendResult:
@@ -467,9 +465,11 @@ class CostRollupResult:
     cache_write: int
     model_override: str | None
 
+
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class TurnFinalizerStageInput:
@@ -508,16 +508,22 @@ class TurnFinalizerStageInput:
     run_kind: str
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
+    # A fixed-v2 response binding that must be present on the assistant row's
+    # first durable write.  The stage merges this patch into the existing
+    # gateway-owned causal context only for the transcript append; legacy turns
+    # leave it unset and retain the exact historical call path.
+    assistant_turn_context_patch: dict[str, Any] | None = None
+
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
     """Outputs the harness applies to ``TurnContext`` after the stage runs.
 
-   Downstream consumers read ``final_text``, ``turn_segments``,
-    ``turn_artifacts``, ``error_message``, ``pending_error_event``,
-    ``done_event`` for its turn_end trace + decision entry. The
-    ``cost_rollup`` snapshot is observability-only (pinned by the
-    equivalence harness, not consumed downstream).
+    Downstream consumers read ``final_text``, ``turn_segments``,
+     ``turn_artifacts``, ``error_message``, ``pending_error_event``,
+     ``done_event`` for its turn_end trace + decision entry. The
+     ``cost_rollup`` snapshot is observability-only (pinned by the
+     equivalence harness, not consumed downstream).
     """
 
     # Heartbeat-normalized final text (the harness writes this onto
@@ -544,39 +550,41 @@ class TurnFinalizerStageOutput:
     # Did the memory capture fire?
     memory_captured: bool
 
+
 # ---------------------------------------------------------------------------
 # Outer stage class
 # ---------------------------------------------------------------------------
 
+
 class TurnFinalizerStage:
     """Persist the assistant turn, capture memory, roll up session totals.
 
-    Stable boundary: runs ONCE per turn, after StreamConsumerStage
-    exhausts (and after the harness flushes the trailing text segment),
-   . The four ports execute in the original order:
+     Stable boundary: runs ONCE per turn, after StreamConsumerStage
+     exhausts (and after the harness flushes the trailing text segment),
+    . The four ports execute in the original order:
 
-    1. Heartbeat-normalize the accumulated text.
-    2. ``TranscriptAppendPort.append_message`` (assistant turn).
-    3. ``TurnMemoryCapturePort.capture_turn`` (memory write -- wrapped
-       in log-and-continue try/except intentional).
-    4. ``TurnErrorPersistPort.persist_error`` (pending error, only if
-       ``error_message`` is truthy).
-    5. ``SessionTotalsPort.rollup`` (DoneEvent-driven session.update --
-       wrapped in log-and-continue try/except intentional).
+     1. Heartbeat-normalize the accumulated text.
+     2. ``TranscriptAppendPort.append_message`` (assistant turn).
+     3. ``TurnMemoryCapturePort.capture_turn`` (memory write -- wrapped
+        in log-and-continue try/except intentional).
+     4. ``TurnErrorPersistPort.persist_error`` (pending error, only if
+        ``error_message`` is truthy).
+     5. ``SessionTotalsPort.rollup`` (DoneEvent-driven session.update --
+        wrapped in log-and-continue try/except intentional).
 
-    The order is load-bearing: transcript persistence MUST precede
-    memory capture (memory capture reads ``final_text`` AS PERSISTED);
-    error persist MUST precede totals rollup for diagnostic ordering
-    that downstream observability relies on.
+     The order is load-bearing: transcript persistence MUST precede
+     memory capture (memory capture reads ``final_text`` AS PERSISTED);
+     error persist MUST precede totals rollup for diagnostic ordering
+     that downstream observability relies on.
 
-    Exception model: the stage does NOT wrap the ``append_message``
-    call. Any exception there propagates to the outer ``_run_turn``
-    terminal handler --. The memory-capture
-    and totals-rollup ports each have their own log-and-continue
-    try/except inside the stage body.
+     Exception model: the stage does NOT wrap the ``append_message``
+     call. Any exception there propagates to the outer ``_run_turn``
+     terminal handler --. The memory-capture
+     and totals-rollup ports each have their own log-and-continue
+     try/except inside the stage body.
 
-    No ``TurnHook.after_turn`` fan-out today; that wiring belongs in a separate
-    production hook pass.
+     No ``TurnHook.after_turn`` fan-out today; that wiring belongs in a separate
+     production hook pass.
     """
 
     name = "turn_finalizer_stage"
@@ -659,26 +667,44 @@ class TurnFinalizerStage:
             if (
                 inp.done_event is not None
                 and inp.done_event.reasoning_content
-                and _is_deepseek_model_id(
-                    inp.done_event.model or inp.resolved_model or ""
-                )
+                and _is_deepseek_model_id(inp.done_event.model or inp.resolved_model or "")
             ):
                 reasoning_content = inp.done_event.reasoning_content
-            token_count = (
-                inp.done_event.output_tokens if inp.done_event is not None else None
-            )
-            append_result = await self._transcript_append.append_message(
-                inp.session_key,
-                role="assistant",
-                content=persisted_content,
-                tool_calls=turn_segments if turn_segments else None,
-                reasoning_content=reasoning_content,
-                turn_usage=_turn_usage_payload(
-                    inp.done_event,
-                    resolved_model=inp.resolved_model,
-                ),
-                token_count=token_count,
-            )
+            token_count = inp.done_event.output_tokens if inp.done_event is not None else None
+
+            async def _append_assistant() -> TranscriptAppendResult | bool:
+                return await self._transcript_append.append_message(
+                    inp.session_key,
+                    role="assistant",
+                    content=persisted_content,
+                    tool_calls=turn_segments if turn_segments else None,
+                    reasoning_content=reasoning_content,
+                    turn_usage=_turn_usage_payload(
+                        inp.done_event,
+                        resolved_model=inp.resolved_model,
+                    ),
+                    token_count=token_count,
+                )
+
+            if inp.assistant_turn_context_patch is None:
+                append_result = await _append_assistant()
+            else:
+                # SessionManager.prepare_message() snapshots this ContextVar
+                # into the row written by append_message().  Scope the binding
+                # around the append itself so a process kill immediately after
+                # the INSERT still leaves crash recovery an exact route/response
+                # association, without leaking fixed-v2 fields to later writes.
+                from opensquilla.session.turn_context import (
+                    current_turn_context,
+                    turn_context_scope,
+                )
+
+                assistant_context = {
+                    **(current_turn_context() or {}),
+                    **inp.assistant_turn_context_patch,
+                }
+                with turn_context_scope(assistant_context):
+                    append_result = await _append_assistant()
             if isinstance(append_result, TranscriptAppendResult):
                 transcript_appended = append_result.appended
                 assistant_message_id = append_result.message_id

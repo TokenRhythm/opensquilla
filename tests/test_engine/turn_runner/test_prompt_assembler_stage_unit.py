@@ -222,6 +222,7 @@ def _make_input(
     bound_user_message_id=None,
     ingress_pipeline_steps=None,
     input_provenance=None,
+    trusted_route_metadata=None,
     skill_catalog=None,
 ):
     return PromptAssemblerStageInput(
@@ -245,6 +246,7 @@ def _make_input(
         bound_user_message_id=bound_user_message_id,
         ingress_pipeline_steps=ingress_pipeline_steps,
         input_provenance=input_provenance,
+        trusted_route_metadata=trusted_route_metadata,
         skill_catalog=skill_catalog,
     )
 
@@ -307,9 +309,7 @@ async def test_provider_name_uses_selector_registry_identity_not_adapter_family(
     adapter = _StubProvider(name="adapter", provider_name="openai")
     executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=adapter)
 
-    out = await _make_stage(executor=executor).run(
-        _make_input(cloned_selector=selector)
-    )
+    out = await _make_stage(executor=executor).run(_make_input(cloned_selector=selector))
 
     assert out.output.provider_name == "dashscope"
 
@@ -348,6 +348,18 @@ async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context
 
 
 @pytest.mark.asyncio
+async def test_prompt_assembler_forwards_bound_user_message_id_to_pipeline() -> None:
+    executor = _RecordingPipelineExecutor(
+        turn=_make_turn(),
+        provider=_StubProvider("pipeline-provider"),
+    )
+
+    await _make_stage(executor=executor).run(_make_input(bound_user_message_id="msg-bound"))
+
+    assert executor.requests[0].bound_user_message_id == "msg-bound"
+
+
+@pytest.mark.asyncio
 async def test_case02_with_tool_ctx_threads_into_pipeline() -> None:
     sentinel = object()
     executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
@@ -370,6 +382,25 @@ async def test_input_provenance_threads_into_pipeline() -> None:
     await stage.run(inp)
 
     assert executor.requests[0].input_provenance == provenance
+
+
+@pytest.mark.asyncio
+async def test_trusted_route_metadata_threads_into_pipeline_separately() -> None:
+    trusted = {
+        "fixed_four_tier_v2_control_event": "redo",
+        "fixed_four_tier_v2_redo_parent_session_id": "parent",
+    }
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+
+    await _make_stage(executor=executor).run(
+        _make_input(
+            input_provenance={"same_names_are_untrusted": True},
+            trusted_route_metadata=trusted,
+        )
+    )
+
+    assert executor.requests[0].trusted_route_metadata == trusted
+    assert executor.requests[0].input_provenance == {"same_names_are_untrusted": True}
 
 
 @pytest.mark.asyncio
@@ -440,9 +471,7 @@ async def test_blocked_cross_provider_route_resolves_primary_selector_model() ->
         provider=_StubProvider("dashscope-primary"),
     )
 
-    out = await _make_stage(executor=executor).run(
-        _make_input(cloned_selector=selector)
-    )
+    out = await _make_stage(executor=executor).run(_make_input(cloned_selector=selector))
 
     assert out.output.turn.model == "doubao-seed-1-6-251015"
     assert out.output.selector_model == "qwen3.7-plus"
@@ -543,7 +572,9 @@ async def test_case07_prompt_cache_hit_str_form() -> None:
 @pytest.mark.asyncio
 async def test_case08_no_cache() -> None:
     resolver = _RecordingPromptConfigResolver(
-        final_prompt="NOCACHE", cache_breakpoints=None, request_context_prompt=None,
+        final_prompt="NOCACHE",
+        cache_breakpoints=None,
+        request_context_prompt=None,
     )
     stage = _make_stage(resolver=resolver)
     inp = _make_input(cloned_selector=_StubSelector())
@@ -558,7 +589,8 @@ async def test_case09_model_override_at_call_site() -> None:
     overridden_provider = _StubProvider("after_override")
     selector.resolve_returns = overridden_provider
     executor = _RecordingPipelineExecutor(
-        turn=_make_turn(model=""), provider=_StubProvider("pp"),
+        turn=_make_turn(model=""),
+        provider=_StubProvider("pp"),
     )
     stage = _make_stage(executor=executor)
     inp = _make_input(cloned_selector=selector, model="claude-haiku-4.5")
@@ -568,6 +600,33 @@ async def test_case09_model_override_at_call_site() -> None:
     inner = getattr(out.output.provider, "_provider", None)
     assert inner is overridden_provider
     assert out.output.resolved_model == "claude-haiku-4.5"
+
+
+@pytest.mark.asyncio
+async def test_fixed_four_tier_final_provider_is_not_overridden_or_wrapped() -> None:
+    selector = _StubSelector("selector", current_model="primary-model")
+    fixed_provider = _StubProvider("fixed-provider")
+    executor = _RecordingPipelineExecutor(
+        turn=_make_turn(
+            metadata={
+                "_fixed_four_tier_v2_provider_finalized": True,
+                "_router_single_provider_finalized": True,
+            },
+            model="fixed-model",
+        ),
+        provider=fixed_provider,
+    )
+
+    outcome = await _make_stage(executor=executor).run(
+        _make_input(
+            cloned_selector=selector,
+            model="caller-explicit-model",
+        )
+    )
+
+    assert selector.overridden_models == []
+    assert outcome.output.provider is fixed_provider
+    assert outcome.output.resolved_model == "fixed-model"
 
 
 @pytest.mark.asyncio
@@ -635,7 +694,8 @@ async def test_no_cloned_selector_skips_selector_block() -> None:
     """When ``cloned_selector`` is None, no override / no fallback wrap."""
     in_provider = _StubProvider("input_provider")
     executor = _RecordingPipelineExecutor(
-        turn=_make_turn(), provider=_StubProvider("pp"),
+        turn=_make_turn(),
+        provider=_StubProvider("pp"),
     )
     stage = _make_stage(executor=executor)
     inp = _make_input(provider=in_provider, cloned_selector=None)
@@ -658,8 +718,13 @@ async def test_skill_catalog_is_forwarded_to_pipeline_unchanged() -> None:
 
 def test_run_pipeline_request_is_frozen() -> None:
     req = RunPipelineRequest(
-        runtime_message="m", session_key="s", provider=None,
-        cloned_selector=None, tool_defs=[], base_prompt="b", attachments=[],
+        runtime_message="m",
+        session_key="s",
+        provider=None,
+        cloned_selector=None,
+        tool_defs=[],
+        base_prompt="b",
+        attachments=[],
     )
     with pytest.raises(Exception):  # noqa: BLE001 - dataclass FrozenInstanceError
         req.runtime_message = "x"  # type: ignore[misc]

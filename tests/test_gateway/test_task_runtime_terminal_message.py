@@ -325,22 +325,24 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
             heartbeat_interval=0.0,
         )
 
-    assert emitted == [
-        (
-            "agent:main:test",
-            "session.event.error",
-            {
-                "message": "The task timed out before it could finish.",
-                "code": "iteration_timeout",
-                # Additive wire field: durable turn_errors reference id
-                # (empty when no record was written for this error).
-                "error_id": "",
-                "terminal_message": "The task timed out before it could finish.",
-                "terminal_reason": "timeout",
-                "error_message": "The task timed out before it could finish.",
-            },
-        )
-    ]
+    assert len(emitted) == 1
+    session_key, event_name, payload = emitted[0]
+    assert session_key == "agent:main:test"
+    assert event_name == "session.event.error"
+    assert payload["message"] == "The task timed out before it could finish."
+    assert payload["code"] == "iteration_timeout"
+    assert payload["error_id"] == ""
+    assert payload["terminal_message"] == "The task timed out before it could finish."
+    assert payload["terminal_reason"] == "timeout"
+    assert payload["error_message"] == "The task timed out before it could finish."
+    # Additive execution/audit fields remain explicit even when the provider
+    # request and usage status are unknown for a local iteration timeout.
+    assert payload["request_started"] is None
+    assert payload["physical_request_count"] is None
+    assert payload["input_tokens"] == 0
+    assert payload["output_tokens"] == 0
+    assert payload["billed_cost"] == 0.0
+    assert payload["cost_source"] == "none"
 
 
 @pytest.mark.asyncio

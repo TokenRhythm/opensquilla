@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import JSON, Column
+from sqlalchemy import JSON, Column, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -250,6 +250,95 @@ class SessionContextState(SQLModel, table=True):
     invalid_reason: str | None = None
 
     # Schema generation (S-MIGRATE).
+    schema_version: int = 1
+
+
+class FixedFourTierState(SQLModel, table=True):
+    """Authoritative per-session semantic state for fixed-four-tier v2."""
+
+    __tablename__ = "fixed_four_tier_states"
+
+    session_id: str = Field(primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    session_epoch: int = 0
+    version: int = 0
+    task_id: str
+    tier: str
+    task_turn_count: int = 0
+    task_start_input_message_id: str | None = None
+    last_request_id: str | None = None
+    last_route_id: str | None = None
+    updated_at_ms: int = Field(default_factory=_now_ms)
+    schema_version: int = 1
+
+
+class FixedFourTierRequestClaim(SQLModel, table=True):
+    """Idempotency lease acquired before a fixed-v2 classification runs."""
+
+    __tablename__ = "fixed_four_tier_request_claims"
+    __table_args__ = (
+        UniqueConstraint("session_id", "request_id", name="uq_fixed_four_tier_claim_request"),
+    )
+
+    claim_id: str = Field(primary_key=True)
+    session_id: str = Field(index=True)
+    session_key: str = Field(index=True, max_length=512)
+    session_epoch: int = 0
+    request_id: str = Field(index=True)
+    execution_id: str = Field(index=True)
+    input_message_id: str = Field(index=True)
+    claimed_at_ms: int = Field(default_factory=_now_ms)
+    updated_at_ms: int = Field(default_factory=_now_ms)
+    lease_expires_at_ms: int
+    status: str = "claimed"
+    route_id: str | None = Field(default=None, index=True)
+    terminal_at_ms: int | None = None
+    error_code: str | None = None
+    schema_version: int = 1
+
+
+class FixedFourTierDecisionRecord(SQLModel, table=True):
+    """Durable classified route and execution settlement for fixed v2."""
+
+    __tablename__ = "fixed_four_tier_decisions"
+
+    route_id: str = Field(primary_key=True)
+    session_id: str = Field(index=True)
+    session_key: str = Field(index=True, max_length=512)
+    session_epoch: int = 0
+    claim_id: str = Field(index=True)
+    request_id: str = Field(index=True)
+    execution_id: str = Field(index=True)
+    input_message_id: str = Field(index=True)
+    task_id: str
+    redo_parent_route_id: str | None = None
+    decided_at_ms: int = Field(default_factory=_now_ms)
+    updated_at_ms: int = Field(default_factory=_now_ms)
+    intent: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    tier: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    previous_tier: str | None = None
+    final_tier: str
+    task_turn_index: int = 0
+    task_start_input_message_id: str | None = None
+    context_action: str
+    state_version_before: int | None = None
+    state_version_after: int | None = None
+    selected_provider: str | None = None
+    selected_model: str | None = None
+    reasoning: str | None = None
+    deployment_version: str | None = None
+    config_version: str | None = None
+    executed_provider: str | None = None
+    executed_model: str | None = None
+    executed_deployment_version: str | None = None
+    usage_summary: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    preflight_status: str = "pending"
+    state_committed: bool = False
+    execution_status: str = "pending"
+    response_id: str | None = None
+    error_code: str | None = None
+    terminal_at_ms: int | None = None
+    route_trace: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     schema_version: int = 1
 
 

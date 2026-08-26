@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 # ``None`` and the pipeline branches on truthiness internally.
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RunPipelineRequest:
     """Typed input for ``PipelineExecutionPort.run_pipeline``.
@@ -80,6 +81,9 @@ class RunPipelineRequest:
     usage_execution_context: Any | None = None
     turn_absolute_deadline: float | None = None
     explicit_model: str | None = None
+    bound_user_message_id: str | None = None
+    trusted_route_metadata: dict[str, Any] | None = None
+
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -87,6 +91,7 @@ class RunPipelineRequest:
 # concrete TurnRunner methods (or to the module-level helper for prompt
 # report).
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class PromptAssemblerPort(Protocol):
@@ -110,6 +115,7 @@ class PromptAssemblerPort(Protocol):
         fresh_user_session: bool = False,
     ) -> str | tuple[str, str]: ...
 
+
 @runtime_checkable
 class PipelineExecutionPort(Protocol):
     """Wraps ``TurnRunner._run_pipeline``.
@@ -125,6 +131,7 @@ class PipelineExecutionPort(Protocol):
         self,
         request: RunPipelineRequest,
     ) -> tuple[Any, Any]: ...
+
 
 @runtime_checkable
 class RouterContextPort(Protocol):
@@ -145,6 +152,7 @@ class RouterContextPort(Protocol):
         bound_user_message_id: str | None = None,
     ) -> dict[str, Any]: ...
 
+
 @runtime_checkable
 class PromptConfigResolverPort(Protocol):
     """Wraps ``TurnRunner._resolve_prompt_config``.
@@ -157,6 +165,7 @@ class PromptConfigResolverPort(Protocol):
         self,
         turn: Any,
     ) -> tuple[str, list[Any] | None, str | None]: ...
+
 
 @runtime_checkable
 class PromptReportBuilderPort(Protocol):
@@ -181,6 +190,7 @@ class PromptReportBuilderPort(Protocol):
         tool_profile: str | None,
     ) -> PromptReport: ...
 
+
 @runtime_checkable
 class SessionIdResolverPort(Protocol):
     """Wraps ``TurnRunner._resolve_session_id_for_log``.
@@ -195,6 +205,7 @@ class SessionIdResolverPort(Protocol):
         session_key: str,
     ) -> str | None: ...
 
+
 @runtime_checkable
 class MemoryFingerprintPort(Protocol):
     """Wraps ``TurnRunner._config.memory_mode_fingerprint`` if present.
@@ -206,9 +217,11 @@ class MemoryFingerprintPort(Protocol):
 
     def memory_mode_fingerprint(self) -> dict[str, str] | None: ...
 
+
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses (frozen)
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class PromptAssemblerStageInput:
@@ -246,9 +259,11 @@ class PromptAssemblerStageInput:
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     normalization_metadata: dict[str, Any] | None = None
     input_provenance: dict[str, Any] | str | None = None
+    trusted_route_metadata: dict[str, Any] | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
     turn_absolute_deadline: float | None = None
+
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -299,9 +314,11 @@ class PromptAssemblerStageOutput:
     selector_model: str
     squilla_router_tier: Any = None
 
+
 # ---------------------------------------------------------------------------
 # Stage
 # ---------------------------------------------------------------------------
+
 
 class PromptAssemblerStage:
     """Assemble identity prompt + run pre-turn pipeline + finalize prompt.
@@ -377,17 +394,13 @@ class PromptAssemblerStage:
         # 2. Fetch router context (transcript-driven)
         router_context = await self._router_context.fetch_router_context(
             inp.session_key,
-            exclude_last_user=(
-                inp.history_has_persisted_user or inp.persist_input
-            ),
+            exclude_last_user=(inp.history_has_persisted_user or inp.persist_input),
             bound_user_message_id=inp.bound_user_message_id,
         )
 
         raw_history_image_turn_count = router_context.get("history_image_turn_count")
         history_image_turn_count = (
-            raw_history_image_turn_count
-            if isinstance(raw_history_image_turn_count, int)
-            else 0
+            raw_history_image_turn_count if isinstance(raw_history_image_turn_count, int) else 0
         )
         raw_vision_sticky_remaining = router_context.get("vision_sticky_remaining")
         vision_sticky_remaining = (
@@ -412,9 +425,7 @@ class PromptAssemblerStage:
         )
         raw_last_image_turn_text = router_context.get("last_image_turn_text")
         last_image_turn_text = (
-            raw_last_image_turn_text
-            if isinstance(raw_last_image_turn_text, str)
-            else None
+            raw_last_image_turn_text if isinstance(raw_last_image_turn_text, str) else None
         )
 
         # 3. Run pre-turn pipeline (model routing, skills, prompt cache, etc.)
@@ -445,6 +456,8 @@ class PromptAssemblerStage:
             usage_execution_context=inp.usage_execution_context,
             turn_absolute_deadline=inp.turn_absolute_deadline,
             explicit_model=inp.model,
+            bound_user_message_id=inp.bound_user_message_id,
+            trusted_route_metadata=inp.trusted_route_metadata,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 
@@ -457,14 +470,16 @@ class PromptAssemblerStage:
         if fingerprint is not None:
             prompt_fingerprint = turn.metadata.get("memory_mode_fingerprint")
             if isinstance(prompt_fingerprint, dict):
-                fingerprint.update(
-                    {str(k): str(v) for k, v in prompt_fingerprint.items()}
-                )
+                fingerprint.update({str(k): str(v) for k, v in prompt_fingerprint.items()})
             turn.metadata["memory_mode_fingerprint"] = fingerprint
 
         # 6. Effective runtime message + selector override / fallback wrap
         effective_runtime_message = getattr(turn, "message", inp.runtime_message)
-        if inp.model and inp.cloned_selector is not None:
+        if (
+            inp.model
+            and inp.cloned_selector is not None
+            and turn.metadata.get("_fixed_four_tier_v2_provider_finalized") is not True
+        ):
             from opensquilla.engine.selector_override import apply_model_override
 
             # An explicit model overrides the routed choice, so the turn
@@ -517,9 +532,7 @@ class PromptAssemblerStage:
         selector_model = ""
         if inp.cloned_selector is not None:
             try:
-                selector_model = (
-                    getattr(inp.cloned_selector.current_config, "model", "") or ""
-                )
+                selector_model = getattr(inp.cloned_selector.current_config, "model", "") or ""
             except Exception:  # noqa: BLE001 - defensive
                 selector_model = ""
         # ``turn.model`` is the router's requested model.  When a
@@ -548,15 +561,12 @@ class PromptAssemblerStage:
             if not selector_provider_id:
                 try:
                     selector_provider_id = str(
-                        getattr(inp.cloned_selector.current_config, "provider", "")
-                        or ""
+                        getattr(inp.cloned_selector.current_config, "provider", "") or ""
                     ).strip()
                 except Exception:  # noqa: BLE001 - telemetry fallback only
                     selector_provider_id = ""
         provider_name = (
-            selector_provider_id
-            or configured_provider_id(provider)
-            or type(provider).__name__
+            selector_provider_id or configured_provider_id(provider) or type(provider).__name__
         )
 
         return StageOutcome.success(

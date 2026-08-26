@@ -1377,6 +1377,79 @@ async def _finish_required_cancel_cleanup(awaitable: Awaitable[Any]) -> Any:
     return task.result()
 
 
+def _fixed_route_visible_transcript_text(role: str, content: Any) -> str:
+    """Return classifier-safe visible text from one persisted transcript row."""
+
+    from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
+
+    text = str(content or "")
+    if text.lstrip().startswith("{"):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, Mapping):
+            visible = payload.get("text")
+            is_user_envelope = role == "user" and "attachments" in payload
+            is_assistant_envelope = role == "assistant" and "artifacts" in payload
+            if isinstance(visible, str) and (is_user_envelope or is_assistant_envelope):
+                text = visible
+    if role == "user":
+        text = TIME_PREFIX_RE.sub("", text, count=1)
+    return text.strip()
+
+
+_FIXED_ROUTE_NATIVE_USAGE_SENSITIVE_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "cookie",
+        "credentials",
+        "headers",
+        "messages",
+        "prompt",
+        "request",
+        "request_body",
+        "request_id",
+        "access_token",
+        "refresh_token",
+        "secret",
+    }
+)
+
+
+def _fixed_route_provider_native_usage(value: Any, *, depth: int = 0) -> Any:
+    """Bound and redact provider-native usage evidence for route audit."""
+
+    if depth > 6:
+        return None
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:128]:
+            key = str(raw_key)
+            normalized = key.strip().casefold().replace("-", "_")
+            if normalized in _FIXED_ROUTE_NATIVE_USAGE_SENSITIVE_KEYS or any(
+                marker in normalized
+                for marker in ("api_key", "authorization", "credential", "secret")
+            ):
+                continue
+            sanitized[key] = _fixed_route_provider_native_usage(
+                raw_value,
+                depth=depth + 1,
+            )
+        return sanitized
+    if isinstance(value, list | tuple):
+        return [
+            _fixed_route_provider_native_usage(item, depth=depth + 1) for item in list(value)[:128]
+        ]
+    if isinstance(value, str):
+        return value[:4096]
+    if value is None or isinstance(value, bool | int | float):
+        return copy.deepcopy(value)
+    return None
+
+
 def _should_add_artifact_delivery_failure_notice(
     *,
     failure_summaries: list[str],
@@ -1972,6 +2045,8 @@ class _RouterSingleDirectProvider:
         absolute_deadline: float | None,
         frozen_catalog: Mapping[str, Any],
         enforces_routed_thinking_policy: bool,
+        turn_metadata: dict[str, Any] | None = None,
+        deployment_version: str | None = None,
         cache_affinity_context: _RouterDynamicCacheAffinityCollectionContext | None = None,
         cache_affinity_receipt_sink: (
             Callable[[_RouterDynamicCacheAffinityReceiptBatch], None] | None
@@ -1990,6 +2065,8 @@ class _RouterSingleDirectProvider:
         self._absolute_deadline = absolute_deadline
         self._router_single_frozen_catalog = dict(frozen_catalog)
         self._enforces_routed_thinking_policy = bool(enforces_routed_thinking_policy)
+        self._turn_metadata = turn_metadata
+        self._deployment_version = str(deployment_version or "").strip() or None
         self._cache_affinity_context = cache_affinity_context
         self._cache_affinity_receipt_sink = cache_affinity_receipt_sink
         self._cache_affinity_generation_getter = cache_affinity_generation_getter
@@ -1997,6 +2074,13 @@ class _RouterSingleDirectProvider:
         self._cache_affinity_credential_namespace_token = cache_affinity_credential_namespace_token
         self._cache_affinity_chat_sequence = 0
         self._local_dispatch_blocked = False
+        # Route-level physical evidence spans every Agent chat iteration (for
+        # example an initial tool-use response followed by the final answer).
+        # It is monotonic: a later local/zero-request failure cannot erase an
+        # earlier confirmed provider call.
+        self._fixed_route_confirmed_physical_requests = 0
+        self._fixed_route_executed_provider: str | None = None
+        self._fixed_route_executed_model: str | None = None
         self._upstream = canonicalize_provider_routing_upstream(
             provider_config.provider_routing.get(provider_config.model, "")
         )
@@ -2005,6 +2089,22 @@ class _RouterSingleDirectProvider:
             self.active_model_id,
             self._upstream,
         )
+
+    def _update_fixed_route_dispatch(self, **updates: Any) -> None:
+        metadata = self._turn_metadata
+        if metadata is None:
+            return
+        trace_value = metadata.get("fixed_four_tier_v2_decision")
+        if not isinstance(trace_value, Mapping):
+            return
+        trace = copy.deepcopy(dict(trace_value))
+        dispatch_value = trace.get("dispatch")
+        dispatch = (
+            copy.deepcopy(dict(dispatch_value)) if isinstance(dispatch_value, Mapping) else {}
+        )
+        dispatch.update(updates)
+        trace["dispatch"] = dispatch
+        metadata["fixed_four_tier_v2_decision"] = trace
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -2272,6 +2372,21 @@ class _RouterSingleDirectProvider:
             return
         if admission.get("allowed") is not True:
             self._local_dispatch_blocked = True
+            rejected_updates: dict[str, Any] = {
+                "health_admission": "rejected",
+                "health_reason": str(admission.get("reason") or "unknown"),
+                "last_call_request_started": False,
+                "last_call_physical_request_count": 0,
+                "execution_evidence": "health_admission_rejected",
+            }
+            if self._fixed_route_confirmed_physical_requests == 0:
+                rejected_updates.update(
+                    physical_request_started=False,
+                    physical_request_count=0,
+                    executed_provider=None,
+                    executed_model=None,
+                )
+            self._update_fixed_route_dispatch(**rejected_updates)
             yield ProviderErrorEvent(
                 message="router_single selected deployment is not healthy",
                 code=str(admission.get("reason") or "router_single_health_admission_rejected"),
@@ -2280,9 +2395,18 @@ class _RouterSingleDirectProvider:
             )
             return
 
+        self._update_fixed_route_dispatch(
+            health_admission="allowed",
+            health_reason=str(admission.get("reason") or "allowed"),
+            last_call_request_started=False,
+            last_call_physical_request_count=0,
+        )
+
         stream: Any = None
         settled = False
         physical_started = False
+        audit_physical_started: bool | None = False
+        audit_physical_count = 0
         close_attempted = False
         close_proven = False
         terminal_event: Any = None
@@ -2310,6 +2434,129 @@ class _RouterSingleDirectProvider:
                 isinstance(count, int) and not isinstance(count, bool) and count == 0
             )
             return event.request_started is False and valid_zero_count
+
+        def record_dispatch_evidence(event: Any) -> None:
+            """Update audit identity only from an observed provider event."""
+
+            nonlocal audit_physical_count, audit_physical_started
+
+            def confirm_physical_requests(count: int) -> int:
+                """Merge per-chat evidence into the monotonic route total."""
+
+                nonlocal audit_physical_count
+                confirmed = max(1, count)
+                if confirmed > audit_physical_count:
+                    self._fixed_route_confirmed_physical_requests += (
+                        confirmed - audit_physical_count
+                    )
+                    audit_physical_count = confirmed
+                return self._fixed_route_confirmed_physical_requests
+
+            def retain_or_clear_route_identity() -> dict[str, Any]:
+                if self._fixed_route_confirmed_physical_requests > 0:
+                    return {
+                        "physical_request_started": True,
+                        "physical_request_count": (self._fixed_route_confirmed_physical_requests),
+                        "executed_provider": self._fixed_route_executed_provider,
+                        "executed_model": self._fixed_route_executed_model,
+                    }
+                if self._turn_metadata is not None:
+                    self._turn_metadata.pop("executed_provider", None)
+                    self._turn_metadata.pop("executed_model", None)
+                return {
+                    "physical_request_started": False,
+                    "physical_request_count": 0,
+                    "executed_provider": None,
+                    "executed_model": None,
+                }
+
+            if isinstance(event, ProviderErrorEvent):
+                if explicit_zero_request_error(event):
+                    audit_physical_started = False
+                    self._update_fixed_route_dispatch(
+                        **retain_or_clear_route_identity(),
+                        last_call_request_started=False,
+                        last_call_physical_request_count=0,
+                        execution_evidence="provider_zero_request_error",
+                    )
+                    return
+                count = event.physical_request_count
+                if event.request_started is True or (
+                    isinstance(count, int) and not isinstance(count, bool) and count > 0
+                ):
+                    confirmed_count = count if isinstance(count, int) and count > 0 else 1
+                    audit_physical_started = True
+                    route_count = confirm_physical_requests(confirmed_count)
+                    executed_provider = str(
+                        getattr(event, "provider", "") or self.active_provider_id
+                    )
+                    executed_model = str(getattr(event, "model", "") or self.active_model_id)
+                    self._fixed_route_executed_provider = executed_provider
+                    self._fixed_route_executed_model = executed_model
+                    if self._turn_metadata is not None:
+                        self._turn_metadata["executed_provider"] = executed_provider
+                        self._turn_metadata["executed_model"] = executed_model
+                    self._update_fixed_route_dispatch(
+                        physical_request_started=True,
+                        physical_request_count=route_count,
+                        last_call_request_started=True,
+                        last_call_physical_request_count=confirmed_count,
+                        execution_evidence="provider_error_request_started",
+                        executed_provider=executed_provider,
+                        executed_model=executed_model,
+                    )
+                    return
+                audit_physical_started = None
+                unknown_updates: dict[str, Any] = {
+                    "last_call_request_started": None,
+                    "last_call_physical_request_count": None,
+                    "execution_evidence": "provider_error_request_unknown",
+                }
+                if self._fixed_route_confirmed_physical_requests == 0:
+                    if self._turn_metadata is not None:
+                        self._turn_metadata.pop("executed_provider", None)
+                        self._turn_metadata.pop("executed_model", None)
+                    unknown_updates.update(
+                        physical_request_started=None,
+                        physical_request_count=None,
+                        executed_provider=None,
+                        executed_model=None,
+                    )
+                self._update_fixed_route_dispatch(
+                    **unknown_updates,
+                )
+                return
+            event_kind = str(getattr(event, "kind", "") or "")
+            if event_kind not in {
+                "text_delta",
+                "reasoning_delta",
+                "tool_use_start",
+                "tool_use_delta",
+                "tool_use_end",
+                "done",
+            }:
+                return
+            audit_physical_started = True
+            route_count = confirm_physical_requests(1)
+            executed_provider = str(getattr(event, "provider", "") or self.active_provider_id)
+            executed_model = str(getattr(event, "model", "") or self.active_model_id)
+            self._fixed_route_executed_provider = executed_provider
+            self._fixed_route_executed_model = executed_model
+            if self._turn_metadata is not None:
+                self._turn_metadata["executed_provider"] = executed_provider
+                self._turn_metadata["executed_model"] = executed_model
+            self._update_fixed_route_dispatch(
+                physical_request_started=True,
+                physical_request_count=route_count,
+                last_call_request_started=True,
+                last_call_physical_request_count=audit_physical_count,
+                execution_evidence=f"provider_{event_kind}",
+                executed_provider=executed_provider,
+                executed_model=executed_model,
+                requested_deployment_version=self._deployment_version,
+                executed_deployment_version=None,
+                deployment_version_attested=False,
+            )
 
         async def close_once(*, require_aclose: bool) -> bool:
             nonlocal close_attempted, close_proven
@@ -2353,12 +2600,33 @@ class _RouterSingleDirectProvider:
                     # Crossing the first __anext__ boundary is the earliest
                     # reliable evidence that a lazy provider may have started
                     # its physical request.
-                    physical_started = True
+                    if not physical_started:
+                        physical_started = True
+                        awaiting_updates: dict[str, Any] = {
+                            "health_admission": "allowed",
+                            "last_call_request_started": None,
+                            "last_call_physical_request_count": None,
+                            "execution_evidence": "awaiting_first_provider_event",
+                            "requested_deployment_version": self._deployment_version,
+                            "executed_deployment_version": None,
+                            "deployment_version_attested": False,
+                        }
+                        if self._fixed_route_confirmed_physical_requests == 0:
+                            awaiting_updates.update(
+                                physical_request_started=None,
+                                physical_request_count=None,
+                                executed_provider=None,
+                                executed_model=None,
+                            )
+                        self._update_fixed_route_dispatch(
+                            **awaiting_updates,
+                        )
                     try:
                         event = await iterator.__anext__()
                     except StopAsyncIteration:
                         stream_boundary_observed = True
                         return
+                    record_dispatch_evidence(event)
                     is_terminal = isinstance(event, ProviderErrorEvent) or (
                         getattr(event, "kind", "") == "done"
                     )
@@ -2397,9 +2665,27 @@ class _RouterSingleDirectProvider:
                     timeout_event = ProviderErrorEvent(
                         message="router_single absolute deadline expired",
                         code="router_single_absolute_deadline",
+                        # Conservative operational evidence retained for
+                        # retry/cleanup governance. The fixed-route audit below
+                        # separately records unknown until a provider event
+                        # proves a physical request.
                         request_started=physical_started,
                         physical_request_count=1 if physical_started else 0,
                     )
+                    if audit_physical_started is not True:
+                        timeout_updates: dict[str, Any] = {
+                            "last_call_request_started": None,
+                            "last_call_physical_request_count": None,
+                            "execution_evidence": "provider_timeout_request_unknown",
+                        }
+                        if self._fixed_route_confirmed_physical_requests == 0:
+                            timeout_updates.update(
+                                physical_request_started=None,
+                                physical_request_count=None,
+                                executed_provider=None,
+                                executed_model=None,
+                            )
+                        self._update_fixed_route_dispatch(**timeout_updates)
                     await close_once(require_aclose=physical_started)
                     if physical_started and not settled:
                         # The absolute deadline cancelled an in-flight physical
@@ -2501,6 +2787,27 @@ class _RouterSingleDirectProvider:
                         )
                     yield terminal_event
         except Exception:
+            if audit_physical_started is not True:
+                audit_physical_started = None
+                if (
+                    self._fixed_route_confirmed_physical_requests == 0
+                    and self._turn_metadata is not None
+                ):
+                    self._turn_metadata.pop("executed_provider", None)
+                    self._turn_metadata.pop("executed_model", None)
+                exception_updates: dict[str, Any] = {
+                    "last_call_request_started": None,
+                    "last_call_physical_request_count": None,
+                    "execution_evidence": "provider_stream_exception_unknown",
+                }
+                if self._fixed_route_confirmed_physical_requests == 0:
+                    exception_updates.update(
+                        physical_request_started=None,
+                        physical_request_count=None,
+                        executed_provider=None,
+                        executed_model=None,
+                    )
+                self._update_fixed_route_dispatch(**exception_updates)
             if physical_started and not settled:
                 try:
                     await close_once(require_aclose=True)
@@ -4153,6 +4460,10 @@ class TurnRunner:
         # It stores route identifiers only; prompt and candidate content never
         # enter this cache.
         self._router_dynamic_last_routes: dict[str, dict[str, Any]] = {}
+        # Stateless classifier facades keyed by accepted four_tier_mapping config hash.
+        # Durable task state lives in the session DB, never in this cache.
+        self._fixed_four_tier_v2_router_lock = threading.Lock()
+        self._fixed_four_tier_v2_routers: OrderedDict[str, Any] = OrderedDict()
         # Optional KV-affinity evidence is intentionally isolated from B5 route
         # continuity. Both containers are process-local and non-persistent, but
         # this state is epoch/topology keyed and never enters TurnContext metadata.
@@ -4277,6 +4588,45 @@ class TurnRunner:
         # config object in accepted_turn_config_scope().
         return accepted
 
+    def _fixed_four_tier_v2_router_for_config(self, ensemble_cfg: Any) -> Any:
+        """Return the mock router bound to one accepted configuration snapshot."""
+
+        from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierV2Router
+
+        route_cfg = getattr(ensemble_cfg, "four_tier_mapping", None)
+        if route_cfg is None:
+            raise RuntimeError("four_tier_mapping configuration is unavailable")
+        dump = getattr(route_cfg, "model_dump", None)
+        payload = dump(mode="json") if callable(dump) else vars(route_cfg)
+        config_hash = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        with self._fixed_four_tier_v2_router_lock:
+            router = self._fixed_four_tier_v2_routers.pop(config_hash, None)
+            if router is None:
+                default_tier = cast(
+                    Any,
+                    str(getattr(route_cfg, "default_new_task_tier", "c1") or "c1"),
+                )
+                router = FixedFourTierV2Router(
+                    mock_seed=getattr(route_cfg, "mock_seed", None),
+                    default_new_task_tier=default_tier,
+                    intent_min_confidence=float(getattr(route_cfg, "intent_min_confidence", 0.5)),
+                    tier_min_confidence=float(getattr(route_cfg, "tier_min_confidence", 0.5)),
+                    min_margin=float(getattr(route_cfg, "min_margin", 0.05)),
+                    policy_config=payload,
+                )
+            self._fixed_four_tier_v2_routers[config_hash] = router
+            while len(self._fixed_four_tier_v2_routers) > 8:
+                self._fixed_four_tier_v2_routers.popitem(last=False)
+            return router
+
     def _persistent_canary_rollout_ledger(self, turn_config: Any) -> Any | None:
         """Return the runner-owned ledger only for explicit live enablement."""
 
@@ -4342,6 +4692,7 @@ class TurnRunner:
     def clear_compaction_turn_state(self, session_key: str) -> None:
         self._turn_compaction_attempted_sessions.discard(session_key)
         self._turn_compacted_sessions.discard(session_key)
+        self._emergency_compaction_overrides.pop(session_key, None)
 
     def _previous_router_dynamic_route(self, session_key: str) -> dict[str, Any] | None:
         route = self._router_dynamic_last_routes.pop(session_key, None)
@@ -5679,6 +6030,7 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
+        trusted_route_metadata: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5694,6 +6046,9 @@ class TurnRunner:
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
+        trusted_route_metadata_snapshot = (
+            dict(trusted_route_metadata) if isinstance(trusted_route_metadata, Mapping) else None
+        )
         lock = self.get_session_lock(session_key)
         effective_tool_context = replace(
             tool_context,
@@ -5745,6 +6100,7 @@ class TurnRunner:
                     router_control_replay_depth=router_control_replay_depth,
                     bound_user_message_id=bound_user_message_id,
                     assistant_message_sink=assistant_message_sink,
+                    trusted_route_metadata=trusted_route_metadata_snapshot,
                 ):
                     yield event
             finally:
@@ -5788,6 +6144,7 @@ class TurnRunner:
                         router_control_replay_depth=router_control_replay_depth,
                         bound_user_message_id=bound_user_message_id,
                         assistant_message_sink=assistant_message_sink,
+                        trusted_route_metadata=trusted_route_metadata_snapshot,
                     ):
                         yield event
                 finally:
@@ -5826,6 +6183,7 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
+        trusted_route_metadata: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
@@ -5855,6 +6213,9 @@ class TurnRunner:
         # CancelledError handler can flush a trailing text segment the same way
         # the normal-completion path does.
         current_text_parts: list[str] = []
+        # Preserve provider usage for cancellation/exception settlement when a
+        # later finalizer operation fails after Done was already observed.
+        done_event: DoneEvent | None = None
         self._emit_turn_event(
             "turn_start",
             trace_context,
@@ -5987,6 +6348,7 @@ class TurnRunner:
                         skill_catalog=skill_catalog,
                         usage_execution_context=pipeline_usage_context,
                         turn_absolute_deadline=turn_absolute_deadline,
+                        trusted_route_metadata=trusted_route_metadata,
                     )
                 )
             pa_out = pa_outcome.require_output()
@@ -6388,7 +6750,6 @@ class TurnRunner:
             # CancelledError handler below still sees them.
             error_message: str | None = None
             pending_error_event: ErrorEvent | None = None
-            done_event: DoneEvent | None = None
             turn_input = att_out.turn_input
 
             stream_state = _StreamState(
@@ -6515,6 +6876,18 @@ class TurnRunner:
                 turn_segments.append({"type": "text", "text": "".join(current_text_parts)})
                 current_text_parts.clear()
 
+            terminal_error_code = str(getattr(pending_error_event, "code", "") or "") or None
+            if terminal_error_code is None and error_message:
+                terminal_error_code = "stream_failed"
+            terminal_execution_status = (
+                "failed" if pending_error_event is not None or bool(error_message) else "succeeded"
+            )
+            assistant_turn_context_patch = self._fixed_four_tier_v2_response_binding_context(
+                turn,
+                execution_status=terminal_execution_status,
+                error_code=terminal_error_code,
+            )
+
             # 10. Persist assistant response (filter sentinel tokens).
             # TurnFinalizerStage owns the slice. The four side effects
             # fire in legacy order: heartbeat normalize -> transcript
@@ -6538,11 +6911,20 @@ class TurnRunner:
                     run_kind=run_kind,
                     heartbeat_ack_max_chars=heartbeat_ack_max_chars,
                     no_memory_capture=no_memory_capture,
+                    assistant_turn_context_patch=assistant_turn_context_patch,
                 )
             )
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
+            await self._settle_fixed_four_tier_v2_route(
+                turn,
+                execution_status=terminal_execution_status,
+                response_id=fin_out.assistant_message_id,
+                error_code=terminal_error_code,
+                done_event=done_event,
+                required=True,
+            )
             if (
                 fin_out.transcript_appended
                 and fin_out.assistant_message_content is not None
@@ -6673,8 +7055,21 @@ class TurnRunner:
                 turn_segments.append({"type": "text", "text": trailing})
                 current_text_parts.clear()
             partial_text = "".join(final_text_parts).rstrip()
+            cancelled_response_id: str | None = None
+            cancelled_binding = self._fixed_four_tier_v2_response_binding_context(
+                turn_obj,
+                execution_status="cancelled",
+                error_code="cancelled",
+            )
             if (
-                partial_text or turn_segments or turn_artifacts
+                partial_text
+                or turn_segments
+                or turn_artifacts
+                # Fixed-v2 commits its task/input anchor before dispatch. Even a
+                # zero-output cancellation therefore needs a terminal assistant
+                # row; deleting the user input would strand durable task state on
+                # an anchor that no longer exists.
+                or cancelled_binding is not None
             ) and self._session_manager is not None:
                 try:
                     body = _cancelled_partial_response_text(partial_text, turn_artifacts)
@@ -6683,13 +7078,36 @@ class TurnRunner:
                             {"text": body, "artifacts": turn_artifacts},
                             ensure_ascii=False,
                         )
-                    await _finish_required_cancel_cleanup(
-                        self._append_session_message(
-                            session_key,
-                            role="assistant",
-                            content=body,
-                            tool_calls=turn_segments if turn_segments else None,
+                    if cancelled_binding is None:
+                        cancelled_append = await _finish_required_cancel_cleanup(
+                            self._append_session_message(
+                                session_key,
+                                role="assistant",
+                                content=body,
+                                tool_calls=turn_segments if turn_segments else None,
+                            )
                         )
+                    else:
+                        from opensquilla.session.turn_context import (
+                            current_turn_context,
+                            turn_context_scope,
+                        )
+
+                        cancelled_context = {
+                            **(current_turn_context() or {}),
+                            **cancelled_binding,
+                        }
+                        with turn_context_scope(cancelled_context):
+                            cancelled_append = await _finish_required_cancel_cleanup(
+                                self._append_session_message(
+                                    session_key,
+                                    role="assistant",
+                                    content=body,
+                                    tool_calls=(turn_segments if turn_segments else None),
+                                )
+                            )
+                    cancelled_response_id = (
+                        str(getattr(cancelled_append, "message_id", "") or "") or None
                     )
                     log.info(
                         "turn_runner.cancelled_partial_persisted",
@@ -6704,14 +7122,22 @@ class TurnRunner:
                         exc_info=True,
                     )
             elif bound_user_message_id and self._session_manager is not None:
-                # Zero-output cancel: no assistant text/segments/artifacts ever
-                # streamed, so the only trace of this turn is the ingress-persisted
-                # user prompt. Drop it so a cancelled question does not silently
-                # influence later turns (#240). Cancels WITH partial output keep
-                # the `[interrupted]` marker above instead.
+                # Legacy zero-output cancel: no assistant text/segments/artifacts
+                # ever streamed, so the only trace is the ingress-persisted user
+                # prompt. Fixed-v2 is excluded above because its committed state
+                # owns that input as a durable task boundary.
                 await _finish_required_cancel_cleanup(
                     self._rollback_cancelled_prompt(session_key, bound_user_message_id)
                 )
+            await _finish_required_cancel_cleanup(
+                self._settle_fixed_four_tier_v2_route(
+                    turn_obj,
+                    execution_status="cancelled",
+                    response_id=cancelled_response_id,
+                    error_code="cancelled",
+                    done_event=done_event,
+                )
+            )
             if turn_call_logger is not None:
                 try:
                     turn_call_logger.write(
@@ -6807,6 +7233,12 @@ class TurnRunner:
                 await self._append_session_message(
                     session_key, role="system", content=transcript_message
                 )
+            await self._settle_fixed_four_tier_v2_route(
+                turn_obj,
+                execution_status="failed",
+                error_code=error_code or type(exc).__name__,
+                done_event=done_event,
+            )
             if turn_call_logger is not None:
                 turn_call_logger.write(
                     "turn_error",
@@ -8386,6 +8818,1362 @@ class TurnRunner:
             total_max_chars=getattr(memory_cfg, "daily_notes_total_max_chars", 8000),
         )
 
+    async def _resolve_fixed_four_tier_v2_provider(
+        self,
+        *,
+        turn: Any,
+        provider: Any,
+        cloned_selector: Any,
+        turn_config: Any,
+        ensemble_cfg: Any,
+        turn_absolute_deadline: float | None,
+        usage_execution_context: UsageExecutionContext | None = None,
+        bound_user_message_id: str | None = None,
+    ) -> Any:
+        """Resolve the isolated four_tier_mapping v2 decision to one provider."""
+
+        from opensquilla.engine.routing.fixed_four_tier_v2 import (
+            MODE,
+            SCHEMA_VERSION,
+            FixedFourTierRoutingError,
+            FixedFourTierTaskState,
+            RoutingRequest,
+            Tier,
+            normalize_attachment_modalities,
+        )
+        from opensquilla.engine.routing.health import get_provider_health_ledger
+        from opensquilla.engine.selector_override import resolve_tier_provider_config
+        from opensquilla.provider.model_catalog import resolve_effective_context_window
+        from opensquilla.provider.selector import ModelSelector, SelectorConfig
+        from opensquilla.session.models import (
+            FixedFourTierDecisionRecord,
+            FixedFourTierRequestClaim,
+            FixedFourTierState,
+        )
+        from opensquilla.session.storage import FixedFourTierStateConflictError
+
+        session_manager = self._session_manager
+        required_persistence_methods = (
+            "get_session",
+            "get_transcript",
+            "get_fixed_four_tier_state",
+            "reconcile_stale_fixed_four_tier_request",
+            "claim_fixed_four_tier_request",
+            "settle_fixed_four_tier_request_claim",
+            "get_fixed_four_tier_decision_by_request",
+            "get_fixed_four_tier_decision_by_route",
+            "get_fixed_four_tier_decision_by_input_message",
+            "stage_fixed_four_tier_decision",
+            "commit_fixed_four_tier_decision",
+            "settle_fixed_four_tier_decision",
+        )
+        if session_manager is None or any(
+            not callable(getattr(session_manager, name, None))
+            for name in required_persistence_methods
+        ):
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping requires durable session routing storage",
+                reason="routing_persistence_unavailable",
+            )
+        session_node = await session_manager.get_session(turn.session_key)
+        durable_session_id = str(getattr(session_node, "session_id", "") or "")
+        session_epoch = int(getattr(session_node, "epoch", 0) or 0)
+        if not durable_session_id:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping session identity is unavailable",
+                reason="session_identity_unavailable",
+            )
+        if not str(bound_user_message_id or "").strip():
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping requires a durable input message anchor",
+                reason="input_message_anchor_unavailable",
+            )
+
+        mode_cfg = getattr(ensemble_cfg, "four_tier_mapping", None)
+        tiers = getattr(mode_cfg, "tiers", None)
+        if not isinstance(tiers, Mapping):
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping tier mapping is unavailable",
+                reason="tier_mapping_unavailable",
+            )
+
+        metadata = turn.metadata
+        history_value = metadata.get("router_history_user_texts")
+        user_history = (
+            tuple(str(value) for value in history_value if isinstance(value, str))
+            if isinstance(history_value, Sequence) and not isinstance(history_value, (str, bytes))
+            else ()
+        )
+        control_event = metadata.get("fixed_four_tier_v2_control_event")
+        execution_id = str(
+            getattr(usage_execution_context, "turn_id", "")
+            or getattr(usage_execution_context, "execution_id", "")
+            or uuid.uuid4().hex
+        ).strip()
+        request_id = str(
+            metadata.get("fixed_four_tier_v2_request_id")
+            or metadata.get("client_request_id")
+            or bound_user_message_id
+        ).strip()
+        claimed_at_ms = time.time_ns() // 1_000_000
+        if turn_absolute_deadline is None:
+            lease_duration_ms = 5 * 60 * 1_000
+        else:
+            lease_duration_ms = max(
+                60_000,
+                int(max(0.0, turn_absolute_deadline - time.monotonic()) * 1_000) + 60_000,
+            )
+        lease_expires_at_ms = claimed_at_ms + lease_duration_ms
+        existing_claim = await session_manager.reconcile_stale_fixed_four_tier_request(
+            session_id=durable_session_id,
+            request_id=request_id,
+            now_ms=claimed_at_ms,
+        )
+        if existing_claim is not None:
+            claim_status = str(getattr(existing_claim, "status", "") or "")
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping request already has a durable execution claim",
+                reason=(
+                    "duplicate_request_in_progress"
+                    if claim_status in {"claimed", "materialized"}
+                    else "duplicate_request_replay"
+                ),
+            )
+        existing_request_decision = await session_manager.get_fixed_four_tier_decision_by_request(
+            session_id=durable_session_id,
+            request_id=request_id,
+        )
+        if existing_request_decision is not None:
+            if int(existing_request_decision.schema_version) != 1:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping decision schema is incompatible",
+                    reason="decision_schema_incompatible",
+                )
+            # Gateway ingress normally deduplicates before reaching the
+            # runner.  This guard is the durable last line of defence for a
+            # crash/replay or a second worker: never classify, advance state,
+            # or call a model twice for the same accepted request.
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping request was already classified",
+                reason="duplicate_request_replay",
+            )
+        persisted_state = await session_manager.get_fixed_four_tier_state(durable_session_id)
+        if persisted_state is not None and int(persisted_state.schema_version) != 1:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping state schema is incompatible",
+                reason="state_schema_incompatible",
+            )
+        task_state = (
+            FixedFourTierTaskState(
+                task_id=str(persisted_state.task_id),
+                tier=cast(Tier, str(persisted_state.tier)),
+                turn_count=int(persisted_state.task_turn_count),
+                version=int(persisted_state.version),
+                task_start_input_message_id=(
+                    str(persisted_state.task_start_input_message_id)
+                    if persisted_state.task_start_input_message_id is not None
+                    else None
+                ),
+            )
+            if persisted_state is not None
+            else None
+        )
+        expected_state_version = task_state.version if task_state is not None else None
+        redo_parent_route_id: str | None = None
+        parent_decision: Any | None = None
+        redo_child_task_start_message_id: str | None = None
+        feature_session_key = turn.session_key
+        redo_feature_transcript: list[Any] | None = None
+        feature_task_start_message_id = (
+            task_state.task_start_input_message_id if task_state is not None else None
+        )
+        feature_current_message_id = bound_user_message_id
+        provenance = metadata.get("input_provenance")
+        provenance_mapping = provenance if isinstance(provenance, Mapping) else {}
+        redo_parent_session_id = str(
+            metadata.get("fixed_four_tier_v2_redo_parent_session_id") or ""
+        ).strip()
+        redo_of_message_id = str(
+            metadata.get("fixed_four_tier_v2_redo_of_message_id") or ""
+        ).strip()
+        trusted_child_task_start_message_id = str(
+            metadata.get("fixed_four_tier_v2_redo_child_task_start_input_message_id") or ""
+        ).strip()
+        untrusted_redo_provenance = bool(
+            provenance_mapping.get("action") == "redo"
+            or provenance_mapping.get("control_event") == "redo"
+            or provenance_mapping.get("fixed_four_tier_v2_redo_parent_session_id")
+            or provenance_mapping.get("fixed_four_tier_v2_redo_of_message_id")
+        )
+        trusted_redo = bool(
+            control_event == "redo"
+            and redo_parent_session_id
+            and redo_of_message_id
+            and trusted_child_task_start_message_id
+        )
+        if untrusted_redo_provenance and not trusted_redo:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping regenerate provenance is not server-authoritative",
+                reason="redo_provenance_untrusted",
+            )
+        if (
+            redo_parent_session_id
+            or redo_of_message_id
+            or trusted_child_task_start_message_id
+            or control_event == "redo"
+        ) and not trusted_redo:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping regenerate controls are incomplete",
+                reason="redo_control_marker_unavailable",
+            )
+        if redo_parent_session_id and redo_of_message_id:
+            parent_decision = await session_manager.get_fixed_four_tier_decision_by_input_message(
+                session_id=redo_parent_session_id,
+                input_message_id=redo_of_message_id,
+            )
+            if parent_decision is not None:
+                parent_task_turn_index = int(parent_decision.task_turn_index)
+                source_task_start_message_id = (
+                    parent_decision.task_start_input_message_id or parent_decision.input_message_id
+                )
+                if not str(source_task_start_message_id or "").strip():
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping regenerate source has no task boundary",
+                        reason="redo_parent_task_boundary_unavailable",
+                    )
+                if parent_task_turn_index == 0:
+                    redo_child_task_start_message_id = str(bound_user_message_id)
+                    if trusted_child_task_start_message_id != redo_child_task_start_message_id:
+                        raise FixedFourTierRoutingError(
+                            "four_tier_mapping first-turn regenerate boundary is invalid",
+                            reason="redo_child_task_boundary_unavailable",
+                        )
+                else:
+                    child_transcript = list(await session_manager.get_transcript(turn.session_key))
+                    boundary_matches = [
+                        index
+                        for index, entry in enumerate(child_transcript)
+                        if getattr(entry, "message_id", None) == trusted_child_task_start_message_id
+                    ]
+                    bound_matches = [
+                        index
+                        for index, entry in enumerate(child_transcript)
+                        if getattr(entry, "message_id", None) == bound_user_message_id
+                    ]
+                    if (
+                        len(boundary_matches) == 1
+                        and len(bound_matches) == 1
+                        and boundary_matches[0] < bound_matches[0]
+                    ):
+                        redo_child_task_start_message_id = trusted_child_task_start_message_id
+                if not str(redo_child_task_start_message_id or "").strip():
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping regenerate child has no exact task boundary",
+                        reason="redo_child_task_boundary_unavailable",
+                    )
+                task_state = FixedFourTierTaskState(
+                    task_id=parent_decision.task_id,
+                    tier=cast(Tier, parent_decision.final_tier),
+                    # The stored index is the pre-route task count. Reusing it
+                    # makes the regenerated turn replace, rather than append
+                    # after, the original answer in the semantic task.
+                    turn_count=parent_task_turn_index,
+                    version=0,
+                    # Classification is bound to the parent source transcript.
+                    # The returned state is translated to its exact child row
+                    # immediately after classification, before persistence.
+                    task_start_input_message_id=str(source_task_start_message_id),
+                )
+                expected_state_version = None
+                redo_parent_route_id = parent_decision.route_id
+                feature_session_key = parent_decision.session_key
+                feature_task_start_message_id = source_task_start_message_id
+                feature_current_message_id = parent_decision.input_message_id
+                get_canonical_transcript = getattr(
+                    session_manager,
+                    "get_canonical_transcript_by_session_id",
+                    None,
+                )
+                is_canonical_complete = getattr(
+                    session_manager,
+                    "is_canonical_transcript_complete_by_session_id",
+                    None,
+                )
+                if not callable(get_canonical_transcript) or not callable(is_canonical_complete):
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping regenerate source archive is unavailable",
+                        reason="redo_parent_canonical_transcript_unavailable",
+                    )
+                try:
+                    canonical_complete = await is_canonical_complete(redo_parent_session_id)
+                    redo_feature_transcript = list(
+                        await get_canonical_transcript(redo_parent_session_id)
+                    )
+                except FixedFourTierRoutingError:
+                    raise
+                except Exception as exc:
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping regenerate source archive could not be read",
+                        reason="redo_parent_canonical_transcript_unavailable",
+                    ) from exc
+                if canonical_complete is not True:
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping regenerate source archive is incomplete",
+                        reason="redo_parent_canonical_transcript_incomplete",
+                    )
+            else:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping regenerate source has no committed route",
+                    reason="redo_parent_route_unavailable",
+                )
+
+        if task_state is not None and not str(feature_task_start_message_id or "").strip():
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping active task has no durable input anchor",
+                reason="task_input_anchor_unavailable",
+            )
+        feature_transcript = (
+            redo_feature_transcript
+            if redo_feature_transcript is not None
+            else list(await session_manager.get_transcript(feature_session_key))
+        )
+        feature_start_index = 0
+        if feature_task_start_message_id:
+            feature_start_index_value = next(
+                (
+                    index
+                    for index, entry in enumerate(feature_transcript)
+                    if getattr(entry, "message_id", None) == feature_task_start_message_id
+                ),
+                None,
+            )
+            if feature_start_index_value is None:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping task feature boundary is unavailable",
+                    reason="task_feature_boundary_unavailable",
+                )
+            feature_start_index = feature_start_index_value
+        feature_end_index_value = next(
+            (
+                index
+                for index, entry in enumerate(feature_transcript)
+                if getattr(entry, "message_id", None) == feature_current_message_id
+            ),
+            None,
+        )
+        if feature_end_index_value is None:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping current feature boundary is unavailable",
+                reason="current_feature_boundary_unavailable",
+            )
+        feature_end_index = feature_end_index_value
+        if feature_end_index < feature_start_index:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping feature boundaries are reversed",
+                reason="invalid_feature_boundary_order",
+            )
+        prior_feature_entries = feature_transcript[feature_start_index:feature_end_index]
+        user_history = tuple(
+            text
+            for entry in prior_feature_entries
+            if getattr(entry, "role", None) == "user"
+            and (
+                text := _fixed_route_visible_transcript_text(
+                    "user",
+                    getattr(entry, "content", ""),
+                )
+            )
+        )
+        previous_route = parent_decision
+        if previous_route is None and persisted_state is not None and persisted_state.last_route_id:
+            previous_route = await session_manager.get_fixed_four_tier_decision_by_route(
+                str(persisted_state.last_route_id)
+            )
+        previous_assistant_entry = None
+        previous_response_id = str(getattr(previous_route, "response_id", "") or "").strip()
+        if previous_response_id:
+            candidate_entry = next(
+                (
+                    (index, entry)
+                    for index, entry in enumerate(feature_transcript)
+                    if getattr(entry, "message_id", None) == previous_response_id
+                    and getattr(entry, "role", None) == "assistant"
+                ),
+                None,
+            )
+            if candidate_entry is not None:
+                response_index, response_entry = candidate_entry
+                if parent_decision is not None or (
+                    feature_start_index <= response_index < feature_end_index
+                ):
+                    previous_assistant_entry = response_entry
+        if previous_assistant_entry is not None:
+            previous_assistant_text = _fixed_route_visible_transcript_text(
+                "assistant",
+                getattr(previous_assistant_entry, "content", ""),
+            )
+            if not previous_assistant_text:
+                previous_assistant_text = None
+        else:
+            previous_assistant_text = None
+        previous_usage = None
+        if previous_assistant_entry is not None and isinstance(
+            getattr(previous_assistant_entry, "turn_usage", None),
+            Mapping,
+        ):
+            previous_usage = dict(previous_assistant_entry.turn_usage)
+        if previous_route is not None:
+            previous_route_trace = dict(previous_route.route_trace or {})
+            previous_usage = {
+                **(previous_usage or {}),
+                "route_id": previous_route.route_id,
+                "execution_status": previous_route.execution_status,
+                "error_code": previous_route.error_code,
+                "response_id": previous_route.response_id,
+                "attempt_ids": list(previous_route_trace.get("attempt_ids") or []),
+                "retry_count": max(
+                    0,
+                    len(previous_route_trace.get("attempt_ids") or []) - 1,
+                ),
+            }
+        route_request = RoutingRequest(
+            session_id=durable_session_id,
+            request_id=request_id,
+            message=str(turn.semantic_message or turn.message or ""),
+            # Redo classification reads the immutable parent source slice;
+            # audit its source input id, while the decision record and claim
+            # below remain bound to the new child input/execution.
+            input_message_id=(
+                feature_current_message_id if parent_decision is not None else bound_user_message_id
+            ),
+            user_history=user_history,
+            previous_assistant_text=previous_assistant_text,
+            previous_assistant_usage=previous_usage,
+            attachment_count=len(turn.attachments or []),
+            attachment_modalities=normalize_attachment_modalities(turn.attachments or []),
+            control_event=str(control_event) if control_event is not None else None,
+        )
+        claim_id = uuid.uuid4().hex
+        request_claim = FixedFourTierRequestClaim(
+            claim_id=claim_id,
+            session_id=durable_session_id,
+            session_key=turn.session_key,
+            session_epoch=session_epoch,
+            request_id=request_id,
+            execution_id=execution_id,
+            input_message_id=str(bound_user_message_id),
+            claimed_at_ms=claimed_at_ms,
+            updated_at_ms=claimed_at_ms,
+            lease_expires_at_ms=lease_expires_at_ms,
+        )
+
+        async def _settle_claim_terminal(
+            execution_status: str,
+            error_code: str,
+        ) -> None:
+            await session_manager.settle_fixed_four_tier_request_claim(
+                claim_id=claim_id,
+                execution_status=execution_status,
+                error_code=error_code,
+            )
+
+        try:
+            acquired, existing_claim = await session_manager.claim_fixed_four_tier_request(
+                request_claim
+            )
+        except asyncio.CancelledError:
+            await _finish_required_cancel_cleanup(
+                _settle_claim_terminal(
+                    "cancelled",
+                    "cancelled_during_request_claim",
+                )
+            )
+            raise
+        except FixedFourTierStateConflictError as exc:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping request claim raced with another execution",
+                reason="duplicate_request_in_progress",
+            ) from exc
+        if not acquired:
+            existing_status = str(getattr(existing_claim, "status", "") or "")
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping request already has a durable execution claim",
+                reason=(
+                    "duplicate_request_in_progress"
+                    if existing_status in {"claimed", "materialized"}
+                    else "duplicate_request_replay"
+                ),
+            )
+        try:
+            router = self._fixed_four_tier_v2_router_for_config(ensemble_cfg)
+        except BaseException as exc:
+            terminal_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+            reason = str(getattr(exc, "reason", "") or type(exc).__name__)
+            if isinstance(exc, asyncio.CancelledError):
+                await _finish_required_cancel_cleanup(
+                    _settle_claim_terminal(terminal_status, reason)
+                )
+            else:
+                await _settle_claim_terminal(terminal_status, reason)
+            raise
+        try:
+            decision, next_task_state = router.decide(route_request, task_state)
+            if parent_decision is not None:
+                if not str(redo_child_task_start_message_id or "").strip():
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping regenerate child has no exact task boundary",
+                        reason="redo_child_task_boundary_unavailable",
+                    )
+                next_task_state = replace(
+                    next_task_state,
+                    task_start_input_message_id=redo_child_task_start_message_id,
+                )
+        except BaseException as exc:
+            terminal_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+            reason = str(getattr(exc, "reason", "") or type(exc).__name__)
+            if isinstance(exc, asyncio.CancelledError):
+                await _finish_required_cancel_cleanup(
+                    _settle_claim_terminal(terminal_status, reason)
+                )
+            else:
+                await _settle_claim_terminal(terminal_status, reason)
+            raise
+
+        def _build_staged_fixed_route() -> tuple[
+            str,
+            str,
+            str,
+            str,
+            dict[str, Any],
+            FixedFourTierDecisionRecord,
+        ]:
+            """Build every fallible post-claim object before persistence."""
+
+            tier_cfg = tiers.get(decision.final_tier)
+            target_provider = str(getattr(tier_cfg, "provider", "") or "").strip().casefold()
+            target_model = str(getattr(tier_cfg, "model", "") or "").strip()
+            reasoning = str(getattr(tier_cfg, "reasoning", "") or "").strip().casefold()
+            deployment_version = str(getattr(tier_cfg, "deployment_version", "") or "").strip()
+            route_trace = decision.trace(provider=target_provider, model=target_model)
+            route_trace.update(
+                {
+                    "session_id": durable_session_id,
+                    "session_epoch": session_epoch,
+                    "claim_id": claim_id,
+                    "execution_id": execution_id,
+                    "session_key_hash": hashlib.sha256(
+                        turn.session_key.encode("utf-8")
+                    ).hexdigest(),
+                    "input_message_id": bound_user_message_id,
+                    "redo_parent_route_id": redo_parent_route_id,
+                    "task_start_input_message_id": (next_task_state.task_start_input_message_id),
+                    "attempt_id": None,
+                    "attempt_ids": [],
+                    "response_id": None,
+                    "execution_status": "pending",
+                    "state_committed": False,
+                    "deployment_version": deployment_version or None,
+                    "deployment_version_attested": False,
+                    "execution_lease": {
+                        "claimed_at_ms": claimed_at_ms,
+                        "lease_expires_at_ms": lease_expires_at_ms,
+                        "status": "materialized",
+                    },
+                    "preflight": {
+                        "status": "pending",
+                        "deployment_resolved": False,
+                        "health_admission": "deferred_to_dispatch",
+                    },
+                    "dispatch": {
+                        "health_admission": "deferred",
+                        "physical_request_started": False,
+                        "physical_request_count": 0,
+                    },
+                }
+            )
+            staged_record = FixedFourTierDecisionRecord(
+                route_id=decision.route_id,
+                session_id=durable_session_id,
+                session_key=turn.session_key,
+                session_epoch=session_epoch,
+                claim_id=claim_id,
+                request_id=request_id,
+                execution_id=execution_id,
+                input_message_id=bound_user_message_id,
+                task_id=decision.task_id,
+                redo_parent_route_id=redo_parent_route_id,
+                decided_at_ms=decision.decided_at_ms,
+                updated_at_ms=decision.decided_at_ms,
+                intent=decision.intent.trace(),
+                tier=decision.tier.trace(),
+                previous_tier=decision.previous_tier,
+                final_tier=decision.final_tier,
+                task_turn_index=decision.task_turn_index,
+                task_start_input_message_id=(next_task_state.task_start_input_message_id),
+                context_action=decision.context_action,
+                state_version_before=expected_state_version,
+                selected_provider=target_provider or None,
+                selected_model=target_model or None,
+                reasoning=reasoning or None,
+                deployment_version=deployment_version or None,
+                config_version=SCHEMA_VERSION,
+                route_trace=route_trace,
+            )
+            return (
+                target_provider,
+                target_model,
+                reasoning,
+                deployment_version,
+                route_trace,
+                staged_record,
+            )
+
+        try:
+            (
+                target_provider,
+                target_model,
+                reasoning,
+                deployment_version,
+                route_trace,
+                staged_record,
+            ) = _build_staged_fixed_route()
+        except BaseException as exc:
+            terminal_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+            reason = str(getattr(exc, "reason", "") or type(exc).__name__)
+            if isinstance(exc, asyncio.CancelledError):
+                await _finish_required_cancel_cleanup(
+                    _settle_claim_terminal(terminal_status, reason)
+                )
+            else:
+                await _settle_claim_terminal(terminal_status, reason)
+            raise
+        metadata.update(
+            {
+                "fixed_four_tier_v2_decision_id": decision.route_id,
+                "fixed_four_tier_v2_decision": route_trace,
+                "fixed_four_tier_v2_context_action": decision.context_action,
+                "fixed_four_tier_v2_history_turns_to_keep": (decision.history_turns_to_keep),
+                "fixed_four_tier_v2_task_start_input_message_id": (
+                    next_task_state.task_start_input_message_id
+                ),
+                "fixed_four_tier_v2_task_id": decision.task_id,
+                "fixed_four_tier_v2_selected_provider": target_provider or None,
+                "fixed_four_tier_v2_selected_model": target_model or None,
+                "router_single_decision_id": decision.route_id,
+                "router_decision_id": decision.route_id,
+            }
+        )
+
+        async def _settle_resolver_terminal(
+            *,
+            execution_status: str,
+            error_code: str,
+            preflight_status: str = "failed",
+            detect_committed_state: bool = False,
+        ) -> None:
+            if detect_committed_state:
+                try:
+                    live_state = await session_manager.get_fixed_four_tier_state(durable_session_id)
+                except Exception:
+                    live_state = None
+                route_trace["state_committed"] = bool(
+                    live_state is not None
+                    and str(getattr(live_state, "last_route_id", "") or "") == decision.route_id
+                )
+            preflight_value = route_trace.get("preflight")
+            preflight_trace = (
+                copy.deepcopy(dict(preflight_value)) if isinstance(preflight_value, Mapping) else {}
+            )
+            preflight_trace["status"] = preflight_status
+            if preflight_status == "failed":
+                preflight_trace["error_code"] = error_code
+            route_trace["preflight"] = preflight_trace
+            route_trace["execution_status"] = execution_status
+            route_trace["error_code"] = error_code
+            metadata["fixed_four_tier_v2_decision"] = route_trace
+            try:
+                await session_manager.settle_fixed_four_tier_decision(
+                    route_id=decision.route_id,
+                    execution_status=execution_status,
+                    preflight_status=preflight_status,
+                    error_code=error_code,
+                    route_trace=route_trace,
+                )
+            finally:
+                await _settle_claim_terminal(execution_status, error_code)
+
+        try:
+            await session_manager.stage_fixed_four_tier_decision(staged_record)
+        except asyncio.CancelledError:
+            await _finish_required_cancel_cleanup(
+                _settle_resolver_terminal(
+                    execution_status="cancelled",
+                    error_code="cancelled_during_decision_persistence",
+                )
+            )
+            raise
+        except Exception as exc:
+            try:
+                await _settle_resolver_terminal(
+                    execution_status="failed",
+                    error_code="decision_persistence_failed",
+                )
+            except Exception:
+                log.exception(
+                    "fixed_four_tier_v2.persistence_settlement_failed",
+                    route_id=decision.route_id,
+                )
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping could not persist its classification",
+                reason="decision_persistence_failed",
+            ) from exc
+
+        try:
+            if not target_provider or not target_model or reasoning not in {"thinking", "max"}:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping selected tier is incomplete",
+                    reason="selected_tier_invalid",
+                )
+            if provider is None or cloned_selector is None:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping requires a configured provider selector",
+                    reason="provider_selector_unavailable",
+                )
+            current_provider_config = getattr(cloned_selector, "current_config", None)
+            if (
+                current_provider_config is None
+                or not str(getattr(current_provider_config, "provider", "") or "").strip()
+                or not str(getattr(current_provider_config, "model", "") or "").strip()
+            ):
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping provider selector has no complete current config",
+                    reason="provider_selector_unavailable",
+                )
+            if self._model_catalog is None:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping requires an authoritative model catalog",
+                    reason="model_catalog_unavailable",
+                )
+
+            current_provider = (
+                str(getattr(current_provider_config, "provider", "") or "").strip().casefold()
+            )
+            if current_provider == target_provider:
+                selected_config = replace(
+                    current_provider_config,
+                    model=target_model,
+                    provider_routing=dict(
+                        getattr(current_provider_config, "provider_routing", {}) or {}
+                    ),
+                    replay_provider_state=False,
+                )
+                metadata["routed_provider_resolution"] = {
+                    "provider": target_provider,
+                    "model": target_model,
+                    "ready": True,
+                    "reason": "inherited_provider",
+                    "credential_source": "inherited_provider",
+                    "endpoint_source": "inherited_provider",
+                }
+            else:
+                selected_config = resolve_tier_provider_config(
+                    turn_config,
+                    target_provider,
+                    target_model,
+                    session_key=turn.session_key,
+                    turn_metadata=metadata,
+                )
+            if selected_config is None:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping selected deployment is unavailable",
+                    reason="selected_deployment_unavailable",
+                )
+
+            llm_cfg = getattr(turn_config, "llm", None)
+            user_max_tokens = int(getattr(llm_cfg, "max_tokens", 0) or 0)
+            user_context_window = int(getattr(llm_cfg, "context_window_tokens", 0) or 0)
+            max_tokens = self._model_catalog.resolve_max_tokens(
+                target_model,
+                user_override=user_max_tokens,
+                provider=target_provider,
+            )
+            context_window, context_window_source = resolve_effective_context_window(
+                self._model_catalog,
+                target_model,
+                provider=target_provider,
+                global_override=user_context_window,
+            )
+            capabilities = self._model_catalog.get_capabilities(
+                target_model,
+                provider_name=target_provider,
+                base_url=str(getattr(selected_config, "base_url", "") or ""),
+            )
+            if (
+                getattr(capabilities, "supports_reasoning", False) is not True
+                and target_provider == "openrouter"
+                and target_model
+                in {
+                    "deepseek/deepseek-v4-flash",
+                    "deepseek/deepseek-v4-pro",
+                }
+            ):
+                capabilities = replace(
+                    capabilities,
+                    supports_reasoning=True,
+                    reasoning_format="openrouter",
+                )
+            if getattr(capabilities, "supports_reasoning", False) is not True:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping selected model lacks required reasoning support",
+                    reason="selected_model_reasoning_unavailable",
+                )
+            has_image = any(
+                str(
+                    attachment.get("mime")
+                    or attachment.get("mime_type")
+                    or attachment.get("type")
+                    or ""
+                )
+                .strip()
+                .casefold()
+                .startswith(("image/", "image"))
+                for attachment in (turn.attachments or [])
+                if isinstance(attachment, Mapping)
+            )
+            if has_image and getattr(capabilities, "supports_vision", False) is not True:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping selected model cannot process image input",
+                    reason="selected_model_vision_unavailable",
+                )
+            if turn.tool_defs and getattr(capabilities, "supports_tools", False) is not True:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping selected model cannot execute tools",
+                    reason="selected_model_tools_unavailable",
+                )
+
+            current_input_tokens = metadata.get("material_estimated_tokens")
+            if not isinstance(current_input_tokens, int) or isinstance(current_input_tokens, bool):
+                current_input_tokens = max(1, (len(turn.semantic_message) + 3) // 4)
+            from opensquilla.session.compaction import (
+                estimate_entry_model_replay_tokens,
+            )
+
+            transcript = list(await session_manager.get_transcript(turn.session_key))
+            task_start_message_id = next_task_state.task_start_input_message_id
+            scoped_transcript: list[Any] = []
+            if decision.history_turns_to_keep > 0:
+                boundary_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(transcript)
+                        if getattr(entry, "message_id", None) == task_start_message_id
+                    ),
+                    None,
+                )
+                if boundary_index is None:
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping task history boundary is unavailable",
+                        reason="task_history_boundary_unavailable",
+                    )
+                bound_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(transcript)
+                        if getattr(entry, "message_id", None) == bound_user_message_id
+                    ),
+                    None,
+                )
+                if bound_index is None or bound_index < boundary_index:
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping current input boundary is unavailable",
+                        reason="current_input_boundary_unavailable",
+                    )
+                # Exclude the current persisted row and every later queued row;
+                # the current semantic message is counted separately below.
+                scoped_transcript = transcript[boundary_index:bound_index]
+            history_tokens = sum(
+                estimate_entry_model_replay_tokens(entry) for entry in scoped_transcript
+            )
+            system_tokens = max(
+                1,
+                (
+                    len(
+                        json.dumps(
+                            turn.system_prompt,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    + 3
+                )
+                // 4,
+            )
+            tool_schema_tokens = (
+                max(
+                    1,
+                    (
+                        len(
+                            json.dumps(
+                                [
+                                    (
+                                        tool.model_dump(mode="json")
+                                        if callable(getattr(tool, "model_dump", None))
+                                        else vars(tool)
+                                    )
+                                    for tool in (turn.tool_defs or [])
+                                ],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                        + 3
+                    )
+                    // 4,
+                )
+                if turn.tool_defs
+                else 0
+            )
+            estimated_input_tokens = (
+                current_input_tokens + history_tokens + system_tokens + tool_schema_tokens
+            )
+            estimated_total_tokens = estimated_input_tokens + max_tokens
+            if estimated_total_tokens >= context_window:
+                raise FixedFourTierRoutingError(
+                    "four_tier_mapping selected model context window is too small",
+                    reason="context_length_exceeded",
+                )
+
+            direct_selector = ModelSelector(SelectorConfig(primary=selected_config, fallbacks=[]))
+            guarded_provider = _RouterSingleDirectProvider(
+                direct_selector.resolve(),
+                selected_config,
+                health_ledger=get_provider_health_ledger(),
+                absolute_deadline=turn_absolute_deadline,
+                frozen_catalog={
+                    "provider": target_provider,
+                    "model": target_model,
+                    "max_tokens": max_tokens,
+                    "context_window": context_window,
+                    "capabilities": capabilities,
+                },
+                enforces_routed_thinking_policy=True,
+                turn_metadata=metadata,
+                deployment_version=deployment_version,
+            )
+            direct_provider = _SelectorFallbackProvider(
+                guarded_provider,
+                direct_selector,
+                turn_metadata=metadata,
+            )
+        except asyncio.CancelledError:
+            await _finish_required_cancel_cleanup(
+                _settle_resolver_terminal(
+                    execution_status="cancelled",
+                    error_code="cancelled_during_preflight",
+                )
+            )
+            raise
+        except Exception as exc:
+            reason = str(getattr(exc, "reason", "") or type(exc).__name__).strip()
+            try:
+                await _settle_resolver_terminal(
+                    execution_status="failed",
+                    error_code=reason,
+                )
+            except Exception:
+                log.exception(
+                    "fixed_four_tier_v2.preflight_settlement_failed",
+                    route_id=decision.route_id,
+                )
+            raise
+
+        try:
+            route_trace["preflight"] = {
+                "status": "passed",
+                "deployment_resolved": True,
+                "health_admission": "deferred_to_dispatch",
+                "estimated_input_tokens": estimated_input_tokens,
+                "estimated_history_tokens": history_tokens,
+                "estimated_system_tokens": system_tokens,
+                "estimated_tool_schema_tokens": tool_schema_tokens,
+                "reserved_output_tokens": max_tokens,
+                "estimated_total_tokens": estimated_total_tokens,
+                "context_window_tokens": context_window,
+                "context_window_source": context_window_source,
+            }
+            durable_next_state = FixedFourTierState(
+                session_id=durable_session_id,
+                session_key=turn.session_key,
+                session_epoch=session_epoch,
+                version=next_task_state.version,
+                task_id=next_task_state.task_id,
+                tier=next_task_state.tier,
+                task_turn_count=next_task_state.turn_count,
+                task_start_input_message_id=(next_task_state.task_start_input_message_id),
+                last_request_id=request_id,
+                last_route_id=decision.route_id,
+                updated_at_ms=time.time_ns() // 1_000_000,
+            )
+            route_trace["state_committed"] = True
+            await session_manager.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=durable_next_state,
+                expected_version=expected_state_version,
+                route_trace=route_trace,
+                updated_at_ms=durable_next_state.updated_at_ms,
+            )
+        except asyncio.CancelledError:
+            await _finish_required_cancel_cleanup(
+                _settle_resolver_terminal(
+                    execution_status="cancelled",
+                    error_code="cancelled_during_state_commit",
+                    preflight_status="passed",
+                    detect_committed_state=True,
+                )
+            )
+            raise
+        except FixedFourTierStateConflictError as exc:
+            route_trace["state_committed"] = False
+            try:
+                await _settle_resolver_terminal(
+                    execution_status="failed",
+                    preflight_status="failed",
+                    error_code="task_state_conflict",
+                    detect_committed_state=True,
+                )
+            except Exception:
+                log.exception(
+                    "fixed_four_tier_v2.conflict_settlement_failed",
+                    route_id=decision.route_id,
+                )
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping task state changed during routing",
+                reason="task_state_conflict",
+            ) from exc
+        except Exception as exc:
+            try:
+                await _settle_resolver_terminal(
+                    execution_status="failed",
+                    error_code="state_commit_failed",
+                    preflight_status="passed",
+                    detect_committed_state=True,
+                )
+            except Exception:
+                log.exception(
+                    "fixed_four_tier_v2.commit_settlement_failed",
+                    route_id=decision.route_id,
+                )
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping could not commit task state",
+                reason="state_commit_failed",
+            ) from exc
+
+        baseline_model = str(turn.model or "")
+        try:
+            cloned_selector.override_provider_config(selected_config)
+            turn.model = target_model
+        except Exception as exc:
+            try:
+                await _settle_resolver_terminal(
+                    execution_status="failed",
+                    error_code="provider_activation_failed",
+                    preflight_status="passed",
+                    detect_committed_state=True,
+                )
+            except Exception:
+                log.exception(
+                    "fixed_four_tier_v2.activation_settlement_failed",
+                    route_id=decision.route_id,
+                )
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping could not activate its selected provider",
+                reason="provider_activation_failed",
+            ) from exc
+        thinking_level = "high" if reasoning == "thinking" else "max"
+        metadata.update(
+            {
+                "_router_single_provider_finalized": True,
+                "_router_single_frozen_catalog": {
+                    "provider": target_provider,
+                    "model": target_model,
+                    "max_tokens": max_tokens,
+                    "context_window": context_window,
+                },
+                "_router_single_managed_provider_thinking_level": thinking_level,
+                "_fixed_four_tier_v2_provider_finalized": True,
+                "fixed_four_tier_v2_decision_id": decision.route_id,
+                "fixed_four_tier_v2_decision": route_trace,
+                "fixed_four_tier_v2_context_action": decision.context_action,
+                "fixed_four_tier_v2_history_turns_to_keep": (decision.history_turns_to_keep),
+                "fixed_four_tier_v2_task_start_input_message_id": (
+                    next_task_state.task_start_input_message_id
+                ),
+                "fixed_four_tier_v2_task_id": decision.task_id,
+                "fixed_four_tier_v2_selected_provider": target_provider,
+                "fixed_four_tier_v2_selected_model": target_model,
+                "router_single_decision_id": decision.route_id,
+                "router_decision_id": decision.route_id,
+                "baseline_model": baseline_model,
+                "routed_tier": decision.final_tier,
+                "routed_model": target_model,
+                "routed_provider": target_provider,
+                "routing_applied": True,
+                "routing_confidence": (
+                    decision.tier.confidence
+                    if decision.tier.confidence is not None
+                    else decision.intent.confidence
+                ),
+                "routing_source": MODE,
+                "rollout_phase": "full",
+                "applied_model": target_model,
+                "router_fallback_chain": [],
+                "route_max_history_turns": decision.history_turns_to_keep,
+                "thinking_requested": True,
+                "thinking_level": thinking_level,
+                "requested_provider": target_provider,
+                "requested_model": target_model,
+                "routed_provider_applied": target_provider,
+                "resolved_model": target_model,
+                "alias_resolution_chain": [target_model],
+                "provider_after_rewrite": target_provider,
+            }
+        )
+        # Initial pipeline metadata describes the pre-route provider; neither
+        # it nor this resolver may claim physical execution before chat starts.
+        metadata.pop("executed_provider", None)
+        metadata.pop("executed_model", None)
+        return direct_provider
+
+    @staticmethod
+    def _fixed_four_tier_v2_response_binding_context(
+        turn: Any | None,
+        *,
+        execution_status: str,
+        error_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Build the content-free binding persisted with a four_tier_mapping response."""
+
+        if turn is None:
+            return None
+        metadata = getattr(turn, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return None
+        trace = metadata.get("fixed_four_tier_v2_decision")
+        if not isinstance(trace, Mapping):
+            return None
+        execution_id = str(trace.get("execution_id") or "").strip()
+        route_id = str(metadata.get("fixed_four_tier_v2_decision_id") or "").strip()
+        request_id = str(trace.get("request_id") or "").strip()
+        if not execution_id or not route_id or not request_id:
+            raise RuntimeError("four_tier_mapping response binding identity is incomplete")
+        return {
+            "schema": "fixed_four_tier_v2_response_binding_v1",
+            "execution_id": execution_id,
+            "route_id": route_id,
+            "request_id": request_id,
+            "execution_status": execution_status,
+            "error_code": error_code,
+        }
+
+    async def _settle_fixed_four_tier_v2_route(
+        self,
+        turn: Any | None,
+        *,
+        execution_status: str,
+        response_id: str | None = None,
+        error_code: str | None = None,
+        done_event: Any | None = None,
+        required: bool = False,
+    ) -> bool:
+        """Settle an already committed route, retrying transient write gaps."""
+
+        if turn is None or self._session_manager is None:
+            return True
+        metadata = getattr(turn, "metadata", None)
+        if not isinstance(metadata, dict):
+            return True
+        route_id = str(metadata.get("fixed_four_tier_v2_decision_id") or "").strip()
+        trace_value = metadata.get("fixed_four_tier_v2_decision")
+        if not route_id or not isinstance(trace_value, Mapping):
+            return True
+        settle = getattr(
+            self._session_manager,
+            "settle_fixed_four_tier_decision",
+            None,
+        )
+        usage_ids = getattr(
+            self._session_manager,
+            "get_usage_event_ids_for_turn",
+            None,
+        )
+        if not callable(settle):
+            if required:
+                raise RuntimeError("four_tier_mapping terminal settlement is unavailable")
+            return False
+
+        route_trace = copy.deepcopy(dict(trace_value))
+        session_id = str(route_trace.get("session_id") or "").strip()
+        execution_id = str(route_trace.get("execution_id") or "").strip()
+        attempt_ids: list[str] = []
+        if session_id and execution_id and callable(usage_ids):
+            try:
+                attempt_ids = await usage_ids(
+                    session_id=session_id,
+                    turn_id=execution_id,
+                )
+            except Exception:
+                log.exception(
+                    "fixed_four_tier_v2.attempt_link_failed",
+                    route_id=route_id,
+                )
+        route_trace["attempt_id"] = attempt_ids[0] if attempt_ids else None
+        route_trace["attempt_ids"] = attempt_ids
+        route_trace["execution_status"] = execution_status
+        lease_value = route_trace.get("execution_lease")
+        execution_lease = (
+            copy.deepcopy(dict(lease_value)) if isinstance(lease_value, Mapping) else {}
+        )
+        execution_lease["status"] = execution_status
+        execution_lease["terminal_at_ms"] = time.time_ns() // 1_000_000
+        route_trace["execution_lease"] = execution_lease
+        if response_id is not None:
+            route_trace["response_id"] = response_id
+        if error_code is not None:
+            route_trace["error_code"] = error_code
+        dispatch_value = route_trace.get("dispatch")
+        dispatch = dict(dispatch_value) if isinstance(dispatch_value, Mapping) else {}
+        physical_started = dispatch.get("physical_request_started") is True
+        if done_event is not None:
+            physical_started = True
+        if physical_started:
+            executed_provider = str(
+                getattr(done_event, "provider", "")
+                or metadata.get("executed_provider")
+                or dispatch.get("executed_provider")
+                or ""
+            ).strip()
+            executed_model = str(
+                getattr(done_event, "model", "")
+                or metadata.get("executed_model")
+                or dispatch.get("executed_model")
+                or ""
+            ).strip()
+            route_trace["executed_provider"] = executed_provider or None
+            route_trace["executed_model"] = executed_model or None
+        else:
+            route_trace["executed_provider"] = None
+            route_trace["executed_model"] = None
+        if done_event is not None:
+            # Provider adapters expose ``input_tokens`` as the total input
+            # envelope, including cache reads/writes.  Keep those raw counters
+            # intact and add the mutually-exclusive billing buckets required
+            # for route audit/reconciliation.
+            raw_input_tokens = int(getattr(done_event, "input_tokens", 0) or 0)
+            raw_output_tokens = int(getattr(done_event, "output_tokens", 0) or 0)
+            raw_reasoning_tokens = int(getattr(done_event, "reasoning_tokens", 0) or 0)
+            raw_cache_read_tokens = int(getattr(done_event, "cached_tokens", 0) or 0)
+            raw_cache_write_tokens = int(getattr(done_event, "cache_write_tokens", 0) or 0)
+            input_tokens = max(0, raw_input_tokens)
+            output_tokens = max(0, raw_output_tokens)
+            reasoning_tokens = max(0, raw_reasoning_tokens)
+            cache_read_tokens = min(
+                input_tokens,
+                max(0, raw_cache_read_tokens),
+            )
+            cache_write_tokens = min(
+                input_tokens - cache_read_tokens,
+                max(0, raw_cache_write_tokens),
+            )
+            normal_input_tokens = input_tokens - cache_read_tokens - cache_write_tokens
+            raw_input_buckets_reconcile = (
+                raw_input_tokens >= 0
+                and raw_cache_read_tokens >= 0
+                and raw_cache_write_tokens >= 0
+                and raw_cache_read_tokens + raw_cache_write_tokens <= raw_input_tokens
+            )
+            route_trace["provider_usage"] = {
+                # These top-level counters preserve the provider adapter's raw
+                # aggregate.  Do not silently repair inconsistent receipts.
+                "input_tokens": raw_input_tokens,
+                "output_tokens": raw_output_tokens,
+                "reasoning_tokens": raw_reasoning_tokens,
+                "cache_read_tokens": raw_cache_read_tokens,
+                "cache_write_tokens": raw_cache_write_tokens,
+                "cost_usd": float(getattr(done_event, "cost_usd", 0.0) or 0.0),
+                "billed_cost_usd": float(getattr(done_event, "billed_cost", 0.0) or 0.0),
+                "cost_source": str(getattr(done_event, "cost_source", "none") or "none"),
+                "provider": str(getattr(done_event, "provider", "") or "") or None,
+                "model": str(getattr(done_event, "model", "") or "") or None,
+                "requested_provider": str(getattr(done_event, "requested_provider", "") or "")
+                or None,
+                "requested_model": str(getattr(done_event, "requested_model", "") or "") or None,
+                "normalized_billing_buckets": {
+                    "normal_input_tokens": normal_input_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens,
+                    "output_tokens": output_tokens,
+                    # Reasoning is an output detail unless the physical
+                    # provider receipt explicitly reports separate billing.
+                    "reasoning_tokens_detail": reasoning_tokens,
+                    "input_tokens_total": input_tokens,
+                    "input_buckets_reconcile": raw_input_buckets_reconcile,
+                    "normalization_anomaly": not raw_input_buckets_reconcile,
+                },
+            }
+            usage_ledger = getattr(done_event, "model_usage_ledger", None)
+            if isinstance(usage_ledger, list) and usage_ledger:
+                route_trace["provider_usage"]["physical_ledger"] = copy.deepcopy(
+                    [row for row in usage_ledger if isinstance(row, Mapping)]
+                )
+            provider_native_usage = getattr(done_event, "provider_usage", None)
+            if isinstance(provider_native_usage, Mapping):
+                route_trace["provider_usage"]["provider_native_usage"] = (
+                    _fixed_route_provider_native_usage(provider_native_usage)
+                )
+        metadata["fixed_four_tier_v2_decision"] = route_trace
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                updated = await settle(
+                    route_id=route_id,
+                    execution_status=execution_status,
+                    response_id=response_id,
+                    error_code=error_code,
+                    route_trace=route_trace,
+                )
+                if updated is True:
+                    metadata.pop(
+                        "fixed_four_tier_v2_terminal_settlement_pending",
+                        None,
+                    )
+                    return True
+                last_error = RuntimeError("four_tier_mapping terminal decision was not available")
+            except Exception as exc:  # noqa: BLE001 - bounded durable retry
+                last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0)
+
+        metadata["fixed_four_tier_v2_terminal_settlement_pending"] = {
+            "route_id": route_id,
+            "execution_status": execution_status,
+            "response_id": response_id,
+            "error_code": error_code,
+            "recorded_at_ms": time.time_ns() // 1_000_000,
+        }
+        log.error(
+            "fixed_four_tier_v2.terminal_settlement_failed",
+            route_id=route_id,
+            execution_status=execution_status,
+            error_type=type(last_error).__name__ if last_error is not None else "unknown",
+        )
+        if required:
+            raise RuntimeError(
+                "four_tier_mapping terminal audit persistence failed"
+            ) from last_error
+        return False
+
     async def _resolve_router_single_provider(
         self,
         *,
@@ -8955,6 +10743,8 @@ class TurnRunner:
         usage_execution_context: UsageExecutionContext | None = None,
         turn_absolute_deadline: float | None = None,
         explicit_model: str | None = None,
+        bound_user_message_id: str | None = None,
+        trusted_route_metadata: Mapping[str, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -8985,6 +10775,13 @@ class TurnRunner:
 
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
         router_timeout = float(getattr(router_cfg, "routing_timeout_seconds", 5.0) or 5.0)
+        initial_ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
+        fixed_four_tier_v2_active = bool(
+            getattr(initial_ensemble_cfg, "enabled", False) is True
+            and str(getattr(initial_ensemble_cfg, "mode", "") or "").strip().casefold() == "single"
+            and str(getattr(initial_ensemble_cfg, "selection_mode", "") or "").strip().casefold()
+            == "four_tier_mapping"
+        )
 
         def _copy_router_turn(turn: TurnContext) -> TurnContext:
             metadata: dict[str, Any] = {}
@@ -9005,6 +10802,18 @@ class TurnRunner:
             )
 
         async def _bounded_apply_squilla_router(turn: TurnContext) -> TurnContext:
+            turn_ensemble_cfg = getattr(turn.config, "llm_ensemble", None)
+            turn_selection_mode = (
+                str(getattr(turn_ensemble_cfg, "selection_mode", "") or "").strip().casefold()
+            )
+            if (
+                getattr(turn_ensemble_cfg, "enabled", False) is True
+                and str(getattr(turn_ensemble_cfg, "mode", "") or "").strip().casefold() == "single"
+                and turn_selection_mode == "four_tier_mapping"
+            ):
+                turn.metadata["fixed_four_tier_v2_legacy_router_skipped"] = True
+                return turn
+
             def _run_router_step_sync() -> TurnContext:
                 return asyncio.run(apply_squilla_router(_copy_router_turn(turn)))
 
@@ -9028,10 +10837,31 @@ class TurnRunner:
 
         _bounded_apply_squilla_router.__name__ = "apply_squilla_router"
 
-        gate_chat, gate_model = self._make_vision_followup_gate_chat(
-            cloned_selector,
-            usage_execution_context,
-        )
+        async def _apply_vision_gate_for_mode(turn: TurnContext) -> TurnContext:
+            if fixed_four_tier_v2_active:
+                turn.metadata["fixed_four_tier_v2_vision_gate_skipped"] = True
+                return turn
+            return await apply_vision_followup_gate(turn)
+
+        _apply_vision_gate_for_mode.__name__ = "apply_vision_followup_gate"
+
+        async def _apply_prompt_cache_for_mode(turn: TurnContext) -> TurnContext:
+            if fixed_four_tier_v2_active:
+                # The final provider/model does not exist until the fixed resolver
+                # runs below. Applying a cache policy here would bind the prompt to
+                # the pre-route selector identity and leak legacy routing behavior.
+                turn.metadata["fixed_four_tier_v2_prompt_cache_skipped"] = True
+                return turn
+            return await apply_prompt_cache(turn)
+
+        _apply_prompt_cache_for_mode.__name__ = "apply_prompt_cache"
+        if fixed_four_tier_v2_active:
+            gate_chat, gate_model = None, None
+        else:
+            gate_chat, gate_model = self._make_vision_followup_gate_chat(
+                cloned_selector,
+                usage_execution_context,
+            )
         agent_skill_loader = self._skill_loader
         if skill_catalog is not None and self._skill_loader is not None:
             from opensquilla.skills.loader import PinnedSkillLoader
@@ -9047,10 +10877,23 @@ class TurnRunner:
             # PR9+: meta_resolution's awaiting branch calls this first when
             # the SKILL.md has ``nl_extract: true``. None keeps clarify reply
             # parsing on the deterministic compatibility path.
-            "meta_llm_chat": self._make_meta_llm_chat(
-                provider,
-                session_key,
-                usage_execution_context,
+            # The fixed route's contract permits exactly one selected model
+            # deployment.  Meta-resolution must stay deterministic in this
+            # mode rather than issuing an extra LLM request on the pre-route
+            # provider.
+            "meta_llm_chat": (
+                None
+                if fixed_four_tier_v2_active
+                else self._make_meta_llm_chat(
+                    provider,
+                    session_key,
+                    usage_execution_context,
+                )
+            ),
+            # TaskRuntime owns a retry-stable ingress execution identity.  The
+            # inner TurnRunner UUID remains separate for usage-attempt linkage.
+            "fixed_four_tier_v2_request_id": (
+                str(getattr(tool_context, "task_id", "") or "").strip() or None
             ),
             "router_control_hold_store": self._router_control_hold_store,
             # Surface the resolved per-agent workspace so the meta_invoke
@@ -9076,12 +10919,22 @@ class TurnRunner:
                 )
             ),
         }
+        if fixed_four_tier_v2_active and isinstance(trusted_route_metadata, Mapping):
+            for key in (
+                "fixed_four_tier_v2_control_event",
+                "fixed_four_tier_v2_redo_parent_session_id",
+                "fixed_four_tier_v2_redo_of_message_id",
+                "fixed_four_tier_v2_redo_child_task_start_input_message_id",
+            ):
+                value = trusted_route_metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    initial_metadata[key] = value.strip()
         if skill_catalog is not None:
             initial_metadata["skill_catalog_generation"] = int(
                 getattr(skill_catalog, "generation", 0)
             )
         initial_provider_config = getattr(cloned_selector, "current_config", None)
-        if initial_provider_config is not None:
+        if initial_provider_config is not None and not fixed_four_tier_v2_active:
             initial_metadata["executed_provider"] = str(
                 getattr(initial_provider_config, "provider", "") or ""
             )
@@ -9180,7 +11033,7 @@ class TurnRunner:
             turn,
             [
                 resolve_model,
-                apply_vision_followup_gate,
+                _apply_vision_gate_for_mode,
                 _bounded_apply_squilla_router,
                 observe_reasoning_hint,
                 meta_resolution,
@@ -9189,12 +11042,12 @@ class TurnRunner:
                 filter_skills,
                 inject_subagent_grounding,
                 inject_platform_hint,
-                apply_prompt_cache,
+                _apply_prompt_cache_for_mode,
             ],
         )
 
         # Apply routed model back to cloned selector (local, not shared)
-        if turn.model and cloned_selector is not None:
+        if turn.model and cloned_selector is not None and not fixed_four_tier_v2_active:
             from opensquilla.engine.selector_override import (
                 apply_model_override,
                 cross_provider_tier_config,
@@ -9221,23 +11074,36 @@ class TurnRunner:
             and str(getattr(ensemble_cfg, "mode", "multiple") or "multiple") == "single"
         )
         if router_single_mode:
-            # Explicit per-turn model selection has higher priority than the
-            # dynamic Analyzer and therefore returns before any Analyzer call.
+            single_selection_mode = (
+                str(getattr(ensemble_cfg, "selection_mode", "") or "").strip().casefold()
+            )
             explicit_model_id = str(explicit_model or "").strip()
-            if explicit_model_id:
+            if explicit_model_id and single_selection_mode != "four_tier_mapping":
                 # Single-only early override preserves PromptAssembler's
-                # shared model precedence without changing b5/default paths.
+                # shared model precedence for the pre-existing dynamic mode.
                 turn.model = explicit_model_id
                 return turn, provider
-            provider = await self._resolve_router_single_provider(
-                turn=turn,
-                provider=provider,
-                cloned_selector=cloned_selector,
-                turn_config=turn_config,
-                ensemble_cfg=ensemble_cfg,
-                turn_absolute_deadline=turn_absolute_deadline,
-                usage_execution_context=usage_execution_context,
-            )
+            if single_selection_mode == "four_tier_mapping":
+                provider = await self._resolve_fixed_four_tier_v2_provider(
+                    turn=turn,
+                    provider=provider,
+                    cloned_selector=cloned_selector,
+                    turn_config=turn_config,
+                    ensemble_cfg=ensemble_cfg,
+                    turn_absolute_deadline=turn_absolute_deadline,
+                    usage_execution_context=usage_execution_context,
+                    bound_user_message_id=bound_user_message_id,
+                )
+            else:
+                provider = await self._resolve_router_single_provider(
+                    turn=turn,
+                    provider=provider,
+                    cloned_selector=cloned_selector,
+                    turn_config=turn_config,
+                    ensemble_cfg=ensemble_cfg,
+                    turn_absolute_deadline=turn_absolute_deadline,
+                    usage_execution_context=usage_execution_context,
+                )
             return turn, provider
 
         if provider is not None and getattr(ensemble_cfg, "enabled", False):
@@ -9572,11 +11438,9 @@ class TurnRunner:
                                     selection_generation=multiple_cache_generation,
                                     topology="multiple",
                                 )
-                                multiple_sidecar_key = (
-                                    self._register_router_dynamic_cache_sidecar(
-                                        context=multiple_context,
-                                        policy=multiple_cache_policy,
-                                    )
+                                multiple_sidecar_key = self._register_router_dynamic_cache_sidecar(
+                                    context=multiple_context,
+                                    policy=multiple_cache_policy,
                                 )
                         analyzer_policy = task_analyzer_policy(ranking_config)
                         analyzer_chain = task_analyzer_chain_policy(ranking_config)
@@ -11832,6 +13696,8 @@ class TurnRunner:
         *,
         trim_last_user: bool = True,
         bound_user_message_id: str | None = None,
+        suppress_compaction_context: bool = False,
+        history_start_message_id: str | None = None,
     ) -> str | None:
         """Load existing transcript as agent history.
 
@@ -11844,7 +13710,9 @@ class TurnRunner:
         prompts into context. Slicing by id drops the bound entry (the caller
         re-appends it) plus any later user entry while keeping the intervening
         assistant replies. When the id is absent or not found, fall back to the
-        positional trim.
+        positional trim. ``suppress_compaction_context`` is the four_tier_mapping
+        exact-task path and therefore fails closed instead of using either
+        positional fallback or request-scoped emergency compaction.
         """
         if self._session_manager is None:
             return None
@@ -11861,9 +13729,37 @@ class TurnRunner:
             session_key,
             None,
         )
-        if emergency_override is not None:
+        if emergency_override is not None and not suppress_compaction_context:
             transcript = list(emergency_override.kept_entries)
             summary_markers.append(emergency_override.summary)
+
+        if history_start_message_id:
+            boundary_index = next(
+                (
+                    index
+                    for index, entry in enumerate(transcript)
+                    if getattr(entry, "message_id", None) == history_start_message_id
+                ),
+                None,
+            )
+            if boundary_index is None:
+                if suppress_compaction_context:
+                    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+                        FixedFourTierRoutingError,
+                    )
+
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping history task boundary is unavailable",
+                        reason="task_history_boundary_unavailable",
+                    )
+                log.warning(
+                    "load_history.task_boundary_missing",
+                    session_key=session_key,
+                    history_start_message_id=history_start_message_id,
+                )
+                transcript = []
+            else:
+                transcript = transcript[boundary_index:]
 
         # Resolve the id-bound slice (see method docstring). Only active when we
         # would otherwise trim positionally.
@@ -11881,6 +13777,15 @@ class TurnRunner:
                     if idx >= bound_index and getattr(candidate, "role", None) == "user"
                 }
             else:
+                if suppress_compaction_context:
+                    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+                        FixedFourTierRoutingError,
+                    )
+
+                    raise FixedFourTierRoutingError(
+                        "four_tier_mapping current history boundary is unavailable",
+                        reason="current_history_boundary_unavailable",
+                    )
                 # The bound message is not in the (possibly compacted) transcript;
                 # fall back to positional trim but surface it — a persistent
                 # occurrence means queued binding is silently degrading.
@@ -12018,7 +13923,9 @@ class TurnRunner:
             Message(role="assistant", content=notice)
             for notice in dict.fromkeys(subagent_terminal_notices)
         )
-        context_states = await self._load_context_states(session_key)
+        context_states = (
+            [] if suppress_compaction_context else await self._load_context_states(session_key)
+        )
         provider = getattr(agent, "provider", None)
         provider_context = build_provider_compaction_context(
             context_states=context_states,
@@ -12028,6 +13935,8 @@ class TurnRunner:
             history = provider_context.messages + history
         if history:
             agent.set_history(history)
+        if suppress_compaction_context:
+            return None
         return await self._compaction_summary_context(
             session_key,
             summary_markers,

@@ -557,7 +557,10 @@ import type {
   ArtifactPayload,
   SessionEventPayload,
 } from '@/types/rpc'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import {
+  isFourTierMappingSelectionMode,
+  type ModelRoutingMode,
+} from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { InterruptViewState } from '@/types/parts'
 import { artifactDownloadUrl } from '@/utils/chat/artifacts'
@@ -727,6 +730,7 @@ let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = task
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
+const pendingRoutingControl = ref<import('@/types/rpc').ChatRoutingControl | null>(null)
 let applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void = () => {}
 let resetComposerInputHistory: () => void = () => {}
 
@@ -888,6 +892,7 @@ const {
   routerEnabled,
   modelRoutingMode,
   modelRoutingSettingsBusy,
+  llmEnsembleSelectionMode,
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
@@ -899,6 +904,20 @@ const {
   setRouterVisualEffectsEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+
+const fourTierMappingActive = computed(() =>
+  modelRoutingMode.value === 'llm_ensemble'
+  && isFourTierMappingSelectionMode(llmEnsembleSelectionMode.value),
+)
+
+function fourTierMappingBranchActionBlocked() {
+  return (
+    isCompactInFlightForCurrentSession()
+    || pendingQueue.value.length > 0
+    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+    || hasPendingAttachmentWork()
+  )
+}
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -997,7 +1016,7 @@ const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
     if (msg.isRouterStrip) return null
     if (msg.displayRole === 'user') break
   }
-  if (modelRoutingMode.value === 'llm_ensemble') {
+  if (modelRoutingMode.value === 'llm_ensemble' && !fourTierMappingActive.value) {
     return {
       id: 'router-strip-reserve',
       role: 'router',
@@ -1097,8 +1116,17 @@ const chatMessageActions = useChatMessageActions({
   sendCurrentInput: () => sendCurrentInput(),
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
+  pendingRoutingControl,
+  isFourTierMapping: () => fourTierMappingActive.value,
+  isBranchActionBlocked: fourTierMappingBranchActionBlocked,
+  hasPendingBranchAttachments: () => pendingAttachments.value.length > 0,
   aiGeneratedLabel: () => aiGeneratedLabel.value,
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
+  notifyBranchBusy: () => pushToast(t('chat.toast.waitBranchIdle'), { tone: 'info' }),
+  notifyAttachmentBranchUnsupported: () => pushToast(
+    t('chat.toast.attachmentBranchUnsupported'),
+    { tone: 'info' },
+  ),
 })
 const {
   copyMessage,
@@ -1237,12 +1265,15 @@ const chatSend = useChatSend({
   pendingQueueOwnerContext,
   busySendMode,
   modelRoutingMode,
+  llmEnsembleSelectionMode,
   modelRoutingSettingsBusy,
   elevatedMode,
   runMode,
   pendingAttachments,
   pendingSessionIntent,
   pendingForkBeforeMessageId,
+  pendingRoutingControl,
+  isFourTierMappingBranchActionBlocked: fourTierMappingBranchActionBlocked,
   aborted,
   activeStreamTaskId,
   activeStreamSessionKey,
@@ -1500,7 +1531,7 @@ const modelImageSendBlockedMessage = computed(() => {
   if (modelRoutingSettingsBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
-  return modelRoutingMode.value === 'llm_ensemble'
+  return modelRoutingMode.value === 'llm_ensemble' && !fourTierMappingActive.value
     ? t('chat.composer.ensembleImageUnsupported')
     : ''
 })
@@ -2249,6 +2280,7 @@ watch(pendingSessionIntent, (intent, previous) => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  pendingRoutingControl.value = null
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
   metaRunsHistoryOpen.value = false

@@ -132,8 +132,13 @@ def _patch_thinking(runner: TurnRunner) -> None:
 
 def _patch_t3(runner, *, return_value="not_applicable", raises=None, calls=None):
     async def _t3(
-        self, session_key, turn, context_window_tokens,  # noqa: ARG001, ARG002
-        *, compaction_provider=None, compaction_model=None,
+        self,
+        session_key,
+        turn,
+        context_window_tokens,  # noqa: ARG001, ARG002
+        *,
+        compaction_provider=None,
+        compaction_model=None,
     ):
         if calls is not None:
             calls.append({"session_key": session_key})
@@ -146,8 +151,12 @@ def _patch_t3(runner, *, return_value="not_applicable", raises=None, calls=None)
 
 def _patch_preflight(runner, *, raises=None, calls=None):
     async def _preflight(
-        self, session_key, context_window_tokens,  # noqa: ARG001, ARG002
-        *, compaction_provider=None, compaction_model=None,
+        self,
+        session_key,
+        context_window_tokens,  # noqa: ARG001, ARG002
+        *,
+        compaction_provider=None,
+        compaction_model=None,
     ):
         if calls is not None:
             calls.append({"session_key": session_key})
@@ -160,13 +169,22 @@ def _patch_preflight(runner, *, raises=None, calls=None):
 
 def _patch_load_history(runner, *, return_value=None, raises=None, calls=None):
     async def _load(
-        self, agent, session_key, *, trim_last_user=True, bound_user_message_id=None
+        self,
+        agent,
+        session_key,
+        *,
+        trim_last_user=True,
+        bound_user_message_id=None,
+        suppress_compaction_context=False,
+        history_start_message_id=None,
     ):  # noqa: ARG001, ARG002
         if calls is not None:
             calls.append(
                 {
                     "trim_last_user": trim_last_user,
                     "bound_user_message_id": bound_user_message_id,
+                    "suppress_compaction_context": suppress_compaction_context,
+                    "history_start_message_id": history_start_message_id,
                 }
             )
         if raises is not None:
@@ -428,13 +446,10 @@ async def test_compaction_and_history_stage_snapshot(
 
     expected_snapshot = {
         "outcome": "success",
-        "agent_request_context_prompt_after": case[
-            "expected_final_request_context"
-        ],
+        "agent_request_context_prompt_after": case["expected_final_request_context"],
     }
     assert captured == expected_snapshot, (
-        f"case={case_id}: snapshot diverged.\n"
-        f"  expected={expected_snapshot}\n  actual  ={captured}"
+        f"case={case_id}: snapshot diverged.\n  expected={expected_snapshot}\n  actual  ={captured}"
     )
 
     # Routing assertions: t3 always invoked exactly once.
@@ -442,15 +457,12 @@ async def test_compaction_and_history_stage_snapshot(
     # Preflight invoked only on fall-through sentinels.
     fall_through = case["t3_return"] in {"not_applicable", "flush_failed"}
     expected_pre_calls = 1 if fall_through else 0
-    assert len(call_log["preflight"]) == expected_pre_calls, (
-        f"{case_id}: preflight calls"
-    )
+    assert len(call_log["preflight"]) == expected_pre_calls, f"{case_id}: preflight calls"
     # History always loaded once.
     assert len(call_log["history"]) == 1
-    assert (
-        call_log["history"][0]["trim_last_user"]
-        is case["history_has_persisted_user"]
-    )
+    assert call_log["history"][0]["trim_last_user"] is case["history_has_persisted_user"]
+    assert call_log["history"][0]["suppress_compaction_context"] is False
+    assert call_log["history"][0]["history_start_message_id"] is None
 
 
 @pytest.mark.asyncio

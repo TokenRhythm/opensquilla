@@ -2955,6 +2955,8 @@
       "waitResponseBeforeCommand": "Warten Sie auf die aktuelle Antwort, bevor Sie {command} ausführen.",
       "queueFull": "Warteschlange ist voll — warten Sie, bis die aktuelle Antwort abgeschlossen ist.",
       "messageStillSaving": "Diese Nachricht ist noch nicht gespeichert — versuchen Sie es gleich erneut.",
+      "waitBranchIdle": "Warten Sie vor dem Verzweigen auf die aktuelle Antwort, Komprimierung oder Warteschlange.",
+      "attachmentBranchUnsupported": "Nachrichten mit Anhängen können noch nicht neu generiert oder verzweigt bearbeitet werden.",
       "artifactOpenFailed": "Öffnen des Artefakts fehlgeschlagen. Verwenden Sie stattdessen Herunterladen."
     },
     "stream": {
