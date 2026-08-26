@@ -3401,7 +3401,10 @@
   "chat": {
     "sessionCreated": {
       "title": "Chat created",
-      "open": "Open chat"
+      "open": "Open chat",
+      "fallbackTitle": "Chat {suffix}",
+      "deleted": "Deleted",
+      "missing": "Session was deleted or does not exist"
     },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",

@@ -672,6 +672,7 @@ export interface ChatMessageMeta {
 export interface ChatCreatedSessionLink {
   callId: string
   sessionKey: string
+  title?: string
 }
 
 export interface ChatRenderedMessage {

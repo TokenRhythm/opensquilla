@@ -33,6 +33,7 @@ import {
   isRpcAbort,
   phaseCallOptions,
   phaseTimeoutMs,
+  rpcErrorCode,
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
@@ -668,6 +669,7 @@ export interface ChatHistoryState {
   initialLoadStatus: InitialHistoryLoadStatus
   loadEarlierError: boolean
   recoveryError: boolean
+  sessionMissing: boolean
 }
 
 interface HistoryLoadParams {
@@ -727,6 +729,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     initialLoadStatus: 'pending',
     loadEarlierError: false,
     recoveryError: false,
+    sessionMissing: false,
   })
 
   function cancelAnchorStabilization() {
@@ -882,6 +885,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
       recoveryError: prepend ? historyState.value.recoveryError : initialLoadError,
+      sessionMissing: false,
     }
   }
 
@@ -910,6 +914,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       initialLoadStatus: 'pending',
       loadEarlierError: false,
       recoveryError: false,
+      sessionMissing: false,
     }
     return crossedSession
   }
@@ -1346,6 +1351,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             : historyState.value.initialLoadStatus,
           loadEarlierError: Boolean(params.prepend),
           recoveryError: !params.prepend,
+          sessionMissing: !params.prepend
+            && ['NOT_FOUND', 'SESSION_NOT_FOUND'].includes(rpcErrorCode(error)),
         }
         flushPendingHistorySync()
       }

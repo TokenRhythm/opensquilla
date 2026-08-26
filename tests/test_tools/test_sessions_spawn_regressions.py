@@ -309,11 +309,12 @@ async def test_sessions_spawn_persists_explicit_or_task_derived_title(
 
     token = current_tool_context.set(_ctx())
     try:
-        await sessions_tool.sessions_spawn(task=task, title=title)
+        result = json.loads(await sessions_tool.sessions_spawn(task=task, title=title))
     finally:
         current_tool_context.reset(token)
 
     assert mgr.created[0]["derived_title"] == expected
+    assert result["title"] == expected
     assert mgr.created[0]["origin"]["task"] == task
     assert mgr.created[0]["origin"]["execution_task"].endswith(task)
 

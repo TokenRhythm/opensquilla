@@ -3401,7 +3401,10 @@
   "chat": {
     "sessionCreated": {
       "title": "聊天已创建",
-      "open": "打开聊天"
+      "open": "打开聊天",
+      "fallbackTitle": "聊天 {suffix}",
+      "deleted": "已删除",
+      "missing": "会话已删除或不存在"
     },
     "promptCacheKeepalive": {
       "action": "提示词缓存保活",

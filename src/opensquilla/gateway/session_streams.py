@@ -85,6 +85,7 @@ class SessionStreamRegistry:
         # persists its terminal row. Build the allowlisted v2 immediately and
         # retain only that sanitized, identity-bound value across the handoff.
         self._terminal_activity_snapshots_by_task: dict[str, dict[str, Any]] = {}
+        self._terminal_session_by_task: dict[str, str] = {}
         self._terminal_task_order: deque[str] = deque()
         self._completed_events_by_session: dict[str, deque[BufferedSessionEvent]] = {}
         self._reset_stream_seqs_by_session: dict[str, list[int]] = {}
@@ -229,12 +230,14 @@ class SessionStreamRegistry:
         if task_id not in self._terminal_activity_snapshots_by_task:
             self._terminal_task_order.append(task_id)
         self._terminal_activity_snapshots_by_task[task_id] = snapshot
+        self._terminal_session_by_task[task_id] = session_key
         # Terminal persistence normally consumes immediately. This defensive
         # bound covers crashes in the finalizer without retaining raw events
         # or whole runs for the process lifetime.
         while len(self._terminal_task_order) > 64:
             stale_task_id = self._terminal_task_order.popleft()
             self._terminal_activity_snapshots_by_task.pop(stale_task_id, None)
+            self._terminal_session_by_task.pop(stale_task_id, None)
 
     def take_terminal_activity_snapshot(
         self,
@@ -248,6 +251,7 @@ class SessionStreamRegistry:
 
         frozen = self._terminal_activity_snapshots_by_task.pop(task_id, None)
         if frozen is not None:
+            self._terminal_session_by_task.pop(task_id, None)
             try:
                 self._terminal_task_order.remove(task_id)
             except ValueError:
@@ -274,6 +278,31 @@ class SessionStreamRegistry:
             task_id=task_id,
             turn_id=turn_id,
         )
+
+    def evict(self, session_key: str) -> None:
+        """Discard every process-local stream artifact owned by one session."""
+
+        self._seq_by_session.pop(session_key, None)
+        self._events_by_session.pop(session_key, None)
+        self._clear_live_state(session_key)
+        self._completed_events_by_session.pop(session_key, None)
+        self._reset_stream_seqs_by_session.pop(session_key, None)
+        self._reset_events_by_session.pop(session_key, None)
+
+        terminal_task_ids = {
+            task_id
+            for task_id, owner_session_key in self._terminal_session_by_task.items()
+            if owner_session_key == session_key
+        }
+        if terminal_task_ids:
+            for task_id in terminal_task_ids:
+                self._terminal_activity_snapshots_by_task.pop(task_id, None)
+                self._terminal_session_by_task.pop(task_id, None)
+            self._terminal_task_order = deque(
+                task_id
+                for task_id in self._terminal_task_order
+                if task_id not in terminal_task_ids
+            )
 
     def _trim_session_events(self, events: deque[BufferedSessionEvent]) -> None:
         while len(events) > self._max_events_per_session:
