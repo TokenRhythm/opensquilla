@@ -2312,9 +2312,29 @@ if (-not [string]::IsNullOrWhiteSpace($__opensquillaProxy)) {
 """.strip()
 
 
+def _host_shell_proxy_set() -> bool:
+    """True when a downstream proxy is set for the host shell.
+
+    Mirrors the env-variable probe inside ``_WINDOWS_POWERSHELL_PROXY_PRELUDE``
+    (HTTPS_PROXY then HTTP_PROXY, case-insensitive) so the wrapper only injects
+    the proxy preamble when it actually has an effect.  Skipping the preamble
+    when no proxy is configured is what keeps the emitted command line clean for
+    AV heuristics that flag ``powershell.exe -Command ... Invoke-WebRequest /
+    WebProxy`` even when the payload is a benign no-op.
+    """
+    return bool(
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+
+
 def _windows_with_powershell_proxy_defaults(command: str) -> str:
-    prelude = _WINDOWS_POWERSHELL_PROXY_PRELUDE
     command = command.strip()
+    if not _host_shell_proxy_set():
+        return command
+    prelude = _WINDOWS_POWERSHELL_PROXY_PRELUDE
     if not command:
         return prelude
     return f"{prelude.rstrip(';')}; {command}"
