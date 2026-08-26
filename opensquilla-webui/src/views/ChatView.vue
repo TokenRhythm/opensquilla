@@ -883,7 +883,7 @@ import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandl
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
-import { useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
+import { chatTaskId, useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
@@ -2240,6 +2240,28 @@ const chatHistory = useChatHistory({
   scrollEpoch,
   stripTimePrefix,
   scrollToBottom,
+  onTerminalTask: outcome => {
+    const taskId = outcome.taskId || ''
+    if (!taskId) return
+    taskOwnership.noteTerminal(taskId)
+    const ownsLiveStream = activeStreamTaskId.value === taskId
+    const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
+    if (ownsLiveStream) {
+      resetStreamLiveTurnState()
+      activeStreamTaskId.value = outcome.status === 'cancelled'
+        ? STOPPED_STREAM_TASK_ID
+        : FINISHED_STREAM_TASK_ID
+    }
+    if (ownsLiveStream || ownsRunStatus) {
+      applySessionRunState({
+        run_status: outcome.status === 'cancelled'
+          ? 'cancelled'
+          : outcome.status === 'failed' ? 'failed' : 'idle',
+        active_task: null,
+        last_task: { task_id: taskId, status: outcome.status },
+      })
+    }
+  },
 })
 const {
   historySessionKey,

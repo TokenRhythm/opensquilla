@@ -2,6 +2,7 @@ import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatTimelineSegment,
+  ChatTurnOutcome,
   ChatUsagePayload,
   RawToolCallPayload,
 } from '@/types/chat'
@@ -445,11 +446,13 @@ function attachHistoryTurnOutcomes(
     }
   })
 
-  // A pre-provider barrier may fail before an assistant transcript row exists.
-  // Materialize one status-only assistant row from the terminal task snapshot
-  // so refresh and reconnect show the completed route/activity trace.
+  // A terminal task may finish before an assistant transcript row exists.
+  // Materialize one activity-only assistant row so refresh and reconnect keep
+  // the durable route/activity trace inspectable.
   for (const outcome of outcomes) {
-    if (!isUsageAccountingBarrier(outcome.errorClass) || !outcome.statusHistory?.length) continue
+    const legacyUsageActivity = isUsageAccountingBarrier(outcome.errorClass)
+      && Boolean(outcome.statusHistory?.length)
+    if (!outcome.activitySnapshot && !legacyUsageActivity) continue
     if (enriched.some(message => message.turnId === outcome.turnId && message.role === 'assistant')) continue
     const turnIndexes = enriched.flatMap((message, index) =>
       message.turnId === outcome.turnId ? [index] : [],
@@ -457,16 +460,34 @@ function attachHistoryTurnOutcomes(
     if (!turnIndexes.length) continue
     const firstTerminalIndex = turnIndexes.find(index => enriched[index]?.role === 'error')
     const insertionIndex = firstTerminalIndex ?? Math.max(...turnIndexes) + 1
-    enriched.splice(insertionIndex, 0, {
+    const activityOnlyMessage: ChatMessage = {
       role: 'assistant',
       text: '',
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
       turnOutcome: outcome,
-      statusHistory: outcome.statusHistory.map(entry => ({ ...entry })),
+      statusHistory: (outcome.statusHistory || []).map(entry => ({ ...entry })),
       messageId: `terminal-activity:${outcome.taskId || outcome.turnId}`,
       restoredFromHistory: true,
-    })
+    }
+    if (outcome.activitySnapshot) {
+      const snapshotReasoningBlocks = outcome.activitySnapshot.complete
+        ? activityReasoningBlocks(outcome.activitySnapshot, '')
+        : undefined
+      const snapshotComplete = Boolean(
+        outcome.activitySnapshot.complete
+        && snapshotReasoningBlocks !== undefined
+        && activitySnapshotMatchesMessage(outcome.activitySnapshot, activityOnlyMessage),
+      )
+      activityOnlyMessage.activitySnapshot = snapshotComplete
+        ? outcome.activitySnapshot
+        : { ...outcome.activitySnapshot, complete: false }
+      activityOnlyMessage.activitySnapshotIncomplete = !snapshotComplete
+      if (snapshotComplete) {
+        activityOnlyMessage.reasoningBlocks = snapshotReasoningBlocks?.map(block => ({ ...block }))
+      }
+    }
+    enriched.splice(insertionIndex, 0, activityOnlyMessage)
   }
 
   // The task outcome is the durable authority for a pre-provider usage
@@ -653,6 +674,7 @@ export interface UseChatHistoryOptions {
   scrollEpoch?: Ref<number>
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
+  onTerminalTask?: (outcome: ChatTurnOutcome) => void
 }
 
 export interface ChatHistoryState {
@@ -728,6 +750,20 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     loadEarlierError: false,
     recoveryError: false,
   })
+
+  function notifyTerminalTasks(data: ChatHistoryResponse) {
+    if (!options.onTerminalTask) return
+    for (const raw of data.turn_outcomes || []) {
+      const outcome = normalizeTurnOutcome(raw)
+      if (
+        outcome?.taskId
+        && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted']
+          .includes(outcome.status.toLowerCase())
+      ) {
+        options.onTerminalTask(outcome)
+      }
+    }
+  }
 
   function cancelAnchorStabilization() {
     const stop = stopAnchorStabilization
@@ -1044,6 +1080,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
+      if (canonicalAvailable !== false) notifyTerminalTasks(data)
+
       const summaryIds = summaryCompactionIds(data)
       let mapped = attachHistoryTurnOutcomes(
         msgs.map(message => mapHistoryMessage(message, summaryIds)),
@@ -1123,6 +1161,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             flushPendingHistorySync()
             return { ok: false }
           }
+
+          notifyTerminalTasks(bridgeData)
 
           const page = attachHistoryTurnOutcomes(
             (bridgeData.messages || []).map(message =>
