@@ -895,6 +895,7 @@
       "tests/test_cli/test_init_cmd.py",
       "tests/test_cli/test_migrate_cmd.py",
       "tests/test_cli/test_onboard_status_json.py",
+      "tests/test_cli/test_option_default_profile_targets.py",
       "tests/test_cli/test_sandbox_cmd.py",
       "tests/test_cli/test_search_cmd.py",
       "tests/test_cli/test_url_utils.py",
