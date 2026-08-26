@@ -192,6 +192,7 @@ export class RpcClient {
     this._token = token || null;
     this._guestSessionKey = this._guestSessionKey || loadGuestSessionKey();
     this._autoReconnect = true;
+    this._reconnectAttempt = 0;
     this._startLifecycleWatch();
     this._clearReconnectTimer();
     if (this._ws) {
@@ -826,11 +827,10 @@ export class RpcClient {
   private _scheduleReconnect(immediate: boolean = false): void {
     if (!this._autoReconnect) return;
     this._clearReconnectTimer();
+    if (!immediate && this._reconnectAttempt >= RECONNECT_BACKOFF_MS.length) return;
     const delay = immediate
       ? 0
-      : RECONNECT_BACKOFF_MS[
-          Math.min(this._reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)
-        ];
+      : RECONNECT_BACKOFF_MS[this._reconnectAttempt];
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
       if (!this._autoReconnect || this._ws) return;
