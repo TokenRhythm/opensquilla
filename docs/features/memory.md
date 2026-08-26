@@ -102,15 +102,22 @@ Promoted entries land under headings such as `User Preferences` and
 `Project Practices`. `MEMORY.md` itself is never a candidate, so consolidation
 cannot feed on its own output.
 
-**Nothing runs until you opt in.** Consolidation is off by default, and so is
-the session flush that produces the notes it reads:
+**Nothing runs on its own until you opt in**, and nothing is promoted into
+`MEMORY.md` until you turn preview off. The settings gate different things, and
+only `preview_mode` stands between a run and a write:
 
-| Setting | Default | Without it |
+| Setting | Default | What the default does |
 | --- | --- | --- |
-| `memory.flush_enabled` | `false` | no dated notes are written, so Dream has nothing to read |
-| `memory.dream.enabled` | `false` | consolidation never runs |
-| `memory.dream.preview_mode` | `true` | runs report what they would promote, but do not write |
-| `memory.dream.auto_schedule` | `false` | consolidation runs only when you invoke it |
+| `memory.dream.preview_mode` | `true` | a run reports what it would promote and leaves `MEMORY.md` alone |
+| `memory.dream.enabled` | `false` | no scheduled run is registered — invoking the command still runs |
+| `memory.dream.auto_schedule` | `false` | no scheduled run, same as above; both must be true to schedule one |
+| `memory.flush_enabled` | `false` | sessions write no dated notes of their own |
+
+`enabled` and `auto_schedule` govern only the scheduled path;
+`opensquilla memory dream` runs whatever the two are set to. And
+`flush_enabled` is not the only writer of dated notes — the `memory_save` tool
+writes the same `memory/<date>.md` files, so an agent you asked to remember
+something can leave Dream candidates behind with flush off.
 
 Check what is waiting without running anything:
 
@@ -118,17 +125,18 @@ Check what is waiting without running anything:
 opensquilla memory dream --status
 ```
 
-Preview a run. Preview writes nothing and does not advance the cursor, so it is
-safe to repeat while you decide:
+Preview a run. A preview leaves `MEMORY.md`, the backups, the evidence store and
+the cursor untouched, so it is safe to repeat while you decide — it does record
+a receipt under `memory/.dream_receipts/`:
 
 ```sh
 opensquilla memory dream
 ```
 
-To let Dream write, set `preview_mode = false` under `[memory.dream]`, and add
-`auto_schedule = true` if it should run on its own (`interval_h`, default 24,
-or a `cron` expression). Enable `memory.flush_enabled` too, or there will be
-nothing to consolidate.
+To let Dream write, set `preview_mode = false` under `[memory.dream]`. To let it
+run on its own, set both `enabled = true` and `auto_schedule = true`, then pick a
+cadence (`interval_h`, default 24, or a `cron` expression). Turning on
+`memory.flush_enabled` gives it a steady supply of notes to read.
 
 Each run backs up `MEMORY.md` under `memory/.dream_backups/` before writing and
 records a receipt, so a promotion you dislike can be traced and reverted. A
