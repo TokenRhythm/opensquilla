@@ -1,0 +1,4 @@
+
+# PowerShell 中文提交信息坑（2026-08-26 实证）
+- PowerShell 内联传中文给 `git commit -m` 会产生乱码提交信息（gh 的 --title/--body-file 不受影响）
+- 对策：提交信息写 UTF-8 文件，用 `git commit -F <file>`；显示乱码时先 `git cat-file commit HEAD` 验证真实存储内容再决定是否返修

@@ -1,6 +1,7 @@
 # OpenSquilla (泰路札) 项目深度架构分析报告
 
 > 分析日期：2026-08-08 | 分支：feat/openai-bridge | 跟踪：upstream/main f87fed4b
+> **⚠ 增量更新（2026-08-24）**：源码已演进至 main @ `4e48f9b56` / v0.5.3（基线以来 164 提交，src 变更 341 文件）。版本号、分支、模块数（33→35）、巨型文件尺寸、路由档位默认模型等数字已过时——**勘误与增补见 [`16-delta-update-f87fed4b-to-main.md`](16-delta-update-f87fed4b-to-main.md)**；新增深挖「配置的能力」模块见 [`17-s5-capability-config-deep-dive.md`](17-s5-capability-config-deep-dive.md)。
 > 状态：进行中
 > 工具：deep-code-analyzer v2.0.0（S1→S7 流程）
 
@@ -94,5 +95,10 @@ SQLite 持久化（会话/记忆/用量）+ JSONL 观测流（决策/安全/追�
 | `12-s5-auxiliary-model-deep-dive.md` | S5② | 辅助功能模型模块：命名/压缩/刷写/视觉门控的已实现与部分实现边界 + 落地建议 |
 | `13-s7-final-report.md` | S7 | 最终综合报告：12 维度覆盖、架构定性、三大亮点、三大技术债务、优先级建议 |
 | `15-auxiliary-module-source-code-analysis.md` | 勘误 | 2026-08-11 复核：naming 通道遗留传输层定性修正 + 四源码库实证 + 落地建议更新 |
+| `16-delta-update-f87fed4b-to-main.md` | 增量体检 | 2026-08-24：基线以来 164 提交的漂移勘误（版本/模块数/巨型文件复测/新增 artifact_session 与 runtime_packs/0.5.3 功能面） |
+| `17-s5-capability-config-deep-dive.md` | S5③ | 「配置的能力」模块深挖：四能力写路径事务、五态状态机、所有权与 resettable 双模型、差分持久化存储、复杂度与替代对比、配置速查 |
+| `18-s5-session-storage-memory-deep-dive.md` | S5④ | 会话存储（session/ 646KB 巨石、28 张内联表、accept_turn 原子提交、SQLite 争用治理、压缩后三层读路径 §3.1）与记忆体系（memory/ 取证） |
+| `19-pluginization-feasibility-routing-kernel.md` | 可行性 | 对照 DSH/pi 插件模型评估"以路由为内核、其余皆插件化"：六真接缝盘点 + L1 路由升格执行模式总线（衔接 AGENTOS c3 决策档）+ L2 装配声明化 + 上游共存策略 |
+| `20-preflight-routing-kernel-mvp.md` | 前置复核 | 路由内核化 MVP 纯读取证：决策对象两级链（RoutingDecision/RoutePlan）、单模型+融合路径行级定位、bypass hack 移位确认、早/晚钩子裁决输入、修订锚点预算 |
 
-> **使用指南**：按 S1→S4→S5→S7 顺序阅读，或按需直接跳至深挖专题。`15-auxiliary-module-source-code-analysis.md` 是对 `12-s5-auxiliary-model-deep-dive.md` 的勘误补充，建议两篇对照阅读。
+> **使用指南**：按 S1→S4→S5→S7 顺序阅读，或按需直接跳至深挖专题。`15-auxiliary-module-source-code-analysis.md` 是对 `12-s5-auxiliary-model-deep-dive.md` 的勘误补充，建议两篇对照阅读。`16` 号为全档案的最新勘误层，先读它再读旧数字。
