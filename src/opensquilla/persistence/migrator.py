@@ -75,15 +75,35 @@ _LEGACY_MIGRATION_ALIASES: dict[str, tuple[str, str]] = {
     ),
 }
 
+# Migration ids that only ever existed in a pre-release build and were RETIRED
+# rather than renumbered. These deliberately have no entry above: an alias marks
+# its replacement applied without replaying it, which is sound only when both
+# migrations produce the same schema. The pre-release Goal preview created a
+# `goal_runs` table, whereas V033/V034 create `session_goals` and
+# `goal_command_receipts` — disjoint schemas, so adopting the ids would record
+# the replacements as applied while their tables were never created.
+#
+# They are listed only so the downgrade guard can explain itself: such a database
+# is not ahead of this build, and no later release will ever read it.
+_RETIRED_PRERELEASE_MIGRATIONS: dict[str, str] = {
+    "V029__goal_runs": "a pre-release Goal preview build",
+    "V030__goal_run_retry": "a pre-release Goal preview build",
+}
+
 
 class SchemaAheadError(RuntimeError):
     """The database records migrations the running code does not know about.
 
-    Signals that the data was created or upgraded by a NEWER OpenSquilla build
-    than the one now running — e.g. a desktop auto-update that was later rolled
-    back to an older app. Booting would run old code against a newer schema (no
-    yoyo down-migration is invoked at boot), so we refuse loudly instead of
-    risking silent corruption.
+    Usually signals that the data was created or upgraded by a NEWER OpenSquilla
+    build than the one now running — e.g. a desktop auto-update that was later
+    rolled back to an older app. Booting would run old code against a newer
+    schema (no yoyo down-migration is invoked at boot), so we refuse loudly
+    instead of risking silent corruption.
+
+    It is also raised for a database carrying a retired pre-release lineage (see
+    :data:`_RETIRED_PRERELEASE_MIGRATIONS`), which is *not* ahead of this build.
+    The refusal is the same; only the guidance differs, because no later release
+    will ever be able to read it.
     """
 
 
@@ -566,6 +586,41 @@ def assert_schema_not_ahead(db_url: str, migrations_dir: Path) -> None:
     unknown = sorted(applied - known)
     if not unknown:
         return
+    retired = sorted(set(unknown) & _RETIRED_PRERELEASE_MIGRATIONS.keys())
+    if retired:
+        origins = sorted({_RETIRED_PRERELEASE_MIGRATIONS[migration_id] for migration_id in retired})
+        log.error(
+            "migrator.schema_retired_prerelease",
+            extra={
+                "db_path": str(db_path),
+                "retired_migrations": retired,
+                "unknown_migrations": unknown,
+            },
+        )
+        also_unknown = [
+            migration_id
+            for migration_id in unknown
+            if migration_id not in _RETIRED_PRERELEASE_MIGRATIONS
+        ]
+        # A retired lineage does not rule out the database ALSO being genuinely
+        # ahead, so never let the friendlier explanation swallow the rest.
+        trailer = (
+            f" It also records {', '.join(also_unknown)}, which this build does "
+            "not know about either."
+            if also_unknown
+            else ""
+        )
+        raise SchemaAheadError(
+            f"The OpenSquilla database at {db_path} was written by "
+            f"{' and '.join(origins)}, which recorded {', '.join(retired)}. Those "
+            "migrations were retired rather than renumbered: the goal_runs table "
+            "they created was replaced by session_goals and goal_command_receipts, "
+            "so there is no in-place upgrade path and no later release that can "
+            "read this lineage. Move this file aside to keep it — it stays "
+            "readable with any SQLite client — and OpenSquilla will create a fresh "
+            "database on the next start, or restore a backup taken with a released "
+            f"version.{trailer}"
+        )
     log.error(
         "migrator.schema_ahead",
         extra={"db_path": str(db_path), "unknown_migrations": unknown},

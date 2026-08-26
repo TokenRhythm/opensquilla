@@ -660,6 +660,64 @@ def test_apply_pending_raises_when_database_is_ahead_of_code(tmp_path: Path) -> 
         apply_pending(str(db_path), migrations_dir)
 
 
+def test_apply_pending_explains_retired_prerelease_goal_lineage(tmp_path: Path) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_demo_migration(migrations_dir)
+    db_path = tmp_path / "sessions.db"
+
+    apply_pending(str(db_path), migrations_dir)
+    # A pre-release Goal build recorded these ids. They were retired rather than
+    # renumbered: V033/V034 replaced the goal_runs table with session_goals and
+    # goal_command_receipts, so there is no replacement to adopt and no newer
+    # release to update to.
+    for migration_id in ("V029__goal_runs", "V030__goal_run_retry"):
+        _record_applied_migration(db_path, migration_id)
+
+    with pytest.raises(migrator.SchemaAheadError) as excinfo:
+        apply_pending(str(db_path), migrations_dir)
+
+    message = str(excinfo.value)
+    assert "V029__goal_runs" in message
+    assert "V030__goal_run_retry" in message
+    # The generic "you are running old code" advice is wrong here and must not
+    # be what the user is told: no newer version exists to update to.
+    assert "was created by a newer version" not in message
+    assert "Update OpenSquilla to a matching or newer version" not in message
+    # Name the incompatibility and a recovery that keeps the existing file.
+    assert "session_goals" in message
+
+
+def test_apply_pending_still_reports_genuinely_ahead_ids_alongside_retired(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_demo_migration(migrations_dir)
+    db_path = tmp_path / "sessions.db"
+
+    apply_pending(str(db_path), migrations_dir)
+    _record_applied_migration(db_path, "V029__goal_runs")
+    _record_applied_migration(db_path, "V999__from_the_future")
+
+    with pytest.raises(migrator.SchemaAheadError) as excinfo:
+        apply_pending(str(db_path), migrations_dir)
+
+    message = str(excinfo.value)
+    # The retired lineage must not hide a database that is also genuinely ahead.
+    assert "V029__goal_runs" in message
+    assert "V999__from_the_future" in message
+
+
+def test_retired_prerelease_ids_are_not_also_aliases() -> None:
+    # An alias marks its replacement applied WITHOUT replaying it, which is only
+    # sound when both migrations produce the same schema. The retired ids exist
+    # precisely because they do not, so the two tables must stay disjoint.
+    overlap = (
+        migrator._RETIRED_PRERELEASE_MIGRATIONS.keys()
+        & migrator._LEGACY_MIGRATION_ALIASES.keys()
+    )
+    assert not overlap, f"retired ids must never be adopted as aliases: {sorted(overlap)}"
+
+
 def test_read_applied_migration_ids_handles_missing_ledger(tmp_path: Path) -> None:
     db_path = tmp_path / "empty.db"
     with sqlite3.connect(db_path) as connection:
