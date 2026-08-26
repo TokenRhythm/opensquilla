@@ -94,6 +94,7 @@ export interface ChatTaskOwnershipApi {
     wasQueued: boolean
     wasStopTarget: boolean
   }
+  isSettled: (taskId: string) => boolean
   isQueued: (taskId: string) => boolean
   isBackgroundQueued: (taskId: string) => boolean
   beginStop: () => string
@@ -234,11 +235,17 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
       rememberSettled(snapshotLastTaskId)
     }
     const activeStatus = taskStatus(activeTask)
-    const runningTask = (
+    const runningCandidates = (
       activeStatus === 'running' || activeStatus === 'approval_pending'
-        ? activeTask
-        : tasks.find(task => ['running', 'approval_pending'].includes(taskStatus(task))) || null
+        ? [activeTask, ...tasks]
+        : tasks
     )
+    const runningTask = runningCandidates.find(task => {
+      const taskId = chatTaskId(task)
+      return ['running', 'approval_pending'].includes(taskStatus(task))
+        && Boolean(taskId)
+        && !settledTaskIds.has(taskId)
+    }) || null
     const nextRunningTaskId = chatTaskId(runningTask)
     const nextQueuedTaskIds = queuedIdsFromSnapshot(source, activeTask)
       .filter(taskId => taskId !== nextRunningTaskId && !settledTaskIds.has(taskId))
@@ -271,6 +278,10 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
 
   function isQueued(taskId: string): boolean {
     return Boolean(taskId && queuedTaskIds.value.has(taskId))
+  }
+
+  function isSettled(taskId: string): boolean {
+    return Boolean(taskId && settledTaskIds.has(taskId))
   }
 
   function isBackgroundQueued(taskId: string): boolean {
@@ -308,6 +319,7 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
     noteQueued,
     noteRunning,
     noteTerminal,
+    isSettled,
     isQueued,
     isBackgroundQueued,
     beginStop,

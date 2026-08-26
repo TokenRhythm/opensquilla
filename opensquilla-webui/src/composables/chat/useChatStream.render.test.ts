@@ -183,6 +183,19 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('seeds a restored timeline before recording the initial activity phase', () => {
+    vi.setSystemTime(10_000)
+    const { api } = makeStream()
+
+    api.startStreaming(1_000, false)
+    api.setAcceptedActivityStartedAt(2_000)
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+
+    expect(api.foldedTurn.value.statusHistory.map(entry => entry.at)).toEqual([2_000])
+    expect(api.streamTurnElapsed.value).toBe('9s')
+    api.cleanup()
+  })
+
   it('restores the turn elapsed clock from a replayed reasoning boundary', () => {
     vi.setSystemTime(20_000)
     const { api } = makeStream()

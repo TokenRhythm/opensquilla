@@ -8,6 +8,7 @@ import {
 import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
 import { RpcTimeoutError, type RpcCallOptions } from '@/lib/rpc'
 import type { ChatRunStatus, ChatRunStatusState } from '@/types/chat'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 
 function createSubscription(hasActiveInterrupt = false) {
   const resetStreamLiveTurnState = vi.fn()
@@ -392,6 +393,71 @@ describe('useChatSessionSubscription', () => {
       ],
     })
     expect(lastStreamSeq.value).toBe(2402)
+  })
+
+  it('rejects a live snapshot for a task already settled by history', async () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteTerminal('task-settled')
+    const onLiveSnapshot = vi.fn()
+    const startStreaming = vi.fn()
+    const resetStreamLiveTurnState = vi.fn()
+    const runStatus = ref<ChatRunStatus>({ status: 'idle', label: 'Idle', task: null })
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn(async (method: string) => {
+        if (method === 'sessions.messages.snapshot') {
+          return {
+            key: 'agent:main:webchat:settled-history',
+            task_id: 'task-settled',
+            current_stream_seq: 40,
+            events: [{
+              event: 'session.event.thinking',
+              payload: { task_id: 'task-settled', text: 'stale', stream_seq: 40 },
+            }],
+          }
+        }
+        return {
+          subscribed: true,
+          hydration_complete: true,
+          run_status: 'running',
+          active_task: { task_id: 'task-settled', status: 'running', started_at: 1_000 },
+          active_task_group_ids: ['stale-task-group'],
+          current_stream_seq: 40,
+          replay_complete: true,
+        }
+      }) as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const activeTaskGroups = ref(new Set<string>())
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:settled-history'),
+      lastStreamSeq: ref(0),
+      runStatus,
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups,
+      taskOwnership,
+      sessionRunStatus: source => ({
+        status: String(source?.run_status || 'idle') as ChatRunStatusState,
+        label: '',
+        task: source?.active_task || null,
+      }),
+      startStreaming,
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState,
+      onLiveSnapshot,
+    })
+
+    const outcome = await subscription.subscribeSession()
+
+    expect(onLiveSnapshot).not.toHaveBeenCalled()
+    expect(startStreaming).not.toHaveBeenCalled()
+    expect(resetStreamLiveTurnState).not.toHaveBeenCalled()
+    expect(runStatus.value.status).toBe('idle')
+    expect([...activeTaskGroups.value]).toEqual([])
+    expect(outcome).toEqual({ authoritative: true, live: false, backgroundOnly: false })
   })
 
   it('hydrates the authoritative run-mode lock from the subscription snapshot', async () => {

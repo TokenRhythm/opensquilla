@@ -487,7 +487,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamActivityTick.value++
   }
 
-  function startStreaming() {
+  function startStreaming(
+    activityStartedAt?: number | string | null,
+    recordInitialActivity = true,
+  ) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
@@ -504,16 +507,18 @@ export function useChatStream(options: UseChatStreamOptions) {
         : { status: 'running' },
     })
     resetStreamState()
+    const restoredStartedAt = normalizedTaskStartedAt(activityStartedAt) ?? 0
+    setAcceptedActivityStartedAt(restoredStartedAt || undefined)
     openToolGroups.value = new Set()
     openToolItems.value = new Set()
     streamToolGroupSeq = 0
     streamRound.value = 1
     streamTaskClockIdentity = ''
-    streamTurnStartedAt.value = Date.now()
+    streamTurnStartedAt.value = restoredStartedAt || Date.now()
     noteStreamSignal()
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
-    setStreamActivity('Sending')
+    setStreamActivity('Sending', 'Sending', recordInitialActivity)
     options.autoScroll.value = true
     resetStreamIdleTimer()
   }

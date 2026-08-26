@@ -183,6 +183,12 @@ class SessionStreamRegistry:
         self._live_task_by_session.pop(session_key, None)
         self._live_generation_epoch_by_session.pop(session_key, None)
 
+    def _clear_live_state_for_task(self, session_key: str, task_id: str) -> bool:
+        if self._live_task_by_session.get(session_key) != task_id:
+            return False
+        self._clear_live_state(session_key)
+        return True
+
     def _store_terminal_activity_snapshot(
         self,
         session_key: str,
@@ -273,11 +279,15 @@ class SessionStreamRegistry:
             turn_id=turn_id,
             terminal_at=terminal_at,
         )
-        return terminal_activity_snapshot(
+        durable_snapshot = terminal_activity_snapshot(
             snapshot,
             task_id=task_id,
             turn_id=turn_id,
         )
+        if durable_snapshot is None:
+            return None
+        self._clear_live_state_for_task(session_key, task_id)
+        return durable_snapshot
 
     def evict(self, session_key: str) -> None:
         """Discard every process-local stream artifact owned by one session."""
