@@ -27,6 +27,23 @@ _LEGACY_PLAN_IMPLEMENTATION_PROMPT = re.compile(
 )
 
 
+def _legacy_tool_presentation(segment: dict[str, Any]) -> dict[str, Any] | None:
+    """Classify old tool-use rows that predate persisted presentation metadata."""
+
+    if segment.get("type") != "tool_use" or not isinstance(segment.get("input"), dict):
+        return None
+    name = segment.get("name") or segment.get("tool_name")
+    if not isinstance(name, str) or not name:
+        return None
+    from opensquilla.tools.presentation import resolve_tool_presentation
+    from opensquilla.tools.types import ToolSpec
+
+    parameters = {str(key): {} for key in segment["input"]}
+    return resolve_tool_presentation(
+        ToolSpec(name=name, description="", parameters=parameters)
+    ).to_payload()
+
+
 def _sanitize_display_protocol_payload(value: Any) -> Any:
     if isinstance(value, str):
         clean = strip_preflight_confirmation_protocol_text(value)
@@ -34,10 +51,31 @@ def _sanitize_display_protocol_payload(value: Any) -> Any:
     if isinstance(value, list):
         return [_sanitize_display_protocol_payload(item) for item in value]
     if isinstance(value, dict):
-        return {
+        projected = {
             key: _sanitize_display_protocol_payload(item)
             for key, item in value.items()
         }
+        presentation = projected.get("tool_presentation")
+        if not isinstance(presentation, dict):
+            presentation = _legacy_tool_presentation(projected)
+        if (
+            projected.get("type") in {"tool_use", "tool_result"}
+            and isinstance(presentation, dict)
+        ):
+            from opensquilla.tools.presentation import project_tool_arguments_payload
+
+            for field in ("input", "arguments"):
+                if field not in projected:
+                    continue
+                arguments = projected[field]
+                if isinstance(arguments, dict):
+                    projected[field] = project_tool_arguments_payload(
+                        presentation,
+                        arguments,
+                    )
+                elif presentation.get("argumentDisplay") == "primary":
+                    projected[field] = {}
+        return projected
     return value
 
 

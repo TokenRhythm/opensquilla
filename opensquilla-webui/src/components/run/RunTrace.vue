@@ -146,7 +146,7 @@
                  secondary ("2 web actions"), so the raw call-count pill would
                  repeat it. -->
             <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
-            <span v-if="item.group.secondary && (!item.group.isRunning || groupOpen(item.group))" class="tool-row__arg">{{ item.group.secondary }}</span>
+            <span v-if="groupSecondary(item.group) && (!item.group.isRunning || groupOpen(item.group))" class="tool-row__arg">{{ groupSecondary(item.group) }}</span>
             <Icon
               v-if="presentation === 'activity' && groupHasDetails(item.group)"
               class="step-chevron tool-row__activity-arrow"
@@ -215,6 +215,23 @@
                   <Icon v-if="presentation !== 'activity' && callHasDetails(call)" class="step-chevron" name="chevronRight" :size="14" />
                 </span>
               </button>
+              <div
+                v-if="presentation === 'activity' && activityTargets(call).length"
+                class="tool-row-targets"
+              >
+                <template v-for="target in activityTargets(call)" :key="target.kind === 'url' ? target.url : target.text">
+                  <button
+                    v-if="target.kind === 'url'"
+                    type="button"
+                    class="tool-row-target tool-row-target--url"
+                    :title="t('workbench.browser.openSide')"
+                    @click="openActivityTarget(target)"
+                  >
+                    {{ target.text }}
+                  </button>
+                  <span v-else class="tool-row-target tool-row-target--path">{{ target.text }}</span>
+                </template>
+              </div>
               <Transition name="activity-tool-detail" :css="presentation === 'activity'">
                 <div v-if="callOpen(call)" class="tool-row-body">
                   <ActivityToolDetails
@@ -283,6 +300,23 @@
                 <Icon v-if="presentation !== 'activity' && callHasDetails(call)" class="step-chevron" name="chevronRight" :size="14" />
               </span>
             </button>
+            <div
+              v-if="presentation === 'activity' && activityTargets(call).length"
+              class="tool-row-targets"
+            >
+              <template v-for="target in activityTargets(call)" :key="target.kind === 'url' ? target.url : target.text">
+                <button
+                  v-if="target.kind === 'url'"
+                  type="button"
+                  class="tool-row-target tool-row-target--url"
+                  :title="t('workbench.browser.openSide')"
+                  @click="openActivityTarget(target)"
+                >
+                  {{ target.text }}
+                </button>
+                <span v-else class="tool-row-target tool-row-target--path">{{ target.text }}</span>
+              </template>
+            </div>
             <Transition name="activity-tool-detail" :css="presentation === 'activity'">
               <div v-if="callOpen(call)" class="tool-row-body">
                 <ActivityToolDetails
@@ -621,7 +655,12 @@ import { toolState } from '@/utils/chat/toParts'
 import { composeTree, statusVisual, type StatusVisual } from '@/components/run/runTrace'
 import { copyTextWithFallback } from '@/utils/browser'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
-import { hasActivityToolDetail } from '@/utils/chat/activityToolDetails'
+import {
+  hasActivityToolDetail,
+  projectActivityToolTargets,
+  type ActivityToolTarget,
+} from '@/utils/chat/activityToolDetails'
+import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 
 const { t } = useI18n()
 const { mode: toolDetailDisplayMode } = useToolDetailPreference()
@@ -1210,7 +1249,30 @@ function callHasDetails(call: ChatToolCallRenderItem): boolean {
 }
 
 function groupHasDetails(group: ChatToolCallGroup): boolean {
-  return group.calls.some(callHasDetails)
+  if (group.calls.some(callHasDetails)) return true
+  return props.presentation === 'activity'
+    && group.calls.length > 1
+    && group.calls.some(call => activityTargets(call).length > 0)
+}
+
+function activityTargets(call: ChatToolCallRenderItem): ActivityToolTarget[] {
+  if (props.presentation !== 'activity') return []
+  return projectActivityToolTargets(call, operationKey(call))
+}
+
+function openActivityTarget(target: Extract<ActivityToolTarget, { kind: 'url' }>) {
+  requestBrowserWorkbenchOpen(target.url)
+}
+
+function isResourceActivityCall(call: ChatToolCallRenderItem): boolean {
+  if (props.presentation !== 'activity') return false
+  const category = call.presentation?.category
+  return category === 'search' || category === 'file_read' || category === 'network_read'
+}
+
+function groupSecondary(group: ChatToolCallGroup): string {
+  if (props.presentation === 'activity' && group.calls.some(isResourceActivityCall)) return ''
+  return group.secondary
 }
 
 function showGroupStatus(group: ChatToolCallGroup): boolean {
@@ -1223,6 +1285,7 @@ function singleCallSecondary(
   group: ChatToolCallGroup,
   call: ChatToolCallRenderItem,
 ): string {
+  if (isResourceActivityCall(call)) return ''
   return props.presentation === 'activity'
     ? group.secondary
     : resolvedSecondaryText(call)
@@ -1230,7 +1293,11 @@ function singleCallSecondary(
 
 function resultCountText(call: ChatToolCallRenderItem): string {
   if (call.isRunning || call.isError) return ''
-  const count = toolResultCount(call.result, call.name)
+  const targetCount = props.presentation === 'activity'
+    && operationKey(call) === 'web.search'
+    ? activityTargets(call).filter(target => target.kind === 'url').length
+    : 0
+  const count = targetCount || toolResultCount(call.result, call.name)
   return count === null ? '' : t('shared.runTrace.resultsCount', { count })
 }
 
@@ -1252,6 +1319,7 @@ function resolvedGroupStatusText(group: ChatToolCallGroup): string {
 }
 
 function resolvedSecondaryText(call: ChatToolCallRenderItem): string {
+  if (isResourceActivityCall(call)) return ''
   return (props.toolSecondaryText ?? defaultToolSecondaryText)(call)
 }
 
@@ -1616,6 +1684,47 @@ function fmtTok(n?: number | null): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tool-row-targets {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
+  min-width: 0;
+  margin: 0.0625rem 0 0.25rem 1.625rem;
+}
+
+.tool-row-target {
+  display: block;
+  max-width: min(100%, 42rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.tool-row-target--url {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: left;
+}
+
+.tool-row-target--url:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.125rem;
+}
+
+.tool-row-target--url:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
 }
 
 .tool-row__trailing {

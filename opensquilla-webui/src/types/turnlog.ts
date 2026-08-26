@@ -1,4 +1,5 @@
 import type { ArtifactPayload } from '@/types/rpc'
+import type { ToolPresentation } from '@/types/chat'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -21,9 +22,29 @@ type FrameBody =
       text: string
       presentation?: 'intermediate' | 'answer'
     }
-  | { kind: 'tool-start'; seq: number; toolId: string; name: string; input: string; at: number }
+  | {
+      kind: 'tool-start'
+      seq: number
+      toolId: string
+      name: string
+      input: string
+      at: number
+      authoritativeInput?: boolean
+      presentation?: ToolPresentation
+    }
   | { kind: 'tool-delta'; seq: number; toolId: string; fragment: string }
-  | { kind: 'tool-result'; seq: number; toolId: string; name: string; result: string; isError: boolean; input: string; at: number }
+  | {
+      kind: 'tool-result'
+      seq: number
+      toolId: string
+      name: string
+      result: string
+      isError: boolean
+      input: string
+      at: number
+      authoritativeInput?: boolean
+      presentation?: ToolPresentation
+    }
   | { kind: 'artifact'; seq: number; artifact: ArtifactPayload }
   | {
       kind: 'thinking-start'

@@ -2752,30 +2752,35 @@ def _ensemble_progress_payload(event: EnsembleProgressEvent) -> dict[str, Any]:
 
 
 def _tool_use_start_payload(event: ToolUseStartEvent) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "tool_use_id": event.tool_use_id,
         "tool_name": event.tool_name,
         "name": event.tool_name,
         "synthetic_from_text": event.synthetic_from_text,
     }
-
-
-def _tool_use_delta_payload(event: ToolUseDeltaEvent) -> dict[str, Any]:
-    return {
-        "tool_use_id": event.tool_use_id,
-        "json_fragment": event.json_fragment,
-    }
+    if event.tool_presentation is not None:
+        payload["tool_presentation"] = dict(event.tool_presentation)
+    return payload
 
 
 def _tool_use_end_payload(event: ToolUseEndEvent) -> dict[str, Any]:
-    return {
+    from opensquilla.tools.presentation import project_tool_arguments_payload
+
+    arguments = project_tool_arguments_payload(
+        event.tool_presentation,
+        event.arguments,
+    )
+    payload: dict[str, Any] = {
         "tool_use_id": event.tool_use_id,
         "tool_name": event.tool_name,
         "name": event.tool_name,
-        "arguments": event.arguments,
-        "input": event.arguments,
+        "arguments": arguments,
+        "input": arguments,
         "synthetic_from_text": event.synthetic_from_text,
     }
+    if event.tool_presentation is not None:
+        payload["tool_presentation"] = dict(event.tool_presentation)
+    return payload
 
 
 def _tool_result_payload(event: ToolResultEvent) -> dict[str, Any]:
@@ -2787,7 +2792,14 @@ def _tool_result_payload(event: ToolResultEvent) -> dict[str, Any]:
         "is_error": event.is_error,
     }
     if event.arguments is not None:
-        payload["arguments"] = event.arguments
+        from opensquilla.tools.presentation import project_tool_arguments_payload
+
+        payload["arguments"] = project_tool_arguments_payload(
+            event.tool_presentation,
+            event.arguments,
+        )
+    if event.tool_presentation is not None:
+        payload["tool_presentation"] = dict(event.tool_presentation)
     if event.execution_status is not None:
         payload["execution_status"] = normalize_execution_status(event.execution_status)
     return payload
@@ -4227,12 +4239,9 @@ async def _run_turn_batch_path(
                         _tool_use_start_payload(event),
                     )
             elif isinstance(event, ToolUseDeltaEvent):
-                if event_bridge is not None:
-                    await event_bridge.emit(
-                        session_key,
-                        "session.event.tool_use_delta",
-                        _tool_use_delta_payload(event),
-                    )
+                # Provisional argument fragments stay inside the engine.  The
+                # public stream receives ToolUseEnd's authoritative snapshot.
+                continue
             elif isinstance(event, ToolUseEndEvent):
                 if event_bridge is not None:
                     await event_bridge.emit(
@@ -4469,12 +4478,7 @@ async def _run_turn_streaming_path(
                         _tool_use_start_payload(event),
                     )
             elif isinstance(event, ToolUseDeltaEvent):
-                if event_bridge is not None:
-                    await event_bridge.emit(
-                        session_key,
-                        "session.event.tool_use_delta",
-                        _tool_use_delta_payload(event),
-                    )
+                continue
             elif isinstance(event, ToolUseEndEvent):
                 if event_bridge is not None:
                     await event_bridge.emit(

@@ -28,10 +28,11 @@ import type {
 import {
   isEmptyToolPreview,
   isInternalToolName,
-  normalizeToolInputText,
   normalizeToolName,
+  normalizeToolPresentation,
   toolCallGroups,
   toolDisplayName,
+  toolDisplayInputText,
   toolOperationKey,
   toolResultIsError,
   truncateToolPreview,
@@ -1307,12 +1308,14 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (!name) return null
     if (isInternalToolName(name)) return null
     if (!isStreaming.value) startStreaming()
-    const input = normalizeToolInputText(payload)
+    const presentation = normalizeToolPresentation(payload)
+    const input = toolDisplayInputText(payload, presentation)
     const toolId = payload.tool_use_id || payload.toolUseId || payload.id || `${name}:${payload.stream_seq || Date.now()}`
 
     const existing = streamToolCalls.value.find(tc => tc.toolId === toolId)
     if (existing) {
-      if (input) {
+      if (presentation) existing.presentation = presentation
+      if (input || presentation?.argumentDisplay === 'primary') {
         existing.inputRaw = input
         existing.inputPreview = truncateToolPreview(input, 200)
         existing.displayName = toolDisplayName(existing.name, input)
@@ -1321,7 +1324,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // refinement (re-narration) stays in sync; result-only ensures emit no
       // tool-start (the tool-result frame finalizes the call there).
       if (useReducer.value && optionsArg.running) {
-        appendFrame({ kind: 'tool-start', toolId, name: existing.name, input: existing.inputRaw || '', at: Date.now() })
+        appendFrame({ kind: 'tool-start', toolId, name: existing.name, input: existing.inputRaw || '', at: Date.now(), presentation: existing.presentation })
       }
       return existing
     }
@@ -1360,13 +1363,14 @@ export function useChatStream(options: UseChatStreamOptions) {
       result: '',
       resultPreview: '',
       isOpen: false,
+      presentation,
     }
     streamToolCalls.value.push(call)
     // Running creates emit a tool-start (fold stamps the clock here, matching the
     // toolTimes seed above). Result-only creates emit nothing: the tool-result
     // frame creates the call in the fold without a clock.
     if (useReducer.value && optionsArg.running) {
-      appendFrame({ kind: 'tool-start', toolId, name, input, at: Date.now() })
+      appendFrame({ kind: 'tool-start', toolId, name, input, at: Date.now(), presentation })
     }
     return call
   }
@@ -1388,6 +1392,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     const existing = streamToolCalls.value.find(t => t.toolId === toolId)
     const tc = existing || ensureStreamToolCall(payload, { running: true })
     if (!tc) return
+    if (tc.presentation?.lifecycleDisplay === 'boundary') return
 
     // The accumulator owns the complete production input. The legacy call is
     // retained only as bounded narration metadata; concatenating the same 10k
@@ -1422,11 +1427,24 @@ export function useChatStream(options: UseChatStreamOptions) {
     const tc = streamToolCalls.value.find(t => t.toolId === toolId)
       || ensureStreamToolCall(payload, { running: true })
     if (!tc) return
+    const presentation = normalizeToolPresentation(payload)
+    if (presentation) tc.presentation = presentation
     if (payload.arguments && typeof payload.arguments === 'object') {
-      const input = JSON.stringify(payload.arguments)
+      const input = toolDisplayInputText(payload, tc.presentation)
       tc.inputRaw = input
       tc.inputPreview = truncateToolPreview(input, 200)
       tc.displayName = toolDisplayName(tc.name, input)
+      if (useReducer.value) {
+        appendFrame({
+          kind: 'tool-start',
+          toolId,
+          name: tc.name,
+          input,
+          at: Date.now(),
+          authoritativeInput: true,
+          presentation: tc.presentation,
+        })
+      }
     }
     scheduleRender()
   }
@@ -1442,8 +1460,10 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     const tc = streamToolCalls.value.find(t => t.toolId === toolId) || ensureStreamToolCall(payload, { running: false })
     if (tc) {
-      const input = normalizeToolInputText(payload)
-      if (input) {
+      const presentation = normalizeToolPresentation(payload)
+      if (presentation) tc.presentation = presentation
+      const input = toolDisplayInputText(payload, tc.presentation)
+      if (input || tc.presentation?.argumentDisplay === 'primary') {
         tc.inputRaw = input
         tc.inputPreview = truncateToolPreview(input, 200)
         tc.displayName = toolDisplayName(tc.name, input)
@@ -1461,7 +1481,19 @@ export function useChatStream(options: UseChatStreamOptions) {
       // created by the fold here without a clock; the result frame carries the
       // same payload input legacy used so a result-only fold call seeds it.
       if (useReducer.value) {
-        appendFrame({ kind: 'tool-result', toolId: tc.toolId, name: tc.name, result: content, isError: tc.isError, input, at: Date.now() })
+        appendFrame({
+          kind: 'tool-result',
+          toolId: tc.toolId,
+          name: tc.name,
+          result: content,
+          isError: tc.isError,
+          input,
+          at: Date.now(),
+          authoritativeInput: payload.input !== undefined
+            || payload.arguments !== undefined
+            || tc.presentation?.argumentDisplay === 'primary',
+          presentation: tc.presentation,
+        })
       }
 
       const stillRunning = streamToolCalls.value.find(t => t.isRunning)
@@ -1502,6 +1534,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       is_error: tc.isError,
       isError: tc.isError,
       execution_status: tc.status ? { status: tc.status } : undefined,
+      ...(tc.presentation ? { tool_presentation: tc.presentation } : {}),
     }
   }
 

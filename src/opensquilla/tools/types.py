@@ -39,6 +39,17 @@ class PlanAccess(StrEnum):
     CONTROL = "control"
 
 
+ToolPresentationCategory = Literal[
+    "search",
+    "file_read",
+    "network_read",
+    "command",
+    "subagent",
+    "mutation",
+    "generic",
+]
+
+
 @dataclass
 class ToolContext:
     """Constructed at the entry point, flows through to tool list building.
@@ -448,6 +459,10 @@ class ToolSpec:
     # Trusted declaration that itemless arrays have textual wire semantics.
     # Provider policy still decides whether a request needs the projection.
     allow_string_item_schema_projection: bool = False
+    # Optional semantic declaration consumed only by UI presentation policy.
+    # It never changes provider schemas, validation, authorization, or execution.
+    # Appended for positional compatibility with embedded ToolSpec callers.
+    presentation_category: ToolPresentationCategory | None = None
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

@@ -678,6 +678,92 @@ describe('useChatRenderedMessages silent sentinel compatibility', () => {
     expect(source.tool_calls?.[0]?.text).toBe('HEARTBEAT_OK')
   })
 
+  it('projects persisted primary-only tool inputs from server metadata', () => {
+    const presentation = {
+      category: 'file_read' as const,
+      primaryArguments: ['path'],
+      argumentDisplay: 'primary' as const,
+      lifecycleDisplay: 'boundary' as const,
+    }
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: '',
+      ts: 1,
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'read-1',
+          name: 'read_file',
+          input: { path: 'src/app.py', offset: 500, limit: 10_000 },
+          tool_presentation: presentation,
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'read-1',
+          name: 'read_file',
+          result: 'file contents',
+          tool_presentation: presentation,
+        },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+    const call = message.timelineItems?.flatMap(item =>
+      item.type === 'tool-group' ? item.group.calls : [],
+    )[0]
+
+    expect(call?.inputRaw).toBe(JSON.stringify({ path: 'src/app.py' }, null, 2))
+    expect(call?.inputRaw).not.toContain('offset')
+    expect(source.tool_calls?.[0]?.input).toEqual({
+      path: 'src/app.py',
+      offset: 500,
+      limit: 10_000,
+    })
+  })
+
+  it('reprojects legacy persisted input when presentation metadata arrives later', () => {
+    const presentation = {
+      category: 'network_read' as const,
+      primaryArguments: ['url'],
+      argumentDisplay: 'primary' as const,
+      lifecycleDisplay: 'boundary' as const,
+    }
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: '',
+      ts: 1,
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'fetch-legacy',
+          name: 'http_request',
+          input: {
+            url: 'https://example.test/report',
+            headers: { Authorization: 'secret' },
+          },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'fetch-legacy',
+          name: 'http_request',
+          arguments: { url: 'https://example.test/report' },
+          result: 'ok',
+          tool_presentation: presentation,
+        },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+    const call = message.timelineItems?.flatMap(item =>
+      item.type === 'tool-group' ? item.group.calls : [],
+    )[0]
+
+    expect(call?.inputRaw).toBe(
+      JSON.stringify({ url: 'https://example.test/report' }, null, 2),
+    )
+    expect(call?.inputRaw).not.toContain('secret')
+  })
+
   it('projects narration and parallel legacy calls into one ordered activity timeline', () => {
     const source: ChatMessage = {
       role: 'assistant',
