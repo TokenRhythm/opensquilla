@@ -3133,7 +3133,9 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
     assert "await launchDesktop(" in script
-    assert "loaded.record.pid !== firstRecord.pid" in script
+    assert "loaded.record.pid === firstRecord.pid" in script
+    assert "verifyDesktopGatewayOwnership(loaded.record)" in script
+    assert "'verified replacement Desktop Gateway ownership record'" in script
     assert "waitForDesktopGatewayOwnershipRelease" in script
     assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
     assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main
