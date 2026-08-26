@@ -1497,7 +1497,7 @@ const chatElevatedMode = useChatElevatedMode({
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
-useChatDraftPersistence({ sessionKey, inputText })
+const draftPersistence = useChatDraftPersistence({ sessionKey, inputText })
 const {
   elevatedMode,
   loadElevatedMode,
@@ -2011,6 +2011,7 @@ const {
   hasLegacyNewChatQuery,
   isDraftRoute,
   persistSession,
+  readAgentFromUrl,
   readProjectFromUrl,
   readSessionFromUrl,
   resolveInitialSession,
@@ -6410,9 +6411,20 @@ onMounted(async () => {
   window.addEventListener('pointercancel', onThreadPointerEnd)
   bindBottomIntersectionObserver()
   const initialRouteFullPath = route.fullPath
+  const initialHistoryState = window.history.state as Record<string, unknown> | null
+  const hasExplicitDraftPrefill = typeof initialHistoryState?.prefill === 'string'
+    && initialHistoryState.prefill.length > 0
+  const explicitFreshTask = isDraftRoute() && Boolean(
+    readAgentFromUrl()
+    || readProjectFromUrl()
+    || hasLegacyNewChatQuery()
+    || hasExplicitDraftPrefill,
+  )
+  if (explicitFreshTask) draftPersistence.discardRecentDraft()
   // Initialize session key. Without an explicit ?session= the view opens as a
-  // draft instead of restoring a previous session.
-  const initialSession = resolveInitialSession()
+  // draft, except for the one most-recent non-empty draft recovered on a cold
+  // /chat/new entry. Explicit new-task handoffs always remain clean.
+  const initialSession = resolveInitialSession({ recoverDraft: !explicitFreshTask })
   sessionKey.value = initialSession.sessionKey
   bindTailLayoutObservers()
   let initialDraftProjectGeneration: number | null = null
@@ -6436,7 +6448,10 @@ onMounted(async () => {
     }
   } else {
     activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
-    persistSession(sessionKey.value, { updateRoute: false, source: 'chatView.initialSession' })
+    persistSession(sessionKey.value, {
+      updateRoute: initialSession.recoveredDraft,
+      source: 'chatView.initialSession',
+    })
   }
 
   // Load elevated mode
@@ -6762,6 +6777,10 @@ watch(freshTaskDraft.request, request => {
   if (!request) return
   draftProjectHydration.invalidate()
   landingPrefilled.value = false
+  // Clear before changing sessionKey. The draft watcher then observes an empty
+  // outgoing composer and cannot recreate the discarded recovery pointer.
+  inputText.value = ''
+  draftPersistence.clearDraft(sessionKey.value)
   if (request.workspaceId && rpc.canChooseProject) {
     const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
     if (workspace) {

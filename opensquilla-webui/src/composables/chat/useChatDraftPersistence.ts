@@ -1,9 +1,48 @@
 import { watch, type Ref } from 'vue'
 
 const DRAFT_KEY_PREFIX = 'opensquilla.chat.draft:'
+export const RECENT_DRAFT_SESSION_KEY = 'opensquilla.chat.recent-draft-session'
 // Cap what we persist so a giant paste cannot bloat localStorage; the composer
 // itself is unbounded, only the saved copy is capped.
 const MAX_DRAFT_CHARS = 100_000
+
+function draftKey(key: string): string {
+  return DRAFT_KEY_PREFIX + key
+}
+
+function validDraftSessionKey(key: string): boolean {
+  if (!key || key.length > 512 || key !== key.trim()) return false
+  if (/[/\u0000-\u001f\u007f\s]/.test(key)) return false
+  const marker = ':webchat:'
+  const markerIndex = key.indexOf(marker)
+  return key.startsWith('agent:')
+    && markerIndex > 'agent:'.length
+    && markerIndex + marker.length < key.length
+}
+
+function clearRecentDraftPointer(key?: string): void {
+  try {
+    const current = localStorage.getItem(RECENT_DRAFT_SESSION_KEY)
+    if (!key || current === key) localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+  } catch {
+    // Storage can be unavailable in private or restricted contexts.
+  }
+}
+
+/** Return the single recoverable draft session, retiring stale/corrupt pointers. */
+export function recentDraftSessionKey(): string {
+  try {
+    const key = localStorage.getItem(RECENT_DRAFT_SESSION_KEY)
+    if (key === null) return ''
+    if (!validDraftSessionKey(key) || !localStorage.getItem(draftKey(key))) {
+      localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+      return ''
+    }
+    return key
+  } catch {
+    return ''
+  }
+}
 
 export interface UseChatDraftPersistenceOptions {
   sessionKey: Ref<string>
@@ -22,17 +61,15 @@ export interface UseChatDraftPersistenceOptions {
  * complaint. Storage failures (private mode, quota) are swallowed.
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
-  function draftKey(key: string): string {
-    return DRAFT_KEY_PREFIX + key
-  }
-
   function saveDraft(key: string, text: string): void {
     if (!key) return
     try {
       if (text) {
         localStorage.setItem(draftKey(key), text.slice(0, MAX_DRAFT_CHARS))
+        localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
       } else {
         localStorage.removeItem(draftKey(key))
+        clearRecentDraftPointer(key)
       }
     } catch {
       // Ignore storage failures in private or restricted contexts.
@@ -52,8 +89,19 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     if (!key) return
     try {
       localStorage.removeItem(draftKey(key))
+      clearRecentDraftPointer(key)
     } catch {
       // Ignore.
+    }
+  }
+
+  function discardRecentDraft(): void {
+    try {
+      const key = localStorage.getItem(RECENT_DRAFT_SESSION_KEY) || ''
+      if (validDraftSessionKey(key)) localStorage.removeItem(draftKey(key))
+      localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+    } catch {
+      // Ignore storage failures in private or restricted contexts.
     }
   }
 
@@ -84,5 +132,5 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     saveDraft(options.sessionKey.value, text)
   })
 
-  return { saveDraft, loadDraft, clearDraft }
+  return { saveDraft, loadDraft, clearDraft, discardRecentDraft }
 }
