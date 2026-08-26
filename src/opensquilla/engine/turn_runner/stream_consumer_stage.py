@@ -549,6 +549,13 @@ class _ToolUseStartHandler:
         event: ToolUseStartEvent,
         state: _StreamState,
     ) -> ToolUseStartEvent:
+        # Agent text is streamed optimistically as ``answer`` until the provider
+        # reveals a tool call.  Once that boundary is known, the preceding run is
+        # work narration, not the terminal answer.  The live surface has already
+        # received the deltas, but correcting the durable segment here keeps the
+        # settled UI, history reloads, copy, and export on the semantic contract.
+        if state.current_text_parts and state.current_text_presentation == "answer":
+            state.current_text_presentation = "intermediate"
         _flush_current_text_segment(state)
         state.turn_segments.append(
             {
