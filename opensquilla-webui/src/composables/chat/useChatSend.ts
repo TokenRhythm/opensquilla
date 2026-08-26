@@ -3224,16 +3224,22 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
-        attempt.requiresIdempotentReplay = hasUnknownAcceptance(err)
+        const acceptanceUnknown = hasUnknownAcceptance(err)
+        attempt.requiresIdempotentReplay = acceptanceUnknown
         if (preserveComposer) {
           if (sendOpts.rememberRetryableAttempt) {
             sendOpts.rememberRetryableAttempt(attempt)
           } else {
             recoveredAttempt = attempt
           }
+        } else if (acceptanceUnknown) {
+          // The optimistic user bubble already owns this payload. Keep its
+          // immutable request identity for exact replay without presenting the
+          // same text as a new editable draft.
+          recoveredAttempt = attempt
         } else if (restoreComposer) {
           restoreSendAttempt(attempt, {
-            requiresIdempotentReplay: hasUnknownAcceptance(err),
+            requiresIdempotentReplay: false,
           })
         }
       }
