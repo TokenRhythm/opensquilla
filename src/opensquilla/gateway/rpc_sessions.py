@@ -12505,6 +12505,12 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         session_routing_revision=routing["revision"],
         session_routing_source=routing["source"],
     )
+    overlay_live_config = getattr(effective_routing_config, "overlay_live_config", None)
+    effective_runtime_config = (
+        overlay_live_config(ctx.config)
+        if callable(overlay_live_config)
+        else effective_routing_config
+    )
 
     metadata: dict[str, Any] = {
         "session_key": session_key,
@@ -12549,7 +12555,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "running_count": running_count,
         },
         "runtime": {
-            "model_routing": model_routing_snapshot(effective_routing_config),
+            "model_routing": model_routing_snapshot(effective_runtime_config),
         },
         "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),

@@ -1817,6 +1817,55 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('drains an image queue item exactly once after the live capability unblocks', async () => {
+    vi.useFakeTimers()
+    let blocked = true
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const { inputText, pendingAttachments, queue } = makeQueue(
+      dispatchPendingItem,
+      () => blocked,
+    )
+    try {
+      inputText.value = 'describe the queued image'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 41,
+        name: 'queued-image.png',
+        mime: 'image/png',
+        size: 64,
+        file_uuid: 'synthetic-image-token',
+      }]
+      await queue.enqueuePendingInput(inputText.value)
+
+      queue.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(50)
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+      expect(queue.pendingQueue.value).toHaveLength(1)
+
+      blocked = false
+      // ChatView deliberately issues both signals when routing changes. The
+      // queue must re-read current capability without scheduling two sends.
+      queue.schedulePendingDrainAfterTerminal()
+      queue.flushDeferredPendingDrain()
+      queue.flushDeferredPendingDrain()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledOnce()
+      expect(dispatchPendingItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: 'describe the queued image',
+          attachments: [expect.objectContaining({ name: 'queued-image.png' })],
+        }),
+        'agent:main:webchat:test',
+      )
+      expect(queue.pendingQueue.value).toEqual([])
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
   it.each(['visible', 'hidden'] as const)(
     'never dispatches an A-session %s lease after switching to B before nextTick',
     async kind => {
