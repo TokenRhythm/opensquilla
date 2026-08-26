@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -33,6 +33,7 @@ const INITIAL_DESKTOP_STARTUP_BUDGET_MS = (
 const ORPHAN_RECOVERY_STARTUP_BUDGET_MS = (
   VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS
 )
+const GATEWAY_CHILD_CRASH_RECOVERY_BUDGET_MS = INITIAL_DESKTOP_STARTUP_BUDGET_MS + 10_000
 const CRASH_EXIT_BUDGET_MS = 15_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000
@@ -404,7 +405,7 @@ try {
     ORPHAN_RECOVERY_STARTUP_BUDGET_MS,
   )
   secondApp = await launchDesktop(orphanRecoveryStartup, 'electron-relaunch')
-  await waitForDesktopRenderer(secondApp, userDataDir, orphanRecoveryStartup)
+  const secondPage = await waitForDesktopRenderer(secondApp, userDataDir, orphanRecoveryStartup)
   const secondOwnershipDir = await ownershipDirectory(
     userDataDir,
     secondApp,
@@ -439,18 +440,92 @@ try {
   }, 'orphan Gateway process exit', orphanRecoveryStartup.remainingMs(
     'orphan-process-exit',
   ), () => phaseDiagnostics(secondApp, userDataDir, orphanRecoveryStartup))
+  await withPhaseDeadline(
+    secondPage.locator('.conn-pill.connected').waitFor({ state: 'visible' }),
+    orphanRecoveryStartup,
+    'renderer-connected-before-child-crash',
+    secondApp,
+    userDataDir,
+  )
+  const rendererUrlBeforeCrash = secondPage.url()
+
+  // The same cross-platform hard-fault primitive now covers the inverse case:
+  // Electron remains healthy while its ready lifecycle-owned Gateway exits.
+  // The main-process lifecycle must replace it without a renderer action or a
+  // second Electron launch, and must leave the existing Control UI document up.
+  const childCrashRecovery = createPhaseBudget(
+    'ready-gateway-child-crash-recovery',
+    GATEWAY_CHILD_CRASH_RECOVERY_BUDGET_MS,
+  )
+  process.kill(secondRecord.pid, 'SIGKILL')
+  await withPhaseDeadline(
+    secondPage.locator('.conn-pill.connected').waitFor({ state: 'hidden' }),
+    childCrashRecovery,
+    'renderer-observed-child-crash',
+    secondApp,
+    userDataDir,
+  )
+  const thirdRecord = await waitFor(() => {
+    assertAppRunning(secondApp, childCrashRecovery, 'replacement-after-child-crash')
+    const loaded = loadDesktopGatewayOwnershipRecord(secondOwnershipDir)
+    if (loaded.status !== 'valid' || loaded.record.pid === secondRecord.pid) return null
+    return verifyDesktopGatewayOwnership(loaded.record).then(verified => (
+      verified ? loaded.record : null
+    ))
+  }, 'automatic Gateway replacement after child crash', childCrashRecovery.remainingMs(
+    'replacement-after-child-crash',
+  ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
+  ownedInstances.push({ ownershipDir: secondOwnershipDir, record: thirdRecord })
+  await waitFor(async () => {
+    assertAppRunning(secondApp, childCrashRecovery, 'replacement-ready')
+    const log = await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8').catch(() => '')
+    return log.includes('"event":"gateway_unexpected_exit_restart_ready"')
+  }, 'automatic Gateway replacement readiness', childCrashRecovery.remainingMs(
+    'replacement-ready',
+  ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
+  await withPhaseDeadline(
+    secondPage.locator('.conn-pill.connected').waitFor({ state: 'visible' }),
+    childCrashRecovery,
+    'renderer-reconnected-after-child-restart',
+    secondApp,
+    userDataDir,
+  )
+  assert.notEqual(thirdRecord.pid, secondRecord.pid)
+  assert.equal(thirdRecord.port, secondRecord.port)
+  assert.equal(secondPage.url(), rendererUrlBeforeCrash)
+  assert.equal(
+    await withPhaseDeadline(
+      verifyDesktopGatewayOwnership(thirdRecord),
+      childCrashRecovery,
+      'verify-automatic-replacement-ownership',
+      secondApp,
+      userDataDir,
+    ),
+    true,
+  )
+  await waitFor(() => {
+    assertAppRunning(secondApp, childCrashRecovery, 'crashed-gateway-process-exit')
+    return !processAlive(secondRecord.pid)
+  }, 'crashed Gateway process exit', childCrashRecovery.remainingMs(
+    'crashed-gateway-process-exit',
+  ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
 
   await secondApp.close()
   secondApp = null
   assert.equal(
-    await waitForDesktopGatewayOwnershipRelease(secondOwnershipDir, secondRecord, {
+    await waitForDesktopGatewayOwnershipRelease(secondOwnershipDir, thirdRecord, {
       timeoutMs: 15_000,
       pollIntervalMs: 100,
     }),
     true,
   )
 
-  console.log(JSON.stringify({ ok: true, orphanPid: firstRecord.pid, replacementPid: secondRecord.pid }))
+  console.log(JSON.stringify({
+    ok: true,
+    orphanPid: firstRecord.pid,
+    replacementPid: secondRecord.pid,
+    childCrashReplacementPid: thirdRecord.pid,
+  }))
   flowSucceeded = true
 } finally {
   if (secondApp) await secondApp.close().catch(() => null)
