@@ -14,6 +14,10 @@ from opensquilla.chat.flattened_tool_markers import (
     strip_confirmed_flattened_tool_result,
     strip_flattened_used_tool_lines,
 )
+from opensquilla.contracts.tool_presentation import (
+    project_tool_arguments_payload,
+    resolve_tool_presentation_fields,
+)
 from opensquilla.meta_preflight_protocol import (
     display_text_from_preflight_confirmation,
     strip_preflight_confirmation_protocol_text,
@@ -35,12 +39,9 @@ def _legacy_tool_presentation(segment: dict[str, Any]) -> dict[str, Any] | None:
     name = segment.get("name") or segment.get("tool_name")
     if not isinstance(name, str) or not name:
         return None
-    from opensquilla.tools.presentation import resolve_tool_presentation
-    from opensquilla.tools.types import ToolSpec
-
-    parameters = {str(key): {} for key in segment["input"]}
-    return resolve_tool_presentation(
-        ToolSpec(name=name, description="", parameters=parameters)
+    return resolve_tool_presentation_fields(
+        name=name,
+        parameter_names=tuple(str(key) for key in segment["input"]),
     ).to_payload()
 
 
@@ -62,8 +63,6 @@ def _sanitize_display_protocol_payload(value: Any) -> Any:
             projected.get("type") in {"tool_use", "tool_result"}
             and isinstance(presentation, dict)
         ):
-            from opensquilla.tools.presentation import project_tool_arguments_payload
-
             for field in ("input", "arguments"):
                 if field not in projected:
                     continue

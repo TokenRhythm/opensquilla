@@ -9,6 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
@@ -37,17 +38,6 @@ class PlanAccess(StrEnum):
     DENY = "deny"
     READ_ONLY = "read_only"
     CONTROL = "control"
-
-
-ToolPresentationCategory = Literal[
-    "search",
-    "file_read",
-    "network_read",
-    "command",
-    "subagent",
-    "mutation",
-    "generic",
-]
 
 
 @dataclass
