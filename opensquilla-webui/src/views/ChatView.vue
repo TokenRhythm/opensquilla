@@ -2050,8 +2050,9 @@ const {
   routerSlots,
   routerModels,
   modelRoutingMode: globalModelRoutingMode,
-  imageInputAdmission,
-  imageInputAdmissionReason,
+  globalImageInputAdmission,
+  globalImageInputAdmissionReason,
+  modelRoutingCapabilitiesByMode,
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
@@ -2073,6 +2074,9 @@ const chatSessionRouting = useChatSessionRouting({
   rpc,
   sessionKey,
   globalMode: globalModelRoutingMode,
+  globalImageInputAdmission,
+  globalImageInputAdmissionReason,
+  capabilitiesByMode: modelRoutingCapabilitiesByMode,
   available: sessionRoutingAvailable,
   isStreaming,
   isDraft: isDraftSurface,
@@ -2085,6 +2089,8 @@ const {
   mode: modelRoutingMode,
   busy: modelRoutingSettingsBusy,
   initialRoutingMode,
+  imageInputAdmission,
+  imageInputAdmissionReason,
 } = chatSessionRouting
 const sessionRoutingSendBlockedReason = computed(() => (
   modelRoutingSettingsBusy.value ? t('chat.composer.routingUpdateBlocked') : ''
@@ -6889,10 +6895,10 @@ watch(sessionKey, () => {
 // Hello refreshes method capabilities on reconnect. Retry the durable index
 // for the current Session then; older gateways simply remain on history/live.
 watch(() => rpc.state, (state, previous) => {
+  if (state !== 'connected' || previous === 'connected') return
+  void loadFeatureToggles()
   if (
-    state === 'connected'
-    && previous !== 'connected'
-    && sessionKey.value
+    sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
   ) {
     void loadSessionArtifactsAfterReconnect()

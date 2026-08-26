@@ -1,6 +1,9 @@
 import { computed, ref, watch, type Ref } from 'vue'
 import type {
   GatewayModelRoutingMode,
+  ImageInputCapability,
+  ImageInputAdmission,
+  ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
 import {
@@ -24,6 +27,9 @@ export interface UseChatSessionRoutingOptions {
   rpc: RpcClient
   sessionKey: Ref<string>
   globalMode: Readonly<Ref<ModelRoutingMode>>
+  globalImageInputAdmission: Readonly<Ref<ImageInputAdmission>>
+  globalImageInputAdmissionReason: Readonly<Ref<string>>
+  capabilitiesByMode: Readonly<Ref<ModelRoutingCapabilitiesByMode | null>>
   available?: Readonly<Ref<boolean>>
   isStreaming: Readonly<Ref<boolean>>
   isDraft: () => boolean
@@ -108,6 +114,23 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
       ? modelRoutingModeToGateway(mode.value)
       : null
   ))
+  const effectiveImageInputCapability = computed<ImageInputCapability>(() => {
+    const sessionMode = modelRoutingModeToGateway(mode.value)
+    const capabilitiesByMode = options.capabilitiesByMode.value
+    if (capabilitiesByMode) return capabilitiesByMode[sessionMode].image_input
+    if (sessionMode === modelRoutingModeToGateway(options.globalMode.value)) {
+      return {
+        admission: options.globalImageInputAdmission.value,
+        reason: options.globalImageInputAdmissionReason.value,
+      }
+    }
+    return {
+      admission: 'unknown',
+      reason: 'capability_unknown',
+    }
+  })
+  const imageInputAdmission = computed(() => effectiveImageInputCapability.value.admission)
+  const imageInputAdmissionReason = computed(() => effectiveImageInputCapability.value.reason)
 
   function reset() {
     generation += 1
@@ -285,6 +308,9 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     modeAppliesNextTurn,
     hasAuthoritativeSnapshot,
     initialRoutingMode,
+    effectiveImageInputCapability,
+    imageInputAdmission,
+    imageInputAdmissionReason,
     applyBootstrap,
     load,
     reset,

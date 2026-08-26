@@ -10960,6 +10960,69 @@ class TestSessionsBootstrap:
         assert res.payload["stream_cursor"] == stream["stream_seq"]
 
     @pytest.mark.asyncio
+    async def test_bootstrap_overlays_live_llm_for_session_direct_image_capability(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        class _Catalog:
+            def resolve_deployment_vision_support(self, *_args, **_kwargs) -> str:
+                return "supported"
+
+        monkeypatch.setattr(
+            "opensquilla.provider.model_catalog.shared_catalog",
+            lambda: _Catalog(),
+        )
+        key = "agent:main:webchat:bootstrap-direct-vision"
+        session = FakeSession(session_key=key, session_id="bootstrap-direct-vision")
+        manager = FakeSessionManager([session])
+
+        async def get_session_routing(
+            candidate: str,
+            *,
+            fallback_mode: str,
+        ) -> dict[str, Any]:
+            assert candidate == key
+            assert fallback_mode == "ensemble"
+            return {
+                "mode": "direct",
+                "revision": 3,
+                "source": "session",
+                "initialized": True,
+            }
+
+        manager.get_session_routing = get_session_routing  # type: ignore[attr-defined]
+        ctx = make_ctx(
+            session_manager=manager,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                llm={"provider": "openrouter", "model": "direct-vision"},
+                llm_ensemble={
+                    "enabled": True,
+                    "selection_mode": "static_openrouter_b5",
+                },
+                squilla_router={"enabled": False, "rollout_phase": "observe"},
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "bootstrap-direct-vision",
+            "sessions.bootstrap",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["routing"]["mode"] == "direct"
+        assert res.payload["routing"]["revision"] == 3
+        assert res.payload["runtime"]["model_routing"]["mode"] == "direct"
+        assert res.payload["runtime"]["model_routing"]["image_input"] == {
+            "admission": "allowed",
+            "reason": "model_vision_supported",
+        }
+
+    @pytest.mark.asyncio
     async def test_legacy_bootstrap_preserves_transcript_larger_than_one_mib(
         self, dispatcher
     ):
