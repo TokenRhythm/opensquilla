@@ -1679,6 +1679,7 @@
       "providerProfileRemoved": "{provider} wurde entfernt.",
       "providerProfileRemovedImageEnv": "{provider} wurde aus dem Modelldienst entfernt. Die Bilderzeugung bleibt über {envKey} verfügbar.",
       "providerProfileRemovedImageNeedsCredential": "{provider} wurde entfernt. Anbieter und Modell der Bilderzeugung bleiben erhalten, benötigen jetzt aber Zugangsdaten.",
+      "providerRemovedRouterDisabled": "{provider} wurde entfernt. Das Modell-Routing wurde deaktiviert, weil gespeicherte Stufen einen anderen Anbieter verwenden.",
       "providerCredentialRemoved": "Die Zugangsdaten für {provider} wurden entfernt.",
       "providerCredentialExternalStillActive": "Der in OpenSquilla gespeicherte Zugangsdatenverweis für {provider} wurde entfernt, aber die Systemumgebungsvariable {envKey} stellt weiterhin Zugangsdaten bereit.",
       "providerActivated": "{provider} ist jetzt aktiv.",

@@ -2900,11 +2900,21 @@ async function removeProviderProfile(providerId: string) {
     primaryLabel: t('setup.provider.removeConfirmPrimary'),
   })
   if (!ok) return
+  let routerAction: 'disable' | undefined
   try {
     if (row.active && replacement) {
+      // Removing the active provider promotes the replacement through the same
+      // primary-swap path as activateProvider. A custom/legacy Router whose
+      // tiers still name another provider cannot be executed safely after that
+      // swap while cross-provider routing is off, so the backend would reject
+      // the removal with an untranslated router_provider_conflict. Detect the
+      // conflict up front and mirror activateProvider: keep the saved tiers,
+      // turn the Router off, and let the operator re-enable it deliberately.
+      routerAction = routerConflictsWithTarget(replacement.providerId) ? 'disable' : undefined
       await rpc.call('onboarding.llmProfile.active.remove', {
         providerId: provider,
         replacementProviderId: replacement.providerId,
+        ...(routerAction ? { routerAction } : {}),
         ...imageGenerationIntentPayload(replacement.providerId, {
           respectProviderEditorChoice: false,
         }),
@@ -2935,7 +2945,12 @@ async function removeProviderProfile(providerId: string) {
         provider: providerLabel,
       }), { tone: 'warn' })
     } else {
-      pushToast(t('setup.toast.providerProfileRemoved', { provider: providerLabel }))
+      pushToast(t(
+        routerAction === 'disable'
+          ? 'setup.toast.providerRemovedRouterDisabled'
+          : 'setup.toast.providerProfileRemoved',
+        { provider: providerLabel },
+      ))
     }
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })

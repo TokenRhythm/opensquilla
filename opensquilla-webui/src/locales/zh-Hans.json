@@ -1767,6 +1767,7 @@
       "providerProfileRemoved": "已删除 {provider}。",
       "providerProfileRemovedImageEnv": "已从模型服务删除 {provider}；图像生成继续通过 {envKey} 使用。",
       "providerProfileRemovedImageNeedsCredential": "已删除 {provider}；图像生成保留了服务商和模型，但现在需要配置凭据。",
+      "providerRemovedRouterDisabled": "已删除 {provider}；由于已保存的路由层级使用其他服务商，模型路由已关闭。",
       "providerCredentialRemoved": "已删除 {provider} 的凭据。",
       "providerCredentialExternalStillActive": "已清除 OpenSquilla 中保存的 {provider} 凭据引用，但系统环境变量 {envKey} 仍在提供凭据。",
       "providerActivated": "已将 {provider} 设为当前使用。",

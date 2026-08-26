@@ -1679,6 +1679,7 @@
       "providerProfileRemoved": "Se eliminó {provider}.",
       "providerProfileRemovedImageEnv": "Se eliminó {provider} del servicio de modelos. La generación de imágenes sigue disponible mediante {envKey}.",
       "providerProfileRemovedImageNeedsCredential": "Se eliminó {provider}. La generación de imágenes conservó el proveedor y el modelo, pero ahora necesita una credencial.",
+      "providerRemovedRouterDisabled": "Se eliminó {provider}. El enrutamiento de modelos se desactivó porque sus niveles guardados usan otro proveedor.",
       "providerCredentialRemoved": "Se eliminaron las credenciales de {provider}.",
       "providerCredentialExternalStillActive": "Se eliminó la referencia a las credenciales de {provider} guardada en OpenSquilla, pero la variable de entorno del sistema {envKey} sigue proporcionando credenciales.",
       "providerActivated": "{provider} está activo.",
