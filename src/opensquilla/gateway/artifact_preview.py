@@ -42,6 +42,7 @@ log = structlog.get_logger(__name__)
 PREVIEW_LEASE_IDLE_SECONDS = 8 * 60 * 60
 PREVIEW_LEASE_LIMIT_PER_SESSION = 8
 _PREVIEW_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_CANDIDATE_HANDLE_RE = re.compile(r"^candidate_[A-Za-z0-9_-]{16,128}$")
 _PREVIEW_AUTHORITY_RE = re.compile(
     r"^p-([0-9a-f]{32})\.localhost:([0-9]{1,5})$"
 )
@@ -82,6 +83,30 @@ class ArtifactPreviewLease:
     last_access_at: float
 
 
+@dataclass(slots=True)
+class CandidatePreviewBinding:
+    """Turn-local mapping from an opaque bridge handle to candidate bytes.
+
+    The handle is deliberately the only value that crosses the Desktop bridge.
+    Artifact/session identifiers remain inside the Gateway and are checked on
+    every resolve.  The mapping is ephemeral and is not part of the persisted
+    artifact or Document schema.
+    """
+
+    handle: str
+    artifact_id: str
+    session_id: str
+    session_key: str
+    created_at: float
+    last_access_at: float
+    lease_id: str | None = None
+    # The mode is derived from the currently active canonical lease(s), never
+    # accepted from the Desktop bridge.  It is intentionally retained on the
+    # ephemeral binding so the materialization endpoint can use the same
+    # policy decision that was made while resolving the handle.
+    mode: str = "offline"
+
+
 @dataclass(frozen=True, slots=True)
 class _ResolvedPreviewResource:
     logical_path: str
@@ -111,6 +136,7 @@ class ArtifactPreviewLeaseService:
         self._lease_id_by_token_hash: dict[str, str] = {}
         self._expired_lease_ids: dict[str, float] = {}
         self._expired_token_hashes: dict[str, float] = {}
+        self._candidate_bindings: dict[str, CandidatePreviewBinding] = {}
         self._listener_port: int | None = None
 
     @property
@@ -124,6 +150,224 @@ class ArtifactPreviewLeaseService:
 
     def clear_listener_port(self) -> None:
         self._listener_port = None
+
+    def register_candidate_preview(
+        self,
+        *,
+        handle: str,
+        artifact_id: str,
+        session_id: str,
+        session_key: str,
+    ) -> None:
+        """Register the current turn candidate for a Desktop bind request."""
+
+        if _CANDIDATE_HANDLE_RE.fullmatch(handle) is None:
+            raise ValueError("candidate preview handle is invalid")
+        now = float(self._clock())
+        # Resolve before publishing the mapping so a missing/corrupt candidate
+        # can never be turned into a browser capability.
+        ref, _path = self._store().resolve_for_download(
+            artifact_id,
+            session_id=session_id,
+        )
+        if not _is_html_artifact(ref):
+            raise ValueError("candidate preview requires an HTML artifact")
+        with self._lock:
+            self._purge_expired_locked(now)
+            previous = self._candidate_bindings.get(handle)
+            same_binding = bool(
+                previous is not None
+                and previous.artifact_id == artifact_id
+                and previous.session_id == session_id
+                and previous.session_key == session_key
+            )
+            if previous is not None and not same_binding:
+                # A handle may be reused after a candidate is replaced.  Do
+                # not carry the old materialized lease into the new mapping:
+                # an in-flight resolve for the old identity will be fenced at
+                # attach time, while the old lease would otherwise remain
+                # reachable until the idle sweeper runs.  Revoke it at the
+                # replacement boundary so register/retire paths are equally
+                # fail-closed.
+                if previous.lease_id:
+                    previous_lease = self._leases_by_id.get(previous.lease_id)
+                    if previous_lease is not None:
+                        self._expire_locked(previous_lease, now)
+            self._candidate_bindings[handle] = CandidatePreviewBinding(
+                handle=handle,
+                artifact_id=artifact_id,
+                session_id=session_id,
+                session_key=session_key,
+                created_at=(previous.created_at if same_binding and previous is not None else now),
+                last_access_at=now,
+                mode=self._derive_candidate_mode_locked(
+                    session_id=session_id,
+                    session_key=session_key,
+                ),
+                # Preserve a lease only when this is a refresh of the same
+                # candidate identity.  A replacement starts unmaterialized.
+                lease_id=(previous.lease_id if same_binding and previous is not None else None),
+            )
+
+    def resolve_candidate_preview(self, handle: str) -> CandidatePreviewBinding:
+        """Return a validated turn-local candidate binding or fail closed."""
+
+        if _CANDIDATE_HANDLE_RE.fullmatch(handle) is None:
+            raise PreviewLeaseNotFoundError("candidate preview not found")
+        now = float(self._clock())
+        with self._lock:
+            self._purge_expired_locked(now)
+            binding = self._candidate_bindings.get(handle)
+            if binding is None:
+                raise PreviewLeaseNotFoundError("candidate preview not found")
+            binding.last_access_at = now
+            # Canonical preview mode can change while a candidate is staged
+            # (for example, the user toggles offline mode).  Re-derive it at
+            # materialization time instead of trusting a stale client value or
+            # a mode captured by an earlier resolve.
+            binding.mode = self._derive_candidate_mode_locked(
+                session_id=binding.session_id,
+                session_key=binding.session_key,
+            )
+            return CandidatePreviewBinding(
+                handle=binding.handle,
+                artifact_id=binding.artifact_id,
+                session_id=binding.session_id,
+                session_key=binding.session_key,
+                created_at=binding.created_at,
+                last_access_at=binding.last_access_at,
+                mode=binding.mode,
+                lease_id=binding.lease_id,
+            )
+
+    def attach_candidate_lease(
+        self,
+        handle: str,
+        lease_id: str,
+        *,
+        expected_artifact_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_key: str | None = None,
+        expected_mode: str | None = None,
+    ) -> bool:
+        """Remember the latest materialized lease for later release.
+
+        Materialization happens outside the service lock because it validates
+        artifact bytes and may perform filesystem work.  The candidate can be
+        retired while that work is in flight (for example when a turn is
+        cancelled).  Returning whether the mapping still exists lets the
+        caller revoke a lease it could not safely attach instead of leaking a
+        browser capability.
+        """
+
+        now = float(self._clock())
+        with self._lock:
+            self._purge_expired_locked(now)
+            binding = self._candidate_bindings.get(handle)
+            if binding is None:
+                return False
+            materialized = self._leases_by_id.get(lease_id)
+            if (
+                materialized is None
+                or materialized.artifact_id != binding.artifact_id
+                or materialized.session_id != binding.session_id
+                or materialized.session_key != binding.session_key
+            ):
+                # A lease may have been revoked while the asynchronous
+                # materialization was in flight.  Never leave a mapping
+                # pointing at an unknown or cross-scope lease; the caller can
+                # safely revoke/forget the newly-created lease instead.
+                return False
+            # Resolution/materialization is intentionally performed outside
+            # this lock.  Fence the attach with the immutable binding
+            # identity so a concurrent registration of the same opaque handle
+            # cannot attach the newly-created lease to a different candidate.
+            if (
+                expected_artifact_id is not None
+                and binding.artifact_id != expected_artifact_id
+            ) or (
+                expected_session_id is not None
+                and binding.session_id != expected_session_id
+            ) or (
+                expected_session_key is not None
+                and binding.session_key != expected_session_key
+            ):
+                return False
+            # Re-evaluate the canonical lease policy at the commit point.  A
+            # full candidate must never become reachable after its canonical
+            # full lease was revoked while bytes were materializing.
+            current_mode = self._derive_candidate_mode_locked(
+                session_id=binding.session_id,
+                session_key=binding.session_key,
+                excluded_lease_ids={lease_id},
+            )
+            binding.mode = current_mode
+            if expected_mode is not None and current_mode != expected_mode:
+                return False
+            previous_lease_id = binding.lease_id
+            if previous_lease_id and previous_lease_id != lease_id:
+                previous_lease = self._leases_by_id.get(previous_lease_id)
+                if previous_lease is not None:
+                    self._expire_locked(previous_lease, now)
+            binding.lease_id = lease_id
+            binding.last_access_at = now
+            return True
+
+    def retire_candidate_preview(self, handle: str) -> CandidatePreviewBinding | None:
+        """Remove a mapping and revoke any materialized candidate lease.
+
+        This method is also used by in-process cancellation/error paths that
+        cannot make the authenticated HTTP DELETE call.  Retiring only the
+        mapping would leave the lease (and therefore the candidate bytes)
+        readable until the idle sweeper runs.
+        """
+
+        now = float(self._clock())
+        with self._lock:
+            self._purge_expired_locked(now)
+            binding = self._candidate_bindings.pop(handle, None)
+            if binding is None:
+                return None
+            if binding.lease_id:
+                candidate_lease = self._leases_by_id.get(binding.lease_id)
+                if candidate_lease is not None:
+                    self._expire_locked(candidate_lease, now)
+            return CandidatePreviewBinding(
+                handle=binding.handle,
+                artifact_id=binding.artifact_id,
+                session_id=binding.session_id,
+                session_key=binding.session_key,
+                created_at=binding.created_at,
+                last_access_at=binding.last_access_at,
+                mode=binding.mode,
+                lease_id=binding.lease_id,
+            )
+
+    def _derive_candidate_mode_locked(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        excluded_lease_ids: set[str] | None = None,
+    ) -> str:
+        """Return the mode allowed for a model-controlled candidate preview.
+
+        Candidate HTML is untrusted code and the browser tools include bounded
+        actions such as ``click`` and ``type``.  It must therefore never inherit
+        the canonical preview's full-network realm: a generated button or
+        script could otherwise turn an agent verification action into an
+        external form/fetch/WebSocket side effect.  The native Electron surface
+        still permits its own loopback preview origin in offline mode, while
+        external origins and privileged Gateway targets remain blocked.
+
+        Keep the arguments for API compatibility and to make it explicit that
+        no canonical or candidate lease is consulted for this security
+        decision.  ``OPENSQUILLA_PREVIEW_FORCE_OFFLINE`` continues to govern
+        ordinary canonical leases; candidate previews are always offline.
+        """
+
+        del session_id, session_key, excluded_lease_ids
+        return "offline"
 
     def create(
         self,
@@ -387,6 +631,13 @@ class ArtifactPreviewLeaseService:
         for token_hash, expired_at in tuple(self._expired_token_hashes.items()):
             if expired_at <= tombstone_deadline:
                 self._expired_token_hashes.pop(token_hash, None)
+        for handle, binding in tuple(self._candidate_bindings.items()):
+            if now - binding.last_access_at >= self._idle_seconds:
+                self._candidate_bindings.pop(handle, None)
+                if binding.lease_id:
+                    candidate_lease = self._leases_by_id.get(binding.lease_id)
+                    if candidate_lease is not None:
+                        self._expire_locked(candidate_lease, now)
 
     def _expire_locked(self, lease: ArtifactPreviewLease, now: float) -> None:
         self._leases_by_id.pop(lease.lease_id, None)
@@ -587,6 +838,145 @@ def register_artifact_preview_routes(
         _set_control_no_store(response)
         return response
 
+    async def resolve_candidate_preview(request: Request) -> Response:
+        """Materialize a turn-local opaque candidate for the native Desktop.
+
+        This endpoint is intentionally separate from the public preview lease
+        API.  It accepts only the process-lifetime Desktop bridge bearer and an
+        opaque candidate handle; artifact ids, session keys, and launch URLs
+        are resolved entirely inside the Gateway.
+        """
+
+        if not _desktop_bridge_internal_request_allowed(request):
+            return _api_error("Candidate preview is unavailable", "FORBIDDEN", 403)
+        try:
+            body = await request.json()
+        except Exception:
+            return _api_error("Invalid JSON body", "INVALID_REQUEST", 400)
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"version", "candidateHandle"}
+            or body.get("version") != 1
+            or isinstance(body.get("version"), bool)
+            or not isinstance(body.get("candidateHandle"), str)
+            or _CANDIDATE_HANDLE_RE.fullmatch(body["candidateHandle"]) is None
+        ):
+            return _api_error("Invalid candidate preview request", "INVALID_REQUEST", 400)
+        try:
+            binding = lease_service.resolve_candidate_preview(body["candidateHandle"])
+            if lease_service.listener_port is None:
+                raise PreviewLeaseError("preview listener is unavailable")
+            lease, token = await asyncio.to_thread(
+                lease_service.create,
+                artifact_id=binding.artifact_id,
+                session_id=binding.session_id,
+                session_key=binding.session_key,
+                # The bridge supplies only an opaque handle.  The service
+                # derives mode from the matching canonical lease and defaults
+                # to offline; never let a request field or a stale candidate
+                # lease escalate an unproven preview to full mode.
+                mode=binding.mode,
+                client="desktop",
+            )
+            previous_lease_id = binding.lease_id
+            attached = lease_service.attach_candidate_lease(
+                body["candidateHandle"],
+                lease.lease_id,
+                expected_artifact_id=binding.artifact_id,
+                expected_session_id=binding.session_id,
+                expected_session_key=binding.session_key,
+                expected_mode=binding.mode,
+            )
+            if not attached:
+                # The opaque mapping may have been retired while the artifact
+                # was being materialized.  Do not leave the newly-created
+                # lease reachable without a mapping that can later revoke it.
+                try:
+                    await asyncio.to_thread(
+                        lease_service.revoke,
+                        lease.lease_id,
+                        session_id=binding.session_id,
+                        session_key=binding.session_key,
+                    )
+                except PreviewLeaseError as exc:
+                    log.debug(
+                        "gateway.artifact_preview_candidate_revoke_failed",
+                        lease_id=lease.lease_id,
+                        session_id=binding.session_id,
+                        artifact_id=binding.artifact_id,
+                        candidate_handle=body["candidateHandle"],
+                        error=str(exc),
+                    )
+                raise PreviewLeaseNotFoundError("candidate preview not found")
+            if previous_lease_id and previous_lease_id != lease.lease_id:
+                try:
+                    await asyncio.to_thread(
+                        lease_service.revoke,
+                        previous_lease_id,
+                        session_id=binding.session_id,
+                        session_key=binding.session_key,
+                    )
+                except PreviewLeaseError as exc:
+                    log.debug(
+                        "gateway.artifact_preview_previous_lease_revoke_failed",
+                        lease_id=previous_lease_id,
+                        session_id=binding.session_id,
+                        artifact_id=binding.artifact_id,
+                        candidate_handle=body["candidateHandle"],
+                        error=str(exc),
+                    )
+            launch_url = lease_service.full_launch_url(token, lease.entrypoint)
+            payload = _lease_payload(
+                lease_service,
+                lease,
+                launch_url=launch_url,
+                preview_origin=f"http://p-{token}.localhost:{lease_service.listener_port}",
+            )
+            payload.update(
+                {
+                    "candidate_handle": body["candidateHandle"],
+                    "candidate_artifact_id": binding.artifact_id,
+                    "scope_id": binding.session_key,
+                    "lease_id": lease.lease_id,
+                }
+            )
+        except PreviewLeaseLimitError:
+            return _api_error("Preview lease limit reached", "PREVIEW_LEASE_LIMIT", 429)
+        except ArtifactBundleUnsupportedError:
+            return _api_error("Artifact bundle version is unsupported", "BUNDLE_UNSUPPORTED", 409)
+        except ArtifactIntegrityError:
+            return _api_error("Artifact integrity check failed", "INTEGRITY_ERROR", 409)
+        except PreviewLeaseError:
+            return _api_error("Preview listener is unavailable", "PREVIEW_UNAVAILABLE", 503)
+        except (ArtifactNotFoundError, ValueError):
+            return _api_error("Candidate preview not found", "NOT_FOUND", 404)
+        response = JSONResponse(payload, status_code=200)
+        _set_control_no_store(response)
+        return response
+
+    async def release_candidate_preview(request: Request) -> Response:
+        if not _desktop_bridge_internal_request_allowed(request):
+            return _api_error("Candidate preview is unavailable", "FORBIDDEN", 403)
+        handle = str(request.path_params.get("candidate_handle") or "")
+        if _CANDIDATE_HANDLE_RE.fullmatch(handle) is None:
+            return _api_error("Invalid candidate preview handle", "INVALID_REQUEST", 400)
+        binding = lease_service.retire_candidate_preview(handle)
+        if binding is not None and binding.lease_id:
+            try:
+                await asyncio.to_thread(
+                    lease_service.revoke,
+                    binding.lease_id,
+                    session_id=binding.session_id,
+                    session_key=binding.session_key,
+                )
+            except PreviewLeaseError:
+                # The lease is already expired/revoked; the mapping removal is
+                # the authoritative cleanup boundary.
+                pass
+        response = Response(status_code=204)
+        _set_control_no_store(response)
+        return response
+
     async def offline_resource(request: Request) -> Response:
         return await _serve_preview_resource(
             request,
@@ -622,6 +1012,16 @@ def register_artifact_preview_routes(
                 "/api/v1/artifact-preview/{token}/{resource_path:path}",
                 offline_resource,
                 methods=["GET", "HEAD"],
+            ),
+            Route(
+                "/api/v1/desktop-artifact-candidate-preview/resolve",
+                resolve_candidate_preview,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/desktop-artifact-candidate-preview/{candidate_handle}",
+                release_candidate_preview,
+                methods=["DELETE"],
             ),
         ]
     )
@@ -810,6 +1210,21 @@ def _desktop_preview_request_allowed(request: Request) -> bool:
         is_loopback_address(peer_ip)
         and request.headers.get("origin") is None
     )
+
+
+def _desktop_bridge_internal_request_allowed(request: Request) -> bool:
+    """Authorize the Electron-only candidate materialization endpoint."""
+
+    if not _desktop_preview_request_allowed(request):
+        return False
+    supplied = request.headers.get("authorization", "")
+    if not supplied.startswith("Bearer "):
+        return False
+    from opensquilla.gateway.desktop_artifact_bridge import (
+        desktop_artifact_bridge_token_valid,
+    )
+
+    return desktop_artifact_bridge_token_valid(supplied[7:])
 
 
 def _is_loopback_hostname(hostname: str | None) -> bool:

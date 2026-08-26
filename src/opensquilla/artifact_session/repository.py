@@ -64,6 +64,18 @@ IdFactory = Callable[[str], str]
 MAX_PROMPT_ANNOTATIONS_PER_BATCH = 16
 MAX_PROMPT_ANNOTATION_BODY_BYTES = 16_384
 _MUTATION_ATTEMPT_TURN_QUERY_CHUNK_SIZE = 400
+# Audit rows that identify a durable revision-producing mutation.  Metadata
+# events such as ``document.renamed`` can carry the current head revision id,
+# but must not be mistaken for the commit that produced that revision when a
+# source.patched notification is replayed.
+_DURABLE_MUTATION_AUDIT_EVENT_TYPES = (
+    "document.created",
+    "document.restored",
+    "document.reverted",
+    "revision.committed",
+    "revision.change_set_applied",
+    "change_set.applied",
+)
 
 
 class _SessionStorageBinding(Protocol):
@@ -2670,6 +2682,7 @@ class ArtifactSessionRepository:
         turn_id: str | None = None,
         summary: str = "",
         change_set_id: str | None = None,
+        candidate_loop: bool = False,
     ) -> ChangeSet:
         """Persist an agent or user change set against an immutable base revision."""
 
@@ -2720,6 +2733,7 @@ class ArtifactSessionRepository:
                     "base_revision_id": base_revision_id,
                     "operation_count": len(operations),
                     "turn_id": turn_id,
+                    "candidate_loop": candidate_loop,
                 },
                 created_at=now,
             )
@@ -2748,6 +2762,51 @@ class ArtifactSessionRepository:
                 (document_id, turn_id),
             )
             return None if row is None else _change_set_from_row(row)
+
+    async def _is_candidate_loop_change_set_on_conn(
+        self,
+        conn: Any,
+        change_set_id: str,
+    ) -> bool:
+        row = await _fetchone(
+            conn,
+            """
+            SELECT 1
+            FROM artifact_change_sets AS change_set
+            JOIN artifact_audit_events AS candidate_audit
+              ON candidate_audit.change_set_id = change_set.change_set_id
+            WHERE change_set.change_set_id = ?
+              AND change_set.turn_id IS NOT NULL
+              AND candidate_audit.event_type = 'change_set.created'
+              AND json_extract(
+                  CASE
+                      WHEN json_valid(candidate_audit.payload_json)
+                      THEN candidate_audit.payload_json
+                      ELSE '{}'
+                  END,
+                  '$.candidate_loop'
+              ) = 1
+            LIMIT 1
+            """,
+            (change_set_id,),
+        )
+        return row is not None
+
+    async def is_candidate_loop_change_set(self, change_set_id: str) -> bool:
+        """Return whether an immutable creation audit marks a candidate loop.
+
+        ``created_by_kind`` and ``turn_id`` are intentionally insufficient
+        ownership signals: ordinary collaboration/review proposals may also
+        be agent-authored and turn-scoped.  The candidate controller writes a
+        dedicated flag in the creation audit payload, which is the only
+        signal used by restart cleanup and mutation reconciliation.
+        """
+
+        async with self._read_transaction("is_candidate_loop_change_set") as conn:
+            return await self._is_candidate_loop_change_set_on_conn(
+                conn,
+                change_set_id,
+            )
 
     async def list_change_sets(
         self,
@@ -2781,6 +2840,413 @@ class ArtifactSessionRepository:
                     (document_id, status.value, limit),
                 )
             return tuple(_change_set_from_row(row) for row in rows)
+
+    async def list_draft_change_sets(
+        self,
+        *,
+        limit: int = 100,
+        candidate_only: bool = False,
+    ) -> tuple[ChangeSet, ...]:
+        """Return durable drafts, optionally narrowed to agent turn candidates.
+
+        Candidate-loop controllers and opaque preview handles are turn-local;
+        after a Gateway restart no live owner can safely resume those rows.
+        ``candidate_only`` keeps restart cleanup from rejecting ordinary
+        user-authored drafts that do not carry a turn-scoped agent owner.
+        """
+
+        if isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ArtifactValidationError("limit must be between 1 and 1000")
+        if not isinstance(candidate_only, bool):
+            raise ArtifactValidationError("candidate_only must be a boolean")
+        candidate_clause = ""
+        params: list[Any] = [ChangeSetStatus.DRAFT.value]
+        if candidate_only:
+            # ``turn_id`` alone is not a candidate-loop marker: collaboration
+            # and review flows may also key an agent proposal by turn.  The
+            # controller opts into restart cleanup through an immutable
+            # ``change_set.created`` audit payload flag, leaving ordinary
+            # agent-owned DRAFTs untouched.
+            candidate_clause = """
+                AND turn_id IS NOT NULL
+                AND EXISTS (
+                    SELECT 1
+                    FROM artifact_audit_events AS candidate_audit
+                    WHERE candidate_audit.change_set_id = artifact_change_sets.change_set_id
+                      AND candidate_audit.event_type = 'change_set.created'
+                      AND json_extract(
+                          CASE
+                              WHEN json_valid(candidate_audit.payload_json)
+                              THEN candidate_audit.payload_json
+                              ELSE '{}'
+                          END,
+                          '$.candidate_loop'
+                      ) = 1
+                )
+            """
+        params.append(limit)
+        async with self._transaction("list_draft_change_sets") as conn:
+            rows = await _fetchall(
+                conn,
+                f"""
+                SELECT * FROM artifact_change_sets
+                WHERE status = ?{candidate_clause}
+                ORDER BY updated_at ASC, change_set_id
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            return tuple(_change_set_from_row(row) for row in rows)
+
+    async def list_applied_candidate_change_sets(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        """Return applied agent turns whose candidate blobs need boot cleanup.
+
+        The result is ``(document_id, session_id, turn_id, current_artifact_id)``.
+        Candidate blobs are internal and turn-marked; recovery uses this durable
+        ownership tuple to remove superseded blobs after a final commit while
+        preserving the artifact referenced by the applied revision.
+        """
+
+        if isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ArtifactValidationError("limit must be between 1 and 1000")
+        async with self._read_transaction("list_applied_candidate_change_sets") as conn:
+            rows = await _fetchall(
+                conn,
+                """
+                SELECT change_set.document_id, document.session_id,
+                       change_set.turn_id,
+                       revision.artifact_id AS current_artifact_id
+                FROM artifact_change_sets AS change_set
+                JOIN artifact_documents AS document
+                  ON document.document_id = change_set.document_id
+                JOIN artifact_revisions AS revision
+                  ON revision.revision_id = change_set.applied_revision_id
+                WHERE change_set.status = ?
+                  AND change_set.turn_id IS NOT NULL
+                  AND document.session_id IS NOT NULL
+                  AND revision.artifact_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM artifact_audit_events AS candidate_audit
+                      WHERE candidate_audit.change_set_id = change_set.change_set_id
+                        AND candidate_audit.event_type = 'change_set.created'
+                        AND json_extract(
+                            CASE
+                                WHEN json_valid(candidate_audit.payload_json)
+                                THEN candidate_audit.payload_json
+                                ELSE '{}'
+                            END,
+                            '$.candidate_loop'
+                        ) = 1
+                  )
+                ORDER BY change_set.updated_at ASC, change_set.change_set_id
+                LIMIT ?
+                """,
+                (ChangeSetStatus.APPLIED.value, limit),
+            )
+            records: list[tuple[str, str, str, str]] = []
+            for row in rows:
+                document_id = row["document_id"]
+                session_id = row["session_id"]
+                turn_id = row["turn_id"]
+                artifact_id = row["current_artifact_id"]
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (document_id, session_id, turn_id, artifact_id)
+                ):
+                    continue
+                records.append(
+                    (
+                        cast(str, document_id),
+                        cast(str, session_id),
+                        cast(str, turn_id),
+                        cast(str, artifact_id),
+                    )
+                )
+            return tuple(records)
+
+    async def list_rejected_candidate_artifacts(
+        self,
+        *,
+        limit: int = 500,
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        """Return detached candidate blobs journaled by rejected change sets.
+
+        Rejecting a draft clears the candidate columns in the same SQLite
+        transaction, while the physical ``ArtifactStore`` bucket is removed
+        outside that transaction.  The rejection audit payload is therefore a
+        small, durable cleanup journal: a process crash between those two
+        operations must not strand an otherwise unreachable blob forever.
+
+        The result is ``(document_id, session_id, artifact_id, sha256)``.  Both
+        the rejected change-set join and the revision exclusion are performed
+        here so callers can safely retry this bounded sweep on every boot.
+        Historical ``candidate_updated`` events are included to cover a
+        replacement candidate whose best-effort deletion lost its response.
+        """
+
+        if isinstance(limit, bool) or not 1 <= limit <= 5000:
+            raise ArtifactValidationError("limit must be between 1 and 5000")
+        async with self._read_transaction("list_rejected_candidate_artifacts") as conn:
+            rows = await _fetchall(
+                conn,
+                """
+                SELECT audit.document_id, document.session_id,
+                       audit.payload_json, audit.change_set_id
+                FROM artifact_audit_events AS audit
+                JOIN artifact_documents AS document
+                  ON document.document_id = audit.document_id
+                JOIN artifact_change_sets AS change_set
+                  ON change_set.change_set_id = audit.change_set_id
+                WHERE audit.event_type IN (?, ?)
+                  AND change_set.status = ?
+                  AND change_set.candidate_artifact_id IS NULL
+                  AND document.session_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM artifact_audit_events AS candidate_created
+                      WHERE candidate_created.change_set_id = change_set.change_set_id
+                        AND candidate_created.event_type = 'change_set.created'
+                        AND json_extract(
+                            CASE
+                                WHEN json_valid(candidate_created.payload_json)
+                                THEN candidate_created.payload_json
+                                ELSE '{}'
+                            END,
+                            '$.candidate_loop'
+                        ) = 1
+                  )
+                  AND (
+                      audit.event_type = 'change_set.candidate_updated'
+                      OR json_extract(
+                          CASE
+                              WHEN json_valid(audit.payload_json)
+                              THEN audit.payload_json
+                              ELSE '{}'
+                          END,
+                          '$.candidate_cleanup'
+                      ) = 1
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM artifact_revisions AS revision
+                    WHERE revision.document_id = audit.document_id
+                      AND revision.artifact_id = json_extract(
+                          audit.payload_json, '$.candidate_artifact_id'
+                      )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM artifact_audit_events AS cleanup
+                    WHERE cleanup.document_id = audit.document_id
+                      AND cleanup.event_type = 'candidate.artifact_cleaned'
+                      AND json_extract(
+                          CASE
+                              WHEN json_valid(cleanup.payload_json)
+                              THEN cleanup.payload_json
+                              ELSE '{}'
+                          END,
+                          '$.candidate_artifact_id'
+                      ) = json_extract(
+                          CASE
+                              WHEN json_valid(audit.payload_json)
+                              THEN audit.payload_json
+                              ELSE '{}'
+                          END,
+                          '$.candidate_artifact_id'
+                      )
+                  )
+                ORDER BY audit.sequence
+                LIMIT ?
+                """,
+                (
+                    "change_set.rejected",
+                    "change_set.candidate_updated",
+                    ChangeSetStatus.REJECTED.value,
+                    limit,
+                ),
+            )
+            candidates: list[tuple[str, str, str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                payload = _json_object(row["payload_json"])
+                artifact_id = payload.get("candidate_artifact_id")
+                sha256 = payload.get("candidate_artifact_sha256")
+                session_id = row["session_id"]
+                document_id = row["document_id"]
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (document_id, session_id, artifact_id, sha256)
+                ):
+                    continue
+                # The runtime checks above deliberately validate values at
+                # the boundary where SQLite's dynamically typed rows enter
+                # the typed repository result.  Keep concrete locals so
+                # static type checkers (and future callers) cannot observe
+                # the row's ``Any``/nullable shape.
+                document_id_value = cast(str, document_id)
+                session_id_value = cast(str, session_id)
+                artifact_id_value = cast(str, artifact_id)
+                sha256_value = cast(str, sha256)
+                key = (session_id_value, artifact_id_value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(
+                    (document_id_value, session_id_value, artifact_id_value, sha256_value)
+                )
+            return tuple(candidates)
+
+    async def list_applied_candidate_artifacts(
+        self,
+        *,
+        limit: int = 500,
+    ) -> tuple[tuple[str, str, str, str, str], ...]:
+        """Return superseded candidate blobs from applied candidate loops."""
+
+        if isinstance(limit, bool) or not 1 <= limit <= 5000:
+            raise ArtifactValidationError("limit must be between 1 and 5000")
+        async with self._read_transaction("list_applied_candidate_artifacts") as conn:
+            rows = await _fetchall(
+                conn,
+                """
+                SELECT audit.document_id, document.session_id, audit.payload_json,
+                       revision.artifact_id AS current_artifact_id
+                FROM artifact_audit_events AS audit
+                JOIN artifact_documents AS document
+                  ON document.document_id = audit.document_id
+                JOIN artifact_change_sets AS change_set
+                  ON change_set.change_set_id = audit.change_set_id
+                JOIN artifact_revisions AS revision
+                  ON revision.revision_id = change_set.applied_revision_id
+                WHERE audit.event_type = 'change_set.candidate_updated'
+                  AND change_set.status = ?
+                  AND document.session_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM artifact_audit_events AS candidate_created
+                      WHERE candidate_created.change_set_id = change_set.change_set_id
+                        AND candidate_created.event_type = 'change_set.created'
+                        AND json_extract(
+                            CASE
+                                WHEN json_valid(candidate_created.payload_json)
+                                THEN candidate_created.payload_json
+                                ELSE '{}'
+                            END,
+                            '$.candidate_loop'
+                        ) = 1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM artifact_revisions AS revision
+                      WHERE revision.document_id = audit.document_id
+                        AND revision.artifact_id = json_extract(
+                            audit.payload_json, '$.candidate_artifact_id'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM artifact_audit_events AS cleanup
+                      WHERE cleanup.document_id = audit.document_id
+                        AND cleanup.event_type = 'candidate.artifact_cleaned'
+                        AND json_extract(
+                            CASE
+                                WHEN json_valid(cleanup.payload_json)
+                                THEN cleanup.payload_json
+                                ELSE '{}'
+                            END,
+                            '$.candidate_artifact_id'
+                        ) = json_extract(
+                            CASE
+                                WHEN json_valid(audit.payload_json)
+                                THEN audit.payload_json
+                                ELSE '{}'
+                            END,
+                            '$.candidate_artifact_id'
+                        )
+                  )
+                ORDER BY audit.sequence
+                LIMIT ?
+                """,
+                (ChangeSetStatus.APPLIED.value, limit),
+            )
+            candidates: list[tuple[str, str, str, str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                payload = _json_object(row["payload_json"])
+                artifact_id = payload.get("candidate_artifact_id")
+                sha256 = payload.get("candidate_artifact_sha256")
+                session_id = row["session_id"]
+                document_id = row["document_id"]
+                current_artifact_id = row["current_artifact_id"]
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (
+                        document_id,
+                        session_id,
+                        artifact_id,
+                        sha256,
+                        current_artifact_id,
+                    )
+                ):
+                    continue
+                values = (
+                    cast(str, document_id),
+                    cast(str, session_id),
+                    cast(str, artifact_id),
+                    cast(str, sha256),
+                    cast(str, current_artifact_id),
+                )
+                key = (values[1], values[2])
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(values)
+            return tuple(candidates)
+
+    async def mark_candidate_artifact_cleaned(
+        self,
+        *,
+        document_id: str,
+        artifact_id: str,
+        sha256: str,
+        actor: Actor,
+    ) -> None:
+        """Durably retire one physical candidate cleanup journal entry."""
+
+        now = self._clock()
+        async with self._transaction("mark_candidate_artifact_cleaned") as conn:
+            await self._get_document_on_conn(conn, document_id)
+            existing = await _fetchone(
+                conn,
+                """
+                SELECT 1 FROM artifact_audit_events
+                WHERE document_id = ?
+                  AND event_type = 'candidate.artifact_cleaned'
+                  AND json_extract(
+                      CASE
+                          WHEN json_valid(payload_json) THEN payload_json
+                          ELSE '{}'
+                      END,
+                      '$.candidate_artifact_id'
+                  ) = ?
+                LIMIT 1
+                """,
+                (document_id, artifact_id),
+            )
+            if existing is not None:
+                return
+            await self._append_audit(
+                conn,
+                document_id=document_id,
+                event_type="candidate.artifact_cleaned",
+                actor=actor,
+                payload={
+                    "candidate_artifact_id": artifact_id,
+                    "candidate_artifact_sha256": sha256,
+                },
+                created_at=now,
+            )
 
     async def ready_change_set(
         self,
@@ -2840,6 +3306,83 @@ class ArtifactSessionRepository:
             )
             return await self._get_change_set_on_conn(conn, change_set_id)
 
+    async def update_draft_change_set_candidate(
+        self,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        candidate_artifact: ArtifactBlobRef,
+        operations: Sequence[dict[str, Any]],
+        validation: dict[str, Any] | None,
+        actor: Actor,
+    ) -> ChangeSet:
+        """CAS-update a turn-local candidate without publishing a revision.
+
+        A candidate loop may replace its proposed bytes many times while the
+        document head remains unchanged.  ``operations`` is the complete
+        aggregate for the candidate (rather than a delta); callers can safely
+        retry after a lost response by supplying the same payload and state
+        revision.  The change set stays ``DRAFT`` until the explicit final
+        commit boundary is crossed.
+        """
+
+        now = self._clock()
+        async with self._transaction("update_draft_change_set_candidate") as conn:
+            change_set = await self._get_change_set_on_conn(conn, change_set_id)
+            if change_set.state_revision != expected_state_revision:
+                raise ArtifactConflictError("change set state_revision changed")
+            if change_set.status is not ChangeSetStatus.DRAFT:
+                raise ArtifactConflictError("only a draft change set can stage a candidate")
+            document = await self._get_document_on_conn(conn, change_set.document_id)
+            if document.head_revision_id != change_set.base_revision_id:
+                raise ArtifactConflictError("change set base is no longer document head")
+            if not operations:
+                raise ArtifactValidationError("operations must not be empty")
+            cursor = await conn.execute(
+                """
+                UPDATE artifact_change_sets
+                SET operations_json = ?, candidate_artifact_id = ?,
+                    candidate_artifact_sha256 = ?, candidate_filename = ?,
+                    candidate_media_type = ?, candidate_byte_size = ?,
+                    validation_json = ?, state_revision = state_revision + 1,
+                    updated_at = ?
+                WHERE change_set_id = ? AND state_revision = ? AND status = ?
+                """,
+                (
+                    _json_dumps(list(operations)),
+                    candidate_artifact.artifact_id,
+                    candidate_artifact.sha256,
+                    candidate_artifact.filename,
+                    candidate_artifact.media_type,
+                    candidate_artifact.byte_size,
+                    None if validation is None else _json_dumps(validation),
+                    now,
+                    change_set_id,
+                    expected_state_revision,
+                    ChangeSetStatus.DRAFT.value,
+                ),
+            )
+            try:
+                if cursor.rowcount != 1:
+                    raise ArtifactConflictError("change set candidate compare-and-swap failed")
+            finally:
+                await cursor.close()
+            await self._append_audit(
+                conn,
+                document_id=change_set.document_id,
+                event_type="change_set.candidate_updated",
+                actor=actor,
+                change_set_id=change_set_id,
+                payload={
+                    "base_revision_id": change_set.base_revision_id,
+                    "candidate_artifact_id": candidate_artifact.artifact_id,
+                    "candidate_artifact_sha256": candidate_artifact.sha256,
+                    "operation_count": len(operations),
+                },
+                created_at=now,
+            )
+            return await self._get_change_set_on_conn(conn, change_set_id)
+
     async def reject_change_set(
         self,
         *,
@@ -2888,6 +3431,180 @@ class ArtifactSessionRepository:
                 created_at=now,
             )
             return await self._get_change_set_on_conn(conn, change_set_id)
+
+    async def _reject_draft_change_set_and_cleanup_on_conn(
+        self,
+        conn: Any,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        actor: Actor,
+        reason: str | None,
+        require_no_active_mutation_attempt: bool,
+        recovery_failure_code: str | None,
+    ) -> tuple[ChangeSet, MutationAttempt | None]:
+        """Reject one DRAFT under an optional mutation-receipt fence."""
+
+        now = self._clock()
+        change_set = await self._get_change_set_on_conn(conn, change_set_id)
+        if change_set.state_revision != expected_state_revision:
+            raise ArtifactConflictError("change set state_revision changed")
+        if change_set.status is not ChangeSetStatus.DRAFT:
+            raise ArtifactConflictError("only a draft change set can be rejected")
+
+        terminal_attempt: MutationAttempt | None = None
+        inspect_attempt = require_no_active_mutation_attempt or recovery_failure_code is not None
+        if inspect_attempt:
+            if change_set.turn_id is None:
+                raise ArtifactValidationError("candidate draft has no mutation-attempt turn")
+            if not await self._is_candidate_loop_change_set_on_conn(
+                conn,
+                change_set.change_set_id,
+            ):
+                raise ArtifactConflictError(
+                    "change set is not owned by the candidate loop"
+                )
+            attempt_row = await _fetchone(
+                conn,
+                """
+                SELECT * FROM artifact_mutation_attempts
+                WHERE turn_id = ?
+                """,
+                (change_set.turn_id,),
+            )
+            if attempt_row is not None:
+                attempt = _mutation_attempt_from_row(attempt_row)
+                if (
+                    attempt.document_id != change_set.document_id
+                    or attempt.base_revision_id != change_set.base_revision_id
+                ):
+                    raise ArtifactConflictError(
+                        "mutation attempt belongs to another candidate"
+                    )
+                if attempt.status is MutationAttemptStatus.APPLIED:
+                    raise ArtifactConflictError("document finish has already committed")
+                if attempt.status in {
+                    MutationAttemptStatus.RESERVED,
+                    MutationAttemptStatus.AMBIGUOUS,
+                }:
+                    if recovery_failure_code is None:
+                        # Once finish has a durable receipt, normal turn
+                        # cleanup may no longer decide that no commit occurred.
+                        # Leave the DRAFT and receipt for explicit/restart
+                        # reconciliation instead of downgrading the outcome.
+                        raise ArtifactConflictError(
+                            "document finish outcome requires reconciliation"
+                        )
+                    terminal_attempt = await self._mark_mutation_attempt_failed_on_conn(
+                        conn,
+                        attempt=attempt,
+                        failure_code=recovery_failure_code,
+                        change_set_id=change_set.change_set_id,
+                    )
+                else:
+                    terminal_attempt = attempt
+
+        cursor = await conn.execute(
+            """
+            UPDATE artifact_change_sets
+            SET status = ?, candidate_artifact_id = NULL,
+                candidate_artifact_sha256 = NULL, candidate_filename = NULL,
+                candidate_media_type = NULL, candidate_byte_size = NULL,
+                validation_json = NULL, state_revision = state_revision + 1,
+                updated_at = ?
+            WHERE change_set_id = ? AND state_revision = ? AND status = ?
+            """,
+            (
+                ChangeSetStatus.REJECTED.value,
+                now,
+                change_set_id,
+                expected_state_revision,
+                ChangeSetStatus.DRAFT.value,
+            ),
+        )
+        try:
+            if cursor.rowcount != 1:
+                raise ArtifactConflictError("draft reject compare-and-swap failed")
+        finally:
+            await cursor.close()
+        await self._append_audit(
+            conn,
+            document_id=change_set.document_id,
+            event_type="change_set.rejected",
+            actor=actor,
+            change_set_id=change_set_id,
+            payload={
+                "reason": reason,
+                "candidate_artifact_id": change_set.candidate_artifact_id,
+                "candidate_artifact_sha256": change_set.candidate_artifact_sha256,
+                "candidate_cleanup": True,
+            },
+            created_at=now,
+        )
+        return await self._get_change_set_on_conn(conn, change_set_id), terminal_attempt
+
+    async def reject_draft_change_set_and_cleanup(
+        self,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        actor: Actor,
+        reason: str | None = None,
+        require_no_active_mutation_attempt: bool = False,
+    ) -> ChangeSet:
+        """Reject a staged candidate and detach its transient artifact refs.
+
+        Artifact bytes are owned by ``ArtifactStore`` and cannot be deleted
+        inside this SQLite transaction.  Clearing the candidate references is
+        the durable cleanup boundary; the store's normal orphan/session GC can
+        safely remove the detached blob after this transaction commits.
+        """
+
+        async with self._transaction("reject_draft_change_set_and_cleanup") as conn:
+            rejected, _attempt = await self._reject_draft_change_set_and_cleanup_on_conn(
+                conn,
+                change_set_id=change_set_id,
+                expected_state_revision=expected_state_revision,
+                actor=actor,
+                reason=reason,
+                require_no_active_mutation_attempt=require_no_active_mutation_attempt,
+                recovery_failure_code=None,
+            )
+            return rejected
+
+    async def reject_candidate_draft_and_fail_attempt_for_recovery(
+        self,
+        *,
+        change_set_id: str,
+        expected_state_revision: int,
+        actor: Actor,
+        reason: str,
+        failure_code: str,
+    ) -> tuple[ChangeSet, MutationAttempt | None]:
+        """Atomically reject a restart-orphaned candidate and close its receipt.
+
+        This repository operation is intentionally separate from ordinary
+        turn cleanup.  Only startup recovery may convert an unresolved
+        RESERVED/AMBIGUOUS receipt to FAILED, and it must do so in the same
+        transaction that proves the candidate DRAFT was rejected.
+        """
+
+        if actor.kind is not ActorKind.SYSTEM or actor.actor_id != "restart-recovery":
+            raise ArtifactValidationError(
+                "candidate recovery rejection requires the restart-recovery actor"
+            )
+        async with self._transaction(
+            "reject_candidate_draft_and_fail_attempt_for_recovery"
+        ) as conn:
+            return await self._reject_draft_change_set_and_cleanup_on_conn(
+                conn,
+                change_set_id=change_set_id,
+                expected_state_revision=expected_state_revision,
+                actor=actor,
+                reason=reason,
+                require_no_active_mutation_attempt=True,
+                recovery_failure_code=failure_code,
+            )
 
     async def apply_change_set(
         self,
@@ -2961,6 +3678,122 @@ class ArtifactSessionRepository:
                 created_at=now,
             )
             return result
+
+    async def commit_draft_change_set_atomically(
+        self,
+        *,
+        change_set_id: str,
+        expected_change_set_state_revision: int,
+        expected_head_revision_id: str,
+        expected_document_state_revision: int,
+        actor: Actor,
+        expected_candidate_sha256: str | None = None,
+        source: RevisionSource = RevisionSource.AGENT,
+        revision_event_type: str = "revision.change_set_applied",
+        lease_id: str | None = None,
+        fencing_token: int | None = None,
+        require_lease: bool = False,
+        mutation_attempt_id: str | None = None,
+        mutation_attempt_tool_use_id: str | None = None,
+    ) -> tuple[CommitResult, ChangeSet]:
+        """Publish a staged draft and its revision in one transaction.
+
+        Unlike :meth:`apply_change_set`, this method deliberately accepts only
+        ``DRAFT`` rows.  The caller must explicitly cross this boundary after
+        its candidate preview/verification loop has completed.  The candidate
+        digest is optionally rechecked to make a stale verification receipt
+        fail closed before the document head can change.
+        """
+
+        async with self._transaction("commit_draft_change_set_atomically") as conn:
+            change_set = await self._get_change_set_on_conn(conn, change_set_id)
+            if change_set.state_revision != expected_change_set_state_revision:
+                raise ArtifactConflictError("change set state_revision changed")
+            if change_set.status is not ChangeSetStatus.DRAFT:
+                raise ArtifactConflictError("change set is not a staged draft")
+            if change_set.base_revision_id != expected_head_revision_id:
+                raise ArtifactConflictError("change set base is no longer document head")
+            candidate = change_set.candidate_artifact
+            if candidate is None:
+                raise ArtifactValidationError("draft change set has no candidate artifact")
+            base = await self._get_revision_on_conn(conn, change_set.base_revision_id)
+            if (
+                base.artifact_sha256 == candidate.sha256
+                and base.byte_size == candidate.byte_size
+                and base.filename == candidate.filename
+                and base.media_type == candidate.media_type
+            ):
+                raise ArtifactValidationError("candidate does not change the document")
+            if (
+                expected_candidate_sha256 is not None
+                and candidate.sha256 != expected_candidate_sha256.lower()
+            ):
+                raise ArtifactConflictError("candidate digest no longer matches verification")
+
+            result = await self._commit_revision_on_conn(
+                conn,
+                document_id=change_set.document_id,
+                expected_head_revision_id=expected_head_revision_id,
+                expected_state_revision=expected_document_state_revision,
+                artifact=candidate,
+                actor=actor,
+                source=source,
+                change_set_id=change_set_id,
+                lease_id=lease_id,
+                fencing_token=fencing_token,
+                require_lease=require_lease,
+                event_type=revision_event_type,
+            )
+            now = self._clock()
+            cursor = await conn.execute(
+                """
+                UPDATE artifact_change_sets
+                SET status = ?, applied_revision_id = ?,
+                    state_revision = state_revision + 1, updated_at = ?
+                WHERE change_set_id = ? AND state_revision = ? AND status = ?
+                """,
+                (
+                    ChangeSetStatus.APPLIED.value,
+                    result.revision.revision_id,
+                    now,
+                    change_set_id,
+                    expected_change_set_state_revision,
+                    ChangeSetStatus.DRAFT.value,
+                ),
+            )
+            try:
+                if cursor.rowcount != 1:
+                    raise ArtifactConflictError("draft commit compare-and-swap failed")
+            finally:
+                await cursor.close()
+            if mutation_attempt_id is not None or mutation_attempt_tool_use_id is not None:
+                if not mutation_attempt_id or not mutation_attempt_tool_use_id:
+                    raise ArtifactValidationError(
+                        "mutation attempt identity must be provided together"
+                    )
+                await self._mark_mutation_attempt_applied_on_conn(
+                    conn,
+                    document_id=change_set.document_id,
+                    turn_id=change_set.turn_id or "",
+                    tool_use_id=mutation_attempt_tool_use_id,
+                    mutation_attempt_id=mutation_attempt_id,
+                    change_set_id=change_set.change_set_id,
+                    revision_id=result.revision.revision_id,
+                )
+            await self._append_audit(
+                conn,
+                document_id=change_set.document_id,
+                event_type="change_set.applied",
+                actor=actor,
+                revision_id=result.revision.revision_id,
+                change_set_id=change_set_id,
+                payload={
+                    "base_revision_id": change_set.base_revision_id,
+                    "candidate_artifact_sha256": candidate.sha256,
+                },
+                created_at=now,
+            )
+            return result, await self._get_change_set_on_conn(conn, change_set_id)
 
     async def commit_change_set_atomically(
         self,
@@ -3188,6 +4021,8 @@ class ArtifactSessionRepository:
         base_revision_id: str,
         proposal_sha256: str | None,
         mutation_attempt_id: str | None = None,
+        candidate_change_set_id: str | None = None,
+        expected_candidate_state_revision: int | None = None,
     ) -> tuple[MutationAttempt, bool]:
         """Reserve the sole artifact-writing slot for a turn.
 
@@ -3196,6 +4031,12 @@ class ArtifactSessionRepository:
         digest fails closed before it can create a second persistent mutation.
         """
 
+        if (candidate_change_set_id is None) != (
+            expected_candidate_state_revision is None
+        ):
+            raise ArtifactValidationError(
+                "candidate change set id and state revision must be provided together"
+            )
         mutation_attempt_id = mutation_attempt_id or self._id_factory("mutation")
         now = self._clock()
         async with self._transaction("reserve_mutation_attempt") as conn:
@@ -3221,6 +4062,54 @@ class ArtifactSessionRepository:
                 raise ArtifactConflictError(
                     "this turn is reserved by a different mutation tool call or document"
                 )
+
+            # Candidate-loop finish calls already own a durable DRAFT.  Bind
+            # reservation to that exact row in the same write transaction so
+            # a concurrent discard cannot win between a preflight read and
+            # this INSERT.  Exact receipt replays above remain valid after the
+            # ChangeSet becomes APPLIED/REJECTED.
+            if candidate_change_set_id is not None:
+                if expected_candidate_state_revision is None:
+                    raise ArtifactValidationError(
+                        "candidate state revision is required with change set id"
+                    )
+                candidate_change_set = await self._get_change_set_on_conn(
+                    conn,
+                    candidate_change_set_id,
+                )
+                if candidate_change_set.document_id != document_id:
+                    raise ArtifactValidationError(
+                        "candidate change set belongs to another document"
+                    )
+                if candidate_change_set.turn_id != turn_id:
+                    raise ArtifactValidationError(
+                        "candidate change set belongs to another turn"
+                    )
+                if candidate_change_set.base_revision_id != base_revision_id:
+                    raise ArtifactValidationError(
+                        "candidate change set uses another base revision"
+                    )
+                if candidate_change_set.status is not ChangeSetStatus.DRAFT:
+                    raise ArtifactConflictError("candidate change set is no longer a draft")
+                if candidate_change_set.state_revision != expected_candidate_state_revision:
+                    raise ArtifactConflictError("candidate change set state_revision changed")
+                if not await self._is_candidate_loop_change_set_on_conn(
+                    conn,
+                    candidate_change_set.change_set_id,
+                ):
+                    raise ArtifactConflictError(
+                        "change set is not owned by the candidate loop"
+                    )
+                if proposal_sha256 is None:
+                    raise ArtifactValidationError(
+                        "candidate reservation requires proposal_sha256"
+                    )
+                if candidate_change_set.candidate_artifact is None:
+                    raise ArtifactValidationError(
+                        "candidate change set has no complete artifact"
+                    )
+                if candidate_change_set.candidate_artifact_sha256 != proposal_sha256:
+                    raise ArtifactConflictError("candidate digest changed before reservation")
 
             document = await self._get_document_on_conn(conn, document_id)
             base = await self._get_revision_on_conn(conn, base_revision_id)
@@ -3293,6 +4182,8 @@ class ArtifactSessionRepository:
         base_revision_id: str,
         proposal_sha256: str | None,
         mutation_attempt_id: str | None = None,
+        candidate_change_set_id: str | None = None,
+        expected_candidate_state_revision: int | None = None,
     ) -> MutationAttempt:
         attempt, _created = await self.reserve_mutation_attempt_with_status(
             document_id=document_id,
@@ -3301,6 +4192,8 @@ class ArtifactSessionRepository:
             base_revision_id=base_revision_id,
             proposal_sha256=proposal_sha256,
             mutation_attempt_id=mutation_attempt_id,
+            candidate_change_set_id=candidate_change_set_id,
+            expected_candidate_state_revision=expected_candidate_state_revision,
         )
         return attempt
 
@@ -3533,6 +4426,135 @@ class ArtifactSessionRepository:
                 raise ArtifactConflictError(
                     "applied result does not match the journaled mutation candidate"
                 )
+
+    async def _mark_mutation_attempt_applied_on_conn(
+        self,
+        conn: Any,
+        *,
+        document_id: str,
+        turn_id: str,
+        tool_use_id: str,
+        mutation_attempt_id: str,
+        change_set_id: str,
+        revision_id: str,
+    ) -> MutationAttempt:
+        """Mark the final candidate commit receipt inside its commit transaction."""
+
+        attempt = await self._get_mutation_attempt_on_conn(
+            conn,
+            document_id=document_id,
+            turn_id=turn_id,
+        )
+        if attempt.mutation_attempt_id != mutation_attempt_id:
+            raise ArtifactConflictError("mutation attempt identity changed")
+        if attempt.tool_use_id != tool_use_id:
+            raise ArtifactConflictError("mutation attempt belongs to a different tool_use_id")
+        if attempt.status is MutationAttemptStatus.APPLIED:
+            if attempt.change_set_id == change_set_id and attempt.revision_id == revision_id:
+                return attempt
+            raise ArtifactConflictError("mutation attempt is already applied differently")
+        if attempt.status not in {
+            MutationAttemptStatus.RESERVED,
+            MutationAttemptStatus.AMBIGUOUS,
+        }:
+            raise ArtifactConflictError("mutation attempt is already terminal")
+        await self._mutation_result_refs_on_conn(
+            conn,
+            attempt=attempt,
+            change_set_id=change_set_id,
+            revision_id=revision_id,
+            require_applied=True,
+        )
+        now = self._clock()
+        cursor = await conn.execute(
+            """
+            UPDATE artifact_mutation_attempts
+            SET status = ?, change_set_id = ?, revision_id = ?, failure_code = NULL,
+                state_revision = state_revision + 1, updated_at = ?
+            WHERE mutation_attempt_id = ? AND document_id = ? AND turn_id = ?
+              AND tool_use_id = ? AND state_revision = ?
+              AND status IN ('reserved', 'ambiguous')
+            """,
+            (
+                MutationAttemptStatus.APPLIED.value,
+                change_set_id,
+                revision_id,
+                now,
+                mutation_attempt_id,
+                document_id,
+                turn_id,
+                tool_use_id,
+                attempt.state_revision,
+            ),
+        )
+        try:
+            if cursor.rowcount != 1:
+                raise ArtifactConflictError("mutation attempt compare-and-swap failed")
+        finally:
+            await cursor.close()
+        return await self._get_mutation_attempt_on_conn(
+            conn,
+            document_id=document_id,
+            turn_id=turn_id,
+        )
+
+    async def _mark_mutation_attempt_failed_on_conn(
+        self,
+        conn: Any,
+        *,
+        attempt: MutationAttempt,
+        failure_code: str,
+        change_set_id: str,
+    ) -> MutationAttempt:
+        """Close one unresolved receipt inside a proven DRAFT reject transaction."""
+
+        if attempt.status is MutationAttemptStatus.FAILED:
+            return attempt
+        if attempt.status not in {
+            MutationAttemptStatus.RESERVED,
+            MutationAttemptStatus.AMBIGUOUS,
+        }:
+            raise ArtifactConflictError("mutation attempt is already terminal")
+        await self._mutation_result_refs_on_conn(
+            conn,
+            attempt=attempt,
+            change_set_id=change_set_id,
+            revision_id=None,
+            require_applied=False,
+        )
+        now = self._clock()
+        cursor = await conn.execute(
+            """
+            UPDATE artifact_mutation_attempts
+            SET status = ?, change_set_id = ?, revision_id = NULL,
+                failure_code = ?, state_revision = state_revision + 1,
+                updated_at = ?
+            WHERE mutation_attempt_id = ? AND document_id = ? AND turn_id = ?
+              AND tool_use_id = ? AND state_revision = ?
+              AND status IN ('reserved', 'ambiguous')
+            """,
+            (
+                MutationAttemptStatus.FAILED.value,
+                change_set_id,
+                failure_code,
+                now,
+                attempt.mutation_attempt_id,
+                attempt.document_id,
+                attempt.turn_id,
+                attempt.tool_use_id,
+                attempt.state_revision,
+            ),
+        )
+        try:
+            if cursor.rowcount != 1:
+                raise ArtifactConflictError("mutation attempt compare-and-swap failed")
+        finally:
+            await cursor.close()
+        return await self._get_mutation_attempt_on_conn(
+            conn,
+            document_id=attempt.document_id,
+            turn_id=attempt.turn_id,
+        )
 
     async def _mark_mutation_attempt(
         self,
@@ -4381,5 +5403,58 @@ class ArtifactSessionRepository:
                 LIMIT 1
                 """,
                 (document_id,),
+            )
+            return None if row is None else _audit_event_from_row(row)
+
+    async def audit_event_for_mutation(
+        self,
+        document_id: str,
+        *,
+        revision_id: str | None = None,
+        change_set_id: str | None = None,
+    ) -> AuditEvent | None:
+        """Return the newest audit row for one exact durable mutation.
+
+        Runtime state notifications are delivered out of band, after the
+        revision transaction commits.  Recovery must therefore derive the
+        event sequence from the mutation that was actually committed rather
+        than from whichever unrelated audit row happens to be newest.  At
+        least one immutable mutation identifier is required; when both are
+        supplied the match is conjunctive.
+        """
+
+        if revision_id is None and change_set_id is None:
+            raise ArtifactValidationError(
+                "revision_id or change_set_id is required for an exact audit lookup"
+            )
+        clauses = ["document_id = ?"]
+        params: list[Any] = [document_id]
+        if revision_id is not None:
+            clauses.append("revision_id = ?")
+            params.append(revision_id)
+        if change_set_id is not None:
+            clauses.append("change_set_id = ?")
+            params.append(change_set_id)
+        # When both immutable identifiers are present they identify the
+        # revision-producing audit row even for a caller-supplied custom
+        # revision event type.  A revision-only lookup needs the event-type
+        # fence because metadata events (rename/publish) may repeat the head
+        # revision id.
+        if revision_id is None or change_set_id is None:
+            event_placeholders = ", ".join("?" for _ in _DURABLE_MUTATION_AUDIT_EVENT_TYPES)
+            clauses.append(
+                f"(event_type IN ({event_placeholders}) OR event_type LIKE 'revision.%')"
+            )
+            params.extend(_DURABLE_MUTATION_AUDIT_EVENT_TYPES)
+        async with self._read_transaction("audit_event_for_mutation") as conn:
+            await self._get_document_on_conn(conn, document_id)
+            row = await _fetchone(
+                conn,
+                """
+                SELECT * FROM artifact_audit_events
+                WHERE """
+                + " AND ".join(clauses)
+                + " ORDER BY sequence DESC LIMIT 1",
+                tuple(params),
             )
             return None if row is None else _audit_event_from_row(row)

@@ -147,7 +147,16 @@ const privacyUserDataDir = `${userDataDir}-privacy-update-smoke`
 try {
   app = await launchCandidate(executablePath, userDataDir, endpoint, false, baseVersion)
   const page = await app.firstWindow({ timeout: 60_000 })
-  await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
+  await waitFor(
+    () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'candidate Desktop renderer',
+  )
+  await waitFor(
+    async () => (await page.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'candidate Desktop Gateway readiness',
+  )
 
   const nativeEnabled = await page.evaluate(
     () => window.opensquillaDesktop?.isAutoUpdateEnabled?.(),
@@ -188,7 +197,16 @@ try {
     baseVersion,
   )
   const privacyPage = await privacyApp.firstWindow({ timeout: 60_000 })
-  await waitFor(() => privacyPage.url().includes('/control/chat'), 'privacy-disabled Control UI')
+  await waitFor(
+    () => privacyPage.url().startsWith('opensquilla-app://desktop/chat'),
+    'privacy-disabled Desktop renderer',
+  )
+  await waitFor(
+    async () => (await privacyPage.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'privacy-disabled Desktop Gateway readiness',
+  )
   // Remove the TTL shield before probing privacy. If the unified privacy gate
   // regresses, this visibility-triggered call would now reach the mock release
   // server and increment requestCount, so the zero-request assertion is real.

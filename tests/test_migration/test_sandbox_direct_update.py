@@ -160,44 +160,357 @@ def _mock_windows_acl(
     fail_when: Any | None = None,
 ) -> None:
     monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_current_windows_user_sid",
+        lambda **_kwargs: "S-1-5-21-1234",
+    )
 
     def run(command: list[str], **kwargs: object) -> SimpleNamespace:
         if command[0] == "whoami":
             return SimpleNamespace(
                 returncode=0,
-                stdout='"DESKTOP\\owner","S-1-5-21-1234"\n',
-                stderr="",
+                stdout=b'"DESKTOP\\owner","S-1-5-21-1234"\n',
+                stderr=b"",
             )
         environment = kwargs["env"]
         assert isinstance(environment, dict)
-        path = Path(environment["OPENSQUILLA_UPGRADE_ACL_TARGET"])
         assert environment["OPENSQUILLA_UPGRADE_ACL_USER_SID"] == "S-1-5-21-1234"
-        assert environment["OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY"] in {"0", "1"}
-        assert kwargs["stdin"] == subprocess.DEVNULL
-        assert kwargs["timeout"] == upgrade_migration._WINDOWS_ACL_TIMEOUT_SECONDS
+        payload = kwargs["input"]
+        assert isinstance(payload, bytes)
+        items = json.loads(payload.decode("ascii"))
+        assert isinstance(items, list) and items
+        paths = [Path(item["path"]) for item in items]
+        for path in paths:
+            events.append(("acl", path, tuple(command)))
+        failed = any(
+            fail_when is not None and fail_when(path, events)
+            for path in paths
+        )
+        result = {
+            "count": len(items),
+            "ids": [str(index) for index in range(len(items))],
+            "pathUtf8Base64": [
+                base64.b64encode(item["path"].encode("utf-8")).decode("ascii")
+                for item in items
+            ],
+            "pathHashes": [
+                upgrade_migration._acl_path_hash(Path(item["path"]))
+                for item in items
+            ],
+        }
+        assert kwargs["timeout"] > 0
         assert kwargs["creationflags"] == int(
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
-        event = ("acl", path, tuple(command))
-        events.append(event)
-        failed = fail_when is not None and fail_when(path, events)
+        assert "text" not in kwargs
+        assert Path(command[0]).stem.casefold() in {"powershell", "pwsh"}
+        assert tuple(command[1:5]) == (
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-EncodedCommand",
+        )
         return SimpleNamespace(
             returncode=5 if failed else 0,
-            stdout="",
-            stderr="access denied" if failed else "",
+            stdout=json.dumps(result).encode("ascii"),
+            stderr=b"access denied" if failed else b"",
         )
 
     monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
 
 
-def test_windows_acl_script_does_not_require_powershell_module_autoload() -> None:
+def test_windows_acl_script_keeps_host_specific_acl_apis_bounded() -> None:
     script = upgrade_migration._WINDOWS_PRIVATE_ACL_SCRIPT
 
-    assert "Get-Acl" not in script
+    assert "Get-Acl -LiteralPath $target" in script
+    assert "Set-Acl -LiteralPath $target -AclObject $acl" in script
     assert "Select-Object" not in script
     assert "Where-Object" not in script
     assert "[System.IO.Directory]::GetAccessControl($target)" in script
     assert "[System.IO.File]::GetAccessControl($target)" in script
+    assert "pathHashes" in script
+    assert "pathUtf8Base64 = $verifiedPathUtf8Base64.ToArray()" in script
+    assert "[Console]::OutputEncoding = $utf8WithoutBom" in script
+    assert "paths = $verifiedPaths.ToArray()" not in script
+    assert "-ne $fullControl" in script
+
+
+def test_windows_acl_batch_round_trips_non_ascii_path_over_ascii_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "中文快照"
+    target.mkdir()
+
+    def run(_command: list[str], **kwargs: object) -> SimpleNamespace:
+        payload = kwargs["input"]
+        assert isinstance(payload, bytes)
+        assert payload.isascii()
+        items = json.loads(payload.decode("ascii"))
+        result = {
+            "count": 1,
+            "ids": ["0"],
+            "pathUtf8Base64": [
+                base64.b64encode(items[0]["path"].encode("utf-8")).decode("ascii")
+            ],
+            "pathHashes": [upgrade_migration._acl_path_hash(target)],
+        }
+        stdout = json.dumps(result, separators=(",", ":")).encode("ascii")
+        assert stdout.isascii()
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    upgrade_migration._protect_windows_acl_batch(
+        ((target, True),),
+        windows_user_sid="S-1-5-21-1234",
+    )
+
+
+def test_windows_acl_batch_falls_back_to_windows_powershell_on_privilege_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "snapshot"
+    target.mkdir()
+    calls: list[str] = []
+    timeouts: list[float] = []
+
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_windows_acl_shells",
+        lambda: ("pwsh", "powershell"),
+    )
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(command[0])
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        timeouts.append(timeout)
+        if command[0] == "pwsh":
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"SeSecurityPrivilege",
+            )
+        result = {
+            "count": 1,
+            "ids": ["0"],
+            "pathUtf8Base64": [base64.b64encode(str(target).encode()).decode("ascii")],
+            "pathHashes": [upgrade_migration._acl_path_hash(target)],
+        }
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(result).encode("ascii"),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    upgrade_migration._protect_windows_acl_batch(
+        ((target, True),),
+        windows_user_sid="S-1-5-21-1234",
+        deadline=upgrade_migration.time.monotonic() + 30,
+    )
+
+    assert calls == ["pwsh", "powershell"]
+    assert 0 < timeouts[1] <= timeouts[0]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["malformed_base64", "invalid_utf8", "count", "path", "hash"],
+)
+def test_windows_acl_batch_rejects_malformed_or_mismatched_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+) -> None:
+    target = tmp_path / "中文快照"
+    target.mkdir()
+    encoded_path = base64.b64encode(str(target).encode("utf-8")).decode("ascii")
+    result: dict[str, object] = {
+        "count": 1,
+        "ids": ["0"],
+        "pathUtf8Base64": [encoded_path],
+        "pathHashes": [upgrade_migration._acl_path_hash(target)],
+    }
+    if case == "malformed_base64":
+        result["pathUtf8Base64"] = ["not base64!"]
+    elif case == "invalid_utf8":
+        result["pathUtf8Base64"] = [
+            base64.b64encode(b"\xff").decode("ascii")
+        ]
+    elif case == "count":
+        result["count"] = 2
+    elif case == "path":
+        result["pathUtf8Base64"] = [
+            base64.b64encode(b"C:\\wrong").decode("ascii")
+        ]
+    else:
+        result["pathHashes"] = ["0" * 64]
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(result).encode("ascii"),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    with pytest.raises(OSError, match="Windows ACL helper"):
+        upgrade_migration._protect_windows_acl_batch(
+            ((target, True),),
+            windows_user_sid="S-1-5-21-1234",
+        )
+
+
+def test_whoami_fallback_parses_sid_from_non_utf8_bytes_and_caps_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_native_sid() -> str:
+        raise OSError("synthetic native SID failure")
+
+    observed: dict[str, object] = {}
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        observed.update(kwargs)
+        assert command == ["whoami", "/user", "/fo", "csv", "/nh"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                b'"'
+                + "中文用户".encode("cp936")
+                + b'","S-1-5-21-1234-5678-9012-1001"\r\n'
+            ),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(upgrade_migration, "_native_windows_user_sid", fail_native_sid)
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    sid = upgrade_migration._current_windows_user_sid(
+        deadline=upgrade_migration.time.monotonic() + 30
+    )
+
+    assert sid == "S-1-5-21-1234-5678-9012-1001"
+    timeout = observed["timeout"]
+    assert isinstance(timeout, (int, float))
+    assert 0 < timeout <= upgrade_migration._WINDOWS_IDENTITY_FALLBACK_TIMEOUT_SECONDS
+    assert observed["stdin"] == subprocess.DEVNULL
+    assert "text" not in observed
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b'"DESKTOP\\owner","missing"\r\n',
+        (
+            b'"DESKTOP\\owner","S-1-5-21-1234-5678-9012-1001" '
+            b'"S-1-5-21-1234-5678-9012-1002"\r\n'
+        ),
+    ],
+)
+def test_whoami_fallback_rejects_missing_or_multiple_sids(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+) -> None:
+    def fail_native_sid() -> str:
+        raise OSError("synthetic native SID failure")
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(upgrade_migration, "_native_windows_user_sid", fail_native_sid)
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    with pytest.raises(OSError, match="cannot resolve"):
+        upgrade_migration._current_windows_user_sid()
+
+
+def test_windows_acl_batch_rejects_incomplete_helper_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_current_windows_user_sid",
+        lambda **_kwargs: "S-1-5-21-1234",
+    )
+    target = tmp_path / "snapshot"
+    target.mkdir()
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "count": 1,
+                    "ids": ["0"],
+                    "pathUtf8Base64": [],
+                    "pathHashes": [],
+                }
+            ).encode("ascii"),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    with pytest.raises(OSError, match="requested paths exactly"):
+        upgrade_migration._protect_windows_acl_batch(
+            ((target, True),),
+            windows_user_sid="S-1-5-21-1234",
+        )
+
+
+def test_windows_acl_batch_timeout_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    target = tmp_path / "snapshot"
+    target.mkdir()
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        raise subprocess.TimeoutExpired("powershell", 0.01)
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    with pytest.raises(TimeoutError, match="ACL migration stage timed out"):
+        upgrade_migration._protect_windows_acl_batch(
+            ((target, True),),
+            windows_user_sid="S-1-5-21-1234",
+            deadline=upgrade_migration.time.monotonic() + 1,
+        )
+
+
+def test_private_tree_rejects_reparse_points_without_following_them(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    link = root / "redirect"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    with pytest.raises(OSError, match="unsafe type"):
+        upgrade_migration._private_tree_entries(root)
+
+
+def test_private_tree_rejects_file_root(tmp_path: Path) -> None:
+    root = tmp_path / "snapshot"
+    root.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(OSError, match="snapshot root is not a directory"):
+        upgrade_migration._private_tree_entries(root)
 
 
 def test_windows_acl_process_timeout_is_actionable(
@@ -211,7 +524,7 @@ def test_windows_acl_process_timeout_is_actionable(
     def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
         raise subprocess.TimeoutExpired(
             command,
-            upgrade_migration._WINDOWS_ACL_TIMEOUT_SECONDS,
+            upgrade_migration.WINDOWS_ACL_STAGE_TIMEOUT_SECONDS,
         )
 
     monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
@@ -245,9 +558,28 @@ def test_frozen_windows_acl_process_restores_packaged_dll_directory(
         lambda path: events.append(("dll", path)),
     )
 
-    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+    def run(_command: list[str], **kwargs: object) -> SimpleNamespace:
         events.append(("run", None))
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        payload = kwargs.get("input")
+        if isinstance(payload, bytes):
+            items = json.loads(payload.decode("ascii"))
+            stdout = json.dumps(
+                {
+                    "count": len(items),
+                    "ids": [str(index) for index in range(len(items))],
+                    "pathUtf8Base64": [
+                        base64.b64encode(item["path"].encode("utf-8")).decode("ascii")
+                        for item in items
+                    ],
+                    "pathHashes": [
+                        upgrade_migration._acl_path_hash(Path(item["path"]))
+                        for item in items
+                    ],
+                }
+            ).encode("ascii")
+        else:
+            stdout = b'"DESKTOP\\owner","S-1-5-21-1234"\n'
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
 
     monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
 
@@ -357,13 +689,130 @@ def test_windows_snapshot_acl_is_applied_in_copy_and_promotion_order(
     )
     assert tmp_path / upgrade_migration.SNAPSHOT_NAME / "manifest.json" in protected_paths
     for _kind, _path, command in (event for event in events if event[0] == "acl"):
-        assert command[:5] == (
-            "powershell",
+        assert Path(command[0]).stem.casefold() in {"powershell", "pwsh"}
+        assert tuple(command[1:5]) == (
             "-NoProfile",
             "-NonInteractive",
             "-NoLogo",
             "-EncodedCommand",
         )
+
+
+@pytest.mark.parametrize("slow_phase", ["copy", "digest"])
+def test_windows_snapshot_materialization_does_not_consume_acl_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    slow_phase: str,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_current_windows_user_sid",
+        lambda **_kwargs: "S-1-5-21-1234",
+    )
+    clock = [100.0]
+    monkeypatch.setattr(upgrade_migration.time, "monotonic", lambda: clock[0])
+    remaining_before_acl: list[float] = []
+
+    def protect_acl(
+        _entries: tuple[tuple[Path, bool], ...],
+        *,
+        windows_user_sid: str,
+        deadline: float | None = None,
+    ) -> None:
+        assert windows_user_sid == "S-1-5-21-1234"
+        remaining_before_acl.append(
+            upgrade_migration._remaining_windows_acl_time(deadline)
+        )
+        if len(remaining_before_acl) == 1:
+            clock[0] += 5.0
+
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_protect_windows_acl_batch",
+        protect_acl,
+    )
+
+    real_copyfileobj = upgrade_migration.shutil.copyfileobj
+    real_digest = upgrade_migration._digest
+
+    def slow_copyfileobj(source: Any, destination: Any, length: int = 0) -> None:
+        clock[0] += upgrade_migration.WINDOWS_ACL_STAGE_TIMEOUT_SECONDS + 1
+        real_copyfileobj(source, destination, length)
+
+    def slow_digest(path: Path) -> str:
+        clock[0] += upgrade_migration.WINDOWS_ACL_STAGE_TIMEOUT_SECONDS + 1
+        return real_digest(path)
+
+    if slow_phase == "copy":
+        monkeypatch.setattr(
+            upgrade_migration.shutil,
+            "copyfileobj",
+            slow_copyfileobj,
+        )
+    else:
+        monkeypatch.setattr(upgrade_migration, "_digest", slow_digest)
+
+    report = SandboxUpgradeCoordinator(tmp_path).run()
+
+    assert report.ok is True
+    assert report.status == "committed"
+    assert clock[0] == 136.0
+    assert remaining_before_acl == pytest.approx([30.0, 25.0, 25.0])
+
+
+def test_windows_acl_budget_exhaustion_requires_manual_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.toml").write_text(
+        '[sandbox]\nrun_mode = "trusted"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_current_windows_user_sid",
+        lambda **_kwargs: "S-1-5-21-1234",
+    )
+    clock = [100.0]
+    monkeypatch.setattr(upgrade_migration.time, "monotonic", lambda: clock[0])
+    copied = False
+
+    def exhaust_acl_budget(
+        _entries: tuple[tuple[Path, bool], ...],
+        *,
+        windows_user_sid: str,
+        deadline: float | None = None,
+    ) -> None:
+        assert windows_user_sid == "S-1-5-21-1234"
+        clock[0] += upgrade_migration.WINDOWS_ACL_STAGE_TIMEOUT_SECONDS + 1
+        upgrade_migration._remaining_windows_acl_time(deadline)
+
+    def copyfileobj(_source: Any, _destination: Any, _length: int = 0) -> None:
+        nonlocal copied
+        copied = True
+
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_protect_windows_acl_batch",
+        exhaust_acl_budget,
+    )
+    monkeypatch.setattr(upgrade_migration.shutil, "copyfileobj", copyfileobj)
+
+    report = SandboxUpgradeCoordinator(tmp_path).run()
+
+    assert report.ok is False
+    assert report.status == "manual_recovery_required"
+    assert report.snapshot_path is None
+    assert copied is False
+    assert "Windows ACL hardening timed out" in str(report.error)
+    journal = json.loads(
+        (tmp_path / upgrade_migration.JOURNAL_NAME).read_text(encoding="utf-8")
+    )
+    assert journal["status"] == "prepared"
 
 
 def test_committed_legacy_snapshot_is_hardened_before_success(
@@ -429,9 +878,33 @@ def test_committed_legacy_snapshot_acl_failure_requires_manual_recovery(
     assert "cannot protect upgrade snapshot path" in journal["error"]
 
 
+def test_committed_journal_without_snapshot_fails_closed(tmp_path: Path) -> None:
+    (tmp_path / upgrade_migration.JOURNAL_NAME).write_text(
+        json.dumps(
+            {
+                "migrationVersion": upgrade_migration.MIGRATION_VERSION,
+                "status": "committed",
+                "stores": ["config.toml"],
+                "snapshot": str(tmp_path / upgrade_migration.SNAPSHOT_NAME),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = SandboxUpgradeCoordinator(tmp_path).run()
+
+    assert report.ok is False
+    assert report.status == "manual_recovery_required"
+    assert "committed sandbox upgrade snapshot is missing" in str(report.error)
+    journal = json.loads(
+        (tmp_path / upgrade_migration.JOURNAL_NAME).read_text(encoding="utf-8")
+    )
+    assert journal["status"] == "prepared"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows DACL smoke")
 def test_windows_private_acl_replaces_explicit_everyone_grants(tmp_path: Path) -> None:
-    directory = tmp_path / "snapshot"
+    directory = tmp_path / "\u4e2d\u6587\u5feb\u7167"
     directory.mkdir()
     file_path = directory / "config.toml"
     file_path.write_text("sensitive", encoding="utf-8")
@@ -439,13 +912,11 @@ def test_windows_private_acl_replaces_explicit_everyone_grants(tmp_path: Path) -
         ["icacls", str(directory), "/grant:r", "*S-1-1-0:(OI)(CI)F", "/L"],
         check=True,
         capture_output=True,
-        text=True,
     )
     subprocess.run(
         ["icacls", str(file_path), "/grant:r", "*S-1-1-0:F", "/L"],
         check=True,
         capture_output=True,
-        text=True,
     )
     user_sid = upgrade_migration._current_windows_user_sid()
 
@@ -462,7 +933,14 @@ def test_windows_private_acl_replaces_explicit_everyone_grants(tmp_path: Path) -
 
     verifier = r"""
 $ErrorActionPreference = "Stop"
-$acl = Get-Acl -LiteralPath $env:OPENSQUILLA_TEST_ACL_TARGET
+$target = $env:OPENSQUILLA_TEST_ACL_TARGET
+$attributes = [System.IO.File]::GetAttributes($target)
+$isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+$acl = if ($isDirectory) {
+    [System.IO.Directory]::GetAccessControl($target)
+} else {
+    [System.IO.File]::GetAccessControl($target)
+}
 $sids = @($acl.Access | ForEach-Object {
     $_.IdentityReference.Translate(
         [System.Security.Principal.SecurityIdentifier]
@@ -558,12 +1036,14 @@ def test_windows_staging_is_rechecked_empty_before_copy(
         *,
         directory: bool,
         windows_user_sid: str | None,
+        deadline: float | None = None,
     ) -> None:
         nonlocal injected
         real_protect(
             path,
             directory=directory,
             windows_user_sid=windows_user_sid,
+            deadline=deadline,
         )
         if directory and path.name.endswith(".tmp") and not injected:
             (path / "unexpected").write_text("injected", encoding="utf-8")

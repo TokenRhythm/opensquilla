@@ -481,6 +481,39 @@ describe('task ownership event races', () => {
     scope.stop()
   })
 
+  it('preserves the accepted router identity when a successor is replayed', () => {
+    const { api, options, activeStreamTaskId, scope } = makeHarness()
+
+    api.handlers.onTaskQueued({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onRouterDecision({
+      task_id: 'task-B',
+      session_key: SESSION,
+      turn_id: 'turn-B',
+      stream_seq: 10,
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    })
+
+    expect(options.queueRouterDecision).not.toHaveBeenCalled()
+
+    api.handlers.onAny('session.event.done', {
+      task_id: 'task-A',
+      session_key: SESSION,
+      stream_seq: 11,
+      reason: 'completed',
+      text: 'complete A answer',
+    })
+
+    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(options.queueRouterDecision).toHaveBeenCalledOnce()
+    const [payload, identityStreamSeq] = vi.mocked(options.queueRouterDecision).mock.calls[0]!
+    expect(payload).not.toHaveProperty('stream_seq')
+    expect(identityStreamSeq).toBe(10)
+    scope.stop()
+  })
+
   it('accepts a queued-only Stop terminal despite an empty render owner', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     taskOwnership.noteTerminal('task-A')

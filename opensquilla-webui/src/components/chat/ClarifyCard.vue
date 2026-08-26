@@ -57,7 +57,12 @@
       </p>
     </header>
 
-    <div class="clarify-card__body">
+    <div
+      class="clarify-card__body"
+      role="region"
+      tabindex="0"
+      :aria-label="t('chat.clarify.inputNeeded')"
+    >
       <div v-for="field in displayedFields" :key="field.name" class="clarify-field">
         <div :id="fieldLabelId(field.name)" class="clarify-field__label">
           <span class="clarify-field__name">{{ field.header || field.name }}</span>

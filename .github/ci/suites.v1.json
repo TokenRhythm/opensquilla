@@ -1,5 +1,11 @@
 {
   "schema_version": 1,
+  "windows_test_assignments": ".github/scripts/windows_test_assignments.json",
+  "macos_recovery_test_inputs": [
+    "tests/test_recovery/**",
+    "tests/test_migration/test_opensquilla_home_migration.py",
+    "tests/test_desktop/test_electron_startup_contract.py"
+  ],
   "baseline_suites": [
     "readme-locale",
     "workflow-lint"
@@ -7,14 +13,17 @@
   "full_suites": [
     "desktop-recovery-e2e",
     "desktop-static",
-    "frontend",
+    "frontend-artifact",
+    "frontend-validation",
     "macos-recovery",
     "managed-toolchain",
     "python-full",
     "readme-locale",
     "release-packaging",
+    "skill-hub",
     "tui",
     "webui-chat-recovery",
+    "wheel-webui-roundtrip",
     "windows-high-risk",
     "workflow-lint"
   ],
@@ -29,7 +38,11 @@
     },
     {
       "os": "macos-latest",
-      "shard": "ownership-workbench"
+      "shard": "ownership"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "workbench"
     },
     {
       "os": "windows-latest",
@@ -124,9 +137,9 @@
       "execution_inputs": [
         ".github/workflows/**",
         ".github/scripts/check_ci_results.py",
-        ".github/scripts/classify-ci-changes.sh",
         ".github/scripts/plan_ci.py",
-        ".github/ci/suites.v1.json"
+        ".github/ci/suites.v1.json",
+        ".github/ci/trust-policy.v1.json"
       ]
     },
     "readme-locale": {
@@ -145,11 +158,24 @@
         "opensquilla-webui/src/i18n/index.ts"
       ]
     },
-    "frontend": {
+    "frontend-artifact": {
       "execution_inputs": [
         "opensquilla-webui/**",
         "src/opensquilla/gateway/static/**",
         "pyproject.toml"
+      ]
+    },
+    "frontend-validation": {
+      "execution_inputs": [
+        "opensquilla-webui/**"
+      ]
+    },
+    "wheel-webui-roundtrip": {
+      "execution_inputs": [
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "scripts/verify_webui_artifact.py",
+        "src/opensquilla/gateway/static/**"
       ]
     },
     "webui-chat-recovery": {
@@ -189,6 +215,7 @@
     },
     "python-targeted": {
       "execution_inputs": [
+        ".github/scripts/**",
         ".github/scripts/windows_test_assignments.json",
         ".github/scripts/windows_test_durations.json",
         "migrations/**",
@@ -205,14 +232,6 @@
         "**"
       ]
     },
-    "windows-compat": {
-      "execution_inputs": [
-        "install.ps1",
-        "start.ps1",
-        "src/opensquilla/**",
-        "tests/test_compat/**"
-      ]
-    },
     "windows-high-risk": {
       "execution_inputs": [
         "**"
@@ -224,6 +243,8 @@
         "src/opensquilla/persistence/**",
         "src/opensquilla/recovery/**",
         "src/opensquilla/session/**",
+        "tests/test_desktop/test_electron_startup_contract.py",
+        "tests/test_migration/test_opensquilla_home_migration.py",
         "tests/test_recovery/**"
       ]
     },
@@ -231,6 +252,9 @@
       "execution_inputs": [
         "README.release.md",
         "RELEASES.md",
+        ".github/scripts/prestage-release-to-oss.sh",
+        ".github/scripts/verify-release-*",
+        ".github/scripts/verify_desktop_slim_size.py",
         "desktop/electron/package*.json",
         "install.*",
         "pyproject.toml",
@@ -239,6 +263,47 @@
         "start.*",
         "tests/test_packaging/**",
         "tests/test_release_consistency.py",
+        "uv.lock"
+      ]
+    },
+    "skill-hub": {
+      "execution_inputs": [
+        "pyproject.toml",
+        "src/opensquilla/cli/gateway_client.py",
+        "src/opensquilla/cli/main.py",
+        "src/opensquilla/cli/skills_cmd.py",
+        "src/opensquilla/cli/skills_meta_cmd.py",
+        "src/opensquilla/gateway/app.py",
+        "src/opensquilla/gateway/boot.py",
+        "src/opensquilla/gateway/config.py",
+        "src/opensquilla/gateway/protocol.py",
+        "src/opensquilla/gateway/rpc/__init__.py",
+        "src/opensquilla/gateway/rpc/registry.py",
+        "src/opensquilla/gateway/rpc_skills.py",
+        "src/opensquilla/gateway/scopes.py",
+        "src/opensquilla/gateway/websocket.py",
+        "src/opensquilla/skills/**",
+        "src/opensquilla/tools/builtin/skill_tools.py",
+        "src/opensquilla/tools/policy_config.py",
+        "src/opensquilla/tools/registry.py",
+        "src/opensquilla/tools/types.py",
+        "tests/test_cli/test_cli_product_completeness.py",
+        "tests/test_cli/test_skills_*.py",
+        "tests/test_engine/turn_runner/test_provider_and_tools_stage_unit.py",
+        "tests/test_gateway/test_rpc_skills_*.py",
+        "tests/test_gateway/test_skill_management_service_injection.py",
+        "tests/test_scripts/test_bench_skill_integrity.py",
+        "tests/test_skills/test_hub_*.py",
+        "tests/test_skills/test_loader_*.py",
+        "tests/test_skills_bundled_baseline.py",
+        "tests/test_skills_default_prompt_contract.py",
+        "tests/test_skills_hash_consumers.py",
+        "tests/test_skills_hot_reload.py",
+        "tests/test_skills_hub_*.py",
+        "tests/test_skills_loader_namespaces.py",
+        "tests/test_skills_manifest.py",
+        "tests/test_skills_tree.py",
+        "tests/test_tools/test_skill_view_resources.py",
         "uv.lock"
       ]
     },

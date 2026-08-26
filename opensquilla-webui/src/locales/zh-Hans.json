@@ -184,6 +184,7 @@
       "readyWithWarnings": "预览已运行，但存在警告。",
       "warningsShort": "存在警告",
       "suspended": "预览已暂停",
+      "agentEditInProgress": "编辑正在后台继续。",
       "nativePreview": "互动预览",
       "allowRemoteResources": "允许加载在线图片、样式和媒体",
       "blockRemoteResources": "禁止加载在线图片、样式和媒体",
@@ -641,6 +642,7 @@
           "disabled": "未启用",
           "installed": "已安装",
           "installedVersion": "已安装 · {version}",
+          "updatePaused": "更新已暂停",
           "unsupported": "当前系统不可用",
           "corrupt": "需要修复",
           "queued": "等待下载",
@@ -663,6 +665,7 @@
           "enable": "启用",
           "download": "下载",
           "cancel": "取消",
+          "discardDownload": "删除下载内容",
           "resume": "继续下载",
           "retry": "重试",
           "repair": "修复",
@@ -1158,19 +1161,7 @@
       "modelMetadataProvenance": "服务商实时列表 · 官网参数优先，缺失时使用目录值"
     },
     "preset": {
-      "summary": "路由模板：{label}",
-      "desc": "一次性应用到模型路由；生效分层在模型路由中编辑。",
-      "customizedSummary": "模型路由当前使用：{label}。",
-      "customizedDesc": "生效分层在模型路由中查看和编辑。",
-      "synthesizedLabel": "已生成路由模板",
-      "synthesizedBadge": "已生成模板",
-      "customize": "查看模板详情 →",
-      "hide": "收起模板详情",
-      "apply": "应用到模型路由",
-      "viewInRouter": "打开模型路由 →",
-      "modeRecommended": "路由模板",
-      "modeCustom": "自定义分层",
-      "modeDisabled": "关"
+      "modeCustom": "自定义分层"
     },
     "modelStrategy": {
       "title": "模型路由",
@@ -1820,8 +1811,6 @@
       "routerSaved": "路由已保存。",
       "routerSavedRestart": "路由已保存。需要重启。",
       "ensembleSaved": "模型融合已保存。",
-      "presetApplied": "路由预设已应用。",
-      "presetAppliedRestart": "路由预设已应用。需要重启。",
       "channelSaved": "渠道已保存——本地校验通过；可点「测试连接」验证凭证",
       "channelSavedLive": "渠道已保存并生效——正以新配置运行",
       "channelStartFailed": "渠道已保存,但启动失败——请在状态中查看错误,然后用「重启」重试",
@@ -3052,16 +3041,6 @@
       "installed": "已安装",
       "add": "下载"
     },
-    "skillCard": {
-      "subSkillsTitle": "此元技能使用的子技能",
-      "uses": "使用",
-      "dependencies": "已声明依赖",
-      "pythonCount": "Python 包：{count}",
-      "binaryCount": "二进制依赖：{count}",
-      "envCount": "环境变量：{count}",
-      "missingCount": "缺失依赖：{count}",
-      "advisoryCount": "提示项：{count}"
-    },
     "skillDetail": {
       "dialogLabel": "技能详情：{name}",
       "triggers": "触发条件",
@@ -3700,7 +3679,7 @@
       "ensembleFallbackUsed": "已使用 fallback",
       "ensembleFallbackReason": "降级 · {reason}",
       "ensembleRouterPoolHidden": "普通 router 池已隐藏",
-      "ensembleTokens": "{count} 令牌",
+      "ensembleTokens": "{count} token",
       "ensembleUsed": "已使用",
       "ensembleFailed": "失败",
       "ensembleQuorumSkipped": "阈值已满足 · 已跳过",
@@ -3772,7 +3751,8 @@
       },
       "more": "另有 {count} 项",
       "stale": "仍在工作 —— 暂无新信号",
-      "liveStep": "第 {n} 步"
+      "liveStep": "第 {n} 步",
+      "recordIncomplete": "活动记录不完整，已显示兼容历史视图。"
     },
     "suggestedTasks": "推荐任务",
     "greetingMorning": "早上好。",
@@ -4439,7 +4419,22 @@
       "activityContentSize": "{lines} 行 · {characters} 个字符",
       "activityExitCode": "退出码 {code}",
       "activityNotCompleted": "未通过",
-      "activityPublished": "已发布"
+      "activityPublished": "已发布",
+      "documentErrorCategory": "类别：{category}（{code}）",
+      "documentPreviewUnavailableCategory": "编辑预览不可用",
+      "documentActionUnknownCategory": "操作结果未知",
+      "documentEditFailedCategory": "文档编辑失败",
+      "documentPreviewUnavailableMessage": "编辑预览不可用，未提交的修改均未应用。",
+      "documentActionUnknownMessage": "操作可能已执行，请先重新检查当前预览再继续。",
+      "documentEditFailedMessage": "文档操作未完成。",
+      "documentRetrySameTurn": "重试策略：在当前任务中继续",
+      "documentRetryNewTurn": "重试策略：开始新任务",
+      "documentRetryNever": "重试策略：不要重试",
+      "documentNextRetry": "下一步：重试",
+      "documentNextReinspect": "下一步：重新检查",
+      "documentNextFinalize": "下一步：不再调用工具并结束",
+      "documentNextNewTurn": "下一步：开始新任务",
+      "documentNextStop": "下一步：停止"
     }
   },
   "channelStatus": {

@@ -16,16 +16,21 @@ import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
 
+from opensquilla.artifact_session.html_anchors import ElementProofV2
+
 DESKTOP_ARTIFACT_BRIDGE_URL_ENV: Final = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL"
 DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV: Final = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN"
-DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION: Final = 3
+DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION: Final = 5
+DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4: Final = 4
+DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3: Final = 3
 
 _LOOPBACK_HOST: Final = "127.0.0.1"
 _TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9_-]{43}$")
@@ -34,6 +39,7 @@ _OPAQUE_ID_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TAG_NAME_RE: Final = re.compile(r"^[a-z][a-z0-9._:-]{0,63}$")
 _SHA256_RE: Final = re.compile(r"^[a-f0-9]{64}$")
 _ARTIFACT_ID_RE: Final = re.compile(r"^art-[A-Za-z0-9_-]{1,200}$")
+_CANDIDATE_HANDLE_RE: Final = re.compile(r"^candidate_[A-Za-z0-9_-]{16,128}$")
 _MAX_REQUEST_BYTES: Final = 64 * 1024
 _MAX_RESPONSE_BYTES: Final = 16 * 1024 * 1024
 _MAX_SCREENSHOT_BYTES: Final = 12 * 1024 * 1024
@@ -49,6 +55,8 @@ BridgeMethod = Literal[
     "screenshot",
     "officeFlush",
     "reloadSurface",
+    "bindCandidatePreview",
+    "restoreCanonicalPreview",
 ]
 BrowserInspectScope = Literal["document", "selection", "viewport"]
 BrowserKey = Literal[
@@ -78,6 +86,8 @@ _BRIDGE_METHODS: Final[frozenset[str]] = frozenset(
         "screenshot",
         "officeFlush",
         "reloadSurface",
+        "bindCandidatePreview",
+        "restoreCanonicalPreview",
     }
 )
 _BROWSER_SCOPES: Final[frozenset[str]] = frozenset({"document", "selection", "viewport"})
@@ -110,6 +120,47 @@ class DesktopArtifactBridgeError(RuntimeError):
         self.status = status
 
 
+class TurnAuthorityCleanup:
+    """Cancellation-safe exactly-once cleanup for one process-local authority."""
+
+    __slots__ = ("_callback", "_lock", "_task", "_ingress_owned")
+
+    def __init__(self, callback: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        self._callback = callback
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task[None] | None = None
+        self._ingress_owned = True
+
+    def __repr__(self) -> str:
+        return "TurnAuthorityCleanup(authority=<redacted>)"
+
+    @property
+    def ingress_owned(self) -> bool:
+        return self._ingress_owned
+
+    def handoff(self) -> None:
+        """Transfer cleanup responsibility away from the ingress scope."""
+
+        self._ingress_owned = False
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            task = self._task
+            if task is None:
+                task = asyncio.create_task(self._callback())
+                self._task = task
+
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+
 @dataclass(frozen=True, slots=True)
 class DesktopArtifactBridgeCapabilities:
     version: int
@@ -122,6 +173,9 @@ class DesktopArtifactBridgeCapabilities:
     screenshot: bool
     office_flush: bool
     reload_surface: bool
+    bind_candidate_preview: bool
+    restore_canonical_preview: bool
+    annotation_proof_v2: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +195,7 @@ class DesktopArtifactResolvedAnnotationSelection:
     dom_sha256: str | None
     element_proof_sha256: str
     scope_id: str
+    annotation_proof_v2: ElementProofV2 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +214,15 @@ class DesktopArtifactBrowserSnapshot:
     scope: str
     nodes: tuple[DesktopArtifactBrowserNode, ...]
     truncated: bool
+    # Protocol-v4 active-surface identity.  Keep these optional so old
+    # embedded test doubles/clients remain readable; candidate-loop callers
+    # must require all three fields before accepting a verification receipt.
+    active_preview_artifact_id: str | None = None
+    scope_id: str | None = None
+    candidate_handle: str | None = None
+    # Protocol-v5 process-local surface generation. It is consumed by the
+    # document verifier and is never projected into model-visible tool output.
+    binding_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +259,109 @@ def _boolean(value: object, *, label: str) -> bool:
             "invalid-response", f"The Desktop bridge {label} is invalid."
         )
     return value
+
+
+def _annotation_proof_v2(value: object) -> ElementProofV2:
+    payload = _record(value, label="annotation proof-v2 response")
+    if set(payload) != {"stableElementProofSha256", "ancestorClassCommitments"}:
+        raise DesktopArtifactBridgeError(
+            "invalid-response", "The Desktop bridge annotation proof-v2 is invalid."
+        )
+    stable_digest = payload.get("stableElementProofSha256")
+    raw_commitments = payload.get("ancestorClassCommitments")
+    if (
+        not isinstance(stable_digest, str)
+        or not _SHA256_RE.fullmatch(stable_digest)
+        or not isinstance(raw_commitments, list)
+        or len(raw_commitments) > 256
+        or any(
+            not isinstance(commitment, str) or not _SHA256_RE.fullmatch(commitment)
+            for commitment in raw_commitments
+        )
+        or raw_commitments != sorted(set(raw_commitments))
+    ):
+        raise DesktopArtifactBridgeError(
+            "invalid-response", "The Desktop bridge annotation proof-v2 is invalid."
+        )
+    return ElementProofV2(
+        stable_element_proof_sha256=stable_digest,
+        ancestor_class_commitments=tuple(raw_commitments),
+    )
+
+
+def _annotation_proof_v2_payload(value: ElementProofV2) -> dict[str, object]:
+    stable_digest = value.stable_element_proof_sha256
+    commitments = value.ancestor_class_commitments
+    if (
+        not isinstance(stable_digest, str)
+        or not _SHA256_RE.fullmatch(stable_digest)
+        or not isinstance(commitments, tuple)
+        or len(commitments) > 256
+        or any(
+            not isinstance(commitment, str) or not _SHA256_RE.fullmatch(commitment)
+            for commitment in commitments
+        )
+        or list(commitments) != sorted(set(commitments))
+    ):
+        raise ValueError("Desktop artifact annotation proof-v2 is invalid")
+    return {
+        "stableElementProofSha256": stable_digest,
+        "ancestorClassCommitments": list(commitments),
+    }
+
+
+def _parse_capabilities(value: object) -> DesktopArtifactBridgeCapabilities:
+    payload = _record(value, label="capabilities response")
+    remote_version = payload.get("version")
+    if remote_version not in {
+        DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
+        DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
+        DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+    }:
+        raise DesktopArtifactBridgeError(
+            "invalid-response", "The Desktop bridge protocol version is invalid."
+        )
+    return DesktopArtifactBridgeCapabilities(
+        version=int(remote_version),
+        available=_boolean(payload.get("available"), label="available capability"),
+        capture_selection=_boolean(
+            payload.get("captureSelection"), label="selection capability"
+        ),
+        resolve_annotation_selection=_boolean(
+            payload.get("resolveAnnotationSelection"),
+            label="annotation selection resolution capability",
+        ),
+        focus_annotation=_boolean(
+            payload.get("focusAnnotation"), label="annotation focus capability"
+        ),
+        browser_inspect=_boolean(
+            payload.get("browserInspect"), label="browser inspection capability"
+        ),
+        browser_act=_boolean(payload.get("browserAct"), label="browser action capability"),
+        screenshot=_boolean(payload.get("screenshot"), label="screenshot capability"),
+        office_flush=_boolean(payload.get("officeFlush"), label="Office flush capability"),
+        reload_surface=_boolean(payload.get("reloadSurface"), label="reload capability"),
+        bind_candidate_preview=(
+            _boolean(
+                payload.get("bindCandidatePreview"), label="candidate binding capability"
+            )
+            if "bindCandidatePreview" in payload
+            else False
+        ),
+        restore_canonical_preview=(
+            _boolean(
+                payload.get("restoreCanonicalPreview"),
+                label="canonical preview restore capability",
+            )
+            if "restoreCanonicalPreview" in payload
+            else False
+        ),
+        annotation_proof_v2=(
+            _boolean(payload.get("annotationProofV2"), label="annotation proof-v2 capability")
+            if "annotationProofV2" in payload
+            else False
+        ),
+    )
 
 
 def _optional_string(value: object, *, label: str, max_chars: int = 16_384) -> str | None:
@@ -280,46 +447,97 @@ def _annotation_element_path(value: str) -> str:
 class DesktopArtifactBridgeClient:
     """Async, fixed-method facade over the authenticated loopback endpoint."""
 
-    __slots__ = ("_port", "_token")
+    __slots__ = ("_port", "_token", "_protocol_version", "_capabilities_negotiated")
 
     def __init__(self, *, endpoint: str, token: str) -> None:
         self._port = _validate_endpoint(endpoint)
         self._token = _validate_token(token)
+        self._protocol_version = DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+        self._capabilities_negotiated = False
 
     def __repr__(self) -> str:
         return "DesktopArtifactBridgeClient(loopback=<redacted>, token=<redacted>)"
 
+    def token_matches(self, token: str) -> bool:
+        """Check an internal request bearer without exposing the credential.
+
+        The Gateway consumes the bridge token from its environment during
+        startup.  Middleware and the candidate-preview endpoints still need
+        to authenticate requests after that scrub, so they use this
+        process-local comparison instead of reintroducing the token into
+        ``os.environ``.
+        """
+
+        return isinstance(token, str) and secrets.compare_digest(self._token, token)
+
     async def capabilities(self, *, deadline_ms: int = 2_000) -> DesktopArtifactBridgeCapabilities:
+        try:
+            response = await self._post(
+                "/v1/capabilities", {"version": self._protocol_version}, deadline_ms=deadline_ms
+            )
+        except DesktopArtifactBridgeError:
+            if self._protocol_version != DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION:
+                raise
+            # New Gateway + old Desktop is deliberately source-only. Negotiate
+            # the old fixed methods but never advertise autonomous candidates.
+            self._protocol_version = DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4
+            response = await self._post(
+                "/v1/capabilities", {"version": self._protocol_version}, deadline_ms=deadline_ms
+            )
+        if response.get("ok") is not True:
+            raise self._response_error(response)
+        capabilities = _parse_capabilities(response.get("value"))
+        self._protocol_version = capabilities.version
+        self._capabilities_negotiated = True
+        return capabilities
+
+    async def acquire_binding(
+        self, *, deadline_ms: int = 2_000
+    ) -> BoundDesktopArtifactBridgeClient | None:
+        self._protocol_version = DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+        advertised = await self.capabilities(deadline_ms=deadline_ms)
+        if advertised.version != DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION:
+            return None
         response = await self._post(
-            "/v1/capabilities",
+            "/v1/bindings/acquire",
             {"version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION},
             deadline_ms=deadline_ms,
         )
         if response.get("ok") is not True:
             raise self._response_error(response)
-        value = _record(response.get("value"), label="capabilities response")
-        if value.get("version") != DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION:
+        value = _record(response.get("value"), label="binding response")
+        token = value.get("bindingToken")
+        if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
             raise DesktopArtifactBridgeError(
-                "invalid-response", "The Desktop bridge protocol version is invalid."
+                "invalid-response", "The Desktop binding token is invalid."
             )
-        return DesktopArtifactBridgeCapabilities(
-            version=DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
-            available=_boolean(value.get("available"), label="available capability"),
-            capture_selection=_boolean(value.get("captureSelection"), label="selection capability"),
-            resolve_annotation_selection=_boolean(
-                value.get("resolveAnnotationSelection"),
-                label="annotation selection resolution capability",
-            ),
-            focus_annotation=_boolean(
-                value.get("focusAnnotation"), label="annotation focus capability"
-            ),
-            browser_inspect=_boolean(
-                value.get("browserInspect"), label="browser inspection capability"
-            ),
-            browser_act=_boolean(value.get("browserAct"), label="browser action capability"),
-            screenshot=_boolean(value.get("screenshot"), label="screenshot capability"),
-            office_flush=_boolean(value.get("officeFlush"), label="Office flush capability"),
-            reload_surface=_boolean(value.get("reloadSurface"), label="reload capability"),
+        try:
+            if value.get("version") != DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION:
+                raise DesktopArtifactBridgeError(
+                    "invalid-response", "The Desktop binding version is invalid."
+                )
+            capabilities = _parse_capabilities(value.get("capabilities"))
+            if capabilities.version != DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION:
+                raise DesktopArtifactBridgeError(
+                    "invalid-response", "The Desktop binding capabilities are invalid."
+                )
+        except DesktopArtifactBridgeError:
+            try:
+                await self._post(
+                    "/v1/bindings/release",
+                    {
+                        "version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+                        "bindingToken": token,
+                    },
+                    deadline_ms=deadline_ms,
+                )
+            except DesktopArtifactBridgeError:
+                # Cleanup is best-effort and must not replace the validation
+                # error that made this newly issued binding unusable.
+                pass
+            raise
+        return BoundDesktopArtifactBridgeClient(
+            parent=self, binding_token=token, capabilities=capabilities
         )
 
     async def capture_selection(
@@ -414,6 +632,11 @@ class DesktopArtifactBridgeClient:
         scope_id = _optional_string(
             value.get("scopeId"), label="annotation scope", max_chars=512
         )
+        annotation_proof_v2 = (
+            _annotation_proof_v2(value["annotationProofV2"])
+            if "annotationProofV2" in value
+            else None
+        )
         if (
             response_active_preview_artifact_id != active_preview_artifact_id
             or response_selection_id != selection_id
@@ -449,6 +672,7 @@ class DesktopArtifactBridgeClient:
             dom_sha256=dom_sha256,
             element_proof_sha256=element_proof_sha256,
             scope_id=scope_id,
+            annotation_proof_v2=annotation_proof_v2,
         )
 
     async def focus_annotation(
@@ -460,6 +684,7 @@ class DesktopArtifactBridgeClient:
         tag_name: str,
         element_path: str,
         element_proof_sha256: str,
+        annotation_proof_v2: ElementProofV2 | None = None,
         deadline_ms: int = 2_000,
     ) -> bool:
         if not isinstance(active_preview_artifact_id, str) or not _ARTIFACT_ID_RE.fullmatch(
@@ -482,16 +707,19 @@ class DesktopArtifactBridgeClient:
             element_proof_sha256
         ):
             raise ValueError("Desktop artifact annotation element proof is invalid")
+        request: dict[str, object] = {
+            "activePreviewArtifactId": active_preview_artifact_id,
+            "annotationId": annotation_id,
+            "scopeId": scope_id,
+            "tagName": tag_name,
+            "elementPath": element_path,
+            "elementProofSha256": element_proof_sha256,
+        }
+        if annotation_proof_v2 is not None:
+            request["annotationProofV2"] = _annotation_proof_v2_payload(annotation_proof_v2)
         value = await self._call(
             "focusAnnotation",
-            {
-                "activePreviewArtifactId": active_preview_artifact_id,
-                "annotationId": annotation_id,
-                "scopeId": scope_id,
-                "tagName": tag_name,
-                "elementPath": element_path,
-                "elementProofSha256": element_proof_sha256,
-            },
+            request,
             deadline_ms=deadline_ms,
         )
         if value != {
@@ -508,13 +736,31 @@ class DesktopArtifactBridgeClient:
         *,
         scope: BrowserInspectScope,
         max_nodes: int,
+        identity_only: bool = False,
+        candidate_handle: str | None = None,
         deadline_ms: int = 5_000,
     ) -> DesktopArtifactBrowserSnapshot:
-        if scope not in _BROWSER_SCOPES or isinstance(max_nodes, bool) or not 1 <= max_nodes <= 200:
+        if (
+            scope not in _BROWSER_SCOPES
+            or isinstance(max_nodes, bool)
+            or not 1 <= max_nodes <= 200
+            or not isinstance(identity_only, bool)
+        ):
             raise ValueError("Desktop artifact browser inspection arguments are invalid")
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {"scope": scope, "maxNodes": max_nodes}
+        if identity_only:
+            # The candidate identity probe must not replace the renderer's
+            # anchor table.  A normal inspect intentionally issues a fresh
+            # bounded anchor set; an internal identity-only probe is used
+            # immediately before click/type/scroll and only checks the
+            # active-surface/health identity.
+            request["identityOnly"] = True
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
         value = await self._call(
             "browserInspect",
-            {"scope": scope, "maxNodes": max_nodes},
+            request,
             deadline_ms=deadline_ms,
         )
         response_scope = value.get("scope")
@@ -526,6 +772,68 @@ class DesktopArtifactBridgeClient:
         if len(raw_nodes) > max_nodes:
             raise DesktopArtifactBridgeError(
                 "invalid-response", "The Desktop bridge returned too many browser nodes."
+            )
+        # v4 surfaces echo their active binding identity so a candidate
+        # verification receipt cannot survive a user switching to another
+        # preview.  Fields remain optional for old embedded test doubles and
+        # non-candidate callers; document_browser_inspect applies the strict
+        # requirement when a candidate is staged.
+        active_preview_artifact_id: str | None = None
+        if "activePreviewArtifactId" in value:
+            active_preview_artifact_id = _optional_string(
+                value.get("activePreviewArtifactId"),
+                label="active preview artifact identity",
+                max_chars=204,
+            )
+            if (
+                active_preview_artifact_id is not None
+                and not _ARTIFACT_ID_RE.fullmatch(active_preview_artifact_id)
+            ):
+                raise DesktopArtifactBridgeError(
+                    "invalid-response", "The Desktop bridge browser identity is invalid."
+                )
+        scope_id: str | None = None
+        if "scopeId" in value:
+            scope_id = _optional_string(value.get("scopeId"), label="browser scope", max_chars=512)
+            if scope_id is not None and (
+                not scope_id
+                or any(ord(character) < 32 or ord(character) == 127 for character in scope_id)
+            ):
+                raise DesktopArtifactBridgeError(
+                    "invalid-response", "The Desktop bridge browser scope is invalid."
+                )
+        response_candidate_handle: str | None = None
+        if "candidateHandle" in value:
+            response_candidate_handle = _optional_string(
+                value.get("candidateHandle"),
+                label="candidate preview handle",
+                max_chars=256,
+            )
+            if (
+                response_candidate_handle is not None
+                and not _CANDIDATE_HANDLE_RE.fullmatch(response_candidate_handle)
+            ):
+                raise DesktopArtifactBridgeError(
+                    "invalid-response", "The Desktop bridge candidate identity is invalid."
+                )
+        binding_generation: int | None = None
+        if "bindingGeneration" in value:
+            raw_binding_generation = value.get("bindingGeneration")
+            if (
+                isinstance(raw_binding_generation, bool)
+                or not isinstance(raw_binding_generation, int)
+                or raw_binding_generation < 1
+            ):
+                raise DesktopArtifactBridgeError(
+                    "invalid-response", "The Desktop bridge binding generation is invalid."
+                )
+            binding_generation = raw_binding_generation
+        if (
+            self._invoke_protocol_version() == DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+            and binding_generation is None
+        ):
+            raise DesktopArtifactBridgeError(
+                "invalid-response", "The Desktop bridge binding generation is unavailable."
             )
         nodes: list[DesktopArtifactBrowserNode] = []
         for raw_node in raw_nodes:
@@ -568,14 +876,30 @@ class DesktopArtifactBridgeClient:
             scope=response_scope,
             nodes=tuple(nodes),
             truncated=_boolean(value.get("truncated"), label="browser snapshot truncation flag"),
+            active_preview_artifact_id=active_preview_artifact_id,
+            scope_id=scope_id,
+            candidate_handle=response_candidate_handle,
+            binding_generation=binding_generation,
         )
 
     async def browser_click(
-        self, *, anchor: str, focus_only: bool = False, deadline_ms: int = 5_000
+        self,
+        *,
+        anchor: str,
+        focus_only: bool = False,
+        candidate_handle: str | None = None,
+        deadline_ms: int = 5_000,
     ) -> DesktopArtifactBrowserActResult:
         self._validate_anchor(anchor)
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {
+            "action": "focus" if focus_only else "click",
+            "anchor": anchor,
+        }
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
         return await self._browser_act(
-            {"action": "focus" if focus_only else "click", "anchor": anchor},
+            request,
             deadline_ms=deadline_ms,
         )
 
@@ -585,6 +909,7 @@ class DesktopArtifactBridgeClient:
         anchor: str,
         text: str,
         replace: bool = False,
+        candidate_handle: str | None = None,
         deadline_ms: int = 5_000,
     ) -> DesktopArtifactBrowserActResult:
         self._validate_anchor(anchor)
@@ -592,34 +917,69 @@ class DesktopArtifactBridgeClient:
             raise ValueError("Desktop artifact browser text is invalid")
         if not isinstance(replace, bool):
             raise ValueError("Desktop artifact browser replace flag is invalid")
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {
+            "action": "type",
+            "anchor": anchor,
+            "text": text,
+            "replace": replace,
+        }
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
         return await self._browser_act(
-            {"action": "type", "anchor": anchor, "text": text, "replace": replace},
+            request,
             deadline_ms=deadline_ms,
         )
 
     async def browser_press(
-        self, *, key: BrowserKey, deadline_ms: int = 5_000
+        self,
+        *,
+        key: BrowserKey,
+        candidate_handle: str | None = None,
+        deadline_ms: int = 5_000,
     ) -> DesktopArtifactBrowserActResult:
         if key not in _BROWSER_KEYS:
             raise ValueError("Desktop artifact browser key is invalid")
-        return await self._browser_act({"action": "press", "key": key}, deadline_ms=deadline_ms)
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {"action": "press", "key": key}
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
+        return await self._browser_act(request, deadline_ms=deadline_ms)
 
     async def browser_scroll(
         self,
         *,
         direction: Literal["up", "down", "left", "right"],
         amount: Literal["line", "page"],
+        candidate_handle: str | None = None,
         deadline_ms: int = 5_000,
     ) -> DesktopArtifactBrowserActResult:
         if direction not in {"up", "down", "left", "right"} or amount not in {"line", "page"}:
             raise ValueError("Desktop artifact browser scroll arguments are invalid")
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {
+            "action": "scroll",
+            "direction": direction,
+            "amount": amount,
+        }
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
         return await self._browser_act(
-            {"action": "scroll", "direction": direction, "amount": amount},
+            request,
             deadline_ms=deadline_ms,
         )
 
-    async def screenshot(self, *, deadline_ms: int = 10_000) -> DesktopArtifactScreenshot:
-        value = await self._call("screenshot", {}, deadline_ms=deadline_ms)
+    async def screenshot(
+        self,
+        *,
+        candidate_handle: str | None = None,
+        deadline_ms: int = 10_000,
+    ) -> DesktopArtifactScreenshot:
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {}
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
+        value = await self._call("screenshot", request, deadline_ms=deadline_ms)
         if value.get("mime") != "image/png" or not isinstance(value.get("dataBase64"), str):
             raise DesktopArtifactBridgeError(
                 "invalid-response", "The Desktop bridge screenshot is invalid."
@@ -655,9 +1015,82 @@ class DesktopArtifactBridgeClient:
             ),
         )
 
-    async def reload_surface(self, *, deadline_ms: int = 10_000) -> bool:
-        value = await self._call("reloadSurface", {}, deadline_ms=deadline_ms)
+    async def reload_surface(
+        self,
+        *,
+        candidate_handle: str | None = None,
+        deadline_ms: int = 10_000,
+    ) -> bool:
+        self._validate_optional_candidate_handle(candidate_handle)
+        request: dict[str, object] = {}
+        if candidate_handle is not None:
+            request["candidateHandle"] = candidate_handle
+        value = await self._call("reloadSurface", request, deadline_ms=deadline_ms)
         return _boolean(value.get("reloaded"), label="reload result")
+
+    async def bind_candidate_preview(
+        self,
+        candidate_handle: str,
+        *,
+        deadline_ms: int = 5_000,
+    ) -> bool:
+        """Bind an opaque Gateway candidate to the active HTML preview.
+
+        The Desktop bridge never receives an artifact id, path, URL, or source
+        bytes.  Older (v3) shells fail closed before transport; v4 shells may
+        still report ``unsupported`` when their Gateway integration cannot
+        materialize a candidate preview.
+        """
+
+        if not isinstance(candidate_handle, str) or not _CANDIDATE_HANDLE_RE.fullmatch(
+            candidate_handle
+        ):
+            raise ValueError("Desktop artifact candidate handle is invalid")
+        # The client starts each connection in v3 for rolling upgrades.  A
+        # candidate preview is a v4-only operation, so perform the capability
+        # handshake lazily when this is the first bridge call in a turn.  The
+        # normal browser path already calls ``capabilities`` explicitly, but a
+        # source writer may bind its candidate before any browser tool runs.
+        if not self._capabilities_negotiated:
+            await self.capabilities(deadline_ms=deadline_ms)
+        self._require_protocol_v4("candidate preview binding")
+        value = await self._call(
+            "bindCandidatePreview",
+            {"candidateHandle": candidate_handle},
+            deadline_ms=deadline_ms,
+        )
+        if value.get("bound") is not True or value.get("candidateHandle") != candidate_handle:
+            raise DesktopArtifactBridgeError(
+                "invalid-response", "The Desktop bridge candidate binding response is invalid."
+            )
+        return True
+
+    async def restore_canonical_preview(
+        self,
+        candidate_handle: str,
+        *,
+        deadline_ms: int = 5_000,
+    ) -> bool:
+        """Restore only the candidate preview owned by this turn.
+
+        The handle is an opaque Gateway capability. Requiring it on restore
+        prevents a stale/cancelled turn from restoring the canonical page
+        underneath a newer turn's candidate preview.
+        """
+
+        if not isinstance(candidate_handle, str) or not _CANDIDATE_HANDLE_RE.fullmatch(
+            candidate_handle
+        ):
+            raise ValueError("Desktop artifact candidate handle is invalid")
+        if not self._capabilities_negotiated:
+            await self.capabilities(deadline_ms=deadline_ms)
+        self._require_protocol_v4("canonical preview restore")
+        value = await self._call(
+            "restoreCanonicalPreview",
+            {"candidateHandle": candidate_handle},
+            deadline_ms=deadline_ms,
+        )
+        return _boolean(value.get("restored"), label="canonical preview restore result")
 
     async def _browser_act(
         self, request: dict[str, object], *, deadline_ms: int
@@ -668,6 +1101,27 @@ class DesktopArtifactBridgeClient:
             changed=_boolean(value.get("changed"), label="browser action changed flag"),
         )
 
+    @staticmethod
+    def _validate_optional_candidate_handle(candidate_handle: str | None) -> None:
+        if candidate_handle is not None and (
+            not isinstance(candidate_handle, str)
+            or not _CANDIDATE_HANDLE_RE.fullmatch(candidate_handle)
+        ):
+            raise ValueError("Desktop artifact candidate handle is invalid")
+
+    def _require_protocol_v4(self, operation: str) -> None:
+        if self._protocol_version < DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4:
+            raise DesktopArtifactBridgeError(
+                "unsupported",
+                f"Desktop protocol-v4 is required for {operation}.",
+            )
+
+    def _invoke_protocol_version(self) -> int:
+        # v5 invocation authority is turn-bound. The process-scoped client is
+        # still used by annotation and other non-turn RPCs, so those calls must
+        # remain on the unbound v4 envelope even after a v5 capability probe.
+        return min(self._protocol_version, DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4)
+
     async def _call(
         self,
         method: BridgeMethod,
@@ -677,13 +1131,14 @@ class DesktopArtifactBridgeClient:
     ) -> dict[str, Any]:
         if method not in _BRIDGE_METHODS:
             raise ValueError("Desktop artifact bridge method is invalid")
+        protocol_version = self._invoke_protocol_version()
         response = await self._post(
             "/v1/invoke",
             {
-                "version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+                "version": protocol_version,
                 "method": method,
                 "request": {
-                    "version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+                    "version": protocol_version,
                     **request,
                 },
             },
@@ -699,7 +1154,9 @@ class DesktopArtifactBridgeClient:
 
     async def _post(
         self,
-        path: Literal["/v1/capabilities", "/v1/invoke"],
+        path: Literal[
+            "/v1/capabilities", "/v1/invoke", "/v1/bindings/acquire", "/v1/bindings/release"
+        ],
         payload: dict[str, object],
         *,
         deadline_ms: int,
@@ -810,6 +1267,87 @@ class DesktopArtifactBridgeClient:
             raise ValueError("Desktop artifact browser anchor is invalid")
 
 
+class BoundDesktopArtifactBridgeClient(DesktopArtifactBridgeClient):
+    """Turn-scoped facade whose opaque token never leaves Gateway memory."""
+
+    __slots__ = ("_binding_token", "_bound_capabilities", "_closed")
+
+    def __init__(
+        self,
+        *,
+        parent: DesktopArtifactBridgeClient,
+        binding_token: str,
+        capabilities: DesktopArtifactBridgeCapabilities,
+    ) -> None:
+        super().__init__(
+            endpoint=f"http://127.0.0.1:{parent._port}",
+            token=parent._token,
+        )
+        self._protocol_version = DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+        self._capabilities_negotiated = True
+        self._binding_token = binding_token
+        self._bound_capabilities = capabilities
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return "BoundDesktopArtifactBridgeClient(loopback=<redacted>, binding=<redacted>)"
+
+    async def capabilities(self, *, deadline_ms: int = 2_000) -> DesktopArtifactBridgeCapabilities:
+        del deadline_ms
+        if self._closed:
+            raise DesktopArtifactBridgeError(
+                "binding-unavailable", "The Desktop binding is unavailable."
+            )
+        return self._bound_capabilities
+
+    async def aclose(self, *, deadline_ms: int = 2_000) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        token, self._binding_token = self._binding_token, ""
+        try:
+            await self._post(
+                "/v1/bindings/release",
+                {"version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION, "bindingToken": token},
+                deadline_ms=deadline_ms,
+            )
+        except DesktopArtifactBridgeError:
+            # Release is idempotent and Desktop also drops all bindings at shutdown.
+            pass
+
+    def _invoke_protocol_version(self) -> int:
+        return DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION
+
+    async def _call(
+        self,
+        method: BridgeMethod,
+        request: dict[str, object],
+        *,
+        deadline_ms: int,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise DesktopArtifactBridgeError(
+                "binding-unavailable", "The Desktop binding is unavailable."
+            )
+        response = await self._post(
+            "/v1/invoke",
+            {
+                "version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+                "bindingToken": self._binding_token,
+                "method": method,
+                "request": {"version": DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION, **request},
+            },
+            deadline_ms=deadline_ms,
+        )
+        if response.get("ok") is not True:
+            raise self._response_error(response)
+        if response.get("method") != method:
+            raise DesktopArtifactBridgeError(
+                "invalid-response", "The Desktop bridge method response is invalid."
+            )
+        return _record(response.get("value"), label="operation response")
+
+
 def desktop_artifact_bridge_client_from_environment(
     environ: Mapping[str, str] | None = None,
 ) -> DesktopArtifactBridgeClient | None:
@@ -859,6 +1397,24 @@ def get_desktop_artifact_bridge_client() -> DesktopArtifactBridgeClient | None:
     return initialize_desktop_artifact_bridge_client()
 
 
+def desktop_artifact_bridge_token_valid(token: str) -> bool:
+    """Validate a candidate-preview bearer against the process-local bridge.
+
+    Before Desktop bridge initialization (for example in isolated ASGI unit
+    tests), retain the environment fallback.  Once initialization has run, a
+    missing client is fail-closed and the consumed environment token is never
+    consulted again.
+    """
+
+    with _runtime_client_lock:
+        initialized = _runtime_client_initialized
+        client = _runtime_client
+    if initialized:
+        return client is not None and client.token_matches(token)
+    expected = os.getenv(DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV, "")
+    return bool(expected and isinstance(token, str) and secrets.compare_digest(token, expected))
+
+
 __all__ = [
     "DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV",
     "DESKTOP_ARTIFACT_BRIDGE_URL_ENV",
@@ -875,4 +1431,5 @@ __all__ = [
     "desktop_artifact_bridge_client_from_environment",
     "get_desktop_artifact_bridge_client",
     "initialize_desktop_artifact_bridge_client",
+    "desktop_artifact_bridge_token_valid",
 ]

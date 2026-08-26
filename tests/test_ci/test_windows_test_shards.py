@@ -33,6 +33,7 @@ validate_assignment_payload = SHARD_MODULE["validate_assignment_payload"]
 validated_files_for_shard = SHARD_MODULE["validated_files_for_shard"]
 requires_isolated_core_wheel = SHARD_MODULE["_requires_isolated_core_wheel"]
 combined_pytest_exit_code = SHARD_MODULE["_combined_pytest_exit_code"]
+pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
 OFFLINE_MARKER_EXCLUSIONS = {
     "tests/functional/test_agent_synthetic_golden.py",
@@ -68,6 +69,9 @@ OFFLINE_MARKER_EXCLUSIONS = {
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_ci/test_plan_ci.py",
+    "tests/test_git_runtime.py",
+    "tests/test_tools/test_gitless_write_tracking.py",
     "tests/test_gateway/test_artifact_product_errors.py",
     "tests/test_scripts/test_bench_skill_integrity.py",
     "tests/test_skills_hash_consumers.py",
@@ -235,6 +239,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
+    "tests/test_artifact_session/test_candidate_loop.py",
+    "tests/test_tools/test_document_browser_identity.py",
 }
 
 
@@ -313,6 +319,21 @@ def _function_decorators(path: Path, function_name: str) -> set[str]:
     raise AssertionError(f"missing test function: {path}:{function_name}")
 
 
+def test_windows_shell_process_runtime_is_marked_ci_serial() -> None:
+    path = Path("tests/test_sandbox/test_windows_shell_process_runtime.py")
+    parsed = ast.parse(path.read_text(encoding="utf-8"))
+
+    assert any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in node.targets
+        )
+        and ast.unparse(node.value) == "pytest.mark.ci_serial"
+        for node in parsed.body
+    )
+
+
 def test_known_process_tree_flakes_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_process_tree.py"),
@@ -332,6 +353,25 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_gateway/test_task_runtime_terminal_cleanup.py"),
         "test_no_leak_under_load",
+    )
+
+
+def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_goal_rpc.py"),
+        "test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_scripts/test_verify_webui_artifact.py"),
+        "test_node_and_python_source_fingerprints_share_order_and_line_endings",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_long_task_case_driver.py"),
+        "test_fault_case_executes_through_isolated_gateway_without_real_provider",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_long_task_case_driver.py"),
+        "test_fault_429_case_proves_retry_after_was_not_violated",
     )
 
 
@@ -801,6 +841,20 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert "serial_pytest_exit_code=5" in text
     assert "junit_status=failed" in text
     assert "synthetic shard failure" in text
+
+
+def test_windows_shard_runner_uses_argfile_for_large_file_selection() -> None:
+    files = tuple(
+        f"tests/test_gateway/test_long_windows_selection_{index:04d}.py"
+        for index in range(600)
+    )
+
+    with pytest_file_selection_arg(files) as selection_arg:
+        argfile = Path(selection_arg.removeprefix("@"))
+        assert len(selection_arg) < 260
+        assert argfile.read_text(encoding="utf-8").splitlines() == list(files)
+
+    assert not argfile.exists()
 
 
 def test_windows_shard_runner_accepts_parallel_no_tests_when_serial_passes(

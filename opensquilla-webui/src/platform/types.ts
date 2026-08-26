@@ -1,5 +1,9 @@
 export type PlatformId = 'web' | 'desktop'
 
+/** Native Workbench protocol versions accepted during the v3→v4 rollout. */
+export type NativeWorkbenchProtocolVersion = 1 | 2 | 3 | 4
+export type NativeWorkbenchInteractiveProtocolVersion = 2 | 3 | 4
+
 export interface GatewayStatus {
   url: string
   port: number
@@ -7,6 +11,25 @@ export interface GatewayStatus {
   status: 'starting' | 'ready' | 'stopped' | 'error'
   logPath: string
   error?: string
+}
+
+export type DesktopGatewayConnectionStatus = 'starting' | 'ready' | 'stopped' | 'error'
+
+/**
+ * Connection facts published only to the trusted Desktop main frame. The
+ * instance-scoped auth token is derived from the owned Gateway launch and
+ * expires with that process; it is never the operator's configured token.
+ */
+export interface DesktopGatewayConnection {
+  schemaVersion: 1
+  revision: number
+  status: DesktopGatewayConnectionStatus
+  instanceId: string | null
+  profileFingerprint: string
+  httpUrl: string | null
+  wsUrl: string | null
+  authToken?: string | null
+  error: string | null
 }
 
 export interface DesktopRetryStartupResult {
@@ -177,7 +200,7 @@ export interface NativeWorkbenchCreateSurfaceRequestV1 {
 }
 
 export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
-  version: 2 | 3
+  version: 2 | 3 | 4
   surfaceId: string
   kind: 'artifact-preview'
   payload: {
@@ -189,7 +212,7 @@ export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
 }
 
 export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
-  version: 2 | 3
+  version: 2 | 3 | 4
   surfaceId: string
   kind: 'url-preview'
   payload: {
@@ -204,28 +227,29 @@ export type NativeWorkbenchCreateSurfaceRequest =
   | NativeWorkbenchCreateUrlSurfaceRequestV2
 
 export interface NativeWorkbenchCapabilities {
-  protocolVersions: Array<1 | 2 | 3>
+  protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
   maxSurfaces: number
 }
 
 export interface NativeArtifactAnnotationCapabilities {
-  version: 3
+  version: 3 | 4
   available: boolean
   picker?: boolean
   trustedOverlay?: boolean
   overlayCopyVersion?: 1
+  atomicCloseRearm?: true
   reason?: string
 }
 
 export interface NativeArtifactAnnotationModeRequest {
-  version: 3
+  version: 3 | 4
   surfaceId: string
   enabled: boolean
 }
 
 export interface NativeArtifactAnnotationOverlayRequest {
-  version: 3
+  version: 3 | 4
   surfaceId: string
   selectionId: string
   annotationId: string
@@ -244,13 +268,14 @@ export interface NativeArtifactAnnotationOverlayRequest {
 }
 
 export interface NativeArtifactAnnotationOverlayCloseRequest {
-  version: 3
+  version: 3 | 4
   surfaceId: string
   annotationId?: string
+  rearm?: true
 }
 
 export interface NativeArtifactScreenshotRequest {
-  version: 3
+  version: 3 | 4
 }
 
 export interface NativeArtifactScreenshotValue {
@@ -295,6 +320,7 @@ export interface NativeWorkbenchSurfaceResult {
   code?: string
   retryable?: boolean
   message?: string
+  surfaceInstanceId?: string
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -315,9 +341,10 @@ export type NativeWorkbenchSurfaceEventType =
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
+  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
-  version: 1 | 2 | 3
+  version: NativeWorkbenchProtocolVersion
   surfaceId: string
   type: NativeWorkbenchSurfaceEventType
   detail?: {
@@ -331,6 +358,7 @@ export interface NativeWorkbenchSurfaceEvent {
     canGoForward?: boolean
     action?: string
     code?: string
+    surfaceInstanceId?: string
     message?: string
     path?: string
     reason?: string
@@ -341,14 +369,14 @@ export interface NativeWorkbenchSurfaceEvent {
 }
 
 export interface NativeWorkbenchNavigateRequest {
-  version: 2 | 3
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
   url?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
-  version: 2 | 3
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   requestId: string
   allow: boolean
@@ -437,6 +465,10 @@ export interface CliInvocation {
 
 export interface PlatformGatewayApi {
   getStatus(): Promise<GatewayStatus>
+  getConnection?: () => Promise<DesktopGatewayConnection>
+  onConnection?: (
+    callback: (connection: DesktopGatewayConnection) => void,
+  ) => () => void
   revealLog?: () => Promise<boolean>
   retryStartup?: () => Promise<DesktopRetryStartupResult>
   /** null when the shell predates the bridge or the lookup fails; callers

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +34,12 @@ from opensquilla.gateway.artifact_contexts import (
     BoundPromptAnnotationTarget,
 )
 from opensquilla.tools import get_default_registry
-from opensquilla.tools.builtin.artifact_editing import _range_error, _stale_context
+from opensquilla.tools.builtin import artifact_editing, document_editing
+from opensquilla.tools.builtin.artifact_editing import (
+    PreparedDocumentMutation,
+    _range_error,
+    _stale_context,
+)
 from opensquilla.tools.builtin.artifact_range_grants import ArtifactRangeGrantError
 from opensquilla.tools.builtin.document_format_adapters import DocumentMutationError
 from opensquilla.tools.dispatch import build_tool_handler
@@ -43,7 +49,13 @@ SESSION_KEY = "agent:main:webchat:document"
 SESSION_ID = "session-document"
 TURN_ID = "turn-document"
 DOCUMENT_TOOL_NAMES = frozenset(
-    {"document_apply", "document_inspect", "document_locate", "document_read"}
+    {
+        "document_apply",
+        "document_inspect",
+        "document_locate",
+        "document_patch",
+        "document_read",
+    }
 )
 RETIRED_ANNOTATION_TOOL_NAMES = frozenset(
     {
@@ -594,12 +606,13 @@ async def _call(
     )
 
 
-def test_restricted_document_toolset_is_exactly_four_tools() -> None:
+def test_restricted_document_toolset_is_exactly_five_tools() -> None:
     registry = get_default_registry()
     assert DOCUMENT_TOOL_NAMES == {
         "document_apply",
         "document_inspect",
         "document_locate",
+        "document_patch",
         "document_read",
     }
     for name in DOCUMENT_TOOL_NAMES:
@@ -638,6 +651,166 @@ def test_restricted_document_toolset_is_exactly_four_tools() -> None:
     }
     edit_schema = patch_writer.spec.parameters["properties"]["edits"]["items"]
     assert set(edit_schema["properties"]) == {"expectedText", "replacement"}
+
+
+@pytest.mark.asyncio
+async def test_candidate_registration_failure_retires_stale_handle_and_skips_bind(
+    tmp_path: Path,
+) -> None:
+    """A failed replacement must never bind an older candidate by handle."""
+
+    service, store, _source, ref, _created, _anchor, ctx = await _sent_img_context(tmp_path)
+    bind_calls: list[str] = []
+    retired_handles: list[str] = []
+
+    class _CandidateController:
+        preview_handle = "candidate_0123456789abcdef"
+        candidate_artifact = None
+        state = SimpleNamespace(candidate_epoch=1)
+
+        async def stage_candidate(self, **kwargs: object) -> None:
+            self.candidate_artifact = kwargs["candidate_artifact"]
+
+    class _PreviewService:
+        def register_candidate_preview(self, **kwargs: object) -> None:
+            raise RuntimeError("simulated registration failure")
+
+        def retire_candidate_preview(self, handle: str) -> None:
+            retired_handles.append(handle)
+
+    class _Bridge:
+        async def bind_candidate_preview(self, handle: str) -> None:
+            bind_calls.append(handle)
+
+    controller = _CandidateController()
+    ctx.artifact_candidate_loop_controller = controller
+    ctx.artifact_preview_service = _PreviewService()
+    ctx.desktop_artifact_bridge = _Bridge()
+    prepared = PreparedDocumentMutation(
+        scope=SimpleNamespace(
+            ctx=ctx,
+            context=SimpleNamespace(session_id=SESSION_ID, session_key=SESSION_KEY),
+        ),
+        store=store,
+        ref=ref,
+        turn_id=TURN_ID,
+        summary="replace heading",
+        artifact_format="html",
+        adapter_id="html",
+        adapter_version=1,
+        base_revision_id="rev-base",
+        source_sha256=ref.sha256,
+        candidate_bytes=b"<main><h1>Updated</h1></main>",
+        candidate_sha256="0" * 64,
+        operations=({"op": "test"},),
+        validation_summary={},
+        mutation_kind="document_semantic",
+        patch_count=1,
+        actor=Actor(ActorKind.AGENT, "artifact-agent"),
+        registry=SimpleNamespace(release_reservation=lambda _reservation_id: None),
+        reservation_id="reservation-test",
+        proposal_sha256="1" * 64,
+    )
+
+    result = json.loads(await artifact_editing._stage_prepared_document_mutation(prepared))
+
+    assert result["status"] == "candidate_staged"
+    assert result["preview"] == "unavailable"
+    assert result["nextAction"] == "document_finish_discard"
+    assert bind_calls == []
+    assert retired_handles == [controller.preview_handle]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotation_patch_deletes_bound_source_without_workspace_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, store, _source, ref, created, _anchor, ctx = await _sent_img_context(
+        tmp_path
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_copy = workspace / "page.html"
+    workspace_copy.write_text("workspace sentinel", encoding="utf-8")
+    ctx.workspace_dir = str(workspace)
+    emitted: list[dict[str, object]] = []
+
+    async def capture_event(payload: dict[str, object]) -> None:
+        emitted.append(payload)
+
+    ctx.artifact_event_emitter = capture_event
+    original_locations = document_editing._locations_for_operation
+
+    def only_style_location(**kwargs):
+        if kwargs.get("operation") != "set_style":
+            return []
+        return original_locations(**kwargs)
+
+    monkeypatch.setattr(
+        document_editing,
+        "_locations_for_operation",
+        only_style_location,
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        inspected = await _call(handler, "document_inspect", {})
+        assert inspected.is_error is False, inspected.content
+        inspect_payload = json.loads(inspected.content)
+        assert inspect_payload["annotations"][0]["grantPolicy"][
+            "availableInitialOperations"
+        ] == ["set_style"]
+        assert "remove_node" in inspect_payload["annotations"][0]["grantPolicy"][
+            "unavailableInitialOperations"
+        ]
+        assert (
+            inspect_payload["annotations"][0]["grantPolicy"][
+                "unsupportedOperationAction"
+            ]
+            == "document_read_then_document_patch"
+        )
+        read = await _call(handler, "document_read", {"view": "source"})
+        assert read.is_error is False, read.content
+        read_payload = json.loads(read.content)
+
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-document_patch")
+        applied = await _call(
+            handler,
+            "document_patch",
+            {
+                "expectedSha256": read_payload["sha256"],
+                "edits": [
+                    {
+                        "expectedText": '<img id="hero" src="photo.png">',
+                        "replacement": "",
+                    }
+                ],
+            },
+            tool_use_id="call-document_patch",
+        )
+
+        assert applied.is_error is False, applied.content
+        result = json.loads(applied.content)
+        assert result["status"] == "applied"
+        assert result["document_head_changed"] is True
+        document = await service.get_document(created.document.document_id)
+        revision = await service.get_revision(document.head_revision_id)
+        _new_ref, path = store.resolve_for_download(
+            revision.artifact_id,
+            session_id=SESSION_ID,
+        )
+        assert document.generation == 2
+        assert path.read_bytes() == b"<main><p>Keep me</p></main>"
+        assert len(await service.list_change_sets(created.document.document_id)) == 1
+        assert len(await service.list_revisions(created.document.document_id)) == 2
+        assert emitted and emitted[-1]["action"] == "source.patched"
+        assert workspace_copy.read_text(encoding="utf-8") == "workspace sentinel"
+        assert ctx.workspace_file_writes == []
+    finally:
+        await service.close()
 
 
 @pytest.mark.asyncio
@@ -697,6 +870,56 @@ async def test_bound_document_patch_commits_unique_text_edits_atomically(
             tool_use_id="call-document_patch",
         )
         assert receipt.status is MutationAttemptStatus.APPLIED
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_document_patch_supports_structure_and_global_css_in_one_commit(
+    tmp_path: Path,
+) -> None:
+    source = b"<html><head></head><body><main><h1>Title</h1></main></body></html>"
+    service, store, _source, ref, created, ctx = await _bound_document_context(
+        tmp_path,
+        source=source,
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-document_patch")
+        applied = await _call(
+            handler,
+            "document_patch",
+            {
+                "expectedSha256": ref.sha256,
+                "edits": [
+                    {
+                        "expectedText": "</head>",
+                        "replacement": "<style>.notice{color:red}</style></head>",
+                    },
+                    {
+                        "expectedText": "</h1>",
+                        "replacement": "</h1><p class=\"notice\">Ready</p>",
+                    },
+                ],
+            },
+        )
+
+        assert applied.is_error is False, applied.content
+        document = await service.get_document(created.document.document_id)
+        revision = await service.get_revision(document.head_revision_id)
+        _new_ref, path = store.resolve_for_download(
+            revision.artifact_id,
+            session_id=SESSION_ID,
+        )
+        assert path.read_bytes() == (
+            b'<html><head><style>.notice{color:red}</style></head><body><main><h1>Title</h1>'
+            b'<p class="notice">Ready</p></main></body></html>'
+        )
+        assert document.generation == 2
+        assert len(await service.list_change_sets(created.document.document_id)) == 1
+        assert len(await service.list_revisions(created.document.document_id)) == 2
     finally:
         await service.close()
 
@@ -832,8 +1055,23 @@ async def test_bound_document_read_bounds_unissued_cursor_retries_without_blocki
             [{"expectedText": "", "replacement": "changed"}],
             "DOCUMENT_PATCH_EXPECTED_TEXT_INVALID",
         ),
+        (
+            b"<p>abcdef</p>",
+            [{"expectedText": "missing", "replacement": "changed"}],
+            "DOCUMENT_PATCH_TEXT_NOT_FOUND",
+        ),
+        (
+            b"<p>abcdef</p>",
+            [{"expectedText": "abcdef", "replacement": "abcdef"}],
+            "DOCUMENT_PATCH_INVALID",
+        ),
+        (
+            b"<p>abcdef</p>",
+            [{"expectedText": "<p>abcdef</p>", "replacement": ""}],
+            "DOCUMENT_PATCH_INVALID",
+        ),
     ],
-    ids=["ambiguous", "overlap", "empty"],
+    ids=["ambiguous", "overlap", "empty", "missing", "no-op", "empty-html"],
 )
 async def test_bound_document_patch_rejects_unsafe_text_matches(
     tmp_path: Path,
@@ -857,6 +1095,34 @@ async def test_bound_document_patch_rejects_unsafe_text_matches(
         )
         assert result.is_error is True
         assert expected_code in result.content
+        assert await service.list_change_sets(created.document.document_id) == ()
+        assert len(await service.list_revisions(created.document.document_id)) == 1
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_document_patch_rejects_stale_sha_without_commit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _source, ref, created, ctx = await _bound_document_context(tmp_path)
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-document_patch")
+        stale_sha = "0" * 64 if ref.sha256 != "0" * 64 else "1" * 64
+        result = await _call(
+            handler,
+            "document_patch",
+            {
+                "expectedSha256": stale_sha,
+                "edits": [{"expectedText": "Original heading", "replacement": "Changed"}],
+            },
+        )
+
+        assert result.is_error is True
+        assert "DOCUMENT_MUTATION_CONFLICT" in result.content
         assert await service.list_change_sets(created.document.document_id) == ()
         assert len(await service.list_revisions(created.document.document_id)) == 1
     finally:
@@ -891,7 +1157,7 @@ def test_stale_bound_document_context_requires_a_new_refreshed_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_contextual_locate_requires_read_and_allows_only_one_candidate(
+async def test_contextual_locate_requires_read_and_allows_idempotent_replays(
     tmp_path: Path,
 ) -> None:
     service, store, _source, _ref, created, ctx = await _sent_contextual_button_context(
@@ -929,7 +1195,11 @@ async def test_contextual_locate_requires_read_and_allows_only_one_candidate(
         locations = located_payload["locations"]
         assert len(locations) == 1
         assert located_payload["selectionStatus"] == "contextual"
-        assert located_payload["retryAllowed"] is False
+        assert located_payload["retryAllowed"] is True
+        assert (
+            located_payload["retryPolicy"]
+            == "same_query_idempotent; reread_after_candidate_change"
+        )
         assert located_payload["nextAction"] == "apply_returned_grant"
 
         changed_candidate = await _call(
@@ -978,10 +1248,11 @@ async def test_ready_inspection_explains_grant_reuse_and_unavailable_operations(
         assert inspected.is_error is False, inspected.content
         payload = json.loads(inspected.content)
         assert payload["protocol"] == {
-            "inspectAgain": False,
+            "inspectAgain": True,
+            "repeatPolicy": "idempotent_with_turn_budget",
             "readyTargets": "reuse_matching_initialLocations",
-            "contextualTargets": "document_read_then_document_locate_once",
-            "unsupportedOperations": "leave_unchanged_and_explain",
+            "contextualTargets": "document_read_then_document_locate",
+            "unsupportedOperations": "document_read_then_document_patch",
         }
         annotation = payload["annotations"][0]
         assert annotation["selection"]["status"] == "ready"
@@ -990,21 +1261,20 @@ async def test_ready_inspection_explains_grant_reuse_and_unavailable_operations(
             "candidateSource": "forbidden",
             "availableInitialOperations": ["remove_node", "set_style"],
             "unavailableInitialOperations": ["replace_text"],
-            "unsupportedOperationAction": "leave_unchanged_and_explain",
+            "unsupportedOperationAction": "document_read_then_document_patch",
         }
 
         replay = await _call(handler, "document_inspect", {})
         assert replay.is_error is False, replay.content
         repeated = await _call(handler, "document_inspect", {})
-        assert repeated.is_error is True
-        assert "ARTIFACT_RANGE_QUERY_LIMIT" in repeated.content
-        assert "Reuse the earlier result" in repeated.content
+        assert repeated.is_error is False, repeated.content
+        assert json.loads(repeated.content)["protocol"]["inspectAgain"] is True
     finally:
         await service.close()
 
 
 @pytest.mark.asyncio
-async def test_ready_locate_rejects_candidate_and_stops_deterministic_retries(
+async def test_ready_locate_rejects_candidate_and_allows_idempotent_retries(
     tmp_path: Path,
 ) -> None:
     service, _store, _source, _ref, _created, _anchor, ctx = await _sent_img_context(
@@ -1037,10 +1307,10 @@ async def test_ready_locate_rejects_candidate_and_stops_deterministic_retries(
         assert unsupported_payload["status"] == "not_found"
         assert unsupported_payload["selectionStatus"] == "ready"
         assert unsupported_payload["reasonCode"] == "DOCUMENT_OPERATION_UNAVAILABLE"
-        assert unsupported_payload["retryAllowed"] is False
+        assert unsupported_payload["retryAllowed"] is True
         assert (
             unsupported_payload["nextAction"]
-            == "leave_unchanged_and_explain_without_retry"
+            == "document_read_then_document_patch"
         )
 
         repeated = await _call(
@@ -1048,9 +1318,10 @@ async def test_ready_locate_rejects_candidate_and_stops_deterministic_retries(
             "document_locate",
             {"annotation_order": 0, "operation": "replace_text"},
         )
-        assert repeated.is_error is True
-        assert "ARTIFACT_RANGE_QUERY_LIMIT" in repeated.content
-        assert "finish without calling it again" in repeated.content
+        assert repeated.is_error is False, repeated.content
+        repeated_payload = json.loads(repeated.content)
+        assert repeated_payload["status"] == "not_found"
+        assert repeated_payload["retryAllowed"] is True
     finally:
         await service.close()
 

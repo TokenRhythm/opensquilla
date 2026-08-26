@@ -12,6 +12,7 @@ _NAMES = [
     "agents",
     "artifacts",
     "artifact_editing",
+    "document_browser",
     "document_editing",
     "code_exec",
     "file_authoring",

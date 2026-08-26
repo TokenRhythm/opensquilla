@@ -30,7 +30,11 @@
 
 ## Novedades
 
-- 📢 **2026-07-03** — Nuestro informe técnico **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)** (versión preliminar) ya está disponible, publicado junto con OpenSquilla **0.5.0 Preview 1**. Detalla cómo el enrutador nativo del harness convierte el tráfico cotidiano de los agentes en un volante de datos que se mejora a sí mismo.
+- 📢 **2026-08-22** — La versión en inglés de nuestro informe técnico ya está disponible en aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). Consulta [Cita](#cita) para saber cómo citar OpenSquilla.
+
+- 📢 **2026-08-21** — Las versiones en PDF de nuestro informe técnico ya están disponibles en este repositorio: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
+
+- 📢 **2026-07-14** — Nuestro informe técnico **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** ya está disponible en arXiv. Muestra cómo el enrutador nativo del harness convierte el tráfico cotidiano de los agentes en un volante de datos que se mejora a sí mismo, y cómo **el enrutamiento de conjunto multi-modelo supera a Fable 5**.
 
 ---
 
@@ -40,7 +44,7 @@ OpenSquilla es un agente de IA con microkernel y eficiente en el uso de tokens. 
 
 Cada punto de entrada —Web UI, CLI y canales de chat— se ejecuta a través de ese mismo bucle, de modo que el envío de herramientas, los reintentos y el registro de decisiones se comportan de forma idéntica en todas partes. Una capa de proveedores conectable se comunica con TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, Qwen/DashScope y más de 20 proveedores de LLM adicionales, sin ningún cambio en tu código ni en el esquema de configuración.
 
-OpenSquilla 0.5.3 es la versión estable actual.
+OpenSquilla 0.5.4 es la versión estable actual.
 
 Para documentación de producto orientada a tareas, comienza por la [Guía de producto de OpenSquilla](README.product.md) o el [índice de documentación](docs/README.md).
 
@@ -54,7 +58,7 @@ Los instaladores de escritorio y la instalación rápida desde terminal te ofrec
 
 Los comandos de instalación de versiones usan los recursos de release publicados en GitHub. Las instalaciones del wheel de Python usan nombres de archivo de wheel con versión, porque los instaladores validan la versión incrustada en el nombre del archivo del wheel.
 
-Para el uso de escritorio de 0.5.3, opta por los instaladores de escritorio empaquetados de la Release de GitHub: `OpenSquilla-0.5.3-mac-arm64.dmg` en macOS y `OpenSquilla-0.5.3-win-x64.exe` en Windows.
+Para el uso de escritorio de 0.5.4, opta por los instaladores de escritorio empaquetados de la Release de GitHub: `OpenSquilla-0.5.4-mac-arm64.dmg` en macOS y `OpenSquilla-0.5.4-win-x64.exe` en Windows.
 
 | Ruta | Público | Cuándo usarla |
 | --- | --- | --- |
@@ -87,10 +91,10 @@ Enlaces de instalación: [Git](https://git-scm.com/downloads) ·
 
 ### Instaladores de escritorio
 
-Los instaladores de escritorio de 0.5.3 empaquetan la consola de control de Vue y el runtime del gateway en una carcasa de Electron.
+Los instaladores de escritorio de 0.5.4 empaquetan la consola de control de Vue y el runtime del gateway en una carcasa de Electron.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/OpenSquilla-0.5.3-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/OpenSquilla-0.5.3-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 Para descargas más rápidas desde China continental, usa los alias de descarga directa de OSS:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -132,7 +136,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Instala OpenSquilla**: el mismo comando en todas las plataformas.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 Esto instala el wheel de OpenSquilla desde la URL de la release y luego deja que `uv` descargue las dependencias declaradas por los extras seleccionados. El extra predeterminado `recommended` incluye dependencias del runtime de SquillaRouter como ONNX Runtime, LightGBM, NumPy y tokenizers, así que una primera instalación necesita acceso a la red salvo que esos wheels ya estén en caché. `uv` no instala runtimes nativos del sistema como `libomp` de macOS o el Visual C++ Redistributable de Windows; consulta [Solución de problemas](#troubleshooting) si el runtime del enrutador informa de un error de carga de biblioteca nativa.
@@ -148,7 +152,7 @@ opensquilla gateway run
 > Si no se encuentra `opensquilla` justo después de una instalación nueva con `uv`, abre una terminal nueva o vuelve a ejecutar la línea de PATH del paso 1.
 
 Para una instalación totalmente fijada, usa la URL del wheel con versión:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl`.
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
@@ -632,3 +636,23 @@ Las contribuciones de todo tipo son bienvenidas: informes de errores, ideas de f
 
 [Código de conducta](CODE_OF_CONDUCT.md) · [Seguridad](SECURITY.md) ·
 [Soporte](SUPPORT.md) · [Licencia](LICENSE) (Apache-2.0)
+
+---
+
+## Cita
+
+Si utilizas OpenSquilla en tu investigación, por favor cita nuestro informe técnico:
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

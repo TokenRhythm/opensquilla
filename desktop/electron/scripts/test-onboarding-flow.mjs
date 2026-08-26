@@ -135,6 +135,25 @@ async function bootWindow(app) {
   }, 'desktop boot window')
 }
 
+async function loadBootContractWindow(app) {
+  const desktopWindowId = await waitFor(async () => (
+    await app.evaluate(({ BrowserWindow }) => (
+      BrowserWindow.getAllWindows().find((candidate) => (
+        !candidate.isDestroyed()
+        && candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
+      ))?.id ?? null
+    ))
+  ), 'local Desktop renderer before the boot-page contract test')
+  await app.evaluate(async ({ BrowserWindow }, payload) => {
+    const window = BrowserWindow.fromId(payload.windowId)
+    if (!window || window.isDestroyed()) throw new Error('Desktop renderer is unavailable.')
+    await window.loadFile(payload.bootPath)
+  }, {
+    windowId: desktopWindowId,
+    bootPath: join(packageRoot, 'src', 'boot.html'),
+  })
+}
+
 async function sendBootEvent(app, channel, payload) {
   await app.evaluate(({ BrowserWindow }, event) => {
     const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -150,6 +169,20 @@ async function bootElapsedSeconds(page) {
   const match = /^(\d+(?:\.\d+)?)s$/.exec(text)
   assert.ok(match, `unexpected boot timer text: ${text}`)
   return Number(match[1])
+}
+
+async function waitForBootProgress(page, expected) {
+  return await waitFor(async () => {
+    const progress = page.locator('#startupProgress')
+    const value = Number(await progress.getAttribute('aria-valuenow'))
+    const count = (await page.locator('#progressCount').innerText()).trim()
+    const width = await progress.evaluate((element) => (
+      element.style.getPropertyValue('--boot-progress').trim()
+    ))
+    return value === expected && count === `${expected}/4`
+      ? { value, count, width }
+      : null
+  }, `boot progress to reach ${expected}/4`)
 }
 
 function boxesOverlap(left, right) {
@@ -185,11 +218,34 @@ async function verifyBootPhaseTimer(app) {
   const page = await bootWindow(app)
   const phase = page.locator('#phase')
   const timer = page.locator('#timer')
+  const progress = page.locator('#startupProgress')
   assert.equal(await phase.getAttribute('role'), 'status')
   assert.equal(await phase.getAttribute('aria-live'), 'polite')
   assert.equal(await phase.getAttribute('aria-atomic'), 'true')
   assert.equal(await timer.getAttribute('aria-hidden'), 'true')
   assert.equal(await page.locator('section.status').getAttribute('aria-live'), null)
+  assert.equal(await progress.getAttribute('role'), 'progressbar')
+  assert.equal(await progress.getAttribute('aria-labelledby'), 'phase')
+  assert.equal(await progress.getAttribute('aria-valuemin'), '0')
+  assert.equal(await progress.getAttribute('aria-valuemax'), '4')
+
+  const stateBeforeReload = await page.evaluate(async () => (
+    await window.opensquillaDesktop.getBootState()
+  ))
+  const persistedProgress = {
+    profile: 0,
+    'gateway-start': 1,
+    'gateway-health': 2,
+    control: 3,
+    ready: 4,
+  }[stateBeforeReload?.status?.phaseId] ?? 0
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await waitForBootProgress(page, persistedProgress)
+  await waitFor(async () => (
+    (await phase.innerText()).trim() === String(stateBeforeReload?.status?.label || '').trim()
+      ? true
+      : null
+  ), 'boot progress snapshot to restore after a splash reload')
 
   const staleStatus = {
     phaseId: 'gateway-start',
@@ -197,6 +253,7 @@ async function verifyBootPhaseTimer(app) {
     at: new Date(Date.now() - 3_000).toISOString(),
   }
   await sendBootEvent(app, 'desktop:boot:status', staleStatus)
+  assert.equal((await waitForBootProgress(page, 1)).width, '25%')
   const anchoredElapsed = await waitFor(async () => {
     const value = await bootElapsedSeconds(page)
     return value >= 2 ? value : null
@@ -208,6 +265,7 @@ async function verifyBootPhaseTimer(app) {
     at: new Date().toISOString(),
   }
   await sendBootEvent(app, 'desktop:boot:status', activeStatus)
+  assert.equal((await waitForBootProgress(page, 2)).width, '50%')
   const resetElapsed = await waitFor(async () => {
     const value = await bootElapsedSeconds(page)
     return value < anchoredElapsed - 1 ? value : null
@@ -237,6 +295,7 @@ async function verifyBootPhaseTimer(app) {
     label: invalidTimestampLabel,
     at: 'not-a-date',
   })
+  await waitForBootProgress(page, 2)
   const invalidTimestampValue = await waitFor(async () => {
     if ((await phase.innerText()).trim() !== invalidTimestampLabel) return null
     const value = await bootElapsedSeconds(page)
@@ -250,6 +309,7 @@ async function verifyBootPhaseTimer(app) {
     label: futureTimestampLabel,
     at: new Date(Date.now() + 60_000).toISOString(),
   })
+  assert.equal((await waitForBootProgress(page, 3)).width, '75%')
   const futureTimestampValue = await waitFor(async () => {
     if ((await phase.innerText()).trim() !== futureTimestampLabel) return null
     const value = await bootElapsedSeconds(page)
@@ -257,22 +317,47 @@ async function verifyBootPhaseTimer(app) {
   }, 'future boot timestamp to clamp near zero')
   assert.ok(futureTimestampValue.value >= 0 && futureTimestampValue.value < 2)
 
+  const activeStepBeforeUnknown = await page.locator('.step.active').getAttribute('data-step')
+  await sendBootEvent(app, 'desktop:boot:status', {
+    phaseId: 'future-phase',
+    label: 'Synthetic future phase',
+    at: new Date().toISOString(),
+  })
+  await waitFor(async () => (
+    (await phase.innerText()).trim() === 'Synthetic future phase' ? true : null
+  ), 'unknown boot phase label to render')
+  await waitForBootProgress(page, 3)
+  assert.equal(
+    await page.locator('.step.active').getAttribute('data-step'),
+    activeStepBeforeUnknown,
+    'an unknown phase must not move the visible milestone state',
+  )
+
+  await sendBootEvent(app, 'desktop:boot:status', {
+    phaseId: 'ready',
+    label: 'Synthetic ready',
+    at: new Date().toISOString(),
+  })
+  assert.equal((await waitForBootProgress(page, 4)).width, '100%')
+
   await sendBootEvent(app, 'desktop:boot:error', { message: 'Synthetic boot pause.' })
   await delay(150)
   const frozenText = await timer.innerText()
   await delay(350)
   assert.equal(await timer.innerText(), frozenText, 'boot errors must freeze the elapsed timer')
+  await waitForBootProgress(page, 4)
 
   await sendBootEvent(app, 'desktop:boot:status', {
     phaseId: 'profile',
     label: 'Synthetic retry',
     at: new Date().toISOString(),
   })
+  await waitForBootProgress(page, 0)
   await delay(350)
   assert.notEqual(await timer.innerText(), frozenText, 'a new retry status must resume phase timing')
 }
 
-async function launchIsolatedOnboarding(prefix, gatewayPort) {
+async function launchIsolatedOnboarding(prefix) {
   const userDataRoot = await mkdtemp(join(tmpdir(), prefix))
   const userDataDir = join(userDataRoot, 'chromium-user-data')
   const isolatedHome = join(userDataRoot, 'home')
@@ -289,7 +374,6 @@ async function launchIsolatedOnboarding(prefix, gatewayPort) {
       USERPROFILE: isolatedHome,
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
-      OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(gatewayPort),
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION: '',
       LANG: 'en_US.UTF-8',
@@ -419,10 +503,14 @@ async function assertSubmitRestored(
 async function verifySubmitFeedbackAndSingleFlight() {
   const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
     'opensquilla-electron-onboarding-submit-test-',
-    18896,
   )
   try {
     const page = await setupWindow(app)
+    // Normal startup now keeps the local Desktop renderer mounted while the
+    // runtime is unavailable. Load the recovery document explicitly so its
+    // timer/progress contract remains covered without restoring the old
+    // gateway-owned shell lifecycle.
+    await loadBootContractWindow(app)
     await verifyBootPhaseTimer(app)
     const submitClockOrigin = Date.now()
     await page.clock.install({ time: submitClockOrigin })
@@ -549,11 +637,35 @@ await verifySubmitFeedbackAndSingleFlight()
 
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
   'opensquilla-electron-onboarding-test-',
-  18897,
 )
+const rendererDiagnostics = []
+const observeRenderer = (candidate) => {
+  candidate.on('console', (message) => rendererDiagnostics.push(`console:${message.type()}:${message.text()}`))
+  candidate.on('pageerror', (error) => rendererDiagnostics.push(`pageerror:${error.message || error}`))
+}
+for (const candidate of app.windows()) observeRenderer(candidate)
+app.on('window', observeRenderer)
 
 try {
   const page = await setupWindow(app)
+  const desktopPage = await waitFor(async () => {
+    for (const candidate of app.windows()) {
+      if (candidate.isClosed()) continue
+      if (candidate.url().startsWith('opensquilla-app://desktop/')) return candidate
+    }
+    return null
+  }, 'local Desktop renderer')
+  assert.equal(
+    desktopPage.url(),
+    'opensquilla-app://desktop/chat/new',
+    'the local Desktop renderer must exist before onboarding and Gateway readiness',
+  )
+  assert.equal(await desktopPage.locator('#app').count(), 1)
+  const startingConnection = await desktopPage.evaluate(
+    () => window.opensquillaDesktop?.getGatewayConnection?.(),
+  )
+  assert.equal(startingConnection?.status, 'starting')
+  assert.equal(startingConnection?.wsUrl, null)
   const pageErrors = []
   page.on('pageerror', (error) => pageErrors.push(error.message || String(error)))
   const providerScreen = page.locator('[data-screen="1"]')
@@ -893,6 +1005,113 @@ try {
   assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.2"[\s\S]*?ensemble_enabled = true/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
+
+  const readyConnection = await waitFor(async () => {
+    const connection = await desktopPage.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    )
+    return connection?.status === 'ready' ? connection : null
+  }, 'ready Desktop Gateway descriptor')
+  assert.match(readyConnection.httpUrl, /^http:\/\/127\.0\.0\.1:\d+$/)
+  assert.equal(
+    readyConnection.wsUrl,
+    readyConnection.httpUrl.replace(/^http:/, 'ws:') + '/ws',
+  )
+  assert.equal(typeof readyConnection.instanceId, 'string')
+  const readyRendererState = await desktopPage.evaluate(() => {
+    const banner = document.getElementById('desktop-runtime-banner')
+    return {
+      appChildren: document.querySelector('#app')?.childElementCount ?? -1,
+      bannerHidden: banner?.hidden ?? null,
+      bannerState: banner?.dataset.state || '',
+      bannerText: banner?.textContent || '',
+      scripts: [...document.scripts].map(script => script.src || '<inline>'),
+    }
+  })
+  assert.equal(
+    readyRendererState.bannerHidden,
+    true,
+    `the local renderer should stay loaded and hide its runtime banner after readiness: ${JSON.stringify({ readyRendererState, rendererDiagnostics })}`,
+  )
+
+  const apiBoundary = await desktopPage.evaluate(async () => {
+    const response = await fetch('/api/system/status')
+    return {
+      status: response.status,
+      csp: response.headers.get('content-security-policy') || '',
+      nosniff: response.headers.get('x-content-type-options') || '',
+    }
+  })
+  assert.equal(apiBoundary.status, 200)
+  assert.match(apiBoundary.csp, /sandbox/)
+  assert.match(apiBoundary.csp, /frame-ancestors 'none'/)
+  assert.equal(apiBoundary.nosniff, 'nosniff')
+
+  await desktopPage.evaluate(() => window.location.assign('/api/system/status'))
+  await delay(300)
+  assert.equal(
+    desktopPage.url(),
+    'opensquilla-app://desktop/chat/new',
+    'API responses must not replace the privileged Desktop document',
+  )
+
+  const childFrameBoundary = await desktopPage.evaluate(async () => {
+    const frame = document.createElement('iframe')
+    frame.src = '/api/system/status'
+    document.body.appendChild(frame)
+    await new Promise(resolve => setTimeout(resolve, 300))
+    let location = 'inaccessible'
+    try { location = frame.contentWindow?.location.href || '' } catch {}
+    let bridge = 'inaccessible'
+    try { bridge = typeof frame.contentWindow?.opensquillaDesktop } catch {}
+    frame.remove()
+    return { bridge, location }
+  })
+  assert.notEqual(childFrameBoundary.location, 'opensquilla-app://desktop/api/system/status')
+  assert.notEqual(childFrameBoundary.bridge, 'object')
+
+  const browserControlWindowId = await app.evaluate(async ({ BrowserWindow }, url) => {
+    const window = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    })
+    await window.loadURL(url)
+    return window.id
+  }, `${readyConnection.httpUrl}/control/`)
+  const browserControlPage = await waitFor(async () => {
+    for (const candidate of app.windows()) {
+      if (candidate.isClosed()) continue
+      if (candidate.url().startsWith(`${readyConnection.httpUrl}/control`)) return candidate
+    }
+    return null
+  }, 'browser Control UI window')
+  await waitFor(
+    async () => await browserControlPage.locator('#app > *').count() > 0,
+    'browser Control UI Vue mount',
+  )
+  await app.evaluate(({ BrowserWindow }, id) => {
+    BrowserWindow.fromId(id)?.destroy()
+  }, browserControlWindowId)
+
+  const shutdownStatus = await desktopPage.evaluate(async () => {
+    const response = await fetch('/api/system/shutdown', { method: 'POST' })
+    return response.status
+  })
+  assert.equal(shutdownStatus, 202)
+  await waitFor(async () => {
+    const connection = await desktopPage.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    )
+    return connection?.status === 'error' ? connection : null
+  }, 'Gateway stop to become a Desktop capability error')
+  assert.equal(desktopPage.url(), 'opensquilla-app://desktop/chat/new')
+  assert.equal(await desktopPage.locator('#app').count(), 1)
+  assert.equal(await desktopPage.locator('#desktop-runtime-banner').isVisible(), true)
+  assert.equal(await desktopPage.locator('#desktop-runtime-retry').isVisible(), true)
 
   console.log(JSON.stringify({
     ok: true,

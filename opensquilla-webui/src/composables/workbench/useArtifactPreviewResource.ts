@@ -5,6 +5,7 @@ import { artifactExtension, artifactName } from '@/utils/chat/artifacts'
 import {
   artifactAccessHeaders,
   artifactAccessUrl,
+  isTrustedArtifactTransportUrl,
 } from '@/utils/chat/artifactAccess'
 import {
   artifactPreviewLimit,
@@ -104,17 +105,6 @@ const GENERIC_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 function defaultBaseOrigin(): string {
   if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
   return 'http://localhost'
-}
-
-function isSameOriginHttpUrl(url: string, baseOrigin: string): boolean {
-  try {
-    const resolved = new URL(url, baseOrigin)
-    const base = new URL(baseOrigin)
-    return (resolved.protocol === 'http:' || resolved.protocol === 'https:')
-      && resolved.origin === base.origin
-  } catch {
-    return false
-  }
 }
 
 function isInlineWorkbenchAttachmentUrl(artifact: ArtifactPayload, url: string): boolean {
@@ -398,7 +388,7 @@ export function createArtifactPreviewResource(
     const baseOrigin = options.baseOrigin?.() || defaultBaseOrigin()
     const url = artifactAccessUrl(artifact, baseOrigin)
     const inlineAttachment = isInlineWorkbenchAttachmentUrl(artifact, url)
-    if (!url || (!inlineAttachment && !isSameOriginHttpUrl(url, baseOrigin))) {
+    if (!url || (!inlineAttachment && !isTrustedArtifactTransportUrl(url, baseOrigin))) {
       setFailure('error', 'missing-url')
       return
     }

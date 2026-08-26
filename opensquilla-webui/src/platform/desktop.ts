@@ -1,6 +1,7 @@
 import { desktopCapabilities } from './capabilities'
 import type {
   CliInvocation,
+  DesktopGatewayConnection,
   DesktopUpdateErrorCode,
   DesktopUpdateInstallMode,
   DesktopUpdateSource,
@@ -12,6 +13,34 @@ import type {
   NativeWorkbenchSurfaceEventType,
   Platform,
 } from './types'
+
+const DESKTOP_GATEWAY_STATUSES = new Set(['starting', 'ready', 'stopped', 'error'])
+
+function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConnection {
+  const raw = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown>
+    : {}
+  if (
+    raw.schemaVersion !== 1
+    || !Number.isInteger(raw.revision)
+    || !DESKTOP_GATEWAY_STATUSES.has(String(raw.status))
+  ) {
+    throw new Error('The Desktop Gateway connection descriptor is invalid.')
+  }
+  return {
+    schemaVersion: 1,
+    revision: raw.revision as number,
+    status: raw.status as DesktopGatewayConnection['status'],
+    instanceId: typeof raw.instanceId === 'string' ? raw.instanceId : null,
+    profileFingerprint: typeof raw.profileFingerprint === 'string'
+      ? raw.profileFingerprint
+      : '',
+    httpUrl: typeof raw.httpUrl === 'string' ? raw.httpUrl : null,
+    wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
+    authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
+    error: typeof raw.error === 'string' ? raw.error : null,
+  }
+}
 
 function requireDesktopApi(): OpenSquillaDesktopApi {
   const api = window.opensquillaDesktop
@@ -58,6 +87,7 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'annotation-submit',
   'annotation-cancel',
   'annotation-overlay-fallback',
+  'agent-edit-released',
 ])
 
 function normalizeArtifactAnnotationSelection(
@@ -109,12 +139,12 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
   if (!payload || typeof payload !== 'object') return null
   const raw = payload as Record<string, unknown>
   if (
-    (raw.version !== 1 && raw.version !== 2 && raw.version !== 3)
+    (raw.version !== 1 && raw.version !== 2 && raw.version !== 3 && raw.version !== 4)
     || typeof raw.surfaceId !== 'string'
     || !NATIVE_SURFACE_EVENT_TYPES.has(raw.type as NativeWorkbenchSurfaceEventType)
   ) return null
   const annotationEvent = typeof raw.type === 'string' && raw.type.startsWith('annotation-')
-  if (annotationEvent && raw.version !== 3) return null
+  if (annotationEvent && raw.version !== 3 && raw.version !== 4) return null
   const rawDetail = raw.detail && typeof raw.detail === 'object'
     ? raw.detail as Record<string, unknown>
     : null
@@ -161,6 +191,10 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
           : {}),
         ...(typeof rawDetail.action === 'string' ? { action: rawDetail.action } : {}),
         ...(typeof rawDetail.code === 'string' ? { code: rawDetail.code } : {}),
+        ...(typeof rawDetail.surfaceInstanceId === 'string'
+          && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.surfaceInstanceId)
+          ? { surfaceInstanceId: rawDetail.surfaceInstanceId }
+          : {}),
       }
     : undefined
   return {
@@ -239,7 +273,9 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
         : {}
       const versions = Array.isArray(raw.protocolVersions)
         ? raw.protocolVersions.filter(
-            (value): value is 1 | 2 | 3 => value === 1 || value === 2 || value === 3,
+            (value): value is 1 | 2 | 3 | 4 => (
+              value === 1 || value === 2 || value === 3 || value === 4
+            ),
           )
         : []
       const modes = Array.isArray(raw.modes)
@@ -268,13 +304,14 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
               ? payload as Record<string, unknown>
               : {}
             return {
-              version: 3 as const,
-              available: raw.version === 3 && raw.available === true,
+              version: raw.version === 4 ? 4 as const : 3 as const,
+              available: (raw.version === 3 || raw.version === 4) && raw.available === true,
               ...(typeof raw.picker === 'boolean' ? { picker: raw.picker } : {}),
               ...(typeof raw.trustedOverlay === 'boolean'
                 ? { trustedOverlay: raw.trustedOverlay }
                 : {}),
               ...(raw.overlayCopyVersion === 1 ? { overlayCopyVersion: 1 as const } : {}),
+              ...(raw.atomicCloseRearm === true ? { atomicCloseRearm: true as const } : {}),
               ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
             }
           },
@@ -467,6 +504,27 @@ export function createDesktopPlatform(): Platform {
     },
     gateway: {
       getStatus: () => requireDesktopApi().getGatewayStatus(),
+      ...(typeof desktopApi.getGatewayConnection === 'function'
+        ? {
+            getConnection: async () => normalizeDesktopGatewayConnection(
+              await requireDesktopApi().getGatewayConnection!(),
+            ),
+          }
+        : {}),
+      ...(typeof desktopApi.onGatewayConnectionChanged === 'function'
+        ? {
+            onConnection: (callback: (connection: DesktopGatewayConnection) => void) => (
+              requireDesktopApi().onGatewayConnectionChanged!((payload) => {
+                try {
+                  callback(normalizeDesktopGatewayConnection(payload))
+                } catch {
+                  // Ignore malformed main-process events; the next trusted
+                  // snapshot or event will restore the authoritative state.
+                }
+              })
+            ),
+          }
+        : {}),
       revealLog: () => requireDesktopApi().revealGatewayLog(),
       retryStartup: () => requireDesktopApi().retryStartup(),
       async getCliInvocation(): Promise<CliInvocation | null> {

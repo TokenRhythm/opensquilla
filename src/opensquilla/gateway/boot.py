@@ -3012,7 +3012,23 @@ async def build_services(
             ensure_sandbox_upgrade_migrated,
         )
 
-        upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        sandbox_upgrade_started_at = time.monotonic()
+        log.info("build_services.sandbox_upgrade_started")
+        try:
+            upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        except Exception as exc:
+            log.exception(
+                "build_services.sandbox_upgrade_failed",
+                duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log.info(
+            "build_services.sandbox_upgrade_finished",
+            ok=upgrade_report.ok,
+            status=upgrade_report.status,
+            duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
+        )
         if not upgrade_report.ok:
             raise RuntimeError(
                 "migration_failed_manual_recovery_required: "
@@ -3124,6 +3140,7 @@ async def build_services(
         from opensquilla.artifacts import ArtifactStore
         from opensquilla.gateway.artifact_mutation_recovery import (
             reconcile_pending_artifact_mutations,
+            reject_orphaned_artifact_drafts,
         )
         from opensquilla.gateway.document_resource_recovery import (
             reconcile_pending_document_resources,
@@ -3144,6 +3161,10 @@ async def build_services(
         )
 
         try:
+            draft_recovery_summary = await reject_orphaned_artifact_drafts(
+                artifact_recovery_service,
+                ArtifactStore(media_root_from_config(config)),
+            )
             recovery_summary = await reconcile_pending_artifact_mutations(
                 artifact_recovery_service,
                 ArtifactStore(media_root_from_config(config)),
@@ -3166,6 +3187,14 @@ async def build_services(
                 failed=recovery_summary.failed,
                 ambiguous=recovery_summary.ambiguous,
                 deleted_candidates=recovery_summary.deleted_candidates,
+            )
+        if draft_recovery_summary.examined:
+            log.info(
+                "build_services.artifact_drafts_reconciled",
+                examined=draft_recovery_summary.examined,
+                rejected=draft_recovery_summary.rejected,
+                ambiguous=draft_recovery_summary.ambiguous,
+                deleted_candidates=draft_recovery_summary.deleted_candidates,
             )
         if resource_recovery_summary.examined:
             log.info(
@@ -5265,7 +5294,25 @@ async def start_gateway_server(
 
     if run:
         preview_service = server_handle._preview_service
-        if preview_service is not None and config.control_ui.enabled:
+        # The isolated preview listener is also required by the Electron
+        # candidate loop.  Desktop-owned profiles intentionally disable the
+        # Control UI during startup, but browser verification still needs a
+        # loopback resource origin for the opaque candidate handle.  The
+        # process-local bridge client is the authority for this exception;
+        # ordinary headless gateways do not open a listener merely because
+        # the preview service was registered.
+        desktop_bridge_available = False
+        try:
+            from opensquilla.gateway.desktop_artifact_bridge import (
+                get_desktop_artifact_bridge_client,
+            )
+
+            desktop_bridge_available = get_desktop_artifact_bridge_client() is not None
+        except Exception:  # noqa: BLE001 - listener startup remains fail-closed
+            desktop_bridge_available = False
+        if preview_service is not None and (
+            config.control_ui.enabled or desktop_bridge_available
+        ):
             preview_socket: socket.socket | None = None
             try:
                 from opensquilla.gateway.artifact_preview import (

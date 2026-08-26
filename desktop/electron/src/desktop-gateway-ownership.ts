@@ -5,6 +5,7 @@ import { join, normalize, resolve } from 'node:path'
 
 export const DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION = 1
 export const DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL = 'opensquilla-desktop-gateway-ownership-v1'
+const DESKTOP_GATEWAY_AUTH_CONTEXT = 'opensquilla-desktop-gateway-auth-v1'
 
 const OWNER_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/
 const PROFILE_FINGERPRINT_RE = /^[0-9a-f]{64}$/
@@ -246,6 +247,12 @@ export function desktopGatewayIdentityProof(
 ): string {
   return createHmac('sha256', nonce)
     .update(canonicalDesktopGatewayIdentityPayload(payload), 'utf8')
+    .digest('hex')
+}
+
+export function desktopGatewayAuthToken(nonce: string): string {
+  return createHmac('sha256', nonce)
+    .update(DESKTOP_GATEWAY_AUTH_CONTEXT, 'ascii')
     .digest('hex')
 }
 

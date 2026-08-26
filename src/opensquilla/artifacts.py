@@ -2199,6 +2199,59 @@ class ArtifactStore:
                 pass
         return removed
 
+    def list_internal_refs(
+        self,
+        session_id: str,
+        *,
+        source_suffix: str | None = None,
+        limit: int = 500,
+    ) -> tuple[ArtifactRef, ...]:
+        """List a bounded set of hidden artifact refs owned by a session.
+
+        This is intentionally narrower than the public artifact listing: the
+        internal marker is the only visibility authority and callers can opt
+        into an exact source suffix.  Candidate recovery uses that suffix to
+        find blobs published immediately before a process died, without ever
+        scanning or deleting listed/user artifacts.
+        """
+
+        session_id = _validate_non_empty("session_id", session_id)
+        if isinstance(limit, bool) or not 1 <= limit <= 5000:
+            raise ArtifactError("limit must be between 1 and 5000")
+        if source_suffix is not None:
+            if (
+                not isinstance(source_suffix, str)
+                or not source_suffix
+                or len(source_suffix) > 512
+            ):
+                raise ArtifactError("source_suffix must be a bounded string")
+        refs: list[ArtifactRef] = []
+        for meta_path in self._iter_session_meta_paths_for_listing(session_id):
+            if len(refs) >= limit:
+                break
+            artifact_dir = meta_path.parent
+            marker_path = artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME
+            try:
+                marker_stat = native_io_path(marker_path).lstat()
+                if (
+                    not stat.S_ISREG(marker_stat.st_mode)
+                    or stat.S_ISLNK(marker_stat.st_mode)
+                    or _is_reparse_point(marker_path)
+                ):
+                    continue
+                ref = ArtifactRef.from_dict(
+                    json.loads(native_io_path(meta_path).read_text(encoding="utf-8"))
+                )
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                # Recovery must fail closed on malformed or raced buckets.
+                continue
+            if ref.session_id != session_id:
+                continue
+            if source_suffix is not None and not ref.source.endswith(source_suffix):
+                continue
+            refs.append(ref)
+        return tuple(refs)
+
     def _iter_session_meta_paths(self, session_id: str) -> Iterator[Path]:
         """Yield every artifact ``meta.json`` for ``session_id`` across all store layouts."""
         roots = (

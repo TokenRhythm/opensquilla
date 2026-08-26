@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
+from opensquilla.gateway.terminal_activity import (
+    build_terminal_activity_snapshot,
+    terminal_activity_snapshot,
+)
 
 _JS_MAX_SAFE_INTEGER = (1 << 53) - 1
 _ANSWER_GENERATION_RESET_EVENT = "session.event.answer_generation_reset"
@@ -77,6 +81,11 @@ class SessionStreamRegistry:
         self._live_events_by_session: dict[str, list[BufferedSessionEvent]] = {}
         self._live_task_by_session: dict[str, str | None] = {}
         self._live_generation_epoch_by_session: dict[str, int | None] = {}
+        # A done/error frame clears the active snapshot before TaskRuntime
+        # persists its terminal row. Build the allowlisted v2 immediately and
+        # retain only that sanitized, identity-bound value across the handoff.
+        self._terminal_activity_snapshots_by_task: dict[str, dict[str, Any]] = {}
+        self._terminal_task_order: deque[str] = deque()
         self._completed_events_by_session: dict[str, deque[BufferedSessionEvent]] = {}
         self._reset_stream_seqs_by_session: dict[str, list[int]] = {}
         self._reset_events_by_session: dict[str, dict[int, BufferedSessionEvent]] = {}
@@ -172,6 +181,99 @@ class SessionStreamRegistry:
         self._live_events_by_session.pop(session_key, None)
         self._live_task_by_session.pop(session_key, None)
         self._live_generation_epoch_by_session.pop(session_key, None)
+
+    def _store_terminal_activity_snapshot(
+        self,
+        session_key: str,
+        terminal_event: BufferedSessionEvent | None = None,
+    ) -> None:
+        task_id = (
+            self._task_id(terminal_event.payload)
+            if terminal_event is not None
+            else self._live_task_by_session.get(session_key)
+        )
+        if not task_id:
+            return
+        events = list(self._live_events_by_session.get(session_key, ()))
+        if terminal_event is not None:
+            events.append(terminal_event)
+        events.sort(key=lambda item: item.stream_seq)
+        if not events:
+            return
+        turn_id = (
+            self._identity_value(
+                terminal_event.payload,
+                "turn_id",
+                "turnId",
+            )
+            if terminal_event is not None
+            else None
+        ) or task_id
+        snapshot = build_terminal_activity_snapshot(
+            events,
+            task_id=task_id,
+            turn_id=turn_id,
+            terminal_at=(
+                terminal_event.payload.get("emitted_at")
+                if terminal_event is not None
+                else None
+            ),
+        )
+        snapshot = terminal_activity_snapshot(
+            snapshot,
+            task_id=task_id,
+            turn_id=turn_id,
+        )
+        if snapshot is None:
+            return
+        if task_id not in self._terminal_activity_snapshots_by_task:
+            self._terminal_task_order.append(task_id)
+        self._terminal_activity_snapshots_by_task[task_id] = snapshot
+        # Terminal persistence normally consumes immediately. This defensive
+        # bound covers crashes in the finalizer without retaining raw events
+        # or whole runs for the process lifetime.
+        while len(self._terminal_task_order) > 64:
+            stale_task_id = self._terminal_task_order.popleft()
+            self._terminal_activity_snapshots_by_task.pop(stale_task_id, None)
+
+    def take_terminal_activity_snapshot(
+        self,
+        session_key: str,
+        task_id: str,
+        *,
+        turn_id: str,
+        terminal_at: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Take one sanitized terminal activity snapshot exactly once."""
+
+        frozen = self._terminal_activity_snapshots_by_task.pop(task_id, None)
+        if frozen is not None:
+            try:
+                self._terminal_task_order.remove(task_id)
+            except ValueError:
+                # A snapshot may outlive its bounded-order bookkeeping entry.
+                pass
+            return terminal_activity_snapshot(
+                frozen,
+                task_id=task_id,
+                turn_id=turn_id,
+            )
+        if self._live_task_by_session.get(session_key) != task_id:
+            return None
+        # Cancellation/timeout/abandon can terminalize without a stream
+        # done/error frame. Build directly from the active compact view and
+        # pass the durable terminal timestamp from TaskRuntime.
+        snapshot = build_terminal_activity_snapshot(
+            list(self._live_events_by_session.get(session_key, ())),
+            task_id=task_id,
+            turn_id=turn_id,
+            terminal_at=terminal_at,
+        )
+        return terminal_activity_snapshot(
+            snapshot,
+            task_id=task_id,
+            turn_id=turn_id,
+        )
 
     def _trim_session_events(self, events: deque[BufferedSessionEvent]) -> None:
         while len(events) > self._max_events_per_session:
@@ -316,6 +418,13 @@ class SessionStreamRegistry:
         existing = events[index]
         payload = dict(existing.payload)
         payload[field] = f"{payload.get(field, '')}{event.payload.get(field, '')}"
+        # Keep the first event's stream_seq/emitted_at as the stable anchor,
+        # but retain the latest accepted boundary for duration reconstruction.
+        ended_at = event.payload.get("ended_at", event.payload.get("endedAt"))
+        if not isinstance(ended_at, int) or isinstance(ended_at, bool):
+            ended_at = event.payload.get("emitted_at", event.payload.get("emittedAt"))
+        if isinstance(ended_at, int) and not isinstance(ended_at, bool):
+            payload["ended_at"] = ended_at
         for metadata_field in ("generation_epoch", "generationEpoch", "sequence"):
             if metadata_field in event.payload:
                 payload[metadata_field] = event.payload[metadata_field]
@@ -331,10 +440,22 @@ class SessionStreamRegistry:
         event: BufferedSessionEvent,
     ) -> None:
         existing_events = self._live_events_by_session.get(session_key, [])
+        started_tool_ids = {
+            self._tool_id(existing.payload)
+            for existing in existing_events
+            if existing.event_name == "session.event.tool_use_start"
+            and self._same_turn_identity(existing, event)
+        }
         completed_tool_ids = {
             self._tool_id(existing.payload)
             for existing in existing_events
-            if existing.event_name == "session.event.tool_use_end"
+            if (
+                existing.event_name == "session.event.tool_use_end"
+                or (
+                    existing.event_name == "session.event.tool_result"
+                    and self._tool_id(existing.payload) in started_tool_ids
+                )
+            )
             and self._same_turn_identity(existing, event)
         }
         completed_tool_timeline_events = {
@@ -342,12 +463,31 @@ class SessionStreamRegistry:
             "session.event.tool_use_delta",
             "session.event.tool_use_end",
         }
+        resolved_approval_ids = {
+            self._identity_value(existing.payload, "approval_id", "approvalId")
+            for existing in existing_events
+            if existing.event_name.endswith(".approval.resolved")
+            and self._same_turn_identity(existing, event)
+        }
         preserved = [
             existing
             for existing in existing_events
             if self._same_turn_identity(existing, event)
             and (
                 self._is_completed_turn_event(existing.event_name)
+                or existing.event_name == "session.event.compaction"
+                or (
+                    (
+                        existing.event_name.endswith(".approval.requested")
+                        or existing.event_name.endswith(".approval.resolved")
+                    )
+                    and self._identity_value(
+                        existing.payload,
+                        "approval_id",
+                        "approvalId",
+                    )
+                    in resolved_approval_ids
+                )
                 or (
                     existing.event_name in completed_tool_timeline_events
                     and self._tool_id(existing.payload) in completed_tool_ids
@@ -395,6 +535,7 @@ class SessionStreamRegistry:
             self._live_task_by_session[session_key] = None
 
         if event.event_name in {"session.event.done", "session.event.error"}:
+            self._store_terminal_activity_snapshot(session_key, event)
             self._clear_live_state(session_key)
             return
 
@@ -473,6 +614,12 @@ class SessionStreamRegistry:
                     events.append(event)
                     return
                 if (
+                    events[-1].payload.get("presentation")
+                    != event.payload.get("presentation")
+                ):
+                    events.append(event)
+                    return
+                if (
                     self._generation_epoch(events[-1].payload) is not None
                     and self._generation_epoch(event.payload) is not None
                     and self._generation_epoch(events[-1].payload)
@@ -506,7 +653,15 @@ class SessionStreamRegistry:
                     continue
                 if str(existing.payload.get("phase") or "") != phase:
                     continue
-                events[index] = event
+                payload = {**existing.payload, **event.payload}
+                payload["stream_seq"] = existing.stream_seq
+                if "started_at" in existing.payload:
+                    payload["started_at"] = existing.payload["started_at"]
+                events[index] = BufferedSessionEvent(
+                    event_name=existing.event_name,
+                    payload=payload,
+                    stream_seq=existing.stream_seq,
+                )
                 return
         events.append(event)
 

@@ -48,6 +48,40 @@ export function isInternalToolName(name: string): boolean {
   return name === 'router_control'
 }
 
+const DOCUMENT_AGENT_TOOL_NAMES = [
+  'document_inspect',
+  'document_read',
+  'document_locate',
+  'document_apply',
+  'document_patch',
+  'document_browser_inspect',
+  'document_browser_act',
+  'document_browser_screenshot',
+  'document_browser_reload',
+  'document_finish',
+] as const
+
+function hasToolNameSuffix(name: string, tool: string): boolean {
+  return name === tool
+    || name.endsWith(`.${tool}`)
+    || name.endsWith(`/${tool}`)
+    || name.endsWith(`:${tool}`)
+    || name.endsWith(`__${tool}`)
+}
+
+/** All tools participating in the bound-document autonomous editing loop. */
+export function isDocumentAgentToolName(name: string | undefined): boolean {
+  const normalized = String(name || '').trim().toLowerCase()
+  return Boolean(normalized)
+    && DOCUMENT_AGENT_TOOL_NAMES.some(tool => hasToolNameSuffix(normalized, tool))
+}
+
+export function isDocumentWriterToolName(name: string | undefined): boolean {
+  const normalized = String(name || '').trim().toLowerCase()
+  if (!normalized) return false
+  return ['document_apply', 'document_patch'].some(tool => hasToolNameSuffix(normalized, tool))
+}
+
 export function normalizeToolInputText(raw: unknown): string {
   const record = asRecord(raw)
   const value = record?.input ?? record?.arguments ?? ''
@@ -90,12 +124,13 @@ export function toolIconName(name: string): IconName {
 
 export function toolOperationKey(name: string): string {
   const n = String(name || '').toLowerCase()
-  if (['document_inspect', 'document_read', 'document_locate'].some(tool => (
-    n === tool || n.endsWith(`.${tool}`) || n.endsWith(`/${tool}`) || n.endsWith(`__${tool}`)
-  ))) return 'document.read'
-  if (['document_apply', 'document_patch'].some(tool => (
-    n === tool || n.endsWith(`.${tool}`) || n.endsWith(`/${tool}`) || n.endsWith(`__${tool}`)
-  ))) return 'document.update'
+  if (['document_inspect', 'document_read', 'document_locate',
+    'document_browser_inspect', 'document_browser_screenshot', 'document_browser_reload',
+  ].some(tool => hasToolNameSuffix(n, tool))) return 'document.read'
+  if (isDocumentWriterToolName(n)) return 'document.update'
+  if (['document_browser_act', 'document_finish'].some(tool => hasToolNameSuffix(n, tool))) {
+    return 'document.update'
+  }
   if (n.includes('web_discover')) return 'web.discover'
   if (n.includes('web_search') || n === 'search' || n.includes('google') || n.includes('bing')) return 'web.search'
   if (n.includes('web_fetch') || n.includes('http') || n.includes('fetch') || n.includes('curl') || n.includes('wget')) return 'web.read'

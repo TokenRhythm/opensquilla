@@ -28,48 +28,73 @@ def test_desktop_resume_is_visible_first_and_single_flight() -> None:
     assert "function ensureGatewayStarted(): Promise<GatewayState>" in main_ts
     assert "gatewayStartPromise = startGatewayWithPortRecovery().finally" in main_ts
     assert "gatewayStartPromise = null" in main_ts
-    assert (
-        "function isCurrentWindowAtControlUi(window: BrowserWindow, gatewayUrl: string): boolean"
-        in main_ts
-    )
+    assert "function isCurrentWindowAtDesktopRenderer(window: BrowserWindow): boolean" in main_ts
 
     assert resume.index("await createMainWindow()") < resume.index("ensureGatewayStarted()")
+    assert resume.index("loadDesktopRendererIntoCurrentWindow()") < resume.index(
+        "ensureGatewayStarted()"
+    )
     assert "focusMainWindow()" in resume
     assert "reuseHealthyGatewayState(" in resume
-    assert "loadControlUiIntoCurrentWindow(" in resume
+    assert "loadControlUiIntoCurrentWindow" not in resume
 
 
-def test_desktop_gateway_completion_uses_current_live_window() -> None:
+def test_desktop_renderer_is_local_and_gateway_connection_is_described() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     load_current = _section(
         main_ts,
-        "async function loadControlUiIntoCurrentWindow",
+        "async function loadDesktopRendererIntoCurrentWindow",
         "async function openOrResumeDesktopApp",
     )
 
     assert "function currentMainWindow(): BrowserWindow | null" in main_ts
     assert "const window = currentMainWindow()" in load_current
     assert "if (!window) return" in load_current
-    assert "if (window.isDestroyed()) return" in load_current
-    assert "isCurrentWindowAtControlUi(window, gatewayUrl)" in load_current
-    guard_index = load_current.index("isCurrentWindowAtControlUi(window, gatewayUrl)")
-    load_index = load_current.index("await loadControlUi(window, gatewayUrl)")
+    guard_index = load_current.index("isCurrentWindowAtDesktopRenderer(window)")
+    load_index = load_current.index("await window.loadURL(DESKTOP_RENDERER_URL)")
     assert guard_index < load_index
-    assert "current.pathname === '/control'" in main_ts
-    assert "current.pathname.startsWith('/control/')" in main_ts
+    assert "desktopGatewayConnectionSnapshot" in main_ts
+    assert "gateway:connection-changed" in main_ts
+    assert "gateway:connection" in _read("desktop/electron/src/preload.cts")
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
-def test_desktop_opens_directly_on_the_new_task_route() -> None:
+def test_desktop_renderer_privileges_are_limited_to_main_spa_documents() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    load_control = _section(
+    protocol = _read("desktop/electron/src/desktop-renderer-protocol.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    trust = _section(
         main_ts,
-        "async function loadControlUi(",
-        "function isAllowedMainWindowNavigation",
+        "function trustedMainWindowControlIpc",
+        "function trustedControlUiIpc",
     )
 
-    assert "const url = `${gatewayUrl}/control/chat/new`" in load_control
-    assert "const url = `${gatewayUrl}/control/chat`" not in load_control
+    assert "isDesktopRendererDocumentUrl" in protocol
+    assert "'/api/system/status'" not in protocol
+    assert "return isDesktopRendererDocumentUrl(targetUrl)" in main_ts
+    assert "window.webContents.on('will-frame-navigate'" in main_ts
+    assert "!details.isMainFrame && isDesktopRendererUrl(details.url)" in main_ts
+    assert '"sandbox; default-src \'none\'' in main_ts
+    assert "frame-ancestors 'none'" in main_ts
+    assert "if (process.isMainFrame)" in preload
+    assert "senderFrame !== event.sender.mainFrame" in trust
+    assert "isDesktopRendererDocumentUrl(rawUrl)" in trust
+
+
+def test_desktop_opens_local_new_task_route_without_control_ui_dependency() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+
+    assert "export const DESKTOP_RENDERER_URL = `${DESKTOP_RENDERER_ORIGIN}/chat/new`" in _read(
+        "desktop/electron/src/desktop-renderer-protocol.ts"
+    )
+    assert "await window.loadURL(DESKTOP_RENDERER_URL)" in main_ts
+    assert "/control/chat/new" not in main_ts
+    assert "waitForControlUi" not in main_ts
+    assert "probe: (remainingMs) => readinessCheck(url, remainingMs)" in _section(
+        main_ts,
+        "async function waitForGateway",
+        "function hasGatewayProcessExited",
+    )
 
 
 def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
@@ -298,6 +323,7 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
     # awaited before respawn rather than reused. The boot page has a separate
     # non-destructive resume path below.
     assert "if (gatewayStartPromise)" in retry
+    assert "invalidateSecretStorageBackendCache()" in retry
     join_call = "const exited = await stopAndJoinAllLifecycleOwnedGateways()"
     assert join_call in retry
     assert "if (!exited)" in retry
@@ -309,7 +335,8 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
     assert "gatewayState.error = message" in failure
     assert "desktopLog('gateway_restart_wait_timeout'" in failure
     assert "sendBootError(message)" in failure
-    assert "await restoreMainWindowToBootPage()" in failure
+    assert "publishGatewayConnection()" in failure
+    assert "restoreMainWindowToBootPage()" not in failure
     assert "return { ok: false, error: message }" in failure
     assert "clearReusableGatewayState()" not in failure
     assert "openOrResumeDesktopApp()" not in failure
@@ -354,11 +381,14 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     )
 
     assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
+    assert "openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain')" in preload
+    assert "invalidateSecretStorageBackendCache()" in resume_flow
     assert "const pendingStart = gatewayStartPromise" in resume_flow
     assert "await resumeOwnedGatewayStartup(" in resume_flow
     assert "if (!gateway)" in resume_flow
     assert "void openOrResumeDesktopApp()" in resume_flow
-    assert "await loadControlUiIntoCurrentWindow(" in resume_flow
+    assert "await loadDesktopRendererIntoCurrentWindow()" in resume_flow
+    assert "loadControlUiIntoCurrentWindow" not in resume_flow
     assert "bootResumeAuthorityIsCurrent(authority)" in resume_flow
     assert "if (pendingStart || !initialAuthority" in resume_flow
     assert "stopAndJoinAllLifecycleOwnedGateways" not in resume_flow
@@ -375,10 +405,12 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     assert "gatewayProcess === child" in resume_owned
     assert "gatewayProfileKey !== desktopProfileKey()" in resume_owned
     assert "await waitForGateway(url, childExitMessage)" in resume_owned
-    assert "await waitForControlUi(url, childExitMessage)" in resume_owned
+    assert "waitForControlUi" not in resume_owned
     assert "await verifyOwnedGatewayLaunch(child)" in resume_owned
     assert "|| !isCurrent()" in resume_owned
     assert "gatewayState.status = 'ready'" in resume_owned
+    ready_index = resume_owned.rindex("gatewayState.status = 'ready'")
+    assert resume_owned.index("publishGatewayConnection()", ready_index) > ready_index
 
 
 def test_desktop_gateway_ready_requires_exact_launch_identity() -> None:
@@ -432,12 +464,6 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
         "async function resumeBootStartup",
         "ipcMain.handle('desktop:boot:resume'",
     )
-    control_load = _section(
-        main_ts,
-        "async function loadControlUiIntoCurrentWindow",
-        "async function restoreMainWindowToBootPage",
-    )
-
     for fence in [
         "!isQuitting",
         "gatewayProcess === authority.child",
@@ -449,11 +475,13 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
     assert "if (!authority || !bootResumeAuthorityIsCurrent" in resume_flow
     assert "!bootResumeAuthorityIsCurrent(initialAuthority)" in resume_flow
 
-    first_fence = control_load.index("if (!isCurrent()) return false")
-    load = control_load.index("await loadControlUi(window, gatewayUrl)")
-    final_fence = control_load.index("if (!isCurrent()) return false", load)
-    ready = control_load.rindex("sendBootStatus('ready')")
-    assert first_fence < load < final_fence < ready
+    load = resume_flow.index("await loadDesktopRendererIntoCurrentWindow()")
+    final_fence = resume_flow.index(
+        "if (!bootResumeAuthorityIsCurrent(authority)) return { ok: true }",
+        load,
+    )
+    ready = resume_flow.index("sendBootStatus('ready')", final_fence)
+    assert load < final_fence < ready
 
     resume_owned = _section(
         main_ts,
@@ -469,12 +497,11 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
         "async function openOrResumeDesktopApp",
         "const GATEWAY_SHUTDOWN_KILL_AFTER_MS",
     )
-    load_index = open_flow.index("await loadControlUiIntoCurrentWindow(")
-    load_call = open_flow[load_index : load_index + 300]
-    assert "operationIsCurrent" in load_call
+    ready_index = open_flow.index("sendBootStatus('ready')")
+    assert "loadControlUiIntoCurrentWindow" not in open_flow
 
     authority_capture = open_flow[
-        open_flow.index("const gatewayUrl = gateway.url") : load_index
+        open_flow.index("const gatewayUrl = gateway.url") : ready_index
     ]
     for exact_gateway_fence in [
         "const expectedOwned = gateway.owned",
@@ -554,7 +581,8 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert "const result = await resumeStartup()" in retry_flow
     assert "result && result.ok === false" in retry_flow
     assert "result.error || msg.errorDefault" in retry_flow
-    assert "applyError({ message: result.error || msg.errorDefault })" in retry_flow
+    assert "message: result.error || msg.errorDefault" in retry_flow
+    assert "code: result.code" in retry_flow
     assert "errorPanel.classList.add('visible')" in apply_error
     assert "retryButton.disabled = false" in retry_flow
     assert "recoveryRetryButton.disabled = false" in retry_flow
@@ -577,7 +605,45 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert boot_html.count("profileInUse:") == 6
 
 
-def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None:
+def test_keychain_startup_recovery_is_actionable_without_plaintext_fallback() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    boot_html = _read("desktop/electron/src/boot.html")
+
+    assert "type BootErrorCode = 'keychain_unavailable'" in main_ts
+    assert "code?: BootErrorCode" in main_ts
+    assert "throw new DesktopStartupError(" in main_ts
+    assert "'keychain_unavailable'" in main_ts
+    assert "...(error instanceof DesktopStartupError ? { code: error.code } : {})" in main_ts
+    assert "function invalidateSecretStorageBackendCache(): void" in main_ts
+    assert "const MAC_KEYCHAIN_ACCESS_PATHS = [" in main_ts
+    assert "/System/Library/CoreServices/Applications/Keychain Access.app" in main_ts
+    assert "/Applications/Utilities/Keychain Access.app" in main_ts
+    assert "if (process.platform !== 'darwin') return false" in main_ts
+
+    open_keychain = _section(
+        main_ts,
+        "ipcMain.handle('desktop:boot:open-keychain'",
+        "interface BootResumeAuthority",
+    )
+    assert "trustedRecoveryIpc(event)" in open_keychain
+    assert "openMacKeychainAccess()" in open_keychain
+    assert "ipcRenderer.invoke('desktop:boot:open-keychain')" in preload
+
+    assert 'id="openKeychain"' in boot_html
+    assert 'data-i18n="openKeychain"' in boot_html
+    assert "payload.code === 'keychain_unavailable'" in boot_html
+    assert "openKeychainButton.hidden = !keychainUnavailable" in boot_html
+    assert "api.openKeychainAccess()" in boot_html
+    assert "keychainUnavailable:" in boot_html
+    assert boot_html.count("openKeychain:") == 6
+    assert boot_html.count("keychainUnavailable:") == 6
+
+    encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
+    assert "catch {\n      return plainSecret(secret)" not in encryption
+
+
+def test_boot_error_and_recovery_states_freeze_determinate_progress() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     paused_styles = _section(
         boot_html,
@@ -595,12 +661,16 @@ def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None
         "async function runRecoveryAction",
     )
 
-    assert "animation: none" in paused_styles
+    assert "opacity: 0.45" in paused_styles
+    assert "@keyframes progress" not in boot_html
+    assert "animation: progress" not in boot_html
     assert "body.errored .loader::before" in paused_styles
     assert "body.errored .loader span" in paused_styles
     assert "animation-play-state: paused" in paused_styles
     assert "document.body.classList.add('errored')" in apply_error
     assert "document.body.classList.add('recovering', 'errored')" in render_recovery
+    assert "resetBootProgressOnNextStatus = true" in apply_error
+    assert "resetBootProgressOnNextStatus = true" in render_recovery
 
 
 def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() -> None:
@@ -642,6 +712,65 @@ def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() 
     assert "phaseStartedAt = performance.now() - Math.max(0, wallAgeMs)" in apply_status
     assert "updateTimer()" in apply_status
     assert "performance.now() - phaseStartedAt" in timer
+
+
+def test_boot_progress_reports_only_completed_startup_milestones() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    main_ts = _read("desktop/electron/src/main.ts")
+    apply_status = _section(
+        boot_html,
+        "function applyStatus(payload)",
+        "function applyError(payload)",
+    )
+    render_progress = _section(
+        boot_html,
+        "function renderBootProgress()",
+        "function applyStatus(payload)",
+    )
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert 'id="startupProgress"' in boot_html
+    assert 'role="progressbar"' in boot_html
+    assert 'aria-labelledby="phase"' in boot_html
+    assert 'aria-valuemin="0"' in boot_html
+    assert 'aria-valuemax="4"' in boot_html
+    assert 'aria-valuenow="0"' in boot_html
+    assert 'id="progressCount">0/4<' in boot_html
+
+    for phase, value in {
+        "profile": 0,
+        "'gateway-start'": 1,
+        "'gateway-health'": 2,
+        "control": 3,
+        "ready": 4,
+    }.items():
+        assert f"{phase}: {value}" in boot_html
+
+    assert "Math.max(completedBootMilestones, reportedProgress)" in apply_status
+    assert "if (Number.isInteger(reportedProgress))" in apply_status
+    assert "if (resetBootProgressOnNextStatus)" in apply_status
+    assert "resetBootProgressOnNextStatus = false" in apply_status
+    assert "const activeStep = stepMap[phaseId]" in apply_status
+    assert "if (activeStep) setStepState" in apply_status
+    assert "stepMap[phaseId] || 'profile'" not in apply_status
+    assert "--boot-progress" in render_progress
+    assert "aria-valuenow" in render_progress
+    assert "progressCount.textContent" in render_progress
+
+    assert (
+        "sendBootStatus('profile')\n"
+        "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
+        in start_gateway
+    )
+    assert (
+        "sendBootStatus('gateway-health')\n"
+        "  await recoverVerifiedOrphanGatewayBeforeSpawn()"
+        not in start_gateway
+    )
 
 
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
@@ -745,6 +874,8 @@ def test_primary_repair_ui_is_accessible_without_profile_choices() -> None:
 def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     locale_keys = (
+        "openKeychain",
+        "keychainUnavailable",
         "recoveryTitle",
         "recoveryTitleLockBusy",
         "recoveryTitleUpdate",
@@ -1126,7 +1257,7 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
     resume = _section(
         main_ts,
@@ -1185,12 +1316,12 @@ def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
     recovery = _section(
         main_ts,
         "async function startGatewayWithPortRecovery",
-        "async function loadControlUi",
+        "function isAllowedMainWindowNavigation",
     )
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
 
     assert "const GATEWAY_PORT_LAST = 18830" in port_selection
@@ -1494,10 +1625,10 @@ def test_start_gateway_reuses_healthy_gateway_before_spawn() -> None:
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
 
-    assert "await healthCheck(gatewayState.url)" in reuse
+    assert "await readinessCheck(gatewayState.url)" in reuse
     assert "gatewayState.status = 'ready'" in reuse
     reuse_guard = "const reusableGateway = forceOnboardingOnNextStartup"
     assert reuse_guard in start
@@ -1513,7 +1644,7 @@ def test_start_gateway_does_not_attach_to_unrequested_default_dev_gateway() -> N
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
 
     assert "const activeProfile = activeDesktopProfile()" in start
@@ -1531,7 +1662,11 @@ def test_desktop_recovers_only_cryptographically_verified_orphan_gateway() -> No
         "async function recoverVerifiedOrphanGatewayBeforeSpawn",
         "async function startGateway",
     )
-    start = _section(main_ts, "async function startGateway", "async function loadControlUi")
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
 
     assert "loadDesktopGatewayOwnershipRecord(ownershipDir)" in recovery
     assert "runRecovery(ownershipDir, record" in recovery
@@ -1586,7 +1721,7 @@ def test_desktop_blocks_macos_app_translocation_without_forcing_applications() -
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
 
     assert "const MAC_APP_TRANSLOCATION_SEGMENT = '/AppTranslocation/'" in main_ts
@@ -1609,12 +1744,12 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
     wait = _section(
         main_ts,
         "async function waitForGateway",
-        "async function waitForControlUi",
+        "function hasGatewayProcessExited",
     )
 
     assert "const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000" in main_ts
@@ -1645,7 +1780,7 @@ def test_start_gateway_preserves_host_path_without_static_runtime_injection() ->
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
 
     assert "function desktopChildPath" in main_ts
@@ -1661,7 +1796,7 @@ def test_desktop_python_children_force_utf8_stdio() -> None:
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
     cleanup = _section(
         main_ts,
@@ -2284,7 +2419,11 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
         "function autoUpdateSupported",
     )
     startup = _section(main_ts, "void app.whenReady().then", "})\n}")
-    start = _section(main_ts, "async function startGateway", "async function loadControlUi")
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
     persisted_gate = _section(
         main_ts,
         "function desktopPersistedNetworkObservabilityDisabled(): boolean",
@@ -2369,7 +2508,7 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         "app.asar",
         "gatewayStartPromise",
         "openOrResumeDesktopApp",
-        "create the desktop window before gateway startup",
+        "load the local Desktop renderer before gateway startup",
         "first-run onboarding an owned modal child window",
         "does not prefer the onboarding window when focusing",
         "app.asar package.json version is not npm semver",
@@ -2379,6 +2518,20 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         "process.exit(1)",
     ]:
         assert expected in verifier
+
+    assert "createWindowIndex + 8_000" not in verifier
+    assert "waitIndex + 1_000" not in verifier
+    assert re.search(
+        r"sourceBetweenMarkers\(\s*source,\s*'async function createMainWindow',"
+        r"\s*'function currentMainWindow',",
+        verifier,
+    )
+    assert re.search(
+        r"sourceBetweenMarkers\(\s*source,\s*'async function waitForGateway',"
+        r"\s*'function hasGatewayProcessExited',",
+        verifier,
+    )
+    assert r"readinessCheck\(\s*url(?:\s*,[^)]*)?\)" in verifier
 
 
 def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
@@ -2430,6 +2583,27 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "real Electron process" in gate
     assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
     assert "requires an unlocked foreground GUI session" in native
+    assert "OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'" in native
+    assert "const annotationGeometryDeltas = fixture.stressMode" in native
+    assert "? [96, -24, 24, -32, 32]" in native
+    assert "const annotationRearmCycleCount = fixture.stressMode ? 50 : 8" in native
+    assert "rearm: true" in native
+    assert "annotationAtomicHandoffPendingState" in native
+    assert "annotationAtomicFailureRetained" in native
+    assert "restoreTrustedAnnotationInputFocus" in native
+    assert "state.ownerFocused" in native
+    assert "&& state.nativeFocused" in native
+    assert "&& state.documentFocused" in native
+    assert "&& state.editorFocused" in native
+    assert "(!ownerFocused || nativeFocused)" not in native
+    assert "(!cycle.ownerFocused || cycle.nativeFocused)" not in native
+    assert native.count("type: 'char'") == 1
+    assert native.count(".insertText(") == 1
+    assert "window.__opensquillaNativeInputProbe" in native
+    assert "observed.input.length > 0" in native
+    assert "ELECTRON_FOREGROUND_PREREQUISITE_MISSING" in native
+    assert "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED" in native
+    assert "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED" in native
     assert ci.count(
         "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
     ) == 3
@@ -2460,7 +2634,17 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "@loader_path/libomp.dylib" in build_gateway
     assert "assertRuntimeSetReady" not in build_gateway
     assert "fetch-bundled-runtimes.mjs" not in build_gateway
+    assert "function externalizeControlUiArtifact()" in build_gateway
+    assert "join(runtimeGatewayDir, 'control-ui-dist')" in build_gateway
+    assert "cpSync(controlUiDistDir, sharedDistDir" in build_gateway
+    assert "exactly one shared Web UI artifact" in build_gateway
+    assert "findEmbeddedControlUiDistDirs" in build_gateway
+    assert "still contains an embedded Web UI dist" in build_gateway
     assert "verifyMacLightgbmRuntime" in verifier
+    assert "runtime must contain exactly one shared Web UI artifact" in verifier
+    assert "embeddedControlUiFiles" in verifier
+    assert "shared Control UI failed artifact verification" in verifier
+    assert "'desktop.html'" in verifier
     assert "lightgbm/lib/lib_lightgbm.dylib" in verifier
     assert "bundled libomp.dylib" in verifier
     assert "otool" in verifier
@@ -2472,10 +2656,11 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     gateway_smoke = _read("desktop/electron/scripts/smoke-gateway.mjs")
     assert "OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT_MS" in gateway_smoke
     assert "'90000'" in gateway_smoke
-    assert "function smokeEnv(tempHome, config)" in gateway_smoke
+    assert "function smokeEnv(tempHome, config, runtimeGatewayDir)" in gateway_smoke
+    assert "OPENSQUILLA_CONTROL_UI_DIST" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: tempHome" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: stateDir" not in gateway_smoke
-    assert "const env = smokeEnv(tempHome, config)" in gateway_smoke
+    assert "const env = smokeEnv(tempHome, config, runtimeGatewayDir)" in gateway_smoke
     assert "verifyGatewayCaStore(gatewayBinary, env)" in gateway_smoke
     assert re.search(r"spawn\(gatewayBinary,.*?\{.*?\benv,", gateway_smoke, re.DOTALL)
     assert "const workspaceDir = join(tempHome, 'workspace')" in gateway_smoke
@@ -2637,7 +2822,7 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
     create_window = _section(
         main_ts,
         "async function createMainWindow(): Promise<BrowserWindow>",
-        "async function loadControlUi",
+        "function currentMainWindow(): BrowserWindow | null",
     )
 
     assert "details.frame !== window.webContents.mainFrame" in create_window
@@ -2660,7 +2845,7 @@ def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
     create_window = _section(
         main_ts,
         "async function createMainWindow(): Promise<BrowserWindow>",
-        "async function loadControlUi",
+        "function currentMainWindow",
     )
     cleanup = _section(
         create_window,
@@ -2695,6 +2880,41 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
     drain = _section(main_ts, "async function drainOwnedGatewayForQuit", "app.on('before-quit'")
+    owned_gateway_quit = _section(
+        before_quit,
+        "if (children.length > 0)",
+        "// Fail closed:",
+    )
+    preview_create = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:create'",
+        "ipcMain.handle('desktop:workbench:preview-lease:renew'",
+    )
+    preview_renew = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:renew'",
+        "ipcMain.handle('desktop:workbench:preview-lease:revoke'",
+    )
+    preview_revoke = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:revoke'",
+        "ipcMain.handle('desktop:workbench:surface:create'",
+    )
+    surface_create = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:create'",
+        "ipcMain.handle('desktop:workbench:surface:navigate'",
+    )
+    surface_navigate = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:navigate'",
+        "ipcMain.handle('desktop:workbench:permission:respond'",
+    )
+    surface_destroy = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:destroy'",
+        "// ── Desktop data cleanup",
+    )
     assert "process.platform === 'win32'" not in before_quit
     assert "event.preventDefault()" in before_quit
     assert "requestOwnedGatewayShutdown(" in drain
@@ -2705,7 +2925,24 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     assert "let quitGatewayDrainPromise: Promise<boolean> | null = null" in main_ts
     assert "if (quitGatewayDrainPromise)" in before_quit
     assert "const children = liveLifecycleOwnedGatewayProcesses()" in before_quit
-    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in before_quit
+    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in owned_gateway_quit
+    assert "const previewCleanup = artifactPreviewLeaseBroker.revokeAll()" in owned_gateway_quit
+    assert "void nativeWorkbenchSurfaces.destroyAll()" in owned_gateway_quit
+    assert owned_gateway_quit.index(
+        "artifactPreviewLeaseBroker.revokeAll()"
+    ) < owned_gateway_quit.index(
+        "nativeWorkbenchSurfaces.destroyAll()"
+    )
+    assert owned_gateway_quit.index("const previewCleanup") < owned_gateway_quit.index(
+        "drainOwnedGatewayForQuit("
+    )
+    exit_admission_guard = "appExitPhase !== 'running'"
+    assert exit_admission_guard in preview_create
+    assert exit_admission_guard in preview_renew
+    assert exit_admission_guard in surface_create
+    assert exit_admission_guard in surface_navigate
+    assert exit_admission_guard not in preview_revoke
+    assert exit_admission_guard not in surface_destroy
     assert "if (exited)" in before_quit
     assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
 
@@ -2766,7 +3003,11 @@ def test_desktop_update_and_recovery_join_every_lifecycle_owned_gateway() -> Non
         apply_update.index("autoUpdater.quitAndInstall(false, true)")
     )
 
-    start = _section(main_ts, "async function startGateway", "async function loadControlUi")
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
     admission = "if (!lifecycleAllowsProcessSpawn("
     assert admission in start
     assert "isQuitting," in start
@@ -2883,15 +3124,46 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     script = _read(
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
+    main = _read("desktop/electron/src/main.ts")
+    lifecycle = _read("desktop/electron/src/gateway-lifecycle.ts")
 
     assert package_json["scripts"]["test:gateway-orphan-recovery-flow"] == (
         "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
-    assert "await launchDesktop()" in script
+    assert "await launchDesktop(" in script
     assert "loaded.record.pid !== firstRecord.pid" in script
     assert "waitForDesktopGatewayOwnershipRelease" in script
+    assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
+    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main
+    assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in script
+    assert (
+        "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + DESKTOP_RENDERER_READY_TIMEOUT_MS"
+        in script
+    )
+    assert (
+        "VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS + INITIAL_DESKTOP_STARTUP_BUDGET_MS"
+        in script
+    )
+    assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
+    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000" in script
+    assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
+    assert (
+        "createPhaseBudget(\n"
+        "    'windows-electron-child-cleanup',\n"
+        "    WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS,\n"
+        "  )"
+    ) in script
+    assert "timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS" in script
+    assert "phase.remainingMs('first-window')" in script
+    assert "phase.remainingMs('desktop-renderer-route')" in script
+    assert "phase.remainingMs('gateway-readiness')" in script
+    assert "DESKTOP_E2E_PHASE_TIMEOUT:" in script
+    assert "DESKTOP_E2E_PHASE_FAILED:" in script
+    assert "DESKTOP_E2E_PROCESS_EXITED:" in script
+    assert "if (flowSucceeded && stillLive.length === 0)" in script
+    assert "async function waitFor(check, label, timeoutMs = 60_000)" not in script
 
 
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
@@ -3013,7 +3285,7 @@ def test_gateway_spawn_state_dir_is_the_desktop_home_root() -> None:
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
     child_environment = _section(
         main_ts,
@@ -3057,7 +3329,7 @@ def test_python_recovery_engine_replaces_typescript_layout_relocation() -> None:
     start = _section(
         main_ts,
         "async function startGateway",
-        "async function loadControlUi",
+        "async function startGatewayWithPortRecovery",
     )
     inspect = _section(
         main_ts,
@@ -3238,6 +3510,35 @@ def test_desktop_migration_run_quiesces_then_restarts_without_forcing_onboarding
     assert run.index("await runMigrateCli(") < run.index("loadFile(bootPagePath())")
 
 
+def test_desktop_migration_gateway_transitions_publish_complete_descriptors() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    run = _section(
+        main_ts,
+        "ipcMain.handle('desktop:migration:run'",
+        "ipcMain.handle('desktop:migration:last-result'",
+    )
+
+    assert "function transitionGatewayConnection(" in main_ts
+    timeout = _section(
+        run,
+        "if (!exited)",
+        "// Refuse while an unmanaged gateway",
+    )
+    assert "transitionGatewayConnection({" in timeout
+    assert "status: 'error'" in timeout
+    assert "instanceId: childInstanceId ?? randomUUID()" in timeout
+
+    takeover = _section(
+        run,
+        "if (gatewayState.url && (await healthCheck(gatewayState.url)))",
+        "// The intent is outside the target tree",
+    )
+    assert "transitionGatewayConnection({" in takeover
+    assert "owned: false" in takeover
+    assert "status: 'ready'" in takeover
+    assert "instanceId: randomUUID()" in takeover
+
+
 def test_desktop_migration_receipt_authority_is_bounded_python_verification() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     detection = _section(
@@ -3400,6 +3701,15 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     )
     save_index = reconcile.index("await saveImportedDesktopCredential(")
     assert save_index < reconcile.index("await clearPendingMigrationProviderSetup()", save_index)
+
+    pending_reconciliation = _section(
+        main_ts,
+        "async function recoverPendingMigrationReconciliation",
+        "function desktopStartupLog",
+    )
+    assert pending_reconciliation.index(
+        "beginDesktopWriterOperation('recover imported provider settings')"
+    ) < pending_reconciliation.index("readPendingMigrationProviderSetup()")
 
     encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
     assert "desktopSecretStoragePolicyBackend()" in encryption
@@ -3605,7 +3915,9 @@ def test_consolidation_e2e_waits_for_primary_route_and_emits_renderer_diagnostic
     source = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
     control = _section(source, "async function controlPage", "async function createLegacyRecovery")
 
-    assert "pathname !== '/control/chat' && pathname !== '/control/chat/new'" in control
+    assert "candidate.url().startsWith('opensquilla-app://desktop/')" in control
+    assert "pathname !== '/chat' && pathname !== '/chat/new'" in control
+    assert "connection?.status !== 'ready'" in control
     assert "candidate.locator('.chat-textarea').count()" in control
     assert "page.on('console'" in source
     assert "page.on('pageerror'" in source

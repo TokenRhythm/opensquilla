@@ -30,13 +30,13 @@ def _status(*, operation: RuntimeOperation | None = None) -> RuntimePackStatus:
         schema_version=1,
         management_supported=True,
         target="darwin-arm64",
-        catalog_version="2026-07-30.1",
+        catalog_version="2026-08-21.2",
         source_order=(RuntimeSource.GITHUB, RuntimeSource.OSS),
         components=(
             RuntimeComponentStatus(
                 component_id="python",
                 availability=RuntimeAvailability.MISSING,
-                catalog_version="2026-07-30.1",
+                catalog_version="2026-08-21.2",
                 active_version=None,
                 installed_bytes=None,
                 removable=False,
@@ -68,6 +68,7 @@ def test_runtime_rpc_scope_contract() -> None:
     assert METHOD_SCOPES["sandbox.runtime.status"] == READ_SCOPE
     assert METHOD_SCOPES["sandbox.runtime.install"] == ADMIN_SCOPE
     assert METHOD_SCOPES["sandbox.runtime.cancel"] == ADMIN_SCOPE
+    assert METHOD_SCOPES["sandbox.runtime.discard_download"] == ADMIN_SCOPE
     assert METHOD_SCOPES["sandbox.runtime.remove"] == ADMIN_SCOPE
 
 
@@ -130,6 +131,103 @@ async def test_runtime_mutations_require_owner(tmp_path) -> None:
         )
     assert excinfo.value.code == "UNAUTHORIZED"
 
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await rpc_sandbox._handle_sandbox_runtime_discard_download(
+            {"componentId": "python"},
+            _ctx(tmp_path, owner=False),
+        )
+    assert excinfo.value.code == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_runtime_discard_download_returns_refreshed_status(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+    from opensquilla.gateway import rpc_sandbox
+
+    observed: list[tuple[str, object]] = []
+    status = _status()
+
+    def discard(component_id, state_dir):
+        observed.append((component_id, state_dir))
+        return status
+
+    monkeypatch.setattr(runtime_packs, "discard_download", discard)
+
+    payload = await rpc_sandbox._handle_sandbox_runtime_discard_download(
+        {"componentId": "python"},
+        _ctx(tmp_path),
+    )
+
+    assert observed == [("python", str(tmp_path))]
+    assert payload == {"status": status.to_public_dict()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params",
+    [None, {}, {"componentId": "ruby"}, {"componentId": 1}],
+)
+async def test_runtime_discard_download_validates_component_request(
+    monkeypatch,
+    tmp_path,
+    params,
+) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+    from opensquilla.gateway import rpc_sandbox
+
+    monkeypatch.setattr(
+        runtime_packs,
+        "discard_download",
+        lambda *_args: pytest.fail("invalid request reached Runtime Pack service"),
+    )
+
+    with pytest.raises(ValueError):
+        await rpc_sandbox._handle_sandbox_runtime_discard_download(
+            params,
+            _ctx(tmp_path),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "expected_code"),
+    [
+        ("discard", "RUNTIME_DISCARD_FAILED"),
+        ("unavailable", "RUNTIME_DISCARD_FAILED"),
+        ("conflict", "RUNTIME_JOB_CONFLICT"),
+    ],
+)
+async def test_runtime_discard_download_projects_safe_errors(
+    monkeypatch,
+    tmp_path,
+    error_type: str,
+    expected_code: str,
+) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+    from opensquilla.gateway import rpc_sandbox
+
+    errors = {
+        "discard": runtime_packs.RuntimePackDiscardError(str(tmp_path / "private")),
+        "unavailable": runtime_packs.RuntimePackUnavailableError("unavailable"),
+        "conflict": runtime_packs.RuntimePackError("changed"),
+    }
+
+    def discard(*_args):
+        raise errors[error_type]
+
+    monkeypatch.setattr(runtime_packs, "discard_download", discard)
+
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await rpc_sandbox._handle_sandbox_runtime_discard_download(
+            {"componentId": "python"},
+            _ctx(tmp_path),
+        )
+    assert excinfo.value.code == expected_code
+    assert str(tmp_path) not in str(excinfo.value)
+
 
 @pytest.mark.asyncio
 async def test_runtime_cancel_projects_stale_operation_as_conflict(monkeypatch, tmp_path) -> None:
@@ -156,6 +254,7 @@ async def test_policy_defaults_do_not_consult_runtime_pack_installation_state(
 ) -> None:
     import opensquilla.runtime_packs as runtime_packs
     import opensquilla.sandbox.runtime_launcher as runtime_launcher
+    import opensquilla.sandbox.runtime_manifest as runtime_manifest
     from opensquilla.gateway import rpc_sandbox
 
     def status_must_not_run(*_args):
@@ -163,15 +262,19 @@ async def test_policy_defaults_do_not_consult_runtime_pack_installation_state(
 
     monkeypatch.setattr(runtime_packs, "status_snapshot", status_must_not_run)
 
-    def broken_resolver():
-        raise ValueError("corrupt manifest")
+    def resolver_must_not_run():
+        raise AssertionError("the finalized catalog must satisfy the legacy projection")
 
-    monkeypatch.setattr(runtime_launcher, "bundled_runtime_resolver", broken_resolver)
+    monkeypatch.setattr(runtime_launcher, "bundled_runtime_resolver", resolver_must_not_run)
+    monkeypatch.setattr(runtime_manifest, "runtime_target", lambda: "darwin-arm64")
 
     payload = await rpc_sandbox._handle_sandbox_policy_defaults({}, _ctx(tmp_path))
 
-    assert payload["runtimeTarget"] is None
-    assert payload["runtimeVersions"] == {}
+    assert payload["runtimeTarget"] == "darwin-arm64"
+    assert payload["runtimeVersions"] == {
+        "python": {"version": "3.13.15+20260814", "available": False},
+        "node": {"version": "24.19.0", "available": False},
+    }
 
 
 def test_runtime_error_payload_does_not_leak_internal_exception() -> None:

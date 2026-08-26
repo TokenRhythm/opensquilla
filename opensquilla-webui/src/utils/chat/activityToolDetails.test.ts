@@ -48,6 +48,90 @@ describe('activity tool detail projection', () => {
     },
   )
 
+  it('shows only allowlisted document failure guidance', () => {
+    const sensitive = JSON.stringify({
+      category: 'DOCUMENT_PREVIEW_UNAVAILABLE',
+      message_key: 'document.previewUnavailable',
+      user_message: '<html>secret source</html>',
+      retry_policy: 'new_turn',
+      next_action: 'finalize_without_tools',
+      expectedSha256: 'a'.repeat(64),
+      cursor: 'private-cursor',
+      bindingToken: 'private-binding-token',
+    })
+    const projection = projectActivityToolDetail(call({
+      name: 'document_apply',
+      status: 'error',
+      isError: true,
+      inputRaw: sensitive,
+      result: sensitive,
+    }), 'document.update')
+
+    expect(projection).toEqual({
+      lines: [
+        { kind: 'document-category', category: 'DOCUMENT_PREVIEW_UNAVAILABLE' },
+        { kind: 'document-message', messageKey: 'document.previewUnavailable' },
+        { kind: 'document-retry', policy: 'new_turn' },
+        { kind: 'document-next-action', action: 'finalize_without_tools' },
+      ],
+      rawContent: '',
+    })
+    expect(JSON.stringify(projection)).not.toMatch(/sha256|cursor|binding|secret source/i)
+  })
+
+  it('maps unknown document failure fields to localized-safe generic values', () => {
+    const projection = projectActivityToolDetail(call({
+      name: 'document_apply',
+      status: 'error',
+      isError: true,
+      result: JSON.stringify({
+        category: 'PRIVATE_SERVER_FAILURE_WITH_TOKEN',
+        message_key: 'private.rawMessage',
+        user_message: 'private source and token',
+      }),
+    }), 'document.update')
+
+    expect(projection).toEqual({
+      lines: [
+        { kind: 'document-category', category: 'DOCUMENT_EDIT_FAILED' },
+        { kind: 'document-message', messageKey: 'document.editFailed' },
+        { kind: 'document-retry', policy: 'never' },
+        { kind: 'document-next-action', action: 'stop' },
+      ],
+      rawContent: '',
+    })
+    expect(JSON.stringify(projection)).not.toMatch(/private|token|source/i)
+  })
+
+  it('recovers a safe failure disclosure from compatibility history flags', () => {
+    const projection = projectActivityToolDetail(call({
+      name: 'document_browser_inspect',
+      status: 'success',
+      isError: false,
+      result: JSON.stringify({
+        ok: false,
+        status: 'error',
+        category: 'DOCUMENT_PREVIEW_UNAVAILABLE',
+        message_key: 'document.previewUnavailable',
+        retry_policy: 'new_turn',
+        next_action: 'finalize_without_tools',
+        source: '<html>private source</html>',
+        bindingToken: 'private-binding-token',
+      }),
+    }), 'document.read')
+
+    expect(projection).toEqual({
+      lines: [
+        { kind: 'document-category', category: 'DOCUMENT_PREVIEW_UNAVAILABLE' },
+        { kind: 'document-message', messageKey: 'document.previewUnavailable' },
+        { kind: 'document-retry', policy: 'new_turn' },
+        { kind: 'document-next-action', action: 'finalize_without_tools' },
+      ],
+      rawContent: '',
+    })
+    expect(JSON.stringify(projection)).not.toMatch(/private|binding|source/i)
+  })
+
   it('shows workspace-relative file details without putting raw paths in lines', () => {
     const projection = projectActivityToolDetail(call({
       inputRaw: JSON.stringify({

@@ -2683,7 +2683,7 @@ def _artifact_event_payload(event: Any) -> dict[str, Any] | None:
 
 
 def _router_decision_payload(event: RouterDecisionEvent) -> dict[str, Any]:
-    return {
+    payload = {
         "tier": event.tier,
         "tier_index": event.tier_index,
         "model": event.model,
@@ -2699,6 +2699,9 @@ def _router_decision_payload(event: RouterDecisionEvent) -> dict[str, Any]:
         "rollout_phase": event.rollout_phase,
         "context_window": event.context_window,
     }
+    if event.router_tier_snapshot is not None:
+        payload["router_tier_snapshot"] = event.router_tier_snapshot
+    return payload
 
 
 def _terminal_generation_reset_text(event: AnswerGenerationResetEvent) -> str:

@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -20,6 +20,7 @@
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
     "verify:gateway-smoke": "node scripts/smoke-gateway.mjs",
+    "test:installer-progress": "node scripts/test-installer-progress-contract.mjs",
     "test:bundled-runtimes": "node scripts/test-bundled-runtimes.mjs",
     "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
     "test:packaged-first-send-renderer": "node scripts/test-packaged-first-send-renderer.mjs",
@@ -29,6 +30,7 @@
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
+    "test:desktop-renderer-protocol": "npm run build && node scripts/test-desktop-renderer-protocol.mjs",
     "test:desktop-zoom": "npm run build && node scripts/test-desktop-zoom-shortcuts.mjs",
     "test:project-workspace-picker": "npm run build && node scripts/test-project-workspace-picker.mjs",
     "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
@@ -162,6 +164,7 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": false,
+      "include": "scripts/nsis/installer-progress.nsh",
       "installerIcon": "assets/icon.ico",
       "uninstallerIcon": "assets/icon.ico"
     }

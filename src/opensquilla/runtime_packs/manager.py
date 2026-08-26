@@ -108,6 +108,10 @@ class RuntimePackUnavailableError(RuntimePackError):
     """Raised when the immutable catalog does not support an operation."""
 
 
+class RuntimePackDiscardError(RuntimePackError):
+    """Raised when downloaded Runtime Pack data cannot be discarded safely."""
+
+
 class RuntimePackCancelledError(RuntimePackError):
     """Raised internally when a user cancels an operation."""
 
@@ -227,6 +231,23 @@ def _replace_atomic_state(source: Path, destination: Path) -> None:
     for delay in (*_WINDOWS_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS, None):
         try:
             os.replace(source, destination)
+            return
+        except PermissionError as error:
+            if (
+                os.name != "nt"
+                or getattr(error, "winerror", None) not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+                or delay is None
+            ):
+                raise
+            time.sleep(delay)
+
+
+def _unlink_discard_path(path: Path) -> None:
+    """Remove one cache path after bounded transient Windows sharing failures."""
+
+    for delay in (*_WINDOWS_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS, None):
+        try:
+            path.unlink(missing_ok=True)
             return
         except PermissionError as error:
             if (
@@ -1129,6 +1150,8 @@ def _component_download_paths(
     root: Path,
     component_id: str,
     descriptor: RuntimePackDescriptor,
+    *,
+    strict: bool = False,
 ) -> tuple[Path, ...]:
     downloads = root / "downloads"
     paths = {
@@ -1138,6 +1161,8 @@ def _component_download_paths(
     try:
         metadata_files = tuple(downloads.iterdir())
     except OSError:
+        if strict:
+            raise
         return tuple(paths)
     for metadata in metadata_files:
         match = re.fullmatch(r"([0-9a-f]{64})\.meta\.json", metadata.name)
@@ -1151,7 +1176,28 @@ def _component_download_paths(
         ):
             paths.add(metadata)
             paths.add(downloads / f"{match.group(1)}.part")
-    return tuple(sorted(paths, key=lambda path: path.name))
+    return tuple(
+        sorted(
+            paths,
+            key=lambda path: (
+                path.name.split(".", 1)[0],
+                0 if path.name.endswith(".part") else 1,
+            ),
+        )
+    )
+
+
+def _require_safe_discard_storage(root: Path) -> None:
+    for name in ("downloads", "operations", "locks"):
+        directory = root / name
+        try:
+            redirected = directory.is_symlink() or directory.is_junction()
+        except OSError:
+            redirected = True
+        if redirected or not _real_path_within(root, directory, directory=True):
+            raise RuntimePackDiscardError(
+                "Runtime Pack downloaded data could not be removed safely."
+            )
 
 
 def _remove_component_downloads_fail_open(
@@ -1747,6 +1793,47 @@ class RuntimePackService:
                 previous_operation_id,
             )
 
+    def discard_download(self, component_id: str) -> RuntimePackStatus:
+        descriptor = self._descriptor(component_id)
+        if descriptor is None:
+            raise RuntimePackUnavailableError(
+                "Runtime Pack management is unavailable for this platform or build."
+            )
+        _require_safe_discard_storage(self.root)
+        with self._state_lock:
+            existing = self._read_operation(component_id)
+            if existing is not None and existing.state in _ACTIVE_STATES:
+                raise RuntimePackError("Runtime Pack operation is still active")
+        try:
+            with ManagedArtifactInstallLock(self.root, component_id, 0.0):
+                with self._state_lock:
+                    _require_safe_discard_storage(self.root)
+                    existing = self._read_operation(component_id)
+                    if existing is not None and existing.state in _ACTIVE_STATES:
+                        raise RuntimePackError("Runtime Pack operation is still active")
+                    try:
+                        for path in _component_download_paths(
+                            self.root,
+                            component_id,
+                            descriptor,
+                            strict=True,
+                        ):
+                            _unlink_discard_path(path)
+                        if (
+                            existing is not None
+                            and existing.kind is RuntimeOperationKind.INSTALL
+                            and existing.state.terminal
+                        ):
+                            _unlink_discard_path(self._operation_path(component_id))
+                    except OSError as exc:
+                        raise RuntimePackDiscardError(
+                            "Runtime Pack downloaded data could not be removed. "
+                            "Retry after closing running tools."
+                        ) from exc
+        except ManagedArtifactError as exc:
+            raise RuntimePackError("Runtime Pack operation changed") from exc
+        return self.status()
+
     def _progress_callback(
         self,
         operation: RuntimeOperation,
@@ -1901,6 +1988,7 @@ class RuntimePackService:
                     archive_type=descriptor.archive_type,
                     compressed_size=descriptor.size_bytes,
                     max_extracted_bytes=descriptor.unpacked_size_bytes,
+                    case_sensitive_paths=descriptor.target.startswith("linux-"),
                 )
             except UnsafeArchiveError:
                 partial.unlink(missing_ok=True)

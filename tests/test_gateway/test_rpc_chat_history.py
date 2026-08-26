@@ -705,6 +705,27 @@ async def test_chat_history_keeps_richer_ensemble_receipt_on_terminal_duplicate(
         "final_request_role": "aggregator",
         "proposer_roles": ["proposer"],
     }
+    richer_route_plan = {
+        "version": 2,
+        "tier": "c2",
+        "model": "aggregator-model",
+        "router_tier_snapshot": {
+            "version": 1,
+            "request_kind": "text",
+            "tiers": [
+                {
+                    "tier": "c1",
+                    "model": "proposal-model",
+                    "execution_kind": "single_model",
+                },
+                {
+                    "tier": "c2",
+                    "model": "aggregator-model",
+                    "execution_kind": "ensemble",
+                },
+            ],
+        },
+    }
     try:
         with turn_context_scope({"turn_id": turn_id}):
             await manager.append_message(
@@ -719,6 +740,7 @@ async def test_chat_history_keeps_richer_ensemble_receipt_on_terminal_duplicate(
                     "cost_usd": 0.001,
                     "model_usage_breakdown": richer_breakdown,
                     "ensemble_trace": richer_trace,
+                    "route_plan": richer_route_plan,
                     "routing_source": "squilla_router",
                 },
             )
@@ -742,6 +764,26 @@ async def test_chat_history_keeps_richer_ensemble_receipt_on_terminal_duplicate(
                     "ensemble_trace": {
                         "final_request_role": "aggregator",
                         "physical_request_count": 1,
+                    },
+                    "route_plan": {
+                        "version": 2,
+                        "tier": "c2",
+                        "model": "aggregator-model",
+                        "fallback_chain": [
+                            {
+                                "tier": f"fallback-{index}",
+                                "provider": "large-stale-provider",
+                                "model": f"large-stale-model-{index}",
+                                "capabilities": {
+                                    "context_window": 128_000,
+                                    "supports_reasoning": True,
+                                    "supports_tools": True,
+                                    "supports_streaming": True,
+                                    "supports_vision": False,
+                                },
+                            }
+                            for index in range(8)
+                        ],
                     },
                 },
             )
@@ -802,6 +844,7 @@ async def test_chat_history_keeps_richer_ensemble_receipt_on_terminal_duplicate(
         assert usage["missing_cost_entries"] == 0
         assert usage["model_usage_breakdown"] == richer_breakdown
         assert usage["ensemble_trace"] == richer_trace
+        assert usage["route_plan"] == richer_route_plan
         assert usage["routing_source"] == "squilla_router"
     finally:
         await storage.close()

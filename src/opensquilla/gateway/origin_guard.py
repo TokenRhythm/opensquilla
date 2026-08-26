@@ -17,6 +17,9 @@ Policy (matches the bundle-route precedent):
   deliberately configured a separate frontend keeps a working deployment. The
   ``"*"`` wildcard never bypasses the guard; it would reopen the exact
   drive-by exposure this module exists to close.
+* The exact registered ``opensquilla-app://desktop`` origin may reach a
+  loopback HTTP Gateway. Normal web pages cannot forge their browser-controlled
+  Origin, while this keeps Desktop development overrides interoperable.
 * Everything else — including the opaque ``"null"`` origin and unparsable
   values — is rejected with 403 ``FORBIDDEN_ORIGIN``.
 """
@@ -35,6 +38,7 @@ from opensquilla.gateway.config import GatewayConfig
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 _BROWSER_ORIGIN_SCHEMES = frozenset({"http", "https"})
 _WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::"})
+_DESKTOP_RENDERER_ORIGIN = "opensquilla-app://desktop"
 
 
 def extract_http_token(request: Request | None) -> str | None:
@@ -170,6 +174,34 @@ def _parsed_browser_origin(origin: str):
     return parsed, port
 
 
+def _desktop_renderer_origin_allowed(
+    *,
+    origin: str,
+    request_scheme: str,
+    request_hostname: str | None,
+    request_port: int | None,
+    config: GatewayConfig | None,
+) -> bool:
+    """Allow the registered Desktop origin to reach only a loopback Gateway.
+
+    A regular web page cannot choose its browser-controlled Origin header, and
+    native clients could already omit Origin entirely. Keeping this exact
+    custom origin interoperable also lets Desktop attach to a separately
+    launched development Gateway without weakening any remote listener.
+    """
+    if origin != _DESKTOP_RENDERER_ORIGIN or not _is_loopback_hostname(request_hostname):
+        return False
+    normalized_request_scheme = _http_equivalent_scheme(request_scheme)
+    if normalized_request_scheme != "http":
+        return False
+    return config is None or _request_authority_matches_config(
+        request_scheme=normalized_request_scheme,
+        request_hostname=request_hostname or "",
+        request_port=request_port,
+        config=config,
+    )
+
+
 def _origin_allowed(
     *,
     origin: str | None,
@@ -179,6 +211,14 @@ def _origin_allowed(
     config: GatewayConfig | None,
 ) -> bool:
     if origin is None:
+        return True
+    if _desktop_renderer_origin_allowed(
+        origin=origin,
+        request_scheme=request_scheme,
+        request_hostname=request_hostname,
+        request_port=request_port,
+        config=config,
+    ):
         return True
     parsed_origin = _parsed_browser_origin(origin)
     if parsed_origin is None or request_hostname is None:

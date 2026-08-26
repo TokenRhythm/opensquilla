@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -148,3 +149,43 @@ async def test_quiesce_sessions_drains_replaced_task_cancellation_tail() -> None
             if not task.done():
                 task.cancel()
         await asyncio.gather(first, replacement, quiescing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_waits_for_direct_task_authority_cleanup_once() -> None:
+    registry = AgentTaskRegistry()
+    session_key = "agent:main:webchat:registry-authority-cleanup"
+    task_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    quiesce_entered = asyncio.Event()
+    async def direct_task() -> None:
+        task_started.set()
+        await asyncio.Event().wait()
+
+    async def terminal_cleanup_impl() -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    terminal_cleanup = AsyncMock(side_effect=terminal_cleanup_impl)
+    task = asyncio.create_task(direct_task())
+    registry.register(
+        session_key,
+        task,
+        terminal_cleanup=terminal_cleanup,
+    )
+    await task_started.wait()
+
+    async def quiesce() -> None:
+        async with registry.quiesce_sessions([session_key]):
+            quiesce_entered.set()
+
+    quiescing = asyncio.create_task(quiesce())
+    await cleanup_started.wait()
+    assert terminal_cleanup.await_count == 1
+    assert quiesce_entered.is_set() is False
+
+    release_cleanup.set()
+    await asyncio.gather(quiescing)
+    assert quiesce_entered.is_set()
+    terminal_cleanup.assert_awaited_once_with()

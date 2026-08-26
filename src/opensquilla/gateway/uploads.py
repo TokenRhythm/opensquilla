@@ -376,6 +376,17 @@ def _extract_authorization_token(request: Request) -> str | None:
     return request.headers.get("x-opensquilla-token")
 
 
+def _authorization_token_matches(config: GatewayConfig, request: Request) -> bool:
+    token = _extract_authorization_token(request)
+    if token == config.auth.token:
+        return True
+    from opensquilla.gateway.desktop_ownership import (
+        active_desktop_gateway_auth_token_matches,
+    )
+
+    return active_desktop_gateway_auth_token_matches(token)
+
+
 def register_upload_routes(
     app: Starlette,
     *,
@@ -388,7 +399,7 @@ def register_upload_routes(
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
         if config.auth.mode == "token":
-            if config.auth.token and _extract_authorization_token(request) != config.auth.token:
+            if config.auth.token and not _authorization_token_matches(config, request):
                 return JSONResponse(
                     {
                         "error": (

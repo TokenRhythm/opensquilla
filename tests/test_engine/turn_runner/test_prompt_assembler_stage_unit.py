@@ -76,6 +76,7 @@ class _RecordingRouterContext:
     context: dict[str, Any] = field(default_factory=dict)
     calls: list[tuple[str, bool]] = field(default_factory=list)
     bound_user_message_ids: list[str | None] = field(default_factory=list)
+    include_capacity_flags: list[bool] = field(default_factory=list)
     transcript_snapshots: list[Any | None] = field(default_factory=list)
 
     async def fetch_router_context(
@@ -89,6 +90,7 @@ class _RecordingRouterContext:
     ):
         self.calls.append((session_key, exclude_last_user))
         self.bound_user_message_ids.append(bound_user_message_id)
+        self.include_capacity_flags.append(include_capacity)
         self.transcript_snapshots.append(transcript_snapshot)
         return dict(self.context)
 
@@ -447,6 +449,33 @@ async def test_prompt_assembler_forwards_turn_transcript_snapshot() -> None:
     await stage.run(_make_input(transcript_snapshot=transcript_snapshot))
 
     assert router_context.transcript_snapshots == [transcript_snapshot]
+
+
+@pytest.mark.asyncio
+async def test_attachment_prompt_carries_repr_safe_router_replay_request() -> None:
+    router_context = _RecordingRouterContext()
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    stage = _make_stage(router=router_context, executor=executor)
+    transcript_snapshot = SimpleNamespace(private_history="history-secret")
+
+    await stage.run(
+        _make_input(
+            attachments=[{"type": "image/png", "data": "current-secret"}],
+            bound_user_message_id="msg-bound",
+            transcript_snapshot=transcript_snapshot,
+        )
+    )
+
+    request = executor.requests[0]
+    replay_request = request.router_history_replay_request
+    assert router_context.include_capacity_flags == [False]
+    assert replay_request is not None
+    assert replay_request.exclude_last_user is True
+    assert replay_request.bound_user_message_id == "msg-bound"
+    assert replay_request.transcript_snapshot is transcript_snapshot
+    assert repr(replay_request) == "RouterHistoryReplayRequest()"
+    assert "history-secret" not in repr(request)
+    assert "current-secret" not in repr(request.router_history_replay_request)
 
 
 @pytest.mark.asyncio

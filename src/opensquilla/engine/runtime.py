@@ -19,6 +19,7 @@ import json
 import math
 import os
 import platform
+import re
 import time
 import uuid
 from collections import deque
@@ -27,6 +28,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Hashable,
     Mapping,
     Sequence,
@@ -176,6 +178,9 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerUsageTelemetryAdapter,
     create_turn_execution_context,
 )
+from opensquilla.engine.turn_runner.prompt_assembler_stage import (
+    RouterHistoryReplayRequest,
+)
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _could_be_human_silent_reply_prefix,
     _flush_current_text_segment,
@@ -300,7 +305,6 @@ from opensquilla.session.compaction_lifecycle import (
     compaction_memory_status,
     compaction_result_payload,
     durable_receipt_allows_destructive_compaction,
-    flush_receipt_allows_destructive_compaction,
     flush_receipt_is_successful_flush,
     flush_receipt_status_for_compaction,
     flush_trigger_enabled,
@@ -2220,6 +2224,7 @@ class _SelectorFallbackProvider:
         self._used_fallback = False
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
+        self._last_request_had_tools = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[
             _FallbackDeploymentIdentity, tuple[int, int]
@@ -2395,6 +2400,71 @@ class _SelectorFallbackProvider:
         )
         model = str(getattr(current_config, "model", "") or "")
         return provider_id, model
+
+    def _fallback_candidate_accepts_tools(self, deployment: Any) -> bool:
+        """Allow unknown candidates and reject only explicit tool denials."""
+
+        capabilities = self._fallback_deployment_capabilities.get(
+            _fallback_deployment_identity(deployment)
+        )
+        return bool(
+            capabilities is None
+            or getattr(capabilities, "supports_tools", None) is not False
+        )
+
+    def _advance_past_explicit_tool_denials(
+        self,
+        *,
+        candidate_predicate: Callable[[Any], bool] | None = None,
+    ) -> bool:
+        """Advance until tools, health, and any caller constraint all pass."""
+
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        current_config = getattr(self._selector, "current_config", None)
+        while current_config is not None:
+            candidate_compatible = bool(
+                self._fallback_candidate_accepts_tools(current_config)
+                and (
+                    candidate_predicate is None
+                    or candidate_predicate(current_config)
+                )
+            )
+            health_eligible = True
+            if (
+                candidate_compatible
+                and self._health_ledger is not None
+                and callable(remaining_chain)
+            ):
+                candidates = [
+                    (
+                        str(getattr(candidate, "provider", "")),
+                        str(getattr(candidate, "model", "")),
+                    )
+                    for candidate in remaining_chain()
+                    if self._fallback_candidate_accepts_tools(candidate)
+                    and (
+                        candidate_predicate is None
+                        or candidate_predicate(candidate)
+                    )
+                ]
+                if candidates:
+                    health_eligible = self._health_ledger.eligible(
+                        candidates[0][0],
+                        candidates[0][1],
+                        candidates,
+                    )
+            if candidate_compatible and health_eligible:
+                return True
+            next_fallback = getattr(self._selector, "next_fallback", None)
+            if not callable(next_fallback):
+                return False
+            try:
+                self._provider = next_fallback()
+            except Exception:  # noqa: BLE001 - optional legacy selector seam
+                return False
+            self._note_fallback_hop()
+            current_config = getattr(self._selector, "current_config", None)
+        return False
 
     def fallback_deployment_configs(self) -> tuple[Any, ...]:
         """Return private physical fallback configs without metadata projection."""
@@ -2742,22 +2812,18 @@ class _SelectorFallbackProvider:
             return
         ledger.record_success(provider_id, model)
 
-    def _can_escalate_local_admission_failure(self, config: Any = None) -> bool:
-        """Return whether the next authorized leg has a larger context window.
+    def _local_admission_candidate_is_compatible(
+        self,
+        current: Any,
+        candidate: Any,
+        config: Any = None,
+        *,
+        requires_tools: bool = False,
+    ) -> bool:
+        """Prove one local-admission candidate is larger and tool-compatible."""
 
-        ``provider_request_budget_exhausted`` is emitted before network I/O by
-        adapters. A small routed leg must not force durable session
-        compaction, but the selector may advance once to an already-authorized
-        larger fallback and let that leg repeat final admission.
-        """
-
-        remaining_chain = getattr(self._selector, "remaining_chain", None)
-        if not callable(remaining_chain):
+        if requires_tools and not self._fallback_candidate_accepts_tools(candidate):
             return False
-        chain = list(remaining_chain())
-        if len(chain) < 2:
-            return False
-        current, fallback = chain[0], chain[1]
         try:
             catalog = shared_catalog()
             global_override = _non_negative_int(
@@ -2773,10 +2839,10 @@ class _SelectorFallbackProvider:
                 provider=str(getattr(current, "provider", "") or ""),
                 global_override=global_override,
             )
-            fallback_window, fallback_source = resolve_effective_context_window(
+            candidate_window, candidate_source = resolve_effective_context_window(
                 catalog,
-                str(getattr(fallback, "model", "") or ""),
-                provider=str(getattr(fallback, "provider", "") or ""),
+                str(getattr(candidate, "model", "") or ""),
+                provider=str(getattr(candidate, "provider", "") or ""),
                 global_override=global_override,
             )
         except Exception:  # noqa: BLE001 - unknown capacity is not an escalation proof
@@ -2784,9 +2850,45 @@ class _SelectorFallbackProvider:
         reliable_sources = {"override", "config", "catalog"}
         return bool(
             str(current_source or "") in reliable_sources
-            and str(fallback_source or "") in reliable_sources
-            and int(fallback_window or 0) > int(current_window or 0)
+            and str(candidate_source or "") in reliable_sources
+            and int(candidate_window or 0) > int(current_window or 0)
         )
+
+    def _local_admission_fallback_index(
+        self,
+        config: Any = None,
+        *,
+        requires_tools: bool = False,
+    ) -> int:
+        """Return the first larger compatible fallback's one-based chain index.
+
+        ``provider_request_budget_exhausted`` is emitted before network I/O by
+        adapters. A small routed leg must not force durable session
+        compaction, but the selector may advance to an already-authorized
+        larger compatible fallback and let that leg repeat final admission.
+        """
+
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        if not callable(remaining_chain):
+            return 0
+        chain = list(remaining_chain())
+        if len(chain) < 2:
+            return 0
+        current = chain[0]
+        for index, fallback in enumerate(chain[1:], start=1):
+            if self._local_admission_candidate_is_compatible(
+                current,
+                fallback,
+                config,
+                requires_tools=requires_tools,
+            ):
+                return index
+        return 0
+
+    def _can_escalate_local_admission_failure(self, config: Any = None) -> bool:
+        """Return whether any authorized leg has a larger context window."""
+
+        return self._local_admission_fallback_index(config) > 0
 
     def _skip_benched_fallbacks(self) -> None:
         """Advance past benched fallback deployments (opt-in ledger only).
@@ -2823,19 +2925,18 @@ class _SelectorFallbackProvider:
             self._note_fallback_hop()
 
     def fallback_after_invalid_response(self, reason: str) -> bool:
-        try:
-            self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
-        except Exception:
-            return False
-        self._note_fallback_hop()
-        self._skip_benched_fallbacks()
-        return True
+        return self.fallback_after_invalid_response_with_capabilities(
+            reason,
+            requires_vision=False,
+            requires_tools=self._last_request_had_tools,
+        )
 
     def fallback_after_invalid_response_with_capabilities(
         self,
         reason: str,
         *,
         requires_vision: bool,
+        requires_tools: bool = False,
     ) -> bool:
         """Select an invalid-response fallback with exact capability evidence.
 
@@ -2845,32 +2946,61 @@ class _SelectorFallbackProvider:
         installs only the matching chain.
         """
 
-        if not requires_vision:
-            return self.fallback_after_invalid_response(reason)
-
         matching_fallback = getattr(
             self._selector,
             "next_fallback_after_failure_matching",
             None,
         )
-        if not callable(matching_fallback):
-            return False
         try:
-            self._provider = matching_fallback(
-                RuntimeError(reason),
-                predicate=lambda candidate: (
-                    self._fallback_deployment_vision_support.get(
-                        _fallback_deployment_identity(candidate),
-                        "unknown",
+            if requires_vision or requires_tools:
+                if not callable(matching_fallback):
+                    # Legacy selector seams cannot prove vision support, but
+                    # tool capability defaults to allowed-until-denied. The
+                    # active-leg admission guard below still blocks a fallback
+                    # that resolves to an explicit tools denial before I/O.
+                    if requires_vision:
+                        return False
+                    self._provider = self._selector.next_fallback_after_failure(
+                        RuntimeError(reason)
                     )
-                    == "supported"
-                ),
-            )
+                    if requires_tools and not self._advance_past_explicit_tool_denials():
+                        # The legacy selector already mutated its active leg.
+                        # Keep configuration rebinding enabled so any caller
+                        # that retries after ``False`` still hits the explicit
+                        # capability guard before provider I/O.
+                        self._note_fallback_hop()
+                        return False
+                else:
+                    self._provider = matching_fallback(
+                        RuntimeError(reason),
+                        predicate=lambda candidate: bool(
+                            (
+                                not requires_vision
+                                or self._fallback_deployment_vision_support.get(
+                                    _fallback_deployment_identity(candidate),
+                                    "unknown",
+                                )
+                                == "supported"
+                            )
+                            and (
+                                not requires_tools
+                                or self._fallback_candidate_accepts_tools(candidate)
+                            )
+                        ),
+                    )
+            else:
+                self._provider = self._selector.next_fallback_after_failure(
+                    RuntimeError(reason)
+                )
         except Exception:  # noqa: BLE001 - fallback support is optional
             return False
 
         self._note_fallback_hop()
-        self._skip_benched_fallbacks()
+        if requires_tools:
+            if not self._advance_past_explicit_tool_denials():
+                return False
+        else:
+            self._skip_benched_fallbacks()
         return True
 
     def _reject_unsupported_image_input(
@@ -2987,6 +3117,7 @@ class _SelectorFallbackProvider:
         *,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
+        self._last_request_had_tools = bool(tools)
         emitted_user_visible_content = False
         pre_text_buffer = _SelectorPreTextBuffer()
         primary_activity_id = uuid.uuid4().hex
@@ -2996,6 +3127,20 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
+        if (
+            tools
+            and getattr(
+                getattr(active_config, "model_capabilities", None),
+                "supports_tools",
+                None,
+            )
+            is False
+        ):
+            yield ProviderErrorEvent(
+                message="The selected model does not support tool calling.",
+                code="model_tools_unsupported",
+            )
+            return
         validation_error = self.validate_chat_admission(messages, config)
         if validation_error is not None:
             yield validation_error
@@ -3143,11 +3288,16 @@ class _SelectorFallbackProvider:
                         code="incomplete_tool_stream",
                     )
 
-                local_admission_escalation = bool(
-                    isinstance(event, ProviderErrorEvent)
+                local_admission_fallback_index = (
+                    self._local_admission_fallback_index(
+                        active_config,
+                        requires_tools=bool(tools),
+                    )
+                    if isinstance(event, ProviderErrorEvent)
                     and event.code == "provider_request_budget_exhausted"
-                    and self._can_escalate_local_admission_failure(active_config)
+                    else 0
                 )
+                local_admission_escalation = local_admission_fallback_index > 0
                 if isinstance(event, ProviderErrorEvent) and (
                     _should_use_selector_fallback(self.provider_name, event)
                     or event.code == "invalid_stream_order"
@@ -3165,9 +3315,68 @@ class _SelectorFallbackProvider:
                         "current_config",
                         None,
                     )
+                    local_candidate_predicate: Callable[[Any], bool] | None = None
+                    legacy_selection_mutated = False
                     try:
                         if local_admission_escalation:
-                            self._provider = self._selector.next_fallback()
+                            def _local_candidate_predicate(candidate: Any) -> bool:
+                                return self._local_admission_candidate_is_compatible(
+                                    failed_authority_config,
+                                    candidate,
+                                    active_config,
+                                    requires_tools=bool(tools),
+                                )
+
+                            local_candidate_predicate = _local_candidate_predicate
+                            matching_fallback = getattr(
+                                self._selector,
+                                "next_fallback_matching",
+                                None,
+                            )
+                            if callable(matching_fallback):
+                                self._provider = matching_fallback(
+                                    predicate=local_candidate_predicate,
+                                )
+                            else:
+                                next_fallback = getattr(
+                                    self._selector,
+                                    "next_fallback",
+                                    None,
+                                )
+                                if not callable(next_fallback):
+                                    raise IndexError(
+                                        "local admission fallback selection unavailable"
+                                    )
+                                for _ in range(local_admission_fallback_index):
+                                    self._provider = next_fallback()
+                                    legacy_selection_mutated = True
+                                    # Legacy selectors cannot advance
+                                    # atomically. Rebind capabilities after
+                                    # every successful step so a later build
+                                    # failure cannot expose this leg using the
+                                    # primary model's config.
+                                    self._used_fallback = True
+                        elif tools:
+                            matching_fallback = getattr(
+                                self._selector,
+                                "next_fallback_after_failure_matching",
+                                None,
+                            )
+                            selector_failure = _selector_failure_for_hook(
+                                active_provider_id or self.provider_name,
+                                event,
+                            )
+                            if callable(matching_fallback):
+                                self._provider = matching_fallback(
+                                    selector_failure,
+                                    predicate=self._fallback_candidate_accepts_tools,
+                                )
+                            else:
+                                self._provider = (
+                                    self._selector.next_fallback_after_failure(
+                                        selector_failure
+                                    )
+                                )
                         else:
                             self._provider = self._selector.next_fallback_after_failure(
                                 _selector_failure_for_hook(
@@ -3176,12 +3385,25 @@ class _SelectorFallbackProvider:
                                 )
                             )
                     except Exception:
+                        if legacy_selection_mutated:
+                            self._note_fallback_hop()
                         for buffered_event in pre_text_buffer.drain(successful_leg=False):
                             yield buffered_event
                         yield event
                         return
                     self._note_fallback_hop()
-                    self._skip_benched_fallbacks()
+                    if tools:
+                        if not self._advance_past_explicit_tool_denials(
+                            candidate_predicate=local_candidate_predicate
+                        ):
+                            for buffered_event in pre_text_buffer.drain(
+                                successful_leg=False
+                            ):
+                                yield buffered_event
+                            yield event
+                            return
+                    else:
+                        self._skip_benched_fallbacks()
                     # Close the failed physical leg before reserving the next
                     # one; otherwise an early-consumer break can defer unknown
                     # coverage until async-generator GC.
@@ -3189,6 +3411,22 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
+                    if (
+                        tools
+                        and getattr(
+                            getattr(fallback_config, "model_capabilities", None),
+                            "supports_tools",
+                            None,
+                        )
+                        is False
+                    ):
+                        yield ProviderErrorEvent(
+                            message=(
+                                "The selected fallback model does not support tool calling."
+                            ),
+                            code="model_tools_unsupported",
+                        )
+                        return
                     fallback_admission_error = self._reject_unsupported_image_input(
                         messages,
                         fallback_config,
@@ -8763,6 +9001,7 @@ class TurnRunner:
         skill_catalog: Any | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        router_history_replay_request: RouterHistoryReplayRequest | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -9155,6 +9394,31 @@ class TurnRunner:
         if not planning_turn and not restricted_tool_boundary:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
+        if router_history_replay_request is not None:
+            history_capacity = await self._router_history_capacity_for_request(
+                session_key,
+                router_history_replay_request,
+                max_history_turns=self._route_history_turn_limit(turn.metadata),
+                preserve_image_attachments=(
+                    turn.metadata.get("image_route_reason")
+                    in {"current_turn", "gate_history"}
+                ),
+                reachable_provider_kinds=self._route_capacity_provider_kinds(
+                    turn,
+                    initial_provider_config=initial_provider_config,
+                ),
+            )
+            turn.metadata["routing_history_capacity_estimated_tokens"] = max(
+                0,
+                int(history_capacity.get("history_capacity_estimated_tokens") or 0),
+            )
+            turn.metadata["routing_history_capacity_message_count"] = max(
+                0,
+                int(history_capacity.get("history_capacity_message_count") or 0),
+            )
+            turn.metadata["routing_history_capacity_estimate_complete"] = (
+                history_capacity.get("history_capacity_estimate_complete") is True
+            )
         # Capacity admission is safety-critical: it runs at the finalized
         # prompt/tool boundary outside the generic fail-open pipeline wrapper.
         # An unexpected estimator failure must stop the turn rather than leave
@@ -9647,6 +9911,407 @@ class TurnRunner:
 
         return turn, provider
 
+    @staticmethod
+    def _route_history_turn_limit(metadata: Mapping[str, Any]) -> int:
+        raw = metadata.get("route_max_history_turns")
+        if isinstance(raw, bool):
+            return 0
+        if isinstance(raw, int):
+            return max(0, raw)
+        if isinstance(raw, str):
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                return 0
+        return 0
+
+    @staticmethod
+    def _route_capacity_provider_kinds(
+        turn: Any,
+        *,
+        initial_provider_config: Any | None,
+    ) -> frozenset[str] | None:
+        """Return provider-native history kinds reachable by this routed turn."""
+
+        providers: set[str] = set()
+
+        def _add(value: Any) -> None:
+            provider = str(value or "").strip().lower()
+            if provider:
+                providers.add(provider)
+
+        active_provider = getattr(initial_provider_config, "provider", "")
+        _add(active_provider)
+        metadata = getattr(turn, "metadata", {}) or {}
+        _add(metadata.get("routed_provider"))
+        for key in ("router_fallback_chain", "selector_execution_chain"):
+            rows = metadata.get(key)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, Mapping):
+                    _add(row.get("provider"))
+
+        router_cfg = getattr(getattr(turn, "config", None), "squilla_router", None)
+        if bool(getattr(router_cfg, "cross_provider_tiers", False)):
+            tiers = getattr(router_cfg, "tiers", None)
+            requires_image = metadata.get("image_route_reason") in {
+                "current_turn",
+                "gate_history",
+            }
+            if isinstance(tiers, Mapping):
+                for raw_tier in tiers.values():
+                    if not isinstance(raw_tier, Mapping):
+                        continue
+                    if requires_image and not bool(raw_tier.get("supports_image", False)):
+                        continue
+                    if not requires_image and bool(raw_tier.get("image_only", False)):
+                        continue
+                    _add(raw_tier.get("provider") or active_provider)
+
+        # Unknown/legacy selector shapes retain the previous conservative
+        # all-provider behavior instead of silently omitting a reachable state.
+        return frozenset(providers) if providers else None
+
+    @staticmethod
+    def _attachment_history_capacity_projection(
+        content: str,
+        *,
+        preserve_image_attachments: bool,
+        media_root: Path | None,
+        session_id: str | None,
+    ) -> tuple[bool, bool, bool]:
+        """Classify an attachment envelope and prove its replay when required.
+
+        Ordinary JSON is not treated as an attachment envelope and remains a
+        conservative text input. The result is ``(recognized, valid,
+        estimate_complete)``. Invalid recognized envelopes remain raw text;
+        only a valid envelope may replace its persisted raw-token floor.
+        """
+
+        if not content or not content.lstrip().startswith("{"):
+            return False, True, True
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return False, True, True
+        if not isinstance(parsed, dict) or "text" not in parsed:
+            return False, True, True
+        if not isinstance(parsed.get("text"), str):
+            return True, False, False
+        attachments = parsed.get("attachments") or []
+        if not isinstance(attachments, list):
+            return True, False, False
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                return True, False, False
+            media_type = (
+                attachment.get("type")
+                or attachment.get("mime")
+                or attachment.get("media_type")
+            )
+            if (
+                not isinstance(media_type, str)
+                or media_type not in _ALLOWED_ENGINE_MEDIA_TYPES
+            ):
+                return True, False, False
+            data = attachment.get("data")
+            sha_ref = attachment.get("sha256_ref")
+            missing_reason = attachment.get("missing_reason")
+            data_text = data if isinstance(data, str) and data else None
+            sha_ref_text = sha_ref if isinstance(sha_ref, str) and sha_ref else None
+            has_missing_reason = isinstance(missing_reason, str) and bool(missing_reason)
+            if not (data_text is not None or sha_ref_text is not None or has_missing_reason):
+                return True, False, False
+            if data_text is not None:
+                try:
+                    base64.b64decode(data_text, validate=True)
+                except (binascii.Error, ValueError):
+                    return True, False, False
+            if not preserve_image_attachments or media_type not in _IMAGE_ATTACHMENT_MIMES:
+                continue
+            if data_text is not None:
+                continue
+            if sha_ref_text is None:
+                # A persisted missing_reason-only record intentionally replays
+                # as an unavailable marker and needs no media hydration.
+                continue
+            if media_root is None or not session_id:
+                return True, True, False
+            raw_size = attachment.get("size")
+            size = raw_size if isinstance(raw_size, int) else -1
+            label = attachment.get("name")
+            if not isinstance(label, str) or not label.strip():
+                label = "image"
+            try:
+                ref = make_attachment_ref(
+                    sha256=sha_ref_text,
+                    name=label,
+                    mime=media_type,
+                    size=size,
+                    session_id=session_id,
+                    source="transcript",
+                )
+                read_attachment_ref_bytes(ref, media_root=media_root)
+            except (OSError, ValueError):
+                return True, True, False
+        return True, True, True
+
+    @staticmethod
+    def _attachment_history_residual_token_floor(
+        content: str,
+        projected_content: Any,
+        persisted_token_count: int,
+    ) -> int:
+        """Remove only replayed inline-image data from a persisted raw floor.
+
+        A transcript token_count is row-scoped, so clearing it wholesale can
+        also discount ordinary text, PDF bytes, or a legacy provider-usage
+        surplus. Replace the exact canonical ``data`` JSON values for images
+        that became typed blocks, then subtract only that measured delta.
+        Failure to locate every value keeps the original conservative floor.
+        """
+
+        raw_tokens = estimate_tokens(content)
+        raw_floor = max(0, persisted_token_count, raw_tokens)
+        if not isinstance(projected_content, list):
+            return raw_floor
+        from opensquilla.provider.types import ContentBlockImage
+
+        typed_image_count = sum(
+            isinstance(block, ContentBlockImage) and block.source_type == "base64"
+            for block in projected_content
+        )
+        if typed_image_count <= 0:
+            return raw_floor
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return raw_floor
+        if not isinstance(parsed, dict):
+            return raw_floor
+        attachments = parsed.get("attachments") or []
+        if not isinstance(attachments, list):
+            return raw_floor
+        inline_image_data = [
+            attachment["data"]
+            for attachment in attachments
+            if isinstance(attachment, dict)
+            and (
+                attachment.get("type")
+                or attachment.get("mime")
+                or attachment.get("media_type")
+            )
+            in _IMAGE_ATTACHMENT_MIMES
+            and isinstance(attachment.get("data"), str)
+            and bool(attachment.get("data"))
+        ]
+        if not inline_image_data or typed_image_count < len(inline_image_data):
+            return raw_floor
+
+        residual = content
+        for data in set(inline_image_data):
+            encoded_data = json.dumps(data, ensure_ascii=False)
+            placeholder = json.dumps(
+                f"[history_image_omitted: {len(data)} chars]",
+                ensure_ascii=False,
+            )
+            pattern = re.compile(r'("data"\s*:\s*)' + re.escape(encoded_data))
+            expected_replacements = inline_image_data.count(data)
+            if len(pattern.findall(residual)) != expected_replacements:
+                return raw_floor
+            residual, replacements = pattern.subn(
+                lambda match: match.group(1) + placeholder,
+                residual,
+            )
+            if replacements != expected_replacements:
+                return raw_floor
+
+        residual_tokens = estimate_tokens(residual)
+        image_data_delta = max(0, raw_tokens - residual_tokens)
+        return max(0, residual_tokens, persisted_token_count - image_data_delta)
+
+    def _project_history_replay(
+        self,
+        entries: Sequence[Any],
+        *,
+        excluded_entry_indexes: Collection[int],
+        trim_last_user: bool,
+        bound_slice_applied: bool,
+        image_replay_entry_indexes: Collection[int] = (),
+        media_root: Path | None = None,
+        session_id: str | None = None,
+        materialize_historical_attachments: bool = False,
+        workspace_dir: str | Path | None = None,
+        historical_materializer: AttachmentWorkspaceMaterializer | None = None,
+        restricted_turn: bool = False,
+        require_capacity_proof: bool = False,
+    ) -> Any:
+        """Project transcript rows through the same replay decoder for all consumers."""
+
+        from opensquilla.engine.history import (
+            HistoryReplayEntryProjection,
+            project_history_replay,
+        )
+
+        image_indexes = set(image_replay_entry_indexes)
+
+        def _entry_projector(entry: Any, entry_index: int) -> HistoryReplayEntryProjection:
+            role = getattr(entry, "role", None)
+            raw_content = getattr(entry, "content", None) or ""
+            raw_token_count = getattr(entry, "token_count", None)
+            if isinstance(raw_token_count, bool):
+                persisted_token_count = 0
+            else:
+                try:
+                    persisted_token_count = max(0, int(raw_token_count or 0))
+                except (TypeError, ValueError):
+                    persisted_token_count = 0
+            if (
+                role == "system"
+                and isinstance(raw_content, str)
+                and raw_content.startswith(_CONTEXT_SUMMARY_MARKER)
+            ):
+                return HistoryReplayEntryProjection(
+                    legacy_summary_marker=(
+                        None
+                        if restricted_turn
+                        else _strip_context_summary_marker(raw_content)
+                    )
+                )
+            subagent_notice = _subagent_terminal_history_notice(entry)
+            if subagent_notice is not None:
+                return HistoryReplayEntryProjection(
+                    terminal_notice=subagent_notice,
+                    persisted_token_count=persisted_token_count,
+                    last_entry_was_user=False,
+                )
+            if role not in {"user", "assistant"}:
+                return HistoryReplayEntryProjection()
+
+            estimate_complete = True
+            raw_token_floor_applies = True
+            if raw_content and role == "user":
+                preserve_image = entry_index in image_indexes
+                recognized = False
+                valid = True
+                if require_capacity_proof:
+                    recognized, valid, estimate_complete = (
+                        self._attachment_history_capacity_projection(
+                            raw_content,
+                            preserve_image_attachments=preserve_image,
+                            media_root=media_root,
+                            session_id=session_id,
+                        )
+                    )
+                if (
+                    require_capacity_proof
+                    and recognized
+                    and (not valid or not estimate_complete)
+                ):
+                    # Do not partially unpack unproven attachment envelopes:
+                    # retaining their raw JSON/base64 is the conservative view.
+                    projected_content = raw_content
+                else:
+                    projected_content = self._maybe_unpack_attachments(
+                        raw_content,
+                        preserve_image_attachments=preserve_image,
+                        materialize_historical_attachments=(
+                            materialize_historical_attachments
+                        ),
+                        media_root=media_root,
+                        session_id=session_id,
+                        workspace_dir=workspace_dir,
+                        historical_materializer=historical_materializer,
+                    )
+                if require_capacity_proof and recognized and valid:
+                    persisted_token_count = (
+                        self._attachment_history_residual_token_floor(
+                            raw_content,
+                            projected_content,
+                            persisted_token_count,
+                        )
+                    )
+            elif raw_content and role == "assistant":
+                projected_content = self._maybe_unpack_assistant_artifacts(raw_content)
+            else:
+                projected_content = raw_content
+            turn_context = getattr(entry, "turn_context", None)
+            return HistoryReplayEntryProjection(
+                role=role,
+                content=projected_content,
+                tool_calls=getattr(entry, "tool_calls", None),
+                reasoning_content=getattr(entry, "reasoning_content", None),
+                turn_context=(turn_context if isinstance(turn_context, dict) else None),
+                estimate_complete=estimate_complete,
+                persisted_token_count=persisted_token_count,
+                raw_token_floor_applies=raw_token_floor_applies,
+                last_entry_was_user=role == "user",
+            )
+
+        return project_history_replay(
+            entries,
+            excluded_entry_indexes=excluded_entry_indexes,
+            trim_last_user=trim_last_user,
+            bound_slice_applied=bound_slice_applied,
+            entry_projector=_entry_projector,
+        )
+
+    async def _router_history_capacity_for_request(
+        self,
+        session_key: str,
+        request: RouterHistoryReplayRequest,
+        *,
+        max_history_turns: int,
+        preserve_image_attachments: bool,
+        reachable_provider_kinds: Collection[str] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a turn-local replay request after the router selects a route."""
+
+        if self._session_manager is None:
+            return {
+                "history_capacity_estimated_tokens": 0,
+                "history_capacity_message_count": 0,
+                "history_capacity_estimate_complete": True,
+            }
+        try:
+            get_transcript = getattr(self._session_manager, "get_transcript", None)
+            if not callable(get_transcript):
+                return {"history_capacity_estimate_complete": False}
+            snapshot = request.transcript_snapshot
+            if snapshot is not None:
+                entries = list(await snapshot.get_entries())
+            else:
+                transcript = get_transcript(session_key)
+                if inspect.isawaitable(transcript):
+                    transcript = await transcript
+                entries = list(transcript or [])
+
+            bound_index: int | None = None
+            if request.bound_user_message_id is not None:
+                for index, entry in enumerate(entries):
+                    if getattr(entry, "message_id", None) == request.bound_user_message_id:
+                        bound_index = index
+                        break
+            return await self._router_history_capacity_context(
+                session_key,
+                entries,
+                exclude_last_user=request.exclude_last_user,
+                bound_user_message_id=request.bound_user_message_id,
+                bound_index=bound_index,
+                max_history_turns=max_history_turns,
+                preserve_image_attachments=preserve_image_attachments,
+                reachable_provider_kinds=reachable_provider_kinds,
+            )
+        except Exception as exc:  # noqa: BLE001 - capacity admission fails closed
+            # Never serialize the exception: storage/provider errors may echo
+            # transcript or attachment material.
+            log.warning(
+                "turn_runner.router_capacity_projection_failed",
+                error_type=type(exc).__name__,
+            )
+            return {"history_capacity_estimate_complete": False}
+
     async def _router_history_capacity_context(
         self,
         session_key: str,
@@ -9655,8 +10320,11 @@ class TurnRunner:
         exclude_last_user: bool,
         bound_user_message_id: str | None,
         bound_index: int | None,
+        max_history_turns: int = 0,
+        preserve_image_attachments: bool = False,
+        reachable_provider_kinds: Collection[str] | None = None,
     ) -> dict[str, Any]:
-        """Measure the pre-current replay projection for attachment routing."""
+        """Measure the route-specific pre-current replay projection."""
 
         excluded_user_indexes: set[int] = set()
         if bound_index is not None:
@@ -9672,37 +10340,52 @@ class TurnRunner:
         ):
             excluded_user_indexes.add(len(entries) - 1)
 
-        from opensquilla.session.compaction import estimate_entry_model_replay_tokens
-
-        capacity_tokens = 0
-        capacity_message_count = 0
-        legacy_summary_markers: list[str] = []
-        for index, entry in enumerate(entries):
-            if index in excluded_user_indexes:
-                continue
-            role = getattr(entry, "role", None)
-            content = getattr(entry, "content", None)
-            if (
-                role == "system"
-                and isinstance(content, str)
-                and content.startswith(_CONTEXT_SUMMARY_MARKER)
-            ):
-                legacy_summary_markers.append(_strip_context_summary_marker(content))
-                continue
-            if role not in {"user", "assistant"}:
-                continue
-            capacity_tokens += estimate_entry_model_replay_tokens(entry)
-            tool_calls = getattr(entry, "tool_calls", None)
-            capacity_message_count += 1 + (
-                2 * len(tool_calls) if isinstance(tool_calls, list) else 0
+        image_replay_entry_indexes: set[int] = set()
+        replay_session_id: str | None = None
+        if preserve_image_attachments:
+            router_cfg = getattr(self._turn_config(), "squilla_router", None)
+            lookback = int(
+                getattr(router_cfg, "vision_history_lookback_turns", 3) or 0
             )
+            if lookback > 0:
+                user_entry_indexes = [
+                    index
+                    for index, entry in enumerate(entries)
+                    if index not in excluded_user_indexes
+                    and getattr(entry, "role", None) == "user"
+                    and isinstance(getattr(entry, "content", None), str)
+                    and bool(str(getattr(entry, "content", "")).strip())
+                ]
+                image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
+                replay_session_id = await self._resolve_session_id_for_log(session_key)
+                if replay_session_id is None:
+                    replay_session_id = session_key
+
+        replay = self._project_history_replay(
+            entries,
+            excluded_entry_indexes=excluded_user_indexes,
+            trim_last_user=exclude_last_user,
+            bound_slice_applied=bool(excluded_user_indexes),
+            image_replay_entry_indexes=image_replay_entry_indexes,
+            media_root=self._attachment_media_root(),
+            session_id=replay_session_id,
+            require_capacity_proof=True,
+        )
+        from opensquilla.engine.history import project_history_replay_capacity
+
+        capacity = project_history_replay_capacity(
+            replay,
+            max_history_turns=max_history_turns,
+        )
+        legacy_summary_markers = list(replay.legacy_summary_markers)
 
         summaries: list[Any] = []
         context_states: list[Any] = []
         get_summaries = getattr(self._session_manager, "get_summaries", None)
         get_context_states = getattr(self._session_manager, "get_context_states", None)
-        capacity_estimate_complete = (
-            bound_user_message_id is None or bound_index is not None
+        capacity_estimate_complete = bool(
+            capacity.estimate_complete
+            and (bound_user_message_id is None or bound_index is not None)
         )
         try:
             pending: list[Any] = []
@@ -9739,12 +10422,28 @@ class TurnRunner:
                 1 if rendered else 0,
             )
 
-        best_compaction_tokens, best_compaction_messages = _summary_projection()
+        portable_summary_tokens, portable_summary_messages = _summary_projection()
+        # A provider without a native checkpoint sees the route-limited
+        # transcript plus the portable request-context summary.
+        capacity_tokens = capacity.estimated_tokens + portable_summary_tokens
+        capacity_message_count = capacity.message_count + portable_summary_messages
+        capacity_envelope_score = capacity_tokens + (8 * capacity_message_count)
         provider_kinds = {
             str(getattr(state, "provider", "") or "").strip()
             for state in context_states
             if str(getattr(state, "provider", "") or "").strip()
         }
+        if reachable_provider_kinds is not None:
+            reachable = {
+                str(provider or "").strip().lower()
+                for provider in reachable_provider_kinds
+                if str(provider or "").strip()
+            }
+            provider_kinds = {
+                provider_kind
+                for provider_kind in provider_kinds
+                if provider_kind.lower() in reachable
+            }
         for provider_kind in provider_kinds:
             native_context = build_provider_compaction_context(
                 context_states=context_states,
@@ -9752,28 +10451,45 @@ class TurnRunner:
             )
             if not native_context.messages:
                 continue
-            payload = [
-                message.model_dump(mode="json", exclude_none=True)
-                for message in native_context.messages
-            ]
-            projected_tokens = estimate_tokens(
-                json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                )
+            # Match _load_history + Agent exactly: native provider state is
+            # prepended before max_history_turns and tool-pair repair apply.
+            # Limiting transcript first and then adding native state would
+            # retain a checkpoint that the actual provider request discards.
+            from opensquilla.engine.history import (
+                HistoryReplayMessageProvenance,
+                HistoryReplayProjection,
+            )
+
+            native_replay = HistoryReplayProjection(
+                messages=tuple(native_context.messages) + replay.messages,
+                message_provenance=(
+                    tuple(
+                        HistoryReplayMessageProvenance()
+                        for _message in native_context.messages
+                    )
+                    + replay.message_provenance
+                ),
+                legacy_summary_markers=replay.legacy_summary_markers,
+                terminal_notices=replay.terminal_notices,
+                estimate_complete=replay.estimate_complete,
+            )
+            provider_capacity = project_history_replay_capacity(
+                native_replay,
+                max_history_turns=max_history_turns,
             )
             residual_tokens, residual_messages = _summary_projection(
                 native_context.covered_through_ids
             )
-            provider_view_tokens = projected_tokens + residual_tokens
-            provider_view_messages = len(native_context.messages) + residual_messages
-            if provider_view_tokens > best_compaction_tokens:
-                best_compaction_tokens = provider_view_tokens
-                best_compaction_messages = provider_view_messages
-        capacity_tokens += best_compaction_tokens
-        capacity_message_count += best_compaction_messages
+            provider_view_tokens = provider_capacity.estimated_tokens + residual_tokens
+            provider_view_messages = provider_capacity.message_count + residual_messages
+            provider_view_score = provider_view_tokens + (8 * provider_view_messages)
+            if provider_view_score > capacity_envelope_score:
+                capacity_tokens = provider_view_tokens
+                capacity_message_count = provider_view_messages
+                capacity_envelope_score = provider_view_score
+            capacity_estimate_complete = bool(
+                capacity_estimate_complete and provider_capacity.estimate_complete
+            )
 
         return {
             "history_capacity_estimated_tokens": max(0, capacity_tokens),
@@ -10541,12 +11257,6 @@ class TurnRunner:
         if not rendered:
             return (0, 0)
         return (estimate_tokens(rendered), len(rendered))
-
-    async def _durable_compaction_context_tokens(self, session_key: str) -> int:
-        """Compatibility projection of durable checkpoint token usage."""
-
-        tokens, _chars = await self._durable_compaction_context_measure(session_key)
-        return tokens
 
     async def _maybe_compact_on_t3_upgrade(
         self,
@@ -12257,9 +12967,6 @@ class TurnRunner:
         except (TypeError, ValueError):
             return 0
 
-    def _flush_receipt_allows_destructive_compaction(self, receipt: Any) -> bool:
-        return flush_receipt_allows_destructive_compaction(receipt)
-
     def _compaction_circuit_open(self, session_key: str) -> bool:
         state = getattr(self, "_compaction_failures", {}).get(session_key)
         if state is None or state.count < _COMPACTION_FAILURE_LIMIT:
@@ -12567,12 +13274,10 @@ class TurnRunner:
             else await self._session_manager.get_transcript(session_key)
         )
 
-        from opensquilla.engine.history import reconstruct_messages_from_entry
         from opensquilla.provider import Message
 
         history: list[Message] = []
         summary_markers: list[str] = []
-        subagent_terminal_notices: list[str] = []
         emergency_overrides = getattr(self, "_emergency_compaction_overrides", {})
         emergency_override = (
             None
@@ -12661,7 +13366,6 @@ class TurnRunner:
             attachment_replay_session_id = await self._resolve_session_id_for_log(session_key)
             if attachment_replay_session_id is None:
                 attachment_replay_session_id = session_key
-        last_entry_was_user = False
         history_materializer: AttachmentWorkspaceMaterializer | None = None
         if materialize_historical_attachments and workspace_dir and attachment_replay_session_id:
             # One instance per history load so first-materialization replays
@@ -12672,76 +13376,21 @@ class TurnRunner:
                 materializable_mimes=None,
                 disk_budget_bytes=workspace_attachment_budget_from_config(self._config),
             )
-        for entry_index, entry in enumerate(transcript):
-            if entry_index in bound_skip_indexes:
-                # The bound current prompt (re-appended by the caller) and any
-                # later still-queued user prompt are excluded from history.
-                last_entry_was_user = False
-                continue
-            if (
-                entry.role == "system"
-                and entry.content
-                and entry.content.startswith(_CONTEXT_SUMMARY_MARKER)
-            ):
-                if not restricted_turn:
-                    summary_markers.append(_strip_context_summary_marker(entry.content))
-                continue
-            subagent_notice = _subagent_terminal_history_notice(entry)
-            if subagent_notice is not None:
-                subagent_terminal_notices.append(subagent_notice)
-                last_entry_was_user = False
-                continue
-            if entry.role not in ("user", "assistant"):
-                continue
-            raw_content = entry.content or ""
-            # User messages may carry attachment envelopes; assistant messages
-            # may carry artifact metadata. Both become text-only safe markers
-            # for model-context replay.
-            if raw_content and entry.role == "user":
-                content: Any = self._maybe_unpack_attachments(
-                    raw_content,
-                    preserve_image_attachments=entry_index in image_replay_entry_indexes,
-                    materialize_historical_attachments=materialize_historical_attachments,
-                    media_root=self._attachment_media_root(),
-                    session_id=attachment_replay_session_id,
-                    workspace_dir=workspace_dir,
-                    historical_materializer=history_materializer,
-                )
-            elif raw_content and entry.role == "assistant":
-                content = self._maybe_unpack_assistant_artifacts(raw_content)
-            else:
-                content = raw_content
-            history.extend(
-                reconstruct_messages_from_entry(
-                    entry.role,
-                    content,
-                    entry.tool_calls,
-                    getattr(entry, "reasoning_content", None),
-                    turn_context=(
-                        getattr(entry, "turn_context", None)
-                        if isinstance(getattr(entry, "turn_context", None), dict)
-                        else None
-                    ),
-                )
-            )
-            last_entry_was_user = entry.role == "user"
-        # Strip the caller-appended user turn only when the transcript really
-        # ended on a user entry; an assistant entry that reconstructs into
-        # assistant + user(tool_result) must keep its tool_result tail. When the
-        # id-bound slice already excluded the current prompt, skip the positional
-        # pop entirely.
-        if (
-            not bound_slice_applied
-            and trim_last_user
-            and last_entry_was_user
-            and history
-            and history[-1].role == "user"
-        ):
-            history.pop()
-        history.extend(
-            Message(role="assistant", content=notice)
-            for notice in dict.fromkeys(subagent_terminal_notices)
+        replay = self._project_history_replay(
+            transcript,
+            excluded_entry_indexes=bound_skip_indexes,
+            trim_last_user=trim_last_user,
+            bound_slice_applied=bound_slice_applied,
+            image_replay_entry_indexes=image_replay_entry_indexes,
+            media_root=self._attachment_media_root(),
+            session_id=attachment_replay_session_id,
+            materialize_historical_attachments=materialize_historical_attachments,
+            workspace_dir=workspace_dir,
+            historical_materializer=history_materializer,
+            restricted_turn=restricted_turn,
         )
+        history = list(replay.messages)
+        summary_markers.extend(replay.legacy_summary_markers)
         if restricted_turn:
             # Context states, durable summaries, and legacy summary markers
             # were produced before this turn's restricted provider projection.

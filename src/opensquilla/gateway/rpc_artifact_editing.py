@@ -45,7 +45,9 @@ from opensquilla.artifact_session import (
     ArtifactNotFoundError as ArtifactSessionNotFoundError,
 )
 from opensquilla.artifact_session.html_anchors import (
+    ElementProofV2,
     HtmlAnchorChangedError,
+    canonical_selection_proof_v2,
     remap_html_anchor,
     target_projection,
 )
@@ -113,6 +115,8 @@ _HTML_TAG_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9:-]{0,127}$")
 _OPAQUE_ANNOTATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _SOURCE_OFFSET_ENCODING = "unicode-code-point"
+
+
 class _OpeningTagCollector(HTMLParser):
     """Collect canonical source opening-tag spans with raw spelling intact."""
 
@@ -575,6 +579,7 @@ def _canonical_opening_anchor(
     element_path: str,
     expected_element_proof_sha256: str,
     expected_tag_name: str,
+    expected_element_proof_v2: ElementProofV2 | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     try:
         return shared_canonical_opening_anchor(
@@ -582,9 +587,18 @@ def _canonical_opening_anchor(
             element_path=element_path,
             expected_element_proof_sha256=expected_element_proof_sha256,
             expected_tag_name=expected_tag_name,
+            expected_element_proof_v2=expected_element_proof_v2,
         )
     except HtmlAnchorChangedError as exc:
-        raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_CHANGED) from exc
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_CHANGED,
+            exc,
+            operation="prompt_annotations.verify_source_selection",
+            retryable=False,
+            reason_code="selection_proof_changed",
+            verification_stage="source-anchor",
+            proof_mode="v2" if expected_element_proof_v2 is not None else "v1",
+        ) from exc
 
 
 # Compatibility aliases for tests and older internal imports. Production
@@ -1204,7 +1218,45 @@ async def _emit_artifact_state(
     revision_id: str | None = None,
     change_set_id: str | None = None,
 ) -> None:
-    latest = await service.latest_audit_event(document_id)
+    # Resolve a notification sequence from the exact durable mutation.  A
+    # source.patched replay can happen after another audit event has landed;
+    # ``latest_audit_event`` would then fence the UI with the wrong sequence.
+    exact_lookup = getattr(service, "audit_event_for_mutation", None)
+    if callable(exact_lookup) and (revision_id is not None or change_set_id is not None):
+        latest = await exact_lookup(
+            document_id,
+            revision_id=revision_id,
+            change_set_id=change_set_id,
+        )
+    elif revision_id is not None or change_set_id is not None:
+        latest = None
+        list_events = getattr(service, "list_audit_events", None)
+        if callable(list_events):
+            for event in await list_events(document_id):
+                event_type = getattr(event, "event_type", "")
+                exact_pair = revision_id is not None and change_set_id is not None
+                if not exact_pair and not (
+                    isinstance(event_type, str)
+                    and (
+                        event_type.startswith("revision.")
+                        or event_type
+                        in {
+                            "document.created",
+                            "document.restored",
+                            "document.reverted",
+                            "change_set.applied",
+                        }
+                    )
+                ):
+                    continue
+                if revision_id is not None and event.revision_id != revision_id:
+                    continue
+                if change_set_id is not None and event.change_set_id != change_set_id:
+                    continue
+                if latest is None or event.sequence > latest.sequence:
+                    latest = event
+    else:
+        latest = await service.latest_audit_event(document_id)
     if latest is None:
         return
     payload = {
@@ -1900,13 +1952,23 @@ async def _trusted_annotation_selection(
     element_path: str,
     dom_sha256: str | None,
     element_proof_sha256: str,
-) -> None:
+) -> ElementProofV2 | None:
     bridge = get_desktop_artifact_bridge_client()
     if bridge is None or not hasattr(bridge, "resolve_annotation_selection"):
         raise artifact_product_error(
             ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
             reason_code="preview_unavailable",
         )
+    annotation_proof_v2_capable = False
+    capabilities = getattr(bridge, "capabilities", None)
+    if callable(capabilities):
+        try:
+            advertised = await capabilities(deadline_ms=2_000)
+            annotation_proof_v2_capable = getattr(advertised, "annotation_proof_v2", False) is True
+        except (DesktopArtifactBridgeError, TypeError, ValueError):
+            # Capability probing is additive. Its absence/failure keeps the
+            # established strict-v1 path available but can never enable v2.
+            annotation_proof_v2_capable = False
     try:
         resolved = await bridge.resolve_annotation_selection(
             active_preview_artifact_id=active_preview_artifact_id,
@@ -1938,6 +2000,27 @@ async def _trusted_annotation_selection(
             ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
             reason_code="preview_changed",
         )
+    if not annotation_proof_v2_capable:
+        return None
+    resolved_v2 = getattr(resolved, "annotation_proof_v2", None)
+    if resolved_v2 is None:
+        return None
+    if (
+        not isinstance(resolved_v2, ElementProofV2)
+        or not _SHA256_RE.fullmatch(resolved_v2.stable_element_proof_sha256)
+        or len(resolved_v2.ancestor_class_commitments) > 256
+        or any(
+            not _SHA256_RE.fullmatch(commitment)
+            for commitment in resolved_v2.ancestor_class_commitments
+        )
+        or list(resolved_v2.ancestor_class_commitments)
+        != sorted(set(resolved_v2.ancestor_class_commitments))
+    ):
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            reason_code="preview_changed",
+        )
+    return resolved_v2
 
 
 async def _scoped_prompt_annotation(
@@ -2007,7 +2090,11 @@ async def _idempotent_prompt_annotation_create(
         or anchor.revision_id != revision_id
         or locator_tag_name != tag_name
         or context.get("element_path") != element_path
-        or context.get("element_proof_sha256") != element_proof_sha256
+        or context.get(
+            "selection_element_proof_sha256",
+            context.get("element_proof_sha256"),
+        )
+        != element_proof_sha256
     ):
         raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_BUSY)
     return annotation, anchor
@@ -2123,7 +2210,7 @@ async def _handle_prompt_annotation_create(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
             reason_code="annotation_unsupported",
         )
-    await _trusted_annotation_selection(
+    trusted_element_proof_v2 = await _trusted_annotation_selection(
         session_key=session_key,
         active_preview_artifact_id=revision.artifact_id,
         selection_id=selection_id,
@@ -2144,7 +2231,13 @@ async def _handle_prompt_annotation_create(
         element_path=element_path,
         expected_element_proof_sha256=element_proof_sha256,
         expected_tag_name=tag_name,
+        expected_element_proof_v2=trusted_element_proof_v2,
     )
+    # The canonical element proof remains in ``element_proof_sha256``. Keep
+    # the exact renderer-selected v1 proof separately so an accepted v2 create
+    # can replay a lost response without consuming another native candidate.
+    # V2 commitments are deliberately never persisted.
+    anchor_context["selection_element_proof_sha256"] = element_proof_sha256
 
     try:
         anchor, annotation = await service.create_prompt_annotation_with_anchor(
@@ -2278,6 +2371,20 @@ async def _handle_prompt_annotation_focus(
         or not _HTML_TAG_NAME_RE.fullmatch(tag_name)
     ):
         raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE)
+    annotation_proof_v2: ElementProofV2 | None = None
+    capabilities = getattr(bridge, "capabilities", None)
+    if callable(capabilities):
+        try:
+            advertised = await capabilities(deadline_ms=2_000)
+            if getattr(advertised, "annotation_proof_v2", False) is True:
+                annotation_proof_v2 = canonical_selection_proof_v2(
+                    current_source,
+                    element_path=element_path,
+                )
+        except (DesktopArtifactBridgeError, TypeError, ValueError):
+            # Keep old Desktop shells on the strict-v1 focus request. A v2
+            # proof is never sent without an affirmative current capability.
+            annotation_proof_v2 = None
     try:
         focused = await bridge.focus_annotation(
             annotation_id=annotation.annotation_id,
@@ -2286,6 +2393,11 @@ async def _handle_prompt_annotation_focus(
             tag_name=tag_name.lower(),
             element_path=element_path,
             element_proof_sha256=element_proof_sha256,
+            **(
+                {"annotation_proof_v2": annotation_proof_v2}
+                if annotation_proof_v2 is not None
+                else {}
+            ),
             deadline_ms=2_000,
         )
     except (DesktopArtifactBridgeError, ValueError) as exc:

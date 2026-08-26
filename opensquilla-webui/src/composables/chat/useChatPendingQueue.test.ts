@@ -1100,6 +1100,25 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('does not edit a queued annotation batch into plain text', async () => {
+    const { inputText, queue } = makeQueue()
+    await expect(queue.enqueuePendingPayload({
+      text: 'apply the second selected edit',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    })).resolves.toBe(true)
+    const itemId = pendingUiId(queue, 0)
+    inputText.value = 'keep the current composer draft'
+
+    expect(queue.editPendingItem(itemId)).toBe(false)
+    expect(queue.pendingQueue.value).toHaveLength(1)
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: 'apply the second selected edit',
+      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+    })
+    expect(inputText.value).toBe('keep the current composer draft')
+    queue.cleanup()
+  })
+
   it('hydrates a cancelling WAL as cancel-only without restoring the server row', async () => {
     const { wal } = memoryWal([{
       schemaVersion: 1,

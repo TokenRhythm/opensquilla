@@ -35,14 +35,14 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
   schemaVersion: 1,
   managementSupported: true,
   target: 'windows-x64',
-  catalogVersion: '2026-07-30.1',
+  catalogVersion: '2026-08-21.2',
   sourceOrder: ['oss', 'github'],
   components: [
     {
       componentId: 'python',
       availability: 'ready',
-      catalogVersion: '2026-07-30.1',
-      activeVersion: '3.13.14+20260728',
+      catalogVersion: '2026-08-21.2',
+      activeVersion: '3.13.15+20260814',
       installedBytes: 1234,
       removable: true,
       resumeAvailable: false,
@@ -53,7 +53,7 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
     {
       componentId: 'node',
       availability: 'missing',
-      catalogVersion: '2026-07-30.1',
+      catalogVersion: '2026-08-21.2',
       activeVersion: null,
       installedBytes: null,
       removable: false,
@@ -65,7 +65,7 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
     {
       componentId: 'gitBash',
       availability: 'missing',
-      catalogVersion: '2026-07-30.1',
+      catalogVersion: '2026-08-21.2',
       activeVersion: null,
       installedBytes: null,
       removable: false,
@@ -156,6 +156,7 @@ async function mountPanel(options: {
     if (
       method === 'sandbox.runtime.install'
       || method === 'sandbox.runtime.cancel'
+      || method === 'sandbox.runtime.discard_download'
       || method === 'sandbox.runtime.remove'
     ) {
       return options.runtimeAction?.(method, params) ?? {
@@ -607,7 +608,7 @@ describe('SandboxSettingsPanel', () => {
 
     expect(el.querySelectorAll('.sandbox-runtime-row')).toHaveLength(3)
     expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
-      .toContain('Installed · 3.13.14+20260728')
+      .toContain('Installed · 3.13.15+20260814')
     expect(el.querySelector('[data-testid="sandbox-runtime-node"]')?.textContent)
       .toContain('Not installed')
     expect(el.querySelector('[data-testid="sandbox-runtime-install-node"]')).toBeTruthy()
@@ -702,7 +703,7 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     const pythonRow = el.querySelector('[data-testid="sandbox-runtime-python"]')
-    expect(pythonRow?.textContent).toContain('Installed · 3.13.14+20260728 · Not enabled')
+    expect(pythonRow?.textContent).toContain('Installed · 3.13.15+20260814 · Not enabled')
     expect(el.querySelector('[data-testid="sandbox-runtime-enable-python"]')).toBeTruthy()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
     await settle()
@@ -718,6 +719,30 @@ describe('SandboxSettingsPanel', () => {
       }),
     }))
     expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+  })
+
+  it('keeps the successful download source visible after installation', async () => {
+    const installed = structuredClone(runtimePackStatus)
+    installed.components[0].operation = {
+      operationId: 'operation-installed',
+      componentId: 'python',
+      kind: 'install',
+      state: 'completed',
+      source: 'oss',
+      downloadedBytes: 1234,
+      totalBytes: 1234,
+      progressPercent: 100,
+      startedAtMs: 1,
+      updatedAtMs: 2,
+      error: null,
+    }
+    const { el } = await mountPanel({ runtimeStatus: installed })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    const pythonText = el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent
+    expect(pythonText).toContain('1.2 KiB')
+    expect(pythonText).toContain('Beijing OSS')
   })
 
   it('uses exact component action payloads from runtime rows', async () => {
@@ -750,6 +775,7 @@ describe('SandboxSettingsPanel', () => {
       .toContain('Downloading · 40%')
     const progress = el.querySelector<HTMLElement>('[role="progressbar"]')
     expect(progress?.getAttribute('aria-valuenow')).toBe('40')
+    expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')).toBeNull()
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-cancel-python"]')!.click()
     await settle()
@@ -761,6 +787,85 @@ describe('SandboxSettingsPanel', () => {
       operationId: 'operation-1',
     })
     expect(call).toHaveBeenCalledWith('sandbox.runtime.install', { componentId: 'node' })
+  })
+
+  it('offers resume and discard for partial or complete cancelled downloads', async () => {
+    for (const complete of [false, true]) {
+      const cancelled = structuredClone(runtimePackStatus)
+      cancelled.components[0] = {
+        ...cancelled.components[0],
+        availability: 'missing',
+        activeVersion: null,
+        installedBytes: null,
+        removable: false,
+        resumeAvailable: !complete,
+        resumeBytes: complete ? 100 : 40,
+        operation: {
+          operationId: `cancelled-${complete}`,
+          componentId: 'python',
+          kind: 'install',
+          state: 'cancelled',
+          source: 'github',
+          downloadedBytes: complete ? 100 : 40,
+          totalBytes: 100,
+          progressPercent: complete ? 100 : 40,
+          startedAtMs: 1,
+          updatedAtMs: 2,
+          error: null,
+        },
+      }
+      const { el, call } = await mountPanel({ runtimeStatus: cancelled })
+      el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+      await settle()
+
+      expect(el.querySelector('[data-testid="sandbox-runtime-install-python"]')?.textContent)
+        .toContain('Resume')
+      expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')?.textContent)
+        .toContain('Discard download')
+      expect(el.querySelector('[data-testid="sandbox-runtime-remove-python"]')).toBeNull()
+
+      el.querySelector<HTMLButtonElement>(
+        '[data-testid="sandbox-runtime-discard-python"]',
+      )!.click()
+      await settle()
+      expect(call).toHaveBeenCalledWith('sandbox.runtime.discard_download', {
+        componentId: 'python',
+      })
+      expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')).toBeNull()
+    }
+  })
+
+  it('keeps an installed runtime while exposing paused update actions', async () => {
+    const updating = structuredClone(runtimePackStatus)
+    updating.components[0] = {
+      ...updating.components[0],
+      resumeAvailable: true,
+      resumeBytes: 40,
+      operation: {
+        operationId: 'cancelled-update',
+        componentId: 'python',
+        kind: 'install',
+        state: 'cancelled',
+        source: 'github',
+        downloadedBytes: 40,
+        totalBytes: 100,
+        progressPercent: 40,
+        startedAtMs: 1,
+        updatedAtMs: 2,
+        error: null,
+      },
+    }
+    const { el } = await mountPanel({ runtimeStatus: updating })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    const python = el.querySelector('[data-testid="sandbox-runtime-python"]')
+    expect(python?.textContent)
+      .toContain('Installed · 3.13.15+20260814 · Update paused')
+    expect(el.querySelector('[data-testid="sandbox-runtime-install-python"]')?.textContent)
+      .toContain('Resume')
+    expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="sandbox-runtime-remove-python"]')).toBeTruthy()
   })
 
   it('hides Git Bash for non-Windows runtime targets', async () => {
@@ -863,6 +968,8 @@ describe('SandboxSettingsPanel', () => {
     const status = structuredClone(runtimePackStatus)
     status.components[0] = {
       ...status.components[0],
+      resumeAvailable: true,
+      resumeBytes: 40,
       operation: {
         operationId: 'remove-1',
         componentId: 'python',
@@ -886,6 +993,7 @@ describe('SandboxSettingsPanel', () => {
     expect(pythonRow?.textContent).toContain('Retry removal')
     expect(el.querySelector('[data-testid="sandbox-runtime-install-python"]')).toBeNull()
     expect(el.querySelector('[data-testid="sandbox-runtime-cancel-python"]')).toBeNull()
+    expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')).toBeNull()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-remove-python"]')!.click()
     await settle()
     expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })

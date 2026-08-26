@@ -18,6 +18,7 @@ const BASE_PROPS = {
   copyIcon: 'copy' as const,
   copyLiveText: '',
   deliverableCount: 2,
+  hasNewDeliverable: false,
   shareMode: false,
   shareableMessageCount: 3,
 }
@@ -286,6 +287,18 @@ describe('ChatHeaderActions', () => {
     expect(el.textContent).not.toContain('Workbench')
     expect(deliverables?.getAttribute('aria-label')).toBe('Deliverables (2)')
     expect(deliverables?.querySelector('.chat-header__count-badge')?.textContent).toBe('2')
+  })
+
+  it('shows a small New marker without replacing the deliverable count', async () => {
+    const { el } = await mountHeader(800, { hasNewDeliverable: true })
+    const deliverables = el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )!
+
+    expect(deliverables.querySelector('[data-testid="chat-deliverables-new-badge"]')?.textContent)
+      .toBe('New')
+    expect(deliverables.querySelector('.chat-header__count-badge')?.textContent).toBe('2')
+    expect(deliverables.getAttribute('aria-label')).toBe('Deliverables (2), New')
   })
 
   it.each([

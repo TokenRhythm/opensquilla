@@ -29,6 +29,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
 )
 from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import ThinkingLevel
+from opensquilla.provider.types import ModelCapabilities
 from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -623,6 +624,163 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
     assert turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"][
         "effective_max_tokens"
     ] == 8_192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_supports_tools", [True, False])
+async def test_fallback_capability_does_not_downgrade_active_model_verification(
+    fallback_supports_tools: bool,
+) -> None:
+    catalog = _PerModelCatalog(
+        rows={
+            ("provider-a", "primary/model"): _ResolvedCatalog(
+                max_tokens=16_384,
+                context_window=128_000,
+                capabilities=ModelCapabilities(supports_tools=True),
+                tools_capability_verified=True,
+            ),
+            ("provider-b", "fallback/model"): _ResolvedCatalog(
+                max_tokens=8_192,
+                context_window=32_000,
+                capabilities=ModelCapabilities(
+                    supports_tools=fallback_supports_tools,
+                ),
+                tools_capability_verified=False,
+            ),
+        }
+    )
+    provider = _FallbackLimitProvider()
+    turn = _make_turn(
+        metadata={
+            "routed_tier": "c2",
+            "routed_provider": "provider-a",
+            "routed_model": "primary/model",
+            "selector_execution_chain": [
+                {"provider": "provider-b", "model": "fallback/model"},
+            ],
+        }
+    )
+
+    out = await _make_stage(catalog=catalog).run(
+        _make_input(
+            provider=provider,
+            turn=turn,
+            resolved_model="primary/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    assert out.output.agent_config.model_tools_capability_verified is True
+    fallback_caps = turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"]
+    assert fallback_caps["supports_tools"] is fallback_supports_tools
+
+
+@pytest.mark.asyncio
+async def test_private_fallback_does_not_downgrade_fixed_glm_5_2_verification() -> None:
+    active = SimpleNamespace(
+        provider="tokenrhythm",
+        model="glm-5.2",
+        api_key="synthetic-primary-key",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    fallback = SimpleNamespace(
+        provider="tokenrhythm",
+        model="legacy-no-tools",
+        api_key="synthetic-fallback-key",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+
+    class _Catalog:
+        def lookup(self, _model_id: str, _provider: str = "") -> _ResolvedCatalog:
+            raise AssertionError("exact deployment lookup must be used")
+
+        def lookup_deployment(
+            self,
+            deployment: Any,
+            *,
+            include_global_overrides: bool = False,
+        ) -> _ResolvedCatalog:
+            del include_global_overrides
+            if deployment is active:
+                return _ResolvedCatalog(
+                    max_tokens=16_384,
+                    context_window=200_000,
+                    capabilities=ModelCapabilities(supports_tools=True),
+                    tools_capability_verified=True,
+                )
+            assert deployment is fallback
+            return _ResolvedCatalog(
+                max_tokens=8_192,
+                context_window=32_000,
+                capabilities=ModelCapabilities(supports_tools=False),
+                tools_capability_verified=True,
+            )
+
+    class _Provider:
+        private_limits: list[tuple[Any, int, int, ModelCapabilities | None]] = []
+
+        def active_deployment_config(self) -> Any:
+            return active
+
+        def fallback_deployment_configs(self) -> tuple[Any, ...]:
+            return (fallback,)
+
+        def configure_fallback_deployment_limits(
+            self,
+            limits: list[tuple[Any, int, int, ModelCapabilities | None]],
+        ) -> None:
+            self.private_limits = limits
+
+        def configure_fallback_deployment_vision_support(
+            self,
+            _entries: list[tuple[Any, str]],
+        ) -> None:
+            return None
+
+    provider = _Provider()
+    out = await _make_stage(catalog=_Catalog()).run(
+        _make_input(
+            provider=provider,
+            resolved_model="glm-5.2",
+            active_provider_id="tokenrhythm",
+        )
+    )
+
+    assert out.output.agent_config.model_tools_capability_verified is True
+    assert provider.private_limits[0][0] is fallback
+    assert provider.private_limits[0][3] == ModelCapabilities(supports_tools=False)
+
+
+@pytest.mark.asyncio
+async def test_unverified_ensemble_aggregator_overrides_inherited_tool_denial() -> None:
+    inherited_catalog = _RecordingModelCatalog(
+        catalog=_ResolvedCatalog(
+            max_tokens=16_384,
+            context_window=200_000,
+            capabilities=ModelCapabilities(supports_tools=False),
+            tools_capability_verified=True,
+        )
+    )
+    provider = SimpleNamespace(
+        artifact_tool_executor_capabilities=ModelCapabilities(supports_tools=True),
+        artifact_tools_capability_verified=False,
+    )
+
+    out = await _make_stage(catalog=inherited_catalog).run(
+        _make_input(
+            provider=provider,
+            resolved_model="inherited-no-tools",
+            active_provider_id="tokenrhythm",
+        )
+    )
+
+    assert out.output.model_capabilities == ModelCapabilities(supports_tools=True)
+    assert out.output.agent_config.model_capabilities == ModelCapabilities(
+        supports_tools=True
+    )
+    assert out.output.agent_config.model_tools_capability_verified is False
 
 
 @pytest.mark.asyncio

@@ -299,6 +299,9 @@ test('floating composer reacts only to user scroll and resets across sessions', 
     .click()
   await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
   await expect(page.getByText('Session B message 48.', { exact: false })).toBeVisible()
+  // Session B deliberately does not restore A's reading position: every
+  // session hand-off starts at the live edge unless the user gestures first.
+  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
   await expect(chat).not.toHaveClass(/chat--composer-collapsed/)
 })
 

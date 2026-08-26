@@ -124,6 +124,7 @@
       <ArtifactPreviewPanel
         v-else
         ref="previewRef"
+        :agent-edit-in-progress="agentEditInProgress"
         :artifact="headArtifact"
         :auth-token="authToken"
         :base-origin="baseOrigin"
@@ -294,6 +295,7 @@ type SourceHandle = {
 }
 
 const props = withDefaults(defineProps<{
+  agentEditInProgress?: boolean
   artifact: ArtifactPayload
   documentActions?: ArtifactDocumentActions | null
   documentFeatures?: boolean
@@ -322,6 +324,7 @@ const props = withDefaults(defineProps<{
     screenshotUrl?: string
   } | null
 }>(), {
+  agentEditInProgress: false,
   documentSnapshot: () => ({
     key: '',
     loading: false,
@@ -435,7 +438,10 @@ function cancelAnnotationFallback() {
   if (!props.annotationFallback) return
   emit('workbench-event', {
     type: 'artifact-annotation-fallback-cancel',
-    payload: { annotationId: props.annotationFallback.annotationId },
+    payload: {
+      annotationId: props.annotationFallback.annotationId,
+      reason: 'user-cancelled',
+    },
   })
 }
 const documentFeatures = computed(() => props.documentFeatures)

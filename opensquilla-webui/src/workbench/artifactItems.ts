@@ -80,33 +80,6 @@ export function artifactWorkbenchItemId(
   ].join(':')
 }
 
-export function artifactCollectionWorkbenchItemId(sessionKey: string): string {
-  return [
-    'artifact-collection',
-    privateIdentityDigest(sessionKey),
-  ].join(':')
-}
-
-export function createArtifactCollectionWorkbenchItem(options: {
-  artifacts: readonly ArtifactPayload[]
-  sessionKey: string
-  title: string
-}): WorkbenchItem {
-  const { artifacts, sessionKey, title } = options
-  return {
-    id: artifactCollectionWorkbenchItemId(sessionKey),
-    kind: 'artifact-collection',
-    title,
-    scope: { type: 'session', id: sessionKey },
-    hostKind: 'dom',
-    retention: 'keep-alive',
-    payload: {
-      artifacts: [...artifacts],
-      sessionKey,
-    },
-  }
-}
-
 export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
   initialSection?: 'preview' | 'source'
@@ -228,19 +201,6 @@ export function preparedPreviewFromWorkbenchItem(
     || typeof ref.id !== 'string'
   ) return null
   return value as WorkbenchPreviewDescriptor
-}
-
-export function artifactsFromWorkbenchItem(
-  item: WorkbenchItem | null,
-): readonly ArtifactPayload[] {
-  if (item?.kind !== 'artifact-collection') return []
-  const artifacts = item.payload.artifacts
-  return Array.isArray(artifacts)
-    ? artifacts.filter(
-      (artifact): artifact is ArtifactPayload =>
-        Boolean(artifact) && typeof artifact === 'object',
-    )
-    : []
 }
 
 export function artifactFromWorkbenchItem(

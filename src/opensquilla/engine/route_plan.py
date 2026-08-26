@@ -9,9 +9,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from opensquilla.provider.types import ModelCapabilities, ProviderRequestCorrelation
+from opensquilla.router_tiers import (
+    IMAGE_TIER,
+    TEXT_TIERS,
+    TierConfig,
+    effective_ensemble_selection_mode,
+    normalize_tier_id,
+    normalize_tier_mapping,
+    tier_ensemble_active,
+    tier_ensemble_execution,
+)
+
+_ROUTER_SNAPSHOT_TIER_ORDER = (*TEXT_TIERS, IMAGE_TIER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +72,42 @@ class RouteCapabilitySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RouterTierSnapshotEntry:
+    """One display-safe candidate from the accepted routing configuration."""
+
+    tier: str
+    provider: str
+    model: str
+    execution_kind: Literal["single_model", "ensemble"]
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = {
+            "tier": self.tier,
+            "model": self.model,
+            "execution_kind": self.execution_kind,
+        }
+        if self.provider:
+            payload["provider"] = self.provider
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class RouterTierSnapshot:
+    """Versioned candidate pool frozen for one routed request."""
+
+    version: Literal[1]
+    request_kind: Literal["text", "image"]
+    tiers: tuple[RouterTierSnapshotEntry, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "request_kind": self.request_kind,
+            "tiers": [item.as_dict() for item in self.tiers],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RoutePlan:
     """One immutable router decision for one logical turn."""
 
@@ -75,9 +123,10 @@ class RoutePlan:
     prompt_policy: str
     fallback_chain: tuple[RouteFallback, ...]
     capabilities: RouteCapabilitySnapshot
+    router_tier_snapshot: RouterTierSnapshot | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "version": self.version,
             "plan_id": self.plan_id,
             "turn_id": self.turn_id,
@@ -91,6 +140,9 @@ class RoutePlan:
             "fallback_chain": [item.as_dict() for item in self.fallback_chain],
             "capabilities": self.capabilities.as_dict(),
         }
+        if self.router_tier_snapshot is not None:
+            payload["router_tier_snapshot"] = self.router_tier_snapshot.as_dict()
+        return payload
 
 
 def _text(value: object) -> str:
@@ -159,8 +211,9 @@ def _capability_snapshot(
             else None
         ),
         supports_tools=(
-            bool(capabilities.supports_tools)
+            capabilities.supports_tools
             if capabilities is not None
+            and isinstance(capabilities.supports_tools, bool)
             else None
         ),
         supports_streaming=(
@@ -189,6 +242,87 @@ def _thinking_snapshot(metadata: Mapping[str, Any], effective_thinking: object) 
     if isinstance(value, bool):
         return "enabled" if value else "disabled"
     return _text(value)
+
+
+def _router_tier_snapshot(
+    config: Any,
+    metadata: Mapping[str, Any],
+    *,
+    winner_tier: object,
+    winner_provider: str,
+    winner_model: str,
+) -> RouterTierSnapshot | None:
+    """Freeze the candidate pool that was accepted for this logical turn."""
+
+    router = getattr(config, "squilla_router", None)
+    tiers = normalize_tier_mapping(getattr(router, "tiers", None))
+    normalized_winner = normalize_tier_id(winner_tier)
+    if not tiers or normalized_winner is None or not winner_model:
+        return None
+
+    request_kind: Literal["text", "image"] = (
+        "image"
+        if _text(metadata.get("routing_source")) == "image_route"
+        or bool(metadata.get("image_route_reason"))
+        or bool(metadata.get("router_vision_followup_needs_image"))
+        or normalized_winner == IMAGE_TIER
+        else "text"
+    )
+    shared_selection_mode = effective_ensemble_selection_mode(config)
+    ensemble = getattr(config, "llm_ensemble", None)
+    c3_fusion_active = bool(getattr(ensemble, "enabled", False)) or tier_ensemble_active(
+        tiers,
+        TEXT_TIERS[-1],
+    )
+
+    entries: list[RouterTierSnapshotEntry] = []
+    for tier in _ROUTER_SNAPSHOT_TIER_ORDER:
+        tier_config = TierConfig.from_value(tiers.get(tier))
+        if not tier_config.model:
+            continue
+        if request_kind == "image":
+            if not tier_config.supports_image:
+                continue
+            if tier == TEXT_TIERS[-1] and c3_fusion_active:
+                continue
+        elif tier_config.image_only or tier == IMAGE_TIER:
+            continue
+
+        selection_mode, _binding = tier_ensemble_execution(
+            tiers,
+            tier,
+            shared_selection_mode=shared_selection_mode,
+        )
+        entries.append(
+            RouterTierSnapshotEntry(
+                tier=tier,
+                provider=tier_config.provider,
+                model=tier_config.model,
+                execution_kind="ensemble" if selection_mode else "single_model",
+            )
+        )
+
+    winner_index = next(
+        (index for index, item in enumerate(entries) if item.tier == normalized_winner),
+        None,
+    )
+    winner_entry = RouterTierSnapshotEntry(
+        tier=normalized_winner,
+        provider=winner_provider,
+        model=winner_model,
+        execution_kind=(
+            entries[winner_index].execution_kind
+            if winner_index is not None
+            else "single_model"
+        ),
+    )
+    if winner_index is None:
+        entries.append(winner_entry)
+        entries.sort(key=lambda item: _ROUTER_SNAPSHOT_TIER_ORDER.index(item.tier))
+    else:
+        entries[winner_index] = winner_entry
+
+    return RouterTierSnapshot(version=1, request_kind=request_kind, tiers=tuple(entries))
 
 
 def pin_route_plan(
@@ -225,7 +359,7 @@ def pin_route_plan(
         if isinstance(value, list):
             fallback_candidates.extend(value)
     plan = RoutePlan(
-        version=1,
+        version=2,
         plan_id=turn_id,
         turn_id=turn_id,
         tier=tier,
@@ -244,6 +378,13 @@ def pin_route_plan(
         capabilities=_capability_snapshot(
             context_window=context_window,
             capabilities=capabilities,
+        ),
+        router_tier_snapshot=_router_tier_snapshot(
+            getattr(turn, "config", None),
+            metadata,
+            winner_tier=tier,
+            winner_provider=route_provider,
+            winner_model=route_model,
         ),
     )
     turn.route_plan = plan
@@ -307,6 +448,8 @@ __all__ = [
     "RouteCapabilitySnapshot",
     "RouteFallback",
     "RoutePlan",
+    "RouterTierSnapshot",
+    "RouterTierSnapshotEntry",
     "pin_route_plan",
     "record_execution_leg",
     "route_plan_snapshot",

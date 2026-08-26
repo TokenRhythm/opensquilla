@@ -184,6 +184,7 @@
       "readyWithWarnings": "The preview is running with warnings.",
       "warningsShort": "Warnings",
       "suspended": "Preview paused",
+      "agentEditInProgress": "Editing is continuing in the background.",
       "nativePreview": "Interactive preview",
       "allowRemoteResources": "Allow online images, styles, and media",
       "blockRemoteResources": "Block online images, styles, and media",
@@ -641,6 +642,7 @@
           "disabled": "Not enabled",
           "installed": "Installed",
           "installedVersion": "Installed · {version}",
+          "updatePaused": "Update paused",
           "unsupported": "Not available for this system",
           "corrupt": "Repair required",
           "queued": "Waiting to download",
@@ -663,6 +665,7 @@
           "enable": "Enable",
           "download": "Download",
           "cancel": "Cancel",
+          "discardDownload": "Discard download",
           "resume": "Resume",
           "retry": "Retry",
           "repair": "Repair",
@@ -1158,19 +1161,7 @@
       "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
     },
     "preset": {
-      "summary": "Routing template: {label}",
-      "desc": "Apply once to fill Model Routing; edit the active tiers there.",
-      "customizedSummary": "Model Routing already uses {label}.",
-      "customizedDesc": "Active tiers are edited in Model Routing.",
-      "synthesizedLabel": "Generated routing template",
-      "synthesizedBadge": "Generated template",
-      "customize": "View template details →",
-      "hide": "Hide template details",
-      "apply": "Apply to Model Routing",
-      "viewInRouter": "Open Model Routing →",
-      "modeRecommended": "routing template",
-      "modeCustom": "custom tiers",
-      "modeDisabled": "off"
+      "modeCustom": "custom tiers"
     },
     "modelStrategy": {
       "title": "Model routing",
@@ -1820,8 +1811,6 @@
       "routerSaved": "Router saved.",
       "routerSavedRestart": "Router saved. Restart required.",
       "ensembleSaved": "Ensemble saved.",
-      "presetApplied": "Routing preset applied.",
-      "presetAppliedRestart": "Routing preset applied. Restart required.",
       "channelSaved": "Channel saved — configuration validated locally; use Test connection to verify credentials",
       "channelSavedLive": "Channel saved and applied — running with the new configuration",
       "channelStartFailed": "Channel saved, but it failed to start — open its status for the error, then retry with Restart",
@@ -3052,16 +3041,6 @@
       "installed": "Installed",
       "add": "Add"
     },
-    "skillCard": {
-      "subSkillsTitle": "Sub-skills used by this meta-skill",
-      "uses": "uses",
-      "dependencies": "Declared dependencies",
-      "pythonCount": "Python packages: {count}",
-      "binaryCount": "Binaries: {count}",
-      "envCount": "Environment variables: {count}",
-      "missingCount": "Missing dependencies: {count}",
-      "advisoryCount": "Advisories: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Skill details: {name}",
       "triggers": "Triggers",
@@ -3700,7 +3679,7 @@
       "ensembleFallbackUsed": "fallback used",
       "ensembleFallbackReason": "fallback · {reason}",
       "ensembleRouterPoolHidden": "router pool hidden",
-      "ensembleTokens": "{count} tok",
+      "ensembleTokens": "{count} token",
       "ensembleUsed": "used",
       "ensembleFailed": "failed",
       "ensembleQuorumSkipped": "threshold met · skipped",
@@ -3772,7 +3751,8 @@
       },
       "more": "{count} more",
       "stale": "Still working — no recent signal",
-      "liveStep": "step {n}"
+      "liveStep": "step {n}",
+      "recordIncomplete": "Activity record incomplete; showing the compatible history view."
     },
     "suggestedTasks": "Suggested tasks",
     "greetingMorning": "Good morning.",
@@ -4439,7 +4419,22 @@
       "activityContentSize": "{lines} lines · {characters} characters",
       "activityExitCode": "Exit code {code}",
       "activityNotCompleted": "Didn't complete",
-      "activityPublished": "Published"
+      "activityPublished": "Published",
+      "documentErrorCategory": "Category: {category} ({code})",
+      "documentPreviewUnavailableCategory": "Preview unavailable",
+      "documentActionUnknownCategory": "Action result unknown",
+      "documentEditFailedCategory": "Document edit failed",
+      "documentPreviewUnavailableMessage": "The editing preview is unavailable. No uncommitted changes were applied.",
+      "documentActionUnknownMessage": "The action may have run. Inspect the current preview before continuing.",
+      "documentEditFailedMessage": "The document operation did not complete.",
+      "documentRetrySameTurn": "Retry policy: continue in this task",
+      "documentRetryNewTurn": "Retry policy: start a new task",
+      "documentRetryNever": "Retry policy: do not retry",
+      "documentNextRetry": "Next action: retry",
+      "documentNextReinspect": "Next action: inspect again",
+      "documentNextFinalize": "Next action: finish without more tools",
+      "documentNextNewTurn": "Next action: start a new task",
+      "documentNextStop": "Next action: stop"
     }
   },
   "channelStatus": {

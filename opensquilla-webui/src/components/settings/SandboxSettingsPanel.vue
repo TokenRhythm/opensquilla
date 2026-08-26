@@ -301,6 +301,9 @@
                     && runtime.status.installedBytes !== null"
                 >
                   {{ formatBytes(runtime.status.installedBytes) }}
+                  <template v-if="runtime.status.operation?.source">
+                    · {{ runtimeSourceLabel(runtime.status.operation.source) }}
+                  </template>
                 </small>
                 <small v-else-if="runtime.status.operation?.source">
                   {{ runtimeSourceLabel(runtime.status.operation.source) }}
@@ -342,6 +345,16 @@
                     @click="void installRuntime(runtime.componentId)"
                   >
                     {{ runtimeInstallLabel(runtime.status) }}
+                  </button>
+                  <button
+                    v-if="canDiscardRuntimeDownload(runtime.status)"
+                    type="button"
+                    class="btn btn--ghost"
+                    :disabled="runtimeActionPending[runtime.componentId]"
+                    :data-testid="`sandbox-runtime-discard-${runtime.componentId}`"
+                    @click="void discardRuntimeDownload(runtime.componentId)"
+                  >
+                    {{ t('settings.sandbox.runtimes.actions.discardDownload') }}
                   </button>
                   <button
                     v-if="canRemoveRuntime(runtime.status)"
@@ -419,6 +432,7 @@ const {
   enableRuntime,
   installRuntime,
   cancelRuntime,
+  discardRuntimeDownload,
   removeRuntime,
   setDefaultRunMode,
   adoptSavedDefaultRunMode,
@@ -536,11 +550,14 @@ function runtimeStatusText(runtime: RuntimeRow): string {
     return t('settings.sandbox.runtimes.states.removeInterrupted')
   }
   if (status.availability === 'ready') {
-    const installed = status.activeVersion
+    let installed = status.activeVersion
       ? t('settings.sandbox.runtimes.states.installedVersion', {
           version: status.activeVersion,
         })
       : t('settings.sandbox.runtimes.states.installed')
+    if (status.resumeBytes > 0) {
+      installed = `${installed} · ${t('settings.sandbox.runtimes.states.updatePaused')}`
+    }
     return runtimeIsAllowed(runtime)
       ? installed
       : `${installed} · ${t('settings.sandbox.runtimes.states.disabled')}`
@@ -603,11 +620,26 @@ function canInstallRuntime(status: SandboxRuntimeComponentStatus): boolean {
     'failed',
     'interrupted',
   ].includes(status.operation.state)) return false
+  if (status.resumeBytes > 0 && (!status.operation || (
+    status.operation.kind === 'install'
+    && ['completed', 'cancelled', 'failed', 'interrupted'].includes(status.operation.state)
+  ))) return true
   if (status.availability === 'ready' && (!status.operation || [
     'completed',
     'cancelled',
   ].includes(status.operation.state))) return false
   return !status.operation || [
+    'completed',
+    'cancelled',
+    'failed',
+    'interrupted',
+  ].includes(status.operation.state)
+}
+
+function canDiscardRuntimeDownload(status: SandboxRuntimeComponentStatus): boolean {
+  if (status.resumeBytes <= 0) return false
+  if (!status.operation) return true
+  return status.operation.kind === 'install' && [
     'completed',
     'cancelled',
     'failed',
@@ -632,10 +664,12 @@ function runtimeRemoveLabel(status: SandboxRuntimeComponentStatus): string {
 
 function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
   if (status.availability === 'corrupt') return t('settings.sandbox.runtimes.actions.repair')
-  if (status.resumeAvailable || status.operation?.state === 'interrupted') {
+  if (status.resumeBytes > 0) {
     return t('settings.sandbox.runtimes.actions.resume')
   }
-  if (status.operation?.state === 'failed') return t('settings.sandbox.runtimes.actions.retry')
+  if (status.operation?.state === 'failed' || status.operation?.state === 'interrupted') {
+    return t('settings.sandbox.runtimes.actions.retry')
+  }
   return t('settings.sandbox.runtimes.actions.download')
 }
 
@@ -1391,6 +1425,7 @@ onMounted(() => void load())
 
 .sandbox-runtime-actions {
   min-height: 30px;
+  flex-wrap: wrap;
 }
 
 .sandbox-runtime-actions > span {

@@ -39,12 +39,8 @@ DIGEST_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 PR_QUEUE_REF_RE: Final = re.compile(r"(?:^|/)pr-(?P<number>[1-9][0-9]*)-")
 COMPOSITION_BASELINE_SUITES: Final = frozenset({"readme-locale", "workflow-lint"})
 COMPOSITION_COMBINED_SMOKE_TRUST_ROOT: Final = frozenset()
-TRUST_POLICY_PATHS: Final = (
-    ".github/CODEOWNERS",
-    ".github/ci/suites.v1.json",
-    ".github/scripts",
-    ".github/workflows",
-)
+TRUST_POLICY_MANIFEST: Final = ".github/ci/trust-policy.v1.json"
+TRUST_POLICY_SCHEMA_VERSION: Final = 1
 
 
 class AttestationError(RuntimeError):
@@ -91,19 +87,82 @@ def _git(*args: str, cwd: Path) -> str:
     return completed.stdout.strip()
 
 
+def _changed_paths(repo: Path, before: str, after: str) -> list[str]:
+    """Return both sides of renames so the planner can route them safely."""
+
+    return _git(
+        "diff", "--no-renames", "--name-only", before, after, cwd=repo
+    ).splitlines()
+
+
 def _require_sha(value: object, label: str) -> str:
     if not isinstance(value, str) or SHA_RE.fullmatch(value) is None:
         raise AttestationError(f"{label} must be a lowercase 40-character SHA")
     return value
 
 
+def _trust_policy_paths(repo: Path, ref: str) -> tuple[str, ...]:
+    completed = subprocess.run(
+        ["git", "show", f"{ref}:{TRUST_POLICY_MANIFEST}"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise AttestationError(f"CI trust policy manifest is missing at {ref}")
+    try:
+        manifest = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AttestationError(f"CI trust policy manifest is invalid at {ref}") from exc
+    if not isinstance(manifest, dict):
+        raise AttestationError("CI trust policy manifest must be a JSON object")
+    if manifest.get("schema_version") != TRUST_POLICY_SCHEMA_VERSION:
+        raise AttestationError("CI trust policy manifest schema is unsupported")
+    configured_paths = manifest.get("merge_critical_inputs")
+    if not isinstance(configured_paths, list) or not configured_paths:
+        raise AttestationError("CI trust policy inputs are missing")
+    if any(not isinstance(path, str) or not path for path in configured_paths):
+        raise AttestationError("CI trust policy inputs must be non-empty strings")
+
+    paths = tuple(configured_paths)
+    if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+        raise AttestationError("CI trust policy inputs must be unique and sorted")
+    for path in paths:
+        parts = path.split("/")
+        if (
+            not path.startswith(".github/")
+            or path.endswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(marker in path for marker in ("*", "?", "["))
+        ):
+            raise AttestationError(f"CI trust policy input is not an exact .github path: {path}")
+    if TRUST_POLICY_MANIFEST not in paths:
+        raise AttestationError("CI trust policy manifest must include itself")
+    return paths
+
+
 def _policy_entries(repo: Path, ref: str) -> bytes:
-    return subprocess.run(
-        ["git", "ls-tree", "-r", "-z", ref, "--", *TRUST_POLICY_PATHS],
+    paths = _trust_policy_paths(repo, ref)
+    entries = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", ref, "--", *paths],
         cwd=repo,
         check=True,
         capture_output=True,
     ).stdout
+    found_paths: set[str] = set()
+    try:
+        for record in entries.rstrip(b"\0").split(b"\0") if entries else ():
+            _metadata, raw_path = record.split(b"\t", 1)
+            found_paths.add(raw_path.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AttestationError(f"CI trust policy tree is invalid at {ref}") from exc
+    missing = sorted(set(paths) - found_paths)
+    if missing:
+        raise AttestationError(
+            f"CI trust policy inputs are missing at {ref}: {', '.join(missing)}"
+        )
+    return entries
 
 
 def policy_digest(repo: Path, ref: str = "HEAD") -> str:
@@ -260,10 +319,8 @@ def create_attestation(
 
     if plan_basis not in {"change_set", "full_fallback"}:
         raise AttestationError("evidence plan basis is invalid")
-    if plan_basis == "full_fallback" and (
-        source_event != "merge_group" or evidence_kind != "root"
-    ):
-        raise AttestationError("full-fallback evidence must be a root merge-group run")
+    if plan_basis == "full_fallback" and evidence_kind != "root":
+        raise AttestationError("full-fallback evidence must be a root run")
 
     suites = sorted({item for item in successful_suites if item}) or ["ci-result"]
     execution_digests = dict(sorted((suite_execution_digests or {}).items()))
@@ -731,10 +788,8 @@ def _validate_canonical_source_plan(
     plan_basis = attestation.get("plan_basis")
     evidence_kind = attestation.get("evidence_kind")
     if plan_basis == "full_fallback":
-        if source_event != "merge_group" or evidence_kind != "root":
-            raise AttestationError(
-                "full-fallback evidence must be a root merge-group run"
-            )
+        if evidence_kind != "root":
+            raise AttestationError("full-fallback evidence must be a root run")
         changed_paths = [".ci/run-all"]
     elif plan_basis != "change_set":
         raise AttestationError("evidence plan basis is invalid")
@@ -745,13 +800,9 @@ def _validate_canonical_source_plan(
         )
         if reconstructed != tested_tree:
             raise AttestationError("attested PR base/head do not reconstruct tested tree")
-        changed_paths = _git(
-            "diff", "--name-only", tested_base, head_sha, cwd=repo
-        ).splitlines()
+        changed_paths = _changed_paths(repo, tested_base, head_sha)
     elif source_event == "merge_group":
-        changed_paths = _git(
-            "diff", "--name-only", tested_base, tested_tree, cwd=repo
-        ).splitlines()
+        changed_paths = _changed_paths(repo, tested_base, tested_tree)
     else:
         raise AttestationError("attestation source event is invalid")
     plan = _plan_paths(repo, changed_paths, ref=tested_tree)
@@ -782,7 +833,7 @@ def _composition_is_safe(
         capture_output=True,
     ).returncode != 0:
         return False, "attested base is not an ancestor of the queue base", ()
-    changed = _git("diff", "--name-only", tested_base_sha, queue_base_sha, cwd=repo).splitlines()
+    changed = _changed_paths(repo, tested_base_sha, queue_base_sha)
     if not changed:
         return False, "advanced-base composition has no verifiable base delta", ()
     plan = _plan_paths(repo, changed)
@@ -892,6 +943,8 @@ def validate_candidate(
     if match_kind == "exact":
         if tested_tree_sha != queue_tree_sha:
             raise AttestationError("attestation tested tree does not match the queue")
+        if tested_base_sha != queue_base_sha:
+            raise AttestationError("attestation tested base does not match the queue")
     elif match_kind == "composed":
         if reconstructed_queue_tree != queue_tree_sha:
             raise AttestationError("pull request head and queue base do not reconstruct queue tree")
@@ -1013,23 +1066,6 @@ def verify_queue(
         if queue_policy != base_policy:
             raise AttestationError("CI policy changed relative to the queue base")
 
-        nightly_details: dict[str, object] = {}
-        nightly_healthy, nightly_reason = verify_nightly_health(
-            repo=repo,
-            repository=repository,
-            token=token,
-            api_url=api_url,
-            details=nightly_details,
-        )
-        details.update(
-            nightly_healthy=str(nightly_healthy).lower(),
-            nightly_reason=nightly_reason,
-            nightly_run_id=nightly_details.get("source_run_id", ""),
-            nightly_age_seconds=nightly_details.get("age_seconds", ""),
-        )
-        if not nightly_healthy:
-            raise AttestationError(f"nightly health check failed: {nightly_reason}")
-
         pull_request_number = _queue_pr_number(merge_group)
         current_pull_request = _request_json(
             f"{api_url}/repos/{repository}/pulls/{pull_request_number}", token
@@ -1121,7 +1157,16 @@ def verify_queue(
                 tested_tree = _require_sha(
                     attestation.get("tested_tree_sha"), "attested tree SHA"
                 )
-                match_kind = "exact" if tested_tree == queue_tree_sha else "composed"
+                if tested_tree != queue_tree_sha:
+                    raise AttestationError(
+                        "only exact-tree pull request evidence may be reused"
+                    )
+                if attestation.get("source_event") != "pull_request":
+                    raise AttestationError(
+                        "only pull request evidence may be reused by the queue"
+                    )
+                if attestation.get("evidence_kind") != "root":
+                    raise AttestationError("only root evidence may be reused by the queue")
                 validate_candidate(
                     attestation=attestation,
                     run=run,
@@ -1129,61 +1174,33 @@ def verify_queue(
                     queue_tree_sha=queue_tree_sha,
                     queue_base_sha=queue_base_sha,
                     queue_policy_digest=queue_policy,
-                    match_kind=match_kind,
+                    match_kind="exact",
                     current_pull_request=current_pull_request,
                     reconstructed_queue_tree=reconstructed_tree,
                     repo=repo,
                 )
-                if attestation.get("source_event") == "pull_request":
-                    attested_number = attestation.get("pull_request_number")
-                    attested_head = _require_sha(
-                        attestation.get("head_sha"), "attested head SHA"
+                attested_number = attestation.get("pull_request_number")
+                attested_head = _require_sha(
+                    attestation.get("head_sha"), "attested head SHA"
+                )
+                if attested_number != pull_request_number:
+                    raise AttestationError("evidence belongs to another pull request")
+                latest_run_id = _latest_pr_run_id(
+                    api_url=api_url,
+                    repository=repository,
+                    token=token,
+                    pull_request_number=pull_request_number,
+                    head_sha=attested_head,
+                    head_ref=str(attestation.get("head_ref", "")),
+                )
+                if latest_run_id != run_id:
+                    raise AttestationError(
+                        "evidence workflow run is not the latest authoritative PR run"
                     )
-                    if attested_number != pull_request_number:
-                        raise AttestationError("evidence belongs to another pull request")
-                    latest_run_id = _latest_pr_run_id(
-                        api_url=api_url,
-                        repository=repository,
-                        token=token,
-                        pull_request_number=pull_request_number,
-                        head_sha=attested_head,
-                        head_ref=str(attestation.get("head_ref", "")),
-                    )
-                    if latest_run_id != run_id:
-                        raise AttestationError(
-                            "evidence workflow run is not the latest authoritative PR run"
-                        )
-                combined_smoke_suites: tuple[str, ...] = ()
-                if match_kind == "composed":
-                    if attestation.get("source_event") != "pull_request":
-                        raise AttestationError(
-                            "only pull request evidence may be composed across a base advance"
-                        )
-                    if not _wait_for_base_successful_ci(
-                        api_url=api_url,
-                        repository=repository,
-                        token=token,
-                        queue_base_sha=queue_base_sha,
-                    ):
-                        raise AttestationError("queue base evidence is not green")
-                    safe, composition_reason, combined_smoke_suites = _composition_is_safe(
-                        repo=repo,
-                        attestation=attestation,
-                        queue_base_sha=queue_base_sha,
-                    )
-                    if not safe:
-                        raise AttestationError(composition_reason)
-                    details["reason_code"] = "reusable_base_advance"
-                    reason = f"composed trusted PR/base evidence: {composition_reason}"
-                else:
-                    details["reason_code"] = "reusable_exact"
-                    reason = "matching trusted exact-tree CI evidence"
+                details["reason_code"] = "reusable_exact"
+                reason = "matching trusted exact-base, exact-tree PR CI evidence"
                 details.update(
-                    artifact_name=(
-                        f"ci-evidence-v2-tree-{queue_tree_sha}"
-                        if match_kind == "exact"
-                        else f"ci-evidence-v2-pr-{pull_request_number}-{current_head_sha}"
-                    ),
+                    artifact_name=f"ci-evidence-v2-tree-{queue_tree_sha}",
                     source_root_issued_at=attestation.get("root_issued_at", ""),
                     source_lineage=json.dumps(
                         attestation.get("lineage", []), separators=(",", ":")
@@ -1197,9 +1214,7 @@ def verify_queue(
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
-                    combined_smoke_suites=_canonical_suite_json(
-                        combined_smoke_suites
-                    ),
+                    combined_smoke_suites=_canonical_suite_json(),
                 )
                 return True, reason, run_id
             except (AttestationError, OSError, ValueError, zipfile.BadZipFile) as exc:
@@ -1414,7 +1429,7 @@ def _create_command(args: argparse.Namespace) -> int:
             parents = _git("rev-list", "--parents", "-n", "1", "HEAD", cwd=repo).split()
             if len(parents) != 3:
                 raise AttestationError("pull request CI must test a two-parent merge preview")
-            changed_paths = _git("diff", "--name-only", parents[1], head_sha, cwd=repo).splitlines()
+            changed_paths = _changed_paths(repo, parents[1], head_sha)
             plan_basis = "change_set"
         elif isinstance(merge_group, dict):
             base_sha = _require_sha(merge_group.get("base_sha"), "merge-group base SHA")
@@ -1422,9 +1437,7 @@ def _create_command(args: argparse.Namespace) -> int:
                 changed_paths = [".ci/run-all"]
                 plan_basis = "full_fallback"
             else:
-                changed_paths = _git(
-                    "diff", "--name-only", base_sha, "HEAD", cwd=repo
-                ).splitlines()
+                changed_paths = _changed_paths(repo, base_sha, "HEAD")
                 plan_basis = "change_set"
         else:
             raise AttestationError("cannot plan suites outside PR or merge-group CI")
@@ -1511,10 +1524,6 @@ def _verify_queue_command(args: argparse.Namespace) -> int:
                 "source_suite_execution_digests", "{}"
             ),
             "combined_smoke_suites": details.get("combined_smoke_suites", "[]"),
-            "nightly_healthy": details.get("nightly_healthy", "false"),
-            "nightly_reason": details.get("nightly_reason", ""),
-            "nightly_run_id": details.get("nightly_run_id", ""),
-            "nightly_age_seconds": details.get("nightly_age_seconds", ""),
         },
     )
     print(f"reusable={str(reusable).lower()} reason={reason}")

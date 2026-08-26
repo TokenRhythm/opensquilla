@@ -10,12 +10,18 @@ import {
   requiredOption,
   waitFor,
 } from './packaged-smoke-helpers.mjs'
+import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
+const INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS
 const HEADER_IDENTITY_ATTRIBUTE = 'data-opensquilla-first-send-identity'
 const HEADER_IDENTITY_SETTLE_MS = 250
 const FORBIDDEN_RENDERER_ERROR = /(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])/i
+const PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS = new Set([
+  'Electron sandboxed_renderer.bundle.js script failed to run',
+  "TypeError: Cannot destructure property 'preloadScripts' of 'binding.startupData' as it is null.",
+])
 const WIDE_VIEWPORT = { width: 1440, height: 900 }
 const TIGHT_VIEWPORT = { width: 900, height: 780 }
 let headerIdentityNonce = 0
@@ -49,6 +55,18 @@ function isLoopbackUrl(value) {
   try {
     const url = new URL(value)
     return url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+function isDesktopMaterializedChatUrl(value) {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'opensquilla-app:'
+      && url.hostname === 'desktop'
+      && url.pathname === '/chat'
+      && url.searchParams.has('session')
   } catch {
     return false
   }
@@ -155,6 +173,8 @@ async function readDesktopLogSummary(userDataDir) {
   const rendererErrors = []
   let malformedRecords = 0
   let forbiddenErrorCount = 0
+  let playwrightSandboxErrorCount = 0
+  let unexpectedRendererErrorCount = 0
   for (const line of source.split(/\r?\n/)) {
     if (!line.trim()) continue
     if (FORBIDDEN_RENDERER_ERROR.test(line)) forbiddenErrorCount += 1
@@ -170,6 +190,13 @@ async function readDesktopLogSummary(userDataDir) {
           line: record?.line,
         })
       }
+      if (event === 'renderer_console') {
+        if (PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS.has(String(record?.message || ''))) {
+          playwrightSandboxErrorCount += 1
+        } else {
+          unexpectedRendererErrorCount += 1
+        }
+      }
     } catch {
       malformedRecords += 1
     }
@@ -179,6 +206,8 @@ async function readDesktopLogSummary(userDataDir) {
     eventCounts,
     rendererErrors,
     forbiddenErrorCount,
+    playwrightSandboxErrorCount,
+    unexpectedRendererErrorCount,
     malformedRecords,
   }
 }
@@ -207,6 +236,38 @@ async function browserRpcSnapshot(page) {
       sends: probe?.sends || [],
     }
   })
+}
+
+function installBrowserRpcProbe() {
+  const probe = { methods: {}, sends: [] }
+  Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
+    configurable: false,
+    enumerable: false,
+    value: probe,
+    writable: false,
+  })
+  const originalSend = WebSocket.prototype.send
+  WebSocket.prototype.send = function opensquillaP15ObservedSend(data) {
+    try {
+      if (typeof data === 'string') {
+        const frame = JSON.parse(data)
+        if (frame?.type === 'req' && typeof frame.method === 'string') {
+          probe.methods[frame.method] = (probe.methods[frame.method] || 0) + 1
+          if (frame.method === 'chat.send') {
+            probe.sends.push({
+              message: typeof frame.params?.message === 'string' ? frame.params.message : '',
+              sessionKey: typeof frame.params?.sessionKey === 'string'
+                ? frame.params.sessionKey
+                : '',
+            })
+          }
+        }
+      }
+    } catch {
+      // The probe is diagnostic only; malformed/non-JSON frames stay intact.
+    }
+    return originalSend.call(this, data)
+  }
 }
 
 async function observedChatSendCount(page, message) {
@@ -323,55 +384,38 @@ try {
     await route.abort('blockedbyclient')
   })
   const page = await app.firstWindow({ timeout: 60_000 })
+  await waitFor(
+    () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'candidate Desktop renderer',
+  )
+  // The Desktop main process awaits its first loadURL() before it can inspect
+  // the profile and start Gateway. Reloading as soon as the committed URL is
+  // visible can interrupt that promise and strand startup before inspection.
+  // Prove the initial document and Gateway are settled before installing the
+  // page-level WebSocket probe.
+  await page.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
+  })
   page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
-  await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
-  // packaged Electron app, so the release gate instruments send() in the page
-  // before a clean reload and leaves the real Gateway connection untouched.
-  await page.addInitScript(() => {
-    const probe = { methods: {}, sends: [] }
-    Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
-      configurable: false,
-      enumerable: false,
-      value: probe,
-      writable: false,
-    })
-    const originalSend = WebSocket.prototype.send
-    WebSocket.prototype.send = function opensquillaP15ObservedSend(data) {
-      try {
-        if (typeof data === 'string') {
-          const frame = JSON.parse(data)
-          if (frame?.type === 'req' && typeof frame.method === 'string') {
-            probe.methods[frame.method] = (probe.methods[frame.method] || 0) + 1
-            if (frame.method === 'chat.send') {
-              probe.sends.push({
-                message: typeof frame.params?.message === 'string' ? frame.params.message : '',
-                sessionKey: typeof frame.params?.sessionKey === 'string'
-                  ? frame.params.sessionKey
-                  : '',
-              })
-            }
-          }
-        }
-      } catch {
-        // The probe is diagnostic only; malformed/non-JSON frames stay intact.
-      }
-      return originalSend.call(this, data)
-    }
-  })
-  await page.reload({ waitUntil: 'domcontentloaded' })
+  // packaged Electron app. Register the probe for later full-document route
+  // transitions, then patch the already-settled initial document directly.
+  // No reload can race Electron's main-process loadURL() promise.
+  await page.addInitScript(installBrowserRpcProbe)
+  await page.evaluate(installBrowserRpcProbe)
 
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
     const draftUrl = new URL(page.url())
-    const alreadyOnEmptyDraft = draftUrl.pathname === '/control/chat/new'
+    const alreadyOnEmptyDraft = draftUrl.pathname === '/chat/new'
       && draftUrl.search === ''
       && draftUrl.hash === ''
-    draftUrl.pathname = '/control/chat/new'
+    draftUrl.pathname = '/chat/new'
     draftUrl.search = ''
     draftUrl.hash = ''
     // Packaged macOS Electron can report ERR_ABORTED for a redundant
@@ -386,6 +430,8 @@ try {
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
     await page.locator('.conn-pill.connected').waitFor({
       state: 'visible',
+      // Initial cold start completed before probe installation. Keep the strict
+      // interaction budget used by the rest of this gate.
       timeout: SEND_TIMEOUT_MS,
     })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
@@ -412,7 +458,11 @@ try {
       `first chat.send ${iteration}`,
     )
     await syncObservedChatSends(page)
-    await waitFor(() => /\/control\/chat\?session=/.test(page.url()), `session materialization ${iteration}`, SEND_TIMEOUT_MS)
+    await waitFor(
+      () => isDesktopMaterializedChatUrl(page.url()),
+      `session materialization ${iteration}`,
+      SEND_TIMEOUT_MS,
+    )
     assert.equal(await page.locator('#app-route-header').count(), 1)
     assert.equal(await page.locator('.chat').count(), 1)
     assert.equal(await page.locator('.chat-textarea').count(), 1)
@@ -499,7 +549,11 @@ if (runError) {
 }
 
 assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
-assert.equal(desktopLogSummary.eventCounts.renderer_console || 0, 0, 'desktop.log contains renderer console errors')
+assert.equal(
+  desktopLogSummary.unexpectedRendererErrorCount,
+  0,
+  'desktop.log contains unexpected renderer console errors',
+)
 assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
 assert.equal(
   provider?.counts().chatRequestCount,

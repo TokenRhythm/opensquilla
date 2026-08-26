@@ -12,9 +12,14 @@ let slowReload = false
 let releaseSlowReload
 let slowReloadAbortObserved = false
 let lateReloadCount = 0
+let bindingReleaseCount = 0
 const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve })
 const annotationDigest = 'b'.repeat(64)
 const annotationElementProof = 'c'.repeat(64)
+const annotationProofV2 = {
+  stableElementProofSha256: 'd'.repeat(64),
+  ancestorClassCommitments: ['e'.repeat(64), 'f'.repeat(64)],
+}
 const activePreviewArtifactId = 'art-loopback-preview'
 const annotationPath = JSON.stringify([
   ['', 'html', 1],
@@ -23,11 +28,14 @@ const annotationPath = JSON.stringify([
 ])
 const target = {
   capabilities: {
+    annotationProofV2: true,
     captureSelection: false,
     resolveAnnotationSelection: true,
     focusAnnotation: true,
     browserInspect: false,
     browserAct: false,
+    bindCandidatePreview: false,
+    restoreCanonicalPreview: false,
     screenshot: true,
     officeFlush: false,
     reloadSurface: true,
@@ -40,6 +48,7 @@ const target = {
     elementPath: request.elementPath,
     ...(request.domSha256 === undefined ? {} : { domSha256: request.domSha256 }),
     elementProofSha256: request.elementProofSha256,
+    annotationProofV2,
     scopeId: 'synthetic:scope',
     rect: { x: 10, y: 20, width: 80, height: 24 },
   }),
@@ -69,7 +78,13 @@ const target = {
 }
 
 const audit = []
-const bridge = new DesktopArtifactBridge({ getActiveTarget: () => target })
+const bridge = new DesktopArtifactBridge({
+  getActiveTarget: () => target,
+  acquireActiveTargetBinding: async () => ({
+    target,
+    release: () => { bindingReleaseCount += 1 },
+  }),
+})
 const transport = new DesktopArtifactBridgeLoopbackTransport(bridge, {
   audit: entry => audit.push(entry),
 })
@@ -104,18 +119,50 @@ const capabilities = await capabilitiesResponse.json()
 assert.deepEqual(capabilities, {
   ok: true,
   value: {
-    version: 3,
+    version: 4,
     available: true,
     captureSelection: false,
     resolveAnnotationSelection: true,
     focusAnnotation: true,
+    annotationProofV2: true,
     browserInspect: false,
     browserAct: false,
+    bindCandidatePreview: false,
+    restoreCanonicalPreview: false,
     screenshot: true,
     officeFlush: false,
     reloadSurface: true,
   },
 })
+
+const bindingResponse = await post('/v1/bindings/acquire', { version: 5 })
+assert.equal(bindingResponse.status, 201)
+const bindingBody = await bindingResponse.json()
+assert.match(bindingBody.value.bindingToken, /^[A-Za-z0-9_-]{43}$/)
+assert.equal(bindingBody.value.capabilities.version, 5)
+const boundReloadResponse = await post('/v1/invoke', {
+  version: 5,
+  bindingToken: bindingBody.value.bindingToken,
+  method: 'screenshot',
+  request: { version: 5 },
+})
+assert.equal(boundReloadResponse.status, 200)
+assert.equal((await boundReloadResponse.json()).ok, true)
+for (let index = 0; index < 2; index += 1) {
+  const releaseResponse = await post('/v1/bindings/release', {
+    version: 5,
+    bindingToken: bindingBody.value.bindingToken,
+  })
+  assert.equal(releaseResponse.status, 200)
+}
+assert.equal(bindingReleaseCount, 1, 'binding release must be idempotent')
+const expiredBindingResponse = await post('/v1/invoke', {
+  version: 5,
+  bindingToken: bindingBody.value.bindingToken,
+  method: 'reloadSurface',
+  request: { version: 5 },
+})
+assert.equal((await expiredBindingResponse.json()).code, 'unavailable')
 
 const resolvedAnnotationResponse = await post('/v1/invoke', {
   version: 3,
@@ -141,6 +188,7 @@ assert.deepEqual(await resolvedAnnotationResponse.json(), {
     elementPath: annotationPath,
     domSha256: annotationDigest,
     elementProofSha256: annotationElementProof,
+    annotationProofV2,
     scopeId: 'synthetic:scope',
     rect: { x: 10, y: 20, width: 80, height: 24 },
   },
@@ -168,6 +216,7 @@ assert.deepEqual(await resolvedAnnotationWithoutDomResponse.json(), {
     tagName: 'button',
     elementPath: annotationPath,
     elementProofSha256: annotationElementProof,
+    annotationProofV2,
     scopeId: 'synthetic:scope',
     rect: { x: 10, y: 20, width: 80, height: 24 },
   },
@@ -184,6 +233,7 @@ const focusAnnotationResponse = await post('/v1/invoke', {
     tagName: 'button',
     elementPath: annotationPath,
     elementProofSha256: annotationElementProof,
+    annotationProofV2,
   },
 })
 assert.equal(focusAnnotationResponse.status, 200)
@@ -192,6 +242,26 @@ assert.deepEqual(await focusAnnotationResponse.json(), {
   method: 'focusAnnotation',
   value: { focused: true, activePreviewArtifactId },
 })
+
+const malformedFocusProofResponse = await post('/v1/invoke', {
+  version: 3,
+  method: 'focusAnnotation',
+  request: {
+    version: 3,
+    activePreviewArtifactId,
+    annotationId: 'annotation_loopback_invalid_v2',
+    scopeId: 'synthetic:scope',
+    tagName: 'button',
+    elementPath: annotationPath,
+    elementProofSha256: annotationElementProof,
+    annotationProofV2: {
+      ...annotationProofV2,
+      ancestorClassCommitments: [...annotationProofV2.ancestorClassCommitments].reverse(),
+    },
+  },
+})
+assert.equal(malformedFocusProofResponse.status, 200)
+assert.equal((await malformedFocusProofResponse.json()).code, 'invalid-request')
 
 const reloadResponse = await post('/v1/invoke', {
   version: 3,
@@ -300,12 +370,48 @@ const unknownMethodResponse = await post('/v1/invoke', {
 assert.equal(unknownMethodResponse.status, 400)
 assert.equal((await unknownMethodResponse.json()).code, 'invalid-request')
 
+const mismatchedProtocolResponse = await post('/v1/invoke', {
+  version: 3,
+  method: 'reloadSurface',
+  request: { version: 4 },
+})
+assert.equal(mismatchedProtocolResponse.status, 400)
+assert.equal((await mismatchedProtocolResponse.json()).code, 'invalid-request')
+
 const oversizedResponse = await post('/v1/capabilities', 'x'.repeat(64 * 1024 + 1))
 assert.equal(oversizedResponse.status, 413)
 
 assert.ok(audit.length >= 9)
 assert.ok(audit.every(entry => !JSON.stringify(entry).includes(token)))
 assert.ok(audit.every(entry => !('payload' in entry)))
+
+let actionAbortObserved = false
+const actionTimeoutBridge = new DesktopArtifactBridge({
+  getActiveTarget: () => ({
+    capabilities: { browserAct: true },
+    isCurrent: () => true,
+    browserAct: async (_request, signal) => {
+      await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+      actionAbortObserved = true
+      throw new Error('synthetic lost action reply')
+    },
+  }),
+  operationTimeoutMs: 100,
+})
+const actionTestKeepalive = setTimeout(() => undefined, 1_000)
+const unknownAction = await actionTimeoutBridge.browserAct({
+  version: 5,
+  action: 'press',
+  key: 'Enter',
+  candidateHandle: 'candidate_timeout_12345678',
+}).finally(() => clearTimeout(actionTestKeepalive))
+assert.deepEqual(unknownAction, {
+  ok: false,
+  method: 'browserAct',
+  code: 'action-result-unknown',
+  message: 'The Desktop artifact action result is unknown; inspect again.',
+})
+assert.equal(actionAbortObserved, true)
 
 await transport.close()
 await assert.rejects(() => fetch(`${endpoint}/v1/capabilities`, {

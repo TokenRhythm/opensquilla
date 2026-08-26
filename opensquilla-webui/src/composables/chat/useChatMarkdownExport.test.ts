@@ -99,4 +99,31 @@ describe('buildChatMarkdown', () => {
 
     expect(markdown).toContain('NO_REPLY\nLiteral explanation')
   })
+
+  it('exports the authoritative routed model instead of inferring it from UI cells', () => {
+    const markdown = buildChatMarkdown({
+      title: 'Historical route',
+      exportedAt: '2026-08-25T00:00:00.000Z',
+      aiGeneratedLabel: 'AI generated',
+      messages: [{
+        displayRole: 'router',
+        roleLabel: 'Router',
+        text: '',
+        timeStr: '',
+        isRouterStrip: true,
+        routerSelectedModel: 'historical/authoritative-model',
+        winnerIdx: 0,
+        gridCells: [{
+          kind: 'real',
+          tier: 'c1',
+          tiers: ['c1'],
+          displayName: 'stale-model',
+          model: 'current/stale-model',
+        }],
+      } as ChatRenderedMessage],
+    })
+
+    expect(markdown).toContain('> Router selected historical/authoritative-model')
+    expect(markdown).not.toContain('current/stale-model')
+  })
 })

@@ -5,8 +5,6 @@
 //               dialog; the corner shows a status dot + an "installed" badge.
 //   registry  — a static tile whose corner "+" button emits `install`
 //               (disabled/"installed" when the skill is already present).
-// The dense dependency/sub-skill rows from the old SkillCard live in the
-// detail dialog now; the tile stays recognition-first (see ChannelTypeGallery).
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'

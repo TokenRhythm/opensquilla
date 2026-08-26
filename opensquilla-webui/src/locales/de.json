@@ -184,6 +184,7 @@
       "readyWithWarnings": "Die Vorschau wird mit Warnungen ausgeführt.",
       "warningsShort": "Warnungen",
       "suspended": "Vorschau pausiert",
+      "agentEditInProgress": "Die Bearbeitung wird im Hintergrund fortgesetzt.",
       "nativePreview": "Interaktive Vorschau",
       "allowRemoteResources": "Online-Bilder, -Stile und -Medien zulassen",
       "blockRemoteResources": "Online-Bilder, -Stile und -Medien blockieren",
@@ -590,12 +591,12 @@
         "title": "Laufzeitpakete", "description": "Downloads werden automatisch aktiviert. Sicher bevorzugt installierte Laufzeitpakete; Vollzugriff priorisiert Host-Werkzeuge.", "target": "Laufzeitziel",
         "allowRuntime": "{runtime} erlauben", "progress": "{runtime}-Download: {progress}%",
         "states": {
-          "unknown": "Status nicht verfügbar", "notInstalled": "Nicht installiert", "disabled": "Nicht aktiviert", "installed": "Installiert", "installedVersion": "Installiert · {version}",
+          "unknown": "Status nicht verfügbar", "notInstalled": "Nicht installiert", "disabled": "Nicht aktiviert", "installed": "Installiert", "installedVersion": "Installiert · {version}", "updatePaused": "Update pausiert",
           "unsupported": "Für dieses System nicht verfügbar", "corrupt": "Reparatur erforderlich", "queued": "Wartet auf Download", "downloading": "Wird heruntergeladen", "downloadingProgress": "Download · {progress}%",
           "verifying": "Download wird geprüft", "extracting": "Wird installiert", "probing": "Laufzeit wird geprüft", "activating": "Installation wird abgeschlossen", "cancelling": "Wird abgebrochen", "queuedRemoval": "Wartet auf Entfernung", "removing": "Wird entfernt",
           "cancelled": "Download abgebrochen", "failed": "Download fehlgeschlagen", "removeFailed": "Entfernen fehlgeschlagen", "removeInterrupted": "Entfernen unterbrochen", "interrupted": "Download pausiert"
         },
-        "actions": { "enable": "Aktivieren", "download": "Herunterladen", "cancel": "Abbrechen", "resume": "Fortsetzen", "retry": "Erneut versuchen", "repair": "Reparieren", "remove": "Entfernen", "retryRemove": "Entfernen wiederholen" },
+        "actions": { "enable": "Aktivieren", "download": "Herunterladen", "cancel": "Abbrechen", "discardDownload": "Download verwerfen", "resume": "Fortsetzen", "retry": "Erneut versuchen", "repair": "Reparieren", "remove": "Entfernen", "retryRemove": "Entfernen wiederholen" },
         "sources": { "oss": "OSS Peking", "github": "GitHub-Veröffentlichungen" }
       },
       "lan": {
@@ -1072,19 +1073,7 @@
       "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte"
     },
     "preset": {
-      "summary": "Routing-Vorlage: {label}",
-      "desc": "Einmal anwenden, um Modellrouting zu füllen; aktive Stufen dort bearbeiten.",
-      "customizedSummary": "Modellrouting verwendet bereits {label}.",
-      "customizedDesc": "Aktive Stufen werden im Modellrouting bearbeitet.",
-      "synthesizedLabel": "Generierte Routing-Vorlage",
-      "synthesizedBadge": "Generierte Vorlage",
-      "customize": "Vorlagendetails anzeigen →",
-      "hide": "Vorlagendetails ausblenden",
-      "apply": "Auf Modellrouting anwenden",
-      "viewInRouter": "Modellrouting öffnen →",
-      "modeRecommended": "Routing-Vorlage",
-      "modeCustom": "benutzerdefiniert",
-      "modeDisabled": "aus"
+      "modeCustom": "benutzerdefiniert"
     },
     "modelStrategy": {
       "title": "Modellrouting",
@@ -1734,8 +1723,6 @@
       "routerSaved": "Router gespeichert.",
       "routerSavedRestart": "Router gespeichert. Neustart erforderlich.",
       "ensembleSaved": "Ensemble gespeichert.",
-      "presetApplied": "Routing-Preset angewendet.",
-      "presetAppliedRestart": "Routing-Preset angewendet. Neustart erforderlich.",
       "channelSaved": "Kanal gespeichert — Konfiguration lokal validiert; mit „Verbindung testen“ die Zugangsdaten prüfen",
       "channelSavedLive": "Kanal gespeichert und übernommen — läuft mit der neuen Konfiguration",
       "channelStartFailed": "Kanal gespeichert, aber der Start ist fehlgeschlagen — Fehler im Status prüfen und mit Neustart erneut versuchen",
@@ -2966,16 +2953,6 @@
       "installed": "Installiert",
       "add": "Hinzufügen"
     },
-    "skillCard": {
-      "subSkillsTitle": "Von dieser Meta-Fähigkeit verwendete Unterfähigkeiten",
-      "uses": "verwendet",
-      "dependencies": "Deklarierte Abhängigkeiten",
-      "pythonCount": "Python-Pakete: {count}",
-      "binaryCount": "Binärdateien: {count}",
-      "envCount": "Umgebungsvariablen: {count}",
-      "missingCount": "Fehlende Abhängigkeiten: {count}",
-      "advisoryCount": "Hinweise: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Skill-Details: {name}",
       "triggers": "Auslöser",
@@ -3684,7 +3661,8 @@
       },
       "more": "{count} weitere",
       "stale": "Arbeitet weiter — kein aktuelles Signal",
-      "liveStep": "Schritt {n}"
+      "liveStep": "Schritt {n}",
+      "recordIncomplete": "Aktivitätsprotokoll unvollständig; kompatible Verlaufsansicht wird angezeigt."
     },
     "suggestedTasks": "Vorgeschlagene Aufgaben",
     "greetingMorning": "Guten Morgen.",
@@ -4351,7 +4329,22 @@
       "activityContentSize": "{lines} Zeilen · {characters} Zeichen",
       "activityExitCode": "Exit-Code {code}",
       "activityNotCompleted": "Nicht abgeschlossen",
-      "activityPublished": "Veröffentlicht"
+      "activityPublished": "Veröffentlicht",
+      "documentErrorCategory": "Kategorie: {category} ({code})",
+      "documentPreviewUnavailableCategory": "Vorschau nicht verfügbar",
+      "documentActionUnknownCategory": "Aktionsergebnis unbekannt",
+      "documentEditFailedCategory": "Dokumentbearbeitung fehlgeschlagen",
+      "documentPreviewUnavailableMessage": "Die Bearbeitungsvorschau ist nicht verfügbar. Nicht übernommene Änderungen wurden verworfen.",
+      "documentActionUnknownMessage": "Die Aktion wurde möglicherweise ausgeführt. Prüfen Sie die Vorschau, bevor Sie fortfahren.",
+      "documentEditFailedMessage": "Der Dokumentvorgang wurde nicht abgeschlossen.",
+      "documentRetrySameTurn": "Wiederholung: in dieser Aufgabe fortfahren",
+      "documentRetryNewTurn": "Wiederholung: neue Aufgabe starten",
+      "documentRetryNever": "Wiederholung: nicht erneut versuchen",
+      "documentNextRetry": "Nächster Schritt: erneut versuchen",
+      "documentNextReinspect": "Nächster Schritt: erneut prüfen",
+      "documentNextFinalize": "Nächster Schritt: ohne weitere Werkzeuge beenden",
+      "documentNextNewTurn": "Nächster Schritt: neue Aufgabe starten",
+      "documentNextStop": "Nächster Schritt: stoppen"
     }
   },
   "channelStatus": {

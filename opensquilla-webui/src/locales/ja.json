@@ -184,6 +184,7 @@
       "readyWithWarnings": "プレビューは警告付きで実行されています。",
       "warningsShort": "警告あり",
       "suspended": "プレビューを一時停止しました",
+      "agentEditInProgress": "編集はバックグラウンドで続行中です。",
       "nativePreview": "インタラクティブプレビュー",
       "allowRemoteResources": "オンラインの画像、スタイル、メディアを許可",
       "blockRemoteResources": "オンラインの画像、スタイル、メディアをブロック",
@@ -590,12 +591,12 @@
         "title": "ランタイムパック", "description": "ダウンロード後は自動的に有効になります。安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。", "target": "ランタイム対象",
         "allowRuntime": "{runtime} を許可", "progress": "{runtime} のダウンロード：{progress}%",
         "states": {
-          "unknown": "状態を取得できません", "notInstalled": "未インストール", "disabled": "無効", "installed": "インストール済み", "installedVersion": "インストール済み · {version}",
+          "unknown": "状態を取得できません", "notInstalled": "未インストール", "disabled": "無効", "installed": "インストール済み", "installedVersion": "インストール済み · {version}", "updatePaused": "更新を一時停止",
           "unsupported": "このシステムでは利用できません", "corrupt": "修復が必要です", "queued": "ダウンロード待ち", "downloading": "ダウンロード中", "downloadingProgress": "ダウンロード中 · {progress}%",
           "verifying": "ダウンロードを検証中", "extracting": "インストール中", "probing": "ランタイムを確認中", "activating": "インストールを完了中", "cancelling": "キャンセル中", "queuedRemoval": "削除待ち", "removing": "削除中",
           "cancelled": "ダウンロードをキャンセルしました", "failed": "ダウンロードに失敗しました", "removeFailed": "削除に失敗しました", "removeInterrupted": "削除が中断されました", "interrupted": "ダウンロードを一時停止しました"
         },
-        "actions": { "enable": "有効にする", "download": "ダウンロード", "cancel": "キャンセル", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除", "retryRemove": "削除を再試行" },
+        "actions": { "enable": "有効にする", "download": "ダウンロード", "cancel": "キャンセル", "discardDownload": "ダウンロードを削除", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除", "retryRemove": "削除を再試行" },
         "sources": { "oss": "北京 OSS", "github": "GitHub リリース" }
       },
       "lan": {
@@ -1072,19 +1073,7 @@
       "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
     },
     "preset": {
-      "summary": "ルーティングテンプレート: {label}",
-      "desc": "一度適用してモデルルーティングを埋めます。アクティブな階層はそこで編集します。",
-      "customizedSummary": "モデルルーティングはすでに {label} を使用しています。",
-      "customizedDesc": "アクティブな階層はモデルルーティングで編集します。",
-      "synthesizedLabel": "生成済みルーティングテンプレート",
-      "synthesizedBadge": "生成済みテンプレート",
-      "customize": "テンプレート詳細を表示 →",
-      "hide": "テンプレート詳細を隠す",
-      "apply": "モデルルーティングに適用",
-      "viewInRouter": "モデルルーティングを開く →",
-      "modeRecommended": "ルーティングテンプレート",
-      "modeCustom": "カスタム",
-      "modeDisabled": "オフ"
+      "modeCustom": "カスタム"
     },
     "modelStrategy": {
       "title": "モデルルーティング",
@@ -1734,8 +1723,6 @@
       "routerSaved": "ルーターを保存しました。",
       "routerSavedRestart": "ルーターを保存しました。再起動が必要です。",
       "ensembleSaved": "アンサンブルを保存しました。",
-      "presetApplied": "ルーティングプリセットを適用しました。",
-      "presetAppliedRestart": "ルーティングプリセットを適用しました。再起動が必要です。",
       "channelSaved": "チャンネルを保存しました — ローカル検証済み。「接続テスト」で認証情報を確認できます",
       "channelSavedLive": "チャネルを保存して適用しました——新しい設定で稼働中",
       "channelStartFailed": "チャネルは保存されましたが起動に失敗しました——ステータスでエラーを確認し、再起動で再試行してください",
@@ -2966,16 +2953,6 @@
       "installed": "インストール済み",
       "add": "追加"
     },
-    "skillCard": {
-      "subSkillsTitle": "このメタスキルが使用するサブスキル",
-      "uses": "使用",
-      "dependencies": "宣言済み依存関係",
-      "pythonCount": "Python パッケージ: {count}",
-      "binaryCount": "バイナリ: {count}",
-      "envCount": "環境変数: {count}",
-      "missingCount": "不足している依存関係: {count}",
-      "advisoryCount": "注意事項: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "スキルの詳細: {name}",
       "triggers": "トリガー",
@@ -3684,7 +3661,8 @@
       },
       "more": "ほか {count} 項目",
       "stale": "処理を継続中 — 最近の信号はありません",
-      "liveStep": "ステップ {n}"
+      "liveStep": "ステップ {n}",
+      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。"
     },
     "suggestedTasks": "おすすめのタスク",
     "greetingMorning": "おはようございます。",
@@ -4351,7 +4329,22 @@
       "activityContentSize": "{lines} 行 · {characters} 文字",
       "activityExitCode": "終了コード {code}",
       "activityNotCompleted": "完了できませんでした",
-      "activityPublished": "公開済み"
+      "activityPublished": "公開済み",
+      "documentErrorCategory": "カテゴリ: {category} ({code})",
+      "documentPreviewUnavailableCategory": "プレビューを利用できません",
+      "documentActionUnknownCategory": "操作結果が不明です",
+      "documentEditFailedCategory": "ドキュメントの編集に失敗しました",
+      "documentPreviewUnavailableMessage": "編集プレビューを利用できません。未確定の変更は適用されていません。",
+      "documentActionUnknownMessage": "操作が実行された可能性があります。続行前に現在のプレビューを確認してください。",
+      "documentEditFailedMessage": "ドキュメント操作は完了しませんでした。",
+      "documentRetrySameTurn": "再試行方針: このタスクで続行",
+      "documentRetryNewTurn": "再試行方針: 新しいタスクを開始",
+      "documentRetryNever": "再試行方針: 再試行しない",
+      "documentNextRetry": "次の操作: 再試行",
+      "documentNextReinspect": "次の操作: 再確認",
+      "documentNextFinalize": "次の操作: ツールを使わずに終了",
+      "documentNextNewTurn": "次の操作: 新しいタスクを開始",
+      "documentNextStop": "次の操作: 停止"
     }
   },
   "channelStatus": {

@@ -529,6 +529,11 @@ describe('ArtifactDocumentPanel', () => {
       type: 'artifact-annotation-fallback-submit',
       payload: { annotationId: 'annotation-1', body: 'Updated draft' },
     })
+    dialog?.querySelector<HTMLButtonElement>('button[type="button"]')?.click()
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({
+      type: 'artifact-annotation-fallback-cancel',
+      payload: { annotationId: 'annotation-1', reason: 'user-cancelled' },
+    })
     mounted.unmount()
   })
 

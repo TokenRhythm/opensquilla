@@ -184,6 +184,7 @@
       "readyWithWarnings": "L’aperçu fonctionne avec des avertissements.",
       "warningsShort": "Avertissements",
       "suspended": "Aperçu en pause",
+      "agentEditInProgress": "La modification se poursuit en arrière-plan.",
       "nativePreview": "Aperçu interactif",
       "allowRemoteResources": "Autoriser les images, styles et médias en ligne",
       "blockRemoteResources": "Bloquer les images, styles et médias en ligne",
@@ -590,12 +591,12 @@
         "title": "Paquets d'exécution", "description": "Les téléchargements sont activés automatiquement. Sûr les privilégie ; Accès complet conserve la priorité aux outils de l'hôte.", "target": "Cible d'exécution",
         "allowRuntime": "Autoriser {runtime}", "progress": "Téléchargement de {runtime} : {progress}%",
         "states": {
-          "unknown": "État indisponible", "notInstalled": "Non installé", "disabled": "Non activé", "installed": "Installé", "installedVersion": "Installé · {version}",
+          "unknown": "État indisponible", "notInstalled": "Non installé", "disabled": "Non activé", "installed": "Installé", "installedVersion": "Installé · {version}", "updatePaused": "Mise à jour en pause",
           "unsupported": "Indisponible pour ce système", "corrupt": "Réparation requise", "queued": "En attente de téléchargement", "downloading": "Téléchargement", "downloadingProgress": "Téléchargement · {progress}%",
           "verifying": "Vérification du téléchargement", "extracting": "Installation", "probing": "Vérification de l'environnement", "activating": "Finalisation de l'installation", "cancelling": "Annulation", "queuedRemoval": "En attente de suppression", "removing": "Suppression",
           "cancelled": "Téléchargement annulé", "failed": "Échec du téléchargement", "removeFailed": "Échec de la suppression", "removeInterrupted": "Suppression interrompue", "interrupted": "Téléchargement suspendu"
         },
-        "actions": { "enable": "Activer", "download": "Télécharger", "cancel": "Annuler", "resume": "Reprendre", "retry": "Réessayer", "repair": "Réparer", "remove": "Supprimer", "retryRemove": "Réessayer la suppression" },
+        "actions": { "enable": "Activer", "download": "Télécharger", "cancel": "Annuler", "discardDownload": "Supprimer le téléchargement", "resume": "Reprendre", "retry": "Réessayer", "repair": "Réparer", "remove": "Supprimer", "retryRemove": "Réessayer la suppression" },
         "sources": { "oss": "OSS de Pékin", "github": "Versions GitHub" }
       },
       "lan": {
@@ -1072,19 +1073,7 @@
       "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
     },
     "preset": {
-      "summary": "Modèle de routage : {label}",
-      "desc": "Appliquez-le une fois pour remplir Routage des modèles ; modifiez-y les niveaux actifs.",
-      "customizedSummary": "Routage des modèles utilise déjà {label}.",
-      "customizedDesc": "Les niveaux actifs se modifient dans Routage des modèles.",
-      "synthesizedLabel": "Modèle de routage généré",
-      "synthesizedBadge": "Modèle généré",
-      "customize": "Voir les détails du modèle →",
-      "hide": "Masquer les détails du modèle",
-      "apply": "Appliquer à Routage des modèles",
-      "viewInRouter": "Ouvrir Routage des modèles →",
-      "modeRecommended": "modèle de routage",
-      "modeCustom": "personnalisé",
-      "modeDisabled": "désactivé"
+      "modeCustom": "personnalisé"
     },
     "modelStrategy": {
       "title": "Routage des modèles",
@@ -1734,8 +1723,6 @@
       "routerSaved": "Routeur enregistré.",
       "routerSavedRestart": "Routeur enregistré. Redémarrage requis.",
       "ensembleSaved": "Ensemble enregistré.",
-      "presetApplied": "Préréglage de routage appliqué.",
-      "presetAppliedRestart": "Préréglage de routage appliqué. Redémarrage requis.",
       "channelSaved": "Canal enregistré — configuration validée localement ; utilisez « Tester la connexion » pour vérifier les identifiants",
       "channelSavedLive": "Canal enregistré et appliqué — actif avec la nouvelle configuration",
       "channelStartFailed": "Canal enregistré, mais son démarrage a échoué — consultez son statut pour l'erreur, puis réessayez avec Redémarrer",
@@ -2966,16 +2953,6 @@
       "installed": "Installé",
       "add": "Ajouter"
     },
-    "skillCard": {
-      "subSkillsTitle": "Sous-compétences utilisées par cette méta-compétence",
-      "uses": "utilise",
-      "dependencies": "Dépendances déclarées",
-      "pythonCount": "Paquets Python : {count}",
-      "binaryCount": "Binaires : {count}",
-      "envCount": "Variables d’environnement : {count}",
-      "missingCount": "Dépendances manquantes : {count}",
-      "advisoryCount": "Avis : {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Détails de la compétence : {name}",
       "triggers": "Déclencheurs",
@@ -3684,7 +3661,8 @@
       },
       "more": "{count} de plus",
       "stale": "Toujours en cours — aucun signal récent",
-      "liveStep": "étape {n}"
+      "liveStep": "étape {n}",
+      "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible."
     },
     "suggestedTasks": "Tâches suggérées",
     "greetingMorning": "Bonjour.",
@@ -4351,7 +4329,22 @@
       "activityContentSize": "{lines} lignes · {characters} caractères",
       "activityExitCode": "Code de sortie {code}",
       "activityNotCompleted": "Non terminé",
-      "activityPublished": "Publié"
+      "activityPublished": "Publié",
+      "documentErrorCategory": "Catégorie : {category} ({code})",
+      "documentPreviewUnavailableCategory": "Aperçu indisponible",
+      "documentActionUnknownCategory": "Résultat de l’action inconnu",
+      "documentEditFailedCategory": "Échec de la modification du document",
+      "documentPreviewUnavailableMessage": "L’aperçu d’édition est indisponible. Aucune modification non validée n’a été appliquée.",
+      "documentActionUnknownMessage": "L’action a peut-être été exécutée. Inspectez l’aperçu avant de continuer.",
+      "documentEditFailedMessage": "L’opération sur le document n’a pas abouti.",
+      "documentRetrySameTurn": "Nouvelle tentative : poursuivre dans cette tâche",
+      "documentRetryNewTurn": "Nouvelle tentative : démarrer une nouvelle tâche",
+      "documentRetryNever": "Nouvelle tentative : ne pas réessayer",
+      "documentNextRetry": "Étape suivante : réessayer",
+      "documentNextReinspect": "Étape suivante : inspecter à nouveau",
+      "documentNextFinalize": "Étape suivante : terminer sans autre outil",
+      "documentNextNewTurn": "Étape suivante : démarrer une nouvelle tâche",
+      "documentNextStop": "Étape suivante : arrêter"
     }
   },
   "channelStatus": {

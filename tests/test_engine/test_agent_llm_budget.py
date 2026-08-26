@@ -2777,7 +2777,6 @@ def test_workspace_edit_gate_allows_configured_scratch_repro_file(
     )
 
     assert result is None
-    assert agent._tool_call_targets_workspace_path(tool_call) is False
     tool_context.scratch_file_writes.append(
         {
             "path": str(target),

@@ -222,25 +222,6 @@ def _versioned_api_url(base_url: str, path: str) -> str:
 _EPHEMERAL_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
-_DASHSCOPE_WORKSPACE_MUTATION_TOOLS = frozenset(
-    {
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-)
-_DASHSCOPE_FAILURE_ANCHOR_MARKERS = (
-    "assertionerror",
-    "traceback",
-    "failed",
-    "failure",
-    "error",
-    "exception",
-    "expected",
-    "actual",
-    "exit code:",
-    "exit_code=",
-)
 
 
 def _is_inert_post_terminal_stream_frame(
@@ -2308,19 +2289,6 @@ def _openrouter_model_uses_alibaba_message_cache(model: str) -> bool:
     )
 
 
-def _openrouter_anthropic_should_use_top_level_cache(
-    *,
-    provider_kind: str,
-    model: str,
-    cfg: ChatConfig,
-) -> bool:
-    return (
-        provider_kind == "openrouter"
-        and cfg.cache_mode in {"auto", "on"}
-        and _openrouter_model_is_anthropic(model)
-    )
-
-
 def _build_cache_breakpoint_blocks(
     cache_breakpoints: list[dict[str, str]],
     *,
@@ -2485,263 +2453,6 @@ def _attach_cache_control_to_latest_text_messages(
             markers_remaining -= 1
             if markers_remaining <= 0:
                 return
-
-
-def _disambiguate_repeated_tool_call_arguments_for_dashscope(
-    messages: list[dict[str, Any]],
-) -> None:
-    def _content_text(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        return json.dumps(content, ensure_ascii=False, sort_keys=True)
-
-    def _preview_tool_result(tool_call_id: str) -> str:
-        result = result_messages_by_id.get(tool_call_id)
-        if result is None:
-            return "missing"
-        content = _content_text(result.get("content", ""))
-        preview = content.replace("\n", "\\n")
-        if len(preview) > 160:
-            preview = preview[:157] + "..."
-        return preview
-
-    def _provider_result_details(tool_call_id: str) -> dict[str, Any]:
-        result = result_messages_by_id.get(tool_call_id)
-        if result is None:
-            return {
-                "result_is_error": None,
-                "exit_code": None,
-                "execution_reason": "missing_tool_result",
-                "result_sha256": None,
-                "result_chars": 0,
-                "failure_anchors": [],
-            }
-
-        content = _content_text(result.get("content", ""))
-        result_text = content
-        execution_status: dict[str, Any] | None = None
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            status = parsed.get("execution_status")
-            if isinstance(status, dict):
-                execution_status = status
-            output = parsed.get("output")
-            if isinstance(output, str):
-                result_text = output
-
-        lowered = result_text.lower()
-        failure_anchors = [
-            line.strip()
-            for line in result_text.splitlines()
-            if line.strip()
-            and any(marker in line.lower() for marker in _DASHSCOPE_FAILURE_ANCHOR_MARKERS)
-        ][:3]
-
-        status_value = (
-            str(execution_status.get("status") or "") if execution_status is not None else ""
-        )
-        inferred_failure = bool(failure_anchors) or bool(
-            re.search(r"\bexit(?: code|_code)[:=]\s*[1-9][0-9]*\b", lowered)
-        )
-        result_is_error = (
-            status_value in {"error", "timeout", "cancelled"}
-            if execution_status is not None
-            else inferred_failure
-        )
-        execution_reason = (
-            str(execution_status.get("reason") or "") if execution_status is not None else ""
-        )
-        if not execution_reason:
-            execution_reason = "failure_anchor" if inferred_failure else "unknown"
-
-        return {
-            "result_is_error": result_is_error,
-            "exit_code": (
-                execution_status.get("exit_code") if execution_status is not None else None
-            ),
-            "execution_reason": execution_reason,
-            "result_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
-            "result_chars": len(content),
-            "failure_anchors": failure_anchors,
-        }
-
-    def _summary_for_omitted_duplicate(
-        *,
-        name: str,
-        arguments: dict[str, Any],
-        repeat_index: int,
-        tool_call_id: str,
-        workspace_epoch: int,
-        latest_workspace_epoch: int,
-    ) -> str:
-        result_details = _provider_result_details(tool_call_id)
-        anchors = json.dumps(
-            result_details["failure_anchors"],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        exit_code = result_details["exit_code"]
-        exit_code_text = "null" if exit_code is None else str(exit_code)
-        result_sha256 = result_details["result_sha256"] or "missing"
-        return (
-            "[Earlier duplicate tool interaction omitted for DashScope replay "
-            f"compatibility: tool={name}, arguments_sha256={_stable_json_hash(arguments)}, "
-            f"repeat_index={repeat_index}, workspace_epoch={workspace_epoch}, "
-            f"latest_workspace_epoch={latest_workspace_epoch}, "
-            f"result_is_error={str(result_details['result_is_error']).lower()}, "
-            f"exit_code={exit_code_text}, "
-            f"execution_reason={result_details['execution_reason']}, "
-            f"result_sha256={result_sha256}, result_chars={result_details['result_chars']}, "
-            f"failure_anchors={anchors}, result_preview="
-            f"{json.dumps(_preview_tool_result(tool_call_id), ensure_ascii=False)}]"
-        )
-
-    result_messages_by_id = {
-        message["tool_call_id"]: message
-        for message in messages
-        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
-    }
-    tool_name_by_id: dict[str, str] = {}
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_call_id = tool_call.get("id")
-            function = tool_call.get("function")
-            name = function.get("name") if isinstance(function, dict) else None
-            if isinstance(tool_call_id, str) and isinstance(name, str):
-                tool_name_by_id[tool_call_id] = name
-
-    occurrences: list[dict[str, Any]] = []
-    seen: dict[tuple[str, str], int] = {}
-    workspace_epoch = 0
-    for message_index, message in enumerate(messages):
-        if message.get("role") == "tool":
-            tool_call_id = message.get("tool_call_id")
-            if (
-                isinstance(tool_call_id, str)
-                and tool_name_by_id.get(tool_call_id) in _DASHSCOPE_WORKSPACE_MUTATION_TOOLS
-                and _provider_result_details(tool_call_id)["result_is_error"] is not True
-            ):
-                workspace_epoch += 1
-            continue
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                continue
-            name = function.get("name")
-            arguments = function.get("arguments")
-            if not isinstance(name, str) or not isinstance(arguments, str):
-                continue
-            try:
-                parsed_arguments = json.loads(arguments) if arguments else {}
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed_arguments, dict):
-                continue
-            canonical_arguments = json.dumps(
-                parsed_arguments,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            key = (name, canonical_arguments)
-            repeat_index = seen.get(key, 0)
-            seen[key] = repeat_index + 1
-            occurrences.append(
-                {
-                    "key": key,
-                    "message_index": message_index,
-                    "tool_call": tool_call,
-                    "tool_call_id": tool_call.get("id"),
-                    "tool": name,
-                    "arguments": parsed_arguments,
-                    "repeat_index": repeat_index,
-                    "workspace_epoch": workspace_epoch,
-                }
-            )
-
-    if not occurrences:
-        return
-
-    last_occurrence_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for occurrence in occurrences:
-        last_occurrence_by_key[occurrence["key"]] = occurrence
-
-    omitted_summaries_by_id: dict[str, str] = {}
-    for occurrence in occurrences:
-        if last_occurrence_by_key.get(occurrence["key"]) is occurrence:
-            continue
-        tool_call_id = occurrence.get("tool_call_id")
-        if not isinstance(tool_call_id, str) or not tool_call_id:
-            continue
-        omitted_summaries_by_id[tool_call_id] = _summary_for_omitted_duplicate(
-            name=str(occurrence["tool"]),
-            arguments=cast(dict[str, Any], occurrence["arguments"]),
-            repeat_index=int(occurrence["repeat_index"]),
-            tool_call_id=tool_call_id,
-            workspace_epoch=int(occurrence["workspace_epoch"]),
-            latest_workspace_epoch=int(
-                last_occurrence_by_key[occurrence["key"]].get("workspace_epoch", 0)
-            ),
-        )
-
-    if not omitted_summaries_by_id:
-        return
-
-    rewritten: list[dict[str, Any]] = []
-    for message in messages:
-        if message.get("role") == "tool" and message.get("tool_call_id") in omitted_summaries_by_id:
-            continue
-        tool_calls = message.get("tool_calls")
-        if message.get("role") != "assistant" or not isinstance(tool_calls, list):
-            rewritten.append(message)
-            continue
-
-        kept_calls: list[dict[str, Any]] = []
-        summaries: list[str] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                kept_calls.append(tool_call)
-                continue
-            tool_call_id = tool_call.get("id")
-            if isinstance(tool_call_id, str) and tool_call_id in omitted_summaries_by_id:
-                summaries.append(omitted_summaries_by_id[tool_call_id])
-            else:
-                kept_calls.append(tool_call)
-        if not summaries:
-            rewritten.append(message)
-            continue
-
-        summary_text = "\n".join(summaries)
-        if kept_calls:
-            next_message = dict(message)
-            next_message["tool_calls"] = kept_calls
-            existing_content = next_message.get("content")
-            next_message["content"] = (
-                f"{existing_content}\n{summary_text}"
-                if isinstance(existing_content, str) and existing_content
-                else summary_text
-            )
-            rewritten.append(next_message)
-        else:
-            rewritten.append({"role": "assistant", "content": summary_text})
-    messages[:] = rewritten
 
 
 def _stable_json_hash(value: Any) -> str:
@@ -3014,8 +2725,10 @@ def _build_openai_messages(
     per tool result, while opensquilla packs multiple tool results into a single
     Message.
 
-    Invariant: tool_result blocks never coexist with text/image blocks in the
-    same Message (agent.py always packs tool results into a dedicated message).
+    Tool results normally arrive in a dedicated message.  The autonomous
+    document loop may additionally place a screenshot image in that message;
+    it is emitted as a trailing user image message because OpenAI-compatible
+    APIs accept only text in a ``role=tool`` payload.
     """
     if isinstance(msg.content, str):
         return [
@@ -3068,8 +2781,14 @@ def _build_openai_messages(
                 }
             )
 
-    # Tool results → one message per result (OpenAI requirement)
+    # Tool results → one message per result (OpenAI requirement).  A browser
+    # screenshot is carried as a separate user image message because the
+    # Chat Completions API accepts only text in a ``role=tool`` payload; doing
+    # this here preserves the tool-call/result pairing while still giving a
+    # vision-capable model the pixels.
     if tool_results:
+        if parts:
+            tool_results.append({"role": "user", "content": parts})
         return tool_results
 
     # Assistant message with tool_calls (preserve text alongside calls)

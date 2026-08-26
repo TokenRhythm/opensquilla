@@ -29,19 +29,27 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from opensquilla.private_paths import apply_windows_private_dacl, create_windows_private_directory
+from opensquilla.private_paths import (
+    _WindowsPrivateDaclVerificationError,
+    apply_windows_private_dacl,
+    create_windows_private_directory,
+)
 
 log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 0.01
+_POSIX_EMPTY_CONFIRMATIONS_REQUIRED = 2
 _CONTROL_READY_TIMEOUT_SECONDS = 2.0
+_WINDOWS_FROZEN_READY_TIMEOUT_SECONDS = 5.0
+_WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS = 0.25
+_WINDOWS_FROZEN_READY_ATTEMPTS = 2
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
@@ -66,11 +74,51 @@ _OWNER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _OWNER_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OWNER_IDENTITY_MAX_CHARS = 256
 _OWNER_DATABASE_TIMEOUT_SECONDS = 5.0
+_OWNER_DATABASE_INSERT_TIMEOUT_SECONDS = 0.5
+_OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18, 0.35, 0.7, 1.0)
 _OWNER_DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 _POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
 _DARWIN_PROC_PIDTBSDINFO = 3
+
+
+def _process_tree_child_argv(*args: str) -> tuple[str, ...]:
+    """Build the source or frozen argv for one process-tree helper."""
+
+    prefix = (
+        (sys.executable, "--internal-child", "process-tree")
+        if getattr(sys, "frozen", False)
+        else (sys.executable, "-m", "opensquilla.process_tree")
+    )
+    return (*prefix, *args)
+
+
+def _wait_for_windows_helper_ready(gate: Any) -> None:
+    """Wait longer, once more, for a cold frozen helper to become ready."""
+
+    frozen = bool(getattr(sys, "frozen", False))
+    timeout = (
+        _WINDOWS_FROZEN_READY_TIMEOUT_SECONDS
+        if frozen
+        else _CONTROL_READY_TIMEOUT_SECONDS
+    )
+    attempts = _WINDOWS_FROZEN_READY_ATTEMPTS if frozen else 1
+    for attempt in range(attempts):
+        try:
+            gate.wait_ready(timeout)
+            return
+        except TimeoutError:
+            if attempt + 1 >= attempts:
+                raise
+            log.warning(
+                "windows_process_tree_helper_ready_retry",
+                extra={
+                    "attempt": attempt + 1,
+                    "timeout_seconds": timeout,
+                },
+            )
+            time.sleep(_WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -369,7 +417,7 @@ def _prepare_private_file_once(path: Path) -> None:
                     != (int(metadata.st_dev), int(metadata.st_ino))
                 )
             ):
-                raise ProcessTreeOwnershipError(
+                raise _OwnerRegistryFileChangedError(
                     "task process owner registry changed during privacy hardening"
                 )
         else:
@@ -387,6 +435,21 @@ def _prepare_private_file(path: Path) -> None:
         try:
             _prepare_private_file_once(path)
             return
+        except _OwnerRegistryFileChangedError:
+            if os.name != "nt" or delay is None:
+                raise
+            time.sleep(delay)
+        except _WindowsPrivateDaclVerificationError:
+            if os.name != "nt" or delay is None:
+                raise
+            time.sleep(delay)
+        except FileNotFoundError:
+            # Another first writer can remove a file it just created when its
+            # own privacy hardening fails. Re-open the create-or-verify race;
+            # a path that stays absent still fails closed after the bound.
+            if os.name != "nt" or delay is None:
+                raise
+            time.sleep(delay)
         except PermissionError as exc:
             if (
                 os.name != "nt"
@@ -415,6 +478,15 @@ def _prepare_existing_private_file(path: Path) -> None:
                         expected_device=int(metadata.st_dev),
                         expected_inode=int(metadata.st_ino),
                     )
+                except _WindowsPrivateDaclVerificationError:
+                    # Another writer can be setting the same ephemeral
+                    # rollback journal DACL concurrently. Retry the exact
+                    # set-then-verify mismatch; other same-object ACL errors
+                    # remain fatal below.
+                    if delay is None:
+                        raise
+                    time.sleep(delay)
+                    continue
                 except OSError as exc:
                     # The sidecar can be replaced between the initial lstat
                     # and the Windows bound-handle open.  Retry only when a
@@ -486,17 +558,22 @@ def _prepare_owner_database_paths(path: Path) -> None:
             _prepare_existing_private_file(sidecar)
 
 
-def _connect_owner_database(path: Path) -> sqlite3.Connection:
+def _connect_owner_database(
+    path: Path,
+    *,
+    timeout_seconds: float = _OWNER_DATABASE_TIMEOUT_SECONDS,
+) -> sqlite3.Connection:
     _prepare_owner_database_paths(path)
     connection = sqlite3.connect(
         f"{path.as_uri()}?mode=rwc&nofollow=1",
-        timeout=_OWNER_DATABASE_TIMEOUT_SECONDS,
+        timeout=timeout_seconds,
         isolation_level=None,
         uri=True,
     )
     try:
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 5000")
+        busy_timeout_ms = max(1, int(timeout_seconds * 1000))
+        connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         connection.execute("PRAGMA journal_mode = DELETE")
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute(
@@ -963,6 +1040,29 @@ def _valid_owner_record(record: _PersistedOwnerRecord) -> bool:
     )
 
 
+def _is_transient_owner_registry_write_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            _OwnerRegistryFileChangedError,
+            _WindowsPrivateDaclVerificationError,
+            FileNotFoundError,
+        ),
+    ):
+        return os.name == "nt"
+    if isinstance(exc, sqlite3.Error):
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(error_code, int):
+            return error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        message = str(exc).lower()
+        return "database is locked" in message or "database table is locked" in message
+    return (
+        os.name == "nt"
+        and isinstance(exc, PermissionError)
+        and getattr(exc, "winerror", None) in _WINDOWS_TRANSIENT_FILE_ERRORS
+    )
+
+
 def _insert_owner_record(
     scope: _TaskProcessScope,
     *,
@@ -988,33 +1088,41 @@ def _insert_owner_record(
     if not _valid_owner_record(record):
         raise ProcessTreeOwnershipError("task process ownership record was invalid")
     path = _owner_database_path(scope.state_dir)
-    try:
-        with _connect_owner_database(path) as connection:
-            connection.execute(
-                """
-                INSERT INTO task_process_owners (
-                    owner_id, schema_version, session_digest, task_digest,
-                    parent_session_digest, parent_task_digest, platform,
-                    controller_pid, controller_start_identity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.owner_id,
-                    _OWNER_SCHEMA_VERSION,
-                    record.session_digest,
-                    record.task_digest,
-                    record.parent_session_digest,
-                    record.parent_task_digest,
-                    record.platform,
-                    record.controller_pid,
-                    record.controller_start_identity,
-                ),
-            )
-    except (OSError, sqlite3.Error) as exc:
-        raise ProcessTreeOwnershipError(
-            "task process ownership could not be persisted before launch"
-        ) from exc
-    return _PersistedOwnerRef(database_path=path, record=record)
+    for delay in (*_OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS, None):
+        try:
+            with _connect_owner_database(
+                path,
+                timeout_seconds=_OWNER_DATABASE_INSERT_TIMEOUT_SECONDS,
+            ) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO task_process_owners (
+                        owner_id, schema_version, session_digest, task_digest,
+                        parent_session_digest, parent_task_digest, platform,
+                        controller_pid, controller_start_identity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.owner_id,
+                        _OWNER_SCHEMA_VERSION,
+                        record.session_digest,
+                        record.task_digest,
+                        record.parent_session_digest,
+                        record.parent_task_digest,
+                        record.platform,
+                        record.controller_pid,
+                        record.controller_start_identity,
+                    ),
+                )
+            return _PersistedOwnerRef(database_path=path, record=record)
+        except (OSError, sqlite3.Error, _OwnerRegistryFileChangedError) as exc:
+            if delay is None or not _is_transient_owner_registry_write_error(exc):
+                raise ProcessTreeOwnershipError(
+                    "task process ownership could not be persisted before launch"
+                ) from exc
+            time.sleep(delay)
+
+    raise AssertionError("owner database insert retry loop did not terminate")
 
 
 def _delete_owner_record(reference: _PersistedOwnerRef) -> None:
@@ -1156,6 +1264,10 @@ def _load_owner_records(state_dir: str | Path) -> tuple[_PersistedOwnerRef, ...]
 
 class ProcessTreeOwnershipError(RuntimeError):
     """Raised when a platform cannot safely own a requested process tree."""
+
+
+class _OwnerRegistryFileChangedError(ProcessTreeOwnershipError):
+    """The main registry file changed during one bounded hardening attempt."""
 
 
 class _OwnerRegistrySidecarChangedError(ProcessTreeOwnershipError):
@@ -1862,12 +1974,11 @@ async def _create_posix_anchor(
     if control_path is not None:
         _prepare_private_directory(control_path.parent)
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "opensquilla.process_tree",
-        "--posix-group-anchor",
-        owner_id,
-        *(str(control_path) if control_path is not None else "-",),
+        *_process_tree_child_argv(
+            "--posix-group-anchor",
+            owner_id,
+            *(str(control_path) if control_path is not None else "-",),
+        ),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -2015,14 +2126,13 @@ async def _create_owned_posix_subprocess(
             status_write_fd,
         )
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "opensquilla.process_tree",
-            "--posix-owned-launch",
-            str(gate.read_fd),
-            str(status_write_fd),
-            "--",
-            *argv,
+            *_process_tree_child_argv(
+                "--posix-owned-launch",
+                str(gate.read_fd),
+                str(status_write_fd),
+                "--",
+                *argv,
+            ),
             **child_kwargs,
         )
         gate.close_child_end()
@@ -2102,10 +2212,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
         )
         child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-        helper_argv = (
-            sys.executable,
-            "-m",
-            "opensquilla.process_tree",
+        helper_argv = _process_tree_child_argv(
             "--windows-owned-launch",
             gate.gate_name,
             gate.ready_name,
@@ -2121,8 +2228,8 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             )
             job.assign_pid(int(windows_process.pid))
             await asyncio.to_thread(
-                gate.wait_ready,
-                _CONTROL_READY_TIMEOUT_SECONDS,
+                _wait_for_windows_helper_ready,
+                gate,
             )
             if task_scope is not None:
                 persisted_owner = _insert_owner_record(
@@ -2196,22 +2303,19 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
     )
     child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-    helper_argv = [
-        sys.executable,
-        "-m",
-        "opensquilla.process_tree",
+    helper_argv = _process_tree_child_argv(
         "--windows-owned-launch",
         gate.gate_name,
         gate.ready_name,
         "--",
         *argv,
-    ]
+    )
     process: Any | None = None
     persisted_owner: _PersistedOwnerRef | None = None
     try:
         process = subprocess.Popen(helper_argv, **child_kwargs)
         job.assign_pid(int(process.pid))
-        gate.wait_ready(_CONTROL_READY_TIMEOUT_SECONDS)
+        _wait_for_windows_helper_ready(gate)
         if task_scope is not None:
             persisted_owner = _insert_owner_record(
                 task_scope,
@@ -2274,7 +2378,8 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
                 # Numeric /proc entries routinely disappear between listdir
                 # and open as unrelated processes exit. The anchor's own stat
                 # is mandatory; other vanished or malformed entries cannot be
-                # members of the final live snapshot.
+                # members of the final live snapshot. Consecutive empty
+                # confirmation below protects same-group fork/exit handoffs.
                 if int(name) == pgid:
                     return None
                 continue
@@ -2312,6 +2417,18 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
     if not members or pgid not in members:
         return None
     return tuple(members)
+
+
+def _advance_posix_empty_confirmation(
+    previous: int,
+    members: tuple[int, ...] | None,
+    own_pid: int,
+    *,
+    captured_alive: bool,
+) -> int:
+    if members == (own_pid,) and not captured_alive:
+        return previous + 1
+    return 0
 
 
 def _run_posix_group_anchor(control_path_raw: str) -> int:
@@ -2396,14 +2513,19 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
         stdin_open = True
         poll_delay = _POLL_INTERVAL_SECONDS
         poll_cap = 0.25 if os.path.isdir("/proc") else 1.0
+        empty_confirmations = 0
         while True:
             members = _posix_group_members(pgid)
-            if (
-                members is not None
-                and len(members) == 1
-                and members[0] == own_pid
-                and not _captured_posix_processes_alive(captured)
-            ):
+            captured_alive = members == (own_pid,) and _captured_posix_processes_alive(
+                captured
+            )
+            empty_confirmations = _advance_posix_empty_confirmation(
+                empty_confirmations,
+                members,
+                own_pid,
+                captured_alive=captured_alive,
+            )
+            if empty_confirmations >= _POSIX_EMPTY_CONFIRMATIONS_REQUIRED:
                 try:
                     sys.stdout.buffer.write(_POSIX_ANCHOR_EMPTY)
                     sys.stdout.buffer.flush()
@@ -2838,8 +2960,10 @@ async def reconcile_persisted_processes(state_dir: str | Path | None) -> int:
     return await _terminate_owner_records(records)
 
 
-def _main() -> int:
-    args = sys.argv[1:]
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one fixed process-tree helper mode."""
+
+    args = list(sys.argv[1:] if argv is None else argv)
     if (
         len(args) == 3
         and args[0] == "--posix-group-anchor"
@@ -2877,10 +3001,11 @@ __all__ = [
     "create_owned_popen",
     "create_owned_subprocess_exec",
     "create_owned_subprocess_shell",
+    "main",
     "reconcile_persisted_processes",
     "task_process_scope",
 ]
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    raise SystemExit(main())

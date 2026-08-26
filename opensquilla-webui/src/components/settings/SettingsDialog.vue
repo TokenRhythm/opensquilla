@@ -126,7 +126,6 @@
             <SetupProviderPanel
               v-if="section === 'provider'"
               :panel="providerPanel"
-              :preset="presetPanel"
               :dirty="providerDraftDirty"
               :saving="saveAllPending || providerSavePending"
               @update-provider-selected="selectProvider"
@@ -138,7 +137,6 @@
               @refresh-models="refreshProviderModels"
               @save-provider="saveProvider"
               @cancel-provider-edit="cancelProviderEdit"
-              @apply-preset="applyProviderPreset"
               @copy="copyCommand"
               @go-to-section="selectSection"
               @select-configured-provider="requestSelectConfiguredProvider"
@@ -275,7 +273,6 @@ const {
   privacyPanel,
   memoryPanel,
   modelStrategyPanel,
-  presetPanel,
   capabilitiesPanel,
   configPath,
   selectInitialSection,
@@ -313,7 +310,6 @@ const {
   setEnsembleMinSuccessful,
   setEnsembleAllFailedPolicy,
   setEnsembleProposerMaxRetries,
-  applyProviderPreset,
   updateProviderField,
   updateLlmTimeout,
   updateContextWindow,

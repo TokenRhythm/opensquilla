@@ -43,10 +43,6 @@ jobs:
       source_planner_digest: ${{ steps.verify.outputs.source_planner_digest }}
       source_suite_execution_digests: ${{ steps.verify.outputs.source_suite_execution_digests }}
       combined_smoke_suites: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
-      nightly_healthy: ${{ steps.verify.outputs.nightly_healthy || 'false' }}
-      nightly_reason: ${{ steps.verify.outputs.nightly_reason }}
-      nightly_run_id: ${{ steps.verify.outputs.nightly_run_id }}
-      nightly_age_seconds: ${{ steps.verify.outputs.nightly_age_seconds }}
     steps:
       - name: Validate optimization mode
         id: mode
@@ -98,10 +94,6 @@ jobs:
           QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
           QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
           COMBINED_SMOKE_SUITES: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
-          NIGHTLY_HEALTHY: ${{ steps.verify.outputs.nightly_healthy || 'false' }}
-          NIGHTLY_REASON: ${{ steps.verify.outputs.nightly_reason }}
-          NIGHTLY_RUN_ID: ${{ steps.verify.outputs.nightly_run_id }}
-          NIGHTLY_AGE_SECONDS: ${{ steps.verify.outputs.nightly_age_seconds }}
         shell: bash
         run: |
           {
@@ -114,7 +106,6 @@ jobs:
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
-            echo "- Nightly health: \`${NIGHTLY_HEALTHY}\` (${NIGHTLY_REASON}; run \`${NIGHTLY_RUN_ID}\`, age \`${NIGHTLY_AGE_SECONDS}s\`)"
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
@@ -122,66 +113,38 @@ jobs:
               echo "- Decision: \`attestation_reuse\`"
             fi
             if [[ "${CI_OPTIMIZATION_MODE}" == "shadow" && "${REUSABLE}" == "true" ]]; then
-              echo "- Shadow decision: evidence matched, but the classifier-selected queue matrix still runs."
+              echo "- Shadow decision: evidence matched, but the full fail-closed queue matrix still runs."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  classify-changes:
-    name: Classify changed files
+  plan-ci:
+    name: Plan CI suites
     needs: queue-attestation
     if: >-
       ${{ always()
           && (github.event_name != 'merge_group'
               || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce'
+              || needs.queue-attestation.result != 'success'
               || needs.queue-attestation.outputs.reusable != 'true')
           && (github.event_name != 'push'
               || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      docs_only: ${{ steps.classify.outputs.docs_only }}
-      runtime_changed: ${{ steps.classify.outputs.runtime_changed }}
-      test_changed: ${{ steps.classify.outputs.test_changed }}
-      ci_changed: ${{ steps.classify.outputs.ci_changed }}
-      dependency_changed: ${{ steps.classify.outputs.dependency_changed }}
-      release_changed: ${{ steps.classify.outputs.release_changed }}
-      windows_full_required: ${{ steps.classify.outputs.windows_full_required }}
-      frontend_changed: ${{ steps.classify.outputs.frontend_changed }}
-      tui_changed: ${{ steps.classify.outputs.tui_changed }}
-      desktop_changed: ${{ steps.classify.outputs.desktop_changed }}
-      python_changed: ${{ steps.classify.outputs.python_changed }}
-      python_full_required: ${{ steps.classify.outputs.python_full_required }}
-      platform_sensitive_changed: ${{ steps.classify.outputs.platform_sensitive_changed }}
-      build_wheel_required: ${{ steps.classify.outputs.build_wheel_required }}
-      toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
-      full_required: ${{ steps.classify.outputs.full_required }}
-      pytest_targets: ${{ steps.classify.outputs.pytest_targets }}
-      nightly_healthy: ${{ steps.nightly.outputs.healthy || 'true' }}
-      nightly_reason: ${{ steps.nightly.outputs.reason }}
       required_suites: ${{ steps.plan.outputs.required_suites }}
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
       python_matrix: ${{ steps.plan.outputs.python_matrix }}
       platform_matrix: ${{ steps.plan.outputs.platform_matrix }}
       python_targets: ${{ steps.plan.outputs.python_targets }}
-      planner_full_fallback: ${{ steps.plan.outputs.full_fallback }}
-      planner_digest: ${{ steps.plan.outputs.plan_digest }}
+      full_fallback: ${{ steps.plan.outputs.full_fallback }}
+      reason_codes: ${{ steps.plan.outputs.reason_codes }}
+      plan_digest: ${{ steps.plan.outputs.plan_digest }}
       suite_execution_digests: ${{ steps.plan.outputs.suite_execution_digests }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Verify fresh full-nightly health
-        id: nightly
-        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .github/scripts/ci_attestation.py verify-nightly-health
-          --repository "${GITHUB_REPOSITORY}"
-          --api-url "${GITHUB_API_URL}"
-          --github-output "${GITHUB_OUTPUT}"
 
       - name: List changed files
         shell: bash
@@ -197,24 +160,18 @@ jobs:
               ;;
           esac
 
-          if [[ ("${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group") \
-                && "${CI_OPTIMIZATION_MODE}" != "legacy" \
-                && "${{ steps.nightly.outputs.healthy || 'false' }}" != "true" ]]; then
-            echo "Fresh full-nightly evidence is unavailable; running the full fail-closed matrix." >&2
-            printf '.ci/run-all\n' > "${changed_files}"
-          else
-            case "${{ github.event_name }}" in
+          case "${{ github.event_name }}" in
             pull_request)
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
               else
-                git diff --name-only \
+                git diff --no-renames --name-only \
                   "${{ github.event.pull_request.base.sha }}" \
                   "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
               fi
               ;;
             merge_group)
-              # Reaching the classifier means the queue fast-path proof was
+              # Reaching the planner means the queue fast-path proof was
               # unavailable or rejected. Do not turn an evidence failure into
               # a weaker targeted queue run: every such path is fail-closed.
               echo "Queue evidence was unavailable; running the full fail-closed matrix." >&2
@@ -224,7 +181,7 @@ jobs:
               before="${{ github.event.before }}"
               after="${{ github.event.after }}"
               if [[ -n "${before}" && "${before}" != "0000000000000000000000000000000000000000" ]]; then
-                git diff --name-only "${before}" "${after}" > "${changed_files}"
+                git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"
               else
                 printf '.ci/run-all\n' > "${changed_files}"
               fi
@@ -232,17 +189,11 @@ jobs:
             *)
               printf '.ci/run-all\n' > "${changed_files}"
               ;;
-            esac
-          fi
+          esac
 
           echo "Changed files:"
           sed 's/^/  /' "${changed_files}"
           printf 'CHANGED_FILES=%s\n' "${changed_files}" >> "${GITHUB_ENV}"
-
-      - name: Classify changed files
-        id: classify
-        shell: bash
-        run: bash .github/scripts/classify-ci-changes.sh "${CHANGED_FILES}"
 
       - name: Build canonical suite plan
         id: plan
@@ -264,6 +215,7 @@ jobs:
                   "platform_matrix",
                   "python_targets",
                   "full_fallback",
+                  "reason_codes",
                   "plan_digest",
                   "suite_execution_digests",
               ):
@@ -277,26 +229,51 @@ jobs:
                   handle.write(f"{key}={value}\n")
           PY
 
-      - name: Summarize merge-group fallback decision
-        if: ${{ github.event_name == 'merge_group' }}
+      - name: Summarize canonical CI plan
         env:
-          FULL_REQUIRED: ${{ steps.classify.outputs.full_required }}
+          REQUIRED_SUITES: ${{ steps.plan.outputs.required_suites }}
+          DESKTOP_MATRIX: ${{ steps.plan.outputs.desktop_matrix }}
+          PYTHON_MATRIX: ${{ steps.plan.outputs.python_matrix }}
+          PLATFORM_MATRIX: ${{ steps.plan.outputs.platform_matrix }}
+          FULL_FALLBACK: ${{ steps.plan.outputs.full_fallback }}
+          REASON_CODES: ${{ steps.plan.outputs.reason_codes }}
         shell: bash
         run: |
-          decision="queue_diff_targeted"
-          if [[ "${FULL_REQUIRED}" == "true" ]]; then
-            decision="full_fail_closed"
-          fi
+          python3 - <<'PY' >> "${GITHUB_STEP_SUMMARY}"
+          import json
+          import os
+
+          required_suites = json.loads(os.environ["REQUIRED_SUITES"])
+          desktop_matrix = json.loads(os.environ["DESKTOP_MATRIX"])
+          python_matrix = json.loads(os.environ["PYTHON_MATRIX"])
+          platform_matrix = json.loads(os.environ["PLATFORM_MATRIX"])
+          reason_codes = json.loads(os.environ["REASON_CODES"])
+          decision = "full_fallback" if os.environ["FULL_FALLBACK"] == "true" else "targeted"
+
+          print("## Canonical CI plan")
+          print()
+          print(f"- Decision: `{decision}`")
+          print(f"- Reason codes: `{json.dumps(reason_codes, separators=(',', ':'))}`")
+          print(f"- Required suites: `{json.dumps(required_suites, separators=(',', ':'))}`")
+          print(f"- Python matrix: `{json.dumps(python_matrix, separators=(',', ':'))}`")
+          print(f"- Desktop matrix: `{json.dumps(desktop_matrix, separators=(',', ':'))}`")
+          print(f"- Suite cells: `{len(platform_matrix)}`")
+          PY
+
+      - name: Summarize merge-group fallback decision
+        if: ${{ github.event_name == 'merge_group' }}
+        shell: bash
+        run: |
           {
             echo "## Merge queue fallback"
             echo
-            echo "- Decision: \`${decision}\`"
+            echo "- Decision: \`full_fail_closed\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   workflow-lint:
     name: Validate GitHub Actions workflows
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'workflow-lint') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -316,10 +293,10 @@ jobs:
 
   frontend-artifact:
     name: Frontend artifact producer
-    needs: classify-changes
+    needs: plan-ci
     # This job owns the generated package input. Source-only Python tests stay
     # parallel; only packaging/browser/desktop consumers wait for this artifact.
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'frontend') }}
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-artifact') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -376,8 +353,13 @@ jobs:
 
   frontend-check:
     name: Frontend tests and package validation
-    needs: [classify-changes, frontend-artifact]
-    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' }}
+    needs: [plan-ci, frontend-artifact]
+    if: >-
+      ${{ always()
+          && needs.plan-ci.result == 'success'
+          && needs.frontend-artifact.result == 'success'
+          && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation')
+              || contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -391,6 +373,7 @@ jobs:
           path: src/opensquilla/gateway/static/dist/
 
       - name: Set up Node.js
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -398,33 +381,34 @@ jobs:
           cache-dependency-path: opensquilla-webui/package-lock.json
 
       - name: Install frontend dependencies
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui
         run: npm ci
 
       - name: Run frontend type checks
-        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui
         run: npm run typecheck
 
       - name: Run frontend unit tests
-        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui
         run: npm run test:unit
 
       - name: Set up Python
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Verify sdist-to-wheel frontend artifact round trip
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.planner_full_fallback == 'true' }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         shell: bash
         run: |
           package_dir="${RUNNER_TEMP}/webui-package"
@@ -459,8 +443,8 @@ jobs:
 
   webui-chat-recovery:
     name: WebUI chat recovery
-    needs: [classify-changes, frontend-artifact]
-    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'webui-chat-recovery') }}
+    needs: [plan-ci, frontend-artifact]
+    if: ${{ always() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -551,8 +535,8 @@ jobs:
 
   tui-check:
     name: OpenTUI package tests
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'tui') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'tui') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -597,8 +581,8 @@ jobs:
 
   desktop-check:
     name: Desktop Electron unit tests
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'desktop-static') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-static') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -628,6 +612,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          node scripts/test-installer-progress-contract.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
@@ -650,8 +635,8 @@ jobs:
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && (contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-targeted') || contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full')) }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-targeted') || contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -665,7 +650,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          lfs: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
+          lfs: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
 
       - name: Configure runtime directories
         shell: bash
@@ -696,10 +681,10 @@ jobs:
         run: uv run mypy src/opensquilla --show-error-codes
 
       - name: Test targeted PR suite
-        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-targeted') && !contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-targeted') && !contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
         shell: bash
         env:
-          TARGETED_PYTEST_TARGETS: ${{ needs.classify-changes.outputs.python_targets }}
+          TARGETED_PYTEST_TARGETS: ${{ needs.plan-ci.outputs.python_targets }}
         run: |
           set -euo pipefail
           markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
@@ -713,12 +698,12 @@ jobs:
               if [[ "${target}" == *'*'* || "${target}" == *'?'* || "${target}" == *'['* ]]; then
                 mapfile -t matched_targets < <(compgen -G "${target}" || true)
                 if [[ "${#matched_targets[@]}" -eq 0 ]]; then
-                  echo "ERROR: classifier pattern matched no pytest targets: ${target}" >&2
+                  echo "ERROR: planner pattern matched no pytest targets: ${target}" >&2
                   exit 2
                 fi
                 pytest_targets+=("${matched_targets[@]}")
               elif [[ ! -e "${target}" ]]; then
-                echo "ERROR: classifier selected a missing pytest target: ${target}" >&2
+                echo "ERROR: planner selected a missing pytest target: ${target}" >&2
                 exit 2
               else
                 pytest_targets+=("${target}")
@@ -732,7 +717,7 @@ jobs:
             -q -m "${markers}" --durations=50
 
       - name: Test Docker build-context exclusions in full CI
-        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
         shell: bash
         run: uv run pytest tests/test_ci/test_dockerignore_context.py -q
 
@@ -748,22 +733,16 @@ jobs:
             fi
           done
 
-      - name: tracemalloc leak smoke test
-        if: ${{ contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
-        shell: bash
-        run: |
-          uv run python -m pytest tests/test_gateway/test_task_runtime_terminal_cleanup.py::test_no_leak_under_load -v
-
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'python-full') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.classify-changes.outputs.python_matrix).ubuntu }}
+        shard: ${{ fromJSON(needs.plan-ci.outputs.python_matrix).ubuntu }}
 
     env:
       UV_PYTHON: "3.12"
@@ -811,14 +790,29 @@ jobs:
           set -euo pipefail
           markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
+          worker_args=()
+          if [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+            # Gateway tests start subprocesses and touch shared SQLite/logging
+            # state.  Match the bounded Windows shard fan-out instead of
+            # letting the Ubuntu default start four competing workers.
+            worker_args+=(--workers=2)
+          fi
+          maxfail_args=()
+          if [[ "${{ github.event_name }}" == "pull_request" ||
+                "${{ github.event_name }}" == "merge_group" ]]; then
+            maxfail_args+=(--maxfail=3)
+          fi
+
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
+            "${worker_args[@]}" \
             -- \
             -q \
             -m "${markers}" \
             --durations=50 \
+            "${maxfail_args[@]}" \
             2>&1 | tee "${CI_REPORT_DIR}/pytest.log"
 
       - name: Upload Ubuntu full shard report
@@ -830,64 +824,16 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  windows-compat:
-    name: Windows compatibility smoke (3.12)
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'windows-compat') }}
-    runs-on: windows-latest
-    timeout-minutes: 20
-
-    env:
-      UV_PYTHON: "3.12"
-      PYTHONPATH: ${{ github.workspace }}
-      OPENSQUILLA_TURN_CALL_LOG: "0"
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Configure runtime directories
-        shell: bash
-        run: |
-          printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-          printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        shell: bash
-        run: uv sync --extra dev --extra recommended --extra mcp --frozen
-
-      - name: Test Windows compatibility smoke
-        shell: bash
-        run: |
-          uv run pytest \
-            tests/test_artifacts.py \
-            tests/test_contrib/test_codetask \
-            tests/test_desktop/test_electron_startup_contract.py \
-            tests/test_engine/test_coding_mode.py \
-            tests/test_engine/test_stream_wrappers.py \
-            tests/test_tools/test_shell_process_isolation.py \
-            -q
-
   windows-full:
     name: Windows high-risk (${{ matrix.shard }})
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'windows-high-risk') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk') }}
     runs-on: windows-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.classify-changes.outputs.python_matrix).windows }}
+        shard: ${{ fromJSON(needs.plan-ci.outputs.python_matrix).windows }}
 
     env:
       UV_PYTHON: "3.12"
@@ -1013,11 +959,12 @@ jobs:
 
           worker_args=()
           if [[ "${{ matrix.shard }}" == "recovery-migration" ||
-                "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
-            # These shards start Windows ``spawn`` children and gateway
-            # subprocesses from several tests.  Keep the other shards at four
-            # workers, but leave headroom for those process-start handshakes
-            # instead of changing their bounded readiness/timing assertions.
+                "${{ matrix.shard }}" == "gateway-sqlite" ||
+                "${{ matrix.shard }}" == "desktop-installer-contracts" ]]; then
+            # These shards start Windows ``spawn`` children, Node/Electron
+            # processes, or gateways from several tests.  Leave runner
+            # headroom for those process-start handshakes instead of changing
+            # their bounded readiness/timing assertions.
             worker_args+=(--workers=2)
           fi
 
@@ -1059,8 +1006,8 @@ jobs:
 
   macos-recovery:
     name: macOS profile recovery and native no-replace (3.12)
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'macos-recovery') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'macos-recovery') }}
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -1142,18 +1089,16 @@ jobs:
           retention-days: 14
 
   desktop-recovery-e2e:
-    # Windows hosted runners can retain Chromium network resources briefly
-    # after a heavy Electron test process exits.  Run the independent recovery
-    # groups on fresh Windows runners so an earlier test cannot starve a later
-    # one of local socket buffers. Linux and macOS retain the full serial
-    # contract, which is useful for their native recovery coverage.
+    # Every matrix cell gets a fresh hosted runner.  Keep ownership and the
+    # heavier workbench cell separate on both Windows and macOS so process,
+    # native-focus, and local-socket state cannot leak across those domains.
     name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
-    needs: [classify-changes, frontend-artifact]
-    if: ${{ always() && needs.classify-changes.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'desktop-recovery-e2e') }}
+    needs: [plan-ci, frontend-artifact]
+    if: ${{ always() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e') }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.classify-changes.outputs.desktop_matrix) }}
+        include: ${{ fromJSON(needs.plan-ci.outputs.desktop_matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -1162,7 +1107,17 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+      # Electron's postinstall download is otherwise repeated on every fresh
+      # hosted runner. Keep it beside the Playwright cache so a cold macOS
+      # worker cannot spend the case watchdog budget downloading the binary.
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
       CI_E2E_SHARD: ${{ matrix.shard }}
+      # Keep merge-critical workbench coverage deterministic and bounded.
+      # Scheduled/manual runs retain the wider geometry/rearm stress cycles.
+      OPENSQUILLA_WORKBENCH_E2E_MODE: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'smoke' || 'stress' }}
+      # A hung Electron/gateway child must fail one case with diagnostics,
+      # rather than consuming the whole 45-minute matrix cell.
+      OPENSQUILLA_DESKTOP_CASE_TIMEOUT_MS: "900000"
 
     steps:
       - name: Prepare Desktop recovery report
@@ -1177,6 +1132,7 @@ jobs:
             printf 'runner_arch=%s\n' "${RUNNER_ARCH}"
             printf 'commit_sha=%s\n' "${GITHUB_SHA}"
             printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'workbench_e2e_mode=%s\n' "${OPENSQUILLA_WORKBENCH_E2E_MODE}"
           } > "${report_dir}/environment.txt"
           printf 'e2e_status=not_started\n' > "${report_dir}/first-failure.txt"
 
@@ -1212,6 +1168,13 @@ jobs:
         shell: bash
         run: node opensquilla-webui/scripts/verify-dist.mjs src/opensquilla/gateway/static/dist
 
+      - name: Restore Electron binary cache
+        id: electron-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ELECTRON_CACHE }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
+
       - name: Install Python dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
@@ -1220,6 +1183,13 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm ci
+
+      - name: Seed Electron binary cache from nightly main
+        if: ${{ github.event_name == 'schedule' && steps.electron-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ELECTRON_CACHE }}
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install WebUI recovery dependencies
         if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
@@ -1324,12 +1294,190 @@ jobs:
             fi
           }
 
-          is_retryable_windows_failure() {
-            local log_path="$1"
-            [[ "${RUNNER_OS}" == "Windows" ]] || return 1
-            grep -Fq 'Gateway did not become healthy' "${log_path}" \
-              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}" \
-              || grep -Fq 'Windows ACL hardening timed out' "${log_path}"
+          classify_retryable_infrastructure_failure() {
+            local name="$1"
+            local log_path="$2"
+            local classifications="${CI_REPORT_DIR}/retry-classifications.jsonl"
+            local evidence_dir="${CI_REPORT_DIR}/retry-evidence"
+            mkdir -p "${evidence_dir}"
+            python3 - "${name}" "${RUNNER_OS}" "${log_path}" "${classifications}" "${evidence_dir}" <<'PY'
+          import hashlib
+          import json
+          import re
+          import shutil
+          import sys
+          from pathlib import Path
+
+          case_name, runner_os, log_name, output_name, evidence_name = sys.argv[1:]
+          log_path = Path(log_name)
+          payload = log_path.read_bytes()
+          text = (
+              payload.decode("utf-8", errors="replace")
+              .replace("\r\n", "\n")
+              .replace("\r", "\n")
+          )
+
+          # Retry only a single case for narrowly identified hosted-runner
+          # handoff/input failures.  Generic timeouts, connection failures,
+          # crashes, assertion errors, and product output mismatches are not
+          # retryable.  Case + OS binding prevents a coincidental message in
+          # another functional assertion from matching.
+          rules = (
+              {
+                  "id": "windows-delete-helper-handoff-timeout-v1",
+                  "os": "Windows",
+                  "cases": {"desktop-cleanup-flow"},
+                  "pattern": re.compile(
+                      r"^Error: Timed out waiting for post-exit delete-all helper completion\."
+                      r"; pending synthetic targets: .+$",
+                      re.MULTILINE,
+                  ),
+                  "companion_patterns": (),
+              },
+              {
+                  "id": "windows-isolated-acl-worker-timeout-v1",
+                  "os": "Windows",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^(?:(?:E\s+)|(?:FAILED\s+\S+\s+-\s+))?"
+                      r"AssertionError: isolated Windows ACL hardening timed out: .+$",
+                      re.MULTILINE,
+                  ),
+                  # pytest can print the same allowed exception once in its
+                  # traceback and again in the short failure summary.  Remove
+                  # only the structural traceback header; any unrelated
+                  # terminal exception inside that traceback remains visible
+                  # to the residual-failure scan below.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^\s*Traceback \(most recent call last\):\s*$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+              {
+                  "id": "macos-electron-foreground-prerequisite-v1",
+                  "os": "macOS",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^(?:(?:Error: )?electronApplication\.evaluate: Error: |Error: )"
+                      r"ELECTRON_FOREGROUND_PREREQUISITE_MISSING: .+$",
+                      re.MULTILINE,
+                  ),
+                  # The outer offline-workbench runner reports the native
+                  # subprocess exit after streaming the structured inner
+                  # exception.  It is part of that same exception stack, not
+                  # a second failure, and is bound to the exact child script.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^Error: .*test-native-workbench-v2-electron\.mjs "
+                          r"failed with exit code 1$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+          )
+          hard_failure_markers = (
+              (
+                  "trusted-overlay-focus-contract-failed-v1",
+                  "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED:",
+              ),
+              (
+                  "trusted-overlay-input-contract-failed-v1",
+                  "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED:",
+              ),
+              ("desktop-e2e-phase-timeout-v1", "DESKTOP_E2E_PHASE_TIMEOUT:"),
+              ("desktop-e2e-phase-failed-v1", "DESKTOP_E2E_PHASE_FAILED:"),
+              ("desktop-e2e-process-exited-v1", "DESKTOP_E2E_PROCESS_EXITED:"),
+          )
+          generic_failure_markers = (
+              (
+                  "generic-assertion-error-v1",
+                  re.compile(
+                      r"^\s*(?:E\s+)?AssertionError(?:\s*[:(]|\s*$)",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "generic-error-or-exception-v1",
+                  re.compile(
+                      r"^\s*(?:E\s+)?(?!AssertionError\s*:)(?:Error|Exception|"
+                      r"[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*:",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "python-traceback-v1",
+                  re.compile(
+                      r"^\s*Traceback \(most recent call last\):\s*$",
+                      re.MULTILINE,
+                  ),
+              ),
+              (
+                  "fatal-crash-process-exit-v1",
+                  re.compile(
+                      r"^(?:\s*(?:FATAL(?: ERROR)?|PANIC)\s*:|"
+                      r".*\b(?:Segmentation fault|core dumped)\b.*|"
+                      r".*\b(?:process|command)\b.*\b(?:crashed|exited unexpectedly|"
+                      r"failed with exit code|exited with (?:code|signal))\b.*)$",
+                      re.IGNORECASE | re.MULTILINE,
+                  ),
+              ),
+          )
+          matched_rules = [
+              rule
+              for rule in rules
+              if rule["os"] == runner_os
+              and case_name in rule["cases"]
+              and rule["pattern"].search(text) is not None
+          ]
+          matches = [rule["id"] for rule in matched_rules]
+
+          # Remove every occurrence of the one permitted terminal exception,
+          # including duplicate summaries and narrowly bound outer wrappers.
+          # Any other terminal failure left in the combined case log blocks
+          # the retry, even when a permitted signature also occurred.
+          residual = text
+          for rule in matched_rules:
+              residual = rule["pattern"].sub("", residual)
+              for companion_pattern in rule["companion_patterns"]:
+                  residual = companion_pattern.sub("", residual)
+
+          blocked_markers = {
+              marker_id
+              for marker_id, marker_text in hard_failure_markers
+              if marker_text in text
+          }
+          generic_residual = residual
+          for _, marker_text in hard_failure_markers:
+              generic_residual = re.sub(
+                  rf"^.*{re.escape(marker_text)}.*$",
+                  "",
+                  generic_residual,
+                  flags=re.MULTILINE,
+              )
+          blocked_markers.update(
+              marker_id
+              for marker_id, marker_pattern in generic_failure_markers
+              if marker_pattern.search(generic_residual) is not None
+          )
+          retryable = len(matches) == 1 and not blocked_markers
+          record = {
+              "schema_version": 1,
+              "case": case_name,
+              "os": runner_os,
+              "attempt": 1,
+              "classification": matches[0] if retryable else "non_retryable",
+              "retryable": retryable,
+              "blocked_markers": sorted(blocked_markers),
+              "log_sha256": hashlib.sha256(payload).hexdigest(),
+          }
+          with Path(output_name).open("a", encoding="utf-8") as handle:
+              handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+          if retryable:
+              shutil.copy2(log_path, Path(evidence_name) / log_path.name)
+          raise SystemExit(0 if retryable else 1)
+          PY
           }
 
           case "${{ matrix.shard }}" in
@@ -1407,9 +1555,10 @@ jobs:
 
             first_log="${CI_REPORT_DIR}/${name}-attempt-1.log"
             printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
-            if is_retryable_windows_failure "${first_log}"
+            if classify_retryable_infrastructure_failure "${name}" "${first_log}"
             then
-              printf 'retry_case=%s\n' "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
+              printf 'retry_case=%s\nretry_reason=classified_hosted_runner_infrastructure\n' \
+                "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
               if run_case "${name}" "${script}" 2; then
                 continue
               fi
@@ -1427,6 +1576,8 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/environment.txt
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
           if-no-files-found: error
           retention-days: 14
 
@@ -1439,10 +1590,82 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  skill-hub:
+    name: skill-hub-contract (${{ matrix.os }})
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'skill-hub') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install test dependencies
+        run: uv sync --extra dev --extra recommended --frozen
+
+      - name: Run offline Community Skill contracts
+        shell: bash
+        env:
+          OPENSQUILLA_STATE_DIR: ${{ runner.temp }}/opensquilla-skill-hub-state
+          OPENSQUILLA_LOG_DIR: ${{ runner.temp }}/opensquilla-skill-hub-logs
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          uv run pytest \
+            tests/test_skills_manifest.py \
+            tests/test_skills_bundled_baseline.py \
+            tests/test_skills_hot_reload.py \
+            tests/test_skills_default_prompt_contract.py \
+            tests/test_skills_loader_namespaces.py \
+            tests/test_skills_tree.py \
+            tests/test_skills_hub_archive.py \
+            tests/test_skills_hub_clawhub.py \
+            tests/test_skills_hub_github.py \
+            tests/test_skills_hub_router.py \
+            tests/test_skills_hub_source.py \
+            tests/test_skills_hub_installer_security.py \
+            tests/test_skills_hub_lockfile_contract.py \
+            tests/test_skills_hub_doctor.py \
+            tests/test_skills_hash_consumers.py \
+            tests/test_skills/test_hub_management_service.py \
+            tests/test_skills/test_hub_scanner.py \
+            tests/test_skills/test_hub_transaction_recovery.py \
+            tests/test_skills/test_hub_transaction_process_gates.py \
+            tests/test_gateway/test_rpc_skills_install_visibility.py \
+            tests/test_gateway/test_rpc_skills_exact_identity.py \
+            tests/test_gateway/test_rpc_skills_coding_gate.py \
+            tests/test_gateway/test_rpc_skills_reload.py \
+            tests/test_gateway/test_skill_management_service_injection.py \
+            tests/test_tools/test_skill_view_resources.py \
+            tests/test_scripts/test_bench_skill_integrity.py \
+            tests/test_cli/test_cli_product_completeness.py \
+            tests/test_cli/test_skills_doctor_cmd.py \
+            tests/test_cli/test_skills_gateway_fallback.py \
+            tests/test_cli/test_skills_search_cmd.py \
+            tests/test_engine/turn_runner/test_provider_and_tools_stage_unit.py \
+            -m "not live_skill_hub" \
+            --strict-markers \
+            -q
+
   release-packaging:
     name: Release packaging contracts
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'release-packaging') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'release-packaging') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -1485,8 +1708,8 @@ jobs:
 
   readme-locale-check:
     name: README locale parity
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'readme-locale') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1504,8 +1727,8 @@ jobs:
 
   managed-toolchain-artifacts:
     name: Managed Toolchain Artifact E2E
-    needs: classify-changes
-    if: ${{ always() && needs.classify-changes.result == 'success' && contains(fromJSON(needs.classify-changes.outputs.required_suites), 'managed-toolchain') }}
+    needs: plan-ci
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'managed-toolchain') }}
     uses: ./.github/workflows/managed-toolchain-artifacts.yml
 
   main-canary:
@@ -1594,7 +1817,7 @@ jobs:
     name: CI result
     needs:
       - queue-attestation
-      - classify-changes
+      - plan-ci
       - workflow-lint
       - readme-locale-check
       - frontend-artifact
@@ -1604,10 +1827,10 @@ jobs:
       - desktop-check
       - ubuntu-quality
       - ubuntu-full
-      - windows-compat
       - windows-full
       - macos-recovery
       - desktop-recovery-e2e
+      - skill-hub
       - release-packaging
       - managed-toolchain-artifacts
       - main-canary
@@ -1619,6 +1842,7 @@ jobs:
         if: >-
           ${{ (github.event_name == 'merge_group'
                && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+               && needs.queue-attestation.result == 'success'
                && needs.queue-attestation.outputs.reusable == 'true')
               || (github.event_name == 'push'
                   && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce') }}
@@ -1660,6 +1884,7 @@ jobs:
         if: >-
           ${{ !((github.event_name == 'merge_group'
                  && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+                 && needs.queue-attestation.result == 'success'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
                     && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
@@ -1671,67 +1896,59 @@ jobs:
         if: >-
           ${{ !((github.event_name == 'merge_group'
                  && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
+                 && needs.queue-attestation.result == 'success'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
                     && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
         env:
-          RESULT_CLASSIFY: ${{ needs.classify-changes.result }}
+          RESULT_PLANNER: ${{ needs.plan-ci.result }}
           RESULT_WORKFLOW_LINT: ${{ needs.workflow-lint.result }}
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
+          RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}
           RESULT_UBUNTU_FULL: ${{ needs.ubuntu-full.result }}
-          RESULT_WINDOWS_SMOKE: ${{ needs.windows-compat.result }}
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
+          RESULT_SKILL_HUB: ${{ needs.skill-hub.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
           RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
-          REQUIRED_SUITES: ${{ needs.classify-changes.outputs.required_suites }}
-          FLAG_DOCS_ONLY: ${{ needs.classify-changes.outputs.docs_only }}
-          FLAG_RUNTIME_CHANGED: ${{ needs.classify-changes.outputs.runtime_changed }}
-          FLAG_TEST_CHANGED: ${{ needs.classify-changes.outputs.test_changed }}
-          FLAG_CI_CHANGED: ${{ needs.classify-changes.outputs.ci_changed }}
-          FLAG_DEPENDENCY_CHANGED: ${{ needs.classify-changes.outputs.dependency_changed }}
-          FLAG_RELEASE_CHANGED: ${{ needs.classify-changes.outputs.release_changed }}
-          FLAG_WINDOWS_FULL_REQUIRED: ${{ needs.classify-changes.outputs.windows_full_required }}
-          FLAG_FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
-          FLAG_TUI_CHANGED: ${{ needs.classify-changes.outputs.tui_changed }}
-          FLAG_DESKTOP_CHANGED: ${{ needs.classify-changes.outputs.desktop_changed }}
-          FLAG_PYTHON_CHANGED: ${{ needs.classify-changes.outputs.python_changed }}
-          FLAG_PYTHON_FULL_REQUIRED: ${{ needs.classify-changes.outputs.python_full_required }}
-          FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
-          FLAG_BUILD_WHEEL_REQUIRED: ${{ needs.classify-changes.outputs.build_wheel_required }}
-          FLAG_TOOLCHAIN_ARTIFACT_CHANGED: ${{ needs.classify-changes.outputs.toolchain_artifact_changed }}
-          FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
+          REQUIRED_SUITES: ${{ needs.plan-ci.outputs.required_suites }}
         run: python .github/scripts/check_ci_results.py
 
       - name: Create trusted CI evidence v2
         id: attestation
-        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        if: >-
+          ${{ env.CI_OPTIMIZATION_MODE != 'legacy'
+              && (github.event_name == 'pull_request'
+                  || (github.event_name == 'merge_group'
+                      && !(env.CI_OPTIMIZATION_MODE == 'enforce'
+                           && needs.queue-attestation.result == 'success'
+                           && needs.queue-attestation.outputs.reusable == 'true'))) }}
         env:
-          QUEUE_REUSABLE: ${{ needs.queue-attestation.outputs.reusable }}
-          SOURCE_RUN_ID: ${{ needs.queue-attestation.outputs.source_run_id }}
-          SOURCE_ROOT_ISSUED_AT: ${{ needs.queue-attestation.outputs.source_root_issued_at }}
-          SOURCE_LINEAGE: ${{ needs.queue-attestation.outputs.source_lineage }}
-          SOURCE_SUCCESSFUL_SUITES: ${{ needs.queue-attestation.outputs.source_successful_suites }}
-          SOURCE_PLANNER_DIGEST: ${{ needs.queue-attestation.outputs.source_planner_digest }}
-          SOURCE_SUITE_EXECUTION_DIGESTS: ${{ needs.queue-attestation.outputs.source_suite_execution_digests }}
+          PLANNED_SUCCESSFUL_SUITES: ${{ needs.plan-ci.outputs.required_suites }}
+          PLANNED_PLANNER_DIGEST: ${{ needs.plan-ci.outputs.plan_digest }}
+          PLANNED_SUITE_EXECUTION_DIGESTS: ${{ needs.plan-ci.outputs.suite_execution_digests }}
+          PLANNED_PLATFORM_MATRIX: ${{ needs.plan-ci.outputs.platform_matrix }}
+          PLANNED_FULL_FALLBACK: ${{ needs.plan-ci.outputs.full_fallback }}
         shell: bash
         run: |
           set -euo pipefail
-          source_args=()
-          if [[ "${GITHUB_EVENT_NAME}" == "merge_group" \
-                && "${CI_OPTIMIZATION_MODE}" == "enforce" \
-                && "${QUEUE_REUSABLE}" == "true" ]]; then
-            source_args=(
-              --source-run-id "${SOURCE_RUN_ID}"
-              --source-root-issued-at "${SOURCE_ROOT_ISSUED_AT}"
-              --source-lineage "${SOURCE_LINEAGE}"
-            )
+          if [[ -z "${PLANNED_SUCCESSFUL_SUITES}" \
+                || -z "${PLANNED_PLANNER_DIGEST}" \
+                || -z "${PLANNED_SUITE_EXECUTION_DIGESTS}" \
+                || -z "${PLANNED_PLATFORM_MATRIX}" \
+                || -z "${PLANNED_FULL_FALLBACK}" ]]; then
+            echo "ERROR: planner evidence metadata is incomplete." >&2
+            exit 2
+          fi
+          plan_basis="change_set"
+          if [[ "${PLANNED_FULL_FALLBACK}" == "true" ]]; then
+            plan_basis="full_fallback"
           fi
           python3 .github/scripts/ci_attestation.py create \
             --repository "${GITHUB_REPOSITORY}" \
@@ -1742,10 +1959,14 @@ jobs:
             --optimization-mode "${CI_OPTIMIZATION_MODE}" \
             --output "${RUNNER_TEMP}/ci-attestation.json" \
             --github-output "${GITHUB_OUTPUT}" \
-            "${source_args[@]}"
+            --successful-suites "${PLANNED_SUCCESSFUL_SUITES}" \
+            --planner-digest "${PLANNED_PLANNER_DIGEST}" \
+            --suite-execution-digests "${PLANNED_SUITE_EXECUTION_DIGESTS}" \
+            --platform-matrix "${PLANNED_PLATFORM_MATRIX}" \
+            --plan-basis "${plan_basis}"
 
       - name: Upload tree-indexed CI evidence v2
-        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        if: ${{ steps.attestation.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-evidence-v2-tree-${{ steps.attestation.outputs.tree_sha }}
@@ -1755,7 +1976,7 @@ jobs:
           overwrite: true
 
       - name: Upload PR-head-indexed CI evidence v2
-        if: ${{ github.event_name == 'pull_request' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        if: ${{ github.event_name == 'pull_request' && steps.attestation.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-evidence-v2-pr-${{ steps.attestation.outputs.pull_request_number }}-${{ steps.attestation.outputs.head_sha }}

@@ -30,6 +30,19 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain("? 'workbench-annotation-mode-status'")
   })
 
+  it('marks the annotation action as beta without changing its accessible label', () => {
+    expect(appWorkbenchSource).toContain(
+      "v-if=\"toolbarItem.id === 'toggle-annotation-mode'\"",
+    )
+    expect(appWorkbenchSource).toContain('class="app-workbench__action-beta"')
+    expect(appWorkbenchSource).toMatch(
+      /app-workbench__action-beta[\s\S]*aria-hidden="true"[\s\S]*>\s*β\s*<\/span>/,
+    )
+    expect(appWorkbenchSource).toMatch(
+      /\.app-workbench__action-beta\s*\{[\s\S]*font-size: 7px;[\s\S]*opacity: 0\.58;/,
+    )
+  })
+
   it('uses the workbench container width and preserves fixed-size toolbar actions', () => {
     expect(appWorkbenchSource).toContain('@container (max-width: 520px)')
     expect(appWorkbenchSource).toMatch(
@@ -59,6 +72,48 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain("type: 'artifact-head-changed'")
     expect(appWorkbenchSource).toContain(
       'refreshOpenArtifactDocuments(sessionKey)',
+    )
+  })
+
+  it('routes source.patched invalidations through resource and preview refresh', () => {
+    const start = appWorkbenchSource.indexOf('function onArtifactState(')
+    const end = appWorkbenchSource.indexOf('\nfunction promptAnnotationItem(', start)
+    const source = appWorkbenchSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('workbenchResources.load(activeSessionKey, true)')
+    expect(source).toContain('refreshResourceCollectionItem(activeSessionKey)')
+    expect(source).toContain('void refreshArtifactDocumentItem(item)')
+    // Artifact actions, including source.patched, share one content-free
+    // invalidation path; filtering by action here would leave Preview stale.
+    expect(source).not.toContain('event.action')
+    expect(appWorkbenchSource).toContain(
+      "rpc.on('session.event.artifact_state', onArtifactState)",
+    )
+  })
+
+  it('matches annotation acceptance across provisional and canonical session keys', () => {
+    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationsAccepted')
+    const end = appWorkbenchSource.indexOf('\nasync function beforeCloseItem', start)
+    const source = appWorkbenchSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('promptAnnotationAcceptanceQueue.enqueue(detail)')
+    expect(source).toContain('schedulePromptAnnotationAcceptanceFlush()')
+    expect(appWorkbenchSource).toContain(
+      'const stopPromptAnnotationLifecycle = store.onLifecycle',
+    )
+    expect(appWorkbenchSource).toContain(
+      "const artifactItems = store.items.filter(item => item.kind === 'artifact-preview')",
+    )
+    expect(appWorkbenchSource).toContain(
+      'if (!runtimeManager.hasRuntime(item.id)) return false',
+    )
+    expect(appWorkbenchSource).toContain(
+      "!Object.prototype.hasOwnProperty.call(state, 'annotationMode')",
+    )
+    expect(appWorkbenchSource).not.toContain(
+      'for (let attempt = 0; attempt < 3; attempt += 1)',
     )
   })
 
@@ -111,7 +166,7 @@ describe('AppWorkbench annotation mode status', () => {
     ) || []
 
     expect(appWorkbenchSource).toContain('function artifactPreviewItemForExplicitOpen(')
-    expect(explicitOpenCalls).toHaveLength(3)
+    expect(explicitOpenCalls).toHaveLength(2)
     expect(appWorkbenchSource).not.toContain('let artifactSectionRequestId')
   })
 

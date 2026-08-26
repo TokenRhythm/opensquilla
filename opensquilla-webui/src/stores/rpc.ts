@@ -6,6 +6,8 @@ import {
   type RpcConnectionWaitOptions,
   type RpcEventHandler,
 } from '@/lib/rpc'
+import type { DesktopGatewayConnection } from '@/platform/types'
+import { getPlatform } from '@/platform'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -84,6 +86,9 @@ export const useRpcStore = defineStore('rpc', () => {
   const events = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
+  let desktopConnectionRevision = -1
+  let desktopConnectionKey = ''
+  let desktopAuthToken = ''
 
   const isConnected = computed(() => state.value === 'connected')
   const isConnecting = computed(() => state.value === 'connecting')
@@ -103,6 +108,57 @@ export const useRpcStore = defineStore('rpc', () => {
     canManageProjectWorkspaces.value
     && supportsMethod('workspaces.open'))
 
+  function clearConnectionIdentity(): void {
+    policy.value = null
+    auth.value = null
+    methods.value = []
+    events.value = []
+    unavailableMethods.value = new Set()
+  }
+
+  function applyDesktopConnection(payload: DesktopGatewayConnection): void {
+    if (
+      !payload
+      || payload.schemaVersion !== 1
+      || !Number.isInteger(payload.revision)
+      || payload.revision < desktopConnectionRevision
+    ) return
+
+    desktopConnectionRevision = payload.revision
+    const nextUrl = typeof payload.wsUrl === 'string' ? payload.wsUrl.trim() : ''
+    const nextInstance = typeof payload.instanceId === 'string' ? payload.instanceId : ''
+    if (payload.status !== 'ready' || !nextUrl || !nextInstance) {
+      desktopConnectionKey = ''
+      if (desktopAuthToken) {
+        try {
+          if (sessionStorage.getItem(WS_TOKEN_KEY) === desktopAuthToken) {
+            sessionStorage.removeItem(WS_TOKEN_KEY)
+          }
+        } catch {}
+        desktopAuthToken = ''
+      }
+      error.value = payload.error || null
+      if (client.value?.state !== 'disconnected') client.value?.disconnect()
+      clearConnectionIdentity()
+      return
+    }
+
+    const nextKey = `${nextInstance}\0${nextUrl}`
+    if (nextKey === desktopConnectionKey) return
+    const nextAuthToken = typeof payload.authToken === 'string'
+      ? payload.authToken.trim()
+      : ''
+    desktopConnectionKey = nextKey
+    if (nextAuthToken) {
+      desktopAuthToken = nextAuthToken
+      try { sessionStorage.setItem(WS_TOKEN_KEY, nextAuthToken) } catch {}
+    }
+    error.value = null
+    if (client.value?.state !== 'disconnected') client.value?.disconnect()
+    clearConnectionIdentity()
+    client.value?.connect(nextUrl, nextAuthToken || loadConnectionSettings().token || undefined)
+  }
+
   function init() {
     const rpc = new RpcClient()
     client.value = rpc
@@ -110,11 +166,7 @@ export const useRpcStore = defineStore('rpc', () => {
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
       state.value = s
       if (s !== 'connected') {
-        policy.value = null
-        auth.value = null
-        methods.value = []
-        events.value = []
-        unavailableMethods.value = new Set()
+        clearConnectionIdentity()
       }
     })
 
@@ -138,7 +190,19 @@ export const useRpcStore = defineStore('rpc', () => {
       console.warn('[RPC] Sequence gap detected:', detail)
     })
 
-    // Auto-connect on init. Desktop shells use the local gateway serving this UI.
+    const gatewayPlatform = getPlatform().gateway
+    if (
+      typeof gatewayPlatform.getConnection === 'function'
+      && typeof gatewayPlatform.onConnection === 'function'
+    ) {
+      gatewayPlatform.onConnection(applyDesktopConnection)
+      void gatewayPlatform.getConnection().then(applyDesktopConnection).catch((reason) => {
+        error.value = reason instanceof Error ? reason.message : String(reason)
+      })
+      return
+    }
+
+    // Browser Control UI keeps its same-origin bootstrap and optional link token.
     consumeLinkTokenFromUrl()
     const { url, token } = loadConnectionSettings()
     if (rpc.state === 'disconnected') {
@@ -171,12 +235,9 @@ export const useRpcStore = defineStore('rpc', () => {
 
   function disconnect() {
     client.value?.disconnect()
+    desktopConnectionKey = ''
     state.value = 'disconnected'
-    policy.value = null
-    auth.value = null
-    methods.value = []
-    events.value = []
-    unavailableMethods.value = new Set()
+    clearConnectionIdentity()
   }
 
   function supportsMethod(method: string): boolean {

@@ -148,14 +148,19 @@ def _build_ollama_messages(
             tool_messages.append(tool_message)
 
     out: list[dict[str, Any]] = []
+    main: dict[str, Any] | None = None
     if text_parts or tool_calls or images:
-        main: dict[str, Any] = {"role": msg.role, "content": " ".join(text_parts)}
+        main = {"role": msg.role, "content": " ".join(text_parts)}
         if tool_calls:
             main["tool_calls"] = tool_calls
         if images:
             main["images"] = images
-        out.append(main)
+    # Tool results must immediately follow the assistant call.  If the same
+    # logical message also carries a screenshot, send the pixels in a trailing
+    # user message rather than attaching them to the ``role=tool`` payload.
     out.extend(tool_messages)
+    if main is not None:
+        out.append(main)
     return out
 
 
