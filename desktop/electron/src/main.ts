@@ -13239,6 +13239,22 @@ async function performOnboardingSave(
       ))
     }
 
+    // Validate credential-backed providers before entering writer admission:
+    // a rejected draft must never reach credential/config persistence. Keep
+    // keyless providers such as Ollama on their existing local-first path.
+    const provider = PROVIDER_BY_ID.get(normalizeProvider(payload.provider))
+    if (provider?.requiresApiKey) {
+      try {
+        const probe = await probeOnboardingProvider(payload)
+        if (!probe.ok) {
+          throw new Error(probe.message || 'Configuration verification failed.')
+        }
+      } catch (error) {
+        if (flow.state === 'saving') flow.state = 'editing'
+        throw error
+      }
+    }
+
     let finishWriter: (() => void) | null = null
     try {
       finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
