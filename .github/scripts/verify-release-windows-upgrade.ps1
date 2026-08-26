@@ -24,6 +24,7 @@ $userData = Join-Path $appData 'OpenSquilla'
 $profile = Join-Path $userData 'opensquilla'
 $probe = Join-Path $PWD '.github\scripts\verify-release-profile-preservation.py'
 $updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-update-banner.mjs'
+$sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
 $realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
 $realUpdateResult = Join-Path $sandbox 'real-update-result.json'
 $externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
@@ -179,6 +180,17 @@ try {
   Start-Sleep -Seconds 8
   if ($launched.HasExited) {
     throw "Candidate Desktop exited during launch verification: $($launched.ExitCode)"
+  }
+  Stop-InstalledProcesses
+
+  & node $sessionRecoverySmoke `
+    --executable $app `
+    --user-data-dir $userData `
+    --session-key 'agent:main:webchat:release-recovery-long-session' `
+    --switch-session-key 'agent:main:webchat:release-recovery-switch-session' `
+    --label $Label
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Candidate packaged session ownership smoke failed.'
   }
   Stop-InstalledProcesses
 

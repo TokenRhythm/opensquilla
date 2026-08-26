@@ -946,4 +946,37 @@ describe('useChatSessionBootstrap', () => {
     expect(loadHistory).toHaveBeenCalledOnce()
     expect(api.historyPhase.value).toBe('ready')
   })
+
+  it('defers connection recovery instead of restarting the source during handoff', async () => {
+    const { api, subscribeSession } = createBootstrap()
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
+
+    api.setSessionHandoffTarget('agent:main:webchat:target', 1)
+    const disconnected = api.handleConnectionState('disconnected')
+    const connected = api.handleConnectionState('connected')
+
+    expect(disconnected?.deferred).toBe(true)
+    expect(connected?.deferred).toBe(true)
+    expect(subscribeSession).toHaveBeenCalledOnce()
+
+    const resumed = api.setSessionHandoffTarget(null, 1)
+    await resumed?.live
+
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(api.livePhase.value).toBe('ready')
+  })
+
+  it('discards stale transport transitions after the target bootstrap commits', async () => {
+    const { api, subscribeSession } = createBootstrap()
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
+
+    api.setSessionHandoffTarget('agent:main:webchat:target', 2)
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+
+    expect(api.setSessionHandoffTarget(null, 2, 'committed')).toBeUndefined()
+    expect(subscribeSession).toHaveBeenCalledOnce()
+  })
 })

@@ -89,6 +89,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "onboarding.status",
         "sandbox.run_mode.preference.get",
         "sessions.list",
+        "sessions.messages.hydrate",
         "usage.status",
         "workspaces.list",
     }

@@ -2551,6 +2551,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcConnectionState(state: string) {
     const stateGeneration = ++connectionStateGeneration
     const recovery = options.handleSessionConnectionState?.(state)
+    if (recovery?.deferred) {
+      // Navigation owns only the logical subscription epoch. While its target
+      // is unresolved, physical state changes must not restart source-session
+      // bootstrap, metadata, usage, or run-mode RPCs on a replacement socket.
+      return
+    }
     if (state === 'connected') {
       clearConnectionLostStatus()
       stream.hideThinkingIndicator()

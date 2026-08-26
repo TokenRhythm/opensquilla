@@ -2615,7 +2615,11 @@ async def test_disconnect_detaches_running_and_idle_goals_but_spectator_does_not
         unchanged = await stack.storage.get_goal(SOURCE_KEY)
         assert unchanged is not None and unchanged.status == "active"
 
-        await stack.service.on_subscription_lost(stack.context.conn_id, SOURCE_KEY)
+        stack.subscriptions.unsubscribe_messages(
+            stack.context.conn_id,
+            SOURCE_KEY,
+        )
+        await _wait_until(lambda: _authority_is_detached(stack.service))
         detached = await stack.storage.get_goal(SOURCE_KEY)
         assert detached is not None
         assert detached.status == "active"
@@ -2635,6 +2639,51 @@ async def test_disconnect_detaches_running_and_idle_goals_but_spectator_does_not
         assert restarted.status == "paused"
         assert restarted.pause_reason == "process_restart"
         assert stack.service._continuity_grants == {}
+
+
+@pytest.mark.asyncio
+async def test_stale_unsubscribe_listener_preserves_resubscribed_goal_authority(
+    tmp_path: Path,
+) -> None:
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-stale-unsubscribe-listener.sqlite",
+    ) as stack:
+        await _handle_goals_set(_set_params(), stack.context)
+        original_lease = stack.service._leases[SOURCE_KEY]
+        listener_started = asyncio.Event()
+        listener_finished = asyncio.Event()
+
+        async def delayed_listener(conn_id: str, session_key: str) -> None:
+            listener_started.set()
+            try:
+                await stack.service.on_subscription_lost(conn_id, session_key)
+            finally:
+                listener_finished.set()
+
+        stack.subscriptions.set_message_unsubscribe_listener(delayed_listener)
+        async with stack.service._lock(SOURCE_KEY):
+            stack.subscriptions.unsubscribe_messages(
+                stack.context.conn_id,
+                SOURCE_KEY,
+            )
+            await asyncio.wait_for(listener_started.wait(), timeout=1.0)
+            assert stack.context.conn_id not in (
+                stack.subscriptions.get_message_subscribers(SOURCE_KEY)
+            )
+            stack.subscriptions.subscribe_messages(
+                stack.context.conn_id,
+                SOURCE_KEY,
+            )
+
+        await asyncio.wait_for(listener_finished.wait(), timeout=1.0)
+
+        assert stack.subscriptions.get_message_subscribers(SOURCE_KEY) == {
+            stack.context.conn_id
+        }
+        assert stack.service._leases[SOURCE_KEY] == original_lease
+        assert stack.service._leases[SOURCE_KEY].owner_connection_id == (
+            stack.context.conn_id
+        )
 
 
 @pytest.mark.asyncio

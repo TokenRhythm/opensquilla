@@ -46,6 +46,7 @@ import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
 
 const props = defineProps<{
   state: ChatSessionRecoveryState
+  transportState?: 'disconnected' | 'connecting' | 'connected'
 }>()
 
 const emit = defineEmits<{
@@ -72,7 +73,11 @@ const title = computed(() => {
     case 'history-error':
       return t('chat.loadSessionFailed')
     case 'live-connecting':
-      return t('chat.liveConnecting')
+      return t(
+        props.transportState === 'connected'
+          ? 'chat.liveConnectingConnected'
+          : 'chat.gatewayReconnecting',
+      )
     case 'live-degraded':
       return t('chat.liveUnavailable')
     case 'session-missing':
@@ -90,11 +95,15 @@ const description = computed(() => {
     case 'live-connecting':
       return ''
     case 'live-degraded':
-      return t('chat.liveUnavailableDescription')
+      return t(
+        props.transportState === 'connected'
+          ? 'chat.liveUnavailableConnectedDescription'
+          : 'chat.liveUnavailableDescription',
+      )
     case 'session-missing':
       return ''
-  }
-})
+    }
+  })
 const action = computed(() => (
   props.state === 'live-degraded'
     ? t('chat.reconnectLive')

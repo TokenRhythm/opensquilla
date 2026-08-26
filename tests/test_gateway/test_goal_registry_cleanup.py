@@ -39,10 +39,13 @@ class _NoGoalStorage:
 
 class _SubscribedConnections:
     def __init__(self, conn_id: str) -> None:
-        self._conn_id = conn_id
+        self._subscribers = {conn_id}
 
     def get_message_subscribers(self, _session_key: str) -> set[str]:
-        return {self._conn_id}
+        return set(self._subscribers)
+
+    def clear(self) -> None:
+        self._subscribers.clear()
 
 
 async def _noop_turn_handler(_run: Any) -> None:
@@ -86,12 +89,13 @@ async def test_goal_registries_reclaim_after_one_thousand_idle_and_fence_operati
     storage = _NoGoalStorage(expected_sessions=len(session_keys))
     runtime = TaskRuntime(storage=storage, turn_handler=_noop_turn_handler)
     conn_id = "goal-registry-owner"
+    subscriptions = _SubscribedConnections(conn_id)
     service = GoalService(
         storage=storage,
         session_manager=SimpleNamespace(),
         task_runtime=runtime,
         event_emitter=None,
-        subscription_manager=_SubscribedConnections(conn_id),
+        subscription_manager=subscriptions,
         config=GoalConfig(),
     )
 
@@ -174,6 +178,7 @@ async def test_goal_registries_reclaim_after_one_thousand_idle_and_fence_operati
         )
     assert len(service._leases) == _SESSION_COUNT
 
+    subscriptions.clear()
     await asyncio.gather(
         *(service.on_subscription_lost(conn_id, session_key) for session_key in session_keys)
     )

@@ -120,7 +120,13 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
     listHandoffs: vi.fn(async () => [...handoffs.values()].map(record => (
       structuredClone(record)
     ))),
-    acceptHandoff: vi.fn(async (ownerRequestId, acceptedSessionKey) => {
+    acceptHandoff: vi.fn(async (
+      ownerRequestId,
+      acceptedSessionKey,
+      shouldAccept = () => true,
+      handoffSignal,
+    ) => {
+      if (!shouldAccept() || handoffSignal?.aborted) return null
       const existing = handoffs.get(ownerRequestId)
       if (!existing) throw new Error('missing handoff')
       const handoff = {
@@ -2056,6 +2062,274 @@ describe('useChatPendingQueue delivery state', () => {
     await reloaded.queue.hydratePendingQueue(reloaded.sessionKey.value)
     expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
     reloaded.queue.cleanup()
+  })
+
+  it('does not switch a pending queue after a delayed handoff is superseded', async () => {
+    const { records, wal } = memoryWal()
+    let releaseCommit: (() => void) | undefined
+    vi.mocked(wal.commitOrder!).mockImplementation(async (
+      _sessionKey,
+      orderedIds,
+      _expectedWalRevisions,
+    ) => {
+      await new Promise<void>(resolve => {
+        releaseCommit = resolve
+      })
+      const committed = orderedIds.map((pendingInputId, position) => {
+        const record = records.get(pendingInputId)!
+        const next = {
+          ...record,
+          position,
+          walRevision: (record.walRevision ?? 1) + 1,
+          updatedAt: Date.now(),
+        }
+        records.set(pendingInputId, structuredClone(next))
+        return next
+      })
+      return { records: committed }
+    })
+    const source = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    for (const text of ['A', 'B']) {
+      source.inputText.value = text
+      await source.queue.enqueuePendingInput(text)
+    }
+    await vi.waitFor(() => expect(source.queue.pendingQueue.value.every(item => (
+      item.pendingPersistenceState === 'local_only'
+    ))).toBe(true))
+    expect(source.queue.beginPendingReorder(1)).toBe(true)
+    expect(source.queue.reorderPendingItem(1, 0)).toBe(true)
+    const reorder = source.queue.endPendingReorder()
+    let current = true
+    const handoff = source.queue.switchPendingQueue(
+      'agent:main:webchat:B',
+      () => current,
+    )
+
+    current = false
+    await Promise.resolve()
+    expect(releaseCommit).toBeTypeOf('function')
+    releaseCommit?.()
+    await reorder
+    await handoff
+
+    expect(source.queue.pendingQueue.value.map(item => item.text)).toEqual(['B', 'A'])
+    source.queue.cleanup()
+  })
+
+  it('does not accept a durable response handoff after navigation supersedes it', async () => {
+    const sourceSessionKey = 'agent:main:webchat:test'
+    const targetSessionKey = 'agent:main:webchat:B'
+    const ownerRequestId = 'owner-superseded-before-accept'
+    const pendingInputId = 'pending-superseded-before-accept'
+    const record: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: sourceSessionKey,
+      clientRequestId: 'request-superseded-before-accept',
+      clientMessageId: 'message-superseded-before-accept',
+      text: 'remain with the source session',
+      attachments: [],
+      intent: null,
+      ownerRequestId,
+      state: 'saving',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { handoffs, records, wal } = memoryWal([record])
+    const handoff: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-superseded-before-accept',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: 'remain with the source session',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-superseded-before-accept',
+      },
+      composerText: 'remain with the source session',
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    handoffs.set(ownerRequestId, structuredClone(handoff))
+    let releaseList!: (records: ResponseHandoffWalRecord[]) => void
+    vi.mocked(wal.listHandoffs!).mockImplementationOnce(() => (
+      new Promise(resolve => { releaseList = resolve })
+    ))
+    const source = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    let current = true
+
+    const adoption = source.queue.adoptPendingQueue(
+      targetSessionKey,
+      ownerRequestId,
+      () => current,
+    )
+    await vi.waitFor(() => expect(releaseList).toBeTypeOf('function'))
+    current = false
+    releaseList([structuredClone(handoff)])
+    await adoption
+
+    expect(wal.acceptHandoff).not.toHaveBeenCalled()
+    expect(records.get(pendingInputId)).toMatchObject({
+      sessionKey: sourceSessionKey,
+      ownerRequestId,
+    })
+    expect(handoffs.get(ownerRequestId)).toMatchObject({ state: 'submitting' })
+    expect(handoffs.get(ownerRequestId)).not.toHaveProperty('acceptedSessionKey')
+    expect(source.queue.pendingQueue.value[0]).toMatchObject({
+      ownerSessionKey: sourceSessionKey,
+      ownerRequestId,
+    })
+    source.queue.cleanup()
+  })
+
+  it('preserves the source terminal drain when durable handoff persistence fails', async () => {
+    vi.useFakeTimers()
+    const ownerRequestId = 'owner-failed-handoff-drain'
+    const { handoffs, wal } = memoryWal()
+    handoffs.set(ownerRequestId, {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: 'agent:main:webchat:test',
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-failed-handoff-drain',
+      params: {
+        sessionKey: 'agent:main:webchat:test',
+        message: 'source item must still drain',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-failed-handoff-drain',
+      },
+      composerText: 'source item must still drain',
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    vi.mocked(wal.acceptHandoff!).mockRejectedValueOnce(new Error('IndexedDB failed'))
+    let blocked = true
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const source = makeQueue(
+      dispatchPendingItem,
+      () => blocked,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, supportsMethod: () => false },
+    )
+    try {
+      source.inputText.value = 'source item must still drain'
+      await source.queue.enqueuePendingInput(source.inputText.value)
+      source.queue.schedulePendingDrainAfterTerminal()
+
+      await expect(source.queue.adoptPendingQueue(
+        'agent:main:webchat:B',
+        ownerRequestId,
+      )).rejects.toThrow('IndexedDB failed')
+      await vi.advanceTimersByTimeAsync(50)
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+
+      blocked = false
+      source.queue.flushDeferredPendingDrain()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledWith(
+        expect.objectContaining({ text: 'source item must still drain' }),
+        'agent:main:webchat:test',
+      )
+    } finally {
+      source.queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('aborts a durable handoff transaction superseded after its writes are queued', async () => {
+    const sourceSessionKey = 'agent:main:webchat:test'
+    const targetSessionKey = 'agent:main:webchat:B'
+    const ownerRequestId = 'owner-superseded-during-transaction'
+    const pendingInputId = 'pending-superseded-during-transaction'
+    const record: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: sourceSessionKey,
+      clientRequestId: 'request-superseded-during-transaction',
+      clientMessageId: 'message-superseded-during-transaction',
+      text: 'keep the atomic transaction with A',
+      attachments: [],
+      intent: null,
+      ownerRequestId,
+      state: 'saving',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { handoffs, records, wal } = memoryWal([record])
+    handoffs.set(ownerRequestId, {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-superseded-during-transaction',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: record.text,
+        clientRequestId: ownerRequestId,
+        clientMessageId: record.clientMessageId,
+      },
+      composerText: record.text,
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    let writesQueued!: () => void
+    const queued = new Promise<void>(resolve => { writesQueued = resolve })
+    vi.mocked(wal.acceptHandoff!).mockImplementationOnce(async (
+      _owner,
+      _target,
+      shouldAccept = () => true,
+      handoffSignal,
+    ) => {
+      writesQueued()
+      return await new Promise(resolve => {
+        const abort = () => resolve(null)
+        if (!shouldAccept() || handoffSignal?.aborted) abort()
+        else handoffSignal?.addEventListener('abort', abort, { once: true })
+      })
+    })
+    const source = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    const controller = new AbortController()
+
+    const adoption = source.queue.adoptPendingQueue(
+      targetSessionKey,
+      ownerRequestId,
+      () => !controller.signal.aborted,
+      controller.signal,
+    )
+    await queued
+    controller.abort()
+    await adoption
+
+    expect(records.get(pendingInputId)).toMatchObject({
+      sessionKey: sourceSessionKey,
+      ownerRequestId,
+    })
+    expect(handoffs.get(ownerRequestId)).toMatchObject({ state: 'submitting' })
+    expect(source.queue.pendingQueue.value[0]).toMatchObject({
+      ownerSessionKey: sourceSessionKey,
+      ownerRequestId,
+    })
+    source.queue.cleanup()
   })
 
   it('commits a staged reorder through the batch RPC before releasing drain', async () => {

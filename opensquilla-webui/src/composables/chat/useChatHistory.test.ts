@@ -712,7 +712,7 @@ describe('useChatHistory canonical pagination', () => {
     )
   })
 
-  it('recycles a legacy serial Gateway when history is abandoned', async () => {
+  it('keeps legacy timeout recovery while making history cancellation local', async () => {
     const { api, rpc } = makeHistory(true, {
       concurrentHistoryReads: false,
     })
@@ -733,7 +733,7 @@ describe('useChatHistory canonical pagination', () => {
       expect.any(Object),
       expect.objectContaining({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       }),
     )
   })
@@ -3213,7 +3213,7 @@ describe('useChatHistory safe local-tail synchronization', () => {
       expect(rpc.call).toHaveBeenCalledTimes(3)
       expect(rpc.call.mock.calls[2]?.[2]).toMatchObject({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       })
       expect(messages.value.map(message => message.messageId)).toEqual([
         'user-a',
@@ -3287,7 +3287,7 @@ describe('useChatHistory safe local-tail synchronization', () => {
 
       expect(rpc.call.mock.calls[2]?.[2]).toMatchObject({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       })
       expect(messages.value.map(message => message.text)).toEqual([
         'm1',

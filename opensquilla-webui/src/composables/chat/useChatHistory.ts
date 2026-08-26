@@ -64,12 +64,15 @@ type RpcClient = {
 }
 
 function historyTerminationActions(rpc: RpcClient) {
-  const action = rpc.policy?.concurrent_history_reads === true
+  const timeoutAction = rpc.policy?.concurrent_history_reads === true
     ? 'reject' as const
     : 'reconnect' as const
   return {
-    timeoutAction: action,
-    abortAction: action,
+    // A request that was actually sent to a legacy serial Gateway may need a
+    // bounded reconnect to escape a stuck handler. Navigation cancellation is
+    // request-local and must never own the shared WebSocket lifecycle.
+    timeoutAction,
+    abortAction: 'reject' as const,
   }
 }
 
@@ -1027,9 +1030,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       await options.rpc.waitForConnection(
         phaseTimeoutMs(bootstrap, 'chat.history'),
         bootstrap.signal,
-        nonReconnecting
-          ? nonReconnectingHistoryActions()
-          : historyTerminationActions(options.rpc),
+        // Waiting has not enqueued a history handler. Let the transport-owned
+        // handshake watchdog decide whether this generation is unhealthy.
+        nonReconnectingHistoryActions(),
       )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {

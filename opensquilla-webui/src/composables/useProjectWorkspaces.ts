@@ -13,6 +13,7 @@ const workspaces = ref<ProjectWorkspaceItem[]>([])
 const isLoading = ref(false)
 const error = ref<string | null>(null)
 const hasLoaded = ref(false)
+let loadSequence = 0
 
 function normalizeWorkspace(value: unknown): ProjectWorkspaceItem | null {
   if (!value || typeof value !== 'object') return null
@@ -39,6 +40,7 @@ export function useProjectWorkspaces() {
   const rpc = useRpcStore()
 
   function resetWorkspaces() {
+    loadSequence += 1
     workspaces.value = []
     isLoading.value = false
     error.value = null
@@ -58,6 +60,7 @@ export function useProjectWorkspaces() {
       resetWorkspaces()
       return []
     }
+    const requestSequence = ++loadSequence
     isLoading.value = true
     error.value = null
     try {
@@ -68,16 +71,21 @@ export function useProjectWorkspaces() {
             callOptions,
           )
         : await rpc.call<ProjectWorkspacesResponse>('workspaces.list')
-      workspaces.value = (response?.workspaces || [])
+      const loadedWorkspaces = (response?.workspaces || [])
         .map(normalizeWorkspace)
         .filter((item): item is ProjectWorkspaceItem => item !== null)
-      hasLoaded.value = true
-      return workspaces.value
+      if (requestSequence === loadSequence) {
+        workspaces.value = loadedWorkspaces
+        hasLoaded.value = true
+      }
+      return loadedWorkspaces
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause)
+      if (requestSequence === loadSequence) {
+        error.value = cause instanceof Error ? cause.message : String(cause)
+      }
       throw cause
     } finally {
-      isLoading.value = false
+      if (requestSequence === loadSequence) isLoading.value = false
     }
   }
 

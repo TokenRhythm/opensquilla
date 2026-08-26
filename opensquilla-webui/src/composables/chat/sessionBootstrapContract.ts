@@ -95,18 +95,24 @@ export function phaseCallOptions(
   return {
     timeoutMs: phaseTimeoutMs(context, method, maximumMs),
     signal: context.signal,
+    // Keep the legacy timeout recovery until the negotiated Gateway policy
+    // proves a method runs outside the serialized dispatcher. Callers may
+    // safely downgrade a policy-advertised detached read to request-local.
     timeoutAction: 'reconnect',
-    // A locally-aborted request can still be executing in the Gateway's
-    // serialized dispatcher. Retiring that socket prevents the abandoned
-    // session from head-of-line blocking the next session's bootstrap.
-    abortAction: 'reconnect',
+    // Route/session ownership ends locally. The transport has an independent
+    // lifecycle and must never be recycled merely because a consumer moved on.
+    abortAction: 'reject',
   }
 }
 
 export function phaseConnectionWaitOptions(): RpcConnectionWaitOptions {
   return {
-    timeoutAction: 'reconnect',
-    abortAction: 'reconnect',
+    // The transport-owned challenge/Hello watchdogs now fence and recycle the
+    // exact generation. A session budget only owns its waiter, so it must not
+    // pre-empt a valid authentication attempt that may legitimately take up to
+    // the 45 second transport deadline.
+    timeoutAction: 'reject',
+    abortAction: 'reject',
   }
 }
 

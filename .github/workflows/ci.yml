@@ -529,6 +529,7 @@ jobs:
           composer-paste.spec.ts
           history-hydration.spec.ts
           session-created-card.spec.ts
+          session-switch-transport.spec.ts
           goal-mode.spec.ts
           queue-steer.spec.ts
           share.spec.ts

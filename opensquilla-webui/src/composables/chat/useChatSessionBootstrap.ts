@@ -60,6 +60,8 @@ export interface SessionBootstrapRun {
   criticalRequestsQueued: Promise<void>
   history: Promise<SessionPhaseResult>
   live: Promise<SessionSubscriptionOutcome>
+  /** Physical state was recorded during a logical handoff; no Session work ran. */
+  deferred?: boolean
 }
 
 export interface UseChatSessionBootstrapOptions {
@@ -114,6 +116,37 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   // for the next external disconnect. A terminal recovery stays terminal
   // across the RpcClient's background reconnect cycles until the user retries.
   let connectionRecoveryArmed = false
+  let pendingHandoff: { targetKey: string; epoch: number } | null = null
+  let deferredConnectionStates: Array<{
+    state: string
+    includeHistory: boolean
+  }> = []
+
+  function setSessionHandoffTarget(
+    targetKey: string | null,
+    epoch: number,
+    outcome: 'committed' | 'unchanged' | 'failed' | 'superseded' = 'failed',
+  ): SessionBootstrapRun | undefined {
+    if (targetKey) {
+      if (!pendingHandoff || epoch >= pendingHandoff.epoch) {
+        pendingHandoff = { targetKey, epoch }
+      }
+      return
+    }
+    if (pendingHandoff && epoch < pendingHandoff.epoch) return
+    pendingHandoff = null
+    const deferred = deferredConnectionStates
+    deferredConnectionStates = []
+    // A committed target starts its own bootstrap before the handoff closes.
+    // Replaying older transport transitions would duplicate or preempt that B
+    // registration. A rollback keeps A, so replay is required there.
+    if (outcome === 'committed') return
+    let resumed: SessionBootstrapRun | undefined
+    for (const event of deferred) {
+      resumed = handleConnectionState(event.state, event.includeHistory) ?? resumed
+    }
+    return resumed
+  }
 
   function isCurrent(run: ActiveBootstrap): boolean {
     return (
@@ -648,6 +681,34 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     state: string,
     includeHistory = true,
   ): SessionBootstrapRun | undefined {
+    if (
+      pendingHandoff
+      && pendingHandoff.targetKey !== options.sessionKey.value
+    ) {
+      // Transport events may race a delayed queue/adoption handoff. Keep the
+      // source run intact and replay only the latest physical state after the
+      // handoff commits or rolls back; never restart source A while B is the
+      // declared target.
+      const previous = deferredConnectionStates[deferredConnectionStates.length - 1]
+      if (state === 'disconnected') {
+        // A later outage supersedes any already-deferred flap. Retain only the
+        // transition needed to recover the eventual target exactly once.
+        deferredConnectionStates = [{ state, includeHistory }]
+      } else if (previous?.state === state) {
+        previous.includeHistory ||= includeHistory
+      } else {
+        deferredConnectionStates.push({ state, includeHistory })
+      }
+      return active
+        ? { ...publicRun(active), deferred: true }
+        : {
+            generation,
+            criticalRequestsQueued: Promise.resolve(),
+            history: Promise.resolve(EMPTY_HISTORY_RESULT),
+            live: Promise.resolve(UNAVAILABLE_LIVE_RESULT),
+            deferred: true,
+          }
+    }
     if (state === 'disconnected') {
       const key = options.sessionKey.value
       if (!key) return
@@ -777,6 +838,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     retryHistory,
     retryLive,
     handleConnectionState,
+    setSessionHandoffTarget,
     isSessionBootstrapCurrent,
   }
 }
