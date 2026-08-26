@@ -216,7 +216,7 @@
                 </span>
               </button>
               <div
-                v-if="presentation === 'activity' && activityTargets(call).length"
+                v-if="activityTargetsVisible(call)"
                 class="tool-row-targets"
               >
                 <template v-for="target in activityTargets(call)" :key="target.kind === 'url' ? target.url : target.text">
@@ -233,7 +233,7 @@
                 </template>
               </div>
               <Transition name="activity-tool-detail" :css="presentation === 'activity'">
-                <div v-if="callOpen(call)" class="tool-row-body">
+                <div v-if="callOpen(call) && callHasDetailBody(call)" class="tool-row-body">
                   <ActivityToolDetails
                     v-if="presentation === 'activity' || isDocumentCall(call)"
                     :call="call"
@@ -301,7 +301,7 @@
               </span>
             </button>
             <div
-              v-if="presentation === 'activity' && activityTargets(call).length"
+              v-if="activityTargetsVisible(call)"
               class="tool-row-targets"
             >
               <template v-for="target in activityTargets(call)" :key="target.kind === 'url' ? target.url : target.text">
@@ -318,7 +318,7 @@
               </template>
             </div>
             <Transition name="activity-tool-detail" :css="presentation === 'activity'">
-              <div v-if="callOpen(call)" class="tool-row-body">
+              <div v-if="callOpen(call) && callHasDetailBody(call)" class="tool-row-body">
                 <ActivityToolDetails
                   v-if="presentation === 'activity' || isDocumentCall(call)"
                   :call="call"
@@ -1236,7 +1236,7 @@ function activityGroupIconClass(group: ChatToolCallGroup) {
   }
 }
 
-function callHasDetails(call: ChatToolCallRenderItem): boolean {
+function callHasDetailBody(call: ChatToolCallRenderItem): boolean {
   if (props.presentation === 'activity' || isDocumentCall(call)) {
     return hasActivityToolDetail(call, operationKey(call))
   }
@@ -1246,6 +1246,21 @@ function callHasDetails(call: ChatToolCallRenderItem): boolean {
     || call.result
     || call.resultPreview,
   )
+}
+
+function hasCollapsibleActivityTargets(call: ChatToolCallRenderItem): boolean {
+  const key = operationKey(call)
+  return props.presentation === 'activity'
+    && (
+      call.presentation?.category === 'search'
+      || key === 'web.search'
+      || key === 'web.discover'
+    )
+    && activityTargets(call).length > 0
+}
+
+function callHasDetails(call: ChatToolCallRenderItem): boolean {
+  return callHasDetailBody(call) || hasCollapsibleActivityTargets(call)
 }
 
 function groupHasDetails(group: ChatToolCallGroup): boolean {
@@ -1258,6 +1273,12 @@ function groupHasDetails(group: ChatToolCallGroup): boolean {
 function activityTargets(call: ChatToolCallRenderItem): ActivityToolTarget[] {
   if (props.presentation !== 'activity') return []
   return projectActivityToolTargets(call, operationKey(call))
+}
+
+function activityTargetsVisible(call: ChatToolCallRenderItem): boolean {
+  const targets = activityTargets(call)
+  if (!targets.length) return false
+  return !hasCollapsibleActivityTargets(call) || callOpen(call)
 }
 
 function openActivityTarget(target: Extract<ActivityToolTarget, { kind: 'url' }>) {

@@ -402,7 +402,7 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.activity-tool-details')).toBeNull()
   })
 
-  it('keeps search activity non-expandable even when the item is marked open', async () => {
+  it('keeps search URLs collapsed without exposing invocation details', async () => {
     const inputRaw = JSON.stringify({ query: 'AI news today 2026-08-26' })
     const el = await mountTimeline([
       group('web.search', [
@@ -410,23 +410,19 @@ describe('RunTrace activity presentation', () => {
           name: 'web_search',
           inputRaw,
           inputPreview: inputRaw,
+          sources: [{ url: 'https://example.test/result', title: 'Result' }],
           result: JSON.stringify({
             ok: true,
             provider_attempts: [{ provider: 'brave', status: 'success' }],
           }),
-          presentation: {
-            category: 'search',
-            primaryArguments: ['query'],
-            argumentDisplay: 'primary',
-            lifecycleDisplay: 'boundary',
-          },
         }),
       ]),
-    ], { presentation: 'activity', itemOpen: true })
+    ], { presentation: 'activity' })
 
     const row = el.querySelector('.tool-row')
-    expect(row?.hasAttribute('aria-expanded')).toBe(false)
-    expect(el.querySelector('.step-chevron')).toBeNull()
+    expect(row?.getAttribute('aria-expanded')).toBe('false')
+    expect(el.querySelector('.step-chevron')).not.toBeNull()
+    expect(el.querySelector('.tool-row-targets')).toBeNull()
     expect(el.querySelector('.tool-row-body')).toBeNull()
     expect(el.querySelector('.activity-tool-details')).toBeNull()
     expect(el.textContent).not.toMatch(/INPUT|RESULT|provider_attempts/)
@@ -459,7 +455,7 @@ describe('RunTrace activity presentation', () => {
         ]),
         searchCall('second result', ['https://docs.example.test/three']),
       ]),
-    ], { presentation: 'activity', groupOpen: true })
+    ], { presentation: 'activity', groupOpen: true, itemOpen: true })
 
     try {
       const groupRow = el.querySelector('.tool-row--group')
@@ -468,7 +464,7 @@ describe('RunTrace activity presentation', () => {
 
       expect(groupRow?.getAttribute('aria-expanded')).toBe('true')
       expect(memberRows).toHaveLength(2)
-      expect(Array.from(memberRows).every(row => !row.hasAttribute('aria-expanded'))).toBe(true)
+      expect(Array.from(memberRows).every(row => row.getAttribute('aria-expanded') === 'true')).toBe(true)
       expect(urlTargets).toHaveLength(3)
       expect(urlTargets[0]?.textContent).toContain('example.test/one')
       expect(memberRows[0]?.textContent).toContain('2 results')
