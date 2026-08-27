@@ -20,6 +20,12 @@ Policy (matches the bundle-route precedent):
 * The exact registered ``opensquilla-app://desktop`` origin may reach a
   loopback HTTP Gateway. Normal web pages cannot forge their browser-controlled
   Origin, while this keeps Desktop development overrides interoperable.
+* Runtime-registered dynamic origins pass — the remote-control tunnel and
+  pairing features add the exact browser origin of a freshly established
+  tunnel (scheme + host + port triple) while it is active, and remove it on
+  teardown. Registration never accepts wildcards or path/query/fragment
+  material, so DNS-rebinding protection is unchanged: only the proven
+  authority of that one origin is trusted while registered.
 * Everything else — including the opaque ``"null"`` origin and unparsable
   values — is rejected with 403 ``FORBIDDEN_ORIGIN``.
 """
@@ -40,6 +46,12 @@ _BROWSER_ORIGIN_SCHEMES = frozenset({"http", "https"})
 _WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::"})
 _DESKTOP_RENDERER_ORIGIN = "opensquilla-app://desktop"
 
+# Runtime-mutable set of extra browser origins (exact serialized strings such
+# as ``https://trycloudflare.com``). The pairing/tunnel lifecycle registers
+# and revokes entries; nothing else writes to it. Exact-string membership is
+# checked after full origin parsing, so malformed input can never match.
+_dynamic_allowed_origins: set[str] = set()
+
 
 def extract_http_token(request: Request | None) -> str | None:
     """Pull the gateway token from an HTTP request (header or query string)."""
@@ -56,14 +68,20 @@ def extract_http_token(request: Request | None) -> str | None:
 
 def request_principal_is_owner(config: GatewayConfig, request: Request) -> bool:
     """Resolve the request's principal and report whether it is the owner."""
-    from opensquilla.gateway.auth import resolve_auth
+    from opensquilla.gateway.auth import normalize_forwarded_for, resolve_auth
 
     auth_params: dict[str, str] = {}
     token = extract_http_token(request)
     if token:
         auth_params["token"] = token
     peer_ip = request.client.host if request.client is not None else None
-    principal = resolve_auth(config, auth_params, "operator", peer_ip=peer_ip)
+    principal = resolve_auth(
+        config,
+        auth_params,
+        "operator",
+        peer_ip=peer_ip,
+        forwarded_for=normalize_forwarded_for(request.headers),
+    )
     return bool(principal and principal.is_owner)
 
 
@@ -164,6 +182,10 @@ def _parsed_browser_origin(origin: str):
     if (
         parsed.scheme not in _BROWSER_ORIGIN_SCHEMES
         or parsed.hostname is None
+        # Reject wildcards and underscores that cannot appear in a real DNS
+        # label. urlsplit happily returns ``*.example.com``.
+        or "*" in parsed.hostname
+        or "_" in parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path
@@ -202,6 +224,37 @@ def _desktop_renderer_origin_allowed(
     )
 
 
+def register_dynamic_origin(origin: str) -> bool:
+    """Allowlist one extra exact browser origin at runtime.
+
+    Returns True when the origin was parsed and stored, False for anything
+    that is not a clean ``scheme://host[:port]`` browser origin. Wildcards,
+    paths, query strings, fragments, credentials, and non-browser schemes are
+    rejected — this list must stay narrower than the static
+    ``cors.allowed_origins`` contract, not wider.
+    """
+
+    if _parsed_browser_origin(origin) is None:
+        return False
+    _dynamic_allowed_origins.add(origin)
+    return True
+
+
+def revoke_dynamic_origin(origin: str) -> bool:
+    """Remove one previously registered dynamic origin."""
+
+    if origin in _dynamic_allowed_origins:
+        _dynamic_allowed_origins.discard(origin)
+        return True
+    return False
+
+
+def dynamic_origins_snapshot() -> tuple[str, ...]:
+    """Return a sorted copy of the currently allowed dynamic origins."""
+
+    return tuple(sorted(_dynamic_allowed_origins))
+
+
 def _origin_allowed(
     *,
     origin: str | None,
@@ -227,6 +280,16 @@ def _origin_allowed(
     if config is not None and any(
         allowed == origin for allowed in config.cors.allowed_origins if allowed != "*"
     ):
+        return True
+    if origin in _dynamic_allowed_origins:
+        # Dynamic origins mirror the static ``cors.allowed_origins`` contract:
+        # the pairing/tunnel lifecycle is the trust anchor, and registration
+        # went through the same strict parser as static entries. The exact
+        # string match IS the scheme+host+port triple check, so no further
+        # authority comparison is needed. In particular, a tunnel page talks
+        # to its own public hostname while cloudflared forwards plaintext to
+        # a loopback-bound gateway, so requiring Origin==listen-address here
+        # would reject every legitimate tunnel request.
         return True
     normalized_request_scheme = _http_equivalent_scheme(request_scheme)
     if config is not None and not _request_authority_matches_config(

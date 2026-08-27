@@ -204,6 +204,48 @@ describe('SidebarConversations project workspaces', () => {
     ).toBe('Recents')
   })
 
+  it('collapses project and recent zones independently', async () => {
+    const { host } = await mountSidebar([
+      projectRow(),
+      taskRow(),
+      taskRow({
+        key: 'agent:main:webchat:ordinary',
+        title: 'Ordinary task',
+        depth: 0,
+        workspaceId: undefined,
+      }),
+    ])
+    const projects = host.querySelector<HTMLButtonElement>(
+      '[data-sidebar-zone-heading="projects"] .sidebar-zone-heading__disclosure',
+    )
+    const recents = host.querySelector<HTMLButtonElement>(
+      '[data-sidebar-zone-heading="recents"] .sidebar-zone-heading__disclosure',
+    )
+
+    projects?.click()
+    await nextTick()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    })
+    await nextTick()
+    expect(projects?.getAttribute('aria-expanded')).toBe('false')
+    expect(host.querySelector<HTMLElement>('#sidebar-zone-projects')?.style.display).toBe('none')
+    expect(host.querySelector<HTMLElement>('#sidebar-zone-recents')?.style.display).not.toBe('none')
+
+    recents?.click()
+    await nextTick()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    })
+    await nextTick()
+    expect(recents?.getAttribute('aria-expanded')).toBe('false')
+    expect(host.querySelector<HTMLElement>('#sidebar-zone-recents')?.style.display).toBe('none')
+    expect(JSON.parse(localStorage.getItem('opensquilla-sidebar-sections') || '{}')).toMatchObject({
+      'zone:projects': true,
+      'zone:recents': true,
+    })
+  })
+
   it('renders peer zone headings with independent counts and unique pinned rows', async () => {
     const { host } = await mountSidebar([
       projectRow(),

@@ -201,6 +201,15 @@ export class RpcClient {
     this._doConnect();
   }
 
+  /**
+   * Swap the credential used by future reconnects without reconnecting now.
+   * Used when a pairing claim hands out a long-lived device token: the
+   * one-shot pairing token is spent, so reconnects must stop replaying it.
+   */
+  updateToken(token: string | null): void {
+    this._token = token || null;
+  }
+
   disconnect(): void {
     this._autoReconnect = false;
     this._stopLifecycleWatch();

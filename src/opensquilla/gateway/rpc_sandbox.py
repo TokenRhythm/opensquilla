@@ -71,6 +71,7 @@ from opensquilla.sandbox.run_context_service import (
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
+    principal_has_host_execute,
     run_mode_allowed_for_principal,
 )
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
@@ -404,6 +405,17 @@ def _require_session_manager(ctx: RpcContext) -> Any:
 def _require_owner(ctx: RpcContext, method: str) -> None:
     if not getattr(ctx.principal, "is_owner", False):
         raise RpcHandlerError("UNAUTHORIZED", f"{method} requires owner principal.")
+
+
+def _require_host_path_access(ctx: RpcContext, method: str) -> None:
+    if (
+        not getattr(ctx.principal, "is_owner", False)
+        and not principal_has_host_execute(ctx.principal)
+    ):
+        raise RpcHandlerError(
+            "HOST_CAPABILITY_REQUIRED",
+            f"{method} requires local ownership or host execution permission.",
+        )
 
 
 def _run_mode_preference_registry() -> Any:
@@ -1372,7 +1384,7 @@ async def _handle_sandbox_bundle_disable(params: dict | None, ctx: RpcContext) -
 async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
     session_key = _require_session_key(params)
-    _require_owner(ctx, "sandbox.path.list")
+    _require_host_path_access(ctx, "sandbox.path.list")
     kind = str(params.get("kind") or "workspace").strip().lower()
     if kind not in {"workspace", "mount"}:
         raise ValueError("params.kind must be workspace or mount")
@@ -1406,7 +1418,7 @@ async def _handle_sandbox_path_create_directory(
 ) -> dict:
     params = _require_params(params)
     _require_session_key(params)
-    _require_owner(ctx, "sandbox.path.create-directory")
+    _require_host_path_access(ctx, "sandbox.path.create-directory")
     kind = str(params.get("kind") or "workspace").strip().lower()
     if kind not in {"workspace", "mount"}:
         raise ValueError("params.kind must be workspace or mount")
@@ -1447,7 +1459,7 @@ async def _handle_sandbox_path_create_directory(
 async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
     session_key = _require_session_key(params)
-    _require_owner(ctx, "sandbox.path.pick")
+    _require_host_path_access(ctx, "sandbox.path.pick")
     kind = str(params.get("kind") or "workspace").strip().lower()
     if kind not in {"workspace", "mount"}:
         raise ValueError("params.kind must be workspace or mount")

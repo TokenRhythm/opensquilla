@@ -33,6 +33,8 @@ class TokenRecord:
     capabilities: frozenset[str]
     source_kind: str
     created_at: int
+    expires_at: int | None = None
+    claimed_at: int | None = None
     last_used_at: int | None = field(default=None, compare=False)
     last_peer: str | None = field(default=None, compare=False)
     revoked_at: int | None = None
@@ -104,6 +106,17 @@ class TokenStore:
                 "CREATE INDEX IF NOT EXISTS idx_sandbox_tokens_active "
                 "ON sandbox_tokens(revoked_at, created_at)"
             )
+            # Additive columns for pairing tokens (TTL + one-shot claim). Older
+            # databases created before this feature lack the columns; ALTER is
+            # idempotent and only runs when the column is absent.
+            existing = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(sandbox_tokens)").fetchall()
+            }
+            if "expires_at" not in existing:
+                connection.execute("ALTER TABLE sandbox_tokens ADD COLUMN expires_at INTEGER")
+            if "claimed_at" not in existing:
+                connection.execute("ALTER TABLE sandbox_tokens ADD COLUMN claimed_at INTEGER")
 
     def create(
         self,
@@ -113,6 +126,7 @@ class TokenStore:
         scopes: Iterable[str],
         capabilities: Iterable[str],
         source_kind: str = "named",
+        expires_at: int | None = None,
     ) -> IssuedToken:
         clean_name = str(name).strip()
         if not clean_name:
@@ -131,15 +145,16 @@ class TokenStore:
             capabilities=frozenset(str(value) for value in capabilities),
             source_kind=str(source_kind),
             created_at=created_at,
+            expires_at=expires_at,
         )
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO sandbox_tokens (
-                    public_id, token_version, name, secret_digest, roles_json,
-                    scopes_json, capabilities_json, source_kind, created_at,
-                    last_used_at, last_peer, revoked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+               INSERT INTO sandbox_tokens (
+                   public_id, token_version, name, secret_digest, roles_json,
+                    scopes_json, capabilities_json, source_kind, created_at, expires_at,
+                   last_used_at, last_peer, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (
                     record.public_id,
@@ -151,6 +166,7 @@ class TokenStore:
                     _json_set(record.capabilities),
                     record.source_kind,
                     record.created_at,
+                    record.expires_at,
                 ),
             )
         return IssuedToken(
@@ -175,6 +191,17 @@ class TokenStore:
         if row is None or not valid_secret or row["revoked_at"] is not None:
             return None
 
+        expires_at = row["expires_at"]
+        if expires_at is not None and int(expires_at) <= int(time.time()):
+            # Expired tokens are treated like revoked: verification fails and
+            # the row is marked revoked so the device list stops showing it.
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE sandbox_tokens SET revoked_at = ? WHERE public_id = ?",
+                    (int(time.time()), public_id),
+                )
+            return None
+
         used_at = int(time.time())
         with self._connect() as connection:
             connection.execute(
@@ -184,12 +211,40 @@ class TokenStore:
             )
         return self._record_from_row(row)
 
+    def claim(self, public_id: str) -> bool:
+        """Atomically claim a pairing token for one-shot use.
+
+        Returns True when this call won the claim (the token was not previously
+        claimed), False when the token was already claimed or missing. The
+        UPDATE...WHERE claimed_at IS NULL guard makes the claim race-safe even
+        when two WebSocket handshakes arrive concurrently.
+        """
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE sandbox_tokens SET claimed_at = ? "
+                "WHERE public_id = ? AND claimed_at IS NULL AND revoked_at IS NULL",
+                (int(time.time()), public_id),
+            )
+            return cursor.rowcount == 1
+
     def revoke(self, public_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE sandbox_tokens SET revoked_at = ? "
                 "WHERE public_id = ? AND revoked_at IS NULL",
                 (int(time.time()), str(public_id)),
+            )
+        return cursor.rowcount == 1
+
+    def revoke_by_name(self, name: str) -> bool:
+        """Revoke active tokens by name (e.g. a pairing's device credential)."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE sandbox_tokens SET revoked_at = ? "
+                "WHERE name = ? AND revoked_at IS NULL",
+                (int(time.time()), str(name)),
             )
         return cursor.rowcount == 1
 
@@ -203,6 +258,16 @@ class TokenStore:
             ).fetchall()
         return tuple(self._record_from_row(row) for row in rows)
 
+    def get(self, public_id: str) -> TokenRecord | None:
+        """Return one token record by public id (revoked or not)."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sandbox_tokens WHERE public_id = ?",
+                (str(public_id),),
+            ).fetchone()
+        return self._record_from_row(row) if row is not None else None
+
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> TokenRecord:
         return TokenRecord(
@@ -215,6 +280,8 @@ class TokenStore:
             capabilities=_decode_set(row["capabilities_json"]),
             source_kind=str(row["source_kind"]),
             created_at=int(row["created_at"]),
+            expires_at=int(row["expires_at"]) if row["expires_at"] is not None else None,
+            claimed_at=int(row["claimed_at"]) if row["claimed_at"] is not None else None,
             last_used_at=(
                 int(row["last_used_at"]) if row["last_used_at"] is not None else None
             ),

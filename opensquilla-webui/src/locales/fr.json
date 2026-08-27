@@ -4376,5 +4376,28 @@
       "copyFailed": "Impossible de copier la commande",
       "copyLabel": "Copier la commande de redémarrage de la passerelle"
     }
+  },
+  "remoteControl": {
+    "title": "Télécommande mobile",
+    "sidebar": "Télécommande",
+    "enable": "Activer la télécommande",
+    "enableDesc": "Contrôler depuis d'autres appareils via un proxy local.",
+    "deviceName": "Nom de l'appareil",
+    "scanHint": "Scannez le code QR pour ouvrir cet appareil, ou",
+    "copyLink": "copier le lien",
+    "desc": "Scannez le code QR avec votre téléphone pour ouvrir un panneau de contrôle mobile de cette passerelle. Le lien expire dans 10 minutes et ne peut être utilisé qu'une seule fois.",
+    "create": "Générer le code QR",
+    "tunnelHint": "Impossible d'établir un tunnel public. Un proxy local en mode TUN (Clash/V2Ray, etc.) peut détourner la connexion sortante de cloudflared ; ajoutez une règle directe pour cloudflared et réessayez.",
+    "safeModeUnavailable": "Le mode securise est indisponible sur cet hote : un telephone associe sans autorisation de commandes hote ne peut rien executer et ses envois sont refuses. Activez cette option et associez a nouveau, ou reparez le mode securise.",
+    "creating": "Création…",
+    "expiresIn": "Expire dans",
+    "hostExecute": "Autoriser l'exécution de commandes hôte",
+    "hostExecuteWarn": "Avertissement : le téléphone pourra exécuter des commandes sur cette machine. À n'activer que sur un réseau de confiance.",
+    "hostExecuteAppliesNext": "Ceci s'applique au prochain QR code. Pour modifier un appareil deja associe, revoquez-le puis associez-le a nouveau.",
+    "devices": "Appareils appairés",
+    "connected": "Connecté",
+    "pending": "En attente de scan",
+    "revoke": "Révoquer",
+    "revokeAll": "Tout révoquer"
   }
 }

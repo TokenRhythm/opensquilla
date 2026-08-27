@@ -23,6 +23,29 @@ export interface SessionProjectWorkspaceMetadata {
   projectWorkspace?: ActiveProjectWorkspaceSnapshot | null
 }
 
+/**
+ * Decide whether an existing session's project binding blocks a send.
+ *
+ * A remote paired operator cannot enumerate arbitrary host workspaces, so the
+ * deferred session hydration intentionally leaves its bound workspace as
+ * `unknown`. That is not evidence that the binding is invalid: turn ingress
+ * resolves and validates the persisted workspace authoritatively. Allow that
+ * one narrow case while continuing to block unresolved, removed, unavailable,
+ * and failed bindings. The caller still cannot browse or switch host paths.
+ */
+export function projectSendBlockedReason(
+  status: ActiveProjectWorkspaceStatus,
+  workspaceId: string | null,
+  canManageProjectWorkspaces: boolean,
+): ActiveProjectWorkspaceStatus | null {
+  if (
+    status === 'unknown'
+    && Boolean(workspaceId)
+    && !canManageProjectWorkspaces
+  ) return null
+  return status === 'none' || status === 'ready' ? null : status
+}
+
 export function createDraftProjectHydrationGuard() {
   let generation = 0
   let activeController: AbortController | null = null
@@ -169,11 +192,11 @@ export function useActiveProjectWorkspace() {
     status.value = 'error'
   }
 
-  const sendBlockedReason = computed(() =>
-    status.value === 'none' || status.value === 'ready'
-      ? null
-      : status.value,
-  )
+  const sendBlockedReason = computed(() => projectSendBlockedReason(
+    status.value,
+    boundWorkspaceId.value,
+    true,
+  ))
 
   return {
     pendingWorkspaceId,

@@ -16,7 +16,8 @@ export type IconName =
   | 'keyboard' | 'languages' | 'shield' | 'lock'
   | 'target'
   | 'thumbs-up' | 'thumbs-down'
-  | 'music' | 'pause' | 'volume' | 'video';
+  | 'music' | 'pause' | 'volume' | 'video'
+  | 'qr';
 
 interface IconDef {
   path: string;
@@ -112,6 +113,7 @@ const ICONS: Record<IconName, IconDef> = {
   video:      { path: '<rect x="3" y="5" width="14" height="14" rx="2"/><path d="m17 10 4-2v8l-4-2z"/>', strokeWidth: 1.7 },
   pause:      { path: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>', strokeWidth: 1.7 },
   volume:     { path: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>', strokeWidth: 1.7 },
+  qr:         { path: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M21 14v.01"/><path d="M14 21v.01"/><path d="M17 17h4v4h-4z"/>', strokeWidth: 1.7 },
 };
 
 export function getIconSvg(name: IconName, size: number = 16): string {

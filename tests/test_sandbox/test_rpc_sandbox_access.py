@@ -90,6 +90,7 @@ def _ctx(
     security_grading: bool = True,
     permissions_default_mode: str = "off",
     scopes: frozenset[str] | None = None,
+    capabilities: frozenset[str] | None = None,
 ):
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
@@ -113,6 +114,7 @@ def _ctx(
             scopes=scopes or frozenset(["operator.read", "operator.write"]),
             is_owner=is_owner,
             authenticated=True,
+            capabilities=capabilities or frozenset(),
         ),
         session_manager=manager,
         config=config,
@@ -2601,7 +2603,7 @@ async def test_path_list_does_not_swallow_directory_access_errors(
 
 
 @pytest.mark.asyncio
-async def test_rpc_sandbox_path_list_requires_owner(tmp_path) -> None:
+async def test_rpc_sandbox_path_list_requires_owner_or_host_execute(tmp_path) -> None:
     from opensquilla.gateway.rpc import RpcHandlerError
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
 
@@ -2609,14 +2611,42 @@ async def test_rpc_sandbox_path_list_requires_owner(tmp_path) -> None:
     target = tmp_path / "target"
     target.mkdir()
 
-    with pytest.raises(RpcHandlerError, match="requires owner principal"):
+    with pytest.raises(RpcHandlerError, match="host execution permission"):
         await _handle_sandbox_path_list(
             {
                 "sessionKey": manager.node.session_key,
                 "path": str(target),
             },
-            _ctx(manager, is_owner=False),
+            _ctx(
+                manager,
+                is_owner=False,
+                capabilities=frozenset({"task.submit"}),
+            ),
         )
+
+
+@pytest.mark.asyncio
+async def test_rpc_sandbox_path_list_allows_remote_host_execute(tmp_path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    target = tmp_path / "target"
+    target.mkdir()
+
+    result = await _handle_sandbox_path_list(
+        {
+            "sessionKey": manager.node.session_key,
+            "path": str(target),
+            "kind": "workspace",
+        },
+        _ctx(
+            manager,
+            is_owner=False,
+            capabilities=frozenset({"host.execute"}),
+        ),
+    )
+
+    assert result["currentPath"] == str(target.resolve(strict=True))
 
 
 @pytest.mark.asyncio
@@ -2667,18 +2697,22 @@ async def test_path_create_directory_rejects_invalid_name(
 
 
 @pytest.mark.asyncio
-async def test_path_create_directory_requires_owner(tmp_path: Path) -> None:
+async def test_path_create_directory_requires_owner_or_host_execute(tmp_path: Path) -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_create_directory
 
     manager = _SessionManager()
-    with pytest.raises(RpcHandlerError, match="requires owner principal"):
+    with pytest.raises(RpcHandlerError, match="host execution permission"):
         await _handle_sandbox_path_create_directory(
             {
                 "sessionKey": manager.node.session_key,
                 "parentPath": str(tmp_path),
                 "name": "blocked",
             },
-            _ctx(manager, is_owner=False),
+            _ctx(
+                manager,
+                is_owner=False,
+                capabilities=frozenset({"task.submit"}),
+            ),
         )
 
 

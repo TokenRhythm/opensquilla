@@ -1028,7 +1028,7 @@ async def handle_ws_connection(
         params_raw = {}
 
     # Step 4: Resolve auth via server-side ScopeResolver
-    from opensquilla.gateway.auth import resolve_auth
+    from opensquilla.gateway.auth import normalize_forwarded_for, resolve_auth
 
     auth_params = params_raw.get("auth")
     if not isinstance(auth_params, dict):
@@ -1037,11 +1037,16 @@ async def handle_ws_connection(
     if not isinstance(role_claim, str):
         role_claim = "operator"
     peer_ip = ws.client.host if ws.client is not None else None
+    # The tunnel relay (cloudflared) dials from loopback and always carries
+    # the phone's address in X-Forwarded-For; its presence marks the
+    # connection as "remote device via tunnel", never as the local owner.
+    forwarded_for = normalize_forwarded_for(getattr(ws, "headers", None))
     principal = resolve_auth(
         config,
         auth_params=auth_params,
         role_claim=role_claim,
         peer_ip=peer_ip,
+        forwarded_for=forwarded_for,
     )
     if principal is None:
         await conn.send_res(make_error_res(req_id, "UNAUTHORIZED", "Authentication failed"))
@@ -1211,6 +1216,11 @@ def _websocket_hello_auth_payload(principal: Any) -> dict[str, Any]:
 
     payload = hello_auth_payload(principal)
     payload["principal"]["guestOwnerId"] = getattr(principal, "guest_owner_id", None)
+    device_token = getattr(principal, "device_token", None)
+    if device_token and getattr(principal, "authenticated", False):
+        # Reconnect credential minted by a pairing-token claim; the phone
+        # stores it and uses it instead of the one-shot pairing token.
+        payload["deviceToken"] = device_token
     guest_session_key = getattr(principal, "guest_session_key", None)
     if guest_session_key and not getattr(principal, "authenticated", False):
         # Preserve ``invalid`` and the public id internally for rate limiting,

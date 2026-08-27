@@ -1,4 +1,4 @@
-"""Owner-only RPC lifecycle for persisted project workspaces."""
+"""Trusted host-control lifecycle for persisted project workspaces."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from opensquilla.project_workspaces import (
     project_workspace_payload,
     resolve_project_path,
 )
+from opensquilla.sandbox.run_mode_policy import principal_has_host_execute
 from opensquilla.session.models import ProjectWorkspace
 from opensquilla.session.storage import ProjectSessionSnapshotMismatchError
 
@@ -46,11 +47,11 @@ async def _settle_despite_cancellation[T](awaitable: Awaitable[T]) -> T:
     return operation.result()
 
 
-def _require_owner(ctx: RpcContext) -> None:
-    if not ctx.principal.is_owner:
+def _require_workspace_manager(ctx: RpcContext) -> None:
+    if not ctx.principal.is_owner and not principal_has_host_execute(ctx.principal):
         raise RpcHandlerError(
-            "OWNER_REQUIRED",
-            "Project workspaces require a locally proven owner.",
+            "HOST_CAPABILITY_REQUIRED",
+            "Project workspaces require local ownership or host execution permission.",
         )
 
 
@@ -93,7 +94,7 @@ async def _handle_workspaces_list(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    _require_owner(ctx)
+    _require_workspace_manager(ctx)
     storage = _storage(ctx)
     await adopt_legacy_project_workspaces(storage, ctx.config)
     workspaces = await storage.list_project_workspaces()
@@ -107,7 +108,7 @@ async def _handle_workspaces_open(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    _require_owner(ctx)
+    _require_workspace_manager(ctx)
     values = _params(params)
     if values.get("trusted") is not True:
         raise RpcHandlerError(
@@ -138,7 +139,7 @@ async def _handle_workspaces_update(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    _require_owner(ctx)
+    _require_workspace_manager(ctx)
     values = _params(params)
     workspace_id = _workspace_id(values)
     name = values.get("name")
@@ -160,7 +161,7 @@ async def _handle_workspaces_pin(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    _require_owner(ctx)
+    _require_workspace_manager(ctx)
     values = _params(params)
     workspace_id = _workspace_id(values)
     if not isinstance(values.get("pinned"), bool):
@@ -179,7 +180,7 @@ async def _handle_workspaces_remove(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    _require_owner(ctx)
+    _require_workspace_manager(ctx)
     workspace_id = _workspace_id(params)
     storage = _storage(ctx)
     await _active_workspace(storage, workspace_id)
@@ -212,7 +213,7 @@ async def _handle_workspaces_history_delete(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    _require_owner(ctx)
+    _require_workspace_manager(ctx)
     workspace_id = _workspace_id(params)
     storage = _storage(ctx)
 

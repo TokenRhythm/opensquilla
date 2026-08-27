@@ -11,6 +11,9 @@ import { getPlatform } from '@/platform'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
+// Long-lived reconnect credential minted by a pairing claim; survives browser
+// restarts, unlike the one-shot link token kept in sessionStorage.
+const WS_DEVICE_TOKEN_KEY = 'opensquilla.deviceToken'
 const CACHED_AUTH_KEY = 'opensquilla.cachedAuth'
 const CHAT_DRAFT_PREFIX = 'opensquilla.chat.draft:'
 
@@ -38,6 +41,33 @@ function clearLinkTokenBrowserState(): void {
   } catch {}
 }
 
+function persistDeviceToken(token: string): void {
+  try {
+    localStorage.setItem(WS_DEVICE_TOKEN_KEY, token)
+    // The one-shot pairing token is spent once the credential is issued.
+    sessionStorage.removeItem(WS_TOKEN_KEY)
+  } catch {}
+}
+
+function clearDeviceToken(): void {
+  try { localStorage.removeItem(WS_DEVICE_TOKEN_KEY) } catch {}
+}
+
+/**
+ * Read the one-shot pairing token from the URL fragment.
+ *
+ * The fragment is chosen deliberately: it is the only part of a URL a browser
+ * never puts on the wire, so the secret cannot reach server access logs or
+ * proxy logs on the initial navigation. A token in the query string would
+ * already have been transmitted before any scrubbing could run, so one is
+ * treated as unusable rather than silently accepted.
+ */
+function readLinkTokenFromFragment(url: URL): string {
+  const raw = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash
+  if (!raw) return ''
+  return (new URLSearchParams(raw).get('token') || '').trim()
+}
+
 function consumeLinkTokenFromUrl(): { url: string; token: string } | null {
   let url: URL
   try {
@@ -45,16 +75,31 @@ function consumeLinkTokenFromUrl(): { url: string; token: string } | null {
   } catch {
     return null
   }
-  const token = (url.searchParams.get('token') || '').trim()
-  if (!token) return null
+  // A query-string token is already leaked by the time this runs. Strip it so
+  // it is not persisted or reused, and refuse to authenticate with it.
+  const leakedQueryToken = url.searchParams.has('token')
+  const token = readLinkTokenFromFragment(url)
+  if (!token) {
+    if (leakedQueryToken) {
+      try {
+        url.searchParams.delete('token')
+        window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+      } catch { /* restricted history */ }
+    }
+    return null
+  }
 
   clearLinkTokenBrowserState()
+  // Explicit re-pair: the scanned token supersedes any credential held here.
+  clearDeviceToken()
   const rpcUrl = getDefaultRpcUrl()
   saveConnectionSettings(rpcUrl, token)
 
   try {
     url.searchParams.delete('token')
-    const cleaned = `${url.pathname}${url.search}${url.hash}`
+    // Drop the fragment too: leaving it in place would keep the spent secret
+    // in browser history and in anything the user copies from the address bar.
+    const cleaned = `${url.pathname}${url.search}`
     window.history.replaceState(null, '', cleaned)
   } catch {}
 
@@ -66,6 +111,9 @@ function loadConnectionSettings(): { url: string; token: string } {
   let token = ''
   try { url = localStorage.getItem(WS_URL_KEY) || url } catch {}
   try { token = sessionStorage.getItem(WS_TOKEN_KEY) || '' } catch {}
+  if (!token) {
+    try { token = localStorage.getItem(WS_DEVICE_TOKEN_KEY) || '' } catch {}
+  }
   return { url, token }
 }
 
@@ -101,8 +149,15 @@ export const useRpcStore = defineStore('rpc', () => {
       && (principal as Record<string, unknown>).isOwner === true,
     )
   })
+  const hasHostExecute = computed(() => {
+    if (!isConnected.value) return false
+    const principal = auth.value?.principal
+    if (!principal || typeof principal !== 'object') return false
+    const capabilities = (principal as Record<string, unknown>).capabilities
+    return Array.isArray(capabilities) && capabilities.includes('host.execute')
+  })
   const canManageProjectWorkspaces = computed(() =>
-    isLocalOwner.value
+    (isLocalOwner.value || hasHostExecute.value)
     && supportsMethod('workspaces.list'))
   const canChooseProject = computed(() =>
     canManageProjectWorkspaces.value
@@ -184,6 +239,24 @@ export const useRpcStore = defineStore('rpc', () => {
         ? data.features.events.filter((event): event is string => typeof event === 'string')
         : []
       unavailableMethods.value = new Set()
+      // A claimed pairing hands the phone a long-lived reconnect credential;
+      // reconnects must switch to it (the pairing token is spent), and an
+      // unauthenticated hello means a stored credential went stale.
+      // The gateway nests this under the auth payload; a top-level read is
+      // always undefined, which left the phone replaying the spent one-shot
+      // pairing token after any reconnect.
+      const issuedDeviceToken =
+        typeof data.auth?.deviceToken === 'string' ? data.auth.deviceToken : ''
+      if (issuedDeviceToken) {
+        persistDeviceToken(issuedDeviceToken)
+        client.value?.updateToken(issuedDeviceToken)
+      } else {
+        const principal = (data.auth?.principal ?? {}) as Record<string, unknown>
+        if (principal.authenticated === false) {
+          clearDeviceToken()
+          client.value?.updateToken(null)
+        }
+      }
     })
 
     rpc.on('_gap', (detail: unknown) => {

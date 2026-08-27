@@ -5389,6 +5389,13 @@ async def start_gateway_server(
             "host": config.host,
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
+            # Never trust X-Forwarded-For for identity: the tunnel relay
+            # (cloudflared) dials from loopback, and honoring its forwarded
+            # header would make the gateway see the phone's public IP as the
+            # connecting peer — which then fails every loopback-proximity
+            # check. The header's presence is still read by auth to tell
+            # "relayed through the tunnel" apart from "true local owner".
+            "proxy_headers": False,
             # Uvicorn invokes this only after its socket server has been
             # created. Keep the callback one-shot because callback_notify is
             # also used for periodic worker health notifications.

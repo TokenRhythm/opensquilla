@@ -149,6 +149,10 @@ METHOD_SCOPES: dict[str, str] = {
     "workbench.resources.get": READ_SCOPE,
     "workbench.previews.create": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
+    # OpenSquilla-only; owner pairing device management.
+    "gateway.pairing.list": READ_SCOPE,
+    "gateway.pairing.create": WRITE_SCOPE,
+    "gateway.pairing.revoke": WRITE_SCOPE,
     "last-heartbeat": READ_SCOPE,
     "system-presence": READ_SCOPE,
     "doctor.status": READ_SCOPE,
@@ -181,7 +185,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.explain": READ_SCOPE,  # OpenSquilla-only; deterministic sandbox explanation.
     "sandbox.run_context.get": READ_SCOPE,  # OpenSquilla-only; session sandbox mode.
     "sandbox.run_mode.preference.get": READ_SCOPE,  # OpenSquilla-only; global picker default.
-    "sandbox.path.list": READ_SCOPE,  # OpenSquilla-only; inline path browser listing.
+    "sandbox.path.list": READ_SCOPE,  # OpenSquilla-only; trusted host path listing.
     "channels.status": READ_SCOPE,
     "commands.list_for_surface": READ_SCOPE,  # OpenSquilla-only.
     "chat.history": READ_SCOPE,
@@ -308,8 +312,8 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.resume": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded denial-pause clear.
     "sandbox.run_context.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.run_mode.preference.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded default.
-    "sandbox.path.pick": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded host directory picker.
-    "sandbox.path.create-directory": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded path creation.
+    "sandbox.path.pick": WRITE_SCOPE,  # OpenSquilla-only; trusted host directory picker.
+    "sandbox.path.create-directory": WRITE_SCOPE,  # OpenSquilla-only; trusted host path creation.
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
