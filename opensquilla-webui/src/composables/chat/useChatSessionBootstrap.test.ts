@@ -476,12 +476,14 @@ describe('useChatSessionBootstrap', () => {
     expect(api.livePhase.value).toBe('ready')
   })
 
-  it('automatically subscribes on a late replacement socket after a recovery budget expires', async () => {
+  it('automatically retries interrupted history after the recovery budget expires', async () => {
+    vi.useFakeTimers()
     let resolveHistory!: (result: SessionPhaseResult) => void
     let resolveLive!: (result: SessionSubscriptionOutcome) => void
     let historyCalls = 0
     let liveCalls = 0
     const timeout = new RpcTimeoutError('session bootstrap', 7_000)
+    const connectionClosed = new Error('connection closed')
     const { api, loadHistory, subscribeSession } = createBootstrap({
       loadHistory: async () => {
         historyCalls += 1
@@ -513,16 +515,77 @@ describe('useChatSessionBootstrap', () => {
       expect(resolveLive).toBeTypeOf('function')
     })
     api.handleConnectionState('disconnected')
-    resolveHistory({ ok: false, error: timeout })
+    resolveHistory({ ok: false, error: connectionClosed })
     resolveLive({ ...UNAVAILABLE_FOR_TEST, error: timeout })
     await Promise.all([run.history, run.live])
 
+    await vi.advanceTimersByTimeAsync(15_001)
     api.handleConnectionState('disconnected')
     expect(api.livePhase.value).toBe('degraded')
     const lateRecovery = api.handleConnectionState('connected')
     await Promise.all([lateRecovery!.history, lateRecovery!.live])
 
-    expect(loadHistory).toHaveBeenCalledTimes(2)
+    expect(loadHistory).toHaveBeenCalledTimes(3)
+    expect(loadHistory.mock.calls[2]?.[0].attempt).toBe(0)
+    expect(loadHistory.mock.calls[2]?.[1]).toBe(true)
+    expect(subscribeSession).toHaveBeenCalledTimes(3)
+    expect(api.historyPhase.value).toBe('ready')
+    expect(api.livePhase.value).toBe('ready')
+  })
+
+  it.each([
+    {
+      label: 'deterministic INVALID_REQUEST',
+      error: Object.assign(new Error('invalid history request'), {
+        code: 'INVALID_REQUEST',
+        retryable: false,
+      }),
+      initialCalls: 1,
+    },
+    {
+      label: 'out-of-scope STORAGE_BUSY',
+      error: Object.assign(new Error('storage busy'), {
+        code: 'STORAGE_BUSY',
+        retryable: true,
+      }),
+      initialCalls: 2,
+    },
+  ])('does not retry $label history on a late replacement connection', async ({
+    error,
+    initialCalls,
+  }) => {
+    vi.useFakeTimers()
+    let resolveLive!: (result: SessionSubscriptionOutcome) => void
+    let liveCalls = 0
+    const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      loadHistory: async () => ({ ok: false, error }),
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveLive = resolve
+          })
+        }
+        return liveCalls === 2
+          ? { ...UNAVAILABLE_FOR_TEST, error: timeout }
+          : LIVE_READY
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => expect(resolveLive).toBeTypeOf('function'))
+    api.handleConnectionState('disconnected')
+    resolveLive({ ...UNAVAILABLE_FOR_TEST, error: timeout })
+    await Promise.all([run.history, run.live])
+    expect(loadHistory).toHaveBeenCalledTimes(initialCalls)
+
+    await vi.advanceTimersByTimeAsync(15_001)
+    api.handleConnectionState('disconnected')
+    const lateRecovery = api.handleConnectionState('connected')
+    await Promise.all([lateRecovery!.history, lateRecovery!.live])
+
+    expect(loadHistory).toHaveBeenCalledTimes(initialCalls)
     expect(subscribeSession).toHaveBeenCalledTimes(3)
     expect(api.historyPhase.value).toBe('error')
     expect(api.livePhase.value).toBe('ready')
@@ -586,6 +649,109 @@ describe('useChatSessionBootstrap', () => {
     await run.live
 
     await vi.waitFor(() => expect(api.livePhase.value).toBe('ready'))
+    expect(subscribeSession).toHaveBeenCalledTimes(3)
+  })
+
+  it('recovers history when replacement connected before interrupted phases settled', async () => {
+    let resolveHistory!: (result: SessionPhaseResult) => void
+    let resolveLive!: (result: SessionSubscriptionOutcome) => void
+    let historyCalls = 0
+    let liveCalls = 0
+    const connectionClosed = new Error('connection closed')
+    const timeout = new RpcTimeoutError('chat.history', 7_000)
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      loadHistory: async () => {
+        historyCalls += 1
+        if (historyCalls === 1) {
+          return new Promise(resolve => {
+            resolveHistory = resolve
+          })
+        }
+        return historyCalls === 2
+          ? { ok: false, error: timeout }
+          : { ok: true }
+      },
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveLive = resolve
+          })
+        }
+        return LIVE_READY
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => {
+      expect(resolveHistory).toBeTypeOf('function')
+      expect(resolveLive).toBeTypeOf('function')
+    })
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+    resolveHistory({ ok: false, error: connectionClosed })
+    resolveLive({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
+    await run.live
+
+    await vi.waitFor(() => {
+      expect(api.historyPhase.value).toBe('ready')
+      expect(api.livePhase.value).toBe('ready')
+    })
+    expect(loadHistory).toHaveBeenCalledTimes(3)
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+  })
+
+  it('recovers history once when connected wins the disconnect-association race', async () => {
+    let resolveHistory!: (result: SessionPhaseResult) => void
+    let resolveLive!: (result: SessionSubscriptionOutcome) => void
+    let historyCalls = 0
+    let liveCalls = 0
+    const connectionClosed = new Error('connection closed')
+    const timeout = new RpcTimeoutError('chat.history', 7_000)
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      loadHistory: async () => {
+        historyCalls += 1
+        if (historyCalls === 1) {
+          return new Promise(resolve => {
+            resolveHistory = resolve
+          })
+        }
+        return historyCalls === 2
+          ? { ok: false, error: timeout }
+          : { ok: true }
+      },
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveLive = resolve
+          })
+        }
+        return liveCalls === 2
+          ? { ...UNAVAILABLE_FOR_TEST, error: connectionClosed }
+          : LIVE_READY
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => {
+      expect(resolveHistory).toBeTypeOf('function')
+      expect(resolveLive).toBeTypeOf('function')
+    })
+    api.handleConnectionState('connected')
+    resolveHistory({ ok: false, error: connectionClosed })
+    resolveLive({ ...UNAVAILABLE_FOR_TEST, error: connectionClosed })
+    await run.live
+
+    await vi.waitFor(() => {
+      expect(api.historyPhase.value).toBe('ready')
+      expect(api.livePhase.value).toBe('ready')
+    })
+    expect(loadHistory).toHaveBeenCalledTimes(3)
+    expect(subscribeSession).toHaveBeenCalledTimes(3)
+    api.handleConnectionState('connected')
+    await Promise.resolve()
+    expect(loadHistory).toHaveBeenCalledTimes(3)
     expect(subscribeSession).toHaveBeenCalledTimes(3)
   })
 
