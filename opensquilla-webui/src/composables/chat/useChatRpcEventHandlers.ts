@@ -153,6 +153,7 @@ export interface UseChatRpcEventHandlersOptions {
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   queueRouterDecision: (payload: RouterDecisionPayload, identityStreamSeq?: number) => void
+  updateRouterExecutionModel?: (model: string, turnId?: string) => void
   bindRouterDecisionToModelCall?: (
     modelCallId: string,
     iteration?: number,
@@ -1774,10 +1775,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const limit = providerActivityCounter(payload.retry_limit, 10_000)
     const retryAfterMs = providerActivityCounter(payload.retry_after_ms, 900_000)
     const retryAfterSeconds = Math.ceil(retryAfterMs / 1000)
+    const model = String(payload.model || '').trim()
+    const turnId = String(payload.turn_id || payload.turnId || '').trim()
 
     if (!stream.isStreaming.value) stream.startStreaming()
     stream.resetStreamIdleTimer()
     options.markEnsembleHandoff()
+    if (model) options.updateRouterExecutionModel?.(model, turnId)
 
     if (phase === 'requesting') {
       recordActivityPhase('Waiting for model', 'provider:requesting')

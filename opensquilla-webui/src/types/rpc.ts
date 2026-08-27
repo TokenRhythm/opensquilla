@@ -337,6 +337,8 @@ export type ProviderActivityReason =
 export interface ProviderActivityPayload extends SessionEventPayload {
   schema_version?: 1
   activity_id?: string
+  /** Current or target physical execution model. Older gateways omit it. */
+  model?: string
   phase?: ProviderActivityPhase
   reason?: ProviderActivityReason
   retry_attempt?: number

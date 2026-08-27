@@ -290,6 +290,18 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     return findRouterMessageForTurn(targetTurnId)
   }
 
+  function updateRouterExecutionModel(
+    model: string,
+    targetTurnId = latestExplicitTurnId(),
+  ) {
+    const normalizedModel = String(model || '').trim()
+    if (!normalizedModel) return
+    const target = findRouterMessageForTurn(targetTurnId)
+    if (!target || target.routerExecutionModel === normalizedModel) return
+    target.routerExecutionModel = normalizedModel
+    scrollToBottomIfFollowing()
+  }
+
   function synthesizeHandoffRouterMessage(): ChatMessage {
     const turnId = latestExplicitTurnId()
     const message: ChatMessage = {
@@ -373,6 +385,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     clearPendingRouterDecision,
     appendEnsembleProgress,
     markEnsembleHandoff,
+    updateRouterExecutionModel,
     bindRouterDecisionToModelCall,
     freezeActiveTurnRoutingMode,
   }

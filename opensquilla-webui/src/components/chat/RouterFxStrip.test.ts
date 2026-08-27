@@ -202,6 +202,93 @@ describe('RouterFxStrip model selection motion', () => {
     app.unmount()
   })
 
+  it('moves the live highlight across physical fallbacks without changing the route choice', async () => {
+    vi.useFakeTimers()
+    const message = reactive(routerStrip({
+      routerSelectedModel: 'deepseek-v4-pro',
+      routerExecutionModel: 'deepseek-v4-pro',
+      gridCells: [
+        {
+          kind: 'real', tier: 'c0', tiers: ['c0'],
+          displayName: 'deepseek-v4-pro', model: 'deepseek-v4-pro',
+        },
+        {
+          kind: 'real', tier: 'c1', tiers: ['c1'],
+          displayName: 'kimi-k2.7-code', model: 'kimi-k2.7-code',
+        },
+      ],
+      winnerIdx: 0,
+    }))
+    const { app, el } = await mountStrip(message)
+
+    await vi.advanceTimersByTimeAsync(600)
+    await nextTick()
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.dataset.cellIdx).toBe('0')
+    expect(el.querySelector('[data-testid="router-execution-model"]')).toBeFalsy()
+
+    message.routerExecutionModel = 'kimi-k2.7-code'
+    await nextTick()
+    expect(message.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.dataset.cellIdx).toBe('1')
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toContain('Currently executing kimi-k2.7-code')
+
+    message.routerExecutionModel = 'deepseek-v4-pro-0813'
+    await nextTick()
+    expect(el.querySelector('.router-fx-cell.win')).toBeFalsy()
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toContain('Currently executing deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-grid')?.textContent).not.toContain('deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-sr-only')?.textContent)
+      .not.toContain('Router selected deepseek-v4-pro-0813')
+    expect(message.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Currently executing deepseek-v4-pro-0813')
+    app.unmount()
+  })
+
+  it('announces consecutive physical fallbacks outside the router candidate pool', async () => {
+    vi.useFakeTimers()
+    const message = reactive(routerStrip({
+      routerSelectedModel: 'deepseek-v4-pro',
+      routerExecutionModel: 'deepseek-v4-pro',
+      gridCells: [
+        {
+          kind: 'real', tier: 'c0', tiers: ['c0'],
+          displayName: 'deepseek-v4-pro', model: 'deepseek-v4-pro',
+        },
+        {
+          kind: 'real', tier: 'c1', tiers: ['c1'],
+          displayName: 'glm-5.2', model: 'glm-5.2',
+        },
+      ],
+      winnerIdx: 0,
+    }))
+    const { app, el } = await mountStrip(message)
+    const announcer = el.querySelector<HTMLElement>('.router-fx-sr-only')
+
+    await vi.advanceTimersByTimeAsync(600)
+    await nextTick()
+
+    message.routerExecutionModel = 'kimi-k2.7-code'
+    await nextTick()
+    expect(el.querySelector('.router-fx-cell.win')).toBeFalsy()
+    expect(announcer?.textContent).toBe('Currently executing kimi-k2.7-code')
+
+    message.routerExecutionModel = 'deepseek-v4-pro-0813'
+    await nextTick()
+    expect(announcer?.textContent).toBe('Currently executing deepseek-v4-pro-0813')
+    expect(announcer?.textContent).not.toContain('Router selected')
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toContain('Currently executing deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Currently executing deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-grid')?.textContent).not.toContain('kimi-k2.7-code')
+    expect(el.querySelector('.router-fx-grid')?.textContent).not.toContain('deepseek-v4-pro-0813')
+    expect(message.routerSelectedModel).toBe('deepseek-v4-pro')
+    app.unmount()
+  })
+
   it('keeps restored router results static and silent', async () => {
     vi.useFakeTimers()
     const { app, el } = await mountStrip(routerStrip({ routerStatic: true }))

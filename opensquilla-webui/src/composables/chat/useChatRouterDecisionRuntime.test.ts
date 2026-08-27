@@ -150,6 +150,42 @@ describe('router decision identity', () => {
       ['router-sess-20', 'provider/replay', '2.0', 2],
     ])
   })
+
+  it('tracks the physical fallback model without mutating the route decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    runtime.queueRouterDecision({
+      stream_seq: 10,
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'deepseek-v4-pro',
+      source: 'squilla_router',
+    })
+    const router = messagesRef.value.find(message => message.role === 'router')
+    const observedExecutionModels: string[] = []
+    for (const model of [
+      'deepseek-v4-pro',
+      'kimi-k2.7-code',
+      'deepseek-v4-pro-0813',
+    ]) {
+      runtime.updateRouterExecutionModel(model, 'turn-1')
+      expect(router?.routerDecision?.model).toBe('deepseek-v4-pro')
+      observedExecutionModels.push(String(router?.routerExecutionModel || ''))
+    }
+
+    expect(observedExecutionModels).toEqual([
+      'deepseek-v4-pro',
+      'kimi-k2.7-code',
+      'deepseek-v4-pro-0813',
+    ])
+    expect(router?.routerDecision?.model).toBe('deepseek-v4-pro')
+    expect(router?.routerExecutionModel).toBe('deepseek-v4-pro-0813')
+  })
 })
 
 describe('appendEnsembleProgress', () => {

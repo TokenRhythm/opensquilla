@@ -3640,6 +3640,7 @@
     "aiModelEnsembleRouter": "AI model ensemble router",
     "routerFx": {
       "selectedModel": "Router selected {model}",
+      "executionModel": "Currently executing {model}",
       "ensembleModel": "Multi-model fusion",
       "ensembleSelecting": "AI model ensemble router · selecting candidates",
       "ensembleHandedOff": "AI model ensemble router · handed off to agent",

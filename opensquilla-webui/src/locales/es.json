@@ -3550,6 +3550,7 @@
     "aiModelEnsembleRouter": "Enrutador agregado de modelos de IA",
     "routerFx": {
       "selectedModel": "El enrutador seleccionó {model}",
+      "executionModel": "Modelo en ejecución: {model}",
       "ensembleModel": "Fusión multimodelo",
       "ensembleSelecting": "Enrutador agregado de modelos de IA · seleccionando candidatos",
       "ensembleHandedOff": "Enrutador agregado de modelos de IA · entregado al agente",

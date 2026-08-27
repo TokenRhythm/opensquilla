@@ -3640,6 +3640,7 @@
     "aiModelEnsembleRouter": "AI 智能融合路由",
     "routerFx": {
       "selectedModel": "路由已选择 {model}",
+      "executionModel": "当前执行模型：{model}",
       "ensembleModel": "多模型融合",
       "ensembleSelecting": "AI 智能融合路由 · 正在选择候选",
       "ensembleHandedOff": "AI 智能融合路由 · 已交给 Agent",

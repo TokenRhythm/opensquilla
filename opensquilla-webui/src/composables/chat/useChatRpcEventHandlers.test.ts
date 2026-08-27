@@ -71,6 +71,7 @@ function createHarness(options: {
     useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
+  const updateRouterExecutionModel = vi.fn()
   const bindRouterDecisionToModelCall = vi.fn()
   const queueRouterDecision = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
@@ -111,6 +112,7 @@ function createHarness(options: {
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
     queueRouterDecision,
+    updateRouterExecutionModel,
     bindRouterDecisionToModelCall,
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
@@ -144,6 +146,7 @@ function createHarness(options: {
     pendingQueue,
     applySessionRunState,
     markEnsembleHandoff,
+    updateRouterExecutionModel,
     bindRouterDecisionToModelCall,
     queueRouterDecision,
     schedulePendingDrainAfterTerminal,
@@ -2558,7 +2561,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
   })
 
   it('maps structured provider activity without rendering provider error text', () => {
-    const { api, stream, stop } = createHarness()
+    const { api, stream, updateRouterExecutionModel, stop } = createHarness()
 
     try {
       api.handlers.onProviderActivity({
@@ -2567,6 +2570,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         phase: 'requesting',
         reason: 'initial',
         activity_id: 'activity-safe',
+        model: 'deepseek-v4-pro',
       })
       api.handlers.onProviderActivity({
         stream_seq: 2,
@@ -2574,6 +2578,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         phase: 'reasoning',
         reason: 'reasoning_only',
         activity_id: 'activity-safe',
+        model: 'deepseek-v4-pro',
       })
       api.handlers.onProviderActivity({
         stream_seq: 3,
@@ -2582,6 +2587,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         reason: 'rate_limited',
         retry_after_ms: 8_000,
         activity_id: 'activity-safe',
+        model: 'kimi-k2.7-code',
         message: 'secret provider body',
       } as never)
       api.handlers.onProviderActivity({
@@ -2592,6 +2598,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         retry_attempt: 2,
         retry_limit: 3,
         activity_id: 'activity-safe',
+        model: 'kimi-k2.7-code',
       })
       api.handlers.onProviderActivity({
         stream_seq: 5,
@@ -2599,6 +2606,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         phase: 'fallback',
         reason: 'provider_overloaded',
         activity_id: 'activity-safe',
+        model: 'deepseek-v4-pro-0813',
       })
 
       expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
@@ -2628,6 +2636,35 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       )
       expect(JSON.stringify(vi.mocked(stream.setStreamActivity).mock.calls))
         .not.toContain('secret provider body')
+      expect(updateRouterExecutionModel.mock.calls).toEqual([
+        ['deepseek-v4-pro', ''],
+        ['deepseek-v4-pro', ''],
+        ['kimi-k2.7-code', ''],
+        ['kimi-k2.7-code', ''],
+        ['deepseek-v4-pro-0813', ''],
+      ])
+    } finally {
+      stop()
+    }
+  })
+
+  it('keeps provider activity compatible when an older gateway omits model', () => {
+    const { api, stream, updateRouterExecutionModel, stop } = createHarness()
+
+    try {
+      api.handlers.onProviderActivity({
+        stream_seq: 1,
+        schema_version: 1,
+        phase: 'requesting',
+        reason: 'initial',
+        activity_id: 'legacy-activity',
+      })
+
+      expect(updateRouterExecutionModel).not.toHaveBeenCalled()
+      expect(stream.setStreamActivity).toHaveBeenCalledWith(
+        'Waiting for model',
+        'provider:requesting',
+      )
     } finally {
       stop()
     }

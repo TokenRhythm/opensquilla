@@ -3550,6 +3550,7 @@
     "aiModelEnsembleRouter": "AI-Modell-Ensemble-Router",
     "routerFx": {
       "selectedModel": "Router hat {model} ausgewählt",
+      "executionModel": "Aktuell ausgeführtes Modell: {model}",
       "ensembleModel": "Multi-Modell-Fusion",
       "ensembleSelecting": "AI-Modell-Ensemble-Router · Kandidaten werden gewählt",
       "ensembleHandedOff": "AI-Modell-Ensemble-Router · an Agent übergeben",
