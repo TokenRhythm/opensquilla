@@ -610,6 +610,7 @@
       "tests/test_gateway/test_usage_upgrade.py",
       "tests/test_gateway/test_user_input_broker.py",
       "tests/test_gateway/test_websocket_auth_payload.py",
+      "tests/test_gateway/test_websocket_close_coordination.py",
       "tests/test_gateway/test_websocket_frame_validation.py",
       "tests/test_gateway/test_websocket_handshake.py",
       "tests/test_gateway/test_websocket_request_concurrency.py",

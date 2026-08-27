@@ -73,6 +73,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_git_runtime.py",
     "tests/test_tools/test_gitless_write_tracking.py",
     "tests/test_gateway/test_artifact_product_errors.py",
+    "tests/test_gateway/test_websocket_close_coordination.py",
     "tests/test_scripts/test_bench_skill_integrity.py",
     "tests/test_skills_hash_consumers.py",
     "tests/test_skills/test_loader_turn_snapshot.py",
