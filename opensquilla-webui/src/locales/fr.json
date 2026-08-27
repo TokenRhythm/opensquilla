@@ -1679,6 +1679,7 @@
       "providerProfileRemoved": "{provider} a été supprimé.",
       "providerProfileRemovedImageEnv": "{provider} a été supprimé du service de modèles. La génération d’images reste disponible via {envKey}.",
       "providerProfileRemovedImageNeedsCredential": "{provider} a été supprimé. La génération d’images a conservé son fournisseur et son modèle, mais nécessite désormais un identifiant.",
+      "providerRemovedRouterDisabled": "{provider} a été supprimé. Le routage des modèles a été désactivé car ses niveaux enregistrés utilisent un autre fournisseur.",
       "providerCredentialRemoved": "Les identifiants de {provider} ont été supprimés.",
       "providerCredentialExternalStillActive": "La référence aux identifiants de {provider} enregistrée dans OpenSquilla a été supprimée, mais la variable d’environnement système {envKey} fournit toujours des identifiants.",
       "providerActivated": "{provider} est maintenant actif.",

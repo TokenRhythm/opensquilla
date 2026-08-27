@@ -1767,6 +1767,7 @@
       "providerProfileRemoved": "{provider} was removed.",
       "providerProfileRemovedImageEnv": "{provider} was removed from Model Service. Image generation remains available through {envKey}.",
       "providerProfileRemovedImageNeedsCredential": "{provider} was removed. Image generation kept its provider and model, but now needs a credential.",
+      "providerRemovedRouterDisabled": "{provider} was removed. Model Routing was turned off because its saved tiers use another provider.",
       "providerCredentialRemoved": "{provider} credential was removed.",
       "providerCredentialExternalStillActive": "Cleared {provider}'s saved credential reference, but system environment variable {envKey} is still providing a credential.",
       "providerActivated": "{provider} is now active.",

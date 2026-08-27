@@ -1679,6 +1679,7 @@
       "providerProfileRemoved": "{provider} を削除しました。",
       "providerProfileRemovedImageEnv": "モデルサービスから {provider} を削除しました。画像生成は {envKey} により引き続き利用できます。",
       "providerProfileRemovedImageNeedsCredential": "{provider} を削除しました。画像生成のプロバイダーとモデルは保持されていますが、認証情報の設定が必要です。",
+      "providerRemovedRouterDisabled": "{provider} を削除しました。保存済みの階層が別のプロバイダーを使用しているため、モデルルーティングをオフにしました。",
       "providerCredentialRemoved": "{provider} の認証情報を削除しました。",
       "providerCredentialExternalStillActive": "OpenSquilla に保存された {provider} の認証情報参照を削除しましたが、システム環境変数 {envKey} から引き続き認証情報が提供されています。",
       "providerActivated": "{provider} をアクティブにしました。",
