@@ -412,6 +412,50 @@ async def test_call_naming_llm_payload_and_sanitization(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("base_url", "expected_url"),
+    [
+        (
+            "https://open.bigmodel.cn/api/paas/v4/",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        ),
+        (
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/chat/completions",
+        ),
+        (
+            "https://compatible.example/api",
+            "https://compatible.example/api/v1/chat/completions",
+        ),
+        (
+            "https://compatible.example/api/",
+            "https://compatible.example/api/v1/chat/completions",
+        ),
+    ],
+)
+async def test_call_naming_llm_builds_versioned_api_url(
+    monkeypatch,
+    base_url,
+    expected_url,
+):
+    captured: dict = {}
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **kwargs: _fake_client(captured),
+    )
+
+    title = await call_naming_llm(
+        "Help me reset my password please",
+        model="naming-model",
+        api_key="test-key",
+        base_url=base_url,
+    )
+
+    assert title == "Reset my password"
+    assert captured["url"] == expected_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("provider", "base_url", "expected_max_tokens"),
     [
         ("tokenrhythm", "https://custom-tokenrhythm.example/v1", 1024),

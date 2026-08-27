@@ -327,10 +327,9 @@ async def call_naming_llm(
     if not api_key or not (first_message or "").strip():
         return None
 
-    url = base_url.rstrip("/")
-    if not url.endswith("/v1"):
-        url += "/v1"
-    url += "/chat/completions"
+    from opensquilla.provider._openai_compat_url import _versioned_api_url
+
+    url = _versioned_api_url(base_url, "/v1/chat/completions")
 
     system_prompt = _build_system_prompt(language)
     budget_provider = provider or (
