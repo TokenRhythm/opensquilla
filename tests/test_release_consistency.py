@@ -615,6 +615,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "synthetic retained chat",
         "LONG_SESSION_MESSAGE_COUNT = 320",
         "agent:main:webchat:release-recovery-long-session",
+        "agent:main:webchat:release-recovery-switch-session",
     ):
         assert artifact in probe
     for helper in (mac_helper, windows_helper):
@@ -624,8 +625,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "workspace" in helper
         assert "state" in helper
         assert "--label" in helper
-        assert "test-packaged-session-recovery.mjs" not in helper
-        assert "--session-key" not in helper
+        assert "test-packaged-session-recovery.mjs" in helper
+        assert "--session-key" in helper
+        assert "--switch-session-key" in helper
 
     assert "runtime/developer/darwin-arm64" in mac_helper
     assert "test ! -e \"${candidate_runtime}/developer\"" in mac_helper
@@ -665,6 +667,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "composer.isEditable()",
         "sendButton.isDisabled()",
         "expectedLastMessage",
+        "healthyNavigationSocketIds.size",
         "socketCount > 1",
     ):
         assert contract in session_recovery_smoke

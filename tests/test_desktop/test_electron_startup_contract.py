@@ -2643,6 +2643,7 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "sessions.messages.subscribe" in recovery
     assert "frame.params?.sessionKey === sessionKey" in recovery
     assert "frame.params?.key === sessionKey" in recovery
+    assert "switchSessionKey = requiredOption('--switch-session-key')" in recovery
     assert "let targetSocketCounted = false" in recovery
     assert recovery.count("countTargetSocket()") == 2
     assert "client.onMessage" in recovery
@@ -2651,6 +2652,7 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "client.send(message)" in recovery
     assert "page.clock" not in recovery
     assert "socketCount > 1" in recovery
+    assert "healthyNavigationSocketIds.size" in recovery
     assert "expectedLastMessage" in recovery
     assert "preservedDraft" in recovery
 

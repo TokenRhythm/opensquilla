@@ -7,6 +7,10 @@ import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRou
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { SessionSubscriptionResult } from '@/composables/chat/useChatSessionSubscription'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
+import {
+  beginSessionHandoffDiag,
+  finishSessionHandoffDiag,
+} from '@/utils/chat/sessionNavigationDiag'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -43,7 +47,14 @@ export interface UseChatSessionRuntimeOptions {
   usageModel: Ref<string>
   createSessionKey: (agentId?: string) => string
   persistSession: (key: string, options?: PersistSessionOptions) => void
-  cancelSessionBootstrap: () => void
+  beginSessionResolution?: (key: string) => void
+  cancelSessionBootstrap: (unsubscribe?: boolean) => void
+  setSessionHandoffTarget?: (
+    targetKey: string | null,
+    epoch: number,
+    outcome?: 'committed' | 'unchanged' | 'failed' | 'superseded',
+  ) => SessionBootstrapRun | undefined
+  resumeSessionBootstrap?: (run: SessionBootstrapRun) => void
   startSessionBootstrap: (options?: {
     includeHistory?: boolean
     force?: boolean
@@ -53,10 +64,16 @@ export interface UseChatSessionRuntimeOptions {
   setCompactInFlight: (active: boolean, key?: string) => void
   hideCompactStatus: () => void
   clearPendingQueue: () => void
-  switchPendingQueue: (targetSessionKey: string) => void | Promise<void>
+  switchPendingQueue: (
+    targetSessionKey: string,
+    shouldCommit?: () => boolean,
+    handoffSignal?: AbortSignal,
+  ) => void | Promise<void>
   adoptPendingQueue: (
     targetSessionKey: string,
     ownerRequestId: string,
+    shouldCommit?: () => boolean,
+    handoffSignal?: AbortSignal,
   ) => void | Promise<void>
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
@@ -79,6 +96,45 @@ function createEmptyUsage(): ChatUsageAccumulator {
 }
 
 export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
+  let handoffEpoch = 0
+  let handoffTargetKey = ''
+  let handoffController: AbortController | null = null
+
+  function beginHandoff(targetKey: string) {
+    handoffController?.abort()
+    const controller = new AbortController()
+    handoffController = controller
+    const epoch = ++handoffEpoch
+    handoffTargetKey = targetKey
+    beginSessionHandoffDiag(epoch, targetKey)
+    options.setSessionHandoffTarget?.(targetKey, epoch)
+    return { epoch, signal: controller.signal }
+  }
+
+  function isCurrentHandoff(
+    epoch: number,
+    targetKey: string,
+    sourceKey: string,
+  ) {
+    return (
+      handoffEpoch === epoch
+      && handoffTargetKey === targetKey
+      && options.sessionKey.value === sourceKey
+    )
+  }
+
+  function finishHandoff(
+    epoch: number,
+    outcome: 'committed' | 'unchanged' | 'failed' | 'superseded',
+  ) {
+    finishSessionHandoffDiag(epoch, outcome)
+    if (handoffEpoch !== epoch) return
+    handoffTargetKey = ''
+    handoffController = null
+    const resumed = options.setSessionHandoffTarget?.(null, epoch, outcome)
+    if (resumed) options.resumeSessionBootstrap?.(resumed)
+  }
+
   function resetLiveTurnState() {
     options.resetStreamLiveTurnState()
     options.aborted.value = false
@@ -126,16 +182,47 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       | { kind: 'navigate' }
       | { kind: 'response_handoff'; ownerRequestId: string },
   ): Promise<ResponseSessionAdoptionResult | undefined> {
-    if (!key || key === options.sessionKey.value) return
+    if (!key) return
+    const sourceKey = options.sessionKey.value
+    const { epoch, signal: handoffSignal } = beginHandoff(key)
+    if (key === sourceKey) {
+      finishHandoff(epoch, 'unchanged')
+      return
+    }
+    const shouldCommit = () => isCurrentHandoff(epoch, key, sourceKey)
 
+    try {
+      if (pendingQueuePolicy.kind === 'response_handoff') {
+        await options.adoptPendingQueue(
+          key,
+          pendingQueuePolicy.ownerRequestId,
+          shouldCommit,
+          handoffSignal,
+        )
+      } else {
+        const pendingQueueSwitch = options.switchPendingQueue(
+          key,
+          shouldCommit,
+          handoffSignal,
+        )
+        if (pendingQueueSwitch) await pendingQueueSwitch
+      }
+    } catch (error) {
+      finishHandoff(epoch, 'failed')
+      throw error
+    }
+    if (!shouldCommit()) {
+      finishHandoff(epoch, 'superseded')
+      return
+    }
+
+    // Commit is deliberately synchronous from the logical cancellation
+    // through the next bootstrap. unsubscribeSession sends its generation-
+    // pinned frame before cancelSessionBootstrap returns, so B never waits for
+    // A's ACK and no connected event can observe a half-switched route.
     options.cancelSessionBootstrap()
     resetCompactState()
-    if (pendingQueuePolicy.kind === 'response_handoff') {
-      await options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
-    } else {
-      const pendingQueueSwitch = options.switchPendingQueue(key)
-      if (pendingQueueSwitch) await pendingQueueSwitch
-    }
+    options.beginSessionResolution?.(key)
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = null
@@ -145,13 +232,22 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     // History and live are launched together by the coordinator but remain
     // orthogonal. Response hand-off only waits for the authoritative live
     // snapshot; history can recover independently without blocking adoption.
-    const bootstrap = options.startSessionBootstrap({ includeHistory: true })
+    let bootstrap: SessionBootstrapRun
+    try {
+      bootstrap = options.startSessionBootstrap({ includeHistory: true })
+    } finally {
+      finishHandoff(epoch, 'committed')
+    }
     // Usage is optional metadata. Start it once the critical request frames are
     // queued; a slow history response must not withhold the rest of the UI.
     void bootstrap.criticalRequestsQueued.then(() => {
-      if (options.sessionKey.value === key) void options.loadCurrentSessionUsage()
+      if (
+        handoffEpoch === epoch
+        && options.sessionKey.value === key
+      ) void options.loadCurrentSessionUsage()
     })
     const subscriptionOutcome = await bootstrap.live
+    if (handoffEpoch !== epoch || options.sessionKey.value !== key) return
     return {
       authoritative: subscriptionOutcome?.authoritative === true,
       authoritativeIdle: subscriptionOutcome?.authoritative === true
@@ -174,17 +270,34 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     guard: DraftSessionRebindGuard,
   ): Promise<SessionSubscriptionResult> {
     const sourceSessionKey = options.sessionKey.value
-    if (!key || key === sourceSessionKey || !guard(sourceSessionKey)) return false
-
-    options.cancelSessionBootstrap()
-    if (options.sessionKey.value !== sourceSessionKey) return false
-    if (!guard(sourceSessionKey)) {
-      return options.startSessionBootstrap({ includeHistory: false, force: true }).live
+    if (!key || !guard(sourceSessionKey)) return false
+    const { epoch, signal: handoffSignal } = beginHandoff(key)
+    if (key === sourceSessionKey) {
+      finishHandoff(epoch, 'unchanged')
+      return false
     }
+    const shouldCommit = () => (
+      isCurrentHandoff(epoch, key, sourceSessionKey)
+      && guard(sourceSessionKey)
+    )
 
+    try {
+      const pendingQueueSwitch = options.switchPendingQueue(
+        key,
+        shouldCommit,
+        handoffSignal,
+      )
+      if (pendingQueueSwitch) await pendingQueueSwitch
+    } catch (error) {
+      finishHandoff(epoch, 'failed')
+      throw error
+    }
+    if (!shouldCommit()) {
+      finishHandoff(epoch, 'superseded')
+      return false
+    }
+    options.cancelSessionBootstrap()
     resetCompactState()
-    const pendingQueueSwitch = options.switchPendingQueue(key)
-    if (pendingQueueSwitch) await pendingQueueSwitch
     // A recovered provisional draft remains a draft: do not write it to the URL
     // or active-session storage before the first accepted send.
     options.sessionKey.value = key
@@ -193,17 +306,42 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.applySessionRunState({ run_status: 'idle' })
     resetSessionViewState()
     options.restoreWidgetState()
-    return options.startSessionBootstrap({ includeHistory: false }).live
+    let live: Promise<SessionSubscriptionResult>
+    try {
+      live = options.startSessionBootstrap({ includeHistory: false }).live
+    } finally {
+      finishHandoff(epoch, 'committed')
+    }
+    const outcome = await live
+    return handoffEpoch === epoch && options.sessionKey.value === key
+      ? outcome
+      : false
   }
 
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
   async function startDraftSession(agentId?: string) {
-    options.cancelSessionBootstrap()
     const key = options.createSessionKey(agentId)
+    const sourceKey = options.sessionKey.value
+    const { epoch, signal: handoffSignal } = beginHandoff(key)
+    const shouldCommit = () => isCurrentHandoff(epoch, key, sourceKey)
+    try {
+      const pendingQueueSwitch = options.switchPendingQueue(
+        key,
+        shouldCommit,
+        handoffSignal,
+      )
+      if (pendingQueueSwitch) await pendingQueueSwitch
+    } catch (error) {
+      finishHandoff(epoch, 'failed')
+      throw error
+    }
+    if (!shouldCommit()) {
+      finishHandoff(epoch, 'superseded')
+      return
+    }
+    options.cancelSessionBootstrap()
     resetCompactState()
-    const pendingQueueSwitch = options.switchPendingQueue(key)
-    if (pendingQueueSwitch) await pendingQueueSwitch
     options.sessionKey.value = key
     resetSessionRuntimeState()
     // A brand-new provisional key cannot own a durable Gateway task yet. Its
@@ -212,7 +350,11 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.pendingSessionIntent.value = 'new_chat'
     options.resetDraftComposer?.()
     resetSessionViewState()
-    options.startSessionBootstrap({ includeHistory: false })
+    try {
+      options.startSessionBootstrap({ includeHistory: false })
+    } finally {
+      finishHandoff(epoch, 'committed')
+    }
   }
 
   return {

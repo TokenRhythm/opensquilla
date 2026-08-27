@@ -147,12 +147,14 @@
           v-else-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
+          :transport-state="rpc.state"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
           v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
+          :transport-state="rpc.state"
           @retry="retryLive"
         />
         <div
@@ -912,14 +914,18 @@ import {
   useChatRunModePreference,
   type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
-import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
-import {
-  autoSendDraftIsUnchanged,
-  rpcErrorCode,
-} from '@/composables/chat/sessionBootstrapContract'
+ import {
+   useChatSessionBootstrap,
+   type SessionBootstrapRun,
+ } from '@/composables/chat/useChatSessionBootstrap'
+ import {
+   autoSendDraftIsUnchanged,
+   rpcErrorCode,
+ } from '@/composables/chat/sessionBootstrapContract'
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
+  optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
   runModeWriteRpcCallOptions,
   sandboxSetupRpcCallOptions,
@@ -2268,6 +2274,7 @@ const chatHistory = useChatHistory({
   preserveLiveTail: preserveHistoryLiveTail,
   autoScroll,
   scrollEpoch,
+  canApplyViewportCorrection: () => !historyNavigationScrollLock.locked,
   stripTimePrefix,
   scrollToBottom,
   onTerminalTask: outcome => {
@@ -2583,6 +2590,7 @@ const {
   retryHistory: retryHistoryCoordinator,
   retryLive: retryLiveCoordinator,
   handleConnectionState: handleSessionConnectionStateCoordinator,
+  setSessionHandoffTarget,
   isSessionBootstrapCurrent,
 } = chatSessionBootstrap
 
@@ -2640,16 +2648,52 @@ function schedulePostBootstrapMetadata(
   })
 }
 
+function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: string): T {
+  const tracked = trackSessionBootstrapAdmission(run)
+  // The subscription snapshot normally carries routing. Older Gateways may
+  // omit it, so queue a bounded fallback only after the critical live/history
+  // frames. A session-key watcher must never put routing.get in front of the
+  // target subscribe during a same-socket handoff.
+  void tracked.criticalRequestsQueued.then(() => {
+    if (
+      chatViewDisposed
+      || sessionKey.value !== key
+      || !isSessionBootstrapCurrent(tracked.generation, key)
+      || chatSessionRouting.hasAuthoritativeSnapshot.value
+    ) return
+    void chatSessionRouting.load()
+  })
+  schedulePostBootstrapMetadata(tracked, key)
+  return tracked
+}
+
 function startSessionBootstrap(options?: {
   includeHistory?: boolean
   force?: boolean
 }) {
   const key = sessionKey.value
-  const run = trackSessionBootstrapAdmission(
-    startSessionBootstrapCoordinator(options),
-  )
-  schedulePostBootstrapMetadata(run, key)
-  return run
+  return bindSessionBootstrapRun(startSessionBootstrapCoordinator(options), key)
+}
+
+function resumeSessionBootstrap(run: SessionBootstrapRun) {
+  const key = sessionKey.value
+  const tracked = bindSessionBootstrapRun(run, key)
+  void tracked.live.then(outcome => {
+    if (
+      outcome.authoritative
+      && sessionKey.value === key
+      && isSessionBootstrapCurrent(tracked.generation, key)
+    ) void handleAuthoritativeSessionSubscription(key)
+  }).catch(() => {})
+  void tracked.criticalRequestsQueued.then(() => {
+    if (
+      chatViewDisposed
+      || sessionKey.value !== key
+      || !isSessionBootstrapCurrent(tracked.generation, key)
+    ) return
+    void loadCurrentSessionUsage()
+    void refreshPostBootstrapMetadata()
+  })
 }
 
 function retryHistory() {
@@ -2660,9 +2704,9 @@ function retryLive() {
   return retryLiveCoordinator()
 }
 
-function cancelSessionBootstrap() {
+function cancelSessionBootstrap(unsubscribe = true) {
   optionalRpcAdmissionGeneration += 1
-  cancelSessionBootstrapCoordinator()
+  cancelSessionBootstrapCoordinator(unsubscribe)
 }
 
 function handleSessionConnectionState(
@@ -2794,13 +2838,16 @@ const chatSessionRuntime = useChatSessionRuntime({
   usageModel,
   createSessionKey,
   persistSession,
-  cancelSessionBootstrap: () => {
+  beginSessionResolution: activeProjectWorkspace.beginSessionResolution,
+  cancelSessionBootstrap: (unsubscribe = true) => {
     // Retire draft-project work on the old socket before the next session's
     // coordinator can start, so its abort/reconnect cannot tear down B.
     draftProjectHydration.invalidate()
     cancelActiveProjectValidation()
-    cancelSessionBootstrap()
+    cancelSessionBootstrap(unsubscribe)
   },
+  setSessionHandoffTarget,
+  resumeSessionBootstrap,
   startSessionBootstrap,
   loadCurrentSessionUsage,
   applySessionRunState,
@@ -2829,9 +2876,6 @@ const {
 switchToPlanSession = switchToSession
 
 async function switchToSession(nextSessionKey: string) {
-  if (nextSessionKey !== sessionKey.value) {
-    activeProjectWorkspace.beginSessionResolution(nextSessionKey)
-  }
   const outcome = await switchRuntimeToSession(nextSessionKey)
   if (outcome?.authoritative) {
     await handleAuthoritativeSessionSubscription(nextSessionKey)
@@ -6294,7 +6338,7 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
         timeoutMs: Math.max(1, deadlineAt - Date.now()),
         signal: controller.signal,
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       })
       if (!recovered) {
         if (!controller.signal.aborted && sessionKey.value === key) {
@@ -6312,7 +6356,7 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
       timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
+      abortAction: 'reject',
     })
     if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
@@ -6376,14 +6420,14 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     await rpc.waitForConnection(
       Math.max(1, deadlineAt - Date.now()),
       controller.signal,
-      { timeoutAction: 'reconnect', abortAction: 'reconnect' },
+      { timeoutAction: 'reject', abortAction: 'reject' },
     )
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
       timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
+      abortAction: 'reject',
     })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     const workspace = projectWorkspaces.byId.value.get(workspaceId)
@@ -6681,6 +6725,7 @@ onUnmounted(() => {
   metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
   cancelSessionBootstrap()
+  pendingSessionOptionalReads = null
   releaseOptionalRpcAdmission?.()
   releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
@@ -6879,6 +6924,57 @@ watch(() => [route.query.newChat, route.query.new], () => {
   if (hasLegacyNewChatQuery()) goToDraft({ replace: true })
 })
 
+type SessionOptionalReadRequest = {
+  key: string
+  artifactMode: 'load' | 'reconnect'
+  forceAnnotations: boolean
+}
+
+let pendingSessionOptionalReads: SessionOptionalReadRequest | null = null
+
+function flushSessionOptionalReads() {
+  if (!optionalSessionRpcAllowed.value) return
+  const pending = pendingSessionOptionalReads
+  pendingSessionOptionalReads = null
+  if (
+    !pending
+    || chatViewDisposed
+    || pending.key !== sessionKey.value
+  ) return
+  if (pending.key && pendingSessionIntent.value !== 'new_chat') {
+    void (pending.artifactMode === 'reconnect'
+      ? loadSessionArtifactsAfterReconnect()
+      : loadSessionArtifacts())
+  }
+  if (pending.key && promptAnnotationsEnabled.value) {
+    void artifactPromptAnnotationsStore.load(
+      pending.key,
+      pending.forceAnnotations ? { force: true } : undefined,
+    )
+  }
+}
+
+function scheduleSessionOptionalReads(request: SessionOptionalReadRequest) {
+  const existing = pendingSessionOptionalReads
+  pendingSessionOptionalReads = existing?.key === request.key
+    ? {
+        key: request.key,
+        artifactMode: existing.artifactMode === 'reconnect'
+          ? 'reconnect'
+          : request.artifactMode,
+        forceAnnotations: existing.forceAnnotations || request.forceAnnotations,
+      }
+    : request
+  flushSessionOptionalReads()
+}
+
+// `startSessionBootstrap()` closes this gate only after subscribe/snapshot are
+// queued. A pre-flush session watcher can otherwise enqueue optional reads in
+// front of B's subscribe on a legacy serial Gateway.
+watch(optionalSessionRpcAllowed, admitted => {
+  if (admitted) flushSessionOptionalReads()
+}, { flush: 'sync' })
+
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
   // Retire any in-flight page walk and clear the old Session before starting
@@ -6886,10 +6982,11 @@ watch(sessionKey, () => {
   resetSessionArtifacts()
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
-  if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
-  if (sessionKey.value && promptAnnotationsEnabled.value) {
-    void artifactPromptAnnotationsStore.load(sessionKey.value)
-  }
+  scheduleSessionOptionalReads({
+    key: sessionKey.value,
+    artifactMode: 'load',
+    forceAnnotations: false,
+  })
 })
 
 // Hello refreshes method capabilities on reconnect. Retry the durable index
@@ -6901,10 +6998,11 @@ watch(() => rpc.state, (state, previous) => {
     sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
   ) {
-    void loadSessionArtifactsAfterReconnect()
-    if (promptAnnotationsEnabled.value) {
-      void artifactPromptAnnotationsStore.load(sessionKey.value, { force: true })
-    }
+    scheduleSessionOptionalReads({
+      key: sessionKey.value,
+      artifactMode: 'reconnect',
+      forceAnnotations: true,
+    })
   }
 })
 

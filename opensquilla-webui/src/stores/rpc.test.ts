@@ -9,11 +9,14 @@ const clients: Array<{
   emit: (event: string, ...args: unknown[]) => void
   disconnect: ReturnType<typeof vi.fn>
   waitForConnection: ReturnType<typeof vi.fn>
+  recoverConnectionGeneration: ReturnType<typeof vi.fn>
+  connectionGeneration: number
 }> = []
 
 vi.mock('@/lib/rpc', () => ({
   RpcClient: class {
     state = 'disconnected'
+    connectionGeneration = 0
     private listeners = new Map<string, Array<(...args: unknown[]) => void>>()
 
     constructor() {
@@ -22,6 +25,7 @@ vi.mock('@/lib/rpc', () => ({
 
     connect(url: string, token?: string) {
       connectCalls.push({ url, token })
+      this.connectionGeneration += 1
       this.state = 'connected'
       this.emit('_state', 'connected')
     }
@@ -44,6 +48,7 @@ vi.mock('@/lib/rpc', () => ({
       this.emit('_state', 'disconnected')
     })
     waitForConnection = vi.fn()
+    recoverConnectionGeneration = vi.fn(() => true)
     call = vi.fn()
   },
 }))
@@ -101,6 +106,24 @@ describe('rpc link-token bootstrap', () => {
       controller.signal,
       { abortAction: 'reconnect' },
     )
+  })
+
+  it('forwards generation-fenced subscription recovery to the live client', () => {
+    const store = useRpcStore()
+    store.init()
+
+    expect(store.connectionGeneration).toBe(1)
+    expect(store.recoverConnectionGeneration(1, 'subscription release failed')).toBe(true)
+    expect(clients[0].recoverConnectionGeneration).toHaveBeenCalledWith(
+      1,
+      'subscription release failed',
+    )
+
+    // RpcClient callbacks mutate the raw class instance. A cached computed
+    // getter would stay at generation 1 and incorrectly fence later leases.
+    clients[0].connectionGeneration = 3
+    clients[0].emit('_state', 'connected')
+    expect(store.connectionGeneration).toBe(3)
   })
 
   it('reconnects with a URL token when an already-loaded app navigates to a token link', () => {

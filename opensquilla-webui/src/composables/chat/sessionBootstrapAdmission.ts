@@ -20,7 +20,9 @@ export const optionalSessionRpcCallOptions: RpcCallOptions = {
   // active stream. If a request is genuinely stuck, the Gateway's serialized
   // dispatcher cannot serve later frames, so reconnect as a last resort.
   timeoutAction: 'reconnect',
-  abortAction: 'reconnect',
+  // Navigation owns this waiter/request, never the shared transport. A
+  // superseded Session may abandon its result without recycling the socket.
+  abortAction: 'reject',
 }
 
 // The first setup-status read can queue behind the live Windows capability
@@ -59,8 +61,11 @@ export function waitForSessionRpcConnection(
     callOptions.timeoutMs,
     callOptions.signal,
     {
-      timeoutAction: callOptions.timeoutAction,
-      abortAction: callOptions.abortAction,
+      // The transport-owned challenge/Hello watchdogs decide when a handshake
+      // is unhealthy. Optional UI waiters timing out or being superseded must
+      // not preempt those generation-fenced watchdogs.
+      timeoutAction: 'reject',
+      abortAction: 'reject',
     },
   )
 }

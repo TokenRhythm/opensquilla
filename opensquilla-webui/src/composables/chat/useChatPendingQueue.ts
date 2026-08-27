@@ -1337,10 +1337,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return result !== false
   }
 
-  function switchPendingQueue(targetSessionKey: string): void | Promise<void> {
+  function switchPendingQueue(
+    targetSessionKey: string,
+    shouldCommit: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
+  ): void | Promise<void> {
     if (reorderCommitPromise) {
-      return reorderCommitPromise.then(() => switchPendingQueue(targetSessionKey))
+      return reorderCommitPromise.then(() => {
+        if (!shouldCommit()) return
+        return switchPendingQueue(targetSessionKey, shouldCommit, handoffSignal)
+      })
     }
+    if (!shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
@@ -1398,17 +1406,26 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function acceptDurableHandoff(
     targetSessionKey: string,
     ownerRequestId: string,
+    shouldApply: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
   ): Promise<boolean> {
     if (!options.pendingInputWal?.acceptHandoff) return false
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
+      if (!shouldApply()) return false
       if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
     }
+    if (!shouldApply()) return false
     const commit = await options.pendingInputWal.acceptHandoff(
       ownerRequestId,
       targetSessionKey,
+      shouldApply,
+      handoffSignal,
     )
-    applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
+    if (!commit) return false
+    if (shouldApply()) {
+      applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
+    }
     return true
   }
 
@@ -1444,15 +1461,27 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  async function adoptPendingQueue(targetSessionKey: string, ownerRequestId: string) {
+  async function adoptPendingQueue(
+    targetSessionKey: string,
+    ownerRequestId: string,
+    shouldCommit: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
+  ) {
     if (reorderCommitPromise) await reorderCommitPromise
     else cancelPendingReorder()
-    clearPendingDrainAfterTerminalTimer()
+    if (!shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
     const durableCommitApplied = await acceptDurableHandoff(
       targetSessionKey,
       ownerRequestId,
+      shouldCommit,
+      handoffSignal,
     )
+    if (!shouldCommit()) return
+    // The source queue still owns its terminal drain signal until the durable
+    // handoff has committed and this epoch is current. Clearing it before the
+    // await would strand A if IndexedDB failed or A→B was superseded by A.
+    clearPendingDrainAfterTerminalTimer()
     const carried: ChatPendingItem[] = []
     const stayingVisible: ChatPendingItem[] = []
     const stayingHidden: ChatPendingItem[] = []

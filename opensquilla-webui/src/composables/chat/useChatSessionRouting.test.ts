@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionRouting } from './useChatSessionRouting'
+import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
 import type {
   ImageInputAdmission,
   ModelRoutingCapabilitiesByMode,
@@ -108,7 +109,15 @@ describe('useChatSessionRouting', () => {
 
     await api.load()
 
-    expect(rpc.call).toHaveBeenCalledWith('sessions.routing.get', { sessionKey: SESSION_ONE })
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sessions.routing.get',
+      { sessionKey: SESSION_ONE },
+      {
+        timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
+    )
     expect(api.mode.value).toBe('llm_ensemble')
     expect(api.revision.value).toBe(0)
     expect(api.hasAuthoritativeSnapshot.value).toBe(true)
@@ -228,7 +237,6 @@ describe('useChatSessionRouting', () => {
   it('keeps a repeated durable selection out of the busy mutation path', async () => {
     const { api, rpc } = harness()
     api.applyBootstrap({ key: SESSION_ONE, mode: 'router', revision: 2 })
-    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalled())
     rpc.call.mockClear()
 
     await expect(api.setMode('squilla_router')).resolves.toBe(true)
@@ -264,10 +272,10 @@ describe('useChatSessionRouting', () => {
     })
 
     const selected = api.setMode('off')
-    await vi.waitFor(() => expect(pendingGets.length).toBeGreaterThanOrEqual(2))
+    await vi.waitFor(() => expect(pendingGets).toHaveLength(1))
     expect(api.busy.value).toBe(true)
     await expect(api.setMode('llm_ensemble')).resolves.toBe(false)
-    expect(pendingGets).toHaveLength(2)
+    expect(pendingGets).toHaveLength(1)
     pendingGets.forEach(resolve => resolve({ key: SESSION_ONE, mode: 'ensemble', revision: 0 }))
 
     await expect(selected).resolves.toBe(true)

@@ -23,6 +23,7 @@ import {
 } from '@/utils/chat/historyMerge'
 import {
   captureVisibleMessageAnchor,
+  createScrollHandoffGuard,
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
@@ -64,12 +65,15 @@ type RpcClient = {
 }
 
 function historyTerminationActions(rpc: RpcClient) {
-  const action = rpc.policy?.concurrent_history_reads === true
+  const timeoutAction = rpc.policy?.concurrent_history_reads === true
     ? 'reject' as const
     : 'reconnect' as const
   return {
-    timeoutAction: action,
-    abortAction: action,
+    // A request that was actually sent to a legacy serial Gateway may need a
+    // bounded reconnect to escape a stuck handler. Navigation cancellation is
+    // request-local and must never own the shared WebSocket lifecycle.
+    timeoutAction,
+    abortAction: 'reject' as const,
   }
 }
 
@@ -673,6 +677,8 @@ export interface UseChatHistoryOptions {
   autoScroll?: Ref<boolean>
   /** Invalidates deferred anchor work when the reused chat viewport changes session. */
   scrollEpoch?: Ref<number>
+  /** Lets application-owned navigation take precedence over deferred viewport corrections. */
+  canApplyViewportCorrection?: () => boolean
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
   onTerminalTask?: (outcome: ChatTurnOutcome) => void
@@ -1027,9 +1033,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       await options.rpc.waitForConnection(
         phaseTimeoutMs(bootstrap, 'chat.history'),
         bootstrap.signal,
-        nonReconnecting
-          ? nonReconnectingHistoryActions()
-          : historyTerminationActions(options.rpc),
+        // Waiting has not enqueued a history handler. Let the transport-owned
+        // handshake watchdog decide whether this generation is unhealthy.
+        nonReconnectingHistoryActions(),
       )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
@@ -1280,9 +1286,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         return { ok: true }
       }
 
-      const prependContainer = params.prepend ? options.threadRef?.value ?? null : null
-      const prependAnchor = captureVisibleMessageAnchor(prependContainer)
-      const prependFallbackHeight = prependAnchor ? 0 : prependContainer?.scrollHeight ?? 0
+      const followingLiveEdge = !params.prepend && (options.autoScroll?.value ?? true)
+      const historyContainer = options.threadRef?.value ?? null
+      const visibleAnchor = !followingLiveEdge
+        ? captureVisibleMessageAnchor(historyContainer)
+        : null
+      const prependFallbackHeight = visibleAnchor ? 0 : historyContainer?.scrollHeight ?? 0
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
@@ -1326,29 +1335,68 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
 
-      if (params.prepend) {
+      if (visibleAnchor) {
         await nextTick()
         if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        if (prependAnchor) {
-          restoreMessageAnchor(prependAnchor)
-          stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
+        if (
+          (options.canApplyViewportCorrection?.() ?? true)
+          && restoreMessageAnchor(visibleAnchor)
+        ) {
+          stopAnchorStabilization = stabilizeMessageAnchor(visibleAnchor, {
             isCurrent: () => options.sessionKey.value === key
               && historySessionKey.value === key
               && historyRequestSeq === requestSeq
               && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
-              && options.threadRef?.value === prependContainer,
-          })
-        } else if (prependContainer) {
-          applyProgrammaticScroll(prependContainer, () => {
-            prependContainer.scrollTop += Math.max(
-              0,
-              prependContainer.scrollHeight - prependFallbackHeight,
-            )
+              && options.threadRef?.value === historyContainer
+              && (options.canApplyViewportCorrection?.() ?? true),
           })
         }
-      } else if (options.autoScroll?.value ?? true) {
+      } else if (params.prepend && historyContainer) {
         await nextTick()
-        options.scrollToBottom()
+        if (!isCurrentRequest()) return { ok: false, cancelled: true }
+        applyProgrammaticScroll(historyContainer, () => {
+          historyContainer.scrollTop += Math.max(
+            0,
+            historyContainer.scrollHeight - prependFallbackHeight,
+          )
+        })
+      } else if (followingLiveEdge) {
+        // Message assignment is one synchronous commit. Install the input
+        // guard immediately afterwards and before yielding to layout.
+        const liveEdgeGuard = historyContainer
+          ? createScrollHandoffGuard(historyContainer)
+          : null
+        try {
+          await nextTick()
+          if (!isCurrentRequest()) return { ok: false, cancelled: true }
+          if (
+            !liveEdgeGuard?.isCancelled()
+            && (options.canApplyViewportCorrection?.() ?? true)
+            && (
+              !historyContainer
+              || (
+                historyContainer.isConnected
+                && options.threadRef?.value === historyContainer
+              )
+            )
+          ) {
+            // The long-history virtualizer may clamp scrollTop while replacing
+            // its rows. That layout event is not reader intent, so restore the
+            // live-edge ownership captured before the commit and mark the
+            // correction as application-owned.
+            if (options.autoScroll) options.autoScroll.value = true
+            if (historyContainer) {
+              applyProgrammaticScroll(historyContainer, () => {
+                historyContainer.scrollTop = historyContainer.scrollHeight
+              })
+              liveEdgeGuard?.acceptCurrentPosition()
+            } else {
+              options.scrollToBottom()
+            }
+          }
+        } finally {
+          liveEdgeGuard?.dispose()
+        }
       }
       // Keep reconnect catch-up moving even when no later live event arrives.
       // Each scheduled request is still bounded to MAX_FORWARD_BRIDGE_PAGES,

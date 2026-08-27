@@ -104,8 +104,8 @@ describe('useChatRunModePreference', () => {
       2_000,
       undefined,
       {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        timeoutAction: 'reject',
+        abortAction: 'reject',
       },
     )
     expect(api.runMode.value).toBe('safe')

@@ -44,6 +44,238 @@ function createSubscription(hasActiveInterrupt = false) {
 }
 
 describe('useChatSessionSubscription', () => {
+  it('keeps a sent subscribe correlated while releasing its generation-pinned lease', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const order: string[] = []
+    let resolveSubscribe!: (value: Record<string, unknown>) => void
+    const subscribeResponse = new Promise<Record<string, unknown>>(resolve => {
+      resolveSubscribe = resolve
+    })
+    const recoverConnectionGeneration = vi.fn()
+    const call = vi.fn((
+      method: string,
+      _params?: Record<string, unknown>,
+      callOptions?: RpcCallOptions,
+    ) => {
+      order.push(method)
+      callOptions?.onSent?.(7)
+      if (method === 'sessions.messages.subscribe') return subscribeResponse
+      return Promise.resolve({ unsubscribed: true })
+    })
+    const rpc = {
+      connectionGeneration: 7,
+      recoverConnectionGeneration,
+      waitForConnection: vi.fn(async () => {}),
+      call: call as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey,
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+    const controller = new AbortController()
+    const subscribe = subscription.subscribeSession({
+      generation: 1,
+      key: sessionKey.value,
+      attempt: 0,
+      deadlineAt: Date.now() + 7_000,
+      attemptDeadlineAt: Date.now() + 7_000,
+      signal: controller.signal,
+      skipSnapshot: false,
+    })
+    await vi.waitFor(() => expect(order).toEqual(['sessions.messages.subscribe']))
+
+    controller.abort()
+    subscription.cancelActiveSubscription()
+    const release = subscription.unsubscribeSession(sessionKey.value)
+
+    expect(order).toEqual([
+      'sessions.messages.subscribe',
+      'sessions.messages.unsubscribe',
+    ])
+    const subscribeOptions = call.mock.calls[0]?.[2]
+    const unsubscribeOptions = call.mock.calls[1]?.[2]
+    expect(subscribeOptions?.signal).toBeUndefined()
+    expect(unsubscribeOptions?.expectedGeneration).toBe(7)
+
+    resolveSubscribe({
+      subscribed: true,
+      hydration_complete: true,
+      run_status: 'idle',
+      current_stream_seq: 0,
+      replay_complete: true,
+    })
+    await Promise.all([subscribe, release])
+    expect(recoverConnectionGeneration).not.toHaveBeenCalled()
+  })
+
+  it('does not send an old lease release on a replacement generation', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    let generation = 4
+    const call = vi.fn(async (
+      method: string,
+      _params?: Record<string, unknown>,
+      callOptions?: RpcCallOptions,
+    ) => {
+      callOptions?.onSent?.(generation)
+      return method === 'sessions.messages.subscribe'
+        ? {
+            subscribed: true,
+            hydration_complete: true,
+            run_status: 'idle',
+            current_stream_seq: 0,
+            replay_complete: true,
+          }
+        : { unsubscribed: true }
+    })
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      get connectionGeneration() { return generation },
+      recoverConnectionGeneration: vi.fn(),
+      waitForConnection: vi.fn(async () => {}),
+      call: call as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey,
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+    generation = 5
+    await subscription.unsubscribeSession(sessionKey.value)
+
+    expect(call.mock.calls.map(([method]) => method)).toEqual([
+      'sessions.messages.subscribe',
+    ])
+  })
+
+  it('recovers only the generation whose unsubscribe explicitly failed', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const recoverConnectionGeneration = vi.fn()
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      connectionGeneration: 9,
+      recoverConnectionGeneration,
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn(async (
+        method: string,
+        _params?: Record<string, unknown>,
+        callOptions?: RpcCallOptions,
+      ) => {
+        callOptions?.onSent?.(9)
+        if (method === 'sessions.messages.unsubscribe') {
+          throw new Error('release failed')
+        }
+        return {
+          subscribed: true,
+          hydration_complete: true,
+          run_status: 'idle',
+          current_stream_seq: 0,
+          replay_complete: true,
+        }
+      }) as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey,
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+    await subscription.unsubscribeSession(sessionKey.value)
+
+    expect(recoverConnectionGeneration).toHaveBeenCalledWith(
+      9,
+      'Failed to release the previous session subscription',
+    )
+  })
+
+  it('does not recycle a healthy generation for an ambiguous unsubscribe timeout', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const recoverConnectionGeneration = vi.fn()
+    const call = vi.fn(async (
+      method: string,
+      _params?: Record<string, unknown>,
+      callOptions?: RpcCallOptions,
+    ) => {
+      callOptions?.onSent?.(11)
+      if (method === 'sessions.messages.unsubscribe') {
+        throw new RpcTimeoutError(method, SESSION_PHASE_ATTEMPT_BUDGET_MS)
+      }
+      return {
+        subscribed: true,
+        hydration_complete: true,
+        run_status: 'idle',
+        current_stream_seq: 0,
+        replay_complete: true,
+      }
+    })
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      connectionGeneration: 11,
+      recoverConnectionGeneration,
+      waitForConnection: vi.fn(async () => {}),
+      call: call as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey,
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+    await subscription.unsubscribeSession(sessionKey.value)
+
+    const unsubscribeCall = call.mock.calls.find(([method]) => (
+      method === 'sessions.messages.unsubscribe'
+    ))
+    expect(unsubscribeCall?.[2]).toMatchObject({
+      timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+      expectedGeneration: 11,
+    })
+    expect(recoverConnectionGeneration).not.toHaveBeenCalled()
+  })
+
   it('preserves same-turn capability across compact lifecycle updates for the same task', () => {
     const runStatus = ref<ChatRunStatus>({
       status: 'running',
@@ -147,6 +379,7 @@ describe('useChatSessionSubscription', () => {
         since_stream_seq: 0,
         fast_ack: true,
       },
+      { onSent: expect.any(Function) },
     )
     expect(rpc.call).toHaveBeenNthCalledWith(
       2,
@@ -373,7 +606,7 @@ describe('useChatSessionSubscription', () => {
       key: 'agent:main:webchat:resume',
       since_stream_seq: 0,
       fast_ack: true,
-    })
+    }, { onSent: expect.any(Function) })
     expect(rpc.call).toHaveBeenNthCalledWith(2, 'sessions.messages.snapshot', {
       key: 'agent:main:webchat:resume',
     })
@@ -1315,14 +1548,18 @@ describe('useChatSessionSubscription', () => {
 
     await expect(subscription.retrySessionMetadata()).resolves.toBe(true)
 
-    expect(rpc.waitForConnection).toHaveBeenCalledOnce()
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.any(AbortSignal),
+      { timeoutAction: 'reject', abortAction: 'reject' },
+    )
     expect(rpc.call).toHaveBeenCalledOnce()
     expect(rpc.call).toHaveBeenCalledWith(
       'sessions.messages.hydrate',
       { key: 'agent:main:webchat:metadata-retry' },
       expect.objectContaining({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       }),
     )
     expect(onSessionMetadata).toHaveBeenCalledWith(

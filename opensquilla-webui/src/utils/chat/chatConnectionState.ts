@@ -2,17 +2,14 @@ export type RpcConnectionState = 'disconnected' | 'connecting' | 'connected'
 export type ChatLiveConnectionPhase = 'idle' | 'connecting' | 'ready' | 'degraded'
 
 /**
- * A healthy WebSocket is necessary but not sufficient for live chat. The
- * topbar must stay non-green while the current session subscription is still
- * recovering or has degraded to history-only mode.
+ * The topbar reports physical Gateway transport only. Session subscription
+ * recovery is rendered inside ChatView so a healthy shared socket is never
+ * described as reconnecting during workspace navigation.
  */
 export function effectiveChatConnectionState(
   rpcState: RpcConnectionState,
-  livePhase: ChatLiveConnectionPhase,
-  chatRoute: boolean,
+  _livePhase: ChatLiveConnectionPhase,
+  _chatRoute: boolean,
 ): RpcConnectionState {
-  if (!chatRoute || rpcState !== 'connected') return rpcState
-  if (livePhase === 'connecting') return 'connecting'
-  if (livePhase === 'degraded') return 'disconnected'
-  return 'connected'
+  return rpcState
 }

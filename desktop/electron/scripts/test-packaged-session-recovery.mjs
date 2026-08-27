@@ -14,6 +14,7 @@ const SESSION_RECOVERY_TIMEOUT_MS = 30_000
 const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const sessionKey = requiredOption('--session-key')
+const switchSessionKey = requiredOption('--switch-session-key')
 const label = requiredOption('--label')
 
 if (!/^[A-Za-z0-9._-]{1,80}$/.test(label)) {
@@ -25,8 +26,12 @@ const expectedLastMessage =
 const preservedDraft = 'Synthetic draft preserved through packaged session recovery.'
 
 let app
-let injectHang = true
+let injectHang = false
 let socketCount = 0
+let nextSocketIndex = 0
+let healthyCloseCount = 0
+const healthyNavigationSocketIds = new Set()
+const healthySubscribeKeys = []
 let heldHistoryRequests = 0
 let heldSubscribeRequests = 0
 let serverTickCount = 0
@@ -44,6 +49,7 @@ try {
     },
   })
   await app.context().routeWebSocket(/\/ws$/, (client) => {
+    const socketIndex = nextSocketIndex++
     let targetSocketCounted = false
     const countTargetSocket = () => {
       if (targetSocketCounted) return
@@ -52,9 +58,22 @@ try {
     }
     const server = client.connectToServer()
 
+    client.onClose(() => {
+      if (!injectHang) healthyCloseCount += 1
+    })
+
     client.onMessage((message) => {
       try {
         const frame = JSON.parse(String(message))
+        if (
+          frame?.type === 'req'
+          && frame.method === 'sessions.messages.subscribe'
+          && !injectHang
+          && [sessionKey, switchSessionKey].includes(frame.params?.key)
+        ) {
+          healthyNavigationSocketIds.add(socketIndex)
+          healthySubscribeKeys.push(frame.params.key)
+        }
         if (frame?.type === 'req' && injectHang) {
           if (
             frame.method === 'chat.history'
@@ -126,6 +145,81 @@ try {
   const thread = page.locator('.chat-thread')
   const composer = page.locator('.chat-textarea')
   const sendButton = page.locator('.chat-send-btn.btn--primary')
+  const recoveredMessage = page.getByText(expectedLastMessage, { exact: true }).first()
+  const sessionRow = key => page.locator(`[data-session-key="${key}"]`)
+
+  await waitFor(
+    async () => await recoveredMessage.isVisible() && !await sendButton.isDisabled(),
+    'the retained session to become live before healthy navigation',
+    SESSION_RECOVERY_TIMEOUT_MS,
+  )
+  // The reload and initial route adoption above are setup, not part of the
+  // navigation proof. Start the transport and subscription baselines only
+  // after A is live so the assertions below cover exactly A -> B -> A2.
+  const healthySocketCountBaseline = nextSocketIndex
+  const healthyCloseCountBaseline = healthyCloseCount
+  healthyNavigationSocketIds.clear()
+  healthySubscribeKeys.length = 0
+  await sessionRow(switchSessionKey).locator('.sidebar-history-item').click()
+  await waitFor(
+    async () => (
+      new URL(page.url()).searchParams.get('session') === switchSessionKey
+      && healthySubscribeKeys.includes(switchSessionKey)
+      && !await sendButton.isDisabled()
+    ),
+    'the packaged client to switch to the synthetic peer session',
+    SESSION_RECOVERY_TIMEOUT_MS,
+  )
+  await sessionRow(sessionKey).locator('.sidebar-history-item').click()
+  await waitFor(
+    async () => (
+      new URL(page.url()).searchParams.get('session') === sessionKey
+      && healthySubscribeKeys.filter(key => key === sessionKey).length === 1
+      && await recoveredMessage.isVisible()
+      && !await sendButton.isDisabled()
+    ),
+    'the packaged client to return on the original transport',
+    SESSION_RECOVERY_TIMEOUT_MS,
+  )
+  const healthyNavigationSample = {
+    socketCount: healthyNavigationSocketIds.size,
+    newSocketCount: nextSocketIndex - healthySocketCountBaseline,
+    closeCount: healthyCloseCount - healthyCloseCountBaseline,
+    subscribeKeys: [...healthySubscribeKeys],
+  }
+  assert.equal(
+    healthyNavigationSample.socketCount,
+    1,
+    'healthy packaged session navigation must keep exactly one WebSocket',
+  )
+  assert.equal(
+    healthyNavigationSample.newSocketCount,
+    0,
+    'healthy packaged session navigation must not create a replacement WebSocket',
+  )
+  assert.equal(
+    healthyNavigationSample.closeCount,
+    0,
+    'healthy packaged session navigation must not close the active WebSocket',
+  )
+  assert.deepEqual(
+    healthyNavigationSample.subscribeKeys,
+    [switchSessionKey, sessionKey],
+    'healthy packaged session navigation must subscribe B and then acquire a fresh A2 lease',
+  )
+  assert.equal(socketCount, 0, 'healthy navigation must not enter recovery')
+
+  injectHang = true
+  await sessionRow(switchSessionKey).locator('.sidebar-history-item').click()
+  await waitFor(
+    async () => (
+      new URL(page.url()).searchParams.get('session') === switchSessionKey
+      && !await sendButton.isDisabled()
+    ),
+    'the peer session before fault injection',
+    SESSION_RECOVERY_TIMEOUT_MS,
+  )
+  await sessionRow(sessionKey).locator('.sidebar-history-item').click()
   await waitFor(
     async () => heldHistoryRequests > 0 && heldSubscribeRequests > 0,
     'packaged history and live requests to enter the injected hang',
@@ -164,7 +258,6 @@ try {
   const liveFailure = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
   )
-  const recoveredMessage = page.getByText(expectedLastMessage, { exact: true }).first()
   const terminalStartedAt = Date.now()
   await waitFor(
     async () => await historyFailure.isVisible() && await liveFailure.isVisible(),
@@ -185,7 +278,12 @@ try {
   assert.equal(await sendButton.isDisabled(), true, 'live degraded state must fail closed')
 
   injectHang = false
-  await historyFailure.locator('[data-testid="chat-session-recovery-retry"]').click()
+  // These controls sit above the long transcript. A Playwright locator click
+  // would scroll an off-screen retry into view and manufacture reader-owned
+  // navigation to the top before activating it. Trigger the product action
+  // in-page so this gate measures recovery of the existing live-edge lease.
+  await historyFailure.locator('[data-testid="chat-session-recovery-retry"]')
+    .evaluate((button) => button.click())
   await waitFor(
     () => recoveredMessage.isVisible(),
     'the retained long-session history to recover from the packaged Gateway',
@@ -194,7 +292,8 @@ try {
   assert.equal(await historyFailure.count(), 0)
 
   if (await liveFailure.count()) {
-    await liveFailure.locator('[data-testid="chat-session-recovery-retry"]').click()
+    await liveFailure.locator('[data-testid="chat-session-recovery-retry"]')
+      .evaluate((button) => button.click())
   }
   await waitFor(
     async () => await liveFailure.count() === 0 && !await sendButton.isDisabled(),
@@ -205,17 +304,48 @@ try {
   assert.equal(await composer.inputValue(), preservedDraft)
   assert.equal(await recoveredMessage.isVisible(), true)
   assert.equal(await thread.getAttribute('aria-busy'), 'false')
+  const recoveredViewportSample = await recoveredMessage.evaluate((message) => {
+    const threadElement = message.closest('.chat-thread')
+    if (!(threadElement instanceof HTMLElement)) return null
+    const threadRect = threadElement.getBoundingClientRect()
+    const messageRect = message.getBoundingClientRect()
+    return {
+      scrollTop: Math.round(threadElement.scrollTop),
+      scrollHeight: threadElement.scrollHeight,
+      clientHeight: threadElement.clientHeight,
+      distanceFromBottom: Math.round(
+        threadElement.scrollHeight - threadElement.clientHeight - threadElement.scrollTop,
+      ),
+      messageTop: Math.round(messageRect.top - threadRect.top),
+      messageBottom: Math.round(messageRect.bottom - threadRect.top),
+      intersectsViewport: (
+        messageRect.bottom > threadRect.top
+        && messageRect.top < threadRect.bottom
+      ),
+    }
+  })
+  assert.equal(
+    recoveredViewportSample?.intersectsViewport,
+    true,
+    'the retained message 0320 must remain inside the recovered conversation viewport',
+  )
 
   console.log(JSON.stringify({
     ok: true,
     executable: basename(executablePath),
     sessionKey,
+    switchSessionKey,
     expectedLastMessage,
+    healthyNavigationSocketCount: healthyNavigationSample.socketCount,
+    healthyNavigationNewSocketCount: healthyNavigationSample.newSocketCount,
+    healthyNavigationCloseCount: healthyNavigationSample.closeCount,
+    healthyNavigationSubscribeKeys: healthyNavigationSample.subscribeKeys,
     heldHistoryRequests,
     heldSubscribeRequests,
     socketCount,
     serverTickCount,
     terminalElapsedMs,
+    recoveredViewportSample,
   }, null, 2))
 } finally {
   await app?.close().catch(() => {})
