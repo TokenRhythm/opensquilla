@@ -367,6 +367,10 @@ _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
 _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
 _DEFAULT_PREFLIGHT_COMPACT_RATIO: Final[float] = 0.85
+# Advisory context waterline: warn once per ramp before automatic
+# preflight compaction (default 0.85) takes over, so long-session growth
+# becomes visible instead of surfacing only as overflow errors.
+_DEFAULT_CONTEXT_WATERLINE_ALERT_RATIO: Final[float] = 0.70
 _COMPACTION_FAILURE_LIMIT: Final[int] = 3
 _COMPACTION_CIRCUIT_COOLDOWN_SECONDS: Final[float] = 300.0
 _T3_NOT_APPLICABLE: Final[str] = "not_applicable"
@@ -4624,6 +4628,9 @@ class TurnRunner:
         self._compaction_failures: dict[str, _CompactionFailureState] = {}
         self._turn_compaction_attempted_sessions: set[str] = set()
         self._turn_compacted_sessions: set[str] = set()
+        # Sessions currently latched as waterline-alerted; cleared when
+        # durable compaction runs or pressure drops back under the line.
+        self._context_waterline_alerted_sessions: set[str] = set()
         self._active_pre_compaction_flush_tasks: dict[str, asyncio.Task] = {}
         self._pre_compaction_flush_status_tasks: dict[
             str,
@@ -8724,8 +8731,17 @@ class TurnRunner:
         return resolve_agent_memory_source_dir(agent_id, self._config, source=source)
 
     def _effective_memory_retrieval_metadata(self, agent_id: str) -> dict[str, str]:
+        from opensquilla.agents.scope import is_isolated_custom_agent
+
         retrievers = self._memory_retrievers or {}
-        for key in (agent_id, "main"):
+
+        # Isolation check: custom agents with their own workspace must not
+        # fall back to main's retriever (prevents memory leakage).
+        search_keys: tuple[str, ...] = (agent_id,)
+        if not is_isolated_custom_agent(self._config, agent_id):
+            search_keys = (agent_id, "main")
+
+        for key in search_keys:
             retriever = retrievers.get(key)
             metadata_fn = getattr(retriever, "effective_retrieval_metadata", None)
             if callable(metadata_fn):
@@ -12070,7 +12086,14 @@ class TurnRunner:
                     threshold=threshold,
                     char_threshold=char_threshold,
                 )
+            await self._emit_context_waterline_alert(
+                session_key,
+                durable_history_tokens=durable_history_tokens,
+                checkpoint_tokens=checkpoint_tokens,
+                history_window_tokens=history_window_tokens,
+            )
             return
+        self._context_waterline_alerted_sessions.discard(session_key)
         if transcript and protected_suffix_count >= len(transcript):
             log.info(
                 "preflight_compaction.skipped",
@@ -13131,6 +13154,77 @@ class TurnRunner:
         if ratio <= 0.0 or ratio > 1.0:
             return _DEFAULT_PREFLIGHT_COMPACT_RATIO
         return ratio
+
+    def _context_waterline_alert_ratio(self) -> float:
+        raw_ratio = getattr(self._config, "context_waterline_alert_ratio", None)
+        if raw_ratio is None:
+            return _DEFAULT_CONTEXT_WATERLINE_ALERT_RATIO
+        try:
+            ratio = float(raw_ratio)
+        except (TypeError, ValueError):
+            return _DEFAULT_CONTEXT_WATERLINE_ALERT_RATIO
+        if ratio <= 0.0 or ratio > 1.0:
+            return _DEFAULT_CONTEXT_WATERLINE_ALERT_RATIO
+        return ratio
+
+    async def _emit_context_waterline_alert(
+        self,
+        session_key: str,
+        *,
+        durable_history_tokens: int,
+        checkpoint_tokens: int,
+        history_window_tokens: int,
+    ) -> None:
+        """Emit an advisory system message once per waterline crossing.
+
+        Fired from the preflight no-pressure path: automatic compaction has
+        NOT been triggered, so durable growth above
+        ``context_waterline_alert_ratio`` would otherwise stay invisible
+        until an overflow error. Latched per session; cleared by durable
+        compaction or when pressure drops back under the line. Best effort:
+        never blocks the turn.
+        """
+
+        try:
+            window = int(history_window_tokens)
+            used = max(0, int(durable_history_tokens)) + max(0, int(checkpoint_tokens))
+            if window <= 0 or used <= 0:
+                return
+            alert_line = int(window * self._context_waterline_alert_ratio())
+            auto_line = int(window * min(self._preflight_compact_ratio(), 1.0))
+            if used < alert_line or used >= auto_line:
+                self._context_waterline_alerted_sessions.discard(session_key)
+                return
+            if session_key in self._context_waterline_alerted_sessions:
+                return
+            self._context_waterline_alerted_sessions.add(session_key)
+            if self._session_manager is None:
+                return
+            percent = int(round(used * 100 / window))
+            await self._session_manager.append_message(
+                session_key,
+                role="system",
+                content=(
+                    f"[context waterline] Session history is at about {percent}% "
+                    f"of the active model context window ({used}/{window} tokens). "
+                    "Oversized historical tool results are projected automatically; "
+                    "consider running /compact or starting a fresh session before "
+                    "the next large task."
+                ),
+            )
+            log.info(
+                "context_waterline.alert_emitted",
+                session_key=session_key,
+                used_tokens=used,
+                window_tokens=window,
+                percent=percent,
+            )
+        except Exception:  # noqa: BLE001 - advisory only, must never break the turn
+            log.debug(
+                "context_waterline.alert_failed",
+                session_key=session_key,
+                exc_info=True,
+            )
 
     async def _rollback_cancelled_prompt(
         self,

@@ -2667,6 +2667,11 @@ def upsert_llm_profile(
     if spec.requires_base_url and not (effective_base_url or spec.default_base_url):
         raise ValueError(f"provider {provider!r} requires a base_url")
 
+    if effective_base_url:
+        from opensquilla.provider.registry import register_profile_provider
+
+        register_profile_provider(provider, effective_base_url)
+
     old_endpoint = existing_base_url or str(spec.default_base_url or "").strip()
     next_endpoint = effective_base_url or str(spec.default_base_url or "").strip()
     endpoint_allows_reuse = existing is not None and base_url_allows_credential_reuse(

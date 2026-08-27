@@ -72,6 +72,7 @@ class GatewayRPCClient:
         request_timeout_s: float | None = 30.0,
     ) -> None:
         self.scopes = scopes or ["operator.read", "operator.write"]
+        self.token: str | None = None
         self.request_timeout_s = request_timeout_s
         self._ws: Any = None
         self._recv_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -82,9 +83,16 @@ class GatewayRPCClient:
         self._connection_error: ConnectionError | None = None
         self._closing = False
 
-    async def connect(self, url: str = "ws://localhost:18791/ws") -> None:
+    async def connect(
+        self,
+        url: str = "ws://localhost:18791/ws",
+        *,
+        token: str | None = None,
+    ) -> None:
         if self._ws is not None:
             await self.close()
+        if token is not None:
+            self.token = str(token).strip() or None
         self._closing = False
         self._connection_error = None
         try:
@@ -104,6 +112,15 @@ class GatewayRPCClient:
             if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
                 raise RuntimeError(f"Unexpected gateway handshake frame: {challenge}")
 
+            connect_params: dict[str, Any] = {
+                "minProtocol": 1,
+                "maxProtocol": 3,
+                "role": "operator",
+                "scopes": self.scopes,
+            }
+            if self.token:
+                connect_params["auth"] = {"token": self.token}
+
             req_id = str(uuid.uuid4())
             await self._ws.send(
                 json.dumps(
@@ -111,12 +128,7 @@ class GatewayRPCClient:
                         "type": "req",
                         "id": req_id,
                         "method": "connect",
-                        "params": {
-                            "minProtocol": 1,
-                            "maxProtocol": 3,
-                            "role": "operator",
-                            "scopes": self.scopes,
-                        },
+                        "params": connect_params,
                     }
                 )
             )

@@ -79,6 +79,7 @@ const props = withDefaults(defineProps<{
   sessionOrder?: string[]
   canManageProjects?: boolean
   canCreateProjects?: boolean
+  workspaces?: { id: string; name: string }[]
 }>(), {
   sessionOrder: () => [],
   loadingMore: false,
@@ -86,6 +87,7 @@ const props = withDefaults(defineProps<{
   hasMore: false,
   canManageProjects: false,
   canCreateProjects: false,
+  workspaces: () => [],
 })
 
 const isDesktop = usePlatform().capabilities.isDesktop
@@ -99,6 +101,8 @@ const emit = defineEmits<{
   (e: 'bulk-delete', keys: string[]): void
   (e: 'reorder', payload: { draggedKey: string; targetKey: string; position: 'before' | 'after' }): void
   (e: 'session-pin', payload: { key: string; pinned: boolean }): void
+  (e: 'move-to-workspace', payload: { key: string; workspaceId: string }): void
+  (e: 'move-from-workspace', key: string): void
   (e: 'new-chat'): void
   (e: 'new-project'): void
   (e: 'new-project-task', workspaceId: string): void
@@ -551,6 +555,10 @@ function setOpenMenu(el: Element | ComponentPublicInstance | null) {
 // Fixed-position style for the teleported menu, computed from the trigger rect
 // on open so the menu escapes the Recents scroll-clip.
 const menuStyle = ref<Record<string, string>>({})
+// Submenu state for the "Move to project" workspace list.
+const openWorkspaceSubmenuKey = ref('')
+const workspaceSubmenuStyle = ref<Record<string, string>>({})
+const workspaceSubmenuTriggerEl = ref<HTMLElement | null>(null)
 const renamingKey = ref('')
 const renameDraft = ref('')
 // A function ref captures the single active rename input. A string ref inside
@@ -641,6 +649,33 @@ function closeMenu() {
   openMenuKey.value = ''
   openMenuEl.value = null
   menuTriggerEl.value = null
+  closeWorkspaceSubmenu()
+}
+
+function closeWorkspaceSubmenu() {
+  openWorkspaceSubmenuKey.value = ''
+  workspaceSubmenuStyle.value = {}
+  workspaceSubmenuTriggerEl.value = null
+}
+
+function openWorkspaceSubmenu(row: SidebarDisplayRow, event: Event) {
+  event.stopPropagation()
+  const trigger = event.currentTarget
+  workspaceSubmenuTriggerEl.value = trigger instanceof HTMLElement ? trigger : null
+  openWorkspaceSubmenuKey.value = row.key
+  if (workspaceSubmenuTriggerEl.value) {
+    const r = workspaceSubmenuTriggerEl.value.getBoundingClientRect()
+    const openRight = r.right + 220 <= window.innerWidth
+    const openUp = r.bottom + 220 > window.innerHeight
+    workspaceSubmenuStyle.value = {
+      position: 'fixed',
+      left: `${openRight ? r.right + 4 : r.left}px`,
+      top: `${openUp ? r.bottom - 8 : r.top}px`,
+      transform: openRight
+        ? (openUp ? 'translateY(-100%)' : 'none')
+        : 'translateX(-100%)',
+    }
+  }
 }
 
 const sessionPreview = ref<{
@@ -1307,6 +1342,30 @@ function onSelectRow(row: SidebarConversationItem) {
                       <span>{{ t('shared.sidebar.rename') }}</span>
                     </button>
                     <button
+                      v-if="props.canManageProjects && props.workspaces.length > 0"
+                      type="button"
+                      class="sidebar-row-menu__item sidebar-row-menu__item--has-submenu"
+                      role="menuitem"
+                      aria-haspopup="true"
+                      :aria-expanded="openWorkspaceSubmenuKey === row.key"
+                      @click.stop="openWorkspaceSubmenu(row, $event)"
+                      @mouseenter="openWorkspaceSubmenu(row, $event)"
+                    >
+                      <Icon name="folder" :size="14" />
+                      <span>{{ t('shared.sidebar.moveToProject') }}</span>
+                      <Icon name="chevronRight" :size="12" class="sidebar-row-menu__submenu-arrow" />
+                    </button>
+                    <button
+                      v-if="props.canManageProjects && row.workspaceId"
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      @click.stop="emit('move-from-workspace', row.key); closeMenu()"
+                    >
+                      <Icon name="x" :size="14" />
+                      <span>{{ t('shared.sidebar.moveFromProject') }}</span>
+                    </button>
+                    <button
                       type="button"
                       class="sidebar-row-menu__item sidebar-row-menu__item--danger"
                       role="menuitem"
@@ -1316,6 +1375,41 @@ function onSelectRow(row: SidebarConversationItem) {
                       <span>{{ t('shared.sidebar.delete') }}</span>
                     </button>
                   </div>
+                  </Teleport>
+                  <!-- Workspace submenu: project list -->
+                  <Teleport to="body">
+                    <div
+                      v-if="openWorkspaceSubmenuKey === row.key"
+                      class="sidebar-row-menu sidebar-row-menu--submenu"
+                      :style="workspaceSubmenuStyle"
+                      role="menu"
+                      :aria-label="t('shared.sidebar.moveToProject')"
+                      @keydown="onMenuKeydown"
+                    >
+                      <button
+                        v-for="ws in props.workspaces"
+                        :key="ws.id"
+                        type="button"
+                        class="sidebar-row-menu__item"
+                        role="menuitem"
+                        :disabled="ws.id === row.workspaceId"
+                        :class="{ 'sidebar-row-menu__item--current': ws.id === row.workspaceId }"
+                        @click.stop="emit('move-to-workspace', { key: row.key, workspaceId: ws.id }); closeMenu(); closeWorkspaceSubmenu()"
+                      >
+                        <Icon name="folder" :size="14" />
+                        <span>{{ ws.name }}</span>
+                      </button>
+                      <div class="sidebar-row-menu__sep" />
+                      <button
+                        type="button"
+                        class="sidebar-row-menu__item"
+                        role="menuitem"
+                        @click.stop="emit('new-project'); closeMenu(); closeWorkspaceSubmenu()"
+                      >
+                        <Icon name="plus" :size="14" />
+                        <span>{{ t('shared.sidebar.newProject') }}</span>
+                      </button>
+                    </div>
                   </Teleport>
                 </div>
 

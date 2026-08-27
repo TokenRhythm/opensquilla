@@ -1368,6 +1368,66 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return result.to_payload()
 
 
+@_d.method("onboarding.customProvider.models.discover", scope="operator.admin")
+async def _custom_provider_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """List models from an arbitrary OpenAI-compatible endpoint.
+
+    Unlike ``onboarding.models.discover``, this method does NOT require the
+    provider to be registered. It accepts a raw base URL and optional API key,
+    issues a server-side ``GET {base_url}/models`` request (bypassing browser
+    CORS), and returns the advertised model ids. Nothing is persisted.
+    """
+    import httpx
+
+    p = params if isinstance(params, dict) else {}
+    base_url = str(p.get("baseUrl", "") or "").strip()
+    if not base_url:
+        raise ValueError("baseUrl is required")
+    api_key_value = str(p.get("apiKey", "") or "").strip()
+    if api_key_value and is_redacted_secret_sentinel(api_key_value):
+        api_key_value = ""
+
+    url = f"{base_url.rstrip('/')}/models"
+    headers: dict[str, str] = {"accept": "application/json"}
+    if api_key_value:
+        headers["authorization"] = f"Bearer {api_key_value}"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            response = await client.get(url, headers=headers)
+        if response.status_code in (401, 403):
+            return {"ok": False, "error": f"HTTP {response.status_code} — check the API key"}
+        if response.status_code != 200:
+            return {"ok": False, "error": f"HTTP {response.status_code}"}
+        body = response.json()
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "request timed out"}
+    except Exception as exc:
+        return {"ok": False, "error": f"could not reach {url}: {exc}"}
+
+    rows: list[dict] = []
+    if isinstance(body, dict) and isinstance(body.get("data"), list):
+        rows = body["data"]
+    elif isinstance(body, list):
+        rows = body
+    elif isinstance(body, dict) and isinstance(body.get("models"), list):
+        rows = body["models"]
+
+    models = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = str(row.get("id", "") or "").strip()
+        if not model_id:
+            continue
+        models.append({
+            "id": model_id,
+            "label": str(row.get("name", "") or row.get("display_name", "") or model_id).strip(),
+        })
+
+    return {"ok": True, "models": models}
+
+
 @_d.method("onboarding.imageGeneration.models.discover", scope="operator.admin")
 async def _image_generation_models_discover(
     params: Any,

@@ -329,12 +329,18 @@ def create_memory_tools(
     on_memory_write: Any | None = None,
     memory_source: str = "state",
     workspace_base: str | None = None,
+    gateway_config: Any | None = None,
 ) -> None:
     """Register memory tools. Accepts either a single store or a dict keyed by agent_id.
 
     Backward-compatible: a single store/retriever is auto-wrapped into ``{"main": ...}``.
     When dicts are provided, the active agent_id (from ToolContext via contextvar) selects
     the correct store, retriever, and memory directory at call time.
+
+    ``gateway_config`` is the live ``GatewayConfig`` object (same reference held by
+    ``AgentRegistry``).  It is used at resolve-time to check whether the current
+    agent is an isolated custom agent (has its own workspace) so that the
+    legacy "fall back to main" behavior is suppressed for such agents.
     """
     # Normalize to dict form
     if not isinstance(stores, dict):
@@ -355,8 +361,26 @@ def create_memory_tools(
 
         agent_id = normalize_agent_id((ctx.agent_id if ctx else None) or "main")
 
-        s = stores.get(agent_id, stores.get("main", next(iter(stores.values()))))
-        r = retrievers.get(agent_id, retrievers.get("main", next(iter(retrievers.values()))))
+        # Isolation check: custom agents with their own workspace must not
+        # fall back to main's store/retriever (prevents memory leakage).
+        isolated = False
+        if gateway_config is not None:
+            from opensquilla.agents.scope import is_isolated_custom_agent
+            isolated = is_isolated_custom_agent(gateway_config, agent_id)
+        
+        if isolated:
+            # Strict isolation: no fallback to main
+            s = stores.get(agent_id)
+            r = retrievers.get(agent_id)
+            if s is None or r is None:
+                raise ToolError(
+                    f"Memory not available for isolated agent '{agent_id}'. "
+                    "Isolated custom agents must have their own memory manager."
+                )
+        else:
+            # Legacy behavior: fall back to main for builtin/subagent/unconfigured
+            s = stores.get(agent_id, stores.get("main", next(iter(stores.values()))))
+            r = retrievers.get(agent_id, retrievers.get("main", next(iter(retrievers.values()))))
 
         if memory_source not in {"state", "workspace"}:
             raise ToolError("memory_source must be 'state' or 'workspace'.")
