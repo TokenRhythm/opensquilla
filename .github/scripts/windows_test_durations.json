@@ -211,6 +211,7 @@
     "tests/test_cli/test_onboard_status_json.py": 0.566,
     "tests/test_cli/test_output_helpers.py": 0.01,
     "tests/test_cli/test_profile_env_loading.py": 5.578,
+    "tests/test_cli/test_profile_target_resolution.py": 5.4,
     "tests/test_cli/test_providers_cmd.py": 0.793,
     "tests/test_cli/test_router_cmd.py": 2.78,
     "tests/test_cli/test_sandbox_cmd.py": 1.827,
