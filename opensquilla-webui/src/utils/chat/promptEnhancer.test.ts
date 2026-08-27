@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest'
 
-import { enhancePrompt } from './promptEnhancer'
+import { detectTaskType, enhancePrompt } from './promptEnhancer'
 
 describe('enhancePrompt', () => {
   it('returns a no-op result for empty or whitespace input', () => {
@@ -68,3 +68,84 @@ describe('enhancePrompt', () => {
     expect(a.text).toBe(b.text)
   })
 })
+
+describe('detectTaskType', () => {
+  it('detects analyze', () => {
+    expect(detectTaskType('分析一下这个月的销售数据为什么会下降')).toBe('analyze')
+    expect(detectTaskType('总结这篇文章的要点')).toBe('analyze')
+  })
+
+  it('detects design', () => {
+    expect(detectTaskType('帮我设计一个微服务架构方案')).toBe('design')
+    expect(detectTaskType('规划一个数据平台的迁移路线')).toBe('design')
+  })
+
+  it('detects implement', () => {
+    expect(detectTaskType('写一个 Python 函数读取 CSV')).toBe('implement')
+    expect(detectTaskType('帮我实现一个登录接口')).toBe('implement')
+  })
+
+  it('detects review', () => {
+    expect(detectTaskType('审查一下这个代码有没有问题')).toBe('review')
+    expect(detectTaskType('帮我 review 这个 PR')).toBe('review')
+  })
+
+  it('detects write', () => {
+    expect(detectTaskType('写一份项目周报')).toBe('write')
+    expect(detectTaskType('帮我起草一封邮件')).toBe('write')
+  })
+
+  it('detects translate', () => {
+    expect(detectTaskType('把这段话翻译成英文')).toBe('translate')
+    expect(detectTaskType('translate this into Japanese')).toBe('translate')
+  })
+
+  it('detects query', () => {
+    expect(detectTaskType('查一下今天北京天气')).toBe('query')
+    expect(detectTaskType('帮我看看这个链接')).toBe('query')
+    expect(detectTaskType('什么是 MCP 协议？')).toBe('query')
+  })
+
+  it('detects orchestrate', () => {
+    expect(detectTaskType('安排一下这个项目的推进计划')).toBe('orchestrate')
+    expect(detectTaskType('帮我跟进这个任务的进度')).toBe('orchestrate')
+  })
+})
+
+describe('enhancePrompt type-specific scaffolding', () => {
+  it('injects review deliverables for a review task', () => {
+    const r = enhancePrompt('审查这个代码有没有问题', { locale: 'zh' })
+    expect(r.dimensions).toContain('类型-审查')
+    expect(r.text).toContain('问题清单')
+    expect(r.text).toContain('修复建议')
+  })
+
+  it('injects design deliverables for a design task', () => {
+    const r = enhancePrompt('设计一个微服务架构', { locale: 'zh' })
+    expect(r.dimensions).toContain('类型-设计')
+    expect(r.text).toContain('候选方案')
+    expect(r.text).toContain('备选退路')
+  })
+
+  it('injects translate deliverables and terminology guard', () => {
+    const r = enhancePrompt('把这段话翻译成英文', { locale: 'zh' })
+    expect(r.dimensions).toContain('类型-翻译')
+    expect(r.text).toContain('术语')
+    expect(r.text).toContain('不要逐字硬翻')
+  })
+
+  it('injects query deliverables with a source requirement', () => {
+    const r = enhancePrompt('查一下今天北京天气', { locale: 'zh' })
+    expect(r.dimensions).toContain('类型-查询')
+    expect(r.text).toContain('来源')
+    expect(r.text).toContain('不要编造来源')
+  })
+
+  it('injects English type scaffold when locale is en', () => {
+    const r = enhancePrompt('Review this code', { locale: 'en' })
+    expect(r.dimensions).toContain('type-review')
+    expect(r.text).toContain('severity')
+    expect(r.text).toContain('fix')
+  })
+})
+
