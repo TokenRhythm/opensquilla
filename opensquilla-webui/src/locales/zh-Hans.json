@@ -4281,6 +4281,11 @@
       "expired": "这条消息的路由记录已过期",
       "failed": "未能记录你的评价"
     }
+,
+    "enhancePrompt": {
+      "enhanceLabel": "增强提示词",
+      "emptyHint": "先输入内容，再增强提示词"
+    }
   },
   "shared": {
     "loading": "加载中",

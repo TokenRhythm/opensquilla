@@ -4281,6 +4281,11 @@
       "expired": "This message’s routing record has expired",
       "failed": "Could not record your rating"
     }
+,
+    "enhancePrompt": {
+      "enhanceLabel": "Enhance prompt",
+      "emptyHint": "Type a message first to enhance it"
+    }
   },
   "shared": {
     "loading": "Loading",

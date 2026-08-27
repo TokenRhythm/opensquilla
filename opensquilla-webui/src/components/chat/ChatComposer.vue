@@ -271,6 +271,19 @@
                 @set-session-routing-mode="emit('setSessionRoutingMode', $event)"
               />
             </div>
+            <button
+              type="button"
+              class="btn btn--icon btn--ghost chat-enhance-btn"
+              :class="{ 'is-active': canEnhance }"
+              :title="canEnhance
+                ? t('chat.enhancePrompt.enhanceLabel')
+                : t('chat.enhancePrompt.emptyHint')"
+              :aria-label="t('chat.enhancePrompt.enhanceLabel')"
+              :disabled="!canEnhance"
+              @click="applyPromptEnhancement"
+            >
+              <Icon name="wand" :size="17" />
+            </button>
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-run-mode-btn"
@@ -461,6 +474,7 @@ import type { CollaborationMode } from '@/types/plans'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import type { PromptAnnotation } from '@/types/promptAnnotations'
 import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
+import { enhancePrompt } from '@/utils/chat/promptEnhancer'
 import {
   PROMPT_ANNOTATION_MAX_BODY_LENGTH,
   promptAnnotationBodyWithinLimit,
@@ -576,6 +590,41 @@ const { t } = useI18n()
 const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
+
+/**
+ * Apply prompt enhancement to the current composer draft.
+ *
+ * This is deliberately a no-op when the draft is empty, and it only
+ * REPLACES the draft text — it never sends. The user reviews the
+ * enhanced prompt in the textarea and presses send themselves, so the
+ * normal send/stop/goal/plan paths are never touched.
+ */
+function applyPromptEnhancement() {
+  const current = inputText.value ?? ''
+  const result = enhancePrompt(current, { locale: detectComposerLocale() })
+  if (!result.enhanced || !result.text) return
+  inputText.value = result.text
+  emit('expand')
+  void nextTick(() => textareaEl.value?.focus())
+}
+
+/** Map the composer UI locale onto the enhancer language hint. */
+function detectComposerLocale(): 'zh' | 'en' {
+  const locale = (t as unknown as { locale?: { value?: string } } | undefined)?.locale?.value
+  if (locale && locale.toLowerCase().startsWith('zh')) return 'zh'
+  return 'en'
+}
+
+/**
+ * True when the composer draft is non-empty and safe to enhance.
+ *
+ * Mirrors the send button's own readiness source: the parent tracks the
+ * draft content and reports it via `hasSendContent`, which stays in sync
+ * with the textarea through v-model. We deliberately do not derive a
+ * separate reactive read of `inputText` here — the composer is a
+ * controlled component whose state lives in the parent.
+ */
+const canEnhance = computed(() => props.hasSendContent === true)
 
 function onTextareaInput(event: Event) {
   // vModelText skips model updates while the element's internal IME

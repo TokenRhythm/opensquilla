@@ -4191,6 +4191,11 @@
       "expired": "L’enregistrement de routage de ce message a expiré",
       "failed": "Impossible d’enregistrer votre évaluation"
     }
+,
+    "enhancePrompt": {
+      "enhanceLabel": "Améliorer le prompt",
+      "emptyHint": "Saisissez d'abord un message pour l'améliorer"
+    }
   },
   "shared": {
     "loading": "Chargement",

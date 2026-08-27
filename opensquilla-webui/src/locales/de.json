@@ -4191,6 +4191,11 @@
       "expired": "Der Routing-Eintrag dieser Nachricht ist abgelaufen",
       "failed": "Bewertung konnte nicht gespeichert werden"
     }
+,
+    "enhancePrompt": {
+      "enhanceLabel": "Prompt verbessern",
+      "emptyHint": "Erst eine Nachricht eingeben, um sie zu verbessern"
+    }
   },
   "shared": {
     "loading": "Wird geladen",
