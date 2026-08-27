@@ -968,7 +968,7 @@ class OpenAIResponsesProvider:
             if isinstance(model_id, str):
                 models.append(
                     ModelInfo(
-                        provider=self.provider_name,
+                        provider=self.provider_id,
                         model_id=model_id,
                         display_name=raw.get("name") or model_id,
                     )

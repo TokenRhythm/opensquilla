@@ -28,7 +28,7 @@
     "model": "deepseek-v4-flash",
     "model_usage_breakdown": [],
     "output_tokens": 17,
-    "provider": "openai",
+    "provider": "tokenrhythm",
     "reasoning_content": "Synthetic reasoning.",
     "reasoning_tokens": 8,
     "stop_reason": "stop",

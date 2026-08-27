@@ -27,7 +27,7 @@
     "model": "minimax-test-1",
     "model_usage_breakdown": [],
     "output_tokens": 22,
-    "provider": "openai",
+    "provider": "minimax",
     "reasoning_content": null,
     "reasoning_tokens": 0,
     "stop_reason": "stop",

@@ -923,7 +923,7 @@ class OpenAICodexProvider:
     async def list_models(self) -> list[ModelInfo]:
         return [
             ModelInfo(
-                provider=self.provider_name,
+                provider=self.provider_id,
                 model_id=model_id,
                 display_name=display_name,
                 context_window=272_000,
