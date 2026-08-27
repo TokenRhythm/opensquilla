@@ -1391,13 +1391,26 @@ async function typeAndSubmitAnnotation(electronApp, body) {
 async function dropNextChatSend(page) {
   await page.evaluate(() => {
     window.__opensquillaV1DroppedChatSend = false
+    window.__opensquillaV1DroppedChatSendRequest = null
+    window.__opensquillaV1ReplayedChatSendRequest = null
     const originalSend = WebSocket.prototype.send
-    WebSocket.prototype.send = function dropSyntheticSessionsSend(data) {
+    const captureReplay = function captureSyntheticSessionsReplay(data) {
       if (
         typeof data === 'string'
         && data.includes('"method":"chat.send"')
       ) {
         WebSocket.prototype.send = originalSend
+        window.__opensquillaV1ReplayedChatSendRequest = JSON.parse(data)
+      }
+      return originalSend.call(this, data)
+    }
+    WebSocket.prototype.send = function dropSyntheticSessionsSend(data) {
+      if (
+        typeof data === 'string'
+        && data.includes('"method":"chat.send"')
+      ) {
+        window.__opensquillaV1DroppedChatSendRequest = JSON.parse(data)
+        WebSocket.prototype.send = captureReplay
         window.__opensquillaV1DroppedChatSend = true
         this.close(4000, 'synthetic sessions.send disconnect')
         return
@@ -1432,7 +1445,8 @@ const evidence = {
   changesAfterAgentPatch: '',
   previewHeading: '',
   annotationModeExitedAfterAcceptance: false,
-  annotationSendFailureRetained: false,
+  annotationUnknownSendSettledWithoutDuplicates: false,
+  annotationReplayIdentityMatched: false,
   annotationAcceptanceEvents: [],
   annotationModeAfterAcceptance: null,
   annotationRequests: 0,
@@ -1736,6 +1750,8 @@ try {
     })
   })
   const annotationRequestStart = provider.requests.length
+  const annotationUserMessageStart = await page.locator('.msg-user').count()
+  const sentAnnotationStart = await page.getByTestId('sent-prompt-annotation').count()
   await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
   await dropNextChatSend(page)
   await submitChatComposer(page)
@@ -1751,8 +1767,18 @@ try {
   await waitForSettledTurn(page)
   assert.equal(
     await page.locator('.chat-textarea').inputValue(),
-    ANNOTATION_MESSAGE,
-    'a disconnected send must retain the user message for retry',
+    '',
+    'an unknown send must not duplicate the optimistic user message in the composer',
+  )
+  assert.equal(
+    await page.locator('.msg-user').count(),
+    annotationUserMessageStart,
+    'an unaccepted synthetic send must not leave a duplicate user message in history',
+  )
+  assert.equal(
+    await page.getByTestId('sent-prompt-annotation').count(),
+    sentAnnotationStart,
+    'unaccepted annotations must remain drafts instead of duplicating into history',
   )
   assert.equal(
     await page.locator('.chat-prompt-annotation-chip').count(),
@@ -1771,9 +1797,31 @@ try {
     0,
     'a disconnected send must not publish an acceptance event',
   )
-  evidence.annotationSendFailureRetained = true
+  evidence.annotationUnknownSendSettledWithoutDuplicates = true
 
   await submitChatComposer(page)
+  await page.waitForFunction(
+    () => window.__opensquillaV1ReplayedChatSendRequest !== null,
+    undefined,
+    { timeout: TIMEOUT_MS },
+  )
+  const replayedAnnotationRequests = await page.evaluate(() => ({
+    dropped: window.__opensquillaV1DroppedChatSendRequest,
+    replayed: window.__opensquillaV1ReplayedChatSendRequest,
+  }))
+  assert.ok(replayedAnnotationRequests.dropped, 'the dropped chat.send request must be captured')
+  assert.ok(replayedAnnotationRequests.replayed, 'the replayed chat.send request must be captured')
+  assert.deepEqual(
+    replayedAnnotationRequests.replayed.params,
+    replayedAnnotationRequests.dropped.params,
+    'the retry must replay the exact immutable chat.send params and request identity',
+  )
+  assert.equal(
+    replayedAnnotationRequests.replayed.params.clientRequestId,
+    replayedAnnotationRequests.dropped.params.clientRequestId,
+    'the retry must reuse the original clientRequestId',
+  )
+  evidence.annotationReplayIdentityMatched = true
   await waitFor(
     () => provider.requests.slice(annotationRequestStart)
       .some(payload => annotationToolNames(payload).length > 0),
@@ -1807,6 +1855,11 @@ try {
     timeout: TIMEOUT_MS,
   })
   assert.equal(
+    evidence.annotationAcceptanceEvents.length,
+    1,
+    'the exact replay must publish one annotation acceptance event',
+  )
+  assert.equal(
     await page.locator('.chat-prompt-annotation-chip').filter({ hasText: ANNOTATION_BODY }).count(),
     0,
     'accepted annotation must leave the composer',
@@ -1815,6 +1868,14 @@ try {
     await page.locator('.chat-prompt-annotation-chip').count(),
     0,
     'all accepted annotations must leave the composer together',
+  )
+  await waitFor(
+    async () => (
+      await page.locator('.msg-user').count() === annotationUserMessageStart + 1
+      && await page.getByTestId('sent-prompt-annotation').count() === sentAnnotationStart + 2
+    ),
+    'one accepted annotation user message with two unique annotations',
+    TIMEOUT_MS,
   )
   evidence.annotationModeExitedAfterAcceptance = true
   assert.match(await versionsTab.innerText(), /3/)

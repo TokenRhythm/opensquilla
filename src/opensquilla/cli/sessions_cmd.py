@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,10 +13,9 @@ from rich.table import Table
 
 from opensquilla.cli.chat.session_state import messages_to_markdown
 from opensquilla.cli.gateway_client import session_history_all
-from opensquilla.cli.gateway_rpc import run_gateway_sync
+from opensquilla.cli.gateway_rpc import default_gateway_url, run_gateway_sync
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
-from opensquilla.cli.url_utils import normalize_gateway_url
 
 app = typer.Typer(help="Manage chat sessions.")
 
@@ -109,9 +107,13 @@ async def _with_client(action):
 
     client = GatewayClient()
     try:
-        await client.connect(
-            normalize_gateway_url(os.environ.get("OPENSQUILLA_GATEWAY_URL", "ws://localhost:18791/ws"))
-        )
+        # `default_gateway_url()` is what `sessions list`/`show`/`abort` reach
+        # through `run_gateway_sync`. The literal this replaced skipped the
+        # config entirely, so `resume`, `delete` and `export` went to
+        # 127.0.0.1:18791 no matter which profile was selected — a named
+        # profile's gateway on another port was invisible to them (#1379).
+        # `OPENSQUILLA_GATEWAY_URL` still wins; the resolver checks it first.
+        await client.connect(default_gateway_url())
         return await action(client)
     except SystemExit as exc:
         console.print(f"[dim]{exc}[/dim]")

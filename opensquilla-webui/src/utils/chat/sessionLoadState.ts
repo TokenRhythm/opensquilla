@@ -8,6 +8,7 @@ export type ChatSessionRecoveryState =
   | Exclude<ChatHistoryRecoveryState, null>
   | 'live-connecting'
   | 'live-degraded'
+  | 'session-missing'
 
 export interface ResolveChatHistoryRecoveryStateOptions {
   isDraftLanding: boolean

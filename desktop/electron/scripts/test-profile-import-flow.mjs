@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { spawnSync } from 'node:child_process'
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -31,6 +32,65 @@ async function waitFor(check, label, timeoutMs = 90_000) {
     await delay(250)
   }
   throw new Error(`Timed out waiting for ${label}: ${lastError?.message || lastError || ''}`)
+}
+
+async function startFakeProvider() {
+  let mode = 'reject'
+  const requests = []
+  const server = createServer((request, response) => {
+    const body = []
+    request.on('data', (chunk) => body.push(chunk))
+    request.on('end', () => {
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization || '',
+        body: Buffer.concat(body).toString('utf8'),
+      })
+      if (mode === 'reject') {
+        response.writeHead(401, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          error: {
+            message: 'Synthetic imported credential rejected.',
+            type: 'authentication_error',
+            code: 'invalid_api_key',
+          },
+        }))
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end([
+        'data: {"id":"chatcmpl-import-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+        '',
+        'data: {"id":"chatcmpl-import-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'))
+    })
+  })
+  await new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => rejectListen(error)
+    server.once('error', onError)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', onError)
+      resolveListen()
+    })
+  })
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    setMode(nextMode) {
+      mode = nextMode
+    },
+    async close() {
+      await new Promise((resolveClose, rejectClose) => {
+        server.close((error) => (error ? rejectClose(error) : resolveClose()))
+      })
+    },
+  }
 }
 
 function runPython(source, args) {
@@ -298,6 +358,7 @@ with sqlite3.connect(Path(sys.argv[1]) / "state" / "sessions.db") as connection:
 
 const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-profile-import-e2e-')))
 let app = null
+let fakeProvider = null
 try {
   if (importScreenshotDir) await mkdir(importScreenshotDir, { recursive: true })
 
@@ -405,6 +466,7 @@ try {
 
   // Settings import with a required key must release exclusive admission before
   // onboarding, preserve source config bytes, and retain the previous credential.
+  fakeProvider = await startFakeProvider()
   const settingsHome = join(root, 'settings-home')
   const settingsSource = join(settingsHome, '.opensquilla')
   const settingsUserData = join(root, 'settings-user-data')
@@ -414,7 +476,7 @@ try {
   await writeProviderProfileConfig(settingsSource, {
     provider: 'openai',
     model: 'gpt-5.4-mini',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: fakeProvider.baseUrl,
     apiKeyEnv: 'OPENAI_API_KEY',
     searchProvider: 'brave',
     searchApiKeyEnv: 'BRAVE_API_KEY',
@@ -429,7 +491,7 @@ try {
   await writeProviderProfileConfig(settingsTarget, {
     provider: 'openai',
     model: 'synthetic-old-target-model',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: fakeProvider.baseUrl,
     apiKeyEnv: 'OPENAI_API_KEY',
     routerEnabled: true,
     disableNetworkObservability: false,
@@ -437,7 +499,7 @@ try {
   const oldCredential = await seedDesktopCredential(settingsUserData, {
     provider: 'openai',
     model: 'synthetic-old-target-model',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: fakeProvider.baseUrl,
     apiKeyEnv: 'OPENAI_API_KEY',
     apiKey: 'synthetic-old-target-key',
   })
@@ -467,6 +529,7 @@ try {
   })
   assert.equal(await requiredKeyOnboarding.locator('#provider').inputValue(), 'openai')
   assert.equal(await requiredKeyOnboarding.locator('#model').inputValue(), 'gpt-5.4-mini')
+  assert.equal(await requiredKeyOnboarding.locator('#baseUrl').inputValue(), fakeProvider.baseUrl)
   const importedConfigBeforeCredential = await readFile(join(settingsTarget, 'config.toml'))
   assert.match(importedConfigBeforeCredential.toString('utf8'), /search_provider = "brave"/)
   assert.match(importedConfigBeforeCredential.toString('utf8'), /confidence_threshold = 0\.77/)
@@ -474,7 +537,39 @@ try {
     importedConfigBeforeCredential.toString('utf8'),
     /disable_network_observability = true/,
   )
+  const credentialBeforeRejectedProbe = await readFile(
+    join(settingsUserData, 'desktop-credential.json'),
+  ).catch(() => null)
+  const pendingBeforeRejectedProbe = await readFile(
+    join(settingsUserData, 'migration-provider-setup.json'),
+  )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
+  await requiredKeyOnboarding.locator('#finish').click()
+
+  const rejectedProbeError = await waitFor(async () => {
+    const error = (await requiredKeyOnboarding.locator('#error').innerText()).trim()
+    const ready = await requiredKeyOnboarding.locator('#setup-form').getAttribute('aria-busy')
+      === 'false'
+    return error && ready && !await requiredKeyOnboarding.locator('#finish').isDisabled()
+      ? error
+      : null
+  }, 'rejected imported credential probe')
+  assert.match(rejectedProbeError, /401|authentication|credential|API key/i)
+  assert.equal(rejectedProbeError.includes('synthetic-new-imported-key'), false)
+  assert.deepEqual(
+    await readFile(join(settingsUserData, 'desktop-credential.json')).catch(() => null),
+    credentialBeforeRejectedProbe,
+    'rejected provider probe wrote imported credential',
+  )
+  assert.deepEqual(
+    await readFile(join(settingsUserData, 'migration-provider-setup.json')),
+    pendingBeforeRejectedProbe,
+    'rejected provider probe cleared the pending adoption marker',
+  )
+  assert.deepEqual(await readFile(join(settingsTarget, 'config.toml')), importedConfigBeforeCredential)
+  assert.deepEqual(await readFile(join(settingsTarget, '.env')), importedEnvBytes)
+
+  fakeProvider.setMode('success')
   await requiredKeyOnboarding.locator('#finish').click()
 
   const adopted = await waitFor(async () => {
@@ -493,6 +588,21 @@ try {
     Buffer.from(adopted.encryptedApiKey, 'base64').toString('utf8'),
     'synthetic-new-imported-key',
   )
+  assert.equal(fakeProvider.requests.length, 2)
+  assert.equal(fakeProvider.requests[0].method, 'POST')
+  assert.equal(fakeProvider.requests[0].url, '/v1/chat/completions')
+  assert.equal(
+    fakeProvider.requests[0].authorization,
+    'Bearer synthetic-new-imported-key',
+  )
+  assert.equal(JSON.parse(fakeProvider.requests[0].body).model, 'gpt-5.4-mini')
+  assert.equal(fakeProvider.requests[1].method, 'POST')
+  assert.equal(fakeProvider.requests[1].url, '/v1/chat/completions')
+  assert.equal(
+    fakeProvider.requests[1].authorization,
+    'Bearer synthetic-new-imported-key',
+  )
+  assert.equal(JSON.parse(fakeProvider.requests[1].body).model, 'gpt-5.4-mini')
   assert.deepEqual(
     await readFile(join(settingsTarget, 'config.toml')),
     importedConfigBeforeCredential,
@@ -525,6 +635,8 @@ try {
   }
   await app.close()
   app = null
+  await fakeProvider.close()
+  fakeProvider = null
 
   console.log(JSON.stringify({
     cliDoesNotTriggerOnboardingTransfer: true,
@@ -539,5 +651,6 @@ try {
   }, null, 2))
 } finally {
   if (app) await app.close().catch(() => {})
+  if (fakeProvider) await fakeProvider.close().catch(() => {})
   await rm(root, { recursive: true, force: true })
 }

@@ -183,6 +183,23 @@ export interface ChatToolCall {
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
+  presentation?: ToolPresentation
+}
+
+export type ToolPresentationCategory =
+  | 'search'
+  | 'file_read'
+  | 'network_read'
+  | 'command'
+  | 'subagent'
+  | 'mutation'
+  | 'generic'
+
+export interface ToolPresentation {
+  category: ToolPresentationCategory
+  primaryArguments: string[]
+  argumentDisplay: 'primary' | 'all'
+  lifecycleDisplay: 'boundary' | 'default'
 }
 
 export type ChatToolCallRenderItem = ChatToolCall & {
@@ -197,6 +214,7 @@ export interface ToolResultContext {
   toolName?: string
   inputRaw?: string
   section?: 'input' | 'result' | 'error'
+  format?: 'diff'
 }
 
 export interface ChatToolCallGroup {
@@ -385,6 +403,7 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   groupId?: string
   group_id?: string
   presentation?: ChatTextPresentation
+  tool_presentation?: ToolPresentation
 }
 
 export interface ChatTimelineSegment extends Record<string, unknown> {
@@ -672,6 +691,7 @@ export interface ChatMessageMeta {
 export interface ChatCreatedSessionLink {
   callId: string
   sessionKey: string
+  title?: string
 }
 
 export interface ChatRenderedMessage {

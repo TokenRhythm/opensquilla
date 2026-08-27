@@ -640,6 +640,7 @@ async def sessions_spawn(
                 "agent_id": resolved_agent_id,
                 "task_id": handle.task_id,
                 "status": "queued",
+                **({"title": session_title} if session_title else {}),
                 "spawn_depth": spawn_depth,
                 "completion_delivery": "pushed_to_parent_session",
                 "yield_instruction": (

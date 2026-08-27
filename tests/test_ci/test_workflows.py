@@ -185,6 +185,148 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "nightly" not in pull_request_case.lower()
 
 
+def test_pr_change_selection_uses_merge_base_and_ignores_base_only_changes(
+    tmp_path: Path,
+) -> None:
+    workflow = _workflow("ci.yml")
+    checkout = next(
+        step
+        for step in workflow["jobs"]["plan-ci"]["steps"]
+        if step.get("uses") == "actions/checkout@v4"
+    )
+    assert checkout["with"]["fetch-depth"] == 0
+
+    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+    pull_request_case = text.split("            pull_request)", 1)[1].split(
+        "              ;;", 1
+    )[0]
+    assert "git diff --merge-base --no-renames --name-only" in pull_request_case
+    assert '"${base_sha}" "${head_sha}" -- > "${changed_files}"' in pull_request_case
+    assert "Unable to derive the PR-owned change set" in pull_request_case
+    assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in pull_request_case
+
+    executable_case = (
+        'changed_files="${CHANGED_FILES}"\n'
+        + pull_request_case.replace(
+            "${{ github.event.pull_request.base.sha }}", "${BASE_SHA}"
+        ).replace("${{ github.event.pull_request.head.sha }}", "${HEAD_SHA}")
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def select_changed_files(base_sha: str, head_sha: str) -> list[str]:
+        changed_files = tmp_path / "changed-files.txt"
+        changed_files.write_text("stale partial result\n", encoding="utf-8")
+        env = os.environ.copy()
+        env.update(
+            {
+                "BASE_SHA": base_sha,
+                "CHANGED_FILES": changed_files.as_posix(),
+                "CI_OPTIMIZATION_MODE": "enforce",
+                "HEAD_SHA": head_sha,
+            }
+        )
+        result = subprocess.run(
+            [_bash_executable(), "-euo", "pipefail", "-c", executable_case],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return changed_files.read_text(encoding="utf-8").splitlines()
+
+    def plan_changed_files(paths: list[str]) -> dict:
+        planner_input = tmp_path / "planner-input.txt"
+        planner_input.write_text("\n".join(paths) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                ".github/scripts/plan_ci.py",
+                planner_input.as_posix(),
+                "--repo",
+                ".",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(result.stdout)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "CI Test")
+    git("config", "user.email", "ci@example.invalid")
+    (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-m", "baseline")
+
+    git("switch", "-c", "feature")
+    feature_path = repo / "src/opensquilla/cli/config_cmd.py"
+    feature_path.parent.mkdir(parents=True)
+    feature_path.write_text("FEATURE = True\n", encoding="utf-8")
+    git("add", feature_path.relative_to(repo).as_posix())
+    git("commit", "-m", "feature change")
+    head_sha = git("rev-parse", "HEAD")
+
+    git("switch", "main")
+    base_only_path = repo / ".github/ci/trust-policy.v1.json"
+    base_only_path.parent.mkdir(parents=True)
+    base_only_path.write_text("{}\n", encoding="utf-8")
+    git("add", base_only_path.relative_to(repo).as_posix())
+    git("commit", "-m", "base-only CI policy change")
+    base_sha = git("rev-parse", "HEAD")
+
+    changed = select_changed_files(base_sha, head_sha)
+    assert changed == ["src/opensquilla/cli/config_cmd.py"]
+    plan = plan_changed_files(changed)
+    assert plan["full_fallback"] is False
+    assert plan["reason_codes"] == ["python_targeted"]
+
+    two_tree_changed = git(
+        "diff",
+        "--no-renames",
+        "--name-only",
+        base_sha,
+        head_sha,
+    ).splitlines()
+    assert ".github/ci/trust-policy.v1.json" in two_tree_changed
+    two_tree_plan = plan_changed_files(two_tree_changed)
+    assert two_tree_plan["full_fallback"] is True
+    assert "ci_policy_changed" in two_tree_plan["reason_codes"]
+
+    git("switch", "--orphan", "unrelated")
+    unrelated_path = repo / "unrelated.txt"
+    unrelated_path.write_text("unrelated history\n", encoding="utf-8")
+    git("add", "unrelated.txt")
+    git("commit", "-m", "unrelated root")
+    unrelated_sha = git("rev-parse", "HEAD")
+    git("switch", "main")
+
+    assert select_changed_files(base_sha, unrelated_sha) == [".ci/run-all"]
+
+
+def test_queue_summary_explains_tree_mismatch_fallback() -> None:
+    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+
+    assert 'if [[ "${REASON_CODE}" == "tree_mismatch" ]]' in text
+    assert "this entry runs the full fail-closed matrix" in text
+    assert "If main advanced" in text
+    assert "wait for a new green PR CI run before requeueing" in text
+    assert "future entry's exact base and tree" in text
+
+
 def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     workflow = _workflow("ci.yml")
     jobs = workflow["jobs"]

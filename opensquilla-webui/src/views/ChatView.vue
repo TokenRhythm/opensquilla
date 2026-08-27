@@ -139,7 +139,12 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && visibleHistoryRecoveryState"
+          v-if="!forkTransition && historyState.sessionMissing"
+          :key="`${sessionKey}:missing`"
+          state="session-missing"
+        />
+        <ChatSessionRecoveryStatus
+          v-else-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
@@ -157,7 +162,7 @@
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding && !forkTransition"
+          v-if="!isNewChatLanding && !forkTransition && !historyState.sessionMissing"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -172,6 +177,7 @@
         />
 
         <div
+          v-if="!historyState.sessionMissing"
           class="chat-message-surface"
           :class="{ 'chat-message-surface--preview': forkTransition }"
           :inert="forkTransition ? true : undefined"
@@ -214,6 +220,7 @@
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
+          :resolve-session-availability="resolveCreatedSessionAvailability"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @edit-attachment="editAttachmentResource"
@@ -653,7 +660,9 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
-      :input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"
+      :input-disabled="Boolean(dockedPlanQuestionnaire)
+        || Boolean(forkTransition)
+        || historyState.sessionMissing"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
       :safe-setup-available="composerSafeSetupAvailable"
@@ -883,7 +892,7 @@ import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandl
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
-import { useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
+import { chatTaskId, useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
@@ -904,7 +913,10 @@ import {
   type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
 import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
-import { autoSendDraftIsUnchanged } from '@/composables/chat/sessionBootstrapContract'
+import {
+  autoSendDraftIsUnchanged,
+  rpcErrorCode,
+} from '@/composables/chat/sessionBootstrapContract'
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
@@ -1142,6 +1154,17 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+
+async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
+  try {
+    await rpc.call('sessions.resolve', { key: sessionKey })
+    return true
+  } catch (error: unknown) {
+    const code = rpcErrorCode(error)
+    if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') return false
+    throw error
+  }
+}
 const sandboxSetupStore = useSandboxSetupStore()
 const {
   ensuring: sandboxSetupPending,
@@ -1497,7 +1520,7 @@ const chatElevatedMode = useChatElevatedMode({
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
-useChatDraftPersistence({ sessionKey, inputText })
+const draftPersistence = useChatDraftPersistence({ sessionKey, inputText })
 const {
   elevatedMode,
   loadElevatedMode,
@@ -2011,6 +2034,7 @@ const {
   hasLegacyNewChatQuery,
   isDraftRoute,
   persistSession,
+  readAgentFromUrl,
   readProjectFromUrl,
   readSessionFromUrl,
   resolveInitialSession,
@@ -2026,8 +2050,9 @@ const {
   routerSlots,
   routerModels,
   modelRoutingMode: globalModelRoutingMode,
-  imageInputAdmission,
-  imageInputAdmissionReason,
+  globalImageInputAdmission,
+  globalImageInputAdmissionReason,
+  modelRoutingCapabilitiesByMode,
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
@@ -2049,6 +2074,9 @@ const chatSessionRouting = useChatSessionRouting({
   rpc,
   sessionKey,
   globalMode: globalModelRoutingMode,
+  globalImageInputAdmission,
+  globalImageInputAdmissionReason,
+  capabilitiesByMode: modelRoutingCapabilitiesByMode,
   available: sessionRoutingAvailable,
   isStreaming,
   isDraft: isDraftSurface,
@@ -2061,6 +2089,8 @@ const {
   mode: modelRoutingMode,
   busy: modelRoutingSettingsBusy,
   initialRoutingMode,
+  imageInputAdmission,
+  imageInputAdmissionReason,
 } = chatSessionRouting
 const sessionRoutingSendBlockedReason = computed(() => (
   modelRoutingSettingsBusy.value ? t('chat.composer.routingUpdateBlocked') : ''
@@ -2240,6 +2270,28 @@ const chatHistory = useChatHistory({
   scrollEpoch,
   stripTimePrefix,
   scrollToBottom,
+  onTerminalTask: outcome => {
+    const taskId = outcome.taskId || ''
+    if (!taskId) return
+    taskOwnership.noteTerminal(taskId)
+    const ownsLiveStream = activeStreamTaskId.value === taskId
+    const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
+    if (ownsLiveStream) {
+      resetStreamLiveTurnState()
+      activeStreamTaskId.value = outcome.status === 'cancelled'
+        ? STOPPED_STREAM_TASK_ID
+        : FINISHED_STREAM_TASK_ID
+    }
+    if (ownsLiveStream || ownsRunStatus) {
+      applySessionRunState({
+        run_status: outcome.status === 'cancelled'
+          ? 'cancelled'
+          : outcome.status === 'failed' ? 'failed' : 'idle',
+        active_task: null,
+        last_task: { task_id: taskId, status: outcome.status },
+      })
+    }
+  },
 })
 const {
   historySessionKey,
@@ -4201,6 +4253,7 @@ watch(isNewChatLanding, landing => {
 }, { flush: 'post' })
 
 const historyRecoveryState = computed(() => {
+  if (historyState.value.sessionMissing) return null
   return resolveChatHistoryRecoveryState({
     isDraftLanding: isNewChatLanding.value,
     initialHistoryStatus: historyState.value.initialLoadStatus,
@@ -4214,6 +4267,7 @@ const visibleHistoryRecoveryState = computed(() => (
 ))
 
 const liveRecoveryState = computed(() => {
+  if (historyState.value.sessionMissing) return null
   if (livePhase.value === 'degraded') return 'live-degraded' as const
   if (
     livePhase.value === 'connecting'
@@ -6410,9 +6464,20 @@ onMounted(async () => {
   window.addEventListener('pointercancel', onThreadPointerEnd)
   bindBottomIntersectionObserver()
   const initialRouteFullPath = route.fullPath
+  const initialHistoryState = window.history.state as Record<string, unknown> | null
+  const hasExplicitDraftPrefill = typeof initialHistoryState?.prefill === 'string'
+    && initialHistoryState.prefill.length > 0
+  const explicitFreshTask = isDraftRoute() && Boolean(
+    readAgentFromUrl()
+    || readProjectFromUrl()
+    || hasLegacyNewChatQuery()
+    || hasExplicitDraftPrefill,
+  )
+  if (explicitFreshTask) draftPersistence.discardRecentDraft()
   // Initialize session key. Without an explicit ?session= the view opens as a
-  // draft instead of restoring a previous session.
-  const initialSession = resolveInitialSession()
+  // draft, except for the one most-recent non-empty draft recovered on a cold
+  // /chat/new entry. Explicit new-task handoffs always remain clean.
+  const initialSession = resolveInitialSession({ recoverDraft: !explicitFreshTask })
   sessionKey.value = initialSession.sessionKey
   bindTailLayoutObservers()
   let initialDraftProjectGeneration: number | null = null
@@ -6436,7 +6501,10 @@ onMounted(async () => {
     }
   } else {
     activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
-    persistSession(sessionKey.value, { updateRoute: false, source: 'chatView.initialSession' })
+    persistSession(sessionKey.value, {
+      updateRoute: initialSession.recoveredDraft,
+      source: 'chatView.initialSession',
+    })
   }
 
   // Load elevated mode
@@ -6762,6 +6830,10 @@ watch(freshTaskDraft.request, request => {
   if (!request) return
   draftProjectHydration.invalidate()
   landingPrefilled.value = false
+  // Clear before changing sessionKey. The draft watcher then observes an empty
+  // outgoing composer and cannot recreate the discarded recovery pointer.
+  inputText.value = ''
+  draftPersistence.clearDraft(sessionKey.value)
   if (request.workspaceId && rpc.canChooseProject) {
     const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
     if (workspace) {
@@ -6823,10 +6895,10 @@ watch(sessionKey, () => {
 // Hello refreshes method capabilities on reconnect. Retry the durable index
 // for the current Session then; older gateways simply remain on history/live.
 watch(() => rpc.state, (state, previous) => {
+  if (state !== 'connected' || previous === 'connected') return
+  void loadFeatureToggles()
   if (
-    state === 'connected'
-    && previous !== 'connected'
-    && sessionKey.value
+    sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
   ) {
     void loadSessionArtifactsAfterReconnect()

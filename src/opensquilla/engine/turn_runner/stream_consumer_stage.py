@@ -70,6 +70,12 @@ log = structlog.get_logger(__name__)
 # downstream" (CompactionEvent + ErrorEvent take this path -- the
 # loop continues instead of yielding).
 _SUPPRESS: Final = object()
+_RESTRICTED_TOOL_PRESENTATION: Final = {
+    "category": "generic",
+    "primaryArguments": [],
+    "argumentDisplay": "primary",
+    "lifecycleDisplay": "boundary",
+}
 _CURRENT_SILENT_REPLY_TEXT_MARKER: Final = (
     "_opensquilla_current_silent_reply_text"
 )
@@ -557,15 +563,40 @@ class _ToolUseStartHandler:
         if state.current_text_parts and state.current_text_presentation == "answer":
             state.current_text_presentation = "intermediate"
         _flush_current_text_segment(state)
-        state.turn_segments.append(
-            {
-                "type": "tool_use",
-                "tool_use_id": event.tool_use_id,
-                "name": event.tool_name,
-                "input": "",
-            }
-        )
+        segment: dict[str, Any] = {
+            "type": "tool_use",
+            "tool_use_id": event.tool_use_id,
+            "name": event.tool_name,
+            "input": "",
+        }
+        if event.tool_presentation is not None:
+            segment["tool_presentation"] = dict(event.tool_presentation)
+        state.turn_segments.append(segment)
         return event
+
+
+def _update_tool_use_segment(event: Any, state: _StreamState) -> None:
+    """Persist the authoritative input as soon as the declaration commits."""
+
+    if event.arguments is None:
+        return
+    from opensquilla.engine.runtime import _persisted_tool_use_input
+
+    for segment in reversed(state.turn_segments):
+        if (
+            segment.get("type") == "tool_use"
+            and segment.get("tool_use_id") == event.tool_use_id
+        ):
+            segment["name"] = event.tool_name
+            segment["input"] = _persisted_tool_use_input(
+                event.tool_name,
+                event.tool_use_id,
+                event.arguments,
+            )
+            if event.tool_presentation is not None:
+                segment["tool_presentation"] = dict(event.tool_presentation)
+            return
+
 
 def _clear_artifact_delivery_failure(state: _StreamState, target_key: str) -> None:
     failure_summary = state.artifact_delivery_failures_by_target.pop(target_key, None)
@@ -623,7 +654,6 @@ class _ToolResultHandler:
             _artifact_delivery_failure_summary,
             _artifact_delivery_target_keys,
             _persisted_tool_result_segment,
-            _persisted_tool_use_input,
         )
 
         failure_summary = _artifact_delivery_failure_summary(event)
@@ -642,19 +672,7 @@ class _ToolResultHandler:
                 _clear_artifact_delivery_failure(state, target_key)
         if _is_completed_meta_invoke(event):
             state.completed_meta_skill_without_text = _meta_invoke_skill_name(event)
-        if event.arguments is not None:
-            for segment in reversed(state.turn_segments):
-                if (
-                    segment.get("type") == "tool_use"
-                    and segment.get("tool_use_id") == event.tool_use_id
-                ):
-                    segment["name"] = event.tool_name
-                    segment["input"] = _persisted_tool_use_input(
-                        event.tool_name,
-                        event.tool_use_id,
-                        event.arguments,
-                    )
-                    break
+        _update_tool_use_segment(event, state)
         result_segment = _persisted_tool_result_segment(event)
         for index in range(len(state.turn_segments) - 1, -1, -1):
             segment = state.turn_segments[index]
@@ -1732,6 +1750,27 @@ class StreamConsumerStage:
             compaction_hooks=compaction_hooks,
         )
 
+    @staticmethod
+    def _with_tool_presentation(event: Any, agent: Any) -> Any:
+        if getattr(event, "tool_presentation", None) is not None:
+            return event
+        resolver = getattr(agent, "tool_presentation_payload", None)
+        tool_name = getattr(event, "tool_name", "")
+        if not callable(resolver) or not isinstance(tool_name, str) or not tool_name:
+            return event
+        try:
+            return replace(event, tool_presentation=resolver(tool_name))
+        except Exception:
+            log.warning(
+                "tool_presentation_resolution_failed",
+                tool_name=tool_name,
+                exc_info=True,
+            )
+            return replace(
+                event,
+                tool_presentation=dict(_RESTRICTED_TOOL_PRESENTATION),
+            )
+
     async def _adopt_generated_artifact(
         self,
         event: ArtifactEvent,
@@ -1924,12 +1963,16 @@ class StreamConsumerStage:
                         human_silent_reply_prefix_open = False
                         human_prefix_crossed_public_boundary = False
             elif isinstance(event, ToolUseStartEvent):
+                event = self._with_tool_presentation(event, inp.agent)
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):
                 transformed = event
             elif isinstance(event, ToolUseEndEvent):
+                event = self._with_tool_presentation(event, inp.agent)
+                _update_tool_use_segment(event, state)
                 transformed = event
             elif isinstance(event, ToolResultEvent):
+                event = self._with_tool_presentation(event, inp.agent)
                 transformed = self._tool_result_handler.handle(
                     event,
                     state,

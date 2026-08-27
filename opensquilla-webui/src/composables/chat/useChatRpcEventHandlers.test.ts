@@ -214,6 +214,38 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
 })
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('starts restored activity at the earliest server event timestamp', () => {
+    const harness = createHarness()
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-clock',
+        current_stream_seq: 2,
+        events: [
+          {
+            event: 'session.event.provider_activity',
+            payload: {
+              session_key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 1, emitted_at: 2_000, phase: 'requesting',
+            },
+          },
+          {
+            event: 'session.event.thinking',
+            payload: {
+              session_key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 2, emitted_at: 3_000, text: 'reasoning',
+            },
+          },
+        ],
+      })
+
+      expect(harness.stream.startStreaming).toHaveBeenCalledWith(2_000, false)
+    } finally {
+      harness.stop()
+    }
+  })
+
   it('replays a committed tool timeline including its authoritative end', () => {
     const { api, stream, stop } = createHarness()
     try {

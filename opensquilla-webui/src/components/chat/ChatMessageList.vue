@@ -92,6 +92,7 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
+          :resolve-session-availability="resolveSessionAvailability"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
           @regenerate="$emit('regenerateMessage', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
@@ -203,6 +204,7 @@ const props = defineProps<{
   isStreaming?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */

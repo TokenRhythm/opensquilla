@@ -6,6 +6,7 @@ import {
   SESSION_BOOTSTRAP_BUDGET_MS,
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
+  isRpcTimeout,
   retryAfterMs,
   shouldRetrySessionPhase,
   type SessionBootstrapPhaseContext,
@@ -48,6 +49,8 @@ interface ActiveBootstrap {
   freshLiveOutageForHistoryRetry: boolean
   awaitingReplacementConnection: boolean
   lateReplacementRecoveryUsed: boolean
+  lateReplacementHistoryRecoveryPhase: PhaseRuntime<SessionPhaseResult> | null
+  lateReplacementHistoryRecoveryUsed: boolean
   history: PhaseRuntime<SessionPhaseResult>
   live: PhaseRuntime<SessionSubscriptionOutcome>
 }
@@ -194,6 +197,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       waiter.resolve(true)
     }
     releaseCriticalRequestsIfReady(run)
+    tryRecoverHistoryOnLateReplacement(run)
   }
 
   function markHistoryRequestSent(
@@ -279,6 +283,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   function runHistoryPhase(
     run: ActiveBootstrap,
     retryFirst: boolean,
+    maxAttempts: 1 | 2 = 2,
   ): Promise<SessionPhaseResult> {
     const phase = run.history
     if (phase.running) return phase.promise
@@ -292,7 +297,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         error: new RpcTimeoutError('chat.history', 0),
       }
       let requiredLiveQueueSequence = Math.max(1, run.liveQueueSequence)
-      while (phase.attempts < 2 && isCurrent(run)) {
+      while (phase.attempts < maxAttempts && isCurrent(run)) {
         if (Date.now() >= phase.deadlineAt) break
         if (!await waitForLiveSubscribeSent(
           run,
@@ -327,7 +332,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           requiredLiveQueueSequence = liveQueueSequenceForAttempt + 1
         }
         if (
-          phase.attempts >= 2
+          phase.attempts >= maxAttempts
           || !shouldRetrySessionPhase(lastResult.error)
           || !await waitBeforeRetry(lastResult.error, run, phase.deadlineAt)
         ) {
@@ -336,13 +341,16 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       }
       if (isCurrent(run)) historyPhase.value = 'error'
       return lastResult
-    })().finally(() => {
+    })().then(result => {
+      phase.result = result
+      return result
+    }).finally(() => {
       // A disconnected or exhausted phase may terminate before it can send.
       // Optional UI traffic must not remain globally blocked in that case.
       run.criticalQueue.historyTerminal = true
       releaseCriticalRequestsIfReady(run)
       phase.running = false
-      phase.result = null
+      tryRecoverHistoryOnLateReplacement(run)
     })
     return phase.promise
   }
@@ -456,6 +464,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       freshLiveOutageForHistoryRetry: false,
       awaitingReplacementConnection: false,
       lateReplacementRecoveryUsed: false,
+      lateReplacementHistoryRecoveryPhase: null,
+      lateReplacementHistoryRecoveryUsed: false,
       history: historyRuntime(deadlineAt),
       live: liveRuntime(deadlineAt),
     }
@@ -520,7 +530,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     return publicRun(run)
   }
 
-  function resetHistoryPhaseForManualRetry(run: ActiveBootstrap) {
+  function resetHistoryPhaseForRetry(run: ActiveBootstrap) {
     run.history = historyRuntime(Date.now() + SESSION_BOOTSTRAP_BUDGET_MS)
   }
 
@@ -535,7 +545,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       return startSessionBootstrap({ includeHistory: true, force: true }).history
     }
     if (run.history.running) return run.history.promise
-    resetHistoryPhaseForManualRetry(run)
+    resetHistoryPhaseForRetry(run)
     // A user-initiated history retry is a new recovery operation. If its local
     // timeout recycles an otherwise-authoritative live socket, re-register live
     // with a fresh outage budget instead of inheriting exhausted attempts from
@@ -543,6 +553,51 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     run.freshLiveOutageForHistoryRetry = true
     run.history.promise = runHistoryPhase(run, true)
     return run.history.promise
+  }
+
+  function armHistoryRecoveryForLateReplacement(run: ActiveBootstrap) {
+    if (
+      !isCurrent(run)
+      || !run.includeHistory
+      || run.lateReplacementHistoryRecoveryUsed
+    ) return
+    run.lateReplacementHistoryRecoveryPhase ??= run.history
+    tryRecoverHistoryOnLateReplacement(run)
+  }
+
+  function tryRecoverHistoryOnLateReplacement(run: ActiveBootstrap) {
+    const phase = run.lateReplacementHistoryRecoveryPhase
+    if (
+      !phase
+      || run.lateReplacementHistoryRecoveryUsed
+      || !isCurrent(run)
+    ) return
+    if (run.history !== phase) {
+      run.lateReplacementHistoryRecoveryPhase = null
+      return
+    }
+    if (phase.running || historyPhase.value !== 'error' || !phase.result) return
+    const terminal = phase.result
+    const recoverable = (
+      !terminal.ok
+      && !terminal.cancelled
+      && (
+        isRpcTimeout(terminal.error)
+        || requiresFreshLiveQueue(terminal.error)
+      )
+    )
+    if (!recoverable) {
+      run.lateReplacementHistoryRecoveryPhase = null
+      return
+    }
+    const liveSocketGeneration = run.criticalQueue.liveSocketGeneration
+    if (liveSocketGeneration === null) return
+
+    run.lateReplacementHistoryRecoveryUsed = true
+    run.lateReplacementHistoryRecoveryPhase = null
+    resetHistoryPhaseForRetry(run)
+    rearmCriticalQueue(run, true, liveSocketGeneration)
+    run.history.promise = runHistoryPhase(run, true, 1)
   }
 
   function retryLive(): Promise<SessionSubscriptionOutcome> {
@@ -648,6 +703,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     }
     const replacementConnected = run.awaitingReplacementConnection
     run.awaitingReplacementConnection = false
+    if (replacementConnected) armHistoryRecoveryForLateReplacement(run)
     if (run.live.running) {
       const interruptedPhase = run.live
       const resumeOnReplacement = (outcome?: SessionSubscriptionOutcome) => {
@@ -681,6 +737,9 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           skipSnapshot: interruptedPhase.skipSnapshot,
         }
         run.live.promise = runLivePhase(run)
+        if (transportFailedAfterConnected) {
+          armHistoryRecoveryForLateReplacement(run)
+        }
       }
       // The replacement handshake can finish before the interrupted subscribe
       // observes its cancellation. Resume exactly once after that old phase
@@ -704,6 +763,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       rearmCriticalQueue(run, false)
       resetLivePhaseForManualRetry(run)
       run.live.promise = runLivePhase(run)
+      armHistoryRecoveryForLateReplacement(run)
       return publicRun(run)
     }
     return publicRun(run)

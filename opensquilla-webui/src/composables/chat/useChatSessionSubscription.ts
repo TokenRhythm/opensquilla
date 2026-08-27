@@ -51,7 +51,10 @@ export interface UseChatSessionSubscriptionOptions {
   ownershipHydrationRequired?: () => boolean
   acceptanceStopPending?: Ref<boolean>
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
-  startStreaming: () => void
+  startStreaming: (
+    activityStartedAt?: number | string | null,
+    recordInitialActivity?: boolean,
+  ) => void
   /** Adopt durable task timing even when snapshot replay already opened the bubble. */
   reconcileStreamTaskClock?: (snapshot: {
     sessionKey: string
@@ -281,14 +284,29 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     if (runModeLock && typeof runModeLock === 'object') {
       options.onRunModeLock?.(runModeLock)
     }
-    options.onSnapshot?.(res)
-    options.taskOwnership?.applySnapshot(res, true)
+    const rawActiveTask = res.active_task || res.activeTask || null
+    const rawActiveTaskId = chatTaskId(rawActiveTask)
+    const rawRunStatus = String(res.run_status || res.runStatus || '').toLowerCase()
+    const settledLiveTask = LIVE_RUN_STATES.includes(rawRunStatus)
+      && Boolean(rawActiveTaskId)
+      && options.taskOwnership?.isSettled(rawActiveTaskId) === true
+    const effectiveSnapshot = settledLiveTask
+      ? {
+          ...res,
+          run_status: 'idle' as const,
+          runStatus: 'idle' as const,
+          active_task: null,
+          activeTask: null,
+        }
+      : res
+    options.onSnapshot?.(effectiveSnapshot)
+    options.taskOwnership?.applySnapshot(effectiveSnapshot, true)
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
     // the matching send transaction (receipt/rejection) or an explicit session
     // reset may release that latch.  Its idempotent replay must still inherit
     // the Stop intent and abort the exact accepted task once the receipt exists.
-    applySessionRunState(res)
+    applySessionRunState(effectiveSnapshot)
     // A pending inline interrupt is newer, stronger evidence than an idle
     // subscription snapshot that raced with the approval request.
     if (
@@ -301,17 +319,21 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       })
     }
     const liveTaskSnapshot = LIVE_RUN_STATES.includes(options.runStatus.value.status)
-    reconcileActiveTaskGroups(res)
+    if (!settledLiveTask) reconcileActiveTaskGroups(res)
     if (liveTaskSnapshot && !options.isStreaming.value) {
-      options.startStreaming()
+      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
+        started_at?: number | string | null
+        startedAt?: number | string | null
+      } | null | undefined
+      options.startStreaming(activeTask?.started_at ?? activeTask?.startedAt)
       // startStreaming establishes the live bubble with a generic running
       // placeholder. Restore the authoritative active-task payload (including
       // steer_capability) that came from hydration instead of waiting for a
       // later task.running event to repair it.
-      applySessionRunState(res)
+      applySessionRunState(effectiveSnapshot)
     }
     if (liveTaskSnapshot) {
-      const activeTask = (res.active_task || res.activeTask) as {
+      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
         task_id?: string
         taskId?: string
         started_at?: number | string | null
@@ -568,9 +590,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
             // snapshot response. Never reset the live surface behind them.
             && snapshot.current_stream_seq >= options.lastStreamSeq.value
           ) {
-            onLiveSnapshot?.(snapshot)
+            const snapshotTaskId = typeof snapshot.task_id === 'string'
+              ? snapshot.task_id
+              : ''
+            const settledSnapshot = Boolean(
+              snapshotTaskId && options.taskOwnership?.isSettled(snapshotTaskId),
+            )
+            if (!settledSnapshot) onLiveSnapshot?.(snapshot)
             options.lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
-            snapshotTaskLive = Boolean(snapshot.task_id)
+            snapshotTaskLive = Boolean(snapshot.task_id) && !settledSnapshot
           }
         }
       }

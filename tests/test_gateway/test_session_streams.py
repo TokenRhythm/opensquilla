@@ -959,6 +959,63 @@ def test_terminal_handoff_retains_only_sanitized_v2_and_is_single_use() -> None:
     ) is None
 
 
+def test_terminal_handoff_clears_matching_live_task_without_done_event() -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:cancelled-terminal-snapshot"
+    common = {"task_id": "task-cancelled", "turn_id": "task-cancelled"}
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**common, "phase": "requesting"},
+    )
+    registry.record(
+        session_key,
+        "session.event.thinking",
+        {**common, "block_id": "reasoning-1", "text": "synthetic reasoning"},
+    )
+
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key,
+        "task-cancelled",
+        turn_id="task-cancelled",
+        terminal_at=10_000,
+    )
+
+    assert snapshot is not None
+    assert snapshot["complete"] is True
+    assert registry.live_snapshot(session_key).task_id is None
+    assert registry.live_snapshot(session_key).events == []
+
+
+def test_terminal_handoff_does_not_clear_successor_live_task() -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:terminal-successor"
+    first = {"task_id": "task-first", "turn_id": "task-first"}
+    successor = {"task_id": "task-successor", "turn_id": "task-successor"}
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**first, "phase": "requesting"},
+    )
+    registry.record(session_key, "session.event.done", first)
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**successor, "phase": "requesting"},
+    )
+
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key,
+        "task-first",
+        turn_id="task-first",
+    )
+
+    assert snapshot is not None
+    live = registry.live_snapshot(session_key)
+    assert live.task_id == "task-successor"
+    assert [event.payload["task_id"] for event in live.events] == ["task-successor"]
+
+
 def test_live_snapshot_keeps_text_presentation_boundaries(monkeypatch) -> None:
     registry = SessionStreamRegistry()
     session_key = "agent:main:text-presentation"

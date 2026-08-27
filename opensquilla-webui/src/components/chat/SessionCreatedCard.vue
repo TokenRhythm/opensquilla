@@ -3,36 +3,77 @@
     class="session-created-card"
     data-testid="session-created-card"
     :data-session-key="sessionKey"
+    :data-session-state="availability"
   >
     <span class="session-created-card__identity">
       <Icon name="chat" :size="17" />
-      <span>{{ t('chat.sessionCreated.title') }}</span>
+      <span>{{ displayTitle }}</span>
     </span>
     <button
       type="button"
       class="session-created-card__open"
-      :aria-label="t('chat.sessionCreated.open')"
-      @click="$emit('open', sessionKey)"
+      :aria-label="availability === 'missing'
+        ? t('chat.sessionCreated.deleted')
+        : t('chat.sessionCreated.open')"
+      :disabled="availability !== 'available'"
+      @click="openSession"
     >
-      {{ t('chat.sessionCreated.open') }}
-      <Icon name="chevronRight" :size="15" />
+      {{ availability === 'missing'
+        ? t('chat.sessionCreated.deleted')
+        : t('chat.sessionCreated.open') }}
+      <Icon v-if="availability !== 'missing'" name="chevronRight" :size="15" />
     </button>
   </div>
 </template>
 
 <script setup lang="ts">
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 
-defineProps<{
+const props = defineProps<{
   sessionKey: string
+  title?: string
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   open: [sessionKey: string]
 }>()
 
 const { t } = useI18n()
+const availability = ref<'checking' | 'available' | 'missing'>('available')
+
+const displayTitle = computed(() => {
+  const title = props.title?.trim()
+  if (title) return title
+  const segments = props.sessionKey.split(':')
+  const suffix = segments[segments.length - 1]?.slice(-8) || props.sessionKey.slice(-8)
+  return t('chat.sessionCreated.fallbackTitle', { suffix })
+})
+
+async function openSession() {
+  if (availability.value !== 'available') return
+  const sessionKey = props.sessionKey
+  const resolveAvailability = props.resolveSessionAvailability
+  if (!resolveAvailability) {
+    emit('open', sessionKey)
+    return
+  }
+  availability.value = 'checking'
+  try {
+    const available = await resolveAvailability(sessionKey)
+    if (props.sessionKey !== sessionKey) return
+    availability.value = available ? 'available' : 'missing'
+    if (available) emit('open', sessionKey)
+  } catch {
+    // Preserve legacy navigation on transient failures. Only an authoritative
+    // not-found result disables the historical card.
+    if (props.sessionKey !== sessionKey) return
+    availability.value = 'available'
+    emit('open', sessionKey)
+  }
+}
 </script>
 
 <style scoped>
@@ -69,6 +110,12 @@ const { t } = useI18n()
   color: var(--text-muted);
 }
 
+.session-created-card__identity > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .session-created-card__open {
   flex: 0 0 auto;
   gap: var(--sp-1);
@@ -85,6 +132,16 @@ const { t } = useI18n()
 .session-created-card__open:hover {
   background: var(--bg-hover);
   color: var(--text);
+}
+
+.session-created-card__open:disabled {
+  cursor: default;
+  opacity: var(--state-disabled-opacity);
+}
+
+.session-created-card__open:disabled:hover {
+  background: transparent;
+  color: var(--text-muted);
 }
 
 .session-created-card__open:focus-visible {

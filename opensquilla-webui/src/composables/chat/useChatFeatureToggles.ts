@@ -2,7 +2,12 @@ import { computed, ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { ChatRouterTierConfig } from '@/types/chat'
-import type { ImageInputAdmission, ModelRoutingMode } from '@/types/modelRouting'
+import type {
+  ImageInputAdmission,
+  ModelRoutingCapabilitiesByMode,
+  ModelRoutingMode,
+  ModelRoutingSnapshot,
+} from '@/types/modelRouting'
 import { normalizeModelRoutingMode } from '@/types/modelRouting'
 import { normalizeRouterTier, sortRouterTiers } from '@/utils/chat/routerTiers'
 import { encodeRouterShape, decodeRouterShape } from '@/utils/chat/routerShapeCache'
@@ -28,6 +33,7 @@ type RpcClient = {
     callOptions?: RpcCallOptions,
   ) => Promise<T>
   on?: (event: string, handler: (payload: unknown) => void) => () => void
+  supportsMethod?: (method: string) => boolean
 }
 
 export interface UseChatFeatureTogglesOptions {
@@ -66,16 +72,47 @@ interface ChatFeatureConfig {
   }
 }
 
-interface ModelRoutingSnapshot {
-  mode?: 'direct' | 'router' | 'ensemble'
-  selection_mode?: string
-  image_input?: {
-    admission?: 'allowed' | 'blocked' | 'unknown'
-    reason?: string
-  }
+const ROUTER_SHAPE_KEY = 'opensquilla.router.shape'
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
 }
 
-const ROUTER_SHAPE_KEY = 'opensquilla.router.shape'
+function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode | null {
+  const source = record(value)
+  if (!source) return null
+
+  const parsed = {} as ModelRoutingCapabilitiesByMode
+  for (const mode of ['direct', 'router', 'ensemble'] as const) {
+    const modeCapabilities = record(source[mode])
+    const imageInput = record(modeCapabilities?.image_input)
+    const admission = imageInput?.admission
+    const reason = imageInput?.reason
+    if (
+      (admission !== 'allowed' && admission !== 'blocked' && admission !== 'unknown')
+      || typeof reason !== 'string'
+      || !reason
+    ) return null
+    parsed[mode] = {
+      image_input: {
+        admission,
+        reason,
+      },
+    }
+  }
+  return parsed
+}
+
+function isMethodNotFound(error: unknown): boolean {
+  const candidate = record(error)
+  const message = error instanceof Error
+    ? error.message
+    : String(candidate?.message || error || '')
+  return candidate?.code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
+}
+
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const { pushToast } = useToasts()
   const routerEnabled = ref(false)
@@ -91,9 +128,13 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const llmEnsembleSelectionMode = ref('')
   const llmEnsembleSettingsBusy = ref(false)
   const modelRoutingSettingsBusy = ref(false)
-  const imageInputAdmission = ref<ImageInputAdmission>('unknown')
-  const imageInputAdmissionReason = ref('capability_unknown')
+  const globalImageInputAdmission = ref<ImageInputAdmission>('unknown')
+  const globalImageInputAdmissionReason = ref('capability_unknown')
+  const modelRoutingCapabilitiesByMode = ref<ModelRoutingCapabilitiesByMode | null>(null)
   let hasCanonicalImageAdmission = false
+  let modelRoutingRequestGeneration = 0
+  let modelRoutingEventGeneration = 0
+  let latestModelRoutingSnapshot: ModelRoutingSnapshot | undefined
   const routerSlots = ref<string[]>([])
   const routerModels = ref<Record<string, string>>({})
   const routerTierConfigs = ref<Record<string, ChatRouterTierConfig>>({})
@@ -106,30 +147,34 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   function applyModelRoutingSnapshot(snapshot: ModelRoutingSnapshot | undefined) {
     const mode = snapshot?.mode
     if (!mode) return false
+    latestModelRoutingSnapshot = snapshot
     llmEnsembleEnabled.value = mode === 'ensemble'
     // The product control remains one three-state selector. The existing
     // routerEnabled ref means "routing feature active" to ChatView, so Ensemble
     // remains active here even when its static selection mode bypasses the
     // SquillaRouter implementation internally.
     routerEnabled.value = mode !== 'direct'
+    modelRoutingCapabilitiesByMode.value = parseCapabilitiesByMode(
+      snapshot.capabilities_by_mode,
+    )
     if (typeof snapshot.selection_mode === 'string') {
       llmEnsembleSelectionMode.value = snapshot.selection_mode
     }
     const admission = snapshot.image_input?.admission
     if (admission === 'allowed' || admission === 'blocked' || admission === 'unknown') {
       hasCanonicalImageAdmission = true
-      imageInputAdmission.value = admission
-      imageInputAdmissionReason.value = String(
+      globalImageInputAdmission.value = admission
+      globalImageInputAdmissionReason.value = String(
         snapshot.image_input?.reason || 'capability_unknown',
       )
     } else if (mode === 'ensemble') {
       hasCanonicalImageAdmission = false
-      imageInputAdmission.value = 'blocked'
-      imageInputAdmissionReason.value = 'ensemble_mode_unsupported'
+      globalImageInputAdmission.value = 'blocked'
+      globalImageInputAdmissionReason.value = 'ensemble_mode_unsupported'
     } else {
       hasCanonicalImageAdmission = false
-      imageInputAdmission.value = 'unknown'
-      imageInputAdmissionReason.value = 'capability_unknown'
+      globalImageInputAdmission.value = 'unknown'
+      globalImageInputAdmissionReason.value = 'capability_unknown'
     }
     return true
   }
@@ -147,8 +192,8 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
     if (!hasCanonicalImageAdmission) {
-      imageInputAdmission.value = ensembleEnabled ? 'blocked' : 'unknown'
-      imageInputAdmissionReason.value = ensembleEnabled
+      globalImageInputAdmission.value = ensembleEnabled ? 'blocked' : 'unknown'
+      globalImageInputAdmissionReason.value = ensembleEnabled
         ? 'ensemble_mode_unsupported'
         : 'capability_unknown'
     }
@@ -201,17 +246,42 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     }
   }
 
+  async function applyLegacyModelRoutingFallback(cfg: ChatFeatureConfig | undefined) {
+    latestModelRoutingSnapshot = undefined
+    modelRoutingCapabilitiesByMode.value = null
+    hasCanonicalImageAdmission = false
+    await applyFeatureConfig(cfg)
+  }
+
   async function loadFeatureToggles() {
+    const requestGeneration = ++modelRoutingRequestGeneration
+    const eventGeneration = modelRoutingEventGeneration
+    let cfg: ChatFeatureConfig | undefined
     try {
       await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
-      const cfg = options.readCallOptions
+      cfg = options.readCallOptions
         ? await options.rpc.call<ChatFeatureConfig>(
             'config.get',
             undefined,
             options.readCallOptions,
           )
         : await options.rpc.call<ChatFeatureConfig>('config.get')
+      if (requestGeneration !== modelRoutingRequestGeneration) return
       await applyFeatureConfig(cfg, { refreshUsage: true })
+      if (requestGeneration !== modelRoutingRequestGeneration) return
+      // Config remains the compatibility source for older Gateways. A routing
+      // event observed while it loaded is newer, so restore that atomic public
+      // snapshot and retire this read before it can start a stale canonical GET.
+      if (eventGeneration !== modelRoutingEventGeneration) {
+        if (latestModelRoutingSnapshot) {
+          applyModelRoutingSnapshot(latestModelRoutingSnapshot)
+        }
+        return
+      }
+      if (options.rpc.supportsMethod?.('models.routing.get') === false) {
+        await applyLegacyModelRoutingFallback(cfg)
+        return
+      }
       try {
         const routing = options.readCallOptions
           ? await options.rpc.call<ModelRoutingSnapshot>(
@@ -220,10 +290,30 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
               options.readCallOptions,
             )
           : await options.rpc.call<ModelRoutingSnapshot>('models.routing.get')
-        applyModelRoutingSnapshot(routing)
-      } catch {
-        // Older Gateways have no canonical routing RPC; the config projection
-        // applied above remains the read-only compatibility snapshot.
+        if (
+          requestGeneration === modelRoutingRequestGeneration
+          && eventGeneration === modelRoutingEventGeneration
+        ) {
+          applyModelRoutingSnapshot(routing)
+        }
+      } catch (error) {
+        if (
+          requestGeneration !== modelRoutingRequestGeneration
+          || eventGeneration !== modelRoutingEventGeneration
+        ) return
+        if (!isMethodNotFound(error)) {
+          // A timeout or transient server/transport error is not evidence that
+          // the Gateway contract disappeared. Preserve the last authoritative
+          // matrix so a known block cannot accidentally degrade to unknown.
+          if (latestModelRoutingSnapshot) {
+            applyModelRoutingSnapshot(latestModelRoutingSnapshot)
+          }
+          return
+        }
+        // A successful connection to an older Gateway must not retain a
+        // matrix learned from the previous connection. Clear the canonical
+        // cache as one unit, then re-apply this Gateway's config projection.
+        await applyLegacyModelRoutingFallback(cfg)
       }
     } catch {
       // Feature toggles are optional for older gateways.
@@ -339,6 +429,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     }
     const onFocus = () => schedule()
     const unbindRouting = options.rpc.on?.('models.routing.changed', (payload) => {
+      modelRoutingEventGeneration += 1
       if (payload && typeof payload === 'object') {
         applyModelRoutingSnapshot(payload as ModelRoutingSnapshot)
         scheduleHistorySync?.()
@@ -361,8 +452,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     routerSettingsBusy,
     modelRoutingMode,
     modelRoutingSettingsBusy,
-    imageInputAdmission,
-    imageInputAdmissionReason,
+    globalImageInputAdmission,
+    globalImageInputAdmissionReason,
+    modelRoutingCapabilitiesByMode,
     codingModeEnabled,
     codingModeSettingsBusy,
     llmEnsembleEnabled,

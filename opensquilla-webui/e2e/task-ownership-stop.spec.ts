@@ -34,6 +34,16 @@ async function preparePage(page: Page) {
     contentType: 'application/json',
     body: JSON.stringify({ pending: [], mode: 'prompt', allowPatterns: [], denyPatterns: [] }),
   }))
+  await page.route('**/api/system/update', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ available: false }),
+  }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ enabled: false }),
+  }))
   await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
     status: 204,
     contentType: 'image/png',

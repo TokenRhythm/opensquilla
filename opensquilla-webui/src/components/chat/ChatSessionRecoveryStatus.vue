@@ -26,7 +26,7 @@
       <span v-if="description">{{ description }}</span>
     </span>
     <button
-      v-if="isFailure"
+      v-if="isRetryableFailure"
       type="button"
       class="chat-session-recovery-status__retry btn btn--ghost"
       data-testid="chat-session-recovery-retry"
@@ -55,6 +55,11 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const statusRef = ref<HTMLElement | null>(null)
 const isFailure = computed(() => (
+  props.state === 'history-error'
+  || props.state === 'live-degraded'
+  || props.state === 'session-missing'
+))
+const isRetryableFailure = computed(() => (
   props.state === 'history-error' || props.state === 'live-degraded'
 ))
 const isBusy = computed(() => !isFailure.value)
@@ -70,6 +75,8 @@ const title = computed(() => {
       return t('chat.liveConnecting')
     case 'live-degraded':
       return t('chat.liveUnavailable')
+    case 'session-missing':
+      return t('chat.sessionCreated.missing')
   }
 })
 const description = computed(() => {
@@ -84,6 +91,8 @@ const description = computed(() => {
       return ''
     case 'live-degraded':
       return t('chat.liveUnavailableDescription')
+    case 'session-missing':
+      return ''
   }
 })
 const action = computed(() => (
@@ -122,7 +131,8 @@ function requestRetry() {
 }
 
 .chat-session-recovery-status--history-error,
-.chat-session-recovery-status--live-degraded {
+.chat-session-recovery-status--live-degraded,
+.chat-session-recovery-status--session-missing {
   background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
   border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
 }
