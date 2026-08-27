@@ -289,6 +289,55 @@ def test_profile_remove_rejects_disabled_static_ensemble_reference() -> None:
         remove_llm_profile(cfg, provider_id="openrouter")
 
 
+def test_profile_remove_allows_untouched_packaged_defaults() -> None:
+    """A profile blocked only by packaged preset defaults is removable (#1297).
+
+    With a non-openrouter primary, an untouched router still materializes the
+    packaged openrouter tier preset, and the legacy static selection_mode
+    default — neither is persisted, so neither can dangle after removal.
+    """
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "k"},
+        llm_profiles={"openrouter": {"api_key_env": "OPENROUTER_PROFILE_KEY"}},
+        squilla_router={"preset_binding": "follow_primary", "enabled": False},
+    )
+    assert cfg.squilla_router.tiers["c0"].get("provider") == "openrouter"
+    assert cfg.llm_ensemble.selection_mode == "static_openrouter_b5"
+
+    result = remove_llm_profile(cfg, provider_id="openrouter")
+
+    assert "openrouter" not in result.config.llm_profiles
+    assert result.public_payload == {"provider": "openrouter", "removed": True}
+
+
+def test_profile_remove_counts_customized_preset_tier() -> None:
+    """A tier the operator edited away from the packaged preset stays a reference."""
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "k"},
+        llm_profiles={"openrouter": {"api_key_env": "OPENROUTER_PROFILE_KEY"}},
+        squilla_router={"preset_binding": "follow_primary", "enabled": False},
+    )
+    cfg.squilla_router.tiers["c0"] = {
+        "provider": "openrouter",
+        "model": "operator-chosen-model",
+    }
+
+    with pytest.raises(ValueError, match=r"squilla_router\.tiers\.c0"):
+        remove_llm_profile(cfg, provider_id="openrouter")
+
+
+def test_profile_remove_ignores_unconfigured_default_selection_mode() -> None:
+    """The dormant stored mode never governs routing until it is configured."""
+    cfg = GatewayConfig(
+        llm_profiles={"openrouter": {"api_key_env": "OPENROUTER_PROFILE_KEY"}},
+        llm_ensemble={"enabled": True},
+    )
+
+    result = remove_llm_profile(cfg, provider_id="openrouter")
+
+    assert "openrouter" not in result.config.llm_profiles
+
+
 def test_profile_remove_unused_entry() -> None:
     cfg = GatewayConfig(llm_profiles={"openai": {"api_key_env": "OPENAI_PROFILE_KEY"}})
 
