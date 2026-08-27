@@ -209,6 +209,7 @@
     "tests/test_cli/test_onboard_cmd_headless_semantics.py": 4.625,
     "tests/test_cli/test_onboard_cmd_review_fixes.py": 2.487,
     "tests/test_cli/test_onboard_status_json.py": 0.566,
+    "tests/test_cli/test_option_default_profile_targets.py": 3.2,
     "tests/test_cli/test_output_helpers.py": 0.01,
     "tests/test_cli/test_profile_env_loading.py": 5.578,
     "tests/test_cli/test_profile_target_resolution.py": 5.4,
