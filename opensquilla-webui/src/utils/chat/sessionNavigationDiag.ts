@@ -161,6 +161,7 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
     : undefined
   if (!phase || generation === undefined) return null
   const handoff = activeHandoff
+  const reason = safeTransportReason(value.reason, phase)
   return recordSessionNavigationDiag('rpc.transport', {
     rendererInstance: sessionNavigationRendererInstance(),
     generation,
@@ -178,9 +179,7 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
     ...(typeof value.delay === 'number' && Number.isFinite(value.delay)
       ? { delayMs: value.delay }
       : {}),
-    ...(safeTransportReason(value.reason, phase)
-      ? { reason: safeTransportReason(value.reason, phase) }
-      : {}),
+    ...(reason ? { reason } : {}),
     ...(handoff
       ? { handoffEpoch: handoff.epoch, targetKeyHash: handoff.targetKeyHash }
       : {}),
