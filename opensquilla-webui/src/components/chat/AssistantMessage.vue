@@ -230,6 +230,8 @@
         v-for="createdSession in createdSessions"
         :key="createdSession.callId"
         :session-key="createdSession.sessionKey"
+        :title="createdSession.title"
+        :resolve-session-availability="resolveSessionAvailability"
         @open="$emit('openSession', $event)"
       />
 
@@ -526,6 +528,7 @@ const props = defineProps<{
   showTurnOutcome?: boolean
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
 }>()
 
 const emit = defineEmits<{

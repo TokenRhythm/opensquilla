@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
     },
     "preset": {
-      "summary": "Modèle de routage : {label}",
-      "desc": "Appliquez-le une fois pour remplir Routage des modèles ; modifiez-y les niveaux actifs.",
-      "customizedSummary": "Routage des modèles utilise déjà {label}.",
-      "customizedDesc": "Les niveaux actifs se modifient dans Routage des modèles.",
-      "synthesizedLabel": "Modèle de routage généré",
-      "synthesizedBadge": "Modèle généré",
-      "customize": "Voir les détails du modèle →",
-      "hide": "Masquer les détails du modèle",
-      "apply": "Appliquer à Routage des modèles",
-      "viewInRouter": "Ouvrir Routage des modèles →",
-      "modeRecommended": "modèle de routage",
-      "modeCustom": "personnalisé",
-      "modeDisabled": "désactivé"
+      "modeCustom": "personnalisé"
     },
     "modelStrategy": {
       "title": "Routage des modèles",
@@ -1704,8 +1692,6 @@
       "routerSaved": "Routeur enregistré.",
       "routerSavedRestart": "Routeur enregistré. Redémarrage requis.",
       "ensembleSaved": "Ensemble enregistré.",
-      "presetApplied": "Préréglage de routage appliqué.",
-      "presetAppliedRestart": "Préréglage de routage appliqué. Redémarrage requis.",
       "channelSaved": "Canal enregistré — configuration validée localement ; utilisez « Tester la connexion » pour vérifier les identifiants",
       "channelSavedLive": "Canal enregistré et appliqué — actif avec la nouvelle configuration",
       "channelStartFailed": "Canal enregistré, mais son démarrage a échoué — consultez son statut pour l'erreur, puis réessayez avec Redémarrer",
@@ -2936,16 +2922,6 @@
       "installed": "Installé",
       "add": "Ajouter"
     },
-    "skillCard": {
-      "subSkillsTitle": "Sous-compétences utilisées par cette méta-compétence",
-      "uses": "utilise",
-      "dependencies": "Dépendances déclarées",
-      "pythonCount": "Paquets Python : {count}",
-      "binaryCount": "Binaires : {count}",
-      "envCount": "Variables d’environnement : {count}",
-      "missingCount": "Dépendances manquantes : {count}",
-      "advisoryCount": "Avis : {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Détails de la compétence : {name}",
       "triggers": "Déclencheurs",
@@ -3337,7 +3313,10 @@
   "chat": {
     "sessionCreated": {
       "title": "Discussion créée",
-      "open": "Ouvrir la discussion"
+      "open": "Ouvrir la discussion",
+      "fallbackTitle": "Discussion {suffix}",
+      "deleted": "Supprimée",
+      "missing": "La session a été supprimée ou n’existe pas"
     },
     "promptCacheKeepalive": {
       "action": "Maintien du cache de prompt",
@@ -4070,6 +4049,33 @@
       "searchMemory": "Rechercher dans la mémoire",
       "readPage": "Lire la page",
       "updatePage": "Mettre la page à jour",
+      "searchRunning": "Recherche en cours",
+      "searchDone": "Recherche terminée",
+      "searchFailed": "Échec de la recherche",
+      "fileReadRunning": "Lecture des fichiers",
+      "fileReadDone": "Lecture des fichiers terminée",
+      "fileReadFailed": "Échec de lecture des fichiers",
+      "networkReadRunning": "Accès au réseau",
+      "networkReadDone": "Accès au réseau terminé",
+      "networkReadFailed": "Échec de l’accès au réseau",
+      "commandRunning": "Exécution de la commande",
+      "commandDone": "Commande exécutée",
+      "commandFailed": "Échec de l’exécution de la commande",
+      "subagentRunning": "Délégation de la tâche",
+      "subagentDone": "Délégation de la tâche terminée",
+      "subagentFailed": "Échec de la délégation de la tâche",
+      "mutationRunning": "Application des modifications",
+      "mutationDone": "Modifications appliquées",
+      "mutationFailed": "Échec de l’application des modifications",
+      "fileWriteRunning": "Écriture du fichier",
+      "fileWriteDone": "Fichier écrit",
+      "fileWriteFailed": "Échec de l’écriture du fichier",
+      "fileEditRunning": "Modification du fichier",
+      "fileEditDone": "Fichier modifié",
+      "fileEditFailed": "Échec de la modification du fichier",
+      "genericRunning": "Appel de l’outil",
+      "genericDone": "Appel de l’outil terminé",
+      "genericFailed": "Échec de l’appel de l’outil",
       "running": "En cours",
       "failed": "Échec",
       "done": "Terminé",
@@ -4308,6 +4314,7 @@
       "callsCount": "{count} appels",
       "resultsCount": "{count} résultats",
       "sectionInput": "entrée",
+      "sectionChanges": "modifications",
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "résultat",
       "sectionError": "erreur",

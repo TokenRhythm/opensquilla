@@ -14,6 +14,7 @@ jobs:
   validate-target:
     name: Validate target branch
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check out trusted workflow scripts
         uses: actions/checkout@v4

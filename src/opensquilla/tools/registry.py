@@ -26,6 +26,7 @@ from opensquilla.tools.types import (
     RegisteredTool,
     ToolContext,
     ToolHandler,
+    ToolPresentationCategory,
     ToolSpec,
 )
 
@@ -448,6 +449,8 @@ class ToolRegistry:
                 ctx = replace(ctx, is_owner=False)
         visible_tools = self._iter_visible_tools(ctx, sort=True)
         visible_tool_names = frozenset(rt.spec.name for rt in visible_tools)
+        from opensquilla.tools.presentation import resolve_tool_presentation
+
         return [
             {
                 "name": rt.spec.name,
@@ -459,6 +462,7 @@ class ToolRegistry:
                 },
                 "source": "plugin" if "." in rt.spec.name else "builtin",
                 "enabled": True,
+                "presentation": resolve_tool_presentation(rt.spec).to_payload(),
             }
             for rt in visible_tools
         ]
@@ -480,6 +484,8 @@ class ToolRegistry:
             tool_surface_capabilities=tool_surface_capabilities,
             is_owner=is_owner,
         )
+        from opensquilla.tools.presentation import resolve_tool_presentation
+
         return [
             {
                 "name": rt.spec.name,
@@ -489,6 +495,7 @@ class ToolRegistry:
                     "properties": self._parameters_for(rt, ctx),
                     "required": self._required_for(rt),
                 },
+                "presentation": resolve_tool_presentation(rt.spec).to_payload(),
             }
             for rt in self._iter_visible_tools(ctx, sort=True)
         ]
@@ -609,6 +616,7 @@ def tool(
     terminal_response_field: str | None = None,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
     allow_string_item_schema_projection: bool = False,
+    presentation_category: ToolPresentationCategory | None = None,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -637,6 +645,7 @@ def tool(
             terminates_turn=terminates_turn,
             terminal_response_field=terminal_response_field,
             allow_string_item_schema_projection=allow_string_item_schema_projection,
+            presentation_category=presentation_category,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

@@ -128,6 +128,7 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
 const LANGUAGE_LABEL: Record<string, string> = {
   bash: 'Shell',
   css: 'CSS',
+  diff: 'Diff',
   ini: 'INI',
   java: 'Java',
   javascript: 'JavaScript',
@@ -208,6 +209,7 @@ const displayTitle = computed(() => fileName.value || props.title)
 const dialogLabel = computed(() => fileName.value ? `${fileName.value} · ${props.title}` : props.title)
 const contentLines = computed(() => props.content ? props.content.split(/\r\n|\r|\n/) : [])
 const viewerLanguage = computed(() => {
+  if (props.context?.format === 'diff') return 'diff'
   if (isReadFileSection.value && props.context?.section === 'error') return 'plaintext'
   const languagePath = props.context?.section === 'result' ? filePath.value : ''
   return inferredLanguage(props.content, languagePath)

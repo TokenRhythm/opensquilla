@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from opensquilla.gateway import model_routing as model_routing_module
 from opensquilla.gateway import websocket as gateway_websocket
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
@@ -15,8 +16,10 @@ from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,
     capture_model_routing_config,
     ensemble_activation_preview,
+    model_routing_capabilities_by_mode,
     model_routing_mode_for_write,
     model_routing_patches,
+    model_routing_public_snapshot,
     model_routing_snapshot,
 )
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
@@ -381,6 +384,150 @@ def test_model_routing_snapshot_exposes_direct_image_admission(
     assert "proxy" not in str(snapshot)
 
 
+def test_model_routing_public_snapshot_exposes_complete_capability_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def set_user_overrides(self, _overrides: Any) -> None:
+            return None
+
+        def resolve_deployment_vision_support(
+            self,
+            model: str,
+            **_kwargs: Any,
+        ) -> str:
+            return "supported" if model in {"direct-vision", "router-vision"} else "unsupported"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "direct-vision",
+            "api_key": "synthetic-secret-key",
+            "proxy": "https://synthetic-proxy.invalid",
+        },
+        squilla_router={
+            "enabled": False,
+            "rollout_phase": "observe",
+            "tiers": {
+                "c1": {
+                    "model": "router-vision",
+                    "supports_image": True,
+                }
+            },
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+        },
+    )
+    before = config.model_dump(mode="python")
+
+    snapshot = model_routing_public_snapshot(config)
+
+    assert set(snapshot["capabilities_by_mode"]) == {
+        "direct",
+        "router",
+        "ensemble",
+    }
+    assert snapshot["capabilities_by_mode"] == {
+        "direct": {
+            "image_input": {
+                "admission": "allowed",
+                "reason": "model_vision_supported",
+            }
+        },
+        "router": {
+            "image_input": {
+                "admission": "allowed",
+                "reason": "router_image_route_available",
+            }
+        },
+        "ensemble": {
+            "image_input": {
+                "admission": "blocked",
+                "reason": "ensemble_mode_unsupported",
+            }
+        },
+    }
+    assert snapshot["mode"] == "ensemble"
+    assert snapshot["image_input"] == snapshot["capabilities_by_mode"]["ensemble"][
+        "image_input"
+    ]
+    assert config.model_dump(mode="python") == before
+    assert "synthetic-secret-key" not in str(snapshot)
+    assert "synthetic-proxy.invalid" not in str(snapshot)
+    assert "capabilities_by_mode" not in model_routing_snapshot(config)
+
+
+def test_model_routing_public_snapshot_projects_router_as_current_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *_args: Any, **_kwargs: Any) -> str:
+            return "supported"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        squilla_router={
+            "enabled": True,
+            "rollout_phase": "full",
+            "tiers": {
+                "c1": {"model": "router-vision", "supports_image": True},
+            },
+        },
+        llm_ensemble={"enabled": False},
+    )
+
+    snapshot = model_routing_public_snapshot(config)
+
+    assert snapshot["mode"] == "router"
+    assert snapshot["image_input"] == {
+        "admission": "allowed",
+        "reason": "router_image_route_available",
+    }
+    assert snapshot["image_input"] == snapshot["capabilities_by_mode"]["router"][
+        "image_input"
+    ]
+
+
+def test_model_routing_capability_projection_isolates_one_mode_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = model_routing_module.model_routing_snapshot_for_mode
+
+    def project(config: Any, mode: str) -> dict[str, Any]:
+        if mode == "router":
+            raise RuntimeError("synthetic router projection failure")
+        return original(config, mode)
+
+    monkeypatch.setattr(model_routing_module, "model_routing_snapshot_for_mode", project)
+
+    capabilities = model_routing_capabilities_by_mode(GatewayConfig())
+
+    assert capabilities["router"] == {
+        "image_input": {
+            "admission": "unknown",
+            "reason": "capability_unknown",
+        }
+    }
+    assert capabilities["direct"]["image_input"]["admission"] in {
+        "allowed",
+        "blocked",
+        "unknown",
+    }
+    assert capabilities["ensemble"]["image_input"] == {
+        "admission": "blocked",
+        "reason": "ensemble_mode_unsupported",
+    }
+
+
 @pytest.mark.parametrize(
     ("tiers", "vision_support", "expected"),
     [
@@ -527,6 +674,10 @@ async def test_models_routing_get_is_read_only() -> None:
     result = await _handle_models_routing_get(None, _ctx(config))
 
     assert result["mode"] == "ensemble"
+    assert set(result["capabilities_by_mode"]) == {"direct", "router", "ensemble"}
+    assert result["image_input"] == result["capabilities_by_mode"]["ensemble"][
+        "image_input"
+    ]
     assert config.model_dump() == before
 
 
@@ -563,7 +714,7 @@ async def test_onboarding_router_configure_broadcasts_one_canonical_change(
         (
             "models.routing.changed",
             {
-                **model_routing_snapshot(config),
+                **model_routing_public_snapshot(config),
                 "source": "onboarding.router.configure",
             },
         )
@@ -666,7 +817,7 @@ async def test_onboarding_ensemble_configure_broadcasts_one_canonical_change(
         (
             "models.routing.changed",
             {
-                **model_routing_snapshot(config),
+                **model_routing_public_snapshot(config),
                 "source": "onboarding.ensemble.configure",
             },
         )
@@ -680,17 +831,19 @@ async def test_models_routing_set_reuses_safe_patch_broadcast_exactly_once(
     config = GatewayConfig(config_path=str(tmp_path / "routing-set.toml"))
     ctx, events = _routing_event_ctx(config, monkeypatch)
 
-    await _handle_models_routing_set({"mode": "direct"}, ctx)
+    result = await _handle_models_routing_set({"mode": "direct"}, ctx)
 
+    expected = model_routing_public_snapshot(config)
     assert events == [
         (
             "models.routing.changed",
             {
-                **model_routing_snapshot(config),
+                **expected,
                 "source": "config.patch.safe",
             },
         )
     ]
+    assert result["capabilities_by_mode"] == expected["capabilities_by_mode"]
 
 
 @pytest.mark.parametrize(
@@ -717,7 +870,7 @@ async def test_admin_config_hot_apply_broadcasts_one_canonical_routing_change(
     )
 
     expected = {
-        **model_routing_snapshot(config),
+        **model_routing_public_snapshot(config),
         "source": case,
     }
     assert events == [("models.routing.changed", expected)]
@@ -749,6 +902,68 @@ async def test_admin_config_hot_apply_does_not_broadcast_unchanged_routing(
 
     assert events == []
     assert "model_routing" not in response
+
+
+async def test_inactive_router_capability_change_broadcasts_public_snapshot(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def set_user_overrides(self, _overrides: Any) -> None:
+            return None
+
+        def resolve_deployment_vision_support(
+            self,
+            model: str,
+            **_kwargs: Any,
+        ) -> str:
+            return "supported" if model == "router-vision" else "unsupported"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        config_path=str(tmp_path / "inactive-router-capability.toml"),
+        llm={"provider": "openrouter", "model": "direct-text"},
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+        },
+        squilla_router={
+            "enabled": False,
+            "rollout_phase": "observe",
+            "tiers": {
+                "c1": {"model": "router-text", "supports_image": True},
+            },
+        },
+    )
+    ctx, events = _routing_event_ctx(config, monkeypatch)
+    before = model_routing_public_snapshot(config)
+    assert before["mode"] == "ensemble"
+    assert before["capabilities_by_mode"]["router"]["image_input"][
+        "admission"
+    ] == "blocked"
+
+    response = await _handle_config_patch(
+        {"patches": {"squilla_router.tiers.c1.model": "router-vision"}},
+        ctx,
+    )
+
+    after = model_routing_public_snapshot(config)
+    assert after["mode"] == "ensemble"
+    assert after["image_input"] == before["image_input"]
+    assert after["capabilities_by_mode"]["router"]["image_input"] == {
+        "admission": "allowed",
+        "reason": "router_image_route_available",
+    }
+    assert events == [
+        (
+            "models.routing.changed",
+            {**after, "source": "config.patch"},
+        )
+    ]
+    assert response["model_routing"] == events[0][1]
 
 
 async def test_safe_patch_noop_does_not_broadcast_model_routing_change(
@@ -813,7 +1028,7 @@ async def test_legacy_safe_patch_ensemble_enable_repairs_router_dependency_once(
     assert config.squilla_router.enabled is True
     assert config.squilla_router.rollout_phase == "full"
     expected = {
-        **model_routing_snapshot(config),
+        **model_routing_public_snapshot(config),
         "source": "config.patch.safe",
     }
     assert events == [("models.routing.changed", expected)]

@@ -5565,21 +5565,6 @@ describe('useSetupCatalog optional provider credentials', () => {
     app.unmount()
   })
 
-  it('reuses the same preservation intent when applying a provider preset', async () => {
-    mockSavedProviderForSave()
-    const { api, app } = await mountCatalog()
-
-    await api.applyProviderPreset()
-
-    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', {
-      providerId: 'custom',
-      model: 'test-model',
-      preserveApiKey: true,
-      presetId: 'custom',
-    })
-    app.unmount()
-  })
-
   it('preserves an optional key for a same-origin endpoint path change', async () => {
     mockSavedProviderForSave({ baseUrl: 'https://llm.example.test/v1' })
     const { api, app } = await mountCatalog()

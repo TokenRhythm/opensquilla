@@ -361,6 +361,16 @@ class WsConnection:
                 meta=meta,
             )
             self._enqueue_frame(frame)
+            # A producer can emit hundreds of tool/text deltas through an
+            # await chain whose queue fast path never actually suspends. Give
+            # the healthy writer a chance to drain at half capacity before a
+            # cooperative burst mistakes event-loop starvation for a slow
+            # consumer and force-closes the connection at the hard limit.
+            if (
+                not self._closing
+                and self._outbox.qsize() >= max(1, self._writer_queue_maxsize // 2)
+            ):
+                await asyncio.sleep(0)
             return
         # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
         async with self._send_lock:

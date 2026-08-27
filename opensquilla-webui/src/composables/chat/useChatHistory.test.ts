@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { nextTick, ref, type Ref } from 'vue'
 
 import { useChatHistory } from './useChatHistory'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import type { ChatHistoryResponse } from '@/types/rpc'
 import { RpcTimeoutError } from '@/lib/rpc'
 
@@ -15,6 +15,7 @@ function makeHistory(autoScroll = true, overrides: {
   scrollEpoch?: Ref<number>
   threadRef?: Ref<HTMLElement | null>
   concurrentHistoryReads?: boolean
+  onTerminalTask?: (outcome: ChatTurnOutcome) => void
 } = {}) {
   const response: ChatHistoryResponse = overrides.response || {
     messages: [
@@ -52,6 +53,7 @@ function makeHistory(autoScroll = true, overrides: {
     scrollEpoch: overrides.scrollEpoch,
     stripTimePrefix: text => text,
     scrollToBottom,
+    onTerminalTask: overrides.onTerminalTask,
   })
   return { api, rpc, scrollToBottom, messages }
 }
@@ -827,6 +829,21 @@ describe('useChatHistory canonical pagination', () => {
       retrying: false,
       loadEarlierError: false,
       recoveryError: false,
+    })
+  })
+
+  it('classifies a missing session separately from a retryable history failure', async () => {
+    const { api, rpc } = makeHistory()
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('missing'), {
+      code: 'NOT_FOUND',
+    }))
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      recoveryError: true,
+      sessionMissing: true,
     })
   })
 
@@ -2176,6 +2193,69 @@ describe('useChatHistory optimistic local rows', () => {
       cancellationSource: 'webui_stop',
       acceptedRoutingMode: 'ensemble',
     })
+  })
+
+  it('restores terminal activity without an assistant transcript row', async () => {
+    const onTerminalTask = vi.fn()
+    const { api, messages } = makeHistory(true, {
+      onTerminalTask,
+      response: {
+        messages: [{
+          id: 'user-cancelled',
+          message_id: 'user-cancelled',
+          role: 'user',
+          text: 'stop after the retry',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-cancelled' },
+        }],
+        turn_outcomes: [{
+          turn_id: 'turn-cancelled',
+          task_id: 'task-cancelled',
+          status: 'cancelled',
+          finished_at: 2_000,
+          activity_snapshot: {
+            version: 2,
+            task_id: 'task-cancelled',
+            turn_id: 'turn-cancelled',
+            complete: true,
+            reasoning_utf16_length: 0,
+            entries: [
+              {
+                type: 'phase', id: 'provider:requesting:1', order: 1,
+                kind: 'provider', phase: 'requesting', at: 1_000, ended_at: 1_200,
+              },
+              {
+                type: 'phase', id: 'provider:retry_wait:2', order: 2,
+                kind: 'provider', phase: 'retry_wait', reason: 'rate_limited',
+                retry_after_ms: 500, at: 1_200, ended_at: 2_000,
+              },
+            ],
+          },
+          outcome: { kind: 'cancelled', cancellation_source: 'webui_stop' },
+        }],
+        has_more: false,
+        canonical_complete: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant'])
+    expect(messages.value[1]).toMatchObject({
+      text: '',
+      turnId: 'turn-cancelled',
+      messageId: 'terminal-activity:task-cancelled',
+      activitySnapshot: { version: 2, complete: true },
+      activitySnapshotIncomplete: false,
+      statusHistory: [
+        expect.objectContaining({ action: 'provider:requesting', activityOrder: 1 }),
+        expect.objectContaining({ action: 'provider:rate_limited:1', activityOrder: 2 }),
+      ],
+    })
+    expect(onTerminalTask).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-cancelled',
+      status: 'cancelled',
+    }))
   })
 
   it('restores usage barrier activity and its retryable error from terminal history', async () => {

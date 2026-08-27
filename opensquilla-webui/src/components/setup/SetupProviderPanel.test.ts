@@ -2093,21 +2093,11 @@ describe('SetupProviderPanel — context-window override', () => {
 describe('SetupProviderPanel — model strategy wayfinding', () => {
   it('shows the active smart-routing mode on the model card with a single routing entry', async () => {
     const onGoToSection = vi.fn()
-    const preset = {
-      hasPreset: true,
-      presetLabel: 'OpenAI balanced tiers',
-      presetDescription: 'A curated tier split.',
-      synthesized: false,
-      tierRows: [],
-      tierLabel: (tier: string) => tier,
-      routerMode: 'custom',
-      routerCustomized: true,
-    }
     const { app, el } = await mountPanel({
       canConfigureRouter: true,
       routerEnabled: true,
       crossProviderRoutingEnabled: true,
-    }, { preset, onGoToSection })
+    }, { onGoToSection })
     const routingLinks = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
       .filter(btn => /Set up model routing/.test(btn.textContent || ''))
 

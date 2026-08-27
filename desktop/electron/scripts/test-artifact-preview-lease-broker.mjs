@@ -492,6 +492,14 @@ try {
   const deferredPostPending = new Promise(resolve => {
     releaseDeferredPost = resolve
   })
+  let markRetiredOldDeleteStarted
+  const retiredOldDeleteStarted = new Promise(resolve => {
+    markRetiredOldDeleteStarted = resolve
+  })
+  let releaseRetiredOldDelete
+  const retiredOldDeletePending = new Promise(resolve => {
+    releaseRetiredOldDelete = resolve
+  })
   let markStalePostStarted
   const stalePostStarted = new Promise(resolve => {
     markStalePostStarted = resolve
@@ -520,6 +528,10 @@ try {
           authorization: init.headers.Authorization,
           scopeId: init.headers['x-opensquilla-session-key'],
         })
+        if (url.pathname.endsWith('/apl-retired_old')) {
+          markRetiredOldDeleteStarted()
+          await retiredOldDeletePending
+        }
         return new Response(null, { status: 204 })
       }
 
@@ -592,7 +604,16 @@ try {
   })
   await deferredPostStarted
 
-  await retiredBroker.revokeAll()
+  let retiredCleanupSettled = false
+  const retiredCleanup = retiredBroker.revokeAll().then(() => {
+    retiredCleanupSettled = true
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(
+    retiredCleanupSettled,
+    false,
+    'revokeAll must join creates admitted before renderer retirement',
+  )
   const newOrigin = 'http://p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.localhost:48721'
   const newGrant = {
     launchUrl: `${newOrigin}/index.html`,
@@ -611,6 +632,15 @@ try {
   assert.equal(retiredBroker.authorizesSurface(newGrant), true)
 
   releaseDeferredPost()
+  await retiredOldDeleteStarted
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(
+    retiredCleanupSettled,
+    false,
+    'revokeAll must keep waiting through the stale create compensating DELETE',
+  )
+  releaseRetiredOldDelete()
+  await retiredCleanup
   assert.deepEqual(await oldCreate, {
     ok: false,
     status: 409,
@@ -642,8 +672,9 @@ try {
   await stalePostStarted
 
   retiredGatewayUrl = 'http://127.0.0.1:9'
-  await retiredBroker.revokeAll()
+  const staleCleanup = retiredBroker.revokeAll()
   releaseStalePost()
+  await staleCleanup
   assert.deepEqual(await staleCreate, {
     ok: false,
     status: 409,

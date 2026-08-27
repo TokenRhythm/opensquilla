@@ -18,12 +18,13 @@ import type {
 } from '@/types/chat'
 import {
   isInternalToolName,
-  normalizeToolInputText,
   normalizeToolName,
+  normalizeToolPresentation,
   summarizeToolGroup,
   toolActionLabel,
   toolCallGroups,
   toolDisplayName,
+  toolDisplayInputText,
   toolIconName,
   toolOperationKey,
   toolResultIsError,
@@ -1414,7 +1415,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           }
           items.push({ type: 'tool-group', key: group.groupId, group })
         }
-        const input = normalizeToolInputText(segment)
+        const presentation = normalizeToolPresentation(segment)
+        const input = toolDisplayInputText(segment, presentation)
         call = {
           toolId,
           name,
@@ -1428,10 +1430,25 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           result: '',
           resultPreview: '',
           isOpen: false,
+          presentation,
           renderKey: `${ownerKey}:tool:${toolId}:${group.calls.length}`,
         } as ChatToolCallRenderItem
         group.calls.push(call as ChatToolCallRenderItem)
         callsById.set(toolId, call)
+      }
+      const presentation = normalizeToolPresentation(segment)
+      if (presentation) {
+        call.presentation = presentation
+        if (presentation.argumentDisplay === 'primary') {
+          const hasSegmentInput = segment.input !== undefined || segment.arguments !== undefined
+          const input = toolDisplayInputText(
+            hasSegmentInput ? segment : { input: call.inputRaw },
+            presentation,
+          )
+          call.inputRaw = input
+          call.inputPreview = truncate(input, 200)
+          call.displayName = toolDisplayName(call.name, input)
+        }
       }
       return call
     }
@@ -1462,7 +1479,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         if (!call) return
         const result = segment.result || segment.content || segment.output || ''
         const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-        const input = normalizeToolInputText(segment)
+        const input = toolDisplayInputText(segment, call.presentation)
         if (input && !call.inputPreview) {
           call.inputRaw = input
           call.inputPreview = truncate(input, 200)
@@ -1840,7 +1857,8 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     const name = normalizeToolName(tc)
     if (!name) return
     if (isInternalToolName(name)) return
-    const input = normalizeToolInputText(tc)
+    const presentation = normalizeToolPresentation(tc)
+    const input = toolDisplayInputText(tc, presentation)
     const result = tc.result || tc.content || tc.output || ''
     const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2)
     const executionStatus = String(tc.execution_status?.status || '')
@@ -1862,11 +1880,13 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
         resultPreview: '',
         sources: undefined,
         isOpen: false,
+        presentation,
       }
       byId.set(toolId, item)
       merged.push(item)
     }
-    if (!item.inputPreview && input) {
+    if (presentation) item.presentation = presentation
+    if (presentation?.argumentDisplay === 'primary' || (!item.inputPreview && input)) {
       item.inputRaw = input
       item.inputPreview = truncate(input, 200)
       item.displayName = toolDisplayName(item.name, input)
@@ -1897,5 +1917,6 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     resultPreview: item.resultPreview,
     sources: item.sources,
     isOpen: false,
+    presentation: item.presentation,
   }))
 }

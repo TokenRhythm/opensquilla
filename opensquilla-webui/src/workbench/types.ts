@@ -13,7 +13,6 @@ export type WorkbenchScope =
 export type WorkbenchHostKind = 'dom' | 'native-webcontents'
 
 export type WorkbenchPanelKind =
-  | 'artifact-collection'
   | 'artifact-preview'
   | 'resource-collection'
   | 'browser'

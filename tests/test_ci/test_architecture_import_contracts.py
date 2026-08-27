@@ -19,6 +19,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # async-SQLite compatibility shim, while Gateway, session lifecycle, and
     # context-bound tools consume its public service without an import cycle.
     ("artifact_session", "compat"),
+    # Transcript publication and the tool registry share a presentation-only
+    # value contract. Contracts remains a leaf and never imports chat or tools.
+    ("chat", "contracts"),
     ("channels", "engine"),
     ("channels", "contracts"),
     ("channels", "gateway"),

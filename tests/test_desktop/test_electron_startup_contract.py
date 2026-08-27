@@ -1350,8 +1350,8 @@ def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
     ) in recovery
     assert "gatewayExitLooksLikePortInUse(message)" in recovery
     assert "desktopLog('gateway_port_retry'" in recovery
-    assert "if (portConflictExit && !hasExplicitGatewayPort())" in start
-    assert "sendBootError(gatewayState.error)" in start
+    assert "if (!childWasReady && portConflictExit && !hasExplicitGatewayPort())" in start
+    assert "publishTerminalGatewayExitError(classifiedMessage)" in start
 
 
 def test_windows_gateway_hard_terminate_clears_pid_without_unlinking_lock() -> None:
@@ -1773,6 +1773,95 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     )
     assert "exitMessage: earlyExitMessage" in wait
     assert "if (result.status === 'exited') throw new Error(result.message)" in wait
+
+
+def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restart() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+    restart = _section(
+        main_ts,
+        "function invalidateGatewayUnexpectedExitRestart",
+        "function ensureGatewayStarted",
+    )
+    stop = _section(
+        main_ts,
+        "function stopGateway(): void",
+        "// ── Desktop updates",
+    )
+    join = _section(
+        main_ts,
+        "async function stopAndJoinAllLifecycleOwnedGateways",
+        "function restoreDownloadedUpdateRetryState",
+    )
+    migration = _section(
+        main_ts,
+        "ipcMain.handle('desktop:migration:run'",
+        "ipcMain.handle('desktop:migration:last-result'",
+    )
+
+    assert (
+        "const GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS = [1_000, 2_000, 4_000] as const"
+        in main_ts
+    )
+    assert "const gatewayReadyProcesses = new WeakMap" in main_ts
+    assert "const startupUnexpectedExitRestartGeneration" in start
+    assert (
+        "startupUnexpectedExitRestartGeneration === gatewayUnexpectedExitRestartGeneration"
+        in start
+    )
+    assert "const childReadyAuthority = gatewayReadyProcesses.get(child)" in start
+    assert "const abnormalExit = signal !== null || (code !== null && code !== 0)" in start
+    assert "let childSpawnSucceeded = false" in start
+    assert "child.once('spawn', () =>" in start
+    post_spawn_error = _section(
+        start,
+        "if (childSpawnSucceeded)",
+        "if (isCurrentGateway) gatewayProcess = null",
+    )
+    assert "gateway_child_process_error" in post_spawn_error
+    assert "return" in post_spawn_error
+    abnormal_exit = _section(
+        start,
+        "if (abnormalExit)",
+        "publishTerminalGatewayExitError(classifiedMessage)",
+    )
+    assert "scheduleGatewayUnexpectedExitRestart" in abnormal_exit
+    assert "childWasReady" in abnormal_exit
+    assert "childReadyAuthority" in abnormal_exit
+    assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in abnormal_exit
+    assert (
+        "scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))"
+        in start
+    )
+    assert "markGatewayProcessReady(child)" in start
+    assert "gatewayUnexpectedExitRestartAttempt + 1" in restart
+    assert "GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS[attempt - 1]" in restart
+    assert (
+        "gatewayUnexpectedExitRestartAttempt >= GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS.length"
+        in restart
+    )
+    assert "generation === gatewayUnexpectedExitRestartGeneration" in restart
+    assert "desktopOpenFlowRevision === gatewayUnexpectedExitRestartOpenFlowRevision" in restart
+    assert "desktopProfileKey() === gatewayUnexpectedExitRestartProfileKey" in restart
+    assert "readyAuthority.profileKey !== desktopProfileKey()" in restart
+    assert "readyAuthority.openFlowRevision !== desktopOpenFlowRevision" in restart
+    assert "!isQuitting" in restart
+    assert "!updateApplying" in restart
+    assert "appExitPhase === 'running'" in restart
+    assert "!desktopWriters.closed" in restart
+    assert "void ensureGatewayStarted()" in restart
+    assert "gatewayUnexpectedExitRestartTimer.unref()" in restart
+    assert "process.platform" not in restart
+    assert "cancelGatewayUnexpectedExitRestart('Gateway stop requested')" in stop
+    assert "cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')" in join
+    assert "cancelGatewayUnexpectedExitRestart('Gateway state cleared')" in main_ts
+    assert "cancelGatewayUnexpectedExitRestart('desktop settings save started')" in main_ts
+    assert "cancelGatewayUnexpectedExitRestart('profile migration started')" in migration
+    assert "cancelGatewayUnexpectedExitRestart('desktop open flow invalidated')" in main_ts
 
 
 def test_start_gateway_preserves_host_path_without_static_runtime_injection() -> None:
@@ -2880,6 +2969,41 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
     drain = _section(main_ts, "async function drainOwnedGatewayForQuit", "app.on('before-quit'")
+    owned_gateway_quit = _section(
+        before_quit,
+        "if (children.length > 0)",
+        "// Fail closed:",
+    )
+    preview_create = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:create'",
+        "ipcMain.handle('desktop:workbench:preview-lease:renew'",
+    )
+    preview_renew = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:renew'",
+        "ipcMain.handle('desktop:workbench:preview-lease:revoke'",
+    )
+    preview_revoke = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:revoke'",
+        "ipcMain.handle('desktop:workbench:surface:create'",
+    )
+    surface_create = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:create'",
+        "ipcMain.handle('desktop:workbench:surface:navigate'",
+    )
+    surface_navigate = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:navigate'",
+        "ipcMain.handle('desktop:workbench:permission:respond'",
+    )
+    surface_destroy = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:destroy'",
+        "// ── Desktop data cleanup",
+    )
     assert "process.platform === 'win32'" not in before_quit
     assert "event.preventDefault()" in before_quit
     assert "requestOwnedGatewayShutdown(" in drain
@@ -2890,7 +3014,24 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     assert "let quitGatewayDrainPromise: Promise<boolean> | null = null" in main_ts
     assert "if (quitGatewayDrainPromise)" in before_quit
     assert "const children = liveLifecycleOwnedGatewayProcesses()" in before_quit
-    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in before_quit
+    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in owned_gateway_quit
+    assert "const previewCleanup = artifactPreviewLeaseBroker.revokeAll()" in owned_gateway_quit
+    assert "void nativeWorkbenchSurfaces.destroyAll()" in owned_gateway_quit
+    assert owned_gateway_quit.index(
+        "artifactPreviewLeaseBroker.revokeAll()"
+    ) < owned_gateway_quit.index(
+        "nativeWorkbenchSurfaces.destroyAll()"
+    )
+    assert owned_gateway_quit.index("const previewCleanup") < owned_gateway_quit.index(
+        "drainOwnedGatewayForQuit("
+    )
+    exit_admission_guard = "appExitPhase !== 'running'"
+    assert exit_admission_guard in preview_create
+    assert exit_admission_guard in preview_renew
+    assert exit_admission_guard in surface_create
+    assert exit_admission_guard in surface_navigate
+    assert exit_admission_guard not in preview_revoke
+    assert exit_admission_guard not in surface_destroy
     assert "if (exited)" in before_quit
     assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
 
@@ -3081,7 +3222,16 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
     assert "await launchDesktop(" in script
-    assert "loaded.record.pid !== firstRecord.pid" in script
+    assert "loaded.record.pid === firstRecord.pid" in script
+    assert "verifyDesktopGatewayOwnership(loaded.record)" in script
+    assert "'verified replacement Desktop Gateway ownership record'" in script
+    assert "process.kill(secondRecord.pid, 'SIGKILL')" in script
+    assert "loaded.record.pid === secondRecord.pid" in script
+    assert "assert.equal(thirdRecord.port, secondRecord.port)" in script
+    assert "assert.equal(secondPage.url(), rendererUrlBeforeCrash)" in script
+    assert "'renderer-observed-child-crash'" in script
+    assert "'renderer-reconnected-after-child-restart'" in script
+    assert "verifyDesktopGatewayOwnership(thirdRecord)" in script
     assert "waitForDesktopGatewayOwnershipRelease" in script
     assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
     assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main

@@ -2,16 +2,35 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionRouting } from './useChatSessionRouting'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import type {
+  ImageInputAdmission,
+  ModelRoutingCapabilitiesByMode,
+  ModelRoutingMode,
+} from '@/types/modelRouting'
 
 const SESSION_ONE = 'agent:main:webchat:one'
 const SESSION_TWO = 'agent:main:webchat:two'
+
+const CAPABILITIES_BY_MODE: ModelRoutingCapabilitiesByMode = {
+  direct: {
+    image_input: { admission: 'allowed', reason: 'model_vision_supported' },
+  },
+  router: {
+    image_input: { admission: 'allowed', reason: 'router_image_route_available' },
+  },
+  ensemble: {
+    image_input: { admission: 'blocked', reason: 'ensemble_mode_unsupported' },
+  },
+}
 
 function harness(options: {
   globalMode?: ModelRoutingMode
   draft?: boolean
   getResponse?: unknown
   available?: boolean
+  globalImageInputAdmission?: ImageInputAdmission
+  globalImageInputAdmissionReason?: string
+  capabilitiesByMode?: ModelRoutingCapabilitiesByMode | null
 } = {}) {
   const handlers = new Map<string, (payload: unknown) => void>()
   const rpc = {
@@ -23,6 +42,15 @@ function harness(options: {
   }
   const sessionKey = ref(SESSION_ONE)
   const globalMode = ref<ModelRoutingMode>(options.globalMode ?? 'off')
+  const globalImageInputAdmission = ref<ImageInputAdmission>(
+    options.globalImageInputAdmission ?? 'unknown',
+  )
+  const globalImageInputAdmissionReason = ref(
+    options.globalImageInputAdmissionReason ?? 'capability_unknown',
+  )
+  const capabilitiesByMode = ref<ModelRoutingCapabilitiesByMode | null>(
+    options.capabilitiesByMode ?? null,
+  )
   const isStreaming = ref(false)
   const isDraft = ref(options.draft === true)
   const available = ref(options.available !== false)
@@ -31,12 +59,28 @@ function harness(options: {
     rpc,
     sessionKey,
     globalMode,
+    globalImageInputAdmission,
+    globalImageInputAdmissionReason,
+    capabilitiesByMode,
     available,
     isStreaming,
     isDraft: () => isDraft.value,
     notifyError,
   })
-  return { api, available, globalMode, handlers, isDraft, isStreaming, notifyError, rpc, sessionKey }
+  return {
+    api,
+    available,
+    capabilitiesByMode,
+    globalImageInputAdmission,
+    globalImageInputAdmissionReason,
+    globalMode,
+    handlers,
+    isDraft,
+    isStreaming,
+    notifyError,
+    rpc,
+    sessionKey,
+  }
 }
 
 describe('useChatSessionRouting', () => {
@@ -211,6 +255,9 @@ describe('useChatSessionRouting', () => {
       rpc,
       sessionKey: ref(SESSION_ONE),
       globalMode: ref<ModelRoutingMode>('off'),
+      globalImageInputAdmission: ref<ImageInputAdmission>('unknown'),
+      globalImageInputAdmissionReason: ref('capability_unknown'),
+      capabilitiesByMode: ref(null),
       isStreaming: ref(false),
       isDraft: () => false,
       notifyError: vi.fn(),
@@ -250,5 +297,82 @@ describe('useChatSessionRouting', () => {
 
     expect(api.mode.value).toBe('squilla_router')
     expect(api.revision.value).toBe(0)
+  })
+
+  it('selects image admission from the current session mode matrix', () => {
+    const { api } = harness({
+      globalMode: 'llm_ensemble',
+      globalImageInputAdmission: 'blocked',
+      globalImageInputAdmissionReason: 'ensemble_mode_unsupported',
+      capabilitiesByMode: CAPABILITIES_BY_MODE,
+    })
+
+    api.applyBootstrap({ key: SESSION_ONE, mode: 'router', revision: 2 })
+
+    expect(api.imageInputAdmission.value).toBe('allowed')
+    expect(api.imageInputAdmissionReason.value).toBe('router_image_route_available')
+  })
+
+  it('blocks when the session switches from a globally allowed mode to ensemble', () => {
+    const { api } = harness({
+      globalMode: 'off',
+      globalImageInputAdmission: 'allowed',
+      globalImageInputAdmissionReason: 'model_vision_supported',
+      capabilitiesByMode: CAPABILITIES_BY_MODE,
+    })
+
+    api.applyBootstrap({ key: SESSION_ONE, mode: 'ensemble', revision: 1 })
+
+    expect(api.imageInputAdmission.value).toBe('blocked')
+    expect(api.imageInputAdmissionReason.value).toBe('ensemble_mode_unsupported')
+  })
+
+  it('uses the matrix for an explicit non-global draft mode', async () => {
+    const { api } = harness({
+      draft: true,
+      globalMode: 'llm_ensemble',
+      capabilitiesByMode: CAPABILITIES_BY_MODE,
+    })
+
+    await api.setMode('squilla_router')
+
+    expect(api.initialRoutingMode.value).toBe('router')
+    expect(api.imageInputAdmission.value).toBe('allowed')
+  })
+
+  it('uses a legacy scalar only when session and global modes match', () => {
+    const matching = harness({
+      globalMode: 'llm_ensemble',
+      globalImageInputAdmission: 'blocked',
+      globalImageInputAdmissionReason: 'ensemble_mode_unsupported',
+    })
+    expect(matching.api.imageInputAdmission.value).toBe('blocked')
+
+    matching.api.applyBootstrap({ key: SESSION_ONE, mode: 'router', revision: 1 })
+
+    expect(matching.api.imageInputAdmission.value).toBe('unknown')
+    expect(matching.api.imageInputAdmissionReason.value).toBe('capability_unknown')
+  })
+
+  it('recomputes capability updates without changing the session revision', () => {
+    const { api, capabilitiesByMode } = harness({
+      capabilitiesByMode: CAPABILITIES_BY_MODE,
+    })
+    api.applyBootstrap({ key: SESSION_ONE, mode: 'router', revision: 4 })
+    expect(api.imageInputAdmission.value).toBe('allowed')
+
+    capabilitiesByMode.value = {
+      ...CAPABILITIES_BY_MODE,
+      router: {
+        image_input: {
+          admission: 'blocked',
+          reason: 'router_image_route_unavailable',
+        },
+      },
+    }
+
+    expect(api.revision.value).toBe(4)
+    expect(api.imageInputAdmission.value).toBe('blocked')
+    expect(api.imageInputAdmissionReason.value).toBe('router_image_route_unavailable')
   })
 })

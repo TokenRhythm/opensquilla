@@ -27,7 +27,7 @@ from opensquilla.gateway.config_secrets import (
 )
 from opensquilla.gateway.model_routing import (
     broadcast_model_routing_changed_if_needed,
-    model_routing_snapshot,
+    model_routing_public_snapshot,
     reconcile_model_routing_write,
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
@@ -776,7 +776,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
         raise ValueError("No config available")
 
     previous_config = ctx.config.model_copy(deep=True)
-    old_model_routing = model_routing_snapshot(ctx.config)
+    old_model_routing = model_routing_public_snapshot(ctx.config)
     old_live_catalog_fingerprint = _live_catalog_fingerprint(ctx.config)
     old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
     old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
@@ -901,7 +901,7 @@ async def _handle_config_patch(
         raise ValueError("No config available")
 
     previous_config = ctx.config.model_copy(deep=True)
-    old_model_routing = model_routing_snapshot(ctx.config)
+    old_model_routing = model_routing_public_snapshot(ctx.config)
     old_live_catalog_fingerprint = _live_catalog_fingerprint(ctx.config)
     old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
     old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
@@ -1095,7 +1095,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
         if ctx.config is not None and hasattr(ctx.config, "model_dump")
         else {}
     )
-    old_model_routing = model_routing_snapshot(ctx.config)
+    old_model_routing = model_routing_public_snapshot(ctx.config)
     config_payload, redacted_paths = _restore_redacted_values(config_payload, old_payload)
     config_payload = _strip_public_derived_config_fields(config_payload)
 
@@ -1221,7 +1221,7 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
         raise ValueError("No config available")
 
     previous_config = ctx.config.model_copy(deep=True)
-    old_model_routing = model_routing_snapshot(ctx.config)
+    old_model_routing = model_routing_public_snapshot(ctx.config)
     from opensquilla.onboarding.config_store import load_config, resolve_config_path
 
     target, _source = resolve_config_path(getattr(ctx.config, "config_path", None) or None)

@@ -20,9 +20,8 @@ export type ToolPartState =
 
 /**
  * Inline interrupt payloads. An interrupt is an approval or clarify request that
- * blocks the run mid-turn and is rendered inline through the part registry. The
- * two sub-kinds keep a single renderer and registry entry while carrying their
- * distinct payloads.
+ * blocks the run mid-turn and is rendered inline by InterruptPart. The two
+ * sub-kinds share that adapter while carrying their distinct payloads.
  */
 export interface InterruptApprovalData {
   approvalId: string

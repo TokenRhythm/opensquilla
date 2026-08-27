@@ -8,6 +8,28 @@ export const GATEWAY_MODEL_ROUTING_MODES = ['direct', 'router', 'ensemble'] as c
 
 export type GatewayModelRoutingMode = (typeof GATEWAY_MODEL_ROUTING_MODES)[number]
 
+export interface ImageInputCapability {
+  admission: ImageInputAdmission
+  reason: string
+}
+
+export interface ModelRoutingModeCapabilities {
+  image_input: ImageInputCapability
+}
+
+export type ModelRoutingCapabilitiesByMode = Record<
+  GatewayModelRoutingMode,
+  ModelRoutingModeCapabilities
+>
+
+/** Additive public snapshot returned by models.routing.get/set/changed. */
+export interface ModelRoutingSnapshot {
+  mode?: GatewayModelRoutingMode
+  selection_mode?: string
+  image_input?: Partial<ImageInputCapability>
+  capabilities_by_mode?: unknown
+}
+
 export function isModelRoutingMode(value: unknown): value is ModelRoutingMode {
   return typeof value === 'string' && MODEL_ROUTING_MODES.includes(value as ModelRoutingMode)
 }

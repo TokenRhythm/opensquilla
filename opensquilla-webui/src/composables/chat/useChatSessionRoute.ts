@@ -1,5 +1,6 @@
 import type { Ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { recentDraftSessionKey } from '@/composables/chat/useChatDraftPersistence'
 import {
   agentIdFromSessionKey,
   canonicalSessionKey,
@@ -13,6 +14,17 @@ const DRAFT_CHAT_PATH = '/chat/new'
 export interface PersistSessionOptions {
   updateRoute?: boolean
   source?: string
+}
+
+export interface ResolveInitialSessionOptions {
+  recoverDraft?: boolean
+}
+
+export interface InitialSessionResolution {
+  sessionKey: string
+  hasUrlSession: boolean
+  draft: boolean
+  recoveredDraft: boolean
 }
 
 export interface InitialDraftCanonicalizationState {
@@ -42,6 +54,15 @@ function writeStoredSession(key: string) {
     localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, key)
   } catch {
     // Storage can be unavailable in restricted browser contexts.
+  }
+}
+
+function readStoredSession(): string {
+  try {
+    const key = localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || ''
+    return key ? canonicalSessionKey(key) : ''
+  } catch {
+    return ''
   }
 }
 
@@ -116,14 +137,42 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
     return webchatSessionKey(agent, Math.random().toString(36).slice(2, 10))
   }
 
-  function resolveInitialSession(): { sessionKey: string; hasUrlSession: boolean; draft: boolean } {
+  function resolveInitialSession(
+    options: ResolveInitialSessionOptions = {},
+  ): InitialSessionResolution {
     const urlSession = readSessionFromUrl()
     if (urlSession) {
-      return { sessionKey: canonicalSessionKey(urlSession), hasUrlSession: true, draft: false }
+      return {
+        sessionKey: canonicalSessionKey(urlSession),
+        hasUrlSession: true,
+        draft: false,
+        recoveredDraft: false,
+      }
+    }
+    const mayRecoverDraft = options.recoverDraft !== false
+      && isDraftRoute()
+      && !readAgentFromUrl()
+      && !readProjectFromUrl()
+      && !hasLegacyNewChatQuery()
+    if (mayRecoverDraft) {
+      const recoveredSessionKey = recentDraftSessionKey()
+      if (recoveredSessionKey) {
+        return {
+          sessionKey: recoveredSessionKey,
+          hasUrlSession: false,
+          draft: readStoredSession() !== recoveredSessionKey,
+          recoveredDraft: true,
+        }
+      }
     }
     // No explicit session in the URL: open a clean draft instead of silently
     // restoring a previous session.
-    return { sessionKey: createSessionKey(draftAgentId()), hasUrlSession: false, draft: true }
+    return {
+      sessionKey: createSessionKey(draftAgentId()),
+      hasUrlSession: false,
+      draft: true,
+      recoveredDraft: false,
+    }
   }
 
   return {

@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte"
     },
     "preset": {
-      "summary": "Routing-Vorlage: {label}",
-      "desc": "Einmal anwenden, um Modellrouting zu füllen; aktive Stufen dort bearbeiten.",
-      "customizedSummary": "Modellrouting verwendet bereits {label}.",
-      "customizedDesc": "Aktive Stufen werden im Modellrouting bearbeitet.",
-      "synthesizedLabel": "Generierte Routing-Vorlage",
-      "synthesizedBadge": "Generierte Vorlage",
-      "customize": "Vorlagendetails anzeigen →",
-      "hide": "Vorlagendetails ausblenden",
-      "apply": "Auf Modellrouting anwenden",
-      "viewInRouter": "Modellrouting öffnen →",
-      "modeRecommended": "Routing-Vorlage",
-      "modeCustom": "benutzerdefiniert",
-      "modeDisabled": "aus"
+      "modeCustom": "benutzerdefiniert"
     },
     "modelStrategy": {
       "title": "Modellrouting",
@@ -1704,8 +1692,6 @@
       "routerSaved": "Router gespeichert.",
       "routerSavedRestart": "Router gespeichert. Neustart erforderlich.",
       "ensembleSaved": "Ensemble gespeichert.",
-      "presetApplied": "Routing-Preset angewendet.",
-      "presetAppliedRestart": "Routing-Preset angewendet. Neustart erforderlich.",
       "channelSaved": "Kanal gespeichert — Konfiguration lokal validiert; mit „Verbindung testen“ die Zugangsdaten prüfen",
       "channelSavedLive": "Kanal gespeichert und übernommen — läuft mit der neuen Konfiguration",
       "channelStartFailed": "Kanal gespeichert, aber der Start ist fehlgeschlagen — Fehler im Status prüfen und mit Neustart erneut versuchen",
@@ -2936,16 +2922,6 @@
       "installed": "Installiert",
       "add": "Hinzufügen"
     },
-    "skillCard": {
-      "subSkillsTitle": "Von dieser Meta-Fähigkeit verwendete Unterfähigkeiten",
-      "uses": "verwendet",
-      "dependencies": "Deklarierte Abhängigkeiten",
-      "pythonCount": "Python-Pakete: {count}",
-      "binaryCount": "Binärdateien: {count}",
-      "envCount": "Umgebungsvariablen: {count}",
-      "missingCount": "Fehlende Abhängigkeiten: {count}",
-      "advisoryCount": "Hinweise: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Skill-Details: {name}",
       "triggers": "Auslöser",
@@ -3337,7 +3313,10 @@
   "chat": {
     "sessionCreated": {
       "title": "Chat erstellt",
-      "open": "Chat öffnen"
+      "open": "Chat öffnen",
+      "fallbackTitle": "Chat {suffix}",
+      "deleted": "Gelöscht",
+      "missing": "Die Sitzung wurde gelöscht oder ist nicht vorhanden"
     },
     "promptCacheKeepalive": {
       "action": "Prompt-Cache aktiv halten",
@@ -4070,6 +4049,33 @@
       "searchMemory": "Speicher durchsuchen",
       "readPage": "Seite lesen",
       "updatePage": "Seite aktualisieren",
+      "searchRunning": "Suche läuft",
+      "searchDone": "Suche abgeschlossen",
+      "searchFailed": "Suche fehlgeschlagen",
+      "fileReadRunning": "Dateien werden gelesen",
+      "fileReadDone": "Dateien gelesen",
+      "fileReadFailed": "Dateien konnten nicht gelesen werden",
+      "networkReadRunning": "Netzwerkzugriff läuft",
+      "networkReadDone": "Netzwerkzugriff abgeschlossen",
+      "networkReadFailed": "Netzwerkzugriff fehlgeschlagen",
+      "commandRunning": "Befehl wird ausgeführt",
+      "commandDone": "Befehl ausgeführt",
+      "commandFailed": "Befehlsausführung fehlgeschlagen",
+      "subagentRunning": "Aufgabe wird delegiert",
+      "subagentDone": "Aufgabe delegiert",
+      "subagentFailed": "Aufgabendelegierung fehlgeschlagen",
+      "mutationRunning": "Änderungen werden angewendet",
+      "mutationDone": "Änderungen angewendet",
+      "mutationFailed": "Änderungen konnten nicht angewendet werden",
+      "fileWriteRunning": "Datei wird geschrieben",
+      "fileWriteDone": "Datei geschrieben",
+      "fileWriteFailed": "Schreiben der Datei fehlgeschlagen",
+      "fileEditRunning": "Datei wird bearbeitet",
+      "fileEditDone": "Datei bearbeitet",
+      "fileEditFailed": "Bearbeiten der Datei fehlgeschlagen",
+      "genericRunning": "Tool wird aufgerufen",
+      "genericDone": "Tool-Aufruf abgeschlossen",
+      "genericFailed": "Tool-Aufruf fehlgeschlagen",
       "running": "Läuft",
       "failed": "Fehlgeschlagen",
       "done": "Fertig",
@@ -4308,6 +4314,7 @@
       "callsCount": "{count} Aufrufe",
       "resultsCount": "{count} Ergebnisse",
       "sectionInput": "Eingabe",
+      "sectionChanges": "Änderungen",
       "sectionDiagnostics": "Diagnose",
       "sectionResult": "Ergebnis",
       "sectionError": "Fehler",

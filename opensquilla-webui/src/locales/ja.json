@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
     },
     "preset": {
-      "summary": "ルーティングテンプレート: {label}",
-      "desc": "一度適用してモデルルーティングを埋めます。アクティブな階層はそこで編集します。",
-      "customizedSummary": "モデルルーティングはすでに {label} を使用しています。",
-      "customizedDesc": "アクティブな階層はモデルルーティングで編集します。",
-      "synthesizedLabel": "生成済みルーティングテンプレート",
-      "synthesizedBadge": "生成済みテンプレート",
-      "customize": "テンプレート詳細を表示 →",
-      "hide": "テンプレート詳細を隠す",
-      "apply": "モデルルーティングに適用",
-      "viewInRouter": "モデルルーティングを開く →",
-      "modeRecommended": "ルーティングテンプレート",
-      "modeCustom": "カスタム",
-      "modeDisabled": "オフ"
+      "modeCustom": "カスタム"
     },
     "modelStrategy": {
       "title": "モデルルーティング",
@@ -1704,8 +1692,6 @@
       "routerSaved": "ルーターを保存しました。",
       "routerSavedRestart": "ルーターを保存しました。再起動が必要です。",
       "ensembleSaved": "アンサンブルを保存しました。",
-      "presetApplied": "ルーティングプリセットを適用しました。",
-      "presetAppliedRestart": "ルーティングプリセットを適用しました。再起動が必要です。",
       "channelSaved": "チャンネルを保存しました — ローカル検証済み。「接続テスト」で認証情報を確認できます",
       "channelSavedLive": "チャネルを保存して適用しました——新しい設定で稼働中",
       "channelStartFailed": "チャネルは保存されましたが起動に失敗しました——ステータスでエラーを確認し、再起動で再試行してください",
@@ -2936,16 +2922,6 @@
       "installed": "インストール済み",
       "add": "追加"
     },
-    "skillCard": {
-      "subSkillsTitle": "このメタスキルが使用するサブスキル",
-      "uses": "使用",
-      "dependencies": "宣言済み依存関係",
-      "pythonCount": "Python パッケージ: {count}",
-      "binaryCount": "バイナリ: {count}",
-      "envCount": "環境変数: {count}",
-      "missingCount": "不足している依存関係: {count}",
-      "advisoryCount": "注意事項: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "スキルの詳細: {name}",
       "triggers": "トリガー",
@@ -3337,7 +3313,10 @@
   "chat": {
     "sessionCreated": {
       "title": "チャットを作成しました",
-      "open": "チャットを開く"
+      "open": "チャットを開く",
+      "fallbackTitle": "チャット {suffix}",
+      "deleted": "削除済み",
+      "missing": "セッションは削除されたか存在しません"
     },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
@@ -4070,6 +4049,33 @@
       "searchMemory": "メモリを検索",
       "readPage": "ページを読み取る",
       "updatePage": "ページを更新",
+      "searchRunning": "検索中",
+      "searchDone": "検索完了",
+      "searchFailed": "検索に失敗",
+      "fileReadRunning": "ファイルを読み取り中",
+      "fileReadDone": "ファイルの読み取り完了",
+      "fileReadFailed": "ファイルの読み取りに失敗",
+      "networkReadRunning": "ネットワークにアクセス中",
+      "networkReadDone": "ネットワークアクセス完了",
+      "networkReadFailed": "ネットワークアクセスに失敗",
+      "commandRunning": "コマンドを実行中",
+      "commandDone": "コマンドの実行が完了",
+      "commandFailed": "コマンドの実行に失敗",
+      "subagentRunning": "タスクを委任中",
+      "subagentDone": "タスクの委任が完了",
+      "subagentFailed": "タスクの委任に失敗",
+      "mutationRunning": "変更を適用中",
+      "mutationDone": "変更を適用しました",
+      "mutationFailed": "変更の適用に失敗",
+      "fileWriteRunning": "ファイルを書き込み中",
+      "fileWriteDone": "ファイルの書き込みが完了",
+      "fileWriteFailed": "ファイルの書き込みに失敗",
+      "fileEditRunning": "ファイルを編集中",
+      "fileEditDone": "ファイルの編集が完了",
+      "fileEditFailed": "ファイルの編集に失敗",
+      "genericRunning": "ツールを呼び出し中",
+      "genericDone": "ツールの呼び出しが完了",
+      "genericFailed": "ツールの呼び出しに失敗",
       "running": "実行中",
       "failed": "失敗",
       "done": "完了",
@@ -4308,6 +4314,7 @@
       "callsCount": "{count} 件の呼び出し",
       "resultsCount": "{count} 件の結果",
       "sectionInput": "入力",
+      "sectionChanges": "変更",
       "sectionDiagnostics": "診断",
       "sectionResult": "結果",
       "sectionError": "エラー",

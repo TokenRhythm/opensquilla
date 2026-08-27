@@ -449,6 +449,7 @@ export interface ToolUsePayload extends SessionEventPayload {
   // restarting from a fresh local clock on remount (issue #329). 0/absent => use
   // the local clock.
   started_at?: number
+  tool_presentation?: import('./chat').ToolPresentation
 }
 
 export interface ToolDeltaPayload extends ToolUsePayload {
@@ -462,6 +463,7 @@ export interface ToolEndPayload extends ToolUsePayload {
 }
 
 export interface ToolResultPayload extends ToolUsePayload {
+  arguments?: Record<string, unknown>
   result?: unknown
   content?: unknown
   output?: unknown

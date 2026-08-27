@@ -1130,19 +1130,7 @@
       "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
     },
     "preset": {
-      "summary": "Routing template: {label}",
-      "desc": "Apply once to fill Model Routing; edit the active tiers there.",
-      "customizedSummary": "Model Routing already uses {label}.",
-      "customizedDesc": "Active tiers are edited in Model Routing.",
-      "synthesizedLabel": "Generated routing template",
-      "synthesizedBadge": "Generated template",
-      "customize": "View template details →",
-      "hide": "Hide template details",
-      "apply": "Apply to Model Routing",
-      "viewInRouter": "Open Model Routing →",
-      "modeRecommended": "routing template",
-      "modeCustom": "custom tiers",
-      "modeDisabled": "off"
+      "modeCustom": "custom tiers"
     },
     "modelStrategy": {
       "title": "Model routing",
@@ -1792,8 +1780,6 @@
       "routerSaved": "Router saved.",
       "routerSavedRestart": "Router saved. Restart required.",
       "ensembleSaved": "Ensemble saved.",
-      "presetApplied": "Routing preset applied.",
-      "presetAppliedRestart": "Routing preset applied. Restart required.",
       "channelSaved": "Channel saved — configuration validated locally; use Test connection to verify credentials",
       "channelSavedLive": "Channel saved and applied — running with the new configuration",
       "channelStartFailed": "Channel saved, but it failed to start — open its status for the error, then retry with Restart",
@@ -3024,16 +3010,6 @@
       "installed": "Installed",
       "add": "Add"
     },
-    "skillCard": {
-      "subSkillsTitle": "Sub-skills used by this meta-skill",
-      "uses": "uses",
-      "dependencies": "Declared dependencies",
-      "pythonCount": "Python packages: {count}",
-      "binaryCount": "Binaries: {count}",
-      "envCount": "Environment variables: {count}",
-      "missingCount": "Missing dependencies: {count}",
-      "advisoryCount": "Advisories: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Skill details: {name}",
       "triggers": "Triggers",
@@ -3425,7 +3401,10 @@
   "chat": {
     "sessionCreated": {
       "title": "Chat created",
-      "open": "Open chat"
+      "open": "Open chat",
+      "fallbackTitle": "Chat {suffix}",
+      "deleted": "Deleted",
+      "missing": "Session was deleted or does not exist"
     },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
@@ -4160,6 +4139,33 @@
       "searchMemory": "Search memory",
       "readPage": "Read page",
       "updatePage": "Update page",
+      "searchRunning": "Searching",
+      "searchDone": "Search complete",
+      "searchFailed": "Search failed",
+      "fileReadRunning": "Reading files",
+      "fileReadDone": "File reading complete",
+      "fileReadFailed": "File reading failed",
+      "networkReadRunning": "Accessing network",
+      "networkReadDone": "Network access complete",
+      "networkReadFailed": "Network access failed",
+      "commandRunning": "Executing command",
+      "commandDone": "Command execution complete",
+      "commandFailed": "Command execution failed",
+      "subagentRunning": "Delegating task",
+      "subagentDone": "Task delegation complete",
+      "subagentFailed": "Task delegation failed",
+      "mutationRunning": "Applying changes",
+      "mutationDone": "Changes applied",
+      "mutationFailed": "Failed to apply changes",
+      "fileWriteRunning": "Writing file",
+      "fileWriteDone": "File written",
+      "fileWriteFailed": "File write failed",
+      "fileEditRunning": "Editing file",
+      "fileEditDone": "File edited",
+      "fileEditFailed": "File edit failed",
+      "genericRunning": "Calling tool",
+      "genericDone": "Tool call complete",
+      "genericFailed": "Tool call failed",
       "running": "Running",
       "failed": "Failed",
       "done": "Done",
@@ -4398,6 +4404,7 @@
       "callsCount": "{count} calls",
       "resultsCount": "{count} results",
       "sectionInput": "input",
+      "sectionChanges": "changes",
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "result",
       "sectionError": "error",

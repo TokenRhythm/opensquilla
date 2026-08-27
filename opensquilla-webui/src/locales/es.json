@@ -1042,19 +1042,7 @@
       "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
     },
     "preset": {
-      "summary": "Plantilla de enrutamiento: {label}",
-      "desc": "Aplícala una vez para llenar Enrutamiento de modelos; edita allí los niveles activos.",
-      "customizedSummary": "Enrutamiento de modelos ya usa {label}.",
-      "customizedDesc": "Los niveles activos se editan en Enrutamiento de modelos.",
-      "synthesizedLabel": "Plantilla de enrutamiento generada",
-      "synthesizedBadge": "Plantilla generada",
-      "customize": "Ver detalles de la plantilla →",
-      "hide": "Ocultar detalles de la plantilla",
-      "apply": "Aplicar a Enrutamiento de modelos",
-      "viewInRouter": "Abrir Enrutamiento de modelos →",
-      "modeRecommended": "plantilla de enrutamiento",
-      "modeCustom": "personalizado",
-      "modeDisabled": "desactivado"
+      "modeCustom": "personalizado"
     },
     "modelStrategy": {
       "title": "Enrutamiento de modelos",
@@ -1704,8 +1692,6 @@
       "routerSaved": "Enrutador guardado.",
       "routerSavedRestart": "Enrutador guardado. Se requiere reiniciar.",
       "ensembleSaved": "Conjunto guardado.",
-      "presetApplied": "Preajuste de enrutamiento aplicado.",
-      "presetAppliedRestart": "Preajuste de enrutamiento aplicado. Se requiere reinicio.",
       "channelSaved": "Canal guardado: configuración validada localmente; usa «Probar conexión» para verificar las credenciales",
       "channelSavedLive": "Canal guardado y aplicado — en ejecución con la nueva configuración",
       "channelStartFailed": "Canal guardado, pero no pudo iniciarse — revisa su estado para ver el error y reintenta con Reiniciar",
@@ -2936,16 +2922,6 @@
       "installed": "Instalado",
       "add": "Añadir"
     },
-    "skillCard": {
-      "subSkillsTitle": "Subhabilidades que usa esta metahabilidad",
-      "uses": "usa",
-      "dependencies": "Dependencias declaradas",
-      "pythonCount": "Paquetes de Python: {count}",
-      "binaryCount": "Binarios: {count}",
-      "envCount": "Variables de entorno: {count}",
-      "missingCount": "Dependencias faltantes: {count}",
-      "advisoryCount": "Avisos: {count}"
-    },
     "skillDetail": {
       "dialogLabel": "Detalles de la habilidad: {name}",
       "triggers": "Disparadores",
@@ -3337,7 +3313,10 @@
   "chat": {
     "sessionCreated": {
       "title": "Chat creado",
-      "open": "Abrir chat"
+      "open": "Abrir chat",
+      "fallbackTitle": "Chat {suffix}",
+      "deleted": "Eliminado",
+      "missing": "La sesión se eliminó o no existe"
     },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
@@ -4070,6 +4049,33 @@
       "searchMemory": "Buscar en la memoria",
       "readPage": "Leer página",
       "updatePage": "Actualizar página",
+      "searchRunning": "Buscando",
+      "searchDone": "Búsqueda completada",
+      "searchFailed": "Error de búsqueda",
+      "fileReadRunning": "Leyendo archivos",
+      "fileReadDone": "Lectura de archivos completada",
+      "fileReadFailed": "Error al leer archivos",
+      "networkReadRunning": "Accediendo a la red",
+      "networkReadDone": "Acceso a la red completado",
+      "networkReadFailed": "Error de acceso a la red",
+      "commandRunning": "Ejecutando comando",
+      "commandDone": "Ejecución del comando completada",
+      "commandFailed": "Error al ejecutar el comando",
+      "subagentRunning": "Delegando tarea",
+      "subagentDone": "Delegación de tarea completada",
+      "subagentFailed": "Error al delegar la tarea",
+      "mutationRunning": "Aplicando cambios",
+      "mutationDone": "Cambios aplicados",
+      "mutationFailed": "Error al aplicar los cambios",
+      "fileWriteRunning": "Escribiendo archivo",
+      "fileWriteDone": "Archivo escrito",
+      "fileWriteFailed": "Error al escribir el archivo",
+      "fileEditRunning": "Editando archivo",
+      "fileEditDone": "Archivo editado",
+      "fileEditFailed": "Error al editar el archivo",
+      "genericRunning": "Llamando a la herramienta",
+      "genericDone": "Llamada a la herramienta completada",
+      "genericFailed": "Error en la llamada a la herramienta",
       "running": "Ejecutando",
       "failed": "Falló",
       "done": "Hecho",
@@ -4308,6 +4314,7 @@
       "callsCount": "{count} llamadas",
       "resultsCount": "{count} resultados",
       "sectionInput": "entrada",
+      "sectionChanges": "cambios",
       "sectionDiagnostics": "diagnósticos",
       "sectionResult": "resultado",
       "sectionError": "error",

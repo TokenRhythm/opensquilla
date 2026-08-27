@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
+import { RpcTransportError } from '@/lib/rpc'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type {
@@ -396,6 +397,47 @@ describe('useChatSend prompt annotations', () => {
     expect(userMessages).toHaveLength(1)
     expect(userMessages[0]?.promptAnnotations?.map(item => item.annotationId))
       .toEqual(['annotation-2', 'annotation-1'])
+  })
+
+  it('keeps accepted=null annotation text out of the composer and replays its exact identity', async () => {
+    const inputText = ref('Answer the selected annotations without changing the document.')
+    const promptAnnotationIds = ref<readonly string[]>(['annotation-2', 'annotation-1'])
+    const harness = createHarness({ inputText, promptAnnotationIds })
+    harness.rpc.call
+      .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+      .mockResolvedValueOnce({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-replayed-annotation-send',
+        acceptedPromptAnnotationIds: ['annotation-2', 'annotation-1'],
+      })
+
+    await harness.api.onSend()
+
+    const firstParams = harness.rpc.call.mock.calls[0]?.[1]
+    expect(firstParams).toBeDefined()
+    expect(inputText.value).toBe('')
+    expect(promptAnnotationIds.value).toEqual(['annotation-2', 'annotation-1'])
+    const userMessagesAfterUnknown = harness.options.messages.value
+      .filter(message => message.role === 'user')
+    expect(userMessagesAfterUnknown).toHaveLength(1)
+    expect(userMessagesAfterUnknown[0]?.text)
+      .toBe('Answer the selected annotations without changing the document.')
+    expect(harness.options.acknowledgePromptAnnotations).not.toHaveBeenCalled()
+
+    await harness.api.onSend()
+
+    const secondParams = harness.rpc.call.mock.calls[1]?.[1]
+    expect(secondParams).toEqual(firstParams)
+    expect(secondParams?.clientRequestId).toBe(firstParams?.clientRequestId)
+    expect(harness.options.messages.value.filter(message => message.role === 'user'))
+      .toHaveLength(1)
+    expect(inputText.value).toBe('')
+    expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledOnce()
+    expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
+      ['annotation-2', 'annotation-1'],
+      ['annotation-2', 'annotation-1'],
+      'agent:main:webchat:test',
+    )
   })
 
   it('acknowledges accepted annotations exactly once after receipt recovery', async () => {

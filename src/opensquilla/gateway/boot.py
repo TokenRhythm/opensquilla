@@ -1803,6 +1803,30 @@ def _optional_positive_timeout(config: Any, attr: str, default: float) -> float 
     return value if value > 0 else None
 
 
+def _project_public_tool_event(
+    event_kind: str,
+    event_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the server-owned display rule without touching engine arguments."""
+
+    presentation = event_dict.get("tool_presentation")
+    if not isinstance(presentation, dict):
+        event_dict.pop("tool_presentation", None)
+        return event_dict
+    if event_kind not in {"tool_use_end", "tool_result"}:
+        return event_dict
+    arguments = event_dict.get("arguments")
+    if not isinstance(arguments, dict):
+        return event_dict
+    from opensquilla.tools.presentation import project_tool_arguments_payload
+
+    projected = project_tool_arguments_payload(presentation, arguments)
+    event_dict["arguments"] = projected
+    if event_kind == "tool_use_end":
+        event_dict["input"] = projected
+    return event_dict
+
+
 async def _emit_task_runtime_stream_events(
     raw_stream: Any,
     session_key: str,
@@ -1859,6 +1883,8 @@ async def _emit_task_runtime_stream_events(
                 if not key.startswith("_")
             }
         event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        if event_dict.get("tool_presentation") is None:
+            event_dict.pop("tool_presentation", None)
         if event_kind == "answer_generation_reset" and event_dict.get("terminal") is True:
             # A terminal generation reset is the canonical visible outcome
             # when the fixed provider also fails.  It intentionally replaces
@@ -1903,12 +1929,13 @@ async def _emit_task_runtime_stream_events(
             # construct an unscoped ThinkingEvent.
             event_dict.pop("block_id", None)
             event_dict.pop("block_index", None)
-        append_activity_phase(
-            activity_phases,
-            event_kind=event_kind,
-            payload=event_dict,
-            observed_at_ms=int(time.time() * 1_000),
-        )
+        if event_kind != "tool_use_delta":
+            append_activity_phase(
+                activity_phases,
+                event_kind=event_kind,
+                payload=event_dict,
+                observed_at_ms=int(time.time() * 1_000),
+            )
         if event_kind == "artifact":
             event_dict = enrich_artifact_event_dict(event_dict)
         if event_kind == "error":
@@ -2032,6 +2059,11 @@ async def _emit_task_runtime_stream_events(
                     event_kind=event_kind,
                     exc_info=True,
                 )
+        # Tool deltas are provisional and can arrive in hundreds of fragments
+        # after the provider generation commits.  Public clients need only the
+        # start marker and ToolUseEnd's authoritative argument object.
+        if event_kind == "tool_use_delta":
+            continue
         if task_id:
             event_dict["task_id"] = task_id
             # Typed generation-reset events carry the engine-owned turn id.
@@ -2051,6 +2083,7 @@ async def _emit_task_runtime_stream_events(
             event_dict["input_mode"] = input_mode
         if run_kind:
             event_dict["run_kind"] = run_kind
+        event_dict = _project_public_tool_event(event_kind, event_dict)
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",

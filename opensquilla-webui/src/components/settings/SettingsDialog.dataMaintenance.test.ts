@@ -72,7 +72,6 @@ async function mountDialog(path: '/settings/advanced' | '/settings/dataMigration
     behaviorPanel: ref({}),
     privacyPanel: ref({}),
     modelStrategyPanel: ref({}),
-    presetPanel: ref({}),
     channelsPanel: ref({}),
     capabilitiesPanel: ref({}),
     hasSetupAction: ref(false),

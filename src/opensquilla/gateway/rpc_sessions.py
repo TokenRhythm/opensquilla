@@ -10029,6 +10029,7 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        get_session_streams().evict(canonical_key)
         for pending_input_id, session_ids in pending_material_owners.items():
             _cleanup_pending_input_scopes(
                 ctx=ctx,
@@ -11364,6 +11365,16 @@ async def _hydrate_sessions_messages_metadata(
 @_d.method("sessions.messages.subscribe", scope="operator.read")
 async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
+    if ":subagent:" in key:
+        storage = get_session_storage(getattr(ctx, "session_manager", None))
+        session = await storage.get_session(key) if storage is not None else None
+        if session is None:
+            raise RpcHandlerError(
+                "SESSION_NOT_FOUND",
+                "Session was deleted or does not exist.",
+                retryable=False,
+                accepted=False,
+            )
     fast_ack = (params or {}).get("fast_ack") is True
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     registered_new = False
@@ -12494,6 +12505,12 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         session_routing_revision=routing["revision"],
         session_routing_source=routing["source"],
     )
+    overlay_live_config = getattr(effective_routing_config, "overlay_live_config", None)
+    effective_runtime_config = (
+        overlay_live_config(ctx.config)
+        if callable(overlay_live_config)
+        else effective_routing_config
+    )
 
     metadata: dict[str, Any] = {
         "session_key": session_key,
@@ -12538,7 +12555,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "running_count": running_count,
         },
         "runtime": {
-            "model_routing": model_routing_snapshot(effective_routing_config),
+            "model_routing": model_routing_snapshot(effective_runtime_config),
         },
         "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),
