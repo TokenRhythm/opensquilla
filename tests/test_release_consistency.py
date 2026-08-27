@@ -999,7 +999,9 @@ def test_recommended_extra_uses_onnx_tokenizers_without_transformers() -> None:
     config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     recommended = config["project"]["optional-dependencies"]["recommended"]
 
-    assert any(dep.startswith("onnxruntime") for dep in recommended)
+    onnx_dependencies = [dep for dep in recommended if dep.startswith("onnxruntime")]
+    assert onnx_dependencies
+    assert "sys_platform != 'darwin' or platform_machine != 'x86_64'" in onnx_dependencies[0]
     assert any(dep.startswith("tokenizers") for dep in recommended)
     assert not any(dep.startswith("transformers") for dep in recommended)
 

@@ -95,6 +95,11 @@ OpenSquilla's on-device model router — and its model assets;
 separate `--router disabled` onboarding flag keeps the dependencies
 installed but turns the router off at runtime.
 
+On Intel Macs, ONNX Runtime does not provide a compatible wheel, so the shell
+installers automatically fall back from `recommended` to the `core` profile.
+OpenSquilla remains usable with direct single-model routing; SquillaRouter is
+currently available on macOS only on Apple Silicon.
+
 On Windows, SquillaRouter's bundled ONNX runtime also needs the Visual
 C++ runtime. The from-source PowerShell installer installs it automatically via
 `winget`; the **Quick terminal install** (`uv tool install`) path does not — if
@@ -349,8 +354,15 @@ Run `npm run build` again after changing Web UI sources. Standard wheel builds
 fail closed when the generated console is missing or stale; editable `uv sync`
 installs remain available for backend-only work.
 
-The `recommended` extra includes SquillaRouter for development too;
-the `dev` extra installs the test, lint, and typecheck tools. Install
+The `recommended` extra includes SquillaRouter for development too. On Intel
+macOS, use the core development environment instead because ONNX Runtime has
+no compatible wheel:
+
+```sh
+uv sync --extra dev
+```
+
+The `dev` extra installs the test, lint, and typecheck tools. Install
 additional extras into the same environment you run:
 
 ```sh

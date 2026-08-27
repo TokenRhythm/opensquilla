@@ -85,7 +85,9 @@ recommended = [
     "lightgbm>=4.0",
     "joblib>=1.3",
     "scikit-learn>=1.3",
-    "onnxruntime>=1.17",
+    # ONNX Runtime no longer publishes macOS x86_64 wheels. Keep this extra
+    # resolvable there; shell installers select the core profile on that host.
+    "onnxruntime>=1.17; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "tokenizers>=0.15",
 ]
 matrix = ["matrix-nio>=0.25,<0.26", "markdown>=3.0"]
