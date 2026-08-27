@@ -428,11 +428,56 @@ def _acl_path_hash(path: Path) -> str:
     return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
 
 
+def _windows_powershell_exe() -> str | None:
+    """Return the absolute path to Windows PowerShell 5.1, or ``None``.
+
+    The ACL migration script depends on .NET Framework-only APIs such as
+    ``[System.IO.Directory]::SetAccessControl`` and
+    ``[System.IO.File]::SetAccessControl``, which do not exist in PowerShell 7
+    (.NET Core / ``pwsh``). ``pwsh`` frequently shadows a bare ``powershell``
+    PATH lookup on hosts that install it, which is exactly the failure this
+    guards against. Instead of trusting PATH, pin the well-known Windows
+    PowerShell install locations. Those canonical paths are always Windows
+    PowerShell 5.1 on a supported Windows host, so returning them is itself the
+    verification that we invoke 5.1 rather than a PATH-resolved ``pwsh``.
+
+    Returns ``None`` only when neither known location exists, so callers fail
+    loudly instead of silently invoking an unverified PATH binary.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidates = (
+        # SysNative is the Wow64 redirector view used by 32-bit processes to
+        # reach the native 64-bit System32 directory.
+        os.path.join(system_root, "SysNative", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _windows_acl_shells() -> tuple[str, ...]:
-    preferred = shutil.which("pwsh")
-    fallback = shutil.which("powershell")
+    """Resolve the PowerShell shells used for Windows ACL hardening.
+
+    Windows PowerShell 5.1 (the .NET Framework build) is required for the
+    ``SetAccessControl`` APIs the ACL script depends on, so it is preferred.
+    ``pwsh`` (.NET Core) can only be a last-resort fallback: it will usually
+    fail the script's verification, and that failure is surfaced rather than
+    masked. If neither a trusted Windows PowerShell 5.1 nor ``pwsh`` is
+    available, fail explicitly so the missing dependency is diagnosable instead
+    of being hidden behind a PATH-resolved binary that may not be 5.1.
+    """
+    preferred = _windows_powershell_exe()
+    fallback = shutil.which("pwsh")
     shells = tuple(item for item in (preferred, fallback) if item is not None)
-    return shells or ("powershell",)
+    if not shells:
+        raise RuntimeError(
+            "Windows PowerShell 5.1 was not found at the expected system "
+            "locations (System32/SysNative WindowsPowerShell v1.0) and no pwsh "
+            "fallback is on PATH; cannot harden upgrade snapshot ACLs."
+        )
+    return shells
 
 
 def _protect_windows_acl_batch(
