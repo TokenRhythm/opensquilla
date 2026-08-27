@@ -1368,6 +1368,28 @@ jobs:
                   ),
               },
               {
+                  "id": "windows-loopback-no-buffer-space-v1",
+                  "os": "Windows",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^electronApplication\.evaluate: Error: "
+                      r"ERR_NO_BUFFER_SPACE \(-176\) loading "
+                      r"'http://127\.0\.0\.1:\d+/one'$",
+                      re.MULTILINE,
+                  ),
+                  # Chromium reports the socket-allocation failure first; the
+                  # outer Workbench runner then reports the exact failed child.
+                  # Remove only that wrapper so any separate assertion, crash,
+                  # or product error still blocks the retry below.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^Error: .*test-native-workbench-v2-electron\.mjs "
+                          r"failed with exit code 1$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+              {
                   "id": "macos-electron-foreground-prerequisite-v1",
                   "os": "macOS",
                   "cases": {"offline-document-workbench-e2e"},

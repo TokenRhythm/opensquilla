@@ -1284,6 +1284,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     )
     assert '"windows-delete-helper-handoff-timeout-v1"' in run["run"]
     assert '"windows-isolated-acl-worker-timeout-v1"' in run["run"]
+    assert '"windows-loopback-no-buffer-space-v1"' in run["run"]
     assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
     assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
     assert '"cases": {"offline-document-workbench-e2e"}' in run["run"]
@@ -1339,6 +1340,18 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             "FAILED tests/synthetic.py - AssertionError: isolated Windows ACL hardening "
             "timed out: stdout='synthetic'\n",
             "windows-isolated-acl-worker-timeout-v1",
+        ),
+        (
+            "offline-document-workbench-e2e",
+            "Windows",
+            "electronApplication.evaluate: Error: "
+            "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
+            "    at synthetic_allowed_stack (native-workbench.mjs:1:1)\n"
+            "Error: C:\\synthetic\\node.exe "
+            "D:\\synthetic\\test-native-workbench-v2-electron.mjs failed with exit "
+            "code 1\n"
+            "    at synthetic_outer_stack (offline-workbench.mjs:1:1)\n",
+            "windows-loopback-no-buffer-space-v1",
         ),
         (
             "offline-document-workbench-e2e",
@@ -1400,6 +1413,61 @@ def test_desktop_retry_classifier_accepts_only_structured_infrastructure_signatu
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert records[-1]["classification"] == "non_retryable"
     assert records[-1]["retryable"] is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "electronApplication.evaluate: Error: "
+        "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/two'\n",
+        "electronApplication.evaluate: Error: "
+        "ERR_NO_BUFFER_SPACE (-176) loading 'http://localhost:54108/one'\n",
+        "electronApplication.evaluate: Error: "
+        "ERR_CONNECTION_RESET (-101) loading 'http://127.0.0.1:54108/one'\n",
+        "electronApplication.evaluate: Error: "
+        "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
+        "Error: C:\\synthetic\\node.exe "
+        "D:\\synthetic\\test-native-workbench-v2-electron.mjs failed with exit "
+        "code 1\n"
+        "AssertionError: saved document content did not match\n",
+    ),
+)
+def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    log.write_text(message, encoding="utf-8")
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "offline-document-workbench-e2e",
+            "Windows",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == "non_retryable"
+    assert record["retryable"] is False
+    assert list(evidence.iterdir()) == []
 
 
 def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Path) -> None:
