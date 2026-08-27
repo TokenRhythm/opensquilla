@@ -440,30 +440,31 @@ def test_isolated_home_environment_supports_path_home_in_child(tmp_path: Path) -
     assert env["USERPROFILE"] == str(isolated_home.resolve())
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows isolated-profile ACL smoke")
-def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name != "nt", reason="Windows isolated-profile migration smoke")
+def test_isolated_home_environment_supports_lightweight_sandbox_migration(
+    tmp_path: Path,
+) -> None:
     isolated_home = tmp_path / "user-state"
     isolated_home.mkdir()
-    protected = tmp_path / "protected"
-    protected.mkdir()
+    config = isolated_home / "config.toml"
+    config.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
     env = e2e._worker_environment("synthetic-rotated-key")
     e2e._apply_isolated_home_environment(env, isolated_home)
     env["PYTHONPATH"] = str(e2e.SRC_DIR)
     code = (
         "from pathlib import Path; import sys; "
-        "from opensquilla.sandbox.upgrade_migration import "
-        "_current_windows_user_sid, _protect_private_path; "
-        "print('acl-child-imported', flush=True); "
-        "sid = _current_windows_user_sid(); "
-        "print(f'acl-child-sid={sid}', flush=True); "
-        "_protect_private_path(Path(sys.argv[1]), directory=True, "
-        "windows_user_sid=sid); "
-        "print('acl-child-protected', flush=True)"
+        "from opensquilla.sandbox.upgrade_migration import SandboxUpgradeCoordinator; "
+        "report = SandboxUpgradeCoordinator(Path(sys.argv[1])).run(); "
+        "assert report.ok, report; "
+        "assert report.status == 'committed', report; "
+        "assert 'run_mode = \"safe\"' in "
+        "(Path(sys.argv[1]) / 'config.toml').read_text(encoding='utf-8'); "
+        "print('sandbox-migration-complete', flush=True)"
     )
 
     try:
         subprocess.run(
-            [sys.executable, "-c", code, str(protected)],
+            [sys.executable, "-c", code, str(isolated_home)],
             check=True,
             capture_output=True,
             env=env,
@@ -472,12 +473,12 @@ def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path
         )
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(
-            f"isolated Windows ACL hardening timed out: stdout={exc.stdout!r} "
+            f"isolated Windows sandbox migration timed out: stdout={exc.stdout!r} "
             f"stderr={exc.stderr!r}"
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise AssertionError(
-            f"isolated Windows ACL hardening failed: stdout={exc.stdout!r} "
+            f"isolated Windows sandbox migration failed: stdout={exc.stdout!r} "
             f"stderr={exc.stderr!r}"
         ) from exc
 

@@ -3030,9 +3030,9 @@ async def build_services(
 
     configure_trusted_fake_ip_cidrs(config.tools.trusted_fake_ip_cidrs)
 
-    # Canonicalize released sandbox state before opening any persistent store.
-    # A failed prepared journal is intentionally left for explicit recovery;
-    # startup never guesses or rolls the profile back automatically.
+    # Best-effort normalization of released sandbox spellings. The config has
+    # already loaded through the legacy codec, so an optional on-disk cleanup
+    # must never make the gateway unavailable.
     config_path = Path(str(getattr(config, "config_path", "") or ""))
     if config_path.is_file():
         from opensquilla.sandbox.upgrade_migration import (
@@ -3044,22 +3044,20 @@ async def build_services(
         try:
             upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
         except Exception as exc:
-            log.exception(
+            log.warning(
                 "build_services.sandbox_upgrade_failed",
                 duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
                 error_type=type(exc).__name__,
+                error=str(exc),
             )
-            raise
-        log.info(
-            "build_services.sandbox_upgrade_finished",
-            ok=upgrade_report.ok,
-            status=upgrade_report.status,
-            duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
-        )
-        if not upgrade_report.ok:
-            raise RuntimeError(
-                "migration_failed_manual_recovery_required: "
-                f"{upgrade_report.error or upgrade_report.status}"
+        else:
+            logger = log.info if upgrade_report.ok and not upgrade_report.error else log.warning
+            logger(
+                "build_services.sandbox_upgrade_finished",
+                ok=upgrade_report.ok,
+                status=upgrade_report.status,
+                error=upgrade_report.error,
+                duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
             )
 
     # ── Sandbox runtime ─────────────────────────────────────────────

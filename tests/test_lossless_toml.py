@@ -1,10 +1,9 @@
 """Contract tests for the comment-preserving TOML patcher.
 
-``patch_import_config`` runs on every Gateway boot (``lossless_patch_sandbox_fields``
-stamps ``sandbox.run_mode``), so a config it refuses to scan is a config the
-Gateway refuses to start on. The scanner is line-oriented, which makes values
-that span several physical lines — arrays of inline tables, nested arrays,
-triple-quoted strings — the interesting cases.
+The optional sandbox compatibility cleanup uses ``patch_import_config`` only
+when a released legacy RunMode field is present. The scanner is line-oriented,
+which makes values that span several physical lines — arrays of inline tables,
+nested arrays, triple-quoted strings — the interesting cases.
 """
 
 from __future__ import annotations
@@ -90,22 +89,20 @@ host = "127.0.0.1"
 def test_untouched_array_of_inline_tables_does_not_block_the_patch() -> None:
     """Regression for #1106.
 
-    The Control UI writes ``agents`` as a multi-line array of inline tables. The
-    boot migration only stamps ``sandbox.run_mode``, but the scan aborted on the
-    array's rows before reaching that edit, so the Gateway never started again.
+    The Control UI writes ``agents`` as a multi-line array of inline tables. An
+    older boot migration stamped ``sandbox.run_mode``, but the scan aborted on
+    the array's rows before reaching that edit.
     """
     patched = _patched(AGENTS_CONFIG, lambda payload: payload.update(port=18793))
     assert patched == AGENTS_CONFIG.decode("utf-8").replace("18792", "18793")
 
 
-def test_boot_migration_stamps_run_mode_next_to_an_agents_array() -> None:
+def test_boot_migration_leaves_agents_only_config_unchanged() -> None:
     from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
 
     patched, mode = lossless_patch_sandbox_fields(AGENTS_CONFIG)
-    payload = tomllib.loads(patched.decode("utf-8"))
-    assert payload["sandbox"]["run_mode"] == mode
-    assert payload["agents"] == [{"id": "qa-agent", "name": "QA Agent", "enabled": True}]
-    assert b'{ id = "qa-agent", name = "QA Agent", enabled = true },' in patched
+    assert patched == AGENTS_CONFIG
+    assert mode is None
 
 
 def test_nested_multi_line_array_rows_are_not_read_as_table_headers() -> None:
