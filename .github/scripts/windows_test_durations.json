@@ -677,6 +677,7 @@
     "tests/test_gateway/test_usage_upgrade.py": 15.498,
     "tests/test_gateway/test_user_input_broker.py": 0.01,
     "tests/test_gateway/test_websocket_auth_payload.py": 0.01,
+    "tests/test_gateway/test_websocket_close_coordination.py": 0.01,
     "tests/test_gateway/test_websocket_frame_validation.py": 0.998,
     "tests/test_gateway/test_websocket_handshake.py": 0.316,
     "tests/test_gateway/test_websocket_request_concurrency.py": 0.669,
