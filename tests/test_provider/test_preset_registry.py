@@ -20,6 +20,7 @@ from opensquilla.provider.preset_registry import (
     list_presets,
 )
 from opensquilla.provider.registry import list_provider_specs
+from opensquilla.router_tiers import recommended_ensemble_selection_mode_for_provider
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "router_tier_profiles.json"
 LEGACY_NINE = frozenset(
@@ -147,10 +148,15 @@ def test_tokenrhythm_curated_ladder() -> None:
     assert preset is not None
     assert preset.synthesized is False
     assert preset.persistable is False
-    assert preset.default_model == "deepseek-v4-pro"
+    assert preset.default_model == "deepseek-v4-pro-0813"
+    assert not hasattr(preset, "default_ensemble_selection_mode")
+    assert (
+        recommended_ensemble_selection_mode_for_provider(preset.provider_id)
+        == "static_tokenrhythm_b5"
+    )
     expected_models = {
-        "c0": "deepseek-v4-flash",
-        "c1": "deepseek-v4-pro",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
         "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
@@ -160,11 +166,19 @@ def test_tokenrhythm_curated_ladder() -> None:
     for name, model in expected_models.items():
         assert tiers[name]["provider"] == "tokenrhythm", name
         assert tiers[name]["model"] == model, name
-        # The endpoint rejects thinking-toggle request fields, so the curated
-        # ladder must not carry a thinking_level for the request builder.
+        # Packaged routes preserve the provider default; explicit turn-level
+        # controls remain separate from this mixed-family router ladder.
         assert "thinking_level" not in tiers[name], name
+    assert {"deepseek-v4-pro", "deepseek-v4-flash"}.isdisjoint({
+        preset.default_model,
+        *(entry["model"] for entry in tiers.values()),
+    })
+    assert tiers["c0"]["supports_image"] is False
+    assert tiers["c2"]["supports_image"] is False
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in tiers["c3"]
 
 
 def test_curated_inline_ids_are_never_legacy_profile_ids() -> None:

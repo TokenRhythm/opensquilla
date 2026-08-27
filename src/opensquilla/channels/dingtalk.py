@@ -1,9 +1,9 @@
 """DingTalk (钉钉) channel adapter.
 
-Uses the ``dingtalk-stream`` SDK Stream Mode (WebSocket) for inbound, and
-the SDK's own card-instance + chat-reply primitives (which delegate to the
-DingTalk OpenAPI) for outbound. There is no HTTP webhook; the SDK keeps a
-persistent WS to DingTalk.
+Uses the ``dingtalk-stream`` SDK Stream Mode (WebSocket) for inbound and
+text/card replies. Generated artifacts use DingTalk's fixed OpenAPI endpoints:
+media upload followed by a native group or one-to-one robot message. There is
+no HTTP webhook; the SDK keeps a persistent WS to DingTalk.
 
 Streaming edits use :class:`dingtalk_stream.MarkdownCardInstance` —
 ``async_create_and_send_card`` for the first emission, then
@@ -15,30 +15,41 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import mimetypes
 import platform
+import re
 import socket
+import stat
+import tempfile
 import time
+import zipfile
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import requests  # type: ignore[import-untyped]
 import structlog
 from pydantic import BaseModel, Field
 
 from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.contract import (
+    ChannelCapabilities,
     ChannelCapabilityProfile,
     ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
     ChannelPlatformManifest,
+    ChannelSendResult,
 )
 from opensquilla.channels.types import (
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -46,6 +57,7 @@ from opensquilla.channels.types import (
     OutgoingMessage,
     UnsupportedChannelOperation,
 )
+from opensquilla.env import trust_env as _trust_env
 
 if TYPE_CHECKING:  # pragma: no cover — typing-only
     from dingtalk_stream import ChatbotMessage as _ChatbotMessage  # type: ignore[import-untyped]
@@ -80,6 +92,102 @@ _DINGTALK_AUTH_INVALID_MESSAGE = "凭证无效：检查 DingTalk AppKey/AppSecre
 _STREAM_STOP_TIMEOUT_S = 5.0
 _STREAM_CANCEL_GRACE_S = 0.25
 
+_DINGTALK_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+_DINGTALK_MEDIA_UPLOAD_URL = "https://oapi.dingtalk.com/media/upload"
+_DINGTALK_GROUP_SEND_URL = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+_DINGTALK_OTO_SEND_URL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+_DINGTALK_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+_DINGTALK_TOKEN_REFRESH_MARGIN_S = 300.0
+_DINGTALK_IMAGE_EXTENSIONS = frozenset({"jpg", "png", "gif", "bmp"})
+_DINGTALK_FILE_EXTENSIONS = frozenset({"doc", "docx", "xlsx", "pdf", "zip", "rar"})
+_DINGTALK_INVALID_TOKEN_CODES = frozenset(
+    {
+        "40014",
+        "42001",
+        "invalidaccesstoken",
+        "invalidauthentication",
+    }
+)
+_DINGTALK_RATE_LIMIT_CODES = frozenset(
+    {
+        "send.bytoken.toofast",
+        "send.too.fast",
+        "too.many.group",
+        "too.many.people",
+    }
+)
+_DINGTALK_ACCESS_TOKEN_QUERY_RE = re.compile(
+    r"(?i)([?&]access_token=)[^&\s\"']+"
+)
+
+
+def _redact_dingtalk_access_token(value: object) -> object:
+    rendered = str(value)
+    redacted = _DINGTALK_ACCESS_TOKEN_QUERY_RE.sub(r"\1<redacted>", rendered)
+    return redacted if redacted != rendered else value
+
+
+class _DingTalkHttpxLogFilter(logging.Filter):
+    """Keep DingTalk's query-string access token out of httpx request logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_dingtalk_access_token(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_dingtalk_access_token(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: _redact_dingtalk_access_token(value)
+                for key, value in record.args.items()
+            }
+        return True
+
+
+_DINGTALK_HTTPX_LOG_FILTER = _DingTalkHttpxLogFilter()
+
+
+def _install_dingtalk_httpx_log_filter() -> None:
+    httpx_logger = logging.getLogger("httpx")
+    if _DINGTALK_HTTPX_LOG_FILTER not in httpx_logger.filters:
+        httpx_logger.addFilter(_DINGTALK_HTTPX_LOG_FILTER)
+
+
+@dataclass(frozen=True, slots=True)
+class _DingTalkTokenState:
+    token: str
+    expires_at: float
+
+
+class _DingTalkApiRejectedError(RuntimeError):
+    """Sanitized provider rejection raised before a visible message is accepted."""
+
+    def __init__(
+        self,
+        operation: str,
+        *,
+        provider_code: str = "",
+        status_code: int | None = None,
+        retryable: bool = False,
+        invalid_token: bool = False,
+    ) -> None:
+        self.operation = operation
+        self.provider_code = provider_code
+        self.status_code = status_code
+        self.retryable = retryable
+        self.invalid_token = invalid_token
+        detail = f" code={provider_code}" if provider_code else ""
+        if status_code is not None:
+            detail += f" http_status={status_code}"
+        super().__init__(f"DingTalk {operation} was rejected{detail}")
+
+
+class DingTalkDeliveryUncertainError(RuntimeError):
+    """Raised when DingTalk may have accepted a visible send request.
+
+    The exception deliberately contains no request URL, token, local path, or
+    payload. The durable outbox records the operation as unknown and must not
+    replay it because DingTalk's send APIs expose no client idempotency key.
+    """
+
 
 class DingTalkAuthError(RuntimeError):
     """Raised when DingTalk rejects the configured Stream Mode credentials."""
@@ -106,6 +214,11 @@ class DingTalkChannelConfig(BaseModel):
     name: str = "dingtalk"
     client_id: str = ""
     client_secret: str = ""
+    # Robot Code is copied from the robot capability page and is not the
+    # application's Client ID/AppKey. Keep an empty default so existing Stream
+    # Mode text-only installations remain valid after upgrade.
+    robot_code: str = ""
+    cool_app_code: str = ""
     event_dedupe_size: int = 4096
     streaming_update_interval_s: float = 2.0
     reconnect_initial_delay_s: float = Field(default=1.0, ge=0.0)
@@ -155,12 +268,26 @@ class DingTalkChannel:
     _last_message_at: datetime | None = field(default=None, init=False, repr=False)
     _msg_count: int = field(default=0, init=False, repr=False)
     _dedupe: EventDedupeCache = field(init=False, repr=False)
+    _http_client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
+    _token_state: _DingTalkTokenState | None = field(default=None, init=False, repr=False)
+    _token_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._dedupe = EventDedupeCache(max_size=self.config.event_dedupe_size)
 
+    def _native_artifacts_configured(self) -> bool:
+        return all(
+            value.strip()
+            for value in (
+                self.config.client_id,
+                self.config.client_secret,
+                self.config.robot_code,
+            )
+        )
+
     @property
     def capability_profile(self) -> ChannelCapabilityProfile:
+        native_artifacts_enabled = self._native_artifacts_configured()
         return ChannelCapabilityProfile(
             channel_type="dingtalk",
             max_message_len=16000,
@@ -170,22 +297,55 @@ class DingTalkChannel:
             mentions=True,
             reply=True,
             cards=True,
+            native_file_upload=native_artifacts_enabled,
+            media=native_artifacts_enabled,
+            artifact_delivery=native_artifacts_enabled,
             transports=("websocket",),
             notes=(
                 "DingTalk stream mode supports card updates for streaming, but robot "
-                "text replies have no generic edit/delete primitive.",
+                "text replies have no generic edit/delete primitive. Native artifact "
+                "delivery additionally requires Robot Code.",
             ),
         )
 
     @property
     def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        native_artifacts_enabled = self._native_artifacts_configured()
+        native_artifact_status = (
+            ChannelPlatformCapabilityStatus.SUPPORTED
+            if native_artifacts_enabled
+            else ChannelPlatformCapabilityStatus.CONFIG_REQUIRED
+        )
         return ChannelPlatformManifest.from_channel_profile(
             self.capability_profile,
         ).with_capabilities(
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.FILES,
+                status=native_artifact_status,
+                tools=(
+                    "media/upload",
+                    "robot/groupMessages/send",
+                    "robot/oToMessages/batchSend",
+                ),
+                required_scopes=("qyapi_base", "qyapi_robot_sendmsg"),
+                mutates=True,
+                notes=(
+                    "Outbound artifacts from an inbound task use DingTalk media upload and "
+                    "native group/one-to-one messages; Robot Code is required.",
+                ),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.MEDIA,
+                status=native_artifact_status,
+                tools=("media/upload", "sampleImageMsg"),
+                required_scopes=("qyapi_base", "qyapi_robot_sendmsg"),
+                mutates=True,
+                notes=("Outbound task images are supported when Robot Code is configured.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
                 status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("DingTalk file upload/download is not implemented in this adapter.",),
+                notes=("Inbound DingTalk attachment resolution is not implemented.",),
             ),
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.CARDS,
@@ -244,10 +404,14 @@ class DingTalkChannel:
 
         metadata: dict[str, Any] = {
             "msg_id": msg_id,
+            "native_message_id": msg_id,
+            "reply_target_id": msg_id,
             "sender_staff_id": getattr(msg, "sender_staff_id", None),
             "sender_nick": getattr(msg, "sender_nick", None),
             "conversation_type": conversation_type,
             "conversation_id": conversation_id,
+            "conversation_kind": "group" if is_group else "dm",
+            "native_chat_id": conversation_id,
             "message_type": message_type,
             "is_group": is_group,
             "bot_mentioned": self._bot_mentioned(msg),
@@ -566,6 +730,11 @@ class DingTalkChannel:
         self._client = None
         self._handler = None
         self._loop = None
+        http_client = self._http_client
+        self._http_client = None
+        self._token_state = None
+        if http_client is not None:
+            await http_client.aclose()
         log.info("dingtalk.stopped", name=self.config.name)
 
     async def _run_stream_supervisor(self) -> None:
@@ -669,6 +838,505 @@ class DingTalkChannel:
     # ------------------------------------------------------------------
     # Outbound
     # ------------------------------------------------------------------
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        # DingTalk's legacy upload endpoint requires access_token in the query
+        # string, while httpx logs request URLs at INFO. Install the filter even
+        # for injected clients so tests and custom transports keep the same
+        # secret boundary.
+        _install_dingtalk_httpx_log_filter()
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                trust_env=_trust_env(),
+            )
+        return self._http_client
+
+    @staticmethod
+    def _api_code(payload: dict[str, Any]) -> str:
+        raw = payload.get("code")
+        if raw is None:
+            raw = payload.get("errcode")
+        if raw in (None, "", 0, "0"):
+            return ""
+        return str(raw)
+
+    @classmethod
+    def _api_rejected(
+        cls,
+        operation: str,
+        response: httpx.Response,
+        payload: dict[str, Any],
+    ) -> None:
+        status_code = response.status_code
+        provider_code = cls._api_code(payload)
+        if status_code < 400 and not provider_code:
+            return
+        normalized_code = provider_code.replace("_", "").replace(".", "").lower()
+        invalid_token = (
+            status_code == 401 or normalized_code in _DINGTALK_INVALID_TOKEN_CODES
+        )
+        if not invalid_token:
+            invalid_token = (
+                "token" in normalized_code
+                and ("invalid" in normalized_code or "expired" in normalized_code)
+            )
+        retryable = status_code == 429 or status_code >= 500 or cls._is_rate_limited(
+            provider_code
+        )
+        raise _DingTalkApiRejectedError(
+            operation,
+            provider_code=provider_code,
+            status_code=status_code,
+            retryable=retryable,
+            invalid_token=invalid_token,
+        )
+
+    @staticmethod
+    def _is_rate_limited(provider_code: str) -> bool:
+        normalized = provider_code.strip().lower()
+        return normalized in _DINGTALK_RATE_LIMIT_CODES or "flowcontrol" in normalized
+
+    @staticmethod
+    def _is_unknown_send_result(provider_code: str) -> bool:
+        return provider_code.strip().lower() == "unknown.send.result"
+
+    async def _get_access_token(self) -> str:
+        async with self._token_lock:
+            now = time.monotonic()
+            state = self._token_state
+            if (
+                state is not None
+                and now < state.expires_at - _DINGTALK_TOKEN_REFRESH_MARGIN_S
+            ):
+                return state.token
+
+            try:
+                response = await self._get_http_client().post(
+                    _DINGTALK_TOKEN_URL,
+                    json={
+                        "appKey": self.config.client_id,
+                        "appSecret": self.config.client_secret,
+                    },
+                )
+            except httpx.HTTPError:
+                raise _DingTalkApiRejectedError(
+                    "access-token request",
+                    retryable=True,
+                ) from None
+
+            payload = self._response_json(response)
+            self._api_rejected("access-token request", response, payload)
+            token = payload.get("accessToken")
+            if not isinstance(token, str) or not token.strip():
+                raise _DingTalkApiRejectedError(
+                    "access-token request",
+                    provider_code="missing_access_token",
+                )
+            try:
+                expires_in = float(payload.get("expireIn", 7200))
+            except (TypeError, ValueError):
+                expires_in = 7200.0
+            self._token_state = _DingTalkTokenState(
+                token=token,
+                expires_at=now + max(0.0, expires_in),
+            )
+            return token
+
+    async def _invalidate_access_token(self, token: str) -> None:
+        async with self._token_lock:
+            if self._token_state is not None and self._token_state.token == token:
+                self._token_state = None
+
+    async def _upload_media_once(
+        self,
+        *,
+        token: str,
+        path: Path,
+        filename: str,
+        media_type: str,
+        mime_type: str,
+    ) -> str:
+        try:
+            with path.open("rb") as handle:
+                response = await self._get_http_client().post(
+                    _DINGTALK_MEDIA_UPLOAD_URL,
+                    params={"access_token": token},
+                    data={"type": media_type},
+                    files={"media": (filename, handle, mime_type)},
+                )
+        except (OSError, httpx.HTTPError) as exc:
+            retryable = isinstance(exc, httpx.HTTPError)
+            raise _DingTalkApiRejectedError(
+                "media upload",
+                retryable=retryable,
+            ) from None
+
+        payload = self._response_json(response)
+        self._api_rejected("media upload", response, payload)
+        if payload.get("errcode") != 0:
+            raise _DingTalkApiRejectedError(
+                "media upload",
+                provider_code="missing_success_errcode",
+            )
+        media_id = payload.get("media_id")
+        if not isinstance(media_id, str) or not media_id.strip():
+            raise _DingTalkApiRejectedError(
+                "media upload",
+                provider_code="missing_media_id",
+            )
+        return media_id
+
+    async def _upload_media(
+        self,
+        *,
+        path: Path,
+        filename: str,
+        media_type: str,
+        mime_type: str,
+    ) -> tuple[str, str]:
+        token = await self._get_access_token()
+        try:
+            media_id = await self._upload_media_once(
+                token=token,
+                path=path,
+                filename=filename,
+                media_type=media_type,
+                mime_type=mime_type,
+            )
+        except _DingTalkApiRejectedError as exc:
+            if not exc.invalid_token:
+                raise
+            await self._invalidate_access_token(token)
+            token = await self._get_access_token()
+            media_id = await self._upload_media_once(
+                token=token,
+                path=path,
+                filename=filename,
+                media_type=media_type,
+                mime_type=mime_type,
+            )
+        return token, media_id
+
+    @staticmethod
+    def _artifact_route(inbound: IncomingMessage) -> tuple[str, str] | None:
+        metadata = inbound.metadata
+        kind = str(metadata.get("conversation_kind") or "").strip().lower()
+        conversation_type = str(metadata.get("conversation_type") or "").strip()
+        is_group = metadata.get("is_group")
+        if kind == "group" or conversation_type == "2" or is_group is True:
+            target = str(
+                metadata.get("native_chat_id")
+                or metadata.get("conversation_id")
+                or ""
+            ).strip()
+            if target and target != "unknown":
+                return "group", target
+            return None
+        if kind == "dm" or conversation_type == "1" or is_group is False:
+            # The OTO API requires a DingTalk staff/user id. Do not substitute
+            # the generic sender id: external contacts may carry a different
+            # identifier that the API cannot safely address.
+            target = str(metadata.get("sender_staff_id") or "").strip()
+            if target and target != "unknown":
+                return "dm", target
+        return None
+
+    @staticmethod
+    def _safe_artifact_name(request: ChannelArtifactDeliveryRequest, path: Path) -> str:
+        candidate = str(request.name or path.name).replace("\\", "/").rsplit("/", 1)[-1]
+        candidate = candidate.strip()
+        if candidate in {"", ".", ".."}:
+            candidate = path.name
+        return candidate
+
+    @staticmethod
+    def _zip_artifact(source: Path, destination: Path, archive_name: str) -> None:
+        with zipfile.ZipFile(
+            destination,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            archive.write(source, arcname=archive_name)
+
+    async def _send_uploaded_media_once(
+        self,
+        *,
+        token: str,
+        route_kind: str,
+        target_id: str,
+        media_id: str,
+        filename: str,
+        file_type: str,
+        media_type: str,
+    ) -> ChannelSendResult:
+        if media_type == "image":
+            msg_key = "sampleImageMsg"
+            msg_param_object = {"photoURL": media_id}
+        else:
+            msg_key = "sampleFile"
+            msg_param_object = {
+                "mediaId": media_id,
+                "fileName": filename,
+                "fileType": file_type,
+            }
+        msg_param = json.dumps(msg_param_object, ensure_ascii=False, separators=(",", ":"))
+
+        payload: dict[str, Any] = {
+            "robotCode": self.config.robot_code.strip(),
+            "msgKey": msg_key,
+            "msgParam": msg_param,
+        }
+        if route_kind == "group":
+            if len(msg_param.encode("utf-8")) > 15_000:
+                return ChannelSendResult.unsupported(
+                    capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                    target_id=target_id,
+                    reason="DingTalk group message parameters exceed 15000 bytes",
+                )
+            payload["openConversationId"] = target_id
+            if self.config.cool_app_code.strip():
+                payload["coolAppCode"] = self.config.cool_app_code.strip()
+            endpoint = _DINGTALK_GROUP_SEND_URL
+        else:
+            payload["userIds"] = [target_id]
+            endpoint = _DINGTALK_OTO_SEND_URL
+
+        try:
+            response = await self._get_http_client().post(
+                endpoint,
+                headers={"x-acs-dingtalk-access-token": token},
+                json=payload,
+            )
+        except httpx.HTTPError:
+            raise DingTalkDeliveryUncertainError(
+                "DingTalk message result is unknown after a transport failure"
+            ) from None
+
+        response_payload = self._response_json(response)
+        provider_code = self._api_code(response_payload)
+        if response.status_code >= 500 or self._is_unknown_send_result(provider_code):
+            raise DingTalkDeliveryUncertainError(
+                "DingTalk message result is unknown after the provider accepted the request"
+            )
+        self._api_rejected("message send", response, response_payload)
+
+        if route_kind == "dm":
+            recipient_failure_fields = (
+                ("flowControlledStaffIdList", True),
+                ("invalidStaffIdList", False),
+            )
+            for field_name, retryable in recipient_failure_fields:
+                recipients = response_payload.get(field_name)
+                if isinstance(recipients, list) and target_id in {
+                    str(item) for item in recipients
+                }:
+                    return ChannelSendResult.failed(
+                        capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                        target_id=target_id,
+                        reason=f"DingTalk did not deliver to the recipient ({field_name})",
+                        retryable=retryable,
+                    )
+
+        process_query_key = response_payload.get("processQueryKey")
+        if not isinstance(process_query_key, str) or not process_query_key.strip():
+            raise DingTalkDeliveryUncertainError(
+                "DingTalk message result is unknown because processQueryKey is missing"
+            )
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=target_id,
+            provider_message_id=process_query_key,
+            provider_file_id=media_id,
+        )
+
+    async def _send_uploaded_media(
+        self,
+        *,
+        token: str,
+        route_kind: str,
+        target_id: str,
+        media_id: str,
+        filename: str,
+        file_type: str,
+        media_type: str,
+    ) -> ChannelSendResult:
+        kwargs = {
+            "route_kind": route_kind,
+            "target_id": target_id,
+            "media_id": media_id,
+            "filename": filename,
+            "file_type": file_type,
+            "media_type": media_type,
+        }
+        try:
+            return await self._send_uploaded_media_once(token=token, **kwargs)
+        except _DingTalkApiRejectedError as exc:
+            if exc.invalid_token:
+                await self._invalidate_access_token(token)
+                try:
+                    refreshed_token = await self._get_access_token()
+                    return await self._send_uploaded_media_once(
+                        token=refreshed_token,
+                        **kwargs,
+                    )
+                except _DingTalkApiRejectedError as refreshed_exc:
+                    exc = refreshed_exc
+            return ChannelSendResult.failed(
+                capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                target_id=target_id,
+                reason=str(exc),
+                retryable=exc.retryable,
+            )
+
+    async def deliver_artifact(
+        self,
+        request: ChannelArtifactDeliveryRequest,
+    ) -> ChannelSendResult:
+        """Upload and send one generated artifact in its originating conversation."""
+        capability = ChannelCapabilities.NATIVE_FILE_UPLOAD
+        if not self.config.robot_code.strip():
+            return ChannelSendResult.unsupported(
+                capability=capability,
+                target_id=request.inbound.channel_id,
+                reason="DingTalk Robot Code is required for native artifact delivery",
+            )
+        if not self.config.client_id.strip() or not self.config.client_secret.strip():
+            return ChannelSendResult.unsupported(
+                capability=capability,
+                target_id=request.inbound.channel_id,
+                reason="DingTalk Client ID and Client Secret are required",
+            )
+
+        route = self._artifact_route(request.inbound)
+        if route is None:
+            return ChannelSendResult.unsupported(
+                capability=capability,
+                target_id=request.inbound.channel_id,
+                reason="DingTalk inbound group or staff-id reply context is required",
+            )
+        route_kind, target_id = route
+
+        path = Path(request.file_path)
+        try:
+            info = path.lstat()
+        except OSError:
+            return ChannelSendResult.failed(
+                capability=capability,
+                target_id=target_id,
+                reason="Artifact file is unavailable",
+            )
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+            return ChannelSendResult.unsupported(
+                capability=capability,
+                target_id=target_id,
+                reason="Artifact delivery requires a regular local file",
+            )
+        if info.st_size <= 0:
+            return ChannelSendResult.unsupported(
+                capability=capability,
+                target_id=target_id,
+                reason="DingTalk cannot upload an empty artifact",
+            )
+        if request.size != info.st_size:
+            return ChannelSendResult.failed(
+                capability=capability,
+                target_id=target_id,
+                reason="Artifact size changed before delivery",
+            )
+        if info.st_size > _DINGTALK_MEDIA_MAX_BYTES:
+            return ChannelSendResult.unsupported(
+                capability=capability,
+                target_id=target_id,
+                reason="DingTalk artifacts must not exceed 20 MB",
+            )
+
+        filename = self._safe_artifact_name(request, path)
+        extension = Path(filename).suffix.lower().lstrip(".")
+        prepared_path = path
+        media_type = "file"
+        if extension in _DINGTALK_IMAGE_EXTENSIONS:
+            media_type = "image"
+        elif extension not in _DINGTALK_FILE_EXTENSIONS:
+            with tempfile.TemporaryDirectory(prefix="opensquilla-dingtalk-") as tmp_dir:
+                prepared_path = Path(tmp_dir) / "artifact.zip"
+                try:
+                    await asyncio.to_thread(
+                        self._zip_artifact,
+                        path,
+                        prepared_path,
+                        filename,
+                    )
+                    if prepared_path.stat().st_size > _DINGTALK_MEDIA_MAX_BYTES:
+                        return ChannelSendResult.unsupported(
+                            capability=capability,
+                            target_id=target_id,
+                            reason="DingTalk artifact ZIP must not exceed 20 MB",
+                        )
+                    return await self._deliver_prepared_artifact(
+                        path=prepared_path,
+                        filename=f"{filename}.zip",
+                        file_type="zip",
+                        media_type="file",
+                        mime_type="application/zip",
+                        route_kind=route_kind,
+                        target_id=target_id,
+                    )
+                except (OSError, zipfile.BadZipFile):
+                    return ChannelSendResult.failed(
+                        capability=capability,
+                        target_id=target_id,
+                        reason="Artifact could not be prepared as a ZIP file",
+                    )
+
+        mime_type = request.mime_type or mimetypes.guess_type(filename)[0]
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        return await self._deliver_prepared_artifact(
+            path=prepared_path,
+            filename=filename,
+            file_type=extension,
+            media_type=media_type,
+            mime_type=mime_type,
+            route_kind=route_kind,
+            target_id=target_id,
+        )
+
+    async def _deliver_prepared_artifact(
+        self,
+        *,
+        path: Path,
+        filename: str,
+        file_type: str,
+        media_type: str,
+        mime_type: str,
+        route_kind: str,
+        target_id: str,
+    ) -> ChannelSendResult:
+        try:
+            token, media_id = await self._upload_media(
+                path=path,
+                filename=filename,
+                media_type=media_type,
+                mime_type=mime_type,
+            )
+        except _DingTalkApiRejectedError as exc:
+            return ChannelSendResult.failed(
+                capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                target_id=target_id,
+                reason=str(exc),
+                retryable=exc.retryable,
+            )
+        return await self._send_uploaded_media(
+            token=token,
+            route_kind=route_kind,
+            target_id=target_id,
+            media_id=media_id,
+            filename=filename,
+            file_type=file_type,
+            media_type=media_type,
+        )
 
     async def send(self, message: OutgoingMessage) -> None:
         """Send a plain-text reply through the SDK's chatbot helper.

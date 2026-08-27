@@ -51,17 +51,26 @@
   filter: drop-shadow(0 1px 6px color-mix(in srgb, var(--accent) 22%, transparent));
 }
 
-/* Soft pastel candy glow on the primary action, the live connection pill, and
-   new-chat -- the "vivid but airy" accent halo (static; the sheen sweep below
-   adds the motion). */
+/* Soft pastel candy glow on elevated accent surfaces. Sidebar navigation stays
+   flat so it remains visually behind modal scrims and matches adjacent rows.
+   Semantic topbar controls opt in below only for actionable states. */
 [data-theme="miami"] .btn--primary,
-[data-theme="miami"] .conn-pill,
-[data-theme="miami"] .sidebar-new-session {
+[data-theme="miami"] .conn-pill:not(.topbar-state) {
   position: relative;
   overflow: hidden;
   box-shadow: var(--elev-1),
               0 6px 20px -6px color-mix(in srgb, var(--accent) 45%, transparent),
               0 2px 8px -2px color-mix(in srgb, var(--accent-secondary) 30%, transparent);
+}
+
+[data-theme="miami"] .topbar .topbar-state:is(
+  [data-state="info"],
+  [data-state="warning"],
+  [data-state="danger"]
+) {
+  box-shadow: var(--elev-1),
+              0 6px 20px -6px color-mix(in srgb, var(--topbar-state-channel) 45%, transparent),
+              0 2px 8px -2px color-mix(in srgb, var(--topbar-state-channel) 30%, transparent);
 }
 
 /* The chrome sheen -- a diagonal light bar that periodically sweeps across the
@@ -70,8 +79,7 @@
    (opacity:0) so with reduced motion no frozen streak sits on the surface; the
    sweep animation is the only thing that makes it briefly glint. */
 [data-theme="miami"] .btn--primary::after,
-[data-theme="miami"] .conn-pill::after,
-[data-theme="miami"] .sidebar-new-session::after {
+[data-theme="miami"] .conn-pill:not(.topbar-state)::after {
   content: "";
   position: absolute;
   top: 0;
@@ -113,8 +121,7 @@
   }
 
   [data-theme="miami"] .btn--primary::after,
-  [data-theme="miami"] .conn-pill::after,
-  [data-theme="miami"] .sidebar-new-session::after {
+  [data-theme="miami"] .conn-pill:not(.topbar-state)::after {
     animation: miami-sheen 9s linear infinite; /* motion-allow */
   }
 }

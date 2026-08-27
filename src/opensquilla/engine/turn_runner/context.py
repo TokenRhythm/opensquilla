@@ -21,8 +21,15 @@ when both names are needed in the same module.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from opensquilla.contracts.turn_execution import (
+    TurnExecutionContext,
+    TurnPublicationLedger,
+)
+from opensquilla.engine.types import ControlTerminalEvent, ControlTerminalReason
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent, ToolHandler
@@ -31,9 +38,66 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ModelCapabilities
     from opensquilla.tools.types import ToolContext
 
+
+def set_execution_deadline_if_missing(
+    context: TurnExecutionContext | None,
+    timeout_seconds: float | int | None,
+) -> None:
+    """Install the resolved whole-turn deadline without replacing an explicit one."""
+
+    if context is None or context.deadline is not None or context.closed:
+        return
+    if isinstance(timeout_seconds, bool):
+        return
+    try:
+        duration = float(timeout_seconds) if timeout_seconds is not None else 0.0
+    except (TypeError, ValueError):
+        return
+    if duration <= 0:
+        return
+    context.set_deadline_if_missing(time.monotonic() + duration)
+
+
+def control_terminal_event_for_context(
+    context: TurnExecutionContext | None,
+    reason: ControlTerminalReason | str,
+) -> ControlTerminalEvent | None:
+    """Create one control terminal event and close the context boundary.
+
+    The additive event type already lives in ``engine.types`` while the
+    immutable contract is intentionally frozen for this lane.  The small
+    bridge updates the context's private terminal markers in the same owner
+    task, making ``accept_event`` reject every late provider event without
+    introducing a second terminal reset.
+    """
+
+    if context is None:
+        return None
+    if context.closed or context.terminal:
+        return None
+
+    normalized_reason = ControlTerminalReason(reason)
+    sequence = context.begin_control_terminal(normalized_reason.value)
+    if sequence is None:
+        return None
+
+    return ControlTerminalEvent(
+        turn_id=context.identity.turn_id,
+        assistant_message_id=context.identity.assistant_message_id,
+        sequence=sequence,
+        reason=normalized_reason,
+    )
+
 @dataclass
 class TurnContext:
     """Cross-cutting state accumulated across stage classes."""
+
+    # Created by the TurnRunner owner and explicitly threaded through stages.
+    # ``None`` keeps older embedding/test callers source-compatible while the
+    # identity-aware path is migrated one boundary at a time.
+    execution_context: TurnExecutionContext | None = None
+    assistant_message_id: str | None = None
+    publication_ledger: TurnPublicationLedger | None = None
 
     # Populated by InputStage
     runtime_message: str = ""

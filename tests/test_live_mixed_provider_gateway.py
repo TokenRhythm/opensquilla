@@ -200,8 +200,8 @@ def test_payloads_preserve_full_provider_model_identity_and_force_one_tier() -> 
 
     ensemble = live.ensemble_payload(group)
     assert [(row["provider"], row["model"], row["role"]) for row in ensemble["candidates"]] == [
-        ("deepseek", "deepseek-chat", "primary"),
-        ("openai", "gpt-4.1-mini", "contrast"),
+        ("deepseek", "deepseek-chat", "proposer"),
+        ("openai", "gpt-4.1-mini", "proposer"),
         ("gemini", "gemini-2.5-flash-lite", "aggregator"),
     ]
     negative = live.ensemble_payload(group, bad_proposer=True, bad_aggregator=True)
@@ -245,7 +245,7 @@ def test_turn_call_observation_extracts_request_response_and_member_evidence() -
                     "model_usage_breakdown": [
                         {
                             **target.public(),
-                            "role": "primary",
+                            "role": "proposer",
                             "input_tokens": 8,
                             "output_tokens": 2,
                             "elapsed_ms": 17,

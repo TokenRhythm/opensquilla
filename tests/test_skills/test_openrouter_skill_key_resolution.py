@@ -16,7 +16,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE_SCRIPT = (
@@ -1183,6 +1183,23 @@ def test_image_decode_rejects_corrupt_truncated_or_mime_mismatched_bytes(
         match="invalid image data|MIME does not match",
     ):
         image_script.decode_data_url(f"data:{mime};base64,{encoded}")
+
+
+def test_image_decode_maps_pillow_index_error_to_invalid_image_data(
+    image_script: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_verify(_image: object) -> None:
+        raise IndexError("synthetic truncated PNG chunk")
+
+    monkeypatch.setattr(PngImagePlugin.PngImageFile, "verify", fail_verify)
+    encoded = image_script.base64.b64encode(_valid_image_bytes()).decode("ascii")
+
+    with pytest.raises(
+        image_script._ImageRequestError,
+        match="invalid image data",
+    ):
+        image_script.decode_data_url(f"data:image/png;base64,{encoded}")
 
 
 def test_image_decode_rejects_unsupported_declared_mime(

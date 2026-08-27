@@ -235,7 +235,8 @@ def test_tokenrhythm_original_583_envelope_yields_typed_limit_proof(
     ]
     error_row = next(row for row in trace_rows if row["event"] == "llm.error")
     assert error_row["code"] == "400"
-    assert error_row["message"] == "Provider request message limit detected"
+    assert error_row["message"] == "Provider request failed"
+    assert error_row["message_chars"] == len("Provider request message limit detected")
     assert error_row["response_body"] is None
     assert error_row["metadata"]["message_limit_proof"]["limit"] == 100
     assert "DO_NOT_RECORD_RESPONSE_VALUE" not in json.dumps(trace_rows)

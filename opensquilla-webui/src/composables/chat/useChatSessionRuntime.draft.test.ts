@@ -2,12 +2,18 @@ import { describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
 
 import { useChatSessionRuntime } from './useChatSessionRuntime'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import type { ChatMessage } from '@/types/chat'
 
 describe('useChatSessionRuntime project drafts', () => {
   it('clears composer state when an explicit new task replaces an empty draft', () => {
     const sessionKey = ref('agent:main:webchat:project-a-draft')
     const resetDraftComposer = vi.fn()
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-project-a')
+    const activeStreamTaskId = ref('task-project-a')
+    const activeStreamSessionKey = ref(sessionKey.value)
+    const acceptanceStopPending = ref(true)
     const runtime = useChatSessionRuntime({
       sessionKey,
       messages: ref<ChatMessage[]>([]),
@@ -16,6 +22,10 @@ describe('useChatSessionRuntime project drafts', () => {
       currentEpoch: ref(0),
       lastStreamSeq: ref(0),
       activeTaskGroups: ref(new Set<string>()),
+      taskOwnership,
+      activeStreamTaskId,
+      activeStreamSessionKey,
+      acceptanceStopPending,
       aborted: ref(false),
       lastHeaderRole: ref(''),
       lastHeaderDay: ref(''),
@@ -59,6 +69,12 @@ describe('useChatSessionRuntime project drafts', () => {
 
     expect(sessionKey.value).toBe('agent:main:webchat:project-b-draft')
     expect(resetDraftComposer).toHaveBeenCalledOnce()
+    expect(taskOwnership.runningTaskId.value).toBe('')
+    expect(taskOwnership.queuedTaskIds.value.size).toBe(0)
+    expect(taskOwnership.hydrationResolved.value).toBe(true)
+    expect(activeStreamTaskId.value).toBe('')
+    expect(activeStreamSessionKey.value).toBe('')
+    expect(acceptanceStopPending.value).toBe(false)
   })
 
   it('loads optional usage once critical requests are queued without waiting for history', async () => {

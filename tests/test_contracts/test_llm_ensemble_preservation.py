@@ -236,6 +236,7 @@ def test_selection_mode_only_upsert_keeps_all_other_keys() -> None:
     assert ensemble.target_successful_proposers == 3
     assert ensemble.proposer_max_retries == 2
     assert ensemble.all_failed_policy == "error"
+    assert res.warnings == []
     assert res.restart_required is False
 
 

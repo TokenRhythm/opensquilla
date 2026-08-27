@@ -73,6 +73,11 @@ def build_router_decision_event(turn: TurnContext) -> RouterDecisionEvent | None
         thinking_mode = plan.thinking
         prompt_policy = plan.prompt_policy
         context_window = plan.capabilities.context_window or None
+        router_tier_snapshot = (
+            plan.router_tier_snapshot.as_dict()
+            if plan.router_tier_snapshot is not None
+            else None
+        )
     else:
         source = str(turn.metadata.get("routing_source") or "none")
         raw_routing_applied = turn.metadata.get("routing_applied")
@@ -83,6 +88,7 @@ def build_router_decision_event(turn: TurnContext) -> RouterDecisionEvent | None
         thinking_mode = str(turn.metadata.get("thinking_mode") or "")
         prompt_policy = str(turn.metadata.get("prompt_policy") or "")
         context_window = _resolve_context_window(model)
+        router_tier_snapshot = None
 
     return RouterDecisionEvent(
         tier=str(routed_tier),
@@ -99,4 +105,5 @@ def build_router_decision_event(turn: TurnContext) -> RouterDecisionEvent | None
         routing_applied=bool(routing_applied),
         rollout_phase=str(turn.metadata.get("rollout_phase") or "full"),
         context_window=context_window,
+        router_tier_snapshot=router_tier_snapshot,
     )

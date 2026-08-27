@@ -36,6 +36,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
+import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
 
 const props = defineProps<{
   message: ChatRenderedMessage
@@ -46,9 +47,16 @@ const maintenance = computed(() => props.message.maintenance)
 const labelCode = computed(() => {
   if (maintenance.value?.state === 'running') return 'chat.compact.compacting'
   if (maintenance.value?.state === 'failed') return 'chat.compact.failed'
-  if (maintenance.value?.state === 'skipped') return 'chat.compact.withinBudget'
+  if (maintenance.value?.state === 'skipped') {
+    return compactionSkippedLabelCode(maintenance.value.reason)
+  }
   if (maintenance.value?.state === 'stale' || maintenance.value?.state === 'cancelled') {
     return 'chat.compact.cancelled'
+  }
+  if (maintenance.value?.historyArchived) {
+    if (maintenance.value.canonicalComplete === true) return 'chat.compact.historyPreserved'
+    if (maintenance.value.canonicalComplete === false) return 'chat.compact.historyIncomplete'
+    return 'chat.compact.historySummarized'
   }
   return 'chat.compact.compacted'
 })

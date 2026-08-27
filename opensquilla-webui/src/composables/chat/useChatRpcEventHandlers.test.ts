@@ -27,8 +27,11 @@ function createHarness(options: {
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
   pendingQueue?: ChatPendingItem[]
+  stream?: ChatRpcStreamApi
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
+  observeStreamGeneration?: (payload: unknown) => boolean
+  supportsTurnCommitted?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -37,23 +40,30 @@ function createHarness(options: {
   const activeStreamTaskId = ref('')
   const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
   const applySessionRunState = vi.fn()
-  const stream: ChatRpcStreamApi = {
+  const stream: ChatRpcStreamApi = options.stream || {
     isStreaming: ref(true),
     streamBubble: ref(true),
     streamHasVisibleOutput: ref(false),
     startStreaming: vi.fn(),
     endStreaming: vi.fn(() => options.endStreaming?.(messages.value)),
+    checkpointForUserMessage: vi.fn(),
+    acknowledgeSteerBoundary: vi.fn(),
     appendDelta: vi.fn(),
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
     appendToolDelta: vi.fn(),
+    appendToolEnd: vi.fn(),
     appendToolResult: vi.fn(),
     appendArtifact: vi.fn(),
     reconcileFinalText: vi.fn(),
     resetLiveTurnState: vi.fn(),
+    resetAnswerGeneration: vi.fn(),
+    setAssistantMessageId: vi.fn(),
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
+    setAcceptedActivityOrder: vi.fn(),
+    setAcceptedActivityStartedAt: vi.fn(),
     recordCompactionActivity: vi.fn(),
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
@@ -61,6 +71,8 @@ function createHarness(options: {
     useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
+  const bindRouterDecisionToModelCall = vi.fn()
+  const queueRouterDecision = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -78,6 +90,7 @@ function createHarness(options: {
     sessionKey,
     currentEpoch: ref(0),
     lastStreamSeq,
+    observeStreamGeneration: options.observeStreamGeneration,
     activeTaskGroups,
     activeStreamTaskId,
     aborted: ref(false),
@@ -97,7 +110,8 @@ function createHarness(options: {
     normalizeRunStatus: (status: string) => status,
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
-    queueRouterDecision: vi.fn(),
+    queueRouterDecision,
+    bindRouterDecisionToModelCall,
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
     flushPendingRouterDecision: vi.fn(),
@@ -106,6 +120,7 @@ function createHarness(options: {
     showCompactionToast,
     getCompactionPlacement: options.getCompactionPlacement,
     showWarningToast,
+    supportsTurnCommitted: () => options.supportsTurnCommitted === true,
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
@@ -129,6 +144,8 @@ function createHarness(options: {
     pendingQueue,
     applySessionRunState,
     markEnsembleHandoff,
+    bindRouterDecisionToModelCall,
+    queueRouterDecision,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showCompactionToast,
@@ -143,7 +160,335 @@ function createHarness(options: {
   }
 }
 
+describe('useChatRpcEventHandlers route-card ownership', () => {
+  it('binds text and thinking events to their physical provider calls', () => {
+    const { api, stream, bindRouterDecisionToModelCall, stop } = createHarness()
+    try {
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 1,
+        generation_epoch: 0,
+        text: 'answer',
+        model_call_id: '1.0',
+        iteration: 1,
+      })
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 2,
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+      })
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 3,
+        generation_epoch: 0,
+        text: 'stale answer',
+        model_call_id: 'stale-call',
+        iteration: 99,
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        turn_id: 'turn-1',
+        stream_seq: 4,
+        generation_epoch: 1,
+        text: 'reasoning',
+        model_call_id: '2.0',
+        iteration: 2,
+      })
+
+      expect(bindRouterDecisionToModelCall.mock.calls).toEqual([
+        ['1.0', 1, 'turn-1'],
+        ['2.0', 2, 'turn-1'],
+      ])
+      expect(stream.appendDelta).toHaveBeenCalledWith('answer', undefined, {
+        modelCallId: '1.0',
+        iteration: 1,
+      })
+    } finally {
+      stop()
+    }
+  })
+})
+
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('starts restored activity at the earliest server event timestamp', () => {
+    const harness = createHarness()
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-clock',
+        current_stream_seq: 2,
+        events: [
+          {
+            event: 'session.event.provider_activity',
+            payload: {
+              session_key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 1, emitted_at: 2_000, phase: 'requesting',
+            },
+          },
+          {
+            event: 'session.event.thinking',
+            payload: {
+              session_key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 2, emitted_at: 3_000, text: 'reasoning',
+            },
+          },
+        ],
+      })
+
+      expect(harness.stream.startStreaming).toHaveBeenCalledWith(2_000, false)
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('replays a committed tool timeline including its authoritative end', () => {
+    const { api, stream, stop } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-tool-timeline',
+        current_stream_seq: 3,
+        events: [
+          {
+            event: 'session.event.tool_use_start',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              tool_name: 'lookup',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.tool_use_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              json_fragment: '{"query":"answer"}',
+              stream_seq: 2,
+            },
+          },
+          {
+            event: 'session.event.tool_use_end',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              tool_name: 'lookup',
+              arguments: { query: 'answer' },
+              stream_seq: 3,
+            },
+          },
+        ],
+      })
+
+      expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
+      expect(stream.appendToolDelta).toHaveBeenCalledTimes(1)
+      expect(stream.appendToolEnd).toHaveBeenCalledWith(expect.objectContaining({
+        tool_use_id: 'tool-1',
+        arguments: { query: 'answer' },
+      }))
+    } finally {
+      stop()
+    }
+  })
+
+  it('replays a generation reset and drops late old-generation text', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      stop,
+    } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 5,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 0,
+              text: 'partial old',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.answer_generation_reset',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              assistant_message_id: 'assistant-1',
+              old_generation_epoch: 0,
+              new_generation_epoch: 1,
+              authoritative_text_snapshot: '',
+              authoritative_reasoning_snapshot: '',
+              preserve_completed_tools: true,
+              stream_seq: 2,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 0,
+              text: 'late old',
+              stream_seq: 3,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 1,
+              text: 'fixed',
+              stream_seq: 4,
+            },
+          },
+        ],
+      })
+
+      expect(activeStreamTaskId.value).toBe('task-live')
+      expect(stream.resetAnswerGeneration).toHaveBeenCalledWith({
+        textSnapshot: '',
+        preserveCompletedTools: true,
+      })
+      expect(stream.appendDelta).toHaveBeenCalledTimes(2)
+      expect(stream.appendDelta).toHaveBeenNthCalledWith(1, 'partial old')
+      expect(stream.appendDelta).toHaveBeenNthCalledWith(2, 'fixed')
+      expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects old-generation delta and done after an in-flight reset', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        text: 'partial old',
+        stream_seq: 1,
+      })
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        assistant_message_id: 'assistant-1',
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+        authoritative_text_snapshot: '',
+        authoritative_reasoning_snapshot: '',
+        preserve_completed_tools: true,
+        stream_seq: 2,
+      })
+
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        text: 'late old',
+        stream_seq: 3,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        stream_seq: 4,
+        text_snapshot: 'old final',
+      })
+
+      expect(stream.appendDelta).toHaveBeenCalledTimes(1)
+      expect(stream.reconcileFinalText).not.toHaveBeenCalled()
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 1,
+        text: 'fixed',
+        stream_seq: 5,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 1,
+        stream_seq: 6,
+        text_snapshot: 'fixed',
+      })
+
+      expect(stream.appendDelta).toHaveBeenCalledTimes(2)
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it('finishes a terminal reset in the same assistant message and suppresses a late error', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      messages,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        assistant_message_id: 'assistant-1',
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+        authoritative_text_snapshot: '',
+        authoritative_reasoning_snapshot: '',
+        terminal: true,
+        terminal_text_snapshot: 'The fixed model could not complete this answer.',
+        stream_seq: 1,
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenCalledWith(
+        'The fixed model could not complete this answer.',
+      )
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+
+      api.handlers.onAny('session.event.error', {
+        session_key: 'agent:main:test',
+        generation_epoch: 1,
+        stream_seq: 2,
+        code: 'fixed_model_failed',
+        message: 'late duplicate error',
+      })
+
+      expect(messages.value.some(message => message.role === 'error')).toBe(false)
+    } finally {
+      stop()
+    }
+  })
+
   it('does not replace live task state for a recents-only session change', () => {
     const {
       api,
@@ -218,8 +563,295 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
         id: 'tool-1',
       }))
       expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
+      expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(1, 10)
+      expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(2, 11)
+      expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(3, 12)
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('keeps a snapshot router sequence as identity without replaying it through the cursor', () => {
+    const {
+      api,
+      lastStreamSeq,
+      queueRouterDecision,
+      stop,
+    } = createHarness()
+    try {
+      lastStreamSeq.value = 900
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2_400,
+        events: [{
+          event: 'session.event.router_decision',
+          payload: {
+            session_key: 'agent:main:test',
+            task_id: 'task-live',
+            turn_id: 'turn-live',
+            stream_seq: 17,
+            tier: 'c1',
+            model: 'provider/first',
+            source: 'squilla_router',
+          },
+        }],
+      })
+
+      expect(queueRouterDecision).toHaveBeenCalledOnce()
+      const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
+      expect(payload).not.toHaveProperty('stream_seq')
+      expect(identityStreamSeq).toBe(17)
+      expect(lastStreamSeq.value).toBe(2_400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('opens the reducer before accepting the first snapshot activity order', () => {
+    const { api, stream, stop } = createHarness()
+    let acceptedOrder: number | undefined
+    try {
+      stream.isStreaming.value = false
+      vi.mocked(stream.setAcceptedActivityOrder!).mockImplementation((order) => {
+        acceptedOrder = order
+      })
+      vi.mocked(stream.startStreaming).mockImplementation(() => {
+        // Mirror the real startStreaming reset: an order accepted before this
+        // point would be cleared with the previous turn log.
+        acceptedOrder = undefined
+        stream.isStreaming.value = true
+      })
+
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 4,
+        events: [{
+          event: 'session.event.provider_activity',
+          payload: {
+            session_key: 'agent:main:test',
+            task_id: 'task-live',
+            phase: 'requesting',
+            reason: 'initial',
+            stream_seq: 4,
+          },
+        }],
+      })
+
+      expect(stream.startStreaming).toHaveBeenCalledOnce()
+      expect(stream.setAcceptedActivityOrder).toHaveBeenCalledWith(4)
+      expect(acceptedOrder).toBe(4)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds an applied steer boundary in snapshot stream order', () => {
+    const { api, stream, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-1',
+        turnId: 'turn-live',
+        inputDisposition: 'steering',
+      }],
+    })
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 12,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Second answer',
+              model_call_id: '2.0',
+              iteration: 2,
+              stream_seq: 12,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'task-live',
+              user_message_id: 'steer-message-1',
+              intent: 'steer',
+              disposition: 'applied',
+              applied_iteration: 2,
+              model_call_id: '2.0',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              model_call_id: '1.0',
+              iteration: 1,
+              stream_seq: 10,
+            },
+          },
+        ],
+      })
+
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'task-live',
+        'steer-message-1',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-1',
+        '2.0',
+        2,
+      )
+      expect(vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder[0])
+        .toBeLessThan(
+          vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder[0]!,
+        )
+      expect(vi.mocked(stream.appendDelta).mock.calls).toEqual([
+        ['First answer', undefined, { modelCallId: '1.0', iteration: 1 }],
+        ['Second answer', undefined, { modelCallId: '2.0', iteration: 2 }],
+      ])
+    } finally {
+      stop()
+    }
+  })
+
+  it('checkpoints an applied snapshot boundary before its history row exists', () => {
+    const { api, messages, stream, stop } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 12,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 10,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'task-live',
+              user_message_id: 'steer-message-orphan',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Second answer',
+              stream_seq: 12,
+            },
+          },
+        ],
+      })
+
+      expect(messages.value).toEqual([])
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'task-live',
+        'steer-message-orphan',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-orphan',
+        '',
+        0,
+      )
+      const textOrders = vi.mocked(stream.appendDelta).mock.invocationCallOrder
+      const checkpointOrders = vi.mocked(stream.checkpointForUserMessage!).mock.invocationCallOrder
+      const acknowledgeOrders = vi.mocked(stream.acknowledgeSteerBoundary!).mock.invocationCallOrder
+      expect(textOrders[0]).toBeLessThan(checkpointOrders[0]!)
+      expect(checkpointOrders[0]).toBeLessThan(acknowledgeOrders[0]!)
+      expect(acknowledgeOrders[0]).toBeLessThan(textOrders[1]!)
+
+      messages.value = [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-orphan',
+        turnId: 'task-live',
+        inputDisposition: 'applied',
+      }]
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledTimes(2)
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledTimes(2)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds the boundary when a legacy applied snapshot omits revision and call id', () => {
+    const { api, messages, stream, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'Use English',
+        ts: 2,
+        messageId: 'steer-message-1',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+        inputDispositionRevision: 3,
+      }],
+    })
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'First answer',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.input_disposition',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              turn_id: 'turn-live',
+              user_message_id: 'steer-message-1',
+              intent: 'steer',
+              disposition: 'applied',
+              stream_seq: 2,
+            },
+          },
+        ],
+      })
+
+      expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+        'turn-live',
+        'steer-message-1',
+      )
+      expect(stream.acknowledgeSteerBoundary).toHaveBeenCalledWith(
+        'steer-message-1',
+        '',
+        0,
+      )
+      expect(messages.value[0]?.inputDispositionRevision).toBe(3)
     } finally {
       stop()
     }
@@ -279,6 +911,37 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(lastStreamSeq.value).toBe(2400)
     } finally {
       stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers stream generation', () => {
+  it('observes a restarted generation before rejecting its lower sequence', () => {
+    let lastStreamSeqRef = ref(500)
+    const observeStreamGeneration = vi.fn((payload: unknown) => {
+      if ((payload as { stream_generation?: string }).stream_generation === 'new-generation') {
+        lastStreamSeqRef.value = 0
+        return true
+      }
+      return false
+    })
+    const harness = createHarness({ observeStreamGeneration })
+    lastStreamSeqRef = harness.lastStreamSeq
+    harness.lastStreamSeq.value = 500
+    try {
+      harness.api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-new',
+        stream_generation: 'new-generation',
+        stream_seq: 1,
+        text: 'first token after restart',
+      })
+
+      expect(observeStreamGeneration).toHaveBeenCalledOnce()
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith('first token after restart')
+      expect(harness.lastStreamSeq.value).toBe(1)
+    } finally {
+      harness.stop()
     }
   })
 })
@@ -394,6 +1057,37 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
       stop()
     }
   })
+
+  it.each(['task.failed', 'task.timeout'])(
+    'schedules queued follow-up delivery after %s settles the active task',
+    (event) => {
+      const {
+        api,
+        activeStreamTaskId,
+        schedulePendingDrainAfterTerminal,
+        stop,
+      } = createHarness({
+        pendingQueue: [{
+          pendingUiId: 'pending-terminal-follow-up',
+          text: 'Follow up',
+          attachments: [],
+          intent: null,
+        }],
+      })
+      try {
+        activeStreamTaskId.value = 'task-failed'
+        api.handlers.onAny(event, {
+          session_key: 'agent:main:test',
+          task_id: 'task-failed',
+          message: 'Provider failed',
+        })
+
+        expect(schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      } finally {
+        stop()
+      }
+    },
+  )
 
   it('lets a terminal own a stream sequence shared with an earlier visible frame', () => {
     const {
@@ -798,13 +1492,21 @@ describe('useChatRpcEventHandlers steer disposition', () => {
       steerClientMessageId: 'client-1',
     }
     const pending: ChatPendingItem = {
+      pendingUiId: 'pending-ui-promoted-adjustment',
       text: steer.text,
       attachments: [],
       intent: null,
-      deliveryState: 'retryable',
-      steerClientRequestId: 'request-1',
-      steerClientMessageId: 'client-1',
-      steerExpectedTurnId: 'turn-old',
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:test',
+          message: steer.text,
+          expected_turn_id: 'turn-old',
+          client_request_id: 'request-1',
+          client_message_id: 'client-1',
+          surface_id: 'webui',
+        },
+      },
     }
     const { api, messages, pendingQueue, scheduleHistorySync, stop } = createHarness({
       messages: [
@@ -1153,6 +1855,20 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         usage: { text: '' },
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('outer legacy canonical')
+
+      const segments = [{
+        model_call_id: '2.0',
+        iteration: 2,
+        start_codepoint: 3,
+        end_codepoint: 6,
+      }]
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 7,
+        text_snapshot: '前半段后半段',
+        model_call_segments: segments,
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('前半段后半段', segments)
     } finally {
       stop()
     }
@@ -1182,6 +1898,86 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     }
   })
 
+  it('honors only the outer suppressed delivery contract and clears stale text', () => {
+    const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
+    const { api, messages, stream, stop } = createHarness({ messages: [previous] })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text_snapshot: 'stale streamed answer',
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+        input_tokens: 10,
+        output_tokens: 1,
+        model: 'z-ai/glm-5.2',
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('')
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ suppressed: true })
+      expect(messages.value).toEqual([previous])
+      expect(previous.usage).toBeUndefined()
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text_snapshot: 'visible despite diagnostic reason',
+        suppression_reason: 'heartbeat_ack',
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith(
+        'visible despite diagnostic reason',
+      )
+      expect(stream.endStreaming).toHaveBeenLastCalledWith(undefined)
+    } finally {
+      stop()
+    }
+  })
+
+  it('attaches suppressed-turn usage only to the preserved tool and artifact row', () => {
+    const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
+    const { api, messages, stream, stop } = createHarness({
+      messages: [previous],
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: '',
+          ts: 'now',
+          tool_calls: [{ type: 'tool_use', name: 'web_search', tool_use_id: 'tool-1' }],
+          artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'heartbeat_ack',
+        input_tokens: 10,
+        output_tokens: 1,
+        model: 'z-ai/glm-5.2',
+      })
+
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ suppressed: true })
+      expect(messages.value).toHaveLength(2)
+      expect(messages.value[0]?.usage).toBeUndefined()
+      expect(messages.value[1]).toMatchObject({
+        text: '',
+        model: 'z-ai/glm-5.2',
+        input_tokens: 10,
+        output_tokens: 1,
+        artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+      })
+      expect(messages.value[1]?.usage).toBeDefined()
+    } finally {
+      stop()
+    }
+  })
+
   it('attaches done usage to the assistant message pushed by endStreaming', () => {
     const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
     const { api, messages, stop } = createHarness({
@@ -1195,12 +1991,42 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
       api.handlers.onAny('session.event.done', {
         session_key: 'agent:main:test',
         stream_seq: 1,
+        turn_id: 'goal-turn-1',
         text: 'current',
         input_tokens: 10,
         output_tokens: 1,
         model: 'z-ai/glm-5.2',
+        input_mode: 'system_event',
+        run_kind: 'goal',
         model_usage_breakdown: [{ model: 'z-ai/glm-5.2', role: 'aggregator' }],
         ensemble_trace: { profile: 'default', llm_request_count: 5 },
+        route_plan: {
+          version: 2,
+          tier: 'c1',
+          model: 'z-ai/glm-5.2',
+          router_tier_snapshot: {
+            version: 1,
+            request_kind: 'text',
+            tiers: [{
+              tier: 'c1',
+              model: 'z-ai/glm-5.2',
+              execution_kind: 'single_model',
+            }],
+          },
+        },
+        usage: {
+          model: 'z-ai/glm-5.2',
+          input_tokens: 10,
+          output_tokens: 1,
+          route_plan: {
+            version: 1,
+            tier: 'c1',
+            model: 'stale/nested-model',
+          },
+        },
+        coverage_status: 'usage_unknown',
+        usage_unknown: true,
+        unknown_usage_events: 1,
       })
 
       expect(messages.value[0].usage).toBeUndefined()
@@ -1208,9 +2034,51 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         profile: 'default',
         llm_request_count: 5,
       })
+      expect(messages.value[1].usage).toMatchObject({
+        coverage_status: 'usage_unknown',
+        usage_unknown: true,
+        unknown_usage_events: 1,
+        route_plan: {
+          version: 2,
+          router_tier_snapshot: {
+            version: 1,
+            request_kind: 'text',
+          },
+        },
+      })
       expect(messages.value[1].model).toBe('z-ai/glm-5.2')
       expect(messages.value[1].input_tokens).toBe(10)
       expect(messages.value[1].output_tokens).toBe(1)
+      expect(messages.value[1].turnId).toBe('goal-turn-1')
+      expect(messages.value[1].turnInputMode).toBe('system_event')
+      expect(messages.value[1].turnRunKind).toBe('goal')
+    } finally {
+      stop()
+    }
+  })
+
+  it('binds an aborted partial assistant to the terminal task identity', () => {
+    const { api, messages, stream, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'partial answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        task_id: 'stopped-turn-1',
+        reason: 'aborted',
+        text_snapshot: 'partial answer',
+      })
+
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ reason: 'aborted' })
+      expect(messages.value[0]).toMatchObject({
+        role: 'assistant',
+        text: 'partial answer',
+        turnId: 'stopped-turn-1',
+      })
     } finally {
       stop()
     }
@@ -1218,6 +2086,89 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
 })
 
 describe('useChatRpcEventHandlers reasoning timer replay', () => {
+  it('keeps production reasoning text on the shared accumulator publish clock', () => {
+    const { api, stream, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+    stream.useReducer.value = true
+    stream.getThinkingText = vi.fn(() => 'folded reasoning')
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'folded ',
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'reasoning',
+      })
+
+      expect(api.streamThinkingText.value).toBe('')
+      expect(stream.appendFrame).toHaveBeenCalledTimes(2)
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        text: 'answer',
+      })
+      expect(messages.value[0]?.reasoning?.text).toBe('folded reasoning')
+    } finally {
+      stop()
+    }
+  })
+
+  it('records structured start, delta, and end frames without losing legacy text', () => {
+    const { api, stream, stop } = createHarness()
+    stream.useReducer.value = 'shadow'
+
+    try {
+      api.handlers.onAny('session.event.thinking_start', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        started_at: Date.now(),
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        text: 'inspect',
+        started_at: Date.now(),
+      })
+      api.handlers.onAny('session.event.thinking_end', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        status: 'completed',
+        ended_at: Date.now(),
+      })
+
+      expect(api.streamThinkingText.value).toBe('inspect')
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        kind: 'thinking-start',
+        blockId: 'reasoning-1',
+        blockIndex: 0,
+      }))
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        kind: 'thinking',
+        blockId: 'reasoning-1',
+        text: 'inspect',
+      }))
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(3, expect.objectContaining({
+        kind: 'thinking-end',
+        blockId: 'reasoning-1',
+        status: 'completed',
+      }))
+    } finally {
+      stop()
+    }
+  })
+
   it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(105_000)
@@ -1358,6 +2309,149 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
   })
 })
 
+describe('useChatRpcEventHandlers terminal activity retention', () => {
+  it('reattaches structured reasoning blocks after canonical history replacement', () => {
+    const reasoningBlocks = [{
+      id: 'reasoning-1',
+      index: 0,
+      text: 'inspect',
+      status: 'completed' as const,
+      startedAt: 1_000,
+      endedAt: 3_000,
+      contentKind: 'reasoning' as const,
+    }]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: 'now',
+          reasoningBlocks,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-reasoning-record',
+        text: 'answer',
+        reasoning_content: 'inspect',
+      })
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: 'now',
+        turnId: 'turn-reasoning-record',
+        reasoning: { text: 'inspect', seconds: 0 },
+        restoredFromHistory: true,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.reasoningBlocks).toEqual(reasoningBlocks)
+    } finally {
+      stop()
+    }
+  })
+
+  it('reattaches safe phase history after canonical history replaces the local row', () => {
+    const phaseHistory = [
+      { action: 'Sending', label: 'Sending', at: 1_000 },
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000 },
+      { action: 'provider:reasoning', label: 'Reasoning', at: 3_000 },
+      { action: 'write:1', label: 'Writing', at: 4_000 },
+    ]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: '2026-01-01T00:00:07.000Z',
+          statusHistory: phaseHistory,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-phase-record',
+        text: 'answer',
+      })
+      expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: '2026-01-01T00:00:07.000Z',
+        turnId: 'turn-phase-record',
+        restoredFromHistory: true,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not reattach local phases over a complete terminal v2 snapshot', () => {
+    const liveHistory = [
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000, activityOrder: 2 },
+      { action: 'write:1', label: 'Writing', at: 4_000, activityOrder: 4 },
+      { action: 'write:2', label: 'Writing', at: 4_001, activityOrder: 4 },
+    ]
+    const durableHistory = [
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000, activityOrder: 2 },
+      { action: 'write:1', label: 'Writing', at: 4_000, activityOrder: 4 },
+    ]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: '2026-01-01T00:00:07.000Z',
+          statusHistory: liveHistory,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-terminal-v2',
+        text: 'answer',
+      })
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: '2026-01-01T00:00:07.000Z',
+        turnId: 'turn-terminal-v2',
+        restoredFromHistory: true,
+        statusHistory: durableHistory,
+        activitySnapshot: {
+          version: 2,
+          taskId: 'task-terminal-v2',
+          turnId: 'turn-terminal-v2',
+          complete: true,
+          entries: [],
+        },
+        activitySnapshotIncomplete: false,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.statusHistory).toEqual(durableHistory)
+    } finally {
+      stop()
+    }
+  })
+})
+
 describe('useChatRpcEventHandlers ensemble handoff', () => {
   it('marks ensemble handoff when a current tool call starts', () => {
     const { api, stream, markEnsembleHandoff, stop } = createHarness()
@@ -1446,21 +2540,94 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('maps ensemble heartbeats without letting channel keepalives replace the phase', () => {
+  it('treats every run heartbeat as transport liveness without replacing the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
       api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'ensemble_proposers_wait' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Generating candidates')
-
       api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
-      expect(stream.setStreamActivity).toHaveBeenCalledTimes(1)
-
       api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Synthesizing candidates')
-
       api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Planning next step')
+
+      expect(stream.setStreamActivity).not.toHaveBeenCalled()
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(4)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
+    } finally {
+      stop()
+    }
+  })
+
+  it('maps structured provider activity without rendering provider error text', () => {
+    const { api, stream, stop } = createHarness()
+
+    try {
+      api.handlers.onProviderActivity({
+        stream_seq: 1,
+        schema_version: 1,
+        phase: 'requesting',
+        reason: 'initial',
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 2,
+        schema_version: 1,
+        phase: 'reasoning',
+        reason: 'reasoning_only',
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 3,
+        schema_version: 1,
+        phase: 'retry_wait',
+        reason: 'rate_limited',
+        retry_after_ms: 8_000,
+        activity_id: 'activity-safe',
+        message: 'secret provider body',
+      } as never)
+      api.handlers.onProviderActivity({
+        stream_seq: 4,
+        schema_version: 1,
+        phase: 'retrying',
+        reason: 'rate_limited',
+        retry_attempt: 2,
+        retry_limit: 3,
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 5,
+        schema_version: 1,
+        phase: 'fallback',
+        reason: 'provider_overloaded',
+        activity_id: 'activity-safe',
+      })
+
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        1,
+        'Waiting for model',
+        'provider:requesting',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        2,
+        'Thinking deeply',
+        'provider:reasoning',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        3,
+        'Rate limited · 8s',
+        'provider:rate_limited:8',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        4,
+        'Retrying 2/3',
+        'provider:retrying:2:3',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        5,
+        'Switching to backup model',
+        'provider:fallback',
+      )
+      expect(JSON.stringify(vi.mocked(stream.setStreamActivity).mock.calls))
+        .not.toContain('secret provider body')
     } finally {
       stop()
     }
@@ -1473,6 +2640,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       vi.mocked(stream.resetStreamIdleTimer).mockClear()
       api.handlers.onConnectionState('connected')
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(1)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
     } finally {
       stop()
     }
@@ -1584,6 +2752,180 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       await Promise.all([live, history])
     } finally {
       harness.stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers durable turn receipts', () => {
+  it('keeps legacy done behavior when the Gateway does not advertise receipts', () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-legacy',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'legacy answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledWith()
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-legacy',
+        turn_id: 'turn-legacy',
+        stream_seq: 2,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('validates a receipt before sequence consumption and handles replay idempotently', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'durable answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set(['task-durable']))
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        stream_seq: 99,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.api.handlers.onAny('task.succeeded', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        stream_seq: 2,
+        status: 'succeeded',
+      })
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 3,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+
+      harness.api.handlers.onAny('session.event.turn_committed', {
+        schema_version: 1,
+        session_key: harness.sessionKey.value,
+        task_id: 'task-durable',
+        turn_id: 'turn-durable',
+        stream_seq: 4,
+        status: 'succeeded',
+        terminal_reason: 'completed',
+        finished_at: 123,
+      })
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
+      expect(harness.showWarningToast).not.toHaveBeenCalled()
+      expect(harness.handleSessionConnectionState).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('performs one silent safe sync after five seconds without blocking done', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-delayed',
+        turn_id: 'turn-delayed',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'visible answer',
+      })
+
+      expect(harness.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(4_999)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(1)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
+      vi.advanceTimersByTime(30_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.showWarningToast).not.toHaveBeenCalled()
+      expect(harness.handleSessionConnectionState).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels commit waiting when finalization transitions the task to failed', () => {
+    vi.useFakeTimers()
+    const harness = createHarness({ supportsTurnCommitted: true })
+    try {
+      harness.api.handlers.onAny('session.event.done', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-finalizer-failed',
+        turn_id: 'turn-finalizer-failed',
+        stream_seq: 1,
+        reason: 'completed',
+        text: 'answer before finalizer failure',
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(
+        new Set(['task-finalizer-failed']),
+      )
+
+      harness.api.handlers.onAny('task.failed', {
+        session_key: harness.sessionKey.value,
+        task_id: 'task-finalizer-failed',
+        stream_seq: 2,
+        status: 'failed',
+        terminal_message: 'transcript finalizer failed',
+      })
+
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      const historyCallsAfterFailure = harness.scheduleHistorySync.mock.calls.length
+      vi.advanceTimersByTime(5_000)
+      expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(historyCallsAfterFailure)
+      expect(harness.scheduleHistorySync.mock.calls).not.toContainEqual([true])
+    } finally {
+      harness.stop()
+      vi.useRealTimers()
     }
   })
 })

@@ -189,6 +189,7 @@ def test_dsml_call_count_matches_native_256_call_limit() -> None:
             dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
             reason="dsml_oversized",
             call_count=257,
+            recognized_tool_names=("ping",) * 256,
         )
     ]
 
@@ -261,15 +262,14 @@ def test_malformed_or_incomplete_dsml_returns_metadata_only_rejection(
 
     assert segments[0] == LiteralTextSegment("Safe prefix.\n")
     assert _synthetic_calls(segments) == []
-    assert _rejections(segments) == [
-        RejectedTextToolSegment(
-            dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
-            reason=reason,
-            call_count=_rejections(segments)[0].call_count,
-        )
-    ]
-    assert not hasattr(_rejections(segments)[0], "source_text")
-    assert candidate not in repr(_rejections(segments)[0])
+    rejection = _rejections(segments)[0]
+    assert rejection.dialect == TEXT_TOOL_DIALECT_DEEPSEEK_DSML
+    assert rejection.reason == reason
+    assert rejection.recognized_tool_names == (
+        "search",
+    ) * candidate.count('<｜DSML｜invoke name="search">')
+    assert not hasattr(rejection, "source_text")
+    assert candidate not in repr(rejection)
 
 
 @pytest.mark.parametrize(
@@ -335,6 +335,9 @@ def test_allowlist_and_schema_rejections_never_replay_dsml(
             dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
             reason=reason,
             call_count=1,
+            recognized_tool_names=("search",)
+            if reason == "dsml_schema_invalid"
+            else (),
         )
     ]
 

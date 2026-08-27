@@ -1583,6 +1583,7 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
         session_key="agent:main:session-1",
         tool_result_store_dir=str(tmp_path / "tool-results"),
         tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=True,
         tool_result_budget_policy=ToolResultBudgetPolicy(
             max_single_execution_result_chars=10_000,
         ),
@@ -1617,6 +1618,52 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
     assert stored.storage_encoding == "gzip+utf-8"
     assert stored.stored_size_bytes is not None
     assert stored.stored_size_bytes < 8 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_emit_handle_when_retrieval_is_not_visible(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry()
+    raw_output = "HEAD\n" + ("x" * 2_000) + "\nTAIL"
+
+    async def exec_command(command: str) -> str:
+        assert command == "pytest -q"
+        return raw_output
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="exec",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
+    ctx = ToolContext(
+        session_key="agent:main:session-1",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+        tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=False,
+        tool_result_budget_policy=ToolResultBudgetPolicy(
+            max_single_execution_result_chars=200,
+        ),
+    )
+
+    result = await build_tool_handler(registry, ctx)(
+        ToolCall(
+            tool_use_id="tc-large-exec-no-retrieval",
+            tool_name="exec_command",
+            arguments={"command": "pytest -q"},
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert payload["result_truncated"] is True
+    assert payload["result_original_chars"] == len(raw_output)
+    assert "tool_result_handle" not in payload
+    assert "retrieve_hint" not in payload
+    assert not list((tmp_path / "tool-results").rglob("meta.json"))
 
 
 @pytest.mark.asyncio

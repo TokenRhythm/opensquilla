@@ -1,13 +1,16 @@
 [
   {
+    "generation_epoch": null,
     "text": "Reasoning about",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": " the reply.",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": "OK",
     "type": "TextDeltaEvent"
   },
@@ -25,6 +28,7 @@
     "cached_tokens": 4,
     "cost_source": "provider_billed",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 6,
     "model": "deepseek-v4-flash",
     "model_usage_breakdown": [],

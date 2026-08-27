@@ -25,6 +25,7 @@ from opensquilla.provider.types import ChatConfig, ErrorEvent, Message
 # credential; the prefix also exercises Google-style API key shapes.
 _API_KEY = "AIza"
 _SHORT_INSTALL_ID = "i7"
+_RAW_UPSTREAM_DETAIL = "opaque upstream diagnostic sentence 731"
 
 
 def test_tiny_synthetic_key_does_not_corrupt_unrelated_error_words() -> None:
@@ -238,7 +239,11 @@ async def test_http_error_echoed_key_is_redacted_from_event_trace_and_log(
         return httpx.Response(
             401,
             request=request,
-            json={"error": {"message": f"invalid api key {_API_KEY}"}},
+            json={
+                "error": {
+                    "message": f"invalid api key {_API_KEY}; {_RAW_UPSTREAM_DETAIL}"
+                }
+            },
         )
 
     _patch_transport(monkeypatch, handler)
@@ -249,6 +254,7 @@ async def test_http_error_echoed_key_is_redacted_from_event_trace_and_log(
     error = errors[0]
     assert error.code == "401"
     assert _API_KEY not in error.message
+    assert _RAW_UPSTREAM_DETAIL in error.message
     assert classify_provider_error(
         failure_provider,
         401,
@@ -263,7 +269,9 @@ async def test_http_error_echoed_key_is_redacted_from_event_trace_and_log(
     assert len(error_rows) == 1
     assert error_rows[0]["status_code"] == 401
     assert error_rows[0]["code"] == "401"
+    assert _RAW_UPSTREAM_DETAIL not in trace_text
     assert _API_KEY not in repr(captured_log.records)
+    assert _RAW_UPSTREAM_DETAIL not in repr(captured_log.records)
     if kind == "openai":
         assert any(event == "provider.chat_http_error" for _, event, _, _ in captured_log.records)
 
@@ -281,7 +289,7 @@ async def test_transport_error_echoed_key_is_redacted_from_event_and_trace(
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError(
-            f"synthetic transport echoed {_API_KEY}",
+            f"synthetic transport echoed {_API_KEY}; {_RAW_UPSTREAM_DETAIL}",
             request=request,
         )
 
@@ -293,13 +301,16 @@ async def test_transport_error_echoed_key_is_redacted_from_event_and_trace(
     error = errors[0]
     assert error.code == "request_error"
     assert _API_KEY not in error.message
+    assert _RAW_UPSTREAM_DETAIL in error.message
     assert classify_provider_error(
         failure_provider,
         None,
         error.code,
         error.message,
     ) is ProviderFailureKind.TRANSPORT_TRANSIENT
-    assert _API_KEY not in trace_path.read_text(encoding="utf-8")
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert _API_KEY not in trace_text
+    assert _RAW_UPSTREAM_DETAIL not in trace_text
 
 
 async def test_ollama_timeout_error_echoed_key_is_redacted_from_event_and_trace(
@@ -313,7 +324,7 @@ async def test_ollama_timeout_error_echoed_key_is_redacted_from_event_and_trace(
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout(
-            f"synthetic timeout echoed {_API_KEY}",
+            f"synthetic timeout echoed {_API_KEY}; {_RAW_UPSTREAM_DETAIL}",
             request=request,
         )
 
@@ -324,7 +335,10 @@ async def test_ollama_timeout_error_echoed_key_is_redacted_from_event_and_trace(
     assert len(errors) == 1
     assert errors[0].code == "timeout"
     assert _API_KEY not in errors[0].message
-    assert _API_KEY not in trace_path.read_text(encoding="utf-8")
+    assert _RAW_UPSTREAM_DETAIL in errors[0].message
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert _API_KEY not in trace_text
+    assert _RAW_UPSTREAM_DETAIL not in trace_text
 
 
 @pytest.mark.parametrize("kind", ["openai", "openai_responses", "anthropic", "ollama"])
@@ -344,9 +358,9 @@ async def test_success_status_error_frame_echoed_key_is_redacted_from_all_sinks(
         raw_code = f"{raw_code}-{_API_KEY}"
     expected_code = raw_code.replace(_API_KEY, "***")
     raw_message = (
-        f"unauthorized api key {_API_KEY}"
+        f"unauthorized api key {_API_KEY}; {_RAW_UPSTREAM_DETAIL}"
         if kind == "ollama"
-        else f"invalid api key {_API_KEY}"
+        else f"invalid api key {_API_KEY}; {_RAW_UPSTREAM_DETAIL}"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -404,19 +418,25 @@ async def test_success_status_error_frame_echoed_key_is_redacted_from_all_sinks(
     error = errors[0]
     assert error.code == expected_code
     assert _API_KEY not in error.message
+    assert _RAW_UPSTREAM_DETAIL in error.message
     assert classify_provider_error(
         failure_provider,
         None,
         error.code,
         error.message,
     ) is ProviderFailureKind.AUTH_INVALID
-    assert _API_KEY not in trace_path.read_text(encoding="utf-8")
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert _API_KEY not in trace_text
+    assert _RAW_UPSTREAM_DETAIL not in trace_text
     assert _API_KEY not in repr(captured_log.records)
+    assert _RAW_UPSTREAM_DETAIL not in repr(captured_log.records)
 
 
 class _ExplodingStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> Any:
-        raise ValueError(f"synthetic stream handler echoed {_API_KEY}")
+        raise ValueError(
+            f"synthetic stream handler echoed {_API_KEY}; {_RAW_UPSTREAM_DETAIL}"
+        )
         yield b""  # pragma: no cover - makes this an async generator
 
 
@@ -443,9 +463,13 @@ async def test_stream_internal_exception_is_redacted_before_trace_event_and_log(
     assert len(errors) == 1
     assert errors[0].code == "provider_internal"
     assert _API_KEY not in errors[0].message
-    assert _API_KEY not in trace_path.read_text(encoding="utf-8")
+    assert _RAW_UPSTREAM_DETAIL in errors[0].message
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert _API_KEY not in trace_text
+    assert _RAW_UPSTREAM_DETAIL not in trace_text
     assert captured_log.records
     assert _API_KEY not in repr(captured_log.records)
+    assert _RAW_UPSTREAM_DETAIL not in repr(captured_log.records)
     assert all(level != "exception" for level, _, _, _ in captured_log.records)
 
 

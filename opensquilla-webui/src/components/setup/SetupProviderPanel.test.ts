@@ -325,6 +325,37 @@ describe('SetupProviderPanel — configured provider management', () => {
     },
   ]
 
+  it('bounds a long configured-provider list and expands it inside a scroll region', async () => {
+    const manyProviders = Array.from({ length: 12 }, (_, index) => ({
+      ...configured[0],
+      providerId: `provider-${index + 1}`,
+      label: `Provider ${index + 1}`,
+      active: index === 0,
+    }))
+    const { app, el } = await mountPanel({ configuredProviders: manyProviders })
+    const list = el.querySelector<HTMLElement>('[data-testid="configured-provider-list"]')!
+    const toggle = el.querySelector<HTMLButtonElement>('.setup-provider-list__toggle')!
+
+    expect(list.querySelectorAll('.setup-provider-card')).toHaveLength(3)
+    expect(list.classList.contains('is-expanded')).toBe(false)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(toggle.textContent).toContain('12')
+
+    toggle.click()
+    await nextTick()
+
+    expect(list.querySelectorAll('.setup-provider-card')).toHaveLength(12)
+    expect(list.classList.contains('is-expanded')).toBe(true)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+
+    const source = readFileSync('src/components/setup/SetupProviderPanel.vue', 'utf8')
+    expect(source).toContain('max-height: min(28rem, 52vh)')
+    expect(source).toContain('overflow-y: auto')
+    expect(source).toContain('scrollbar-gutter: stable')
+
+    app.unmount()
+  })
+
   it('shows the default-on accessible image offer only inside the OpenRouter editor', async () => {
     const onUpdateImageGenerationOptIn = vi.fn()
     const { app, el, panelState } = await mountPanel({
@@ -2062,21 +2093,11 @@ describe('SetupProviderPanel — context-window override', () => {
 describe('SetupProviderPanel — model strategy wayfinding', () => {
   it('shows the active smart-routing mode on the model card with a single routing entry', async () => {
     const onGoToSection = vi.fn()
-    const preset = {
-      hasPreset: true,
-      presetLabel: 'OpenAI balanced tiers',
-      presetDescription: 'A curated tier split.',
-      synthesized: false,
-      tierRows: [],
-      tierLabel: (tier: string) => tier,
-      routerMode: 'custom',
-      routerCustomized: true,
-    }
     const { app, el } = await mountPanel({
       canConfigureRouter: true,
       routerEnabled: true,
       crossProviderRoutingEnabled: true,
-    }, { preset, onGoToSection })
+    }, { onGoToSection })
     const routingLinks = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
       .filter(btn => /Set up model routing/.test(btn.textContent || ''))
 

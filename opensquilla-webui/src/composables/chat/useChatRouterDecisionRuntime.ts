@@ -1,7 +1,7 @@
 import { ref, type Ref } from 'vue'
 import type { ChatEnsembleMeta, ChatEnsembleMetaModel, ChatMessage } from '@/types/chat'
-import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { EnsembleProgressPayload, RouterDecisionPayload } from '@/types/rpc'
+import { normalizeEnsembleMemberRole } from '@/utils/ensembleRoles'
 import {
   type NormalizedRouterDecision,
   normalizeRouterDecision,
@@ -16,7 +16,8 @@ export interface UseChatRouterDecisionRuntimeOptions {
   sessionKey: Ref<string>
   isStreaming: Ref<boolean>
   autoScroll: Ref<boolean>
-  modelRoutingMode: Ref<ModelRoutingMode>
+  activeTurnUsesEnsemble: Readonly<Ref<boolean>>
+  activeTurnId: Readonly<Ref<string>>
   streamBubble: Ref<boolean>
   streamHasVisibleOutput: Ref<boolean>
   startStreaming: () => void
@@ -27,7 +28,12 @@ export interface UseChatRouterDecisionRuntimeOptions {
 }
 
 export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRuntimeOptions) {
-  const pendingRouterDecision = ref<{ payload: RouterDecisionPayload; decision: NormalizedRouterDecision } | null>(null)
+  const pendingRouterDecision = ref<{
+    payload: RouterDecisionPayload
+    decision: NormalizedRouterDecision
+    messageId: string
+  } | null>(null)
+  let localRouterMessageSeq = 0
 
   // Router and ensemble events can arrive throughout a long streamed answer.
   // They should follow the live edge only while the reader has elected to stay
@@ -74,33 +80,100 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     return undefined
   }
 
-  function appendRouterDecision(payload: RouterDecisionPayload, decision = normalizeRouterDecision(payload)) {
-    if (!decision) return
-    const messageId = payload?.stream_seq
-      ? `router-${options.sessionKey.value}-${payload.stream_seq}`
-      : `router-${options.sessionKey.value}-${Date.now()}`
-    const last = options.messages.value[options.messages.value.length - 1]
-    if (last?.messageId === messageId) return
-
-    const turnId = payloadTurnId(payload)
-    if (options.isStreaming.value) {
-      const message = findRouterMessageForTurn(turnId)
-      if (message) {
-        message.routerDecision = decision
-        message.messageId = messageId
-        message.ts = new Date().toISOString()
-        message.routerSettled = true
-        if (turnId) message.turnId = turnId
-        scrollToBottomIfFollowing()
-        return
+  function bindRouterDecisionToModelCall(
+    modelCallId: string,
+    iteration = 0,
+    targetTurnId = latestExplicitTurnId(),
+  ) {
+    const normalizedCallId = String(modelCallId || '').trim()
+    if (!normalizedCallId) return
+    for (let i = options.messages.value.length - 1; i >= 0; i--) {
+      const message = options.messages.value[i]
+      if (
+        message.role === 'router'
+        && message.provenanceKind === 'router_decision'
+        && (!targetTurnId || message.turnId === targetTurnId)
+      ) {
+        if (message.routerModelCallId === normalizedCallId) return
+        if (!message.routerModelCallId) {
+          message.routerModelCallId = normalizedCallId
+          if (iteration > 0) message.routerIteration = iteration
+          return
+        }
       }
+      if (
+        message.role === 'user'
+        && (!targetTurnId || !message.turnId || message.turnId !== targetTurnId)
+      ) break
     }
+  }
+
+  function freezeAcceptedRoutingMode(
+    decision: NormalizedRouterDecision,
+    turnId: string,
+  ): NormalizedRouterDecision {
+    const acceptedMode = String(
+      decision.accepted_routing_mode || decision.acceptedRoutingMode || '',
+    ).trim()
+    const expectedTurnId = String(options.activeTurnId.value || '').trim()
+    if (
+      acceptedMode
+      || !options.activeTurnUsesEnsemble.value
+      || !expectedTurnId
+      || !turnId
+      || turnId !== expectedTurnId
+    ) return decision
+    return { ...decision, accepted_routing_mode: 'ensemble' }
+  }
+
+  function freezeActiveTurnRoutingMode(targetTurnId: string): boolean {
+    const expectedTurnId = String(options.activeTurnId.value || '').trim()
+    if (
+      !options.activeTurnUsesEnsemble.value
+      || !targetTurnId
+      || targetTurnId !== expectedTurnId
+    ) return false
+    const message = findRouterMessageForTurn(targetTurnId)
+    const decision = message?.routerDecision
+      ? normalizeRouterDecision(message.routerDecision)
+      : null
+    if (!message || !decision) return false
+    message.routerDecision = freezeAcceptedRoutingMode(decision, targetTurnId)
+    return true
+  }
+
+  function validIdentityStreamSeq(value: unknown): number | null {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+      ? value
+      : null
+  }
+
+  function routerDecisionMessageId(
+    payload: RouterDecisionPayload,
+    identityStreamSeq?: number,
+  ): string {
+    const streamSeq = validIdentityStreamSeq(payload.stream_seq)
+      ?? validIdentityStreamSeq(identityStreamSeq)
+    if (streamSeq !== null) return `router-${options.sessionKey.value}-${streamSeq}`
+    localRouterMessageSeq += 1
+    return `router-${options.sessionKey.value}-${Date.now()}-${localRouterMessageSeq}`
+  }
+
+  function appendRouterDecision(
+    payload: RouterDecisionPayload,
+    decision: NormalizedRouterDecision,
+    messageId: string,
+  ) {
+    if (!decision) return
+    const turnId = payloadTurnId(payload)
+    const acceptedDecision = freezeAcceptedRoutingMode(decision, turnId)
+    if (options.messages.value.some(message => message.messageId === messageId)) return
 
     options.messages.value.push({
       role: 'router',
       text: '',
       ts: new Date().toISOString(),
-      routerDecision: decision,
+      routerDecision: acceptedDecision,
       provenanceKind: 'router_decision',
       messageId,
       ...(turnId ? { turnId } : {}),
@@ -108,22 +181,27 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     scrollToBottomIfFollowing()
   }
 
-  function queueRouterDecision(payload: RouterDecisionPayload) {
-    const decision = normalizeRouterDecision(payload)
-    if (!decision) return
+  function queueRouterDecision(payload: RouterDecisionPayload, identityStreamSeq?: number) {
+    const normalizedDecision = normalizeRouterDecision(payload)
+    if (!normalizedDecision) return
+    const decision = freezeAcceptedRoutingMode(
+      normalizedDecision,
+      payloadTurnId(payload),
+    )
     if (options.isStreaming.value && options.streamBubble.value && !options.streamHasVisibleOutput.value) {
       const model = shortModelName(decision.model || decision.routed_model || '')
       options.setStreamActivity(model ? `Router selected · ${model}` : 'Router selected')
     }
-    pendingRouterDecision.value = { payload, decision }
-    appendRouterDecision(payload, decision)
+    const messageId = routerDecisionMessageId(payload, identityStreamSeq)
+    pendingRouterDecision.value = { payload, decision, messageId }
+    appendRouterDecision(payload, decision, messageId)
   }
 
   function flushPendingRouterDecision() {
     const pending = pendingRouterDecision.value
     if (!pending) return
     pendingRouterDecision.value = null
-    appendRouterDecision(pending.payload, pending.decision)
+    appendRouterDecision(pending.payload, pending.decision, pending.messageId)
   }
 
   function clearPendingRouterDecision() {
@@ -149,21 +227,22 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const model = String(payload.proposer_model || '').trim()
     const isAggregator = payload.event_type === 'aggregator_start' || payload.event_type === 'aggregator_finish'
     if (!model && !isAggregator) return null
-    const label = String(payload.proposer_label || '').trim() || (isAggregator ? 'aggregator' : 'proposer')
+    const role = normalizeEnsembleMemberRole(isAggregator ? 'aggregator' : 'proposer')
     const finished = payload.event_type === 'proposer_finish' || payload.event_type === 'aggregator_finish'
     const error = String(payload.error || '').trim()
     const explicitErrorCode = String(payload.error_code || '').trim()
     const errorCode = explicitErrorCode
       || (LEGACY_QUORUM_CANCELLED_ERROR.test(error) ? 'quorum_cancelled' : '')
     return {
-      role: isAggregator ? 'aggregator' : label,
-      label,
+      role,
+      label: role,
       provider: String(payload.proposer_provider || '').trim(),
       model,
       modelShort: shortModelName(model),
       input: Number(payload.input_tokens || 0),
       output: Number(payload.output_tokens || 0),
       costUsd: Number(payload.cost_usd || 0),
+      sampleIndex: Math.max(0, Number(payload.proposer_index || 0)),
       status: finished
         ? errorCode === 'quorum_cancelled'
           ? 'skipped'
@@ -178,8 +257,11 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   }
 
   function upsertEnsembleMember(ensemble: ChatEnsembleMeta, member: ChatEnsembleMetaModel) {
-    const key = `${member.role}:${member.provider}:${member.model}`
-    const idx = ensemble.models.findIndex(m => `${m.role}:${m.provider}:${m.model}` === key)
+    const identity = (model: ChatEnsembleMetaModel) => (
+      `${model.role}:${model.provider}:${model.model}:${model.sampleIndex || 0}`
+    )
+    const key = identity(member)
+    const idx = ensemble.models.findIndex(model => identity(model) === key)
     if (idx >= 0) {
       // Merge so a later 'done' delta keeps the row identity while adding usage.
       ensemble.models.splice(idx, 1, { ...ensemble.models[idx], ...member })
@@ -194,7 +276,13 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   function isEnsembleRouterMessage(message: ChatMessage): boolean {
     const decision = message.routerDecision || null
     const source = String(decision?.source || decision?.routing_source || '').toLowerCase()
-    return source.includes('ensemble') || options.modelRoutingMode.value === 'llm_ensemble' || Boolean(message.ensemble)
+    const acceptedMode = String(
+      decision?.accepted_routing_mode || decision?.acceptedRoutingMode || '',
+    ).toLowerCase()
+    return source.includes('ensemble')
+      || acceptedMode === 'ensemble'
+      || acceptedMode === 'llm_ensemble'
+      || Boolean(message.ensemble)
   }
 
   function findLiveRouterMessage(targetTurnId = latestExplicitTurnId()): ChatMessage | undefined {
@@ -222,8 +310,22 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     if (!options.isStreaming.value) return
     let target = findLiveRouterMessage()
     if (!target) {
-      if (options.modelRoutingMode.value !== 'llm_ensemble') return
+      const expectedTurnId = String(options.activeTurnId.value || '').trim()
+      if (
+        !options.activeTurnUsesEnsemble.value
+        || !expectedTurnId
+        || latestExplicitTurnId() !== expectedTurnId
+      ) return
       target = synthesizeHandoffRouterMessage()
+    }
+    if (options.activeTurnUsesEnsemble.value && target.routerDecision) {
+      const decision = normalizeRouterDecision(target.routerDecision)
+      if (decision) {
+        target.routerDecision = freezeAcceptedRoutingMode(
+          decision,
+          String(target.turnId || '').trim(),
+        )
+      }
     }
     if (!isEnsembleRouterMessage(target)) return
     target.routerState = 'handoff'
@@ -255,9 +357,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       target = options.messages.value[options.messages.value.length - 1]
     }
 
-    // Keep the strip on the ensemble branch even if a prior squilla-router
-    // decision stamped a non-ensemble source on this same turn's message.
-    if (target.routerDecision) target.routerDecision.source = 'llm_ensemble'
+    // Keep the original router decision intact. When Squilla Router selected an
+    // ensemble-enabled tier, the renderer needs both that decision and these
+    // member deltas to play the route stage before the ensemble stage.
     if (!target.ensemble) target.ensemble = emptyEnsemble()
     upsertEnsembleMember(target.ensemble, member)
     scrollToBottomIfFollowing()
@@ -271,5 +373,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     clearPendingRouterDecision,
     appendEnsembleProgress,
     markEnsembleHandoff,
+    bindRouterDecisionToModelCall,
+    freezeActiveTurnRoutingMode,
   }
 }

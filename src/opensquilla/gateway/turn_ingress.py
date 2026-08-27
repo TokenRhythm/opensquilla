@@ -36,6 +36,10 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "collaboration_mode",
         ),
     ),
+    (
+        "initial_routing_mode",
+        ("initialRoutingMode", "initial_routing_mode"),
+    ),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),
@@ -46,6 +50,11 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("run_kind", ("runKind", "run_kind")),
     ("workspace_id", ("workspaceId", "workspace_id")),
+    (
+        "prompt_annotation_ids",
+        ("promptAnnotationIds", "prompt_annotation_ids"),
+    ),
+    ("document_context", ("documentContext", "document_context")),
 )
 
 
@@ -54,7 +63,16 @@ def _canonical_fingerprint_payload(params: dict[str, Any]) -> dict[str, Any]:
     for canonical_name, aliases in _FINGERPRINT_FIELDS:
         for alias in aliases:
             if alias in params:
-                payload[canonical_name] = params[alias]
+                value = params[alias]
+                if canonical_name == "document_context" and isinstance(value, dict):
+                    value = {
+                        "document_id": value.get("documentId", value.get("document_id")),
+                        "head_revision_id": value.get(
+                            "headRevisionId",
+                            value.get("head_revision_id"),
+                        ),
+                    }
+                payload[canonical_name] = value
                 break
     return payload
 

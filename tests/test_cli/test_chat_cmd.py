@@ -15,13 +15,14 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
-from opensquilla.cli.chat.turn_stream import turn_stream_error_message
+from opensquilla.cli.chat.turn_stream import turn_stream_error_message, wrap_cli_turn_stream
 from opensquilla.cli.main import app
 from opensquilla.cli.repl import commands as repl_commands
 from opensquilla.cli.repl import slash_bridge
 from opensquilla.cli.repl.session_state import ChatSessionState
 from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
 from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     DoneEvent,
     TextDeltaEvent,
@@ -44,6 +45,51 @@ def test_cli_surfaces_actionable_ensemble_image_rejection() -> None:
     )
 
     assert turn_stream_error_message(event) == event.message
+
+
+@pytest.mark.asyncio
+async def test_cli_context_bound_wrapper_does_not_timeout_before_canonical_terminal() -> None:
+    async def source():
+        await asyncio.sleep(0.04)
+        yield AnswerGenerationResetEvent(
+            turn_id="turn-cli-context-bound",
+            assistant_message_id="assistant-cli-context-bound",
+            old_generation_epoch=0,
+            new_generation_epoch=1,
+            safe_reason="canonical ensemble takeover",
+            sequence=1,
+        )
+        yield DoneEvent(text="fixed answer")
+
+    config = SimpleNamespace(
+        agent_stream_idle_timeout_seconds=0.001,
+        agent_stream_heartbeat_interval_seconds=0.0,
+    )
+    events = [
+        event
+        async for event in wrap_cli_turn_stream(
+            source(),
+            config,
+            context_bound=True,
+        )
+    ]
+
+    assert [event.kind for event in events] == ["answer_generation_reset", "done"]
+
+
+@pytest.mark.asyncio
+async def test_cli_unmarked_wrapper_keeps_legacy_idle_timeout() -> None:
+    async def source():
+        await asyncio.sleep(0.04)
+        yield TextDeltaEvent(text="late")
+
+    config = SimpleNamespace(
+        agent_stream_idle_timeout_seconds=0.001,
+        agent_stream_heartbeat_interval_seconds=0.0,
+    )
+    with pytest.raises(TimeoutError, match="Stream idle"):
+        async for _event in wrap_cli_turn_stream(source(), config):
+            pass
 
 
 def _install_fake_inputs(monkeypatch, inputs: Iterable[str]) -> None:
@@ -134,6 +180,7 @@ EXPECTED_GATEWAY_COMMANDS = {
     "/approvals",
     "/permissions",
     "/forget",
+    "/goal",
     "/sessions",
     "/resume",
     "/delete",
@@ -145,6 +192,7 @@ EXPECTED_STANDALONE_COMMANDS = EXPECTED_GATEWAY_COMMANDS - {
     "/delete",
     "/file",
     "/forget",
+    "/goal",
     "/models",
     "/permissions",
     "/resume",
@@ -167,6 +215,7 @@ def test_gateway_registry_commands_have_gateway_handlers() -> None:
     assert "/quit" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
     assert "/usage" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
     assert "/file" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
+    assert "/goal" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
 
 
 def test_standalone_registry_commands_have_standalone_handlers() -> None:
@@ -198,6 +247,14 @@ def test_usage_is_gateway_only_and_not_standalone_help() -> None:
 def test_file_is_gateway_only() -> None:
     assert "/file" in _handler_words(Surface.CLI_GATEWAY)
     assert "/file" not in _handler_words(Surface.CLI_STANDALONE)
+
+
+def test_goal_surface_visibility() -> None:
+    assert "/goal" in _handler_words(Surface.CLI_GATEWAY)
+    assert "/goal" not in _handler_words(Surface.CLI_STANDALONE)
+    assert "/goal" in _handler_words(Surface.WEB_CHAT)
+    assert "/goal" in EXPECTED_GATEWAY_COMMANDS
+    assert "/goal" not in EXPECTED_STANDALONE_COMMANDS
 
 
 def test_interactive_chat_clear_screen_only_on_terminal(monkeypatch) -> None:

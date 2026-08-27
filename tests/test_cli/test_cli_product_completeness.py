@@ -5,8 +5,10 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import click
 from typer.testing import CliRunner
 
+from opensquilla.cli import gateway_lifecycle
 from opensquilla.cli.main import app
 
 runner = CliRunner()
@@ -88,7 +90,7 @@ class FakeGatewayClient:
 
 class FailingConnectGatewayClient(FakeGatewayClient):
     async def connect(self, url: str, *, token=None) -> None:
-        raise SystemExit("gateway offline")
+        raise SystemExit(f"Cannot connect to OpenSquilla gateway at {url}")
 
 
 class RPCFailGatewayClient(FakeGatewayClient):
@@ -193,6 +195,17 @@ def test_models_list_table_warns_about_provider_listing_errors(monkeypatch):
     assert "auth_invalid" not in result.stdout
     assert "openrouter" in result.stderr
     assert "auth_invalid" in result.stderr
+
+
+def test_config_port_docs_use_public_top_level_key() -> None:
+    root = Path(__file__).resolve().parents[2]
+    expected = "opensquilla config set port 18791"
+    invalid = "opensquilla config set gateway.port"
+
+    for relative_path in ("docs/cli.md", "README.product.md"):
+        text = (root / relative_path).read_text(encoding="utf-8")
+        assert expected in text, relative_path
+        assert invalid not in text, relative_path
 
 
 def test_config_get_honors_env_path_and_redacts(tmp_path: Path, monkeypatch):
@@ -486,6 +499,115 @@ def test_skills_view_and_update_use_gateway_rpc(monkeypatch):
     assert ("skills.update", {"name": "planner"}) in fake.calls
 
 
+def test_skills_update_force_is_forwarded_to_gateway(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.rpc_payloads = {
+        "skills.update": {
+            "results": [{"success": True, "name": "planner", "message": "updated"}]
+        },
+    }
+
+    result = runner.invoke(
+        app,
+        ["skills", "update", "planner", "--force", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert ("skills.update", {"name": "planner", "force": True}) in fake.calls
+
+
+def test_skills_scanner_confirmation_is_forwarded_to_gateway(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.rpc_payloads = {
+        "skills.install": {"success": True, "name": "planner", "message": "installed"},
+        "skills.update": {
+            "results": [{"success": True, "name": "planner", "message": "updated"}]
+        },
+    }
+
+    install = runner.invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "planner",
+            "--force",
+            "--risk-confirmation",
+            "install-token",
+            "--json",
+        ],
+    )
+    update = runner.invoke(
+        app,
+        [
+            "skills",
+            "update",
+            "planner",
+            "--force",
+            "--risk-confirmation",
+            "update-token",
+            "--json",
+        ],
+    )
+
+    assert install.exit_code == 0, install.stdout
+    assert update.exit_code == 0, update.stdout
+    assert (
+        "skills.install",
+        {
+            "identifier": "planner",
+            "source": "clawhub",
+            "force": True,
+            "riskConfirmation": "install-token",
+        },
+    ) in fake.calls
+    assert (
+        "skills.update",
+        {
+            "name": "planner",
+            "force": True,
+            "riskConfirmation": "update-token",
+        },
+    ) in fake.calls
+
+
+def test_skills_scanner_confirmation_requires_force(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["skills", "install", "planner", "--risk-confirmation", "unbound-token"],
+    )
+
+    assert result.exit_code != 0
+    assert "--risk-confirmation requires --force" in click.unstyle(result.output)
+    assert not any(method == "skills.install" for method, _params in fake.calls)
+
+
+def test_skills_update_noop_keeps_legacy_success_and_zero_exit(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.rpc_payloads = {
+        "skills.update": {
+            "results": [
+                {
+                    "success": True,
+                    "unchanged": True,
+                    "name": "planner",
+                    "message": "already current",
+                }
+            ]
+        },
+    }
+
+    result = runner.invoke(app, ["skills", "update", "planner", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["results"][0]["success"] is True
+    assert payload["results"][0]["unchanged"] is True
+    assert ("skills.update", {"name": "planner"}) in fake.calls
+
+
 def test_skills_update_all_exits_nonzero_on_partial_failure(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
@@ -575,6 +697,146 @@ def test_skills_install_and_uninstall_fall_back_when_gateway_unavailable(monkeyp
     assert json.loads(install.stdout)["path"] == "/tmp/skill"
     assert uninstall.exit_code == 1
     assert json.loads(uninstall.stdout)["message"] == "missing"
+
+
+def test_skills_install_legacy_fallback_cannot_bypass_scanner_with_force(monkeypatch):
+    _install_fake_gateway(monkeypatch, FailingConnectGatewayClient)
+    from opensquilla.skills.hub.installer import SkillInstaller
+
+    called = False
+
+    async def legacy_install(
+        self,
+        identifier: str,
+        source: str,
+        force: bool = False,
+    ):
+        nonlocal called
+        called = True
+        raise AssertionError("legacy force-only installer must not receive acknowledgement")
+
+    monkeypatch.setattr(SkillInstaller, "install", legacy_install)
+
+    result = runner.invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "planner",
+            "--force",
+            "--risk-confirmation",
+            "reviewed-token",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert called is False
+    payload = json.loads(result.stdout)
+    assert payload["success"] is False
+    assert "riskConfirmation" in payload["message"]
+
+
+def test_skills_install_legacy_fallback_rejects_replace_source_without_call(monkeypatch):
+    _install_fake_gateway(monkeypatch, FailingConnectGatewayClient)
+    from opensquilla.skills.hub.installer import InstallResult, SkillInstaller
+
+    calls = 0
+
+    async def fake_install(
+        self,
+        identifier: str,
+        source: str,
+        force: bool = False,
+    ) -> InstallResult:
+        nonlocal calls
+        calls += 1
+        return InstallResult(success=True, name=identifier)
+
+    monkeypatch.setattr(SkillInstaller, "install", fake_install)
+
+    result = runner.invoke(
+        app,
+        ["skills", "install", "planner", "--replace-source", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["success"] is False
+    assert payload["diagnostics"][0]["code"] == "INSTALLER_CAPABILITY_UNSUPPORTED"
+    assert calls == 0
+
+
+def test_skills_install_legacy_fallback_internal_type_error_is_not_retried(monkeypatch):
+    _install_fake_gateway(monkeypatch, FailingConnectGatewayClient)
+    from opensquilla.skills.hub.installer import InstallResult, SkillInstaller
+
+    calls = 0
+
+    async def fake_install(
+        self,
+        identifier: str,
+        source: str,
+        force: bool = False,
+    ) -> InstallResult:
+        nonlocal calls
+        calls += 1
+        raise TypeError("installer failed after mutation began")
+
+    monkeypatch.setattr(SkillInstaller, "install", fake_install)
+
+    result = runner.invoke(app, ["skills", "install", "planner", "--json"])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, TypeError)
+    assert calls == 1
+
+
+def test_skills_uninstall_legacy_fallback_rejects_exact_identity_without_call(monkeypatch):
+    _install_fake_gateway(monkeypatch, FailingConnectGatewayClient)
+    from opensquilla.skills.hub.installer import InstallResult, SkillInstaller
+
+    calls = 0
+
+    async def fake_uninstall(self, name: str) -> InstallResult:
+        nonlocal calls
+        calls += 1
+        return InstallResult(success=True, name=name)
+
+    monkeypatch.setattr(SkillInstaller, "uninstall", fake_uninstall)
+
+    result = runner.invoke(
+        app,
+        ["skills", "uninstall", "--install-id", "install-1", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["success"] is False
+    assert payload["diagnostics"][0]["code"] == "INSTALLER_CAPABILITY_UNSUPPORTED"
+    assert calls == 0
+
+
+def test_skills_update_legacy_name_fallback_remains_compatible(monkeypatch):
+    _install_fake_gateway(monkeypatch, FailingConnectGatewayClient)
+    from opensquilla.skills.hub.installer import InstallResult, SkillInstaller
+
+    calls: list[str | None] = []
+
+    async def fake_update(
+        self,
+        name: str | None = None,
+    ) -> list[InstallResult]:
+        calls.append(name)
+        return [InstallResult(success=True, name=name or "", message="updated")]
+
+    monkeypatch.setattr(SkillInstaller, "update", fake_update)
+
+    result = runner.invoke(app, ["skills", "update", "planner", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["results"][0]["success"] is True
+    assert calls == ["planner"]
 
 
 def test_skills_install_fallback_exposes_github_source_without_token(monkeypatch):
@@ -682,6 +944,56 @@ def test_sessions_list_json_filters_client_side(monkeypatch):
     payload = json.loads(result.stdout)
     assert payload["count"] == 1
     assert payload["sessions"][0]["key"] == "a"
+
+
+def test_sessions_list_uses_active_profile_managed_gateway_runtime_port(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake = _install_fake_gateway(monkeypatch)
+    fake.sessions_payload = {
+        "sessions": [{"key": "qa-session", "status": "active"}],
+        "count": 1,
+    }
+    home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_URL", raising=False)
+    config = home / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    lifecycle = home / "state" / "gateway" / "gateway.json"
+    lifecycle.parent.mkdir(parents=True)
+    lifecycle.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "host": "127.0.0.1",
+                "port": 18792,
+                "url": "http://127.0.0.1:18792",
+                "healthUrl": "http://127.0.0.1:18792/health",
+                "startedAt": "2026-08-10T00:00:00Z",
+                "argv": ["opensquilla", "gateway", "run", "--port", "18792"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_pid_running",
+        lambda self, pid: True,
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_probe_health",
+        lambda self: True,
+    )
+
+    result = runner.invoke(app, ["sessions", "list", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert ("connect", "ws://127.0.0.1:18792/ws") in fake.calls
+    assert json.loads(result.stdout)["sessions"][0]["key"] == "qa-session"
 
 
 def test_sessions_show_json_resolves_and_previews(monkeypatch):
@@ -1276,6 +1588,174 @@ def test_cost_json_returns_gateway_payload(monkeypatch):
     assert ("usage.cost", {}) in fake.calls
 
 
+def test_cost_by_model_uses_routed_model_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:routed",
+                "model": "unknown",
+                "inputTokens": 30,
+                "outputTokens": 3,
+                "costUsd": 0.03,
+                "modelBreakdown": [
+                    {
+                        "model": "deepseek-v4-flash",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    },
+                    {
+                        "model": "deepseek-v4-pro",
+                        "inputTokens": 20,
+                        "outputTokens": 2,
+                        "costUsd": 0.02,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 0.03,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "deepseek-v4-flash",
+            "inputTokens": 10,
+            "outputTokens": 1,
+            "costUsd": 0.01,
+        },
+        {
+            "model": "deepseek-v4-pro",
+            "inputTokens": 20,
+            "outputTokens": 2,
+            "costUsd": 0.02,
+        },
+    ]
+
+
+def test_cost_by_model_prefers_deployment_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:multi-provider",
+                "model": "gpt-4o",
+                "inputTokens": 2_000_000,
+                "outputTokens": 0,
+                "costUsd": 2.5,
+                "modelBreakdown": [
+                    {
+                        "model": "gpt-4o",
+                        "inputTokens": 2_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 0.0,
+                    }
+                ],
+                "deploymentBreakdown": [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 2.5,
+                    },
+                    {
+                        "provider": "ollama",
+                        "model": "gpt-4o",
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 0.0,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 2.5,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "gpt-4o",
+            "inputTokens": 2_000_000,
+            "outputTokens": 0,
+            "costUsd": 2.5,
+        }
+    ]
+
+
+def test_cost_by_model_falls_back_when_breakdown_is_partial(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:resumed",
+                "model": "post-restart-model",
+                "inputTokens": 1_010,
+                "outputTokens": 101,
+                "costUsd": 0.11,
+                "deploymentBreakdown": [
+                    {
+                        "provider": "openai",
+                        "model": "post-restart-model",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    }
+                ],
+            }
+        ],
+        "totalCostUsd": 0.11,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout) == {
+        "byModel": [
+            {
+                "model": "unknown",
+                "inputTokens": 1_010,
+                "outputTokens": 101,
+                "costUsd": 0.11,
+            }
+        ],
+        "totalCostUsd": 0.11,
+    }
+
+
+def test_cost_by_model_preserves_legacy_row_fallback(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:legacy",
+                "model": "legacy-model",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost_usd": 0.1,
+            }
+        ],
+        "totalCostUsd": 0.1,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "legacy-model",
+            "inputTokens": 10,
+            "outputTokens": 2,
+            "costUsd": 0.1,
+        }
+    ]
+
+
 def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
@@ -1311,6 +1791,31 @@ def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
         "search.query",
         {"query": "hello", "provider": "duckduckgo", "limit": 2},
     ) in fake.calls
+
+
+def test_search_status_text_reports_blocked_network_precondition(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    reason = (
+        "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
+        "in-process network tools through the managed proxy."
+    )
+    fake.rpc_payloads = {
+        "search.status": {
+            "activeProvider": "duckduckgo",
+            "provider": "duckduckgo",
+            "configured": True,
+            "buildable": True,
+            "networkReady": False,
+            "networkBlockedReason": reason,
+        }
+    }
+
+    result = runner.invoke(app, ["search", "status"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "blocked" in result.stdout
+    assert reason in " ".join(result.stdout.split())
+    assert ("search.status", {}) in fake.calls
 
 
 def test_search_query_json_exits_nonzero_on_diagnostic_failure(monkeypatch):

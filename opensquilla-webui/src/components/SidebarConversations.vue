@@ -39,32 +39,61 @@ export type { SidebarSection as SidebarSectionType }
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch, type ComponentPublicInstance } from 'vue'
+import {
+  computed,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  ref,
+  watch,
+  type ComponentPublicInstance,
+} from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
+import SidebarSessionHoverCard, {
+  sessionPreviewPosition,
+} from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { usePlatform } from '@/platform'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
+import {
+  buildSidebarDisplayProjection,
+  isSidebarSessionOrderable,
+  type SidebarDisplayRow,
+  type SidebarDisplayZone,
+} from '@/utils/sidebarDisplayProjection'
 
 const props = withDefaults(defineProps<{
   sections: SidebarSection[]
   error: boolean
   loading: boolean
+  loadingMore?: boolean
+  loadMoreError?: boolean
+  hasMore?: boolean
   currentKey: string
   contractDebugEnabled: boolean
   /** Command-palette chord, shown in the search button's tooltip. */
   searchHint: string
+  sessionOrder?: string[]
   canManageProjects?: boolean
   canCreateProjects?: boolean
 }>(), {
+  sessionOrder: () => [],
+  loadingMore: false,
+  loadMoreError: false,
+  hasMore: false,
   canManageProjects: false,
   canCreateProjects: false,
 })
 
+const isDesktop = usePlatform().capabilities.isDesktop
+
 const emit = defineEmits<{
   (e: 'select', key: string): void
   (e: 'refresh'): void
+  (e: 'load-more'): void
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
@@ -82,6 +111,24 @@ const emit = defineEmits<{
 
 const { confirm } = useConfirm()
 const { t } = useI18n()
+const historyList = ref<HTMLElement | null>(null)
+
+function maybeLoadMore() {
+  const element = historyList.value
+  if (
+    !element
+    || !props.hasMore
+    || props.loading
+    || props.loadingMore
+    || props.loadMoreError
+  ) return
+  const remaining = element.scrollHeight - element.scrollTop - element.clientHeight
+  if (remaining <= 160) emit('load-more')
+}
+
+function onHistoryScroll() {
+  maybeLoadMore()
+}
 
 const TASK_ATTENTION_LABEL_KEYS: Record<Exclude<SessionTaskAttention, 'none'>, string> = {
   running: 'shared.sidebar.taskRunning',
@@ -193,9 +240,9 @@ function startProjectTask(row: SidebarConversationItem) {
   emit('new-project-task', row.workspaceId)
 }
 
-function filterCollapsedProjectRows(rows: SidebarConversationItem[]): SidebarConversationItem[] {
+function filterCollapsedProjectRows<T extends SidebarConversationItem>(rows: T[]): T[] {
   const hiddenProjects = new Set<string>()
-  const result: SidebarConversationItem[] = []
+  const result: T[] = []
   for (const row of rows) {
     if (row.rowKind === 'workspace') {
       if (row.workspaceId && isProjectCollapsed(row)) hiddenProjects.add(row.workspaceId)
@@ -209,7 +256,7 @@ function filterCollapsedProjectRows(rows: SidebarConversationItem[]): SidebarCon
 }
 
 // Sections with at least one row, honoring the agent filter inside Chats.
-const visibleSections = computed(() => {
+const filteredSections = computed(() => {
   return props.sections
     .map(section => {
       const filteredRows = section.family === 'chats' && agentFilter.value
@@ -217,71 +264,82 @@ const visibleSections = computed(() => {
         : section.rows
       return {
         ...section,
-        rows: filterCollapsedProjectRows(filteredRows)
-          .filter(row => row.rowKind !== 'workspace-empty'),
+        rows: filteredRows.filter(row => row.rowKind !== 'workspace-empty'),
       }
     })
     .filter(section => section.rows.length > 0)
 })
 
-const visibleProjectCount = computed(() =>
-  visibleSections.value.reduce(
-    (sum, section) => sum + section.rows.filter(row => row.rowKind === 'workspace').length,
-    0,
-  ),
+const displayProjection = computed(() =>
+  buildSidebarDisplayProjection(filteredSections.value, props.sessionOrder),
 )
 
-/**
- * `arrangeSidebarSections` emits project rows as a small ordered ledger:
- * a workspace header followed by its task rows. Track those task keys without
- * treating every session cwd as a project — ordinary tasks can still carry a
- * workspace path even when they are not bound to a persisted project.
- */
-const projectRowKeys = computed(() => {
-  const keys = new Set<string>()
-  const chats = props.sections.find(section => section.family === 'chats')
-  let project: SidebarConversationItem | null = null
+interface SidebarDisplayBlock {
+  key: string
+  zone: SidebarDisplayZone
+  label: string
+  count: number
+  rows: SidebarDisplayRow[]
+  showHeading: boolean
+  family?: SidebarFamilyId
+  familyLabel?: string
+  showFamilyHeader?: boolean
+}
 
-  for (const row of chats?.rows || []) {
-    if (row.rowKind === 'workspace') {
-      project = row
-      keys.add(row.key)
-      continue
-    }
-    if (row.rowKind === 'workspace-empty') {
-      if (project) keys.add(row.key)
-      continue
-    }
-    const belongsToProject = Boolean(
-      project
-      && (
-        project.workspaceId
-          ? row.workspaceId === project.workspaceId
-          : Boolean(project.workspace && row.workspace === project.workspace)
-      ),
-    )
-    if (belongsToProject) keys.add(row.key)
-    else project = null
+const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
+  const projection = displayProjection.value
+  const blocks: SidebarDisplayBlock[] = []
+  if (projection.pinned.length > 0) {
+    blocks.push({
+      key: 'pinned',
+      zone: 'pinned',
+      label: t('shared.sidebar.pinned'),
+      count: projection.pinned.length,
+      rows: projection.pinned,
+      showHeading: true,
+    })
   }
-  return keys
+  if (props.canManageProjects || projection.projectCount > 0) {
+    blocks.push({
+      key: 'projects',
+      zone: 'projects',
+      label: t('workspaces.projects'),
+      count: projection.projectCount,
+      rows: filterCollapsedProjectRows(projection.projects),
+      showHeading: true,
+    })
+  }
+  if (projection.recents.length === 0) {
+    blocks.push({
+      key: 'recents',
+      zone: 'recents',
+      label: t('shared.sidebar.recents'),
+      count: 0,
+      rows: [],
+      showHeading: true,
+    })
+  } else {
+    projection.recents.forEach((section, index) => {
+      blocks.push({
+        key: `recents:${section.family}`,
+        zone: 'recents',
+        label: t('shared.sidebar.recents'),
+        count: projection.recentCount,
+        rows: section.rows,
+        showHeading: index === 0,
+        family: section.family,
+        familyLabel: section.label,
+        showFamilyHeader: projection.recents.length > 1,
+      })
+    })
+  }
+  return blocks
 })
 
-const firstRecentRowKey = computed(() => {
-  for (const section of visibleSections.value) {
-    const row = section.rows.find(item =>
-      item.rowKind === 'session' && !projectRowKeys.value.has(item.key),
-    )
-    if (row) return row.key
-  }
-  return ''
-})
-
-const hasVisibleRecentRows = computed(() =>
-  visibleSections.value.some(section =>
-    section.rows.some(row =>
-      row.rowKind === 'session' && !projectRowKeys.value.has(row.key),
-    ),
-  ),
+const controlsZone = computed<SidebarDisplayZone>(() =>
+  props.canManageProjects || displayProjection.value.projectCount > 0
+    ? 'projects'
+    : 'recents',
 )
 
 // Total rendered rows: drives the onboarding empty-state and the filter's
@@ -294,7 +352,7 @@ const totalRows = computed(() =>
 )
 
 const hasFilterMatches = computed(() =>
-  visibleSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
+  filteredSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
 )
 
 /* ── Session drag ordering ────────────────────────────────────────── */
@@ -312,16 +370,14 @@ const pointerDrag = ref<{
 } | null>(null)
 const suppressSelectKey = ref('')
 
-function reorderScope(row: SidebarConversationItem): string {
-  const pinGroup = row.pinned ? 'pinned' : 'regular'
-  if (!projectRowKeys.value.has(row.key)) return `recents:${pinGroup}`
-  return `project:${row.workspaceId || row.workspace || ''}:${pinGroup}`
+function reorderScope(row: SidebarDisplayRow): string {
+  if (row.pinned) return 'pinned'
+  if (row.displayZone === 'recents') return 'recents'
+  return `project:${row.workspaceId || row.workspace || ''}`
 }
 
-function canDragRow(row: SidebarConversationItem): boolean {
-  return row.rowKind === 'session'
-    && row.sessionKind === 'chat'
-    && !row.provisional
+function canDragRow(row: SidebarDisplayRow): boolean {
+  return isSidebarSessionOrderable(row)
     && !selectionMode.value
     && !agentFilter.value
     && renamingKey.value !== row.key
@@ -334,15 +390,11 @@ function clearRowDrag() {
   pointerDrag.value = null
 }
 
-function findSessionRow(key: string): SidebarConversationItem | undefined {
-  for (const section of props.sections) {
-    const row = section.rows.find(candidate => candidate.key === key)
-    if (row) return row
-  }
-  return undefined
+function findSessionRow(key: string): SidebarDisplayRow | undefined {
+  return displayProjection.value.allRows.find(row => row.key === key)
 }
 
-function onRowPointerDown(row: SidebarConversationItem, event: PointerEvent) {
+function onRowPointerDown(row: SidebarDisplayRow, event: PointerEvent) {
   if (event.button !== 0 || !canDragRow(row)) return
   const target = event.target
   if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge')) return
@@ -402,10 +454,10 @@ const selectedKeys = ref<Set<string>>(new Set())
 const selectionMode = ref(false)
 
 const visibleSelectableRows = computed(() =>
-  visibleSections.value.flatMap(section =>
-    isCollapsed(section.family)
+  displayBlocks.value.flatMap(block =>
+    block.showFamilyHeader && block.family && isCollapsed(block.family)
       ? []
-      : section.rows.filter(row => row.rowKind === 'session' && !row.provisional),
+      : block.rows.filter(row => row.rowKind === 'session' && !row.provisional),
   ),
 )
 
@@ -512,6 +564,26 @@ function setRenameInput(el: Element | ComponentPublicInstance | null) {
 // duplicate save through the input's blur handler.
 let renameCommitting = false
 
+function canOpenSessionMenu(row: SidebarDisplayRow): boolean {
+  return row.rowKind === 'session'
+    && (
+      row.sessionKind === 'chat'
+      || row.sessionKind === 'cron'
+      || row.sessionKind === 'channel'
+      || row.sessionKind === 'task'
+    )
+    && !row.provisional
+    && renamingKey.value !== row.key
+    && !selectionMode.value
+}
+
+function focusOpenMenu() {
+  nextTick(() => {
+    const items = openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
+    items?.[0]?.focus()
+  })
+}
+
 function toggleMenu(key: string, event?: Event) {
   if (openMenuKey.value === key) {
     closeMenu()
@@ -539,10 +611,30 @@ function toggleMenu(key: string, event?: Event) {
     }
   }
   // Move focus into the menu so keyboard users land on an actionable item.
-  nextTick(() => {
-    const items = openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
-    items?.[0]?.focus()
-  })
+  focusOpenMenu()
+}
+
+function openSessionContextMenu(row: SidebarDisplayRow, event: MouseEvent) {
+  // Keep the browser's native context menu on the web build. The desktop shell
+  // owns right-click behavior and reuses the same actions as the row's ⋯ menu.
+  if (!isDesktop || !canOpenSessionMenu(row)) return
+  event.preventDefault()
+  event.stopPropagation()
+  closeSessionPreview()
+  openMenuKey.value = row.key
+  const trigger = event.currentTarget
+  menuTriggerEl.value = trigger instanceof HTMLElement ? trigger : null
+  const openLeft = event.clientX + 160 > window.innerWidth
+  const openUp = event.clientY + 220 > window.innerHeight
+  menuStyle.value = {
+    position: 'fixed',
+    left: `${event.clientX}px`,
+    top: `${event.clientY}px`,
+    transform: openLeft
+      ? (openUp ? 'translate(-100%, -100%)' : 'translateX(-100%)')
+      : (openUp ? 'translateY(-100%)' : 'none'),
+  }
+  focusOpenMenu()
 }
 
 function closeMenu() {
@@ -550,6 +642,53 @@ function closeMenu() {
   openMenuEl.value = null
   menuTriggerEl.value = null
 }
+
+const sessionPreview = ref<{
+  row: SidebarDisplayRow
+  position: { left: string; top: string }
+} | null>(null)
+
+function openSessionPreview(row: SidebarDisplayRow, event: Event) {
+  if (
+    row.rowKind !== 'session'
+    || selectionMode.value
+    || openMenuKey.value
+    || renamingKey.value === row.key
+  ) return
+  const anchor = event.currentTarget
+  if (!(anchor instanceof HTMLElement)) return
+  sessionPreview.value = {
+    row,
+    position: sessionPreviewPosition(
+      anchor.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight },
+    ),
+  }
+}
+
+function closeSessionPreview() {
+  sessionPreview.value = null
+}
+
+function onSessionFocusOut(event: FocusEvent) {
+  const row = event.currentTarget
+  const next = event.relatedTarget
+  if (row instanceof HTMLElement && next instanceof Node && row.contains(next)) return
+  closeSessionPreview()
+}
+
+watch([selectionMode, openMenuKey], closeSessionPreview)
+useDocumentEvent('scroll', closeSessionPreview, true)
+onMounted(() => {
+  window.addEventListener('resize', closeSessionPreview)
+  void nextTick(maybeLoadMore)
+})
+onUnmounted(() => window.removeEventListener('resize', closeSessionPreview))
+watch(
+  [displayBlocks, () => props.hasMore, () => props.loadingMore],
+  () => nextTick(maybeLoadMore),
+  { flush: 'post' },
+)
 
 // Escape closes and returns focus to the row's ⋯ trigger; arrows rove between
 // the menu items, wrapping at the ends.
@@ -687,15 +826,23 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
-    v-if="error || totalRows > 0 || visibleProjectCount > 0 || props.canManageProjects"
+    v-if="
+      error
+      || hasMore
+      || loadingMore
+      || loadMoreError
+      || totalRows > 0
+      || displayProjection.projectCount > 0
+      || props.canManageProjects
+    "
     class="sidebar-section sidebar-history"
     :class="{
       'is-selecting': selectionMode,
-      'has-projects': visibleProjectCount > 0,
+      'has-projects': displayProjection.projectCount > 0,
     }"
     :aria-label="t('shared.sidebar.recentConversations')"
   >
-    <div class="sidebar-recents-header">
+    <div v-if="selectionMode" class="sidebar-recents-header">
       <span class="sidebar-recents-eyebrow">
         {{
           selectionMode
@@ -708,7 +855,7 @@ function onSelectRow(row: SidebarConversationItem) {
         }}
       </span>
       <span
-        v-if="!selectionMode && visibleProjectCount === 0 && totalRows > 0"
+        v-if="!selectionMode && displayProjection.projectCount === 0 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
       <button
@@ -806,352 +953,427 @@ function onSelectRow(row: SidebarConversationItem) {
     </div>
 
     <!-- Filtered to nothing within the Chats agent filter -->
-    <div v-else-if="agentFilter && !hasFilterMatches" class="sidebar-history-empty">
+    <div
+      v-else-if="agentFilter && !hasFilterMatches && !hasMore"
+      class="sidebar-history-empty"
+    >
       {{ t('shared.sidebar.noMatches') }}
     </div>
 
-    <div v-else class="sidebar-history-list">
+    <div
+      v-else
+      ref="historyList"
+      class="sidebar-history-list"
+      @scroll.passive="onHistoryScroll"
+    >
       <div
-        v-for="section in visibleSections"
-        :key="section.family"
-        class="sidebar-group"
-        :data-family="section.family"
+        v-for="block in displayBlocks"
+        :key="block.key"
+        class="sidebar-group sidebar-zone"
+        :data-family="block.family || block.key"
+        :data-sidebar-zone-group="block.zone"
       >
-        <!-- One vocabulary, one header: with a single family the panel's own
-             "Chats" eyebrow already labels the list, so the per-family header
-             renders only when there are actually multiple families to tell
-             apart (chats vs cron vs channels). -->
+        <div
+          v-if="block.showHeading"
+          class="sidebar-zone-heading"
+          :data-sidebar-zone-heading="block.zone"
+        >
+          <span class="sidebar-zone-heading__label">{{ block.label }}</span>
+          <span class="sidebar-zone-heading__count">{{ block.count }}</span>
+          <button
+            v-if="
+              block.zone === 'projects'
+              && props.canManageProjects
+              && props.canCreateProjects
+              && !selectionMode
+            "
+            type="button"
+            class="sidebar-project-create-btn"
+            data-testid="sidebar-create-project"
+            :aria-label="t('workspaces.createProject')"
+            :title="t('workspaces.createProject')"
+            @click="emit('new-project')"
+          >
+            <Icon name="plus" :size="13" />
+          </button>
+          <button
+            v-if="block.zone === controlsZone && !selectionMode"
+            type="button"
+            class="sidebar-cmd-btn"
+            :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
+            :title="`${t('chrome.searchChats')} (${props.searchHint})`"
+            aria-haspopup="dialog"
+            @click="emit('search')"
+          >
+            <Icon name="search" :size="13" />
+          </button>
+          <button
+            v-if="block.zone === controlsZone && totalRows > 0 && !selectionMode"
+            type="button"
+            class="sidebar-bulk-mode-btn"
+            :aria-label="t('shared.sidebar.enterSelectionMode')"
+            :title="t('shared.sidebar.enterSelectionMode')"
+            @click="toggleSelectionMode"
+          >
+            <Icon name="listChecks" :size="13" />
+          </button>
+        </div>
+
         <button
-          v-if="visibleSections.length > 1"
+          v-if="block.showFamilyHeader && block.family"
           type="button"
           class="sidebar-group__header"
-          :aria-expanded="!isCollapsed(section.family)"
-          :aria-controls="`sidebar-group-${section.family}`"
-          @click="toggleSection(section.family)"
+          :aria-expanded="!isCollapsed(block.family)"
+          :aria-controls="`sidebar-group-${block.key}`"
+          @click="toggleSection(block.family)"
         >
           <Icon class="sidebar-group__chevron" name="chevronRight" :size="12" />
-          <span class="sidebar-group__label">{{ section.label }}</span>
-          <span class="sidebar-group__count">{{ section.rows.length }}</span>
+          <span class="sidebar-group__label">{{ block.familyLabel }}</span>
+          <span class="sidebar-group__count">{{ block.rows.length }}</span>
         </button>
 
-        <TransitionGroup
-          v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
-          :id="`sidebar-group-${section.family}`"
-          name="sidebar-row"
-          tag="div"
-          class="sidebar-group__body"
-        >
+        <Transition name="sidebar-group">
           <div
-            v-for="row in section.rows"
-            :key="row.key"
-            class="sidebar-history-row"
-            :class="{
-              'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
-              'sidebar-history-row--workspace': row.rowKind === 'workspace',
-              'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
-              'sidebar-history-row--recent-start': row.key === firstRecentRowKey,
-              'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
-              'is-reorderable': canDragRow(row),
-              'is-dragging': draggedRowKey === row.key,
-              'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
-              'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
-            }"
-            :data-family="section.family"
-            :data-sidebar-zone="projectRowKeys.has(row.key) ? 'projects' : 'recents'"
-            :data-zone-label="row.key === firstRecentRowKey ? t('shared.sidebar.recents') : undefined"
-            :data-depth="row.depth"
-            :data-session-key="row.rowKind === 'session' ? row.key : undefined"
-            :style="{ '--row-depth': row.depth }"
-            @pointerdown="onRowPointerDown(row, $event)"
+            v-show="!block.showFamilyHeader || !block.family || !isCollapsed(block.family)"
+            :id="`sidebar-group-${block.key}`"
+            class="sidebar-group__body"
           >
-            <div
-              v-if="row.rowKind === 'workspace'"
-              class="sidebar-workspace-header"
-            >
-              <div class="sidebar-project-info-wrap">
-                <button
-                  type="button"
-                  class="sidebar-project-info"
-                  data-testid="project-workspace-info"
-                  :aria-label="t('workspaces.projectInfo', {
-                    path: row.workspaceDisplayPath || row.workspace || row.title,
-                    count: row.workspaceTaskCount ?? 0,
-                  })"
+            <div class="sidebar-group__content">
+              <div
+                v-for="row in block.rows"
+                :key="row.key"
+                class="sidebar-history-row"
+                :class="{
+                  'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
+                  'sidebar-history-row--workspace': row.rowKind === 'workspace',
+                  'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
+                  'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
+                  'is-reorderable': canDragRow(row),
+                  'is-dragging': draggedRowKey === row.key,
+                  'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
+                  'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
+                }"
+                :data-family="row.displayFamily"
+                :data-sidebar-zone="row.displayZone"
+                :data-depth="row.depth"
+                :data-session-key="row.rowKind === 'session' ? row.key : undefined"
+                :style="{ '--row-depth': row.depth }"
+                @pointerdown="onRowPointerDown(row, $event)"
+                @mouseenter="openSessionPreview(row, $event)"
+                @mouseleave="closeSessionPreview"
+                @focusin="openSessionPreview(row, $event)"
+                @focusout="onSessionFocusOut"
+              >
+                <div
+                  v-if="row.rowKind === 'workspace'"
+                  class="sidebar-workspace-header"
                 >
-                  <Icon name="folder" :size="15" />
-                </button>
-                <div class="sidebar-project-info-popover" role="tooltip">
-                  <span class="sidebar-project-info-path">
-                    {{ row.workspaceDisplayPath || row.workspace || row.title }}
-                  </span>
-                  <span>{{ t('workspaces.taskCount', { count: row.workspaceTaskCount ?? 0 }) }}</span>
-                  <span v-if="row.workspaceAvailable === false" class="sidebar-project-unavailable">
-                    {{ t('workspaces.unavailable') }}
-                  </span>
+                  <div class="sidebar-project-info-wrap">
+                    <button
+                      type="button"
+                      class="sidebar-project-info"
+                      data-testid="project-workspace-info"
+                      :aria-label="t('workspaces.projectInfo', {
+                        path: row.workspaceDisplayPath || row.workspace || row.title,
+                        count: row.workspaceTaskCount ?? 0,
+                      })"
+                    >
+                      <Icon name="folder" :size="15" />
+                    </button>
+                    <div class="sidebar-project-info-popover" role="tooltip">
+                      <span class="sidebar-project-info-path">
+                        {{ row.workspaceDisplayPath || row.workspace || row.title }}
+                      </span>
+                      <span>{{ t('workspaces.taskCount', { count: row.workspaceTaskCount ?? 0 }) }}</span>
+                      <span v-if="row.workspaceAvailable === false" class="sidebar-project-unavailable">
+                        {{ t('workspaces.unavailable') }}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    class="sidebar-project-disclosure"
+                    data-testid="project-workspace-disclosure"
+                    :aria-expanded="!isProjectCollapsed(row)"
+                    :aria-label="row.title"
+                    @click="toggleProject(row)"
+                  >
+                    <Icon class="sidebar-project-chevron" name="chevronRight" :size="12" />
+                    <span class="sidebar-workspace-label">{{ row.title }}</span>
+                  </button>
+                  <div
+                    v-if="!selectionMode && props.canManageProjects && row.workspaceId"
+                    class="sidebar-project-actions"
+                  >
+                    <button
+                      type="button"
+                      class="sidebar-project-action sidebar-project-action--new-task"
+                      data-testid="project-workspace-new-task"
+                      :aria-label="row.workspaceAvailable === false
+                        ? t('workspaces.unavailableProjectCannotStartTask')
+                        : t('workspaces.newTask')"
+                      :title="row.workspaceAvailable === false
+                        ? t('workspaces.unavailableProjectCannotStartTask')
+                        : t('workspaces.newTask')"
+                      :disabled="row.workspaceAvailable === false"
+                      @click.stop="startProjectTask(row)"
+                    >
+                      <Icon name="plus" :size="13" />
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-project-action sidebar-row-menu-btn"
+                      data-testid="project-workspace-more"
+                      aria-haspopup="menu"
+                      :aria-expanded="openMenuKey === row.key"
+                      :aria-label="t('workspaces.moreActions')"
+                      :title="t('workspaces.moreActions')"
+                      @click.stop="toggleMenu(row.key, $event)"
+                    >
+                      <Icon name="moreHorizontal" :size="14" />
+                    </button>
+                  </div>
                 </div>
-              </div>
-              <button
-                type="button"
-                class="sidebar-project-disclosure"
-                data-testid="project-workspace-disclosure"
-                :aria-expanded="!isProjectCollapsed(row)"
-                :aria-label="row.title"
-                @click="toggleProject(row)"
-              >
-                <Icon class="sidebar-project-chevron" name="chevronRight" :size="12" />
-                <span class="sidebar-workspace-label">{{ row.title }}</span>
-              </button>
-              <div
-                v-if="!selectionMode && props.canManageProjects && row.workspaceId"
-                class="sidebar-project-actions"
-              >
-                <button
-                  type="button"
-                  class="sidebar-project-action sidebar-project-action--new-task"
-                  data-testid="project-workspace-new-task"
-                  :aria-label="row.workspaceAvailable === false
-                    ? t('workspaces.unavailableProjectCannotStartTask')
-                    : t('workspaces.newTask')"
-                  :title="row.workspaceAvailable === false
-                    ? t('workspaces.unavailableProjectCannotStartTask')
-                    : t('workspaces.newTask')"
-                  :disabled="row.workspaceAvailable === false"
-                  @click.stop="startProjectTask(row)"
+
+                <span
+                  v-if="row.depth > 0 && row.rowKind !== 'workspace'"
+                  class="sidebar-history-rail"
+                  aria-hidden="true"
+                />
+
+                <div
+                  v-if="row.rowKind === 'workspace-empty'"
+                  class="sidebar-workspace-empty"
                 >
-                  <Icon name="plus" :size="13" />
+                  {{ row.title }}
+                </div>
+
+                <!-- Inline rename input replaces the row button while editing -->
+                <input
+                  v-if="row.rowKind === 'session' && renamingKey === row.key"
+                  :ref="setRenameInput"
+                  v-model="renameDraft"
+                  class="sidebar-history-rename"
+                  type="text"
+                  :aria-label="t('shared.sidebar.renameLabel', { title: row.title })"
+                  @keydown.enter.prevent="commitRename"
+                  @keydown.esc.prevent="cancelRename"
+                  @blur="onRenameBlur"
+                />
+
+                <button
+                  v-else-if="row.rowKind === 'session'"
+                  class="sidebar-history-item"
+                  :class="{ 'is-current': row.key === currentKey }"
+                  :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
+                  :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
+                  @click="onSelectRow(row)"
+                  @contextmenu="openSessionContextMenu(row, $event)"
+                >
+                  <span
+                    v-if="selectionMode && !row.provisional"
+                    class="sidebar-selection-box"
+                    :class="{ 'is-checked': isRowSelected(row.key) }"
+                    aria-hidden="true"
+                  >
+                    <Icon v-if="isRowSelected(row.key)" name="check" :size="11" />
+                  </span>
+                  <span class="sidebar-history-title">{{ row.title }}</span>
+                  <Icon
+                    v-if="row.pinned"
+                    class="sidebar-history-pin"
+                    name="arrowUp"
+                    :size="11"
+                    aria-hidden="true"
+                  />
+                  <span
+                    v-if="contractDebugEnabled && row.hasContractGaps"
+                    class="sidebar-history-gap"
+                    :aria-label="t('shared.sidebar.contractGap')"
+                    :title="t('shared.sidebar.contractGap')"
+                  >{{ t('shared.sidebar.contractGapBadge') }}</span>
+                  <span
+                    v-if="!selectionMode"
+                    class="sidebar-task-attention"
+                    :class="`sidebar-task-attention--${row.taskAttention}`"
+                    :role="row.taskAttention === 'none' ? undefined : 'img'"
+                    :aria-hidden="row.taskAttention === 'none' ? 'true' : undefined"
+                    :aria-label="taskAttentionLabel(row.taskAttention) || undefined"
+                    :title="taskAttentionLabel(row.taskAttention) || undefined"
+                    data-testid="sidebar-task-attention"
+                  />
                 </button>
-                <button
-                  type="button"
-                  class="sidebar-project-action sidebar-row-menu-btn"
-                  data-testid="project-workspace-more"
-                  aria-haspopup="menu"
-                  :aria-expanded="openMenuKey === row.key"
-                  :aria-label="t('workspaces.moreActions')"
-                  :title="t('workspaces.moreActions')"
-                  @click.stop="toggleMenu(row.key, $event)"
+
+                <!-- Per-session ⋯ menu: task rows omit pin but keep rename + delete. -->
+                <Teleport to="body">
+                  <div
+                    v-if="
+                      props.canManageProjects
+                      && row.rowKind === 'workspace'
+                      && openMenuKey === row.key
+                    "
+                    :ref="setOpenMenu"
+                    class="sidebar-row-menu sidebar-project-menu"
+                    :style="menuStyle"
+                    role="menu"
+                    :aria-label="t('workspaces.moreActions')"
+                    @keydown="onMenuKeydown"
+                  >
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      data-project-action="pin"
+                      role="menuitem"
+                      @click.stop="emitProjectPin(row)"
+                    >
+                      <Icon name="arrowUp" :size="13" />
+                      <span>{{ row.workspacePinned ? t('workspaces.unpin') : t('workspaces.pin') }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      data-project-action="edit"
+                      role="menuitem"
+                      @click.stop="emitProjectEdit(row)"
+                    >
+                      <Icon name="pencil" :size="13" />
+                      <span>{{ t('workspaces.editProject') }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      data-project-action="delete-history"
+                      role="menuitem"
+                      @click.stop="requestProjectHistoryDelete(row)"
+                    >
+                      <Icon name="trash" :size="13" />
+                      <span>{{ t('workspaces.menuDeleteHistory') }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      data-project-action="remove"
+                      role="menuitem"
+                      @click.stop="emitProjectRemove(row)"
+                    >
+                      <Icon name="x" :size="13" />
+                      <span>{{ t('workspaces.menuRemove') }}</span>
+                    </button>
+                  </div>
+                </Teleport>
+
+                <div
+                  v-if="canOpenSessionMenu(row)"
+                  class="sidebar-row-menu-wrap"
                 >
-                  <Icon name="moreHorizontal" :size="14" />
+                  <button
+                    type="button"
+                    class="sidebar-row-menu-btn"
+                    aria-haspopup="menu"
+                    :aria-expanded="openMenuKey === row.key"
+                    :aria-label="t('shared.sidebar.rowActions', { title: row.title })"
+                    :title="t('shared.sidebar.rowActions', { title: row.title })"
+                    @click.stop="toggleMenu(row.key, $event)"
+                  >
+                    <span aria-hidden="true">&#8943;</span>
+                  </button>
+                  <Teleport to="body">
+                  <div
+                    v-if="openMenuKey === row.key"
+                    :ref="setOpenMenu"
+                    class="sidebar-row-menu"
+                    :style="menuStyle"
+                    role="menu"
+                    :aria-label="t('shared.sidebar.rowActions', { title: row.title })"
+                    @keydown="onMenuKeydown"
+                  >
+                    <button
+                      v-if="row.sessionKind !== 'task'"
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      @click.stop="emitSessionPin(row)"
+                    >
+                      <Icon name="arrowUp" :size="14" />
+                      <span>{{ row.pinned ? t('shared.sidebar.unpinTask') : t('shared.sidebar.pinTask') }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      @click.stop="startRename(row)"
+                    >
+                      <Icon name="pencil" :size="14" />
+                      <span>{{ t('shared.sidebar.rename') }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item sidebar-row-menu__item--danger"
+                      role="menuitem"
+                      @click.stop="requestDelete(row)"
+                    >
+                      <Icon name="trash" :size="14" />
+                      <span>{{ t('shared.sidebar.delete') }}</span>
+                    </button>
+                  </div>
+                  </Teleport>
+                </div>
+
+                <!-- Agent-initial badge: indicator + click-to-filter (Chats only) -->
+                <button
+                  v-else-if="
+                    row.rowKind === 'session'
+                    && !row.provisional
+                    && shouldShowAgentFilterBadge(row.displayFamily, row)
+                    && renamingKey !== row.key
+                    && !selectionMode
+                  "
+                  type="button"
+                  class="sidebar-agent-badge"
+                  :class="{ 'is-active': agentFilter === row.effectiveAgentId }"
+                  :aria-pressed="agentFilter === row.effectiveAgentId"
+                  :aria-label="t('shared.sidebar.filterByAgent', { name: row.agentName })"
+                  :title="t('shared.sidebar.filterByAgent', { name: row.agentName })"
+                  @click.stop="toggleAgentFilter(row.effectiveAgentId)"
+                >
+                  {{ agentInitial(row.agentName) }}
                 </button>
               </div>
             </div>
-
-            <span
-              v-if="row.depth > 0 && row.rowKind !== 'workspace'"
-              class="sidebar-history-rail"
-              aria-hidden="true"
-            />
-
-            <div
-              v-if="row.rowKind === 'workspace-empty'"
-              class="sidebar-workspace-empty"
-            >
-              {{ row.title }}
-            </div>
-
-            <!-- Inline rename input replaces the row button while editing -->
-            <input
-              v-if="row.rowKind === 'session' && renamingKey === row.key"
-              :ref="setRenameInput"
-              v-model="renameDraft"
-              class="sidebar-history-rename"
-              type="text"
-              :aria-label="t('shared.sidebar.renameLabel', { title: row.title })"
-              @keydown.enter.prevent="commitRename"
-              @keydown.esc.prevent="cancelRename"
-              @blur="onRenameBlur"
-            />
-
-            <button
-              v-else-if="row.rowKind === 'session'"
-              class="sidebar-history-item"
-              :class="{ 'is-current': row.key === currentKey }"
-              :title="row.title"
-              :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
-              @click="onSelectRow(row)"
-            >
-              <span
-                v-if="selectionMode && !row.provisional"
-                class="sidebar-selection-box"
-                :class="{ 'is-checked': isRowSelected(row.key) }"
-                aria-hidden="true"
-              >
-                <Icon v-if="isRowSelected(row.key)" name="check" :size="11" />
-              </span>
-              <span class="sidebar-history-title">{{ row.title }}</span>
-              <Icon
-                v-if="row.pinned"
-                class="sidebar-history-pin"
-                name="arrowUp"
-                :size="11"
-                aria-hidden="true"
-              />
-              <span
-                v-if="contractDebugEnabled && row.hasContractGaps"
-                class="sidebar-history-gap"
-                :aria-label="t('shared.sidebar.contractGap')"
-                :title="t('shared.sidebar.contractGap')"
-              >{{ t('shared.sidebar.contractGapBadge') }}</span>
-              <span
-                v-if="!selectionMode"
-                class="sidebar-task-attention"
-                :class="`sidebar-task-attention--${row.taskAttention}`"
-                :role="row.taskAttention === 'none' ? undefined : 'img'"
-                :aria-hidden="row.taskAttention === 'none' ? 'true' : undefined"
-                :aria-label="taskAttentionLabel(row.taskAttention) || undefined"
-                :title="taskAttentionLabel(row.taskAttention) || undefined"
-                data-testid="sidebar-task-attention"
-              />
-            </button>
-
-            <!-- Chat-only ⋯ menu: rename + delete -->
-            <Teleport to="body">
-              <div
-                v-if="
-                  props.canManageProjects
-                  && row.rowKind === 'workspace'
-                  && openMenuKey === row.key
-                "
-                :ref="setOpenMenu"
-                class="sidebar-row-menu sidebar-project-menu"
-                :style="menuStyle"
-                role="menu"
-                :aria-label="t('workspaces.moreActions')"
-                @keydown="onMenuKeydown"
-              >
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item"
-                  data-project-action="pin"
-                  role="menuitem"
-                  @click.stop="emitProjectPin(row)"
-                >
-                  <Icon name="arrowUp" :size="13" />
-                  <span>{{ row.workspacePinned ? t('workspaces.unpin') : t('workspaces.pin') }}</span>
-                </button>
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item"
-                  data-project-action="edit"
-                  role="menuitem"
-                  @click.stop="emitProjectEdit(row)"
-                >
-                  <Icon name="pencil" :size="13" />
-                  <span>{{ t('workspaces.editProject') }}</span>
-                </button>
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item"
-                  data-project-action="delete-history"
-                  role="menuitem"
-                  @click.stop="requestProjectHistoryDelete(row)"
-                >
-                  <Icon name="trash" :size="13" />
-                  <span>{{ t('workspaces.menuDeleteHistory') }}</span>
-                </button>
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item"
-                  data-project-action="remove"
-                  role="menuitem"
-                  @click.stop="emitProjectRemove(row)"
-                >
-                  <Icon name="x" :size="13" />
-                  <span>{{ t('workspaces.menuRemove') }}</span>
-                </button>
-              </div>
-            </Teleport>
-
-            <div
-              v-if="
-                row.rowKind === 'session'
-                && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
-                && !row.provisional
-                && renamingKey !== row.key
-                && !selectionMode
-              "
-              class="sidebar-row-menu-wrap"
-            >
-              <button
-                type="button"
-                class="sidebar-row-menu-btn"
-                aria-haspopup="menu"
-                :aria-expanded="openMenuKey === row.key"
-                :aria-label="t('shared.sidebar.rowActions', { title: row.title })"
-                :title="t('shared.sidebar.rowActions', { title: row.title })"
-                @click.stop="toggleMenu(row.key, $event)"
-              >
-                <span aria-hidden="true">&#8943;</span>
-              </button>
-              <Teleport to="body">
-              <div
-                v-if="openMenuKey === row.key"
-                :ref="setOpenMenu"
-                class="sidebar-row-menu"
-                :style="menuStyle"
-                role="menu"
-                :aria-label="t('shared.sidebar.rowActions', { title: row.title })"
-                @keydown="onMenuKeydown"
-              >
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item"
-                  role="menuitem"
-                  @click.stop="emitSessionPin(row)"
-                >
-                  <Icon name="arrowUp" :size="14" />
-                  <span>{{ row.pinned ? t('shared.sidebar.unpinTask') : t('shared.sidebar.pinTask') }}</span>
-                </button>
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item"
-                  role="menuitem"
-                  @click.stop="startRename(row)"
-                >
-                  <Icon name="pencil" :size="14" />
-                  <span>{{ t('shared.sidebar.rename') }}</span>
-                </button>
-                <button
-                  type="button"
-                  class="sidebar-row-menu__item sidebar-row-menu__item--danger"
-                  role="menuitem"
-                  @click.stop="requestDelete(row)"
-                >
-                  <Icon name="trash" :size="14" />
-                  <span>{{ t('shared.sidebar.delete') }}</span>
-                </button>
-              </div>
-              </Teleport>
-            </div>
-
-            <!-- Agent-initial badge: indicator + click-to-filter (Chats only) -->
-            <button
-              v-else-if="
-                row.rowKind === 'session'
-                && !row.provisional
-                && shouldShowAgentFilterBadge(section.family, row)
-                && renamingKey !== row.key
-                && !selectionMode
-              "
-              type="button"
-              class="sidebar-agent-badge"
-              :class="{ 'is-active': agentFilter === row.effectiveAgentId }"
-              :aria-pressed="agentFilter === row.effectiveAgentId"
-              :aria-label="t('shared.sidebar.filterByAgent', { name: row.agentName })"
-              :title="t('shared.sidebar.filterByAgent', { name: row.agentName })"
-              @click.stop="toggleAgentFilter(row.effectiveAgentId)"
-            >
-              {{ agentInitial(row.agentName) }}
-            </button>
           </div>
-        </TransitionGroup>
+        </Transition>
+        <div
+          v-if="block.zone === 'recents' && block.rows.length === 0"
+          class="sidebar-zone-empty"
+        >
+          <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
+        </div>
       </div>
       <div
-        v-if="visibleProjectCount > 0 && !hasVisibleRecentRows"
-        class="sidebar-zone-empty"
+        v-if="loadingMore || loadMoreError || (!hasMore && totalRows > 0)"
+        class="sidebar-history-page-state"
+        role="status"
       >
-        <div class="sidebar-zone-empty__label">{{ t('shared.sidebar.recents') }}</div>
-        <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
+        <span v-if="loadingMore">{{ t('sessions.loading') }}</span>
+        <button
+          v-else-if="loadMoreError"
+          type="button"
+          class="sidebar-history-retry"
+          @click="emit('load-more')"
+        >
+          {{ t('shared.errorState.retry') }}
+        </button>
+        <span v-else>{{ t('shared.sidebar.allLoaded') }}</span>
       </div>
     </div>
+    <Teleport to="body">
+      <SidebarSessionHoverCard
+        v-if="sessionPreview"
+        :title="sessionPreview.row.title"
+        :updated-at="sessionPreview.row.updatedAt"
+        :project-name="sessionPreview.row.displayProjectName"
+        :position="sessionPreview.position"
+      />
+    </Teleport>
   </div>
 </template>

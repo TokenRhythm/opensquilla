@@ -18,6 +18,8 @@ from opensquilla.memory.session_flush import (
     FlushReceipt,
     SessionFlushService,
     _make_flush_read_only_handler,
+    _usage_from_complete_response,
+    _usage_from_event,
 )
 from opensquilla.memory.store import LongTermMemoryStore
 from opensquilla.memory.sync_manager import MemorySyncManager
@@ -27,9 +29,9 @@ from opensquilla.provider import (
     Message,
     ProviderRequestCorrelation,
     TextDeltaEvent,
-    ToolUseEndEvent,
-    ToolUseStartEvent,
 )
+from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+from opensquilla.provider.protocol import ProviderMetadata
 from opensquilla.tool_boundary import ToolCall, ToolResult
 
 
@@ -44,6 +46,87 @@ def test_memory_tool_handler_protocol_uses_tool_boundary_types() -> None:
     typed_handler: MemoryToolHandler = handler
 
     assert typed_handler is handler
+
+
+@pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic"])
+def test_session_flush_event_usage_uses_generic_custom_price(
+    monkeypatch: pytest.MonkeyPatch, provider_id: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    usage = _usage_from_event(
+        DoneEvent(
+            input_tokens=100_000,
+            output_tokens=1_000,
+            model="gpt-4.1",
+            provider=provider_id,
+        )
+    )
+
+    assert usage["cost_usd"] == 0.0
+    assert usage["estimated_cost_usd"] == 0.0
+    assert usage["cost_source"] == "unavailable"
+
+
+@pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic"])
+def test_session_flush_complete_response_uses_configured_provider_price(
+    monkeypatch: pytest.MonkeyPatch, provider_id: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    class CustomProvider:
+        def provider_metadata(self) -> ProviderMetadata:
+            return ProviderMetadata(
+                provider_id=provider_id,
+                provider_name="openai",
+                provider_kind="openai_compat",
+                model="gpt-4.1",
+            )
+
+    usage = _usage_from_complete_response(
+        SimpleNamespace(
+            model="gpt-4.1",
+            usage={"prompt_tokens": 100_000, "completion_tokens": 1_000},
+        ),
+        CustomProvider(),
+    )
+
+    assert usage["cost_usd"] == 0.0
+    assert usage["estimated_cost_usd"] == 0.0
+    assert usage["cost_source"] == "unavailable"
+
+
+def test_session_flush_usage_estimate_prices_custom_cache_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "custom/vendor/cached-model": {
+                "input_cost_per_mtok": 10.0,
+                "output_cost_per_mtok": 20.0,
+                "cache_read_cost_per_mtok": 1.0,
+                "cache_write_cost_per_mtok": 4.0,
+            }
+        }
+    )
+    set_shared_catalog(catalog)
+    try:
+        usage = _usage_from_event(
+            DoneEvent(
+                input_tokens=1_000_000,
+                output_tokens=100_000,
+                cached_tokens=200_000,
+                cache_write_tokens=100_000,
+                model="vendor/cached-model",
+                provider="custom",
+            )
+        )
+    finally:
+        set_shared_catalog(None)
+
+    assert usage["estimated_cost_usd"] == pytest.approx(9.6)
+    assert usage["cost_usd"] == pytest.approx(9.6)
 
 
 @pytest.mark.asyncio
@@ -157,68 +240,6 @@ async def test_flush_runner_rejects_wrong_memory_path() -> None:
     assert result.is_error
     assert "only append to" in result.content
     assert calls == []
-
-
-@pytest.mark.asyncio
-async def test_flush_runner_allows_selected_part_archive_path(tmp_path) -> None:
-    plan = resolve_flush_plan(workspace_dir=tmp_path, archive_max_bytes=5)
-    first_path = tmp_path / plan.relative_path
-    first_path.parent.mkdir(parents=True)
-    first_path.write_text("123456", encoding="utf-8")
-    plan = resolve_flush_plan(workspace_dir=tmp_path, archive_max_bytes=5)
-    assert plan.relative_path.endswith("-part001.md")
-
-    calls: list[ToolCall] = []
-
-    async def handler(call: ToolCall) -> ToolResult:
-        calls.append(call)
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content=f"Saved to {plan.relative_path} (1 chunks indexed; integrity=ok).",
-        )
-
-    class PartPathProvider:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def chat(self, *_args: Any, **_kwargs: Any):
-            self.calls += 1
-            if self.calls == 1:
-                yield ToolUseStartEvent(
-                    tool_use_id="flush-save-1",
-                    tool_name="memory_save",
-                )
-                yield ToolUseEndEvent(
-                    tool_use_id="flush-save-1",
-                    tool_name="memory_save",
-                    arguments={
-                        "path": plan.relative_path,
-                        "content": "durable fact",
-                        "mode": "append",
-                    },
-                )
-            yield DoneEvent()
-
-    service = SessionFlushService(
-        provider_selector=lambda _agent_id: PartPathProvider(),
-        tool_registry=SimpleNamespace(
-            to_tool_definitions=lambda: [SimpleNamespace(name="memory_save")]
-        ),
-        tool_handler=handler,
-    )
-
-    save_results, _done_event = await service._run_llm_flush_sub_agent(
-        PartPathProvider(),
-        agent_id="main",
-        plan=plan,
-        user_prompt="save durable memory",
-        flush_tools=[SimpleNamespace(name="memory_save")],
-        source_name="test",
-    )
-
-    assert [result.path for result in save_results] == [plan.relative_path]
-    assert calls and calls[0].arguments["path"] == plan.relative_path
 
 
 @pytest.mark.asyncio

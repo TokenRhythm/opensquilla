@@ -23,11 +23,17 @@ def _live_enrichment() -> dict[str, Any]:
 
     async def _fetch() -> dict[str, Any]:
         from opensquilla.cli import gateway_client as gateway_client_module
+        from opensquilla.cli.gateway_rpc import default_gateway_url
 
         client = gateway_client_module.GatewayClient()
         extra: dict[str, Any] = {}
         try:
-            await client.connect("ws://localhost:18791/ws")
+            # The rest of the bundle is read from the selected profile's home.
+            # Enriching it from a hardcoded 127.0.0.1:18791 meant a bundle
+            # collected under `--profile x` could carry `doctor`/`channels`
+            # sections describing a different gateway, and nothing in the file
+            # said so — worse than having no live section at all (#1374).
+            await client.connect(default_gateway_url())
             for key, method in (("doctor", "doctor.status"), ("channels", "channels.status")):
                 try:
                     extra[key] = dict(await client.call(method, {}))

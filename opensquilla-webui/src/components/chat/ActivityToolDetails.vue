@@ -1,7 +1,56 @@
 <template>
-  <div class="activity-tool-details">
+  <div
+    class="activity-tool-details"
+    :class="{ 'activity-tool-details--bounded': isBoundedDetail }"
+  >
+    <template v-if="isBoundedDetail">
+      <button
+        type="button"
+        class="activity-tool-details__copy"
+        :class="{
+          'is-copied': copyState === 'copied',
+          'is-error': copyState === 'error',
+        }"
+        data-share-control
+        data-testid="activity-tool-detail-copy"
+        :aria-label="copyLabel"
+        :title="copyLabel"
+        @click.stop="copyDetails"
+      >
+        <Icon :name="copyIcon" :size="13" aria-hidden="true" />
+      </button>
+      <span
+        class="activity-tool-details__copy-status"
+        aria-live="polite"
+        aria-atomic="true"
+      >{{ copyState === 'idle' ? '' : copyLabel }}</span>
+      <div
+        class="activity-tool-details__window"
+        role="region"
+        tabindex="0"
+        :aria-label="detailActionLabel"
+      >
+        <section
+          v-for="section in detailSections"
+          :key="section.kind"
+          class="activity-tool-details__section"
+        >
+          <div class="activity-tool-details__section-label">{{ section.label }}</div>
+          <pre class="activity-tool-details__preview">{{ section.preview }}</pre>
+        </section>
+        <button
+          type="button"
+          class="activity-tool-details__view"
+          data-share-control
+          @click.stop="showRawDetails"
+        >
+          {{ t('shared.runTrace.viewFull') }}
+        </button>
+      </div>
+      <div class="activity-tool-details__fade" aria-hidden="true"></div>
+    </template>
     <div
-      v-if="projection.lines.length"
+      v-else-if="projection.lines.length"
       class="activity-tool-details__summary"
       :class="{ 'activity-tool-details__summary--interactive': projection.rawContent }"
     >
@@ -41,13 +90,28 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import Icon from '@/components/Icon.vue'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
 import {
   projectActivityToolDetail,
+  redactActivityDetail,
   type ActivityToolDetailLine,
 } from '@/utils/chat/activityToolDetails'
+import { copyTextWithFallback } from '@/utils/browser'
+
+const DETAIL_WINDOW_CHAR_LIMIT = 360
+const DETAIL_WINDOW_LINE_LIMIT = 6
+const DETAIL_PREVIEW_CHAR_LIMIT = 6_000
+const DETAIL_PREVIEW_LINE_LIMIT = 80
+
+type ActivityDetailSection = {
+  kind: 'input' | 'result' | 'error' | 'changes'
+  label: string
+  content: string
+  preview: string
+}
 
 const props = defineProps<{
   call: ChatToolCallRenderItem
@@ -63,6 +127,150 @@ const { locale, t } = useI18n()
 const projection = computed(() =>
   projectActivityToolDetail(props.call, props.operationKey),
 )
+const copyState = ref<'idle' | 'copied' | 'error'>('idle')
+let copyResetId: number | null = null
+
+function detailInputText(): string {
+  const raw = String(props.call.inputRaw || props.call.inputPreview || '').trim()
+  return raw ? redactActivityDetail(raw) : ''
+}
+
+function detailResultText(): string {
+  return redactActivityDetail(
+    String(props.call.result || props.call.resultPreview || '').trim(),
+  )
+}
+
+function detailLineCount(value: string): number {
+  return value ? value.split(/\r\n|\r|\n/).length : 0
+}
+
+function boundedPreview(value: string): string {
+  const lines = value.split(/\r\n|\r|\n/)
+  let preview = lines.slice(0, DETAIL_PREVIEW_LINE_LIMIT).join('\n')
+  let truncated = lines.length > DETAIL_PREVIEW_LINE_LIMIT
+  if (preview.length > DETAIL_PREVIEW_CHAR_LIMIT) {
+    preview = preview.slice(0, DETAIL_PREVIEW_CHAR_LIMIT).trimEnd()
+    truncated = true
+  }
+  return truncated ? `${preview}\n…` : preview
+}
+
+const detailSections = computed<ActivityDetailSection[]>(() => {
+  if (projection.value.detailMode === 'changes') {
+    const content = projection.value.rawContent
+    return content
+      ? [{
+          kind: 'changes',
+          label: t('shared.runTrace.sectionChanges'),
+          content,
+          preview: boundedPreview(content),
+        }]
+      : []
+  }
+  if (projection.value.detailMode === 'result') {
+    const content = projection.value.rawContent
+    const kind = props.call.isError || props.call.status === 'error'
+      ? 'error'
+      : 'result'
+    return content
+      ? [{
+          kind,
+          label: t(
+            kind === 'error'
+              ? 'shared.runTrace.sectionError'
+              : 'shared.runTrace.sectionResult',
+          ),
+          content,
+          preview: boundedPreview(content),
+        }]
+      : []
+  }
+  const sections: ActivityDetailSection[] = []
+  const input = detailInputText()
+  const result = detailResultText()
+  if (input) {
+    sections.push({
+      kind: 'input',
+      label: t('shared.runTrace.sectionInput'),
+      content: input,
+      preview: boundedPreview(input),
+    })
+  }
+  if (result) {
+    const kind = props.call.isError || props.call.status === 'error'
+      ? 'error'
+      : 'result'
+    sections.push({
+      kind,
+      label: t(
+        kind === 'error'
+          ? 'shared.runTrace.sectionError'
+          : 'shared.runTrace.sectionResult',
+      ),
+      content: result,
+      preview: boundedPreview(result),
+    })
+  }
+  return sections
+})
+
+const isBoundedDetail = computed(() => {
+  if (!projection.value.rawContent) return false
+  if (projection.value.detailMode) return true
+  const sections = detailSections.value
+  const characters = sections.reduce(
+    (total, section) => total + section.content.length,
+    0,
+  )
+  const lines = sections.reduce(
+    (total, section) => total + detailLineCount(section.content),
+    0,
+  )
+  return characters > DETAIL_WINDOW_CHAR_LIMIT || lines > DETAIL_WINDOW_LINE_LIMIT
+})
+
+const copyLabel = computed(() => (
+  copyState.value === 'copied'
+    ? t('chat.copied')
+    : copyState.value === 'error'
+      ? t('chat.toast.copyFailed')
+      : t('chat.copy')
+))
+
+const copyIcon = computed(() => (
+  copyState.value === 'copied'
+    ? 'check'
+    : copyState.value === 'error'
+      ? 'x'
+      : 'copy'
+))
+
+function clearCopyReset() {
+  if (copyResetId === null) return
+  window.clearTimeout(copyResetId)
+  copyResetId = null
+}
+
+function scheduleCopyReset() {
+  clearCopyReset()
+  copyResetId = window.setTimeout(() => {
+    copyState.value = 'idle'
+    copyResetId = null
+  }, 1600)
+}
+
+async function copyDetails() {
+  try {
+    await copyTextWithFallback(projection.value.rawContent)
+    copyState.value = 'copied'
+  } catch {
+    copyState.value = 'error'
+  }
+  scheduleCopyReset()
+}
+
+onBeforeUnmount(clearCopyReset)
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat(locale.value).format(value)
@@ -85,6 +293,40 @@ function formatBytes(value: number): string {
 }
 
 function formatLine(line: ActivityToolDetailLine): string {
+  if (line.kind === 'document-category') {
+    const category = {
+      DOCUMENT_PREVIEW_UNAVAILABLE: t('shared.runTrace.documentPreviewUnavailableCategory'),
+      DOCUMENT_ACTION_RESULT_UNKNOWN: t('shared.runTrace.documentActionUnknownCategory'),
+      DOCUMENT_EDIT_FAILED: t('shared.runTrace.documentEditFailedCategory'),
+    }[line.category]
+    return t('shared.runTrace.documentErrorCategory', {
+      category,
+      code: line.category,
+    })
+  }
+  if (line.kind === 'document-message') {
+    return t({
+      'document.previewUnavailable': 'shared.runTrace.documentPreviewUnavailableMessage',
+      'document.actionResultUnknown': 'shared.runTrace.documentActionUnknownMessage',
+      'document.editFailed': 'shared.runTrace.documentEditFailedMessage',
+    }[line.messageKey])
+  }
+  if (line.kind === 'document-retry') {
+    return t({
+      same_turn: 'shared.runTrace.documentRetrySameTurn',
+      new_turn: 'shared.runTrace.documentRetryNewTurn',
+      never: 'shared.runTrace.documentRetryNever',
+    }[line.policy])
+  }
+  if (line.kind === 'document-next-action') {
+    return t({
+      retry: 'shared.runTrace.documentNextRetry',
+      reinspect: 'shared.runTrace.documentNextReinspect',
+      finalize_without_tools: 'shared.runTrace.documentNextFinalize',
+      start_new_turn: 'shared.runTrace.documentNextNewTurn',
+      stop: 'shared.runTrace.documentNextStop',
+    }[line.action])
+  }
   if (line.kind === 'bytes') {
     return t('shared.runTrace.activityBytesWritten', { size: formatBytes(line.bytes) })
   }
@@ -117,8 +359,9 @@ function showRawDetails() {
     `${props.label} · ${t('shared.runTrace.activityDetailsTitle')}`,
     {
       toolName: props.call.name,
-      inputRaw: props.call.inputRaw || props.call.inputPreview,
+      inputRaw: redactActivityDetail(props.call.inputRaw || props.call.inputPreview),
       section: detail.rawSection,
+      format: detail.detailMode === 'changes' ? 'diff' : undefined,
     },
   )
 }
@@ -130,6 +373,147 @@ function showRawDetails() {
   padding: 0.0625rem 0 0.25rem;
   font-size: 0.75rem;
   line-height: 1.45;
+}
+
+.activity-tool-details--bounded {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  max-width: min(100%, 48rem);
+  max-height: min(20rem, 52vh);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+
+.activity-tool-details__window {
+  min-height: 0;
+  padding: 0.625rem 2.75rem 1.5rem 0.75rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.activity-tool-details__window:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-inset);
+}
+
+.activity-tool-details__section {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.activity-tool-details__section + .activity-tool-details__section {
+  margin-top: 0.75rem;
+}
+
+.activity-tool-details__section-label {
+  margin-bottom: 0.25rem;
+  color: var(--text-dim);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.activity-tool-details__preview {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.activity-tool-details__copy {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.375rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.activity-tool-details__copy:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.activity-tool-details__copy:focus-visible,
+.activity-tool-details__view:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.activity-tool-details__copy.is-copied {
+  color: var(--ok);
+}
+
+.activity-tool-details__copy.is-error {
+  color: var(--danger);
+}
+
+.activity-tool-details__copy-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.activity-tool-details__view {
+  margin: 0.625rem 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.71875rem;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 0.15em;
+}
+
+.activity-tool-details__view:hover,
+.activity-tool-details__view:focus-visible {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
+.activity-tool-details__fade {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1.5rem;
+  background: linear-gradient(to bottom, transparent, var(--bg-elevated));
+  pointer-events: none;
 }
 
 .activity-tool-details__summary {
@@ -261,6 +645,13 @@ function showRawDetails() {
 @media (prefers-reduced-motion: reduce) {
   .activity-tool-details__fallback {
     transition: none;
+  }
+}
+
+@media (pointer: coarse) {
+  .activity-tool-details__copy {
+    width: 2.75rem;
+    height: 2.75rem;
   }
 }
 </style>

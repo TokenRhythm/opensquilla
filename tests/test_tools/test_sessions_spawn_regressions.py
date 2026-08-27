@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +38,7 @@ from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin import sessions as sessions_tool
-from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
 
 
 class _ConfigurableConfig:
@@ -228,6 +229,140 @@ async def test_max_children_uses_spawned_by_filter_not_global_page() -> None:
             await sessions_tool.sessions_spawn(task="hi")
     finally:
         current_tool_context.reset(token)
+
+
+def test_sessions_spawn_exposes_optional_bounded_title_schema() -> None:
+    from opensquilla.tools.registry import get_default_registry
+
+    registered = get_default_registry().get("sessions_spawn")
+
+    assert registered is not None
+    assert "title" not in registered.spec.required
+    assert registered.spec.parameters["title"] == {
+        "type": "string",
+        "description": (
+            "Short human-readable task title (3-8 words). Name the work, not "
+            "the agent, and avoid generic labels such as 'Subagent task'. Omit "
+            "or leave blank to derive a bounded title from the task description."
+        ),
+        "maxLength": 512,
+    }
+    assert list(inspect.signature(sessions_tool.sessions_spawn).parameters) == [
+        "agent_id",
+        "task",
+        "model",
+        "title",
+    ]
+    assert sessions_tool._normalize_spawn_title("界" * 512, "unused") == "界" * 512
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("👨‍👩‍👧‍👦" * 6, "👨‍👩‍👧‍👦" * 4 + "..."),
+        ("🇨🇳" * 20, "🇨🇳" * 15 + "..."),
+        ("e\u0301" * 20, "e\u0301" * 15 + "..."),
+        ("각" * 12, "각" * 10 + "..."),
+    ],
+)
+def test_sessions_spawn_task_fallback_preserves_grapheme_clusters(
+    task: str,
+    expected: str,
+) -> None:
+    assert sessions_tool._normalize_spawn_title(None, task) == expected
+    assert len(expected) <= 34
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("title", "task", "expected"),
+    [
+        (
+            "  Issue #1130  搜索工具策略\n分析  🧪  ",
+            "This task body must not replace the explicit title.",
+            "Issue #1130 搜索工具策略 分析 🧪",
+        ),
+        (
+            None,
+            "Analyze the readiness search regression",
+            "Analyze the readiness search re...",
+        ),
+        (
+            " \n\t ",
+            "分析 Issue #1115 Windows 工具持续超时",
+            "分析 Issue #1115 Windows 工具持续超时",
+        ),
+    ],
+)
+async def test_sessions_spawn_persists_explicit_or_task_derived_title(
+    title: str | None,
+    task: str,
+    expected: str,
+) -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(runtime)
+
+    token = current_tool_context.set(_ctx())
+    try:
+        result = json.loads(await sessions_tool.sessions_spawn(task=task, title=title))
+    finally:
+        current_tool_context.reset(token)
+
+    assert mgr.created[0]["derived_title"] == expected
+    assert result["title"] == expected
+    assert mgr.created[0]["origin"]["task"] == task
+    assert mgr.created[0]["origin"]["execution_task"].endswith(task)
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_rejects_overlong_title_before_creation() -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(runtime)
+
+    token = current_tool_context.set(_ctx())
+    try:
+        with pytest.raises(ToolError, match="Title must not exceed 512 characters"):
+            await sessions_tool.sessions_spawn(task="bounded task", title="x" * 513)
+    finally:
+        current_tool_context.reset(token)
+
+    assert mgr.created == []
+    assert runtime.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_spawn_keeps_each_title_isolated() -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(runtime)
+
+    async def spawn(title: str) -> None:
+        token = current_tool_context.set(_ctx())
+        try:
+            await sessions_tool.sessions_spawn(task=f"Task body for {title}", title=title)
+        finally:
+            current_tool_context.reset(token)
+
+    await asyncio.gather(spawn("Issue #1115"), spawn("Issue #1130"))
+
+    assert {row["derived_title"] for row in mgr.created} == {
+        "Issue #1115",
+        "Issue #1130",
+    }
 
 
 # Bug 3 — concurrent spawns must not both pass the gate
@@ -461,7 +596,10 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     token = current_tool_context.set(parent_tool_context)
     try:
         spawned = json.loads(
-            await sessions_tool.sessions_spawn(task="exercise inherited authority")
+            await sessions_tool.sessions_spawn(
+                task="exercise inherited authority",
+                title="Inherited authority audit",
+            )
         )
     finally:
         current_tool_context.reset(token)
@@ -585,6 +723,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         assert child.spawn_depth == 1
         assert child.parent_session_key == parent_key
         assert child.origin is not None
+        assert child.derived_title == "Inherited authority audit"
         assert child.origin["parent_task_id"] == "parent-task-restart"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode_source"] == "user"

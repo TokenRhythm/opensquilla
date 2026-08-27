@@ -138,6 +138,25 @@ class TokenScopeResolver:
             raise ValueError("Public peers are not accepted")
 
         provided = str((auth_params or {}).get("token") or "")
+        if provided and role_claim == "operator":
+            from opensquilla.gateway.desktop_ownership import (
+                active_desktop_gateway_auth_token_matches,
+            )
+
+            if (
+                is_loopback_bind(config.host)
+                and is_loopback_address(peer_ip)
+                and active_desktop_gateway_auth_token_matches(provided)
+            ):
+                return Principal(
+                    role="operator",
+                    scopes=normalize_operator_scopes(config.auth.token_scopes),
+                    is_owner=True,
+                    authenticated=True,
+                    capabilities=HUMAN_TOKEN_CAPABILITIES,
+                    auth_state="authenticated",
+                    token_public_id="desktop",
+                )
         if not provided:
             return _guest_principal(
                 auth_state="guest",

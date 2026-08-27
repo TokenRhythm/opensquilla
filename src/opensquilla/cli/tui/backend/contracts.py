@@ -111,6 +111,7 @@ class TuiInputKind(Enum):
     # runtime rejects it with a notice while busy instead of silently enqueueing
     # it as conversation input.
     COMMAND_REQUIRES_IDLE = "command_requires_idle"
+    COMMAND_REQUIRES_QUEUE_EMPTY = "command_requires_queue_empty"
 
 
 @dataclass(frozen=True, eq=False)

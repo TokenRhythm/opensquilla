@@ -1,8 +1,9 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App } from 'vue'
+import { createApp, h, nextTick, reactive, type App } from 'vue'
 import i18n from '@/i18n'
 import ChatComposer from './ChatComposer.vue'
+import ChatComposerModelRouting from './ChatComposerModelRouting.vue'
 
 function pointerDown(target: EventTarget) {
   target.dispatchEvent(new Event('pointerdown', { bubbles: true, composed: true }))
@@ -18,13 +19,14 @@ async function mountComposer(overrides: Record<string, unknown> = {}) {
     busySendMode: 'queue',
     hasSendContent: false,
     isStreaming: false,
+    canStop: false,
     isNewLanding: false,
     placeholder: 'Send a message',
     sendButtonTitle: 'Send',
     runMode: 'safe',
     allowedRunModes: ['safe', 'full'],
-    modelRoutingMode: 'off',
-    modelRoutingSettingsBusy: false,
+    sessionRoutingMode: 'off',
+    sessionRoutingBusy: false,
     routerVisualEffectsEnabled: true,
     codingModeEnabled: false,
     codingModeSettingsBusy: false,
@@ -36,9 +38,9 @@ async function mountComposer(overrides: Record<string, unknown> = {}) {
     ...overrides,
   })
   app.use(i18n)
-  app.mount(el)
+  const vm = app.mount(el) as unknown as { canCollapse: () => boolean }
   await nextTick()
-  return { app: app as App<Element>, el }
+  return { app: app as App<Element>, el, vm }
 }
 
 async function clickButton(el: HTMLElement, label: string) {
@@ -64,6 +66,98 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it('keeps the focused routing option mounted while a mutation is busy', async () => {
+    const setMode = vi.fn()
+    const props = reactive({
+      modelRoutingMode: 'squilla_router',
+      busy: false,
+      onSetSessionRoutingMode: setMode,
+    })
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp({ render: () => h(ChatComposerModelRouting, props as any) })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const selected = el.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+    expect(selected).toBeTruthy()
+    selected?.focus()
+    props.busy = true
+    await nextTick()
+
+    expect(selected?.disabled).toBe(false)
+    expect(selected?.getAttribute('aria-disabled')).toBe('true')
+    expect(document.activeElement).toBe(selected)
+    selected?.click()
+    expect(setMode).not.toHaveBeenCalled()
+
+    app.unmount()
+  })
+
+  it('keeps floating visuals opt-in for non-ChatView consumers', async () => {
+    const { app, el } = await mountComposer()
+    const root = el.querySelector('.chat-composer')
+
+    expect(root?.classList.contains('chat-composer--docked')).toBe(true)
+    expect(root?.classList.contains('chat-composer--floating')).toBe(false)
+    app.unmount()
+  })
+
+  it('requests expansion before pointer, focus, and input interactions', async () => {
+    const expand = vi.fn()
+    const { app, el } = await mountComposer({ collapsed: true, onExpand: expand })
+    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+
+    pointerDown(textarea)
+    textarea.focus()
+    textarea.dispatchEvent(new Event('beforeinput', { bubbles: true }))
+
+    expect(expand).toHaveBeenCalledTimes(3)
+    app.unmount()
+  })
+
+  it('prevents collapse while a composer control owns focus or a popover is open', async () => {
+    const { app, el, vm } = await mountComposer()
+    expect(vm.canCollapse()).toBe(true)
+
+    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')!
+    textarea.focus()
+    expect(vm.canCollapse()).toBe(true)
+    textarea.blur()
+
+    const more = el.querySelector<HTMLButtonElement>('button[aria-label="More"]')!
+    more.focus()
+    expect(vm.canCollapse()).toBe(false)
+    more.blur()
+
+    await clickButton(el, 'More')
+    expect(vm.canCollapse()).toBe(false)
+    pointerDown(document.body)
+    await nextTick()
+    more.blur()
+    expect(vm.canCollapse()).toBe(true)
+    app.unmount()
+  })
+
+  it('retains attachment DOM while the visual region retracts', async () => {
+    const { app, el } = await mountComposer({
+      collapsed: true,
+      attachments: [{
+        kind: 'inline',
+        local_id: 1,
+        name: 'synthetic.txt',
+        mime: 'text/plain',
+        size: 12,
+        data: 'c3ludGhldGlj',
+      }],
+    })
+
+    expect(el.querySelector('.attachment-chip__name')?.textContent).toBe('synthetic.txt')
+    expect(el.querySelector('.chat-attachments')?.closest('.chat-collapse-region')).toBeTruthy()
+    app.unmount()
+  })
+
   it('shows an accessible Coding ON chip that requests disabling the global mode', async () => {
     const setCodingModeEnabled = vi.fn()
     const { app, el } = await mountComposer({
@@ -122,7 +216,7 @@ describe('ChatComposer popovers', () => {
   })
 
   it.each([
-    ['Model routing', '.composer-model-routing'],
+    ["This chat's model routing", '.composer-model-routing'],
     ['Execution mode', '.composer-run-mode'],
   ])('closes %s on outside pointerdown', async (label, selector) => {
     const { app, el } = await mountComposer()
@@ -154,12 +248,87 @@ describe('ChatComposer popovers', () => {
 
     await clickButton(el, 'More')
     expectPopover(el, '.chat-more-actions-menu', true)
-    await clickButton(el, 'Model routing')
+    await clickButton(el, "This chat's model routing")
     expectPopover(el, '.chat-more-actions-menu', false)
     expectPopover(el, '.composer-model-routing', true)
     await clickButton(el, 'Execution mode')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
+
+    app.unmount()
+  })
+
+  it('keeps routing choices read-only while a Goal is materializing', async () => {
+    const setMode = vi.fn()
+    const { app, el } = await mountComposer({
+      sessionRoutingControlBlocked: true,
+      onSetSessionRoutingMode: setMode,
+    })
+
+    await clickButton(el, "This chat's model routing")
+    const option = el.querySelector<HTMLButtonElement>('[role="radio"]')
+    expect(option?.getAttribute('aria-disabled')).toBe('true')
+    option?.click()
+    await nextTick()
+
+    expect(setMode).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('closes every open popover when the composer collapses', async () => {
+    const props = reactive({
+      modelValue: '',
+      'onUpdate:modelValue': () => {},
+      attachments: [],
+      busySendMode: 'queue',
+      hasSendContent: false,
+      isStreaming: false,
+      canStop: false,
+      isNewLanding: false,
+      placeholder: 'Send a message',
+      sendButtonTitle: 'Send',
+      runMode: 'safe',
+      allowedRunModes: ['safe', 'full'],
+      sessionRoutingMode: 'off',
+      sessionRoutingBusy: false,
+      routerVisualEffectsEnabled: true,
+      codingModeEnabled: false,
+      codingModeSettingsBusy: false,
+      voiceBusy: false,
+      voiceRecording: false,
+      voiceReady: true,
+      runModeLocked: false,
+      runModeLockMessage: '',
+      collapsed: false,
+    })
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp({ render: () => h(ChatComposer, props as any) })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const popovers = [
+      ['Add', '.composer-add-menu'],
+      ['More', '.chat-more-actions-menu'],
+      ["This chat's model routing", '.composer-model-routing'],
+      ['Execution mode', '.composer-run-mode'],
+    ] as const
+    for (const [label, selector] of popovers) {
+      props.collapsed = false
+      await nextTick()
+      await clickButton(el, label)
+      expectPopover(el, selector, true)
+
+      props.collapsed = true
+      await nextTick()
+      expectPopover(el, selector, false)
+    }
+
+    // re-expanding keeps the menu closed
+    props.collapsed = false
+    await nextTick()
+    expectPopover(el, '.chat-more-actions-menu', false)
 
     app.unmount()
   })
@@ -204,8 +373,8 @@ describe('ChatComposer popovers', () => {
       sendButtonTitle: 'Send',
       runMode: 'safe',
       allowedRunModes: ['safe', 'full'],
-      modelRoutingMode: 'off',
-      modelRoutingSettingsBusy: false,
+      sessionRoutingMode: 'off',
+      sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
       codingModeEnabled: false,
       codingModeSettingsBusy: false,

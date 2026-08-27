@@ -220,6 +220,37 @@ async def test_gate_off_by_default_red_final_is_accepted(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gate_skips_when_git_status_is_unavailable(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "src.py"
+    source.write_text("old\n", encoding="utf-8")
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("exec", "python /tmp/squilla-scratch/fail-run.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(workspace_dir=str(tmp_path))
+    agent = Agent(
+        provider=provider,
+        config=_gate_config(tmp_path),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    async def unavailable_status() -> None:
+        return None
+
+    monkeypatch.setattr(agent, "_workspace_git_status_porcelain", unavailable_status)
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 3
+    assert _gate_warnings(events) == []
+    assert "finalize_evidence_gate_detections" not in agent.config.metadata
+
+
+@pytest.mark.asyncio
 async def test_gate_challenges_red_final_then_accepts_verified_final(tmp_path) -> None:
     _init_git_workspace(tmp_path)
     runtime_events_path = tmp_path / "runtime_events.jsonl"

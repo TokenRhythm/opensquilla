@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from opensquilla.skills.hub.lockfile import LockEntry, Lockfile
 from opensquilla.skills.loader import SkillLoader
+from opensquilla.skills.types import SkillLayer
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
@@ -14,6 +17,39 @@ def _write_skill(dir_path: Path, name: str, body: str) -> None:
     skill_dir = dir_path / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+
+
+def _rewrite_v2_with_v1_field_filter(path: Path) -> None:
+    v1_fields = {
+        "source",
+        "identifier",
+        "version",
+        "installed_at",
+        "path",
+        "sha256",
+        "license",
+        "upstream_url",
+        "source_trust",
+        "scan_verdict",
+        "scan_strategy",
+        "scan_findings",
+    }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(
+        json.dumps(
+            {
+                "version": payload["version"],
+                "installed": {
+                    storage_key: {
+                        key: value for key, value in entry.items() if key in v1_fields
+                    }
+                    for storage_key, entry in payload["installed"].items()
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_clawdbot_namespace_resolves(tmp_path: Path) -> None:
@@ -216,3 +252,67 @@ def test_existing_bundled_skills_still_parse() -> None:
     assert on_disk.issubset(parsed_names), (
         f"loader dropped bundled skill(s): {on_disk - parsed_names}"
     )
+
+
+def test_loader_keeps_degraded_v2_entries_in_instruction_only_projection(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "skills"
+    storage_key = "package-storage"
+    runtime_name = "runtime-projection"
+    _write_skill(
+        managed,
+        storage_key,
+        "---\n"
+        f"name: {runtime_name}\n"
+        "description: Synthetic rollback loader fixture\n"
+        "always: true\n"
+        "entrypoint:\n"
+        "  command: unsafe-upstream-command\n"
+        "composition:\n"
+        "  steps: []\n"
+        "---\n"
+        "Portable instruction body.\n",
+    )
+    skill_dir = managed / storage_key
+    lock_path = tmp_path / "skills-lock.json"
+    Lockfile(
+        installed={
+            storage_key: LockEntry(
+                source="github",
+                identifier="owner/repo:skills/runtime-projection",
+                path=str(skill_dir),
+                install_id="install-demo",
+                manifest_name=runtime_name,
+                relative_path=storage_key,
+                requested_identifier="owner/repo:skills/runtime-projection@main",
+                resolved_identifier=(
+                    "owner/repo@" + "a" * 40 + ":skills/runtime-projection/SKILL.md"
+                ),
+                resolved_revision="a" * 40,
+                source_package_id="github:owner/repo:skills/runtime-projection",
+                parser_version="community-instruction-v1",
+                dialect="instruction-first",
+            )
+        }
+    ).save(lock_path)
+    _rewrite_v2_with_v1_field_filter(lock_path)
+
+    loader = SkillLoader(
+        bundled_dir=tmp_path / "bundled",
+        workspace_dir=tmp_path / "workspace",
+        managed_dir=managed,
+        personal_agents_dir=tmp_path / "personal",
+        project_agents_dir=tmp_path / "project",
+        snapshot_path=tmp_path / "snapshot.json",
+        lockfile_path=lock_path,
+    )
+
+    loaded = loader.load_all()
+
+    spec = next(item for item in loaded if item.name == runtime_name)
+    assert spec.layer is SkillLayer.MANAGED
+    assert spec.content == "Portable instruction body."
+    assert spec.always is False
+    assert spec.entrypoint is None
+    assert spec.composition_raw is None

@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import i18n from '@/i18n'
+import zhHans from '@/locales/zh-Hans.json'
 import {
   arrangeSidebarSections,
   normalizeSessionItem,
@@ -21,6 +23,37 @@ function sectionFor(sections: SidebarSection[], family: SidebarSection['family']
   if (!found) throw new Error(`missing section: ${family}`)
   return found
 }
+
+describe('normalizeSessionItem subagent titles', () => {
+  it('keeps a durable task title and preserves the legacy grounding-prompt fallback', () => {
+    expect(session({
+      key: 'agent:main:subagent:new',
+      sessionKind: 'task',
+      title: 'Analyze checkout failures',
+    }).title).toBe('Analyze checkout failures')
+
+    expect(session({
+      key: 'agent:main:subagent:legacy',
+      sessionKind: 'task',
+      title: 'You are a subagent. Execute the delegated task',
+    }).title).toBe('Subagent task')
+  })
+
+  it('localizes the generic title returned for legacy task rows', () => {
+    i18n.global.setLocaleMessage('zh-Hans', zhHans)
+    i18n.global.locale.value = 'zh-Hans'
+    try {
+      expect(session({
+        key: 'agent:main:subagent:legacy-generic',
+        sessionKind: 'task',
+        title: 'Subagent task',
+      }).title).toBe('子智能体任务')
+    }
+    finally {
+      i18n.global.locale.value = 'en'
+    }
+  })
+})
 
 describe('arrangeSidebarSections — family bucketing', () => {
   it('buckets chat, channel, and cron sessions into their families', () => {
@@ -154,22 +187,31 @@ describe('arrangeSidebarSections — subagent nesting', () => {
     expect(rows[0].depth).toBe(1)
   })
 
-  it('keeps a forked chat flat even when its parent is visible', () => {
+  it('keeps a numbered fork title flat while preserving the parent title', () => {
     const parentKey = 'agent:main:webchat:parent'
+    const parentTitle = 'Release planning notes'
     const sections = arrangeSidebarSections([
-      session({ key: parentKey, title: 'Parent chat', updatedAt: 100 }),
+      session({ key: parentKey, title: parentTitle, updatedAt: 100 }),
       session({
         key: 'agent:main:webchat:fork',
-        title: 'Forked chat',
+        title: `${parentTitle} (2)`,
         updatedAt: 200,
         forked_from_parent: true,
-        parent: { key: parentKey, title: 'Parent chat' },
+        parent: { key: parentKey, title: parentTitle },
+      }),
+      session({
+        key: 'agent:main:webchat:fork-2',
+        title: `${parentTitle} (3)`,
+        updatedAt: 300,
+        forked_from_parent: true,
+        parent: { key: parentKey, title: parentTitle },
       }),
     ])
 
     expect(sectionFor(sections, 'chats').rows.map(row => ({ title: row.title, depth: row.depth }))).toEqual([
-      { title: 'Forked chat', depth: 0 },
-      { title: 'Parent chat', depth: 0 },
+      { title: `${parentTitle} (3)`, depth: 0 },
+      { title: `${parentTitle} (2)`, depth: 0 },
+      { title: parentTitle, depth: 0 },
     ])
   })
 })

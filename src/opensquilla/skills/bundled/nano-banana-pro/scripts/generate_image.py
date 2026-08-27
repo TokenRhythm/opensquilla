@@ -620,7 +620,7 @@ def decode_data_url(data_url: str) -> bytes:
             png_bytes = output.getvalue()
     except _ImageRequestError:
         raise
-    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+    except (IndexError, OSError, SyntaxError, ValueError, Image.DecompressionBombError):
         raise _ImageRequestError("upstream image provider returned invalid image data") from None
 
     if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):

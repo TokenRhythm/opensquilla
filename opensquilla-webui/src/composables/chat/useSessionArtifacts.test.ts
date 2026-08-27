@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
@@ -46,6 +46,29 @@ function makeHarness(options: {
 }
 
 describe('useSessionArtifacts', () => {
+  it('promotes a live publication event into the durable index before stream reset', async () => {
+    const published = {
+      id: 'art-published',
+      name: 'published.html',
+      mime: 'text/html',
+      sha256: 'b'.repeat(64),
+    }
+    const { api, callMock, streamArtifacts } = makeHarness({
+      call: async () => ({ artifacts: [published], has_more: false }),
+    })
+
+    streamArtifacts.value = [published]
+    await nextTick()
+    await vi.waitFor(() => expect(callMock).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(api.indexedArtifacts.value).toEqual([published]))
+
+    // Starting the next turn clears the transient stream. The published
+    // deliverable must remain discoverable through the durable index.
+    streamArtifacts.value = []
+    await nextTick()
+    expect(api.artifacts.value).toEqual([published])
+  })
+
   it('loads every index page and merges index, history, and live fields by identity', async () => {
     const call = async (_method: string, params?: Record<string, unknown>) => {
       if (params?.before === 'cursor-2') {

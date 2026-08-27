@@ -1,174 +1,186 @@
 #!/usr/bin/env python3
-"""Fail closed when required CI jobs or classifier outputs are incomplete."""
+"""Fail closed when the canonical CI plan or required job results are incomplete."""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Mapping
 from typing import Final
 
-BOOLEAN_FLAGS: Final[tuple[str, ...]] = (
-    "docs_only",
-    "runtime_changed",
-    "test_changed",
-    "ci_changed",
-    "dependency_changed",
-    "release_changed",
-    "windows_full_required",
-    "frontend_changed",
-    "tui_changed",
-    "desktop_changed",
-    "python_changed",
-    "platform_sensitive_changed",
-    "build_wheel_required",
-    "toolchain_artifact_changed",
-    "full_required",
+PLANNER_RESULT: Final[tuple[str, str]] = ("RESULT_PLANNER", "Plan CI suites")
+BASELINE_SUITES: Final[frozenset[str]] = frozenset(
+    {"readme-locale", "workflow-lint"}
 )
 
-ALWAYS_REQUIRED_RESULTS: Final[tuple[tuple[str, str], ...]] = (
-    ("RESULT_CLASSIFY", "Classify changed files"),
-    ("RESULT_WORKFLOW_LINT", "Workflow lint"),
-    ("RESULT_README_LOCALE", "README locale parity"),
+JOB_RESULT_LABELS: Final[dict[str, str]] = {
+    "RESULT_WORKFLOW_LINT": "Workflow lint",
+    "RESULT_README_LOCALE": "README locale parity",
+    "RESULT_FRONTEND_ARTIFACT": "Frontend artifact",
+    "RESULT_FRONTEND": "Frontend validation and wheel WebUI roundtrip",
+    "RESULT_TUI": "OpenTUI package tests",
+    "RESULT_DESKTOP": "Desktop Electron unit tests",
+    "RESULT_UBUNTU": "Ubuntu quality gate",
+    "RESULT_UBUNTU_FULL": "Ubuntu full test matrix",
+    "RESULT_WINDOWS_FULL": "Windows high-risk matrix",
+    "RESULT_MACOS_RECOVERY": "macOS profile recovery and native no-replace tests",
+    "RESULT_DESKTOP_RECOVERY_E2E": "Desktop recovery E2E matrix",
+    "RESULT_WEBUI_CHAT_RECOVERY": "WebUI chat recovery browser contracts",
+    "RESULT_RELEASE": "Release packaging contracts",
+    "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS": "Managed Toolchain Artifact E2E",
+    "RESULT_SKILL_HUB": "Skill Hub contract matrix",
+}
+
+KNOWN_SUITES: Final[frozenset[str]] = frozenset(
+    {
+        "desktop-recovery-e2e",
+        "desktop-static",
+        "frontend-artifact",
+        "frontend-validation",
+        "macos-recovery",
+        "managed-toolchain",
+        "python-full",
+        "python-targeted",
+        "readme-locale",
+        "release-packaging",
+        "skill-hub",
+        "tui",
+        "webui-chat-recovery",
+        "wheel-webui-roundtrip",
+        "windows-high-risk",
+        "workflow-lint",
+    }
 )
 
+# A suite may require more than one job, and multiple suites may share one job.
+# Keep this mapping explicit so contract drift fails closed instead of silently
+# accepting a planner suite that the aggregate gate does not understand.
+SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
+    "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E",),
+    "desktop-static": ("RESULT_DESKTOP",),
+    "frontend-artifact": ("RESULT_FRONTEND_ARTIFACT",),
+    "frontend-validation": ("RESULT_FRONTEND",),
+    "macos-recovery": ("RESULT_MACOS_RECOVERY",),
+    "managed-toolchain": ("RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",),
+    "python-full": ("RESULT_UBUNTU", "RESULT_UBUNTU_FULL"),
+    "python-targeted": ("RESULT_UBUNTU",),
+    "readme-locale": ("RESULT_README_LOCALE",),
+    "release-packaging": ("RESULT_RELEASE",),
+    "skill-hub": ("RESULT_SKILL_HUB",),
+    "tui": ("RESULT_TUI",),
+    "webui-chat-recovery": ("RESULT_WEBUI_CHAT_RECOVERY",),
+    "wheel-webui-roundtrip": ("RESULT_FRONTEND",),
+    "windows-high-risk": ("RESULT_WINDOWS_FULL",),
+    "workflow-lint": ("RESULT_WORKFLOW_LINT",),
+}
 
-def _flag_env(name: str) -> str:
-    return f"FLAG_{name.upper()}"
 
-
-def _read_flags(env: Mapping[str, str], errors: list[str]) -> dict[str, bool]:
-    flags: dict[str, bool] = {}
-    for name in BOOLEAN_FLAGS:
-        raw = env.get(_flag_env(name), "")
-        if raw not in {"true", "false"}:
-            errors.append(f"Classifier output {name} must be exactly true or false; got {raw!r}.")
-            continue
-        flags[name] = raw == "true"
-    return flags
-
-
-def _require_result(
+def _require_exact_result(
     env: Mapping[str, str],
     errors: list[str],
     variable: str,
     label: str,
     *,
-    required: bool,
+    expected: str,
 ) -> None:
     result = env.get(variable, "")
-    allowed = {"success"} if required else {"success", "skipped"}
-    if result not in allowed:
-        expectation = "succeed" if required else "be successful or intentionally skipped"
-        errors.append(f"{label} must {expectation}; got {result or 'missing'}.")
+    if result != expected:
+        errors.append(f"{label} must be {expected}; got {result or 'missing'}.")
+
+
+def _read_required_suites(env: Mapping[str, str], errors: list[str]) -> set[str]:
+    raw = env.get("REQUIRED_SUITES")
+    if raw is None:
+        errors.append("Suite planner output required_suites is missing.")
+        return set()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        errors.append("Suite planner output required_suites must be valid JSON.")
+        return set()
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        errors.append("Suite planner output required_suites must be a list of strings.")
+        return set()
+    if value != sorted(set(value)):
+        errors.append("Suite planner output required_suites must be sorted and duplicate-free.")
+        return set()
+    unknown = sorted(set(value) - KNOWN_SUITES)
+    if unknown:
+        errors.append("Suite planner selected unknown suites: " + ", ".join(unknown))
+    required_suites = set(value)
+    missing_baseline = sorted(BASELINE_SUITES - required_suites)
+    if missing_baseline:
+        errors.append(
+            "Suite planner omitted baseline suites: " + ", ".join(missing_baseline)
+        )
+    return required_suites
+
+
+def _validate_suite_result_contract(errors: list[str]) -> None:
+    mapped_suites = set(SUITE_RESULT_REQUIREMENTS)
+    missing_suites = sorted(KNOWN_SUITES - mapped_suites)
+    if missing_suites:
+        errors.append("CI result mappings are missing suites: " + ", ".join(missing_suites))
+
+    unknown_suites = sorted(mapped_suites - KNOWN_SUITES)
+    if unknown_suites:
+        errors.append("CI result mappings contain unknown suites: " + ", ".join(unknown_suites))
+
+    for suite, variables in sorted(SUITE_RESULT_REQUIREMENTS.items()):
+        if not variables:
+            errors.append(f"CI result mapping for {suite} must contain at least one job result.")
+            continue
+        unknown_variables = sorted(set(variables) - set(JOB_RESULT_LABELS))
+        if unknown_variables:
+            errors.append(
+                f"CI result mapping for {suite} contains unknown job results: "
+                + ", ".join(unknown_variables)
+            )
 
 
 def check_ci_results(env: Mapping[str, str]) -> list[str]:
     """Return gate errors; an empty list means the aggregate check may pass."""
 
     errors: list[str] = []
-    flags = _read_flags(env, errors)
-
-    for variable, label in ALWAYS_REQUIRED_RESULTS:
-        _require_result(env, errors, variable, label, required=True)
-
-    if len(flags) != len(BOOLEAN_FLAGS):
-        return errors
-
-    full = flags["full_required"]
-    conditional_results = (
-        (
-            "RESULT_FRONTEND",
-            "Frontend build, tests, and artifact",
-            flags["frontend_changed"]
-            or flags["build_wheel_required"]
-            or flags["platform_sensitive_changed"]
-            or flags["desktop_changed"]
-            or full,
-        ),
-        ("RESULT_TUI", "OpenTUI package tests", flags["tui_changed"] or full),
-        ("RESULT_DESKTOP", "Desktop Electron unit tests", flags["desktop_changed"] or full),
-        ("RESULT_UBUNTU", "Ubuntu quality gate", flags["python_changed"] or full),
-        ("RESULT_UBUNTU_FULL", "Ubuntu full test matrix", full),
-        (
-            "RESULT_WINDOWS_SMOKE",
-            "Windows compatibility smoke tests",
-            flags["python_changed"]
-            or flags["platform_sensitive_changed"]
-            or flags["dependency_changed"]
-            or flags["release_changed"]
-            or full,
-        ),
-        (
-            "RESULT_WINDOWS_FULL",
-            "Windows high-risk matrix",
-            flags["windows_full_required"] or full,
-        ),
-        (
-            "RESULT_MACOS_RECOVERY",
-            "macOS profile recovery and native no-replace tests",
-            flags["platform_sensitive_changed"] or flags["desktop_changed"] or full,
-        ),
-        (
-            "RESULT_DESKTOP_RECOVERY_E2E",
-            "Desktop recovery E2E matrix",
-            flags["frontend_changed"]
-            or flags["platform_sensitive_changed"]
-            or flags["desktop_changed"]
-            or full,
-        ),
-        (
-            "RESULT_RELEASE",
-            "Release packaging contracts",
-            flags["release_changed"] or full,
-        ),
-        (
-            "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",
-            "Managed Toolchain Artifact E2E",
-            flags["toolchain_artifact_changed"] or full,
-        ),
+    planner_variable, planner_label = PLANNER_RESULT
+    _require_exact_result(
+        env,
+        errors,
+        planner_variable,
+        planner_label,
+        expected="success",
     )
-    for variable, label, required in conditional_results:
-        _require_result(env, errors, variable, label, required=required)
 
-    if flags["platform_sensitive_changed"] and not flags["windows_full_required"]:
-        errors.append("Platform-sensitive changes must require the Windows high-risk matrix.")
+    _validate_suite_result_contract(errors)
+    required_suites = _read_required_suites(env, errors)
 
-    if full:
-        if flags["docs_only"]:
-            errors.append("A full CI run cannot be classified as docs-only.")
-        for name in BOOLEAN_FLAGS:
-            if name in {"docs_only", "full_required"}:
-                continue
-            if not flags[name]:
-                errors.append(f"Full CI classification must set {name}=true.")
-
-    if flags["docs_only"]:
-        active = [
-            name
-            for name in BOOLEAN_FLAGS
-            if name != "docs_only" and flags[name]
-        ]
-        if active:
-            errors.append(
-                "Docs-only classification cannot enable other flags: " + ", ".join(active)
-            )
+    required_results = {
+        variable
+        for suite in required_suites & KNOWN_SUITES
+        for variable in SUITE_RESULT_REQUIREMENTS.get(suite, ())
+    }
+    for variable, label in JOB_RESULT_LABELS.items():
+        _require_exact_result(
+            env,
+            errors,
+            variable,
+            label,
+            expected="success" if variable in required_results else "skipped",
+        )
 
     return errors
 
 
 def main() -> int:
     errors = check_ci_results(os.environ)
-    for variable, label in ALWAYS_REQUIRED_RESULTS:
+    planner_variable, planner_label = PLANNER_RESULT
+    print(f"{planner_label}: {os.environ.get(planner_variable, 'missing')}")
+    print(f"Required suites: {os.environ.get('REQUIRED_SUITES', 'missing')}")
+    for variable, label in JOB_RESULT_LABELS.items():
         print(f"{label}: {os.environ.get(variable, 'missing')}")
-    print(
-        "Classifier flags: "
-        + " ".join(
-            f"{name}={os.environ.get(_flag_env(name), 'missing')}" for name in BOOLEAN_FLAGS
-        )
-    )
     if not errors:
-        print("All required CI results are complete and successful.")
+        print("All planner-required CI results are complete and successful.")
         return 0
     for error in errors:
         print(f"ERROR: {error}", file=sys.stderr)

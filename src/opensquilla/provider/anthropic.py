@@ -1090,7 +1090,6 @@ class AnthropicProvider:
                 "provider.stream_internal_error",
                 provider=self.provider_name,
                 model=self._model,
-                error=message,
                 exception_type=type(exc).__name__,
             )
             trace.record_error(

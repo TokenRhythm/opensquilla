@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from opensquilla.engine.pricing import estimate_cost, resolve_model_price  # noqa: E402
+from opensquilla.provider.compat_policy import effective_reasoning_format  # noqa: E402
 from opensquilla.provider.model_catalog import ModelCatalog  # noqa: E402
 from opensquilla.provider.openai import _versioned_api_url  # noqa: E402
 from opensquilla.provider.reasoning_dialects import (  # noqa: E402
@@ -161,18 +162,18 @@ _DEFAULT_MODELS = {
     "tencent_tokenhub_intl": "deepseek-v3.2",
     "tencent_token_plan": "hy3",
     "tencent_token_plan_anthropic": "hy3",
-    "tokenrhythm": "deepseek-v4-flash",
+    "tokenrhythm": "deepseek-v4-pro-0813",
 }
 
-# Providers whose models spend reasoning tokens out of max_tokens before any
-# text: the CLI default budget of 64 would come back as empty content with
-# finish_reason "length", failing the smoke for provider-independent reasons.
+# Test-only floors for providers whose models spend reasoning tokens out of
+# max_tokens before any text. These keep the CLI's default 64-token live smoke
+# from failing for provider-independent reasons; exact probes can bypass them.
 _MIN_MAX_TOKENS = {
     # MiniMax M2.7 honors the output cap exactly and may spend most of a
     # 32-token smoke on its answer preamble before reaching the marker.
     # Sixty-four remains inside the ordinary-smoke contract.
     "minimax": 64,
-    "tokenrhythm": 1024,
+    "tokenrhythm": 4096,
 }
 
 _DIRECT_TIMEOUT_SECONDS = 60.0
@@ -278,9 +279,14 @@ def _apply_direct_reasoning_off(
     if not caps.supports_reasoning:
         return
     spec = get_provider_spec(provider)
+    reasoning_format = effective_reasoning_format(
+        spec.compat,
+        caps.reasoning_format,
+        base_url,
+    )
     apply_reasoning_disable(
         payload,
-        caps.reasoning_format,
+        reasoning_format,
         ReasoningDisableArgs(
             model=model,
             disable_reasoning_by_default_models=(

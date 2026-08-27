@@ -138,6 +138,9 @@ def _exception_status_code(exc: Exception) -> int | None:
 _ProviderConfigIdentity = tuple[
     str, str, str, str, str, str, bool, tuple[tuple[str, str], ...]
 ]
+_CapacityConfigIdentity = tuple[
+    str, str, str, str, str, str, tuple[tuple[str, str], ...]
+]
 
 
 def _provider_config_identity(cfg: ProviderConfig) -> _ProviderConfigIdentity:
@@ -150,6 +153,21 @@ def _provider_config_identity(cfg: ProviderConfig) -> _ProviderConfigIdentity:
         cfg.org_id,
         cfg.proxy,
         cfg.replay_provider_state,
+        provider_routing,
+    )
+
+
+def _capacity_config_identity(cfg: ProviderConfig) -> _CapacityConfigIdentity:
+    """Identity of one physical deployment for capacity-bound failover."""
+
+    provider_routing = tuple(sorted((str(k), str(v)) for k, v in cfg.provider_routing.items()))
+    return (
+        cfg.provider,
+        cfg.model,
+        cfg.api_key,
+        cfg.base_url,
+        cfg.org_id,
+        cfg.proxy,
         provider_routing,
     )
 
@@ -369,6 +387,43 @@ class ModelSelector:
         # Keep it after rewriting the current chain so a plugin that supplies
         # a new failover chain later cannot re-enable provider-private replay.
         self._provider_state_replay_disabled = False
+        self._capacity_bounded_fallbacks: frozenset[_CapacityConfigIdentity] | None = None
+
+    def _apply_capacity_fallback_bound(self) -> None:
+        allowed = self._capacity_bounded_fallbacks
+        if allowed is None:
+            return
+        current = self._chain[self._index]
+        tail = [
+            cfg
+            for cfg in self._chain[self._index + 1 :]
+            if _capacity_config_identity(cfg) in allowed
+        ]
+        self._chain = [current, *tail]
+        self._index = 0
+
+    def _install_capacity_fallback_bound(self, entries: list[object]) -> None:
+        current = self._chain[self._index]
+        materialized: list[ProviderConfig] = []
+        for entry in entries:
+            if isinstance(entry, ProviderConfig):
+                materialized.append(entry)
+                continue
+            if not isinstance(entry, Mapping):
+                continue
+            provider = str(entry.get("provider") or current.provider).strip()
+            model = str(entry.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            materialized.extend(
+                cfg
+                for cfg in self._chain[self._index + 1 :]
+                if cfg.provider == provider and cfg.model == model
+            )
+        self._capacity_bounded_fallbacks = frozenset(
+            _capacity_config_identity(cfg) for cfg in materialized
+        )
+        self._apply_capacity_fallback_bound()
 
     @property
     def is_configured(self) -> bool:
@@ -430,8 +485,60 @@ class ModelSelector:
         """
         if not self.has_fallback():
             raise IndexError("No more provider fallbacks available")
-        self._index += 1
-        return _build_provider(self._chain[self._index])
+        next_index = self._index + 1
+        provider = _build_provider(self._chain[next_index])
+        self._index = next_index
+        return provider
+
+    def next_fallback_matching(
+        self,
+        *,
+        predicate: Callable[[ProviderConfig], bool],
+    ) -> LLMProvider:
+        """Atomically advance to the first matching static fallback."""
+
+        current = self._chain[self._index]
+        matching_chain = [
+            candidate
+            for candidate in self._chain[self._index + 1 :]
+            if predicate(candidate)
+        ]
+        return self._activate_fallback_chain(current, matching_chain)
+
+    def _fallback_chain_after_failure(
+        self,
+        primary_failure: Exception,
+    ) -> tuple[ProviderConfig, list[ProviderConfig]]:
+        """Resolve and constrain a failure-specific chain without mutating state."""
+
+        current = self._chain[self._index]
+        if self._plugin is not None and hasattr(self._plugin, "failover_hook"):
+            chain = resolve_failover_chain(primary_failure, self._config, self._plugin)
+        else:
+            chain = list(self._chain[self._index + 1 :])
+        if self._provider_state_replay_disabled:
+            chain = [_without_provider_state_replay(cfg) for cfg in chain]
+        if self._capacity_bounded_fallbacks is not None:
+            chain = [
+                cfg
+                for cfg in chain
+                if _capacity_config_identity(cfg) in self._capacity_bounded_fallbacks
+            ]
+        return current, chain
+
+    def _activate_fallback_chain(
+        self,
+        current: ProviderConfig,
+        chain: list[ProviderConfig],
+    ) -> LLMProvider:
+        """Build the first candidate before atomically installing its chain."""
+
+        if not chain:
+            raise IndexError("No fallback chain available")
+        provider = _build_provider(chain[0])
+        self._chain = [current, *chain]
+        self._index = 1
+        return provider
 
     def next_fallback_after_failure(self, primary_failure: Exception) -> LLMProvider:
         """Advance to the next fallback, consulting ``plugin.failover_hook``.
@@ -440,20 +547,28 @@ class ModelSelector:
         replaces the static fallback chain from ``SelectorConfig``. An
         empty chain raises ``IndexError`` exactly like ``next_fallback``.
         """
-        current = self._chain[self._index]
-        if self._plugin is not None and hasattr(self._plugin, "failover_hook"):
-            chain = resolve_failover_chain(primary_failure, self._config, self._plugin)
-        else:
-            chain = list(self._chain[self._index + 1 :])
-        if self._provider_state_replay_disabled:
-            chain = [_without_provider_state_replay(cfg) for cfg in chain]
-        if not chain:
-            raise IndexError("No fallback chain available")
-        self._chain = [current, *chain]
-        self._index = 1
-        return _build_provider(self._chain[self._index])
 
-    def override_provider_config(self, cfg: ProviderConfig) -> None:
+        current, chain = self._fallback_chain_after_failure(primary_failure)
+        return self._activate_fallback_chain(current, chain)
+
+    def next_fallback_after_failure_matching(
+        self,
+        primary_failure: Exception,
+        *,
+        predicate: Callable[[ProviderConfig], bool],
+    ) -> LLMProvider:
+        """Atomically advance to the first constrained fallback candidate."""
+
+        current, chain = self._fallback_chain_after_failure(primary_failure)
+        matching_chain = [candidate for candidate in chain if predicate(candidate)]
+        return self._activate_fallback_chain(current, matching_chain)
+
+    def override_provider_config(
+        self,
+        cfg: ProviderConfig,
+        *,
+        preserve_existing_tail: bool = True,
+    ) -> None:
         """Replace the active chain head with a full per-turn provider config.
 
         Cross-provider tier execution: unlike ``override_model`` (which keeps
@@ -467,7 +582,10 @@ class ModelSelector:
         original_primary = self._chain[0]
         deduped_fallbacks: list[ProviderConfig] = []
         seen: set[_ProviderConfigIdentity] = {_provider_config_identity(cfg)}
-        for candidate in [original_primary, *self._chain[1:]]:
+        candidates = (
+            [original_primary, *self._chain[1:]] if preserve_existing_tail else []
+        )
+        for candidate in candidates:
             identity = _provider_config_identity(candidate)
             if identity in seen:
                 continue
@@ -475,6 +593,17 @@ class ModelSelector:
             deduped_fallbacks.append(candidate)
         self._chain = [cfg, *deduped_fallbacks]
         self._index = 0
+        self._apply_capacity_fallback_bound()
+
+    def override_provider_config_with_bounded_fallbacks(
+        self,
+        cfg: ProviderConfig,
+        approved_fallbacks: list[object],
+    ) -> None:
+        """Install a cross-provider head while preserving only proven fallbacks."""
+
+        self.override_provider_config(cfg)
+        self._install_capacity_fallback_bound(approved_fallbacks)
 
     def override_model(self, model: str) -> None:
         """Update the model on the primary provider config (for runtime switching)."""
@@ -503,6 +632,7 @@ class ModelSelector:
                 deduped_fallbacks.append(cfg)
             self._chain = [overridden_primary, *deduped_fallbacks]
             self._index = 0
+            self._apply_capacity_fallback_bound()
 
     def override_original_primary_model(self, model: str) -> None:
         """Restore the turn clone's configured primary and apply a model.
@@ -530,6 +660,7 @@ class ModelSelector:
             deduped_fallbacks.append(candidate)
         self._chain = [restored, *deduped_fallbacks]
         self._index = 0
+        self._apply_capacity_fallback_bound()
 
     def disable_provider_state_replay(self) -> None:
         """Disable provider-private history replay across the whole turn chain."""
@@ -547,6 +678,8 @@ class ModelSelector:
         self,
         model: str,
         fallback_chain: list[object],
+        *,
+        preserve_existing_tail: bool = True,
     ) -> None:
         """Override primary model and prefer router-provided fallback models.
 
@@ -557,7 +690,7 @@ class ModelSelector:
         skipped instead of guessing secrets.
         """
         self.override_model(model)
-        if not fallback_chain:
+        if not fallback_chain and preserve_existing_tail:
             return
 
         current = self._chain[0]
@@ -599,7 +732,12 @@ class ModelSelector:
         seen: set[_ProviderConfigIdentity] = {
             _provider_config_identity(current)
         }
-        for cfg in [*router_fallbacks, *existing_tail]:
+        candidates = (
+            [*router_fallbacks, *existing_tail]
+            if preserve_existing_tail
+            else router_fallbacks
+        )
+        for cfg in candidates:
             identity = _provider_config_identity(cfg)
             if identity in seen:
                 continue
@@ -607,6 +745,37 @@ class ModelSelector:
             deduped_tail.append(cfg)
         self._chain = [current, *deduped_tail]
         self._index = 0
+
+    def override_model_with_bounded_fallback_chain(
+        self,
+        model: str,
+        fallback_chain: list[object],
+        approved_configured_fallbacks: list[object] | None = None,
+    ) -> None:
+        """Install only definitely capacity-safe fallbacks for a floored turn."""
+
+        allowed_entries = [*fallback_chain, *(approved_configured_fallbacks or [])]
+        if allowed_entries and all(
+            isinstance(entry, ProviderConfig) for entry in allowed_entries
+        ):
+            self.override_model(model)
+            current = self._chain[0]
+            deduped_tail: list[ProviderConfig] = []
+            seen: set[_ProviderConfigIdentity] = {
+                _provider_config_identity(current)
+            }
+            for entry in allowed_entries:
+                assert isinstance(entry, ProviderConfig)
+                identity = _provider_config_identity(entry)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                deduped_tail.append(entry)
+            self._chain = [current, *deduped_tail]
+            self._index = 0
+        else:
+            self.override_model_with_fallback_chain(model, fallback_chain)
+        self._install_capacity_fallback_bound(allowed_entries)
 
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""
@@ -641,6 +810,8 @@ class ModelSelector:
         )
         cloned = ModelSelector(config_copy, plugin=self._plugin)
         cloned._provider_state_replay_disabled = self._provider_state_replay_disabled
+        cloned._capacity_bounded_fallbacks = self._capacity_bounded_fallbacks
+        cloned._apply_capacity_fallback_bound()
         return cloned
 
     async def list_models(self) -> list[dict]:

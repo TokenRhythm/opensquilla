@@ -66,6 +66,34 @@ describe('ConfirmModal accessibility', () => {
     await expect(confirmed).resolves.toBe(true)
   })
 
+  it('can present save and discard as the only visible actions', async () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    app = createApp(ConfirmModal)
+    app.use(i18n)
+    app.mount(root)
+
+    const choice = useConfirm().confirmChoice({
+      title: 'Save changes before closing?',
+      body: 'Choose how to handle the current edits.',
+      primaryLabel: 'Save and close',
+      secondaryLabel: 'Discard changes',
+      showCancel: false,
+    })
+    await nextTick()
+    await nextTick()
+
+    const labels = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('.modal__footer button'),
+      button => button.textContent?.trim(),
+    )
+    expect(labels).toEqual(['Discard changes', 'Save and close'])
+    expect(document.activeElement?.textContent?.trim()).toBe('Save and close')
+
+    document.querySelector<HTMLButtonElement>('.modal__secondary')?.click()
+    await expect(choice).resolves.toBe('secondary')
+  })
+
   it('places Cancel before Trust and open in the project trust prompt', async () => {
     const root = document.createElement('div')
     document.body.appendChild(root)

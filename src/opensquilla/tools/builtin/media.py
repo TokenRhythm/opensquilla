@@ -458,7 +458,7 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         metadata = provider_metadata(provider)
         stream = account_provider_stream(
             lambda: provider.chat(messages=messages, config=config),
-            provider=metadata.provider_name or metadata.provider_kind,
+            provider=metadata.provider_id or metadata.provider_name or metadata.provider_kind,
             model=metadata.model,
         )
         close_stream = stream

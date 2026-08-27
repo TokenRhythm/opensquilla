@@ -282,7 +282,7 @@ async def test_reusable_envelopes_never_retain_execution_freshness() -> None:
         ("default", True),
         ("runtime_send", False),
         ("runtime_send", False),
-        ("default", False),
+        ("runtime_send", False),
     ]
     assert cached.sandbox_run_context_fresh is False
     assert cached.metadata is not fresh.metadata

@@ -194,6 +194,47 @@ def test_resolve_target_follows_configured_default_tier():
     assert target.model == "deepseek/deepseek-v4-flash"
 
 
+def test_resolve_target_direct_mode_uses_provider_model_instead_of_default_tier():
+    cfg = SimpleNamespace(tier=None, model=None, timeout_seconds=30.0)
+    provider = _FakeProvider(provider_kind="tokenrhythm", model="mimo-v2.5-pro")
+
+    target = resolve_naming_target(
+        cfg,
+        _router("c1"),
+        provider,
+        None,
+        use_router_default_tier=False,
+    )
+
+    assert target.model == "mimo-v2.5-pro"
+
+
+@pytest.mark.parametrize(
+    ("tier", "model", "expected"),
+    [
+        ("c0", None, "deepseek/deepseek-v4-flash"),
+        ("c0", "explicit/model", "explicit/model"),
+    ],
+)
+def test_resolve_target_direct_mode_preserves_explicit_naming_overrides(
+    tier,
+    model,
+    expected,
+):
+    cfg = SimpleNamespace(tier=tier, model=model, timeout_seconds=30.0)
+    provider = _FakeProvider(provider_kind="tokenrhythm", model="mimo-v2.5-pro")
+
+    target = resolve_naming_target(
+        cfg,
+        _router("c1"),
+        provider,
+        None,
+        use_router_default_tier=False,
+    )
+
+    assert target.model == expected
+
+
 def test_resolve_target_falls_back_to_provider_model():
     cfg = SimpleNamespace(tier=None, model=None, timeout_seconds=30.0)
     empty_router = SimpleNamespace(tiers={}, default_tier="c1")
@@ -367,6 +408,63 @@ async def test_call_naming_llm_payload_and_sanitization(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["headers"]["HTTP-Referer"] == "https://opensquilla.ai"
     assert captured["headers"]["X-Title"] == "OpenSquilla"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected_max_tokens"),
+    [
+        ("tokenrhythm", "https://custom-tokenrhythm.example/v1", 1024),
+        ("openrouter", "https://openrouter.ai/api/v1", 512),
+    ],
+)
+async def test_call_naming_llm_selects_output_budget_by_provider_kind(
+    monkeypatch,
+    provider,
+    base_url,
+    expected_max_tokens,
+):
+    captured: dict = {}
+    budget_calls: list[dict] = []
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **kwargs: _fake_client(captured),
+    )
+
+    def resolve_budget(*args, **kwargs):
+        budget_calls.append(kwargs)
+        return AuxiliaryRequestBudget(
+            provider_id=kwargs["provider_id"],
+            model=kwargs["model"],
+            context_window_tokens=32_000,
+            max_output_tokens=kwargs["max_output_tokens"],
+            max_input_tokens=16_000,
+            provider_request_max_chars=64_000,
+            context_window_source="test",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.session.naming.resolve_auxiliary_request_budget",
+        resolve_budget,
+    )
+
+    title = await call_naming_llm(
+        "Help me reset my password please",
+        model="deepseek-v4-pro",
+        api_key="test-key",
+        base_url=base_url,
+        provider=provider,
+    )
+
+    assert title == "Reset my password"
+    assert budget_calls == [
+        {
+            "provider_id": provider,
+            "model": "deepseek-v4-pro",
+            "max_output_tokens": expected_max_tokens,
+        }
+    ]
+    assert captured["json"]["max_tokens"] == expected_max_tokens
 
 
 @pytest.mark.asyncio
@@ -752,7 +850,12 @@ async def test_old_db_without_derived_title_migrates():
 # ── generate_session_title (orchestrator) ───────────────────────────────────
 
 
-def _patch_provider_and_emit(monkeypatch, *, title: str | None):
+def _patch_provider_and_emit(
+    monkeypatch,
+    *,
+    title: str | None,
+    provider_model: str = "deepseek-v4-pro",
+):
     """Patch provider resolution, the LLM call, and the broadcast; capture emits."""
     import opensquilla.gateway.rpc_chat as rpc_chat_mod
     import opensquilla.gateway.rpc_sessions as rpc_sessions_mod
@@ -766,7 +869,8 @@ def _patch_provider_and_emit(monkeypatch, *, title: str | None):
         # aimed at another provider. The explicit model keeps resolution alive
         # via the connection fallback if the default profile ever changes.
         lambda ctx, session: _FakeProvider(
-            provider_kind="tokenrhythm", model="deepseek-v4-pro"
+            provider_kind="tokenrhythm",
+            model=provider_model,
         ),
     )
 
@@ -819,6 +923,86 @@ async def test_generate_session_title_writes_and_broadcasts(storage, mgr, monkey
     assert emit_key == key
     assert event_name == "sessions.changed"
     assert payload["reason"] == "auto_titled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("routing_mode", "expected_model"),
+    [
+        ("direct", "mimo-v2.5-pro"),
+        ("direct_observe", "mimo-v2.5-pro"),
+        ("router", "deepseek-v4-pro"),
+        ("ensemble", "deepseek-v4-pro"),
+    ],
+)
+async def test_generate_session_title_follows_model_routing_mode(
+    storage,
+    mgr,
+    monkeypatch,
+    routing_mode,
+    expected_model,
+):
+    calls, _emits = _patch_provider_and_emit(
+        monkeypatch,
+        title="Routing Mode",
+        provider_model="mimo-v2.5-pro",
+    )
+    key = f"agent:main:webchat:naming-{routing_mode}"
+    await storage.upsert_session(
+        SessionNode(
+            session_key=key,
+            session_id=f"sid-{routing_mode}",
+            display_name="WebChat",
+        )
+    )
+    config = GatewayConfig()
+    config.squilla_router.tiers = {
+        "c1": {"provider": "tokenrhythm", "model": "deepseek-v4-pro"}
+    }
+    config.squilla_router.default_tier = "c1"
+    config.squilla_router.enabled = routing_mode in {"direct_observe", "router"}
+    config.squilla_router.rollout_phase = (
+        "full" if routing_mode == "router" else "observe"
+    )
+    config.llm_ensemble.enabled = routing_mode == "ensemble"
+    ctx = SimpleNamespace(config=config, session_manager=mgr, provider_selector=None)
+
+    await generate_session_title(ctx, key, "Which model names this session?")
+
+    assert calls["llm"] == 1
+    assert calls["kwargs"]["model"] == expected_model
+
+
+@pytest.mark.asyncio
+async def test_generate_session_title_direct_inherits_session_model_override(
+    storage,
+    mgr,
+    monkeypatch,
+):
+    calls, _emits = _patch_provider_and_emit(
+        monkeypatch,
+        title="Pinned Session",
+        provider_model="",
+    )
+    key = "agent:main:webchat:naming-session-model-override"
+    await storage.upsert_session(
+        SessionNode(
+            session_key=key,
+            session_id="sid-session-model-override",
+            display_name="WebChat",
+            model_override="session-pinned-model",
+        )
+    )
+    config = GatewayConfig()
+    config.squilla_router.enabled = False
+    config.squilla_router.rollout_phase = "observe"
+    config.llm_ensemble.enabled = False
+    ctx = SimpleNamespace(config=config, session_manager=mgr, provider_selector=None)
+
+    await generate_session_title(ctx, key, "Use my pinned session model")
+
+    assert calls["llm"] == 1
+    assert calls["kwargs"]["model"] == "session-pinned-model"
 
 
 @pytest.mark.asyncio

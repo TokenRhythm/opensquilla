@@ -133,12 +133,9 @@ function channel(item: SessionItem): { token: string; trace: string; running: bo
 }
 
 function rowTitle(entry: SessionLedgerEntry): string {
-  // Subagent rows read as lineage ("↳ Subagent · {parent}") instead of a flat
-  // title; forked conversations keep their own (copied) title behind the
-  // lineage arrow; root rows keep their human title.
+  // Child rows keep the lineage arrow while displaying their own durable title.
   if (entry.depth <= 0) return entry.item.title
-  if (entry.item.forkedFromParent) return `↳ ${entry.item.title}`
-  return subagentRowTitle(entry.parentTitle)
+  return subagentRowTitle(entry.item.title)
 }
 
 // Screen readers announce "↳" as "right-pointing arrow" noise; the accessible

@@ -25,7 +25,11 @@ from opensquilla.channels.contract import (
     classify_channel_send_error,
     normalize_channel_send_result,
 )
-from opensquilla.channels.types import IncomingMessage, OutgoingMessage
+from opensquilla.channels.types import (
+    ChannelArtifactDeliveryRequest,
+    IncomingMessage,
+    OutgoingMessage,
+)
 from opensquilla.paths import state_dir
 
 log = structlog.get_logger(__name__)
@@ -798,6 +802,7 @@ class ChannelDeliveryStore:
         *,
         capability: str = "message",
         target_id: str = "",
+        safe_reason: str | None = None,
     ) -> ChannelSendResult:
         normalized = normalize_channel_send_result(
             result,
@@ -820,7 +825,9 @@ class ChannelDeliveryStore:
                     normalized.provider_message_id,
                     normalized.provider_file_id,
                     1 if normalized.retryable else 0,
-                    normalized.reason,
+                    normalized.reason
+                    if safe_reason is None
+                    else safe_reason,
                     time.time(),
                     send_id,
                 ),
@@ -828,7 +835,13 @@ class ChannelDeliveryStore:
             self._conn.commit()
         return normalized
 
-    def fail_send(self, send_id: str, error: BaseException) -> None:
+    def fail_send(
+        self,
+        send_id: str,
+        error: BaseException,
+        *,
+        safe_error_message: str | None = None,
+    ) -> None:
         # error_class carries the taxonomy value every consumer branches on
         # (doctor's auth_invalid alert, the console's operator cause lines);
         # the concrete exception type stays in error_message so nothing is
@@ -839,7 +852,9 @@ class ChannelDeliveryStore:
                 "error_message = ?, updated_at = ? WHERE send_id = ?",
                 (
                     classify_channel_send_error(error),
-                    f"{type(error).__name__}: {_safe_error_text(error)}"[:2000],
+                    safe_error_message
+                    if safe_error_message is not None
+                    else f"{type(error).__name__}: {_safe_error_text(error)}"[:2000],
                     time.time(),
                     send_id,
                 ),
@@ -1072,14 +1087,19 @@ def _operation_message(
     kwargs: dict[str, Any],
 ) -> OutgoingMessage:
     """Build a secret-free durable intent for a non-``send`` mutation."""
+    artifact_request = _artifact_request_from_operation(operation, args, kwargs)
     target = ""
-    for key in ("target_id", "channel_id", "chat_id", "room_id"):
-        value = kwargs.get(key)
-        if value is not None and str(value).strip():
-            target = str(value).strip()
-            break
-    if not target and operation != "send_streaming" and args:
-        target = str(args[0])
+    if operation == "deliver_artifact":
+        if artifact_request is not None:
+            target = artifact_request.inbound.channel_id
+    else:
+        for key in ("target_id", "channel_id", "chat_id", "room_id"):
+            value = kwargs.get(key)
+            if value is not None and str(value).strip():
+                target = str(value).strip()
+                break
+        if not target and operation != "send_streaming" and args:
+            target = str(args[0])
 
     content = ""
     if operation == "edit":
@@ -1092,14 +1112,44 @@ def _operation_message(
         value = kwargs.get("content", args[2] if len(args) > 2 else "")
         content = str(value or "")
 
+    metadata: dict[str, Any] = {
+        "delivery_id": uuid.uuid4().hex,
+        "outbox_operation": operation,
+    }
+    if artifact_request is not None:
+        metadata.update(
+            {
+                "artifact_id": artifact_request.artifact_id,
+                "artifact_name": ntpath.basename(artifact_request.name),
+                "artifact_mime_type": artifact_request.mime_type,
+                "artifact_size": artifact_request.size,
+            }
+        )
+
     return OutgoingMessage(
         content=content,
         reply_to=target or None,
-        metadata={
-            "delivery_id": uuid.uuid4().hex,
-            "outbox_operation": operation,
-        },
+        metadata=metadata,
     )
+
+
+def _artifact_request_from_operation(
+    operation: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> ChannelArtifactDeliveryRequest | None:
+    if operation != "deliver_artifact":
+        return None
+    candidate = kwargs.get("request", args[0] if args else None)
+    return candidate if isinstance(candidate, ChannelArtifactDeliveryRequest) else None
+
+
+def _redact_operation_error(
+    error: BaseException,
+) -> str:
+    """Keep contextual artifact paths and inbound data out of durable diagnostics."""
+
+    return f"{type(error).__name__}: contextual artifact delivery failed"
 
 
 async def deliver_operation_with_outbox(
@@ -1116,17 +1166,26 @@ async def deliver_operation_with_outbox(
         return await raw_operation(*args, **kwargs)
 
     intent = _operation_message(operation, args, kwargs)
+    contextual_artifact_operation = operation == "deliver_artifact"
     send_id = store.begin_send(channel_name, intent, capability=operation)
     try:
         result = await raw_operation(*args, **kwargs)
     except BaseException as exc:
-        store.fail_send(send_id, exc)
+        if contextual_artifact_operation:
+            store.fail_send(
+                send_id,
+                exc,
+                safe_error_message=_redact_operation_error(exc),
+            )
+        else:
+            store.fail_send(send_id, exc)
         raise
     store.complete_send(
         send_id,
         result,
         capability=operation,
         target_id=str(intent.reply_to or ""),
+        safe_reason="" if contextual_artifact_operation else None,
     )
     return result
 
@@ -1147,6 +1206,14 @@ def install_outbox(channel: Any) -> None:
 
     profile = channel_capability_profile(channel)
     supported_operations = {
+        "deliver_artifact": bool(
+            profile
+            and (
+                profile.native_file_upload
+                or profile.media
+                or profile.artifact_delivery
+            )
+        ),
         "send_file": bool(
             profile
             and (

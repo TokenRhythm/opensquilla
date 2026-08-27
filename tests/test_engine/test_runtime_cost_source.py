@@ -150,6 +150,45 @@ async def test_runtime_persists_billed_and_estimated_cost_source_rollup() -> Non
 
 
 @pytest.mark.asyncio
+async def test_runtime_reuses_supplied_assistant_id_without_duplicate_transcript_rows() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:assistant-identity-runtime"
+    await manager.create(session_key)
+    provider = _CostProvider(
+        [
+            ProviderDone(model="claude-opus-4-7"),
+            ProviderDone(model="claude-opus-4-7"),
+        ]
+    )
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        session_manager=manager,
+    )
+    tool_context = ToolContext(is_owner=True, caller_kind=CallerKind.CLI)
+
+    try:
+        for message in ("first", "second"):
+            async for _event in runner.run(
+                message,
+                session_key,
+                tool_context=tool_context,
+                history_has_persisted_user=False,
+                no_memory_capture=True,
+                assistant_message_id="assistant-runtime-fixed",
+            ):
+                pass
+
+        entries = await manager.get_transcript(session_key)
+        assert len(entries) == 1
+        assert entries[0].message_id == "assistant-runtime-fixed"
+        assert entries[0].content == "ok"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_persists_usage_before_yielding_terminal_error() -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()

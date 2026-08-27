@@ -53,6 +53,40 @@ async function mountSidebar(options: {
 }
 
 describe('SidebarConversations bulk actions', () => {
+  it('offers rename and delete actions for channel sessions', async () => {
+    await mountSidebar({
+      sections: [{
+        family: 'chats',
+        label: 'Channels',
+        rows: [{
+          rowKind: 'session',
+          key: 'agent:main:feishu:user-1',
+          title: 'Feishu DM',
+          effectiveAgentId: 'main',
+          agentName: 'Main',
+          sessionKind: 'channel',
+          depth: 0,
+          runStatus: 'idle',
+          runLabel: 'Idle',
+          taskAttention: 'none',
+          updatedAt: Date.now(),
+          hasContractGaps: false,
+        }],
+      }],
+    })
+
+    const menuButton = document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="Actions for Feishu DM"]',
+    )
+    expect(menuButton).not.toBeNull()
+    menuButton?.click()
+    await nextTick()
+
+    const menuText = document.body.querySelector('.sidebar-row-menu')?.textContent
+    expect(menuText).toContain('Rename')
+    expect(menuText).toContain('Delete')
+  })
+
   it('offers rename and delete actions for automation run records', async () => {
     await mountSidebar({
       sections: [{
@@ -85,6 +119,39 @@ describe('SidebarConversations bulk actions', () => {
     const menuText = document.body.querySelector('.sidebar-row-menu')?.textContent
     expect(menuText).toContain('Rename')
     expect(menuText).toContain('Delete')
+  })
+
+  it('offers rename and delete without pinning for subagent task records', async () => {
+    await mountSidebar({
+      sections: [{
+        family: 'chats',
+        label: 'Tasks',
+        rows: [{
+          rowKind: 'session',
+          key: 'agent:main:subagent:child',
+          title: 'Analyze checkout failures',
+          effectiveAgentId: 'main',
+          agentName: 'Main',
+          sessionKind: 'task',
+          depth: 1,
+          runStatus: 'idle',
+          runLabel: 'Idle',
+          taskAttention: 'none',
+          updatedAt: Date.now(),
+          hasContractGaps: false,
+        }],
+      }],
+    })
+
+    document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="Actions for Analyze checkout failures"]',
+    )?.click()
+    await nextTick()
+
+    const menuItems = Array.from(
+      document.body.querySelectorAll<HTMLElement>('.sidebar-row-menu__item'),
+    ).map(item => item.textContent?.trim())
+    expect(menuItems).toEqual(['Rename', 'Delete'])
   })
 
   it('does not render the conversations region until a session exists', async () => {

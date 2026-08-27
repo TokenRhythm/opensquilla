@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextvars
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from opensquilla.contracts.tool_presentation import ToolPresentationCategory
+from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
 
@@ -178,8 +180,96 @@ class ToolContext:
     # run. Runtime-only prompt input; checkpoint tools continue to read live
     # storage for compare-and-set transitions.
     plan_run: Any | None = field(default=None, repr=False)
+    # Dormant compatibility surface for callers built against the earlier
+    # Goal-aware PlanRun runtime. The session Goal path no longer populates it,
+    # but retaining its positional slot avoids shifting embedded callers.
+    goal_run: Any | None = field(default=None, repr=False)
+    # Immutable generation-fenced Goal context captured for this exact task.
+    # It is runtime-only authority and never reconstructed from a current row.
+    goal_context: Any | None = field(default=None, repr=False)
+    # Process-local Goal coordinator used only by Goal-owned main-agent turns.
+    # The service is never serialized into task details or route metadata.
+    goal_service: Any | None = field(default=None, repr=False)
+    # Validated editor state injected only by the Web/Desktop ingress after
+    # durable turn acceptance.  These handles are process-local authority and
+    # must never be copied into route metadata, transcripts, or decision logs.
+    artifact_context: Any | None = field(default=None, repr=False)
+    artifact_session: Any | None = field(default=None, repr=False)
+    desktop_artifact_bridge: Any | None = field(default=None, repr=False)
+    artifact_event_emitter: (
+        Callable[[dict[str, Any]], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
+    # Narrow, runtime-only hook that turns a freshly published editable
+    # deliverable into the session's canonical Document before the artifact
+    # event crosses the public stream boundary. The engine never receives the
+    # underlying persistence service and adoption failures remain recoverable
+    # through the Workbench open path.
+    generated_artifact_adopter: (
+        Callable[[Any], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
+    # Hard upper bound on the tools that may be exposed or dispatched during
+    # this turn. Unlike ``allowed_tools``, declarative policy layers may never
+    # widen this set. It is used only for narrowly scoped runtime authorities
+    # such as a PromptAnnotation turn; ordinary contexts leave it unset.
+    #
+    # Runtime-only fields must remain appended here to preserve the historical
+    # positional constructor contract for embedded callers.
+    exclusive_tools: frozenset[str] | None = field(default=None, repr=False)
+    # Durable single-writer receipt controller for a PromptAnnotation turn.
+    # The Gateway constructs this only after TaskRuntime has attached the
+    # accepted task id. Dispatch consumes it before validating the first
+    # writer call; it must never be serialized or copied to another turn.
+    artifact_mutation_attempt_controller: Any | None = field(
+        default=None,
+        repr=False,
+    )
+    # Process-local authority cleanup registered by ingress/runtime adapters.
+    # The shared Agent turn boundary invokes these callbacks on every terminal
+    # path without importing feature-specific tool implementations.
+    turn_cleanup_callbacks: list[Callable[[], Any]] = field(
+        default_factory=list,
+        repr=False,
+    )
+    # Frozen after the final provider-visible tool schema is built. Dispatch
+    # and projection code use this bit to avoid replacing raw tool output with
+    # a handle that the current model is not authorized to retrieve.
+    tool_result_retrieval_available: bool = False
+    # Process-local task ancestry used only to persist exact subprocess
+    # ownership. Raw values are never written to the owner registry.
+    parent_session_key: str | None = field(default=None, repr=False)
+    parent_task_id: str | None = field(default=None, repr=False)
+    # Process-local candidate-loop authority for PromptAnnotation turns.  It
+    # stages repeated edits in one draft ChangeSet and crosses the durable
+    # revision boundary only when the model invokes document_finish(commit).
+    # This field is intentionally at the end to preserve every historical
+    # positional ToolContext constructor contract.
+    artifact_candidate_loop_controller: Any | None = field(
+        default=None,
+        repr=False,
+    )
+    # Process-local preview materialization service used by the protocol-v4
+    # Electron candidate bridge.  It is never serialized or exposed to the
+    # model; the bridge receives only the controller's opaque handle.
+    artifact_preview_service: Any | None = field(
+        default=None,
+        repr=False,
+    )
+    # Ephemeral binary evidence produced by a tool for the current provider
+    # request. The map is keyed by tool_use_id and consumed by the Agent
+    # before the next provider call; it is never persisted or exposed as a
+    # filesystem path.
+    tool_result_media: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
+        # A restricted turn's ceiling is an authority boundary, not a policy
+        # preference.  Normalize every caller (including embedded callers
+        # that still pass a mutable set) so no later hook can widen the live
+        # schema/dispatch ceiling in place.
+        if self.exclusive_tools is not None:
+            self.exclusive_tools = frozenset(self.exclusive_tools)
         self.validate_path_roots()
 
     def validate_path_roots(self) -> None:
@@ -201,6 +291,60 @@ class ToolContext:
         )
 
 
+def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
+    """Return whether ``ctx`` carries authority for a top-level Goal turn.
+
+    ``main`` describes the execution role here, not the configured agent ID.
+    Named top-level agents own ordinary sessions too; caller provenance and
+    subagent depth are the authority boundary.
+    """
+
+    return bool(
+        ctx is not None
+        and isinstance(getattr(ctx, "goal_context", None), Mapping)
+        and str(getattr(ctx, "collaboration_mode", "default")) == "default"
+        and ctx.caller_kind
+        in {
+            CallerKind.AGENT,
+            CallerKind.CHANNEL,
+            CallerKind.CLI,
+            CallerKind.WEB,
+        }
+        and int(getattr(ctx, "subagent_depth", 0) or 0) == 0
+    )
+
+
+def surface_capabilities_for_tool_context(
+    tool_context: ToolContext | None,
+) -> SurfaceCapabilities:
+    """Resolve publication capabilities from the authenticated entry surface.
+
+    ``caller_kind`` is the canonical route classification.  In particular,
+    ``channel_id`` is deliberately not used as a proxy: WebUI routes also have
+    a channel id, but WebUI can replace a generation in place.  External
+    channel delivery cannot retract speculative text, so it receives a fully
+    buffered surface contract.
+    """
+
+    if tool_context is None:
+        return SurfaceCapabilities()
+
+    raw_caller_kind = getattr(tool_context, "caller_kind", CallerKind.AGENT)
+    try:
+        caller_kind = CallerKind(raw_caller_kind)
+    except (TypeError, ValueError):
+        caller_kind = CallerKind.AGENT
+
+    if caller_kind is CallerKind.CHANNEL:
+        return SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        )
+
+    return SurfaceCapabilities()
+
+
 # Request-scoped context — set by build_tool_handler before each dispatch.
 current_tool_context: contextvars.ContextVar[ToolContext | None] = contextvars.ContextVar(
     "current_tool_context", default=None
@@ -220,6 +364,16 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "session_search",
         "message",
         "publish_artifact",
+        "document_apply",
+        "document_browser_act",
+        "document_browser_inspect",
+        "document_browser_reload",
+        "document_browser_screenshot",
+        "document_finish",
+        "document_patch",
+        "document_inspect",
+        "document_locate",
+        "document_read",
     }
 )
 
@@ -271,6 +425,9 @@ class ToolSpec:
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    # Internal cancellation semantics. ``None`` lets the registry infer
+    # must-settle behavior for filesystem mutation descriptors.
+    cancellation_policy: Literal["bounded", "must_settle"] | None = None
     result_budget_class: str | None = None
     sandbox: SandboxToolDescriptor = field(
         default_factory=lambda: SandboxToolDescriptor.custom(kind="")
@@ -285,6 +442,17 @@ class ToolSpec:
     # persisted. The dispatcher owns this behavior; handlers must not emulate
     # it with tool-name branches.
     terminates_turn: bool = False
+    # Successful terminal tools may opt in to an authoritative completion
+    # string carried in one top-level JSON result field. The dispatcher, not
+    # the model or Agent, extracts and bounds this text.
+    terminal_response_field: str | None = None
+    # Trusted declaration that itemless arrays have textual wire semantics.
+    # Provider policy still decides whether a request needs the projection.
+    allow_string_item_schema_projection: bool = False
+    # Optional semantic declaration consumed only by UI presentation policy.
+    # It never changes provider schemas, validation, authorization, or execution.
+    # Appended for positional compatibility with embedded ToolSpec callers.
+    presentation_category: ToolPresentationCategory | None = None
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

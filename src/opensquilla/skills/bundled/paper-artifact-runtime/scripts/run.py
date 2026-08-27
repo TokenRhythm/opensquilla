@@ -841,7 +841,7 @@ def _compile_commands(paper: Path) -> tuple[list[str], str]:
     )
     deadline = time.monotonic() + 110.0
     for command in commands:
-        remaining = deadline - time.monotonic()
+        remaining = min(110.0, deadline - time.monotonic())
         if remaining <= 0:
             raise PaperArtifactError(
                 "COMPILE_FAILED: TeX command sequence exceeded the 110-second compile budget"

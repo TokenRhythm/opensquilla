@@ -29,7 +29,7 @@ async function waitFor(check, label, timeoutMs = 60_000) {
 async function mainWindowSnapshot(app) {
   return await app.evaluate(({ BrowserWindow }) => {
     const window = BrowserWindow.getAllWindows().find((candidate) => (
-      candidate.webContents.getURL().includes('/control/')
+      candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
     ))
     if (!window) return null
     return {
@@ -87,6 +87,8 @@ try {
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
+      OPENSQUILLA_AUTH_MODE: 'token',
+      OPENSQUILLA_AUTH_TOKEN: 'synthetic-window-flow-operator-token',
     },
   })
 
@@ -99,9 +101,27 @@ try {
   const page = await desktopApp.firstWindow({ timeout: 60_000 })
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
   await waitFor(
-    async () => page.url().includes('/control/chat'),
-    'Control UI to load on Chat',
+    async () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'Desktop renderer to load on Chat',
   )
+  await waitFor(
+    async () => (await page.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'Desktop Gateway readiness',
+  )
+  const gatewayAccess = await page.evaluate(async () => {
+    const connection = await window.opensquillaDesktop?.getGatewayConnection?.()
+    const response = await fetch('/api/system/status', {
+      headers: { Authorization: 'Bearer stale-renderer-token' },
+    })
+    return {
+      authToken: connection?.authToken || '',
+      status: response.status,
+    }
+  })
+  assert.match(gatewayAccess.authToken, /^[0-9a-f]{64}$/)
+  assert.equal(gatewayAccess.status, 200)
 
   const preferences = await page.evaluate(
     () => window.opensquillaDesktop.getDesktopPreferences?.(),
@@ -139,9 +159,9 @@ try {
 
     await desktopApp.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
-        candidate.webContents.getURL().includes('/control/')
+        candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
       ))
-      if (!window) throw new Error('Main Control UI window is unavailable.')
+      if (!window) throw new Error('Main Desktop window is unavailable.')
       window.close()
     })
 
@@ -155,13 +175,13 @@ try {
     assert.equal(hidden.destroyed, false)
     assert.equal(hidden.browserWindowId, before.browserWindowId)
     assert.equal(hidden.webContentsId, before.webContentsId)
-    // The live SPA may move between client-side routes while hidden (e.g.
-    // /control/chat -> /control/chat/new), so only require that the window was
-    // not navigated away from the Control UI or reloaded to the boot splash.
+    // The live SPA may move between client-side routes while hidden, so only
+    // require that the window was not navigated away from the Desktop renderer
+    // or reloaded to the boot splash.
     // Renderer continuity itself is proven by the marker check below.
     assert.ok(
-      hidden.url.includes('/control/'),
-      `hidden window must stay on the Control UI, got ${hidden.url}`,
+      hidden.url.startsWith('opensquilla-app://desktop/'),
+      `hidden window must stay on the Desktop renderer, got ${hidden.url}`,
     )
     assert.equal(page.isClosed(), false)
 
@@ -179,8 +199,8 @@ try {
     assert.equal(revealed.browserWindowId, before.browserWindowId)
     assert.equal(revealed.webContentsId, before.webContentsId)
     assert.ok(
-      revealed.url.includes('/control/'),
-      `revealed window must stay on the Control UI, got ${revealed.url}`,
+      revealed.url.startsWith('opensquilla-app://desktop/'),
+      `revealed window must stay on the Desktop renderer, got ${revealed.url}`,
     )
     assert.equal(
       await page.evaluate(() => window.__opensquillaWindowLifecycleMarker),
@@ -190,9 +210,9 @@ try {
 
     await desktopApp.evaluate(({ app, BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
-        candidate.webContents.getURL().includes('/control/')
+        candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
       ))
-      if (!window) throw new Error('Main Control UI window is unavailable.')
+      if (!window) throw new Error('Main Desktop window is unavailable.')
       // Reproduce the activation race deterministically: activateMainWindow()
       // focuses synchronously, then continues across an asynchronous startup
       // boundary. A user hide after that first focus must not be undone by a
@@ -251,9 +271,9 @@ try {
 
     await desktopApp.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
-        candidate.webContents.getURL().includes('/control/')
+        candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
       ))
-      if (!window) throw new Error('Main Control UI window is unavailable.')
+      if (!window) throw new Error('Main Desktop window is unavailable.')
       window.hide()
     })
     const openUrlPrevented = await desktopApp.evaluate(({ app }) => {
@@ -278,7 +298,7 @@ try {
 
     const minimizable = await desktopApp.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
-        candidate.webContents.getURL().includes('/control/')
+        candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
       ))
       if (!window || !window.isMinimizable()) return false
       window.minimize()

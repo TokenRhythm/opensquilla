@@ -350,13 +350,42 @@ def _dingtalk_spec() -> ChannelSetupSpec:
         requires_public_url=False,
         dependency_extra=None,
         restart_required=True,
-        docs_hint="https://open.dingtalk.com/document/",
+        docs_hint="https://open.dingtalk.com/document/dingstart/robot-reply-and-send-messages",
+        help=(
+            "Robot Code is the robot identifier copied from the DingTalk developer "
+            "console; it is distinct from Client id and enables native outbound image "
+            "and file delivery. Grant qyapi_base and qyapi_robot_sendmsg to the app. "
+            "Cool App Code is needed only when the installed robot requires it."
+        ),
         fields=(
             *_common_fields(),
             ChannelSetupField("client_id", "Client id", "text", required=True,
-                              group="credentials"),
+                              group="credentials",
+                              description="DingTalk application Client ID (AppKey)."),
             ChannelSetupField("client_secret", "Client secret", "password",
                               required=True, secret=True, group="credentials"),
+            ChannelSetupField(
+                "robot_code",
+                "Robot Code",
+                "text",
+                required=True,
+                group="credentials",
+                description=(
+                    "Robot identifier from the DingTalk developer console. "
+                    "This is not the application Client ID."
+                ),
+                placeholder="ding...",
+            ),
+            ChannelSetupField(
+                "cool_app_code",
+                "Cool App Code",
+                "text",
+                required=False,
+                default="",
+                group="credentials",
+                advanced=True,
+                description="Optional; set only when required by the installed robot.",
+            ),
         ),
     )
 

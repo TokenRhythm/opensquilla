@@ -21,7 +21,7 @@ export interface UseChatComposerShortcutsOptions {
   completeSlashCmd: (cmd: ChatSlashCommand) => void
   activateSlashCmd: (cmd: ChatSlashCommand) => void
   popPendingTail: () => boolean
-  enqueuePendingInput: (text: string) => boolean
+  enqueuePendingInput: (text: string) => boolean | Promise<boolean>
   sendCurrentInput: () => void
   isSafariWebKit?: () => boolean
 }

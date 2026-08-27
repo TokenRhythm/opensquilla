@@ -16,9 +16,14 @@ from typing import Any
 
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
-from opensquilla.gateway.websocket import WsConnection, handle_ws_connection
+from opensquilla.gateway.websocket import WsConnection, get_registry, handle_ws_connection
 
 _CONNECT_FRAME = json.dumps(
     {
@@ -63,7 +68,22 @@ class _EchoDispatcher:
         return ["noop"]
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
-        return make_ok_res(req_id, {"method": method})
+        return make_ok_res(req_id, {"method": method, "params": params})
+
+
+class _CapabilityDispatcher:
+    def list_methods(self) -> list[str]:
+        return ["connection.capabilities"]
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        connection = get_registry().get(ctx.conn_id)
+        return make_ok_res(
+            req_id,
+            {
+                "method": method,
+                "client_caps": sorted(connection.client_caps),
+            },
+        )
 
 
 class _BlockingMetaDispatcher:
@@ -131,6 +151,52 @@ async def _run(frames: list[str]) -> _ScriptedWebSocket:
     ws = _ScriptedWebSocket(frames)
     await handle_ws_connection(ws, _config(), dispatcher=_EchoDispatcher())
     return ws
+
+
+async def test_handshake_persists_connect_capabilities_on_connection() -> None:
+    connect = json.dumps(
+        {
+            "type": "req",
+            "id": "h",
+            "method": "connect",
+            "params": {
+                "minProtocol": 1,
+                "role": "operator",
+                "auth": {},
+                "caps": [
+                    ANSWER_GENERATION_RESET_CAPABILITY,
+                    TURN_COMMITTED_CAPABILITY,
+                    7,
+                    "",
+                ],
+            },
+        }
+    )
+    ws = _ScriptedWebSocket(
+        [
+            connect,
+            json.dumps(
+                {
+                    "type": "req",
+                    "id": "caps",
+                    "method": "connection.capabilities",
+                    "params": {},
+                }
+            ),
+        ]
+    )
+
+    await handle_ws_connection(ws, _config(), dispatcher=_CapabilityDispatcher())
+
+    response = next(frame for frame in ws.responses() if frame["id"] == "caps")
+    assert response["payload"]["client_caps"] == [
+        ANSWER_GENERATION_RESET_CAPABILITY,
+        TURN_COMMITTED_CAPABILITY,
+    ]
+    hello = next(
+        json.loads(frame) for frame in ws.sent if json.loads(frame)["type"] == "hello-ok"
+    )
+    assert TURN_COMMITTED_EVENT in hello["features"]["events"]
 
 
 async def test_non_string_req_id_gets_error_res_and_connection_survives() -> None:
@@ -313,7 +379,7 @@ async def test_lone_surrogate_id_rejected_and_connection_survives() -> None:
     assert ws.close_codes == []
 
 
-async def test_lone_surrogate_frame_type_error_still_serializes() -> None:
+async def test_lone_surrogate_frame_type_is_rejected_by_ingress_validation() -> None:
     ws = await _run(
         [
             _CONNECT_FRAME,
@@ -325,8 +391,69 @@ async def test_lone_surrogate_frame_type_error_still_serializes() -> None:
     responses = ws.responses()
     errors = [r for r in responses if not r["ok"]]
     assert len(errors) == 1
-    assert "Unknown frame type" in errors[0]["error"]["message"]
+    assert errors[0]["error"]["code"] == "INVALID_REQUEST"
+    assert errors[0]["error"]["details"] == {"reason": "invalid_utf8_text"}
     assert any(r["ok"] and r["id"] == "ok7" for r in responses)
+    assert ws.close_codes == []
+
+
+async def test_lone_surrogates_anywhere_in_rpc_frame_are_rejected_and_socket_survives() -> None:
+    malformed_params = [
+        {"message": "\ud800"},
+        {"message": "ok", "metadata": {"nested": ["\udfff"]}},
+        {"message": "ok", "attachments": [{"name": "bad\ud800.txt"}]},
+        {"message": "ok", "\udfff": "hidden"},
+    ]
+    frames = [
+        json.dumps({"type": "req", "id": f"bad-{index}", "method": "noop", "params": params})
+        for index, params in enumerate(malformed_params)
+    ]
+    frames.append(json.dumps({"type": "req", "id": "after-bad", "method": "noop"}))
+
+    ws = await _run([_CONNECT_FRAME, *frames])
+
+    responses = ws.responses()
+    errors = [response for response in responses if not response["ok"]]
+    assert [response["id"] for response in errors] == ["bad-0", "bad-1", "bad-2", "bad-3"]
+    assert all(response["error"]["code"] == "INVALID_REQUEST" for response in errors)
+    assert all(
+        response["error"]["details"] == {"reason": "invalid_utf8_text"}
+        for response in errors
+    )
+    assert all("hidden" not in response["error"]["message"] for response in errors)
+    assert any(response["ok"] and response["id"] == "after-bad" for response in responses)
+    assert ws.close_codes == []
+
+
+async def test_json_surrogate_pair_emoji_and_cjk_are_accepted() -> None:
+    raw = (
+        '{"type":"req","id":"unicode","method":"noop","params":'
+        '{"message":"\\ud83d\\ude00 中文","attachments":[{"name":"图像🧪.png"}]}}'
+    )
+    decoded = json.loads(raw)
+    assert decoded["params"]["message"] == "😀 中文"
+
+    ws = await _run([_CONNECT_FRAME, raw])
+
+    response = next(response for response in ws.responses() if response["id"] == "unicode")
+    assert response["ok"] is True
+    assert response["payload"]["params"] == decoded["params"]
+    assert ws.close_codes == []
+
+
+async def test_dense_json_well_below_payload_limit_is_accepted_consistently() -> None:
+    params = {"items": [None] * 100_000}
+    raw = json.dumps(
+        {"type": "req", "id": "dense", "method": "noop", "params": params},
+        separators=(",", ":"),
+    )
+    assert len(raw.encode("utf-8")) < 1_000_000
+
+    ws = await _run([_CONNECT_FRAME, raw])
+
+    response = next(response for response in ws.responses() if response["id"] == "dense")
+    assert response["ok"] is True
+    assert response["payload"]["params"] == params
     assert ws.close_codes == []
 
 

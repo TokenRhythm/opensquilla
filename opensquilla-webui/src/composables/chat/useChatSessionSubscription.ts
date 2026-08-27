@@ -10,6 +10,8 @@ import type {
   SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
+import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   SESSION_SNAPSHOT_BUDGET_MS,
@@ -45,8 +47,20 @@ export interface UseChatSessionSubscriptionOptions {
   hasActiveInterrupt: Ref<boolean>
   activeStreamTaskId: Ref<string>
   activeTaskGroups: Ref<Set<string>>
+  taskOwnership?: ChatTaskOwnershipApi
+  ownershipHydrationRequired?: () => boolean
+  acceptanceStopPending?: Ref<boolean>
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
-  startStreaming: () => void
+  startStreaming: (
+    activityStartedAt?: number | string | null,
+    recordInitialActivity?: boolean,
+  ) => void
+  /** Adopt durable task timing even when snapshot replay already opened the bubble. */
+  reconcileStreamTaskClock?: (snapshot: {
+    sessionKey: string
+    taskId: string
+    startedAt?: number | string | null
+  }) => boolean | void
   loadHistory: () => void | Promise<unknown>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
@@ -97,9 +111,11 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
 
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
   const isHydrating = ref(false)
+  const streamGeneration = ref<string | null>(null)
   let subscriptionAttempt = 0
   let activeSubscription: {
     key: string
+    sinceStreamGeneration: string | null
     sinceStreamSeq: number
     bootstrapGeneration: number
     bootstrapAttempt: number
@@ -114,12 +130,17 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
+    if (options.ownershipHydrationRequired?.() !== false) {
+      options.taskOwnership?.beginHydration()
+    }
     const key = options.sessionKey.value
+    const sinceStreamGeneration = streamGeneration.value
     const sinceStreamSeq = options.lastStreamSeq.value
     const bootstrapGeneration = bootstrap?.generation ?? -1
     const bootstrapAttempt = bootstrap?.attempt ?? -1
     if (
       activeSubscription?.key === key
+      && activeSubscription.sinceStreamGeneration === sinceStreamGeneration
       && activeSubscription.sinceStreamSeq === sinceStreamSeq
       && activeSubscription.bootstrapGeneration === bootstrapGeneration
       && activeSubscription.bootstrapAttempt === bootstrapAttempt
@@ -138,6 +159,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const token = Symbol('session-subscription')
     const outcome = runSubscription(
       key,
+      sinceStreamGeneration,
       sinceStreamSeq,
       token,
       controller,
@@ -147,6 +169,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     })
     activeSubscription = {
       key,
+      sinceStreamGeneration,
       sinceStreamSeq,
       bootstrapGeneration,
       bootstrapAttempt,
@@ -156,17 +179,93 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     return outcome
   }
 
-  function applyReplayCursor(res: SessionMessagesSubscribeResponse) {
-    if (res.replay_complete === false) {
-      options.lastStreamSeq.value = typeof res.current_stream_seq === 'number'
-        ? Math.max(options.lastStreamSeq.value, res.current_stream_seq)
-        : options.lastStreamSeq.value
+  function generationFrom(source: unknown): string | null {
+    if (typeof source === 'string') return source || null
+    if (!source || typeof source !== 'object') return null
+    const envelope = source as {
+      stream_generation?: unknown
+      streamGeneration?: unknown
+    }
+    const value = envelope.stream_generation ?? envelope.streamGeneration
+    return typeof value === 'string' && value ? value : null
+  }
+
+  /**
+   * Observe a generation-bearing live event before applying its numeric cursor.
+   * The event-handler integration calls this first so a restarted Gateway's low
+   * sequence numbers are accepted instead of compared with the retired stream.
+   */
+  function observeStreamGeneration(source: unknown): boolean {
+    const generation = generationFrom(source)
+    if (!generation || generation === streamGeneration.value) return false
+    const previous = streamGeneration.value
+    streamGeneration.value = generation
+    if (previous === null) {
+      // A page can survive an in-place upgrade from a legacy Gateway which did
+      // not expose generations.  In that case the client owns a numeric cursor
+      // but cannot prove it belongs to the newly observed stream.  Reset when
+      // the new stream is visibly behind, or explicitly reports a generation
+      // gap; otherwise merely adopt the generation (the ordinary first
+      // subscribe response has an equal/current cursor).
+      const envelope = source && typeof source === 'object'
+        ? source as {
+            current_stream_seq?: unknown
+            replay_gap_reason?: unknown
+            stream_seq?: unknown
+          }
+        : null
+      const sequence = envelope?.stream_seq ?? envelope?.current_stream_seq
+      const newStreamIsBehind = typeof sequence === 'number'
+        && Number.isFinite(sequence)
+        && sequence < options.lastStreamSeq.value
+      const generationGap = envelope?.replay_gap_reason === 'stream_generation_changed'
+      if (!newStreamIsBehind && !generationGap) return false
+    }
+    options.lastStreamSeq.value = 0
+    options.resetStreamLiveTurnState()
+    return true
+  }
+
+  function reconcileSubscriptionGeneration(
+    res: SessionMessagesSubscribeResponse,
+    sinceStreamGeneration: string | null,
+  ): boolean {
+    const received = generationFrom(res)
+    // Keep the ACK envelope intact: the legacy -> generation-aware upgrade
+    // path needs its current sequence/replay-gap fields to decide whether a
+    // pre-existing numeric cursor belongs to the retired stream. Passing only
+    // the generation string would adopt the generation while still rejecting
+    // every low-sequence event from the restarted Gateway.
+    if (received) return observeStreamGeneration(res)
+    if (sinceStreamGeneration === null) return false
+
+    // A mixed-version reconnect can land on an older Gateway which ignores
+    // generation fields. Treat that capability downgrade as a new stream so
+    // its lower sequence numbers are not hidden behind the modern cursor.
+    streamGeneration.value = null
+    options.lastStreamSeq.value = 0
+    options.resetStreamLiveTurnState()
+    return true
+  }
+
+  function applyReplayCursor(
+    res: SessionMessagesSubscribeResponse,
+    generationReset: boolean,
+  ) {
+    const current = typeof res.current_stream_seq === 'number'
+      && Number.isFinite(res.current_stream_seq)
+      ? Math.max(0, res.current_stream_seq)
+      : null
+    if (res.replay_complete === false || generationReset) {
+      if (current !== null) {
+        options.lastStreamSeq.value = generationReset
+          && options.lastStreamSeq.value === 0
+          ? current
+          : Math.max(options.lastStreamSeq.value, current)
+      }
       options.loadHistory()
-    } else if (typeof res.current_stream_seq === 'number') {
-      options.lastStreamSeq.value = Math.max(
-        options.lastStreamSeq.value,
-        res.current_stream_seq,
-      )
+    } else if (current !== null) {
+      options.lastStreamSeq.value = Math.max(options.lastStreamSeq.value, current)
     }
   }
 
@@ -185,8 +284,29 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     if (runModeLock && typeof runModeLock === 'object') {
       options.onRunModeLock?.(runModeLock)
     }
-    options.onSnapshot?.(res)
-    applySessionRunState(res)
+    const rawActiveTask = res.active_task || res.activeTask || null
+    const rawActiveTaskId = chatTaskId(rawActiveTask)
+    const rawRunStatus = String(res.run_status || res.runStatus || '').toLowerCase()
+    const settledLiveTask = LIVE_RUN_STATES.includes(rawRunStatus)
+      && Boolean(rawActiveTaskId)
+      && options.taskOwnership?.isSettled(rawActiveTaskId) === true
+    const effectiveSnapshot = settledLiveTask
+      ? {
+          ...res,
+          run_status: 'idle' as const,
+          runStatus: 'idle' as const,
+          active_task: null,
+          activeTask: null,
+        }
+      : res
+    options.onSnapshot?.(effectiveSnapshot)
+    options.taskOwnership?.applySnapshot(effectiveSnapshot, true)
+    // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
+    // The subscription can race ahead of the original ingress commit, so only
+    // the matching send transaction (receipt/rejection) or an explicit session
+    // reset may release that latch.  Its idempotent replay must still inherit
+    // the Stop intent and abort the exact accepted task once the receipt exists.
+    applySessionRunState(effectiveSnapshot)
     // A pending inline interrupt is newer, stronger evidence than an idle
     // subscription snapshot that raced with the approval request.
     if (
@@ -199,22 +319,37 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       })
     }
     const liveTaskSnapshot = LIVE_RUN_STATES.includes(options.runStatus.value.status)
-    reconcileActiveTaskGroups(res)
+    if (!settledLiveTask) reconcileActiveTaskGroups(res)
     if (liveTaskSnapshot && !options.isStreaming.value) {
-      options.startStreaming()
+      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
+        started_at?: number | string | null
+        startedAt?: number | string | null
+      } | null | undefined
+      options.startStreaming(activeTask?.started_at ?? activeTask?.startedAt)
       // startStreaming establishes the live bubble with a generic running
       // placeholder. Restore the authoritative active-task payload (including
       // steer_capability) that came from hydration instead of waiting for a
       // later task.running event to repair it.
-      applySessionRunState(res)
+      applySessionRunState(effectiveSnapshot)
     }
     if (liveTaskSnapshot) {
-      const activeTask = (res.active_task || res.activeTask) as {
+      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
         task_id?: string
         taskId?: string
+        started_at?: number | string | null
+        startedAt?: number | string | null
       } | null | undefined
       const taskId = activeTask?.task_id || activeTask?.taskId
-      if (taskId) options.activeStreamTaskId.value = taskId
+      if (taskId) {
+        options.activeStreamTaskId.value = taskId
+        if (options.runStatus.value.status !== 'queued') {
+          options.reconcileStreamTaskClock?.({
+            sessionKey: key,
+            taskId,
+            startedAt: activeTask?.started_at ?? activeTask?.startedAt,
+          })
+        }
+      }
     }
     // Replayed events can rebuild a live bubble for work that is already
     // terminal. An authoritative idle snapshot removes only that stale tail.
@@ -302,6 +437,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   async function runSubscription(
     key: string,
+    sinceStreamGeneration: string | null,
     sinceStreamSeq: number,
     token: symbol,
     controller: AbortController,
@@ -327,6 +463,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       }
       const params: SessionMessagesSubscribeParams = {
         key,
+        ...(sinceStreamGeneration
+          ? { since_stream_generation: sinceStreamGeneration }
+          : {}),
         since_stream_seq: sinceStreamSeq,
         fast_ack: true,
       }
@@ -406,6 +545,16 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
 
+      if (subscribeResult.status === 'rejected') throw subscribeResult.reason
+      const res = subscribeResult.value
+      if (res && res.subscribed === false) {
+        throw new Error('No subscription manager available')
+      }
+      const generationReset = reconcileSubscriptionGeneration(
+        res,
+        sinceStreamGeneration,
+      )
+
       let snapshotTaskLive = false
       if (snapshotPromise) {
         skipSnapshotOnRetry = true
@@ -427,26 +576,33 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           // bounded replay protocol so mixed-version client updates still work.
         } else {
           const snapshot = snapshotResult.value
+          const snapshotGeneration = generationFrom(snapshot)
           if (
             snapshot?.key === key
             && Array.isArray(snapshot.events)
             && typeof snapshot.current_stream_seq === 'number'
+            && (
+              !snapshotGeneration
+              || !streamGeneration.value
+              || snapshotGeneration === streamGeneration.value
+            )
             // Events delivered after registration are newer than a late
             // snapshot response. Never reset the live surface behind them.
             && snapshot.current_stream_seq >= options.lastStreamSeq.value
           ) {
-            onLiveSnapshot?.(snapshot)
+            const snapshotTaskId = typeof snapshot.task_id === 'string'
+              ? snapshot.task_id
+              : ''
+            const settledSnapshot = Boolean(
+              snapshotTaskId && options.taskOwnership?.isSettled(snapshotTaskId),
+            )
+            if (!settledSnapshot) onLiveSnapshot?.(snapshot)
             options.lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
-            snapshotTaskLive = Boolean(snapshot.task_id)
+            snapshotTaskLive = Boolean(snapshot.task_id) && !settledSnapshot
           }
         }
       }
-      if (subscribeResult.status === 'rejected') throw subscribeResult.reason
-      const res = subscribeResult.value
-      if (res && res.subscribed === false) {
-        throw new Error('No subscription manager available')
-      }
-      applyReplayCursor(res)
+      applyReplayCursor(res, generationReset)
       const hydrationComplete = (
         res.hydration_complete
         ?? res.hydrationComplete
@@ -454,6 +610,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       ) !== false
       if (hydrationComplete) {
         return applyHydratedSubscriptionState(key, metadataGeneration, res)
+      }
+      if (options.ownershipHydrationRequired?.() !== false) {
+        options.taskOwnership?.applySnapshot(res, false)
       }
       if (bootstrap) {
         scheduleDeferredHydration(
@@ -630,22 +789,32 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   function applySessionRunState(source: ChatRunStatusSource | null | undefined) {
     const next = options.sessionRunStatus(source)
     const current = options.runStatus.value
+    const currentTaskId = chatTaskId(current.task)
+    const nextTaskId = chatTaskId(next.task)
+    if (next.status === 'queued' && nextTaskId) {
+      options.taskOwnership?.noteQueued(next.task || nextTaskId)
+      const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+      // A compact task.queued or an older sessions.changed payload can name
+      // the task that changed rather than the session foreground. Never let it
+      // demote a different task that is already known to be running.
+      if (runningTaskId && runningTaskId !== nextTaskId) return
+    } else if (next.status === 'running' && nextTaskId) {
+      options.taskOwnership?.noteRunning(next.task || nextTaskId)
+    } else if (
+      ['cancelled', 'failed', 'timeout', 'interrupted', 'idle'].includes(next.status)
+      && nextTaskId
+    ) {
+      const settled = options.taskOwnership?.noteTerminal(nextTaskId)
+      if (settled?.wasQueued && !settled.wasRunning && currentTaskId !== nextTaskId) return
+      const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+      if (runningTaskId && runningTaskId !== nextTaskId) return
+    }
     if (
       LIVE_RUN_STATES.includes(current.status)
       && LIVE_RUN_STATES.includes(next.status)
       && current.task
       && next.task
     ) {
-      const currentTaskId = current.task.task_id
-        || current.task.taskId
-        || current.task.turn_id
-        || current.task.turnId
-        || ''
-      const nextTaskId = next.task.task_id
-        || next.task.taskId
-        || next.task.turn_id
-        || next.task.turnId
-        || ''
       if (currentTaskId && (!nextTaskId || nextTaskId === currentTaskId)) {
         // Lifecycle broadcasts are intentionally compact and can follow the
         // richer task.running frame for the same task. Preserve authoritative
@@ -674,6 +843,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   return {
     isHydrating,
+    streamGeneration,
+    observeStreamGeneration,
     subscribeSession,
     retrySessionMetadata,
     unsubscribeSession,

@@ -109,15 +109,9 @@ export function formatRelativeTime(timestamp: number | null | undefined): string
 /** Back-compat alias; prefer {@link formatRelativeTime} for new call sites. */
 export const sessionRelTime = formatRelativeTime
 
-/**
- * Ledger title for a subagent row: "↳ Subagent · {parent title}" when the
- * parent title is known, otherwise a plain "↳ Subagent" so we never surface a
- * raw key. The arrow + label conveys lineage without rendering UUIDs.
- */
-export function subagentRowTitle(parentTitle: string | null | undefined): string {
+/** Ledger title for a subagent row, preserving its own durable title. */
+export function subagentRowTitle(title: string | null | undefined): string {
   const t = i18n.global.t
-  const parent = (parentTitle || '').trim()
-  return parent
-    ? `↳ ${t('sessions.ledger.subagentWithParent', { parent })}`
-    : `↳ ${t('sessions.ledger.subagent')}`
+  const normalized = (title || '').trim()
+  return normalized ? `↳ ${normalized}` : `↳ ${t('sessions.ledger.subagent')}`
 }

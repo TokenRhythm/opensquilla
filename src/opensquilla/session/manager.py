@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.session.compaction import (
@@ -29,6 +30,7 @@ from opensquilla.session.compaction import (
     await_compaction_phase,
     compact_context,
     compaction_remaining_seconds,
+    effective_protected_recent_messages,
     require_compaction_time,
 )
 from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
@@ -59,11 +61,20 @@ from opensquilla.session.storage import (
     SessionStorage,
 )
 from opensquilla.session.tokenizer import estimate_tokens
+from opensquilla.silent_reply import sanitize_historical_silent_reply
+from opensquilla.turn_outcome_projection import (
+    attach_fork_terminal_outcome_projection,
+    build_fork_terminal_outcome_projection,
+    extract_fork_terminal_outcome_projection,
+    terminal_turn_outcome,
+    turn_id_from_context,
+)
 
 if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+_MODEL_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +111,13 @@ class _CompactionSingleflight:
 
     task: asyncio.Task[CompactionResult]
     operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ForkTerminalOutcomeResolution:
+    projections: dict[str, dict[str, Any]]
+    active_turn_ids: frozenset[str]
+    invalid_turn_ids: frozenset[str]
 
 
 _COMPACTION_SINGLEFLIGHT_LOCK = threading.Lock()
@@ -331,21 +349,33 @@ def _successful_submit_plan_input(
 
 
 def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": e.id,
-            "message_id": e.message_id,
-            "role": e.role,
-            "content": e.content or "",
-            "token_count": e.token_count,
-            "tool_calls": e.tool_calls,
-            "tool_call_id": e.tool_call_id,
-            "reasoning_content": e.reasoning_content,
-            "turn_usage": e.turn_usage,
-            "turn_context": e.turn_context,
-        }
-        for e in entries
-    ]
+    payloads: list[dict[str, Any]] = []
+    for entry in entries:
+        silent_reply = sanitize_historical_silent_reply(
+            entry.content or "",
+            entry.tool_calls,
+            role=entry.role,
+            turn_context=entry.turn_context,
+        )
+        # Preserve a strict one-to-one mapping with the durable preimage. The
+        # compactor's removed_count and kept-entry suffix are positional, so a
+        # fully suppressed row projects to empty content instead of being
+        # deleted from this request-scoped view.
+        payloads.append(
+            {
+                "id": entry.id,
+                "message_id": entry.message_id,
+                "role": entry.role,
+                "content": silent_reply.content or "",
+                "token_count": entry.token_count,
+                "tool_calls": silent_reply.segments,
+                "tool_call_id": entry.tool_call_id,
+                "reasoning_content": entry.reasoning_content,
+                "turn_usage": entry.turn_usage,
+                "turn_context": entry.turn_context,
+            }
+        )
+    return payloads
 
 
 def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...], ...]:
@@ -464,6 +494,100 @@ def _branch_origin(parent_origin: Any) -> dict[str, Any] | None:
     return {_SANDBOX_RUN_CONTEXT_ORIGIN_KEY: dict(sandbox_context)}
 
 
+def _entry_turn_id(entry: TranscriptEntry) -> str | None:
+    return turn_id_from_context(entry.turn_context)
+
+
+def _accepted_routing_mode_from_task_details(details: object) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    accepted_routing = details.get("accepted_model_routing")
+    if not isinstance(accepted_routing, dict):
+        return None
+    mode = accepted_routing.get("effective_mode")
+    if not isinstance(mode, str):
+        return None
+    normalized = mode.strip().lower()
+    return normalized if normalized in _MODEL_ROUTING_MODES else None
+
+
+def _is_promoted_turn_entry(entry: TranscriptEntry) -> bool:
+    return isinstance(entry.turn_context, dict) and (
+        entry.turn_context.get("disposition") == "promoted"
+    )
+
+
+def _fork_material_references(
+    entries: Sequence[TranscriptEntry],
+) -> tuple[set[str], set[str]]:
+    """Return attachment hashes and artifact ids reachable from copied rows."""
+
+    attachment_hashes: set[str] = set()
+    artifact_ids: set[str] = set()
+
+    def _valid_sha256(value: Any) -> str | None:
+        if not isinstance(value, str) or len(value) != 64:
+            return None
+        lowered = value.lower()
+        if any(ch not in "0123456789abcdef" for ch in lowered):
+            return None
+        return lowered
+
+    def _visit(value: Any, *, depth: int = 0) -> None:
+        if isinstance(value, dict):
+            sha = _valid_sha256(value.get("sha256_ref"))
+            if sha is None and value.get("kind") == "attachment_ref":
+                sha = _valid_sha256(value.get("sha256") or value.get("material_id"))
+            if sha is not None:
+                attachment_hashes.add(sha)
+
+            artifact_id = value.get("id")
+            if (
+                isinstance(artifact_id, str)
+                and artifact_id
+                and (
+                    value.get("kind") == "artifact_ref"
+                    or value.get("store") == "artifacts"
+                )
+            ):
+                artifact_ids.add(artifact_id)
+            artifacts = value.get("artifacts")
+            if isinstance(artifacts, list):
+                for artifact in artifacts:
+                    if isinstance(artifact, dict):
+                        artifact_id = artifact.get("id")
+                        if isinstance(artifact_id, str) and artifact_id:
+                            artifact_ids.add(artifact_id)
+
+            for item in value.values():
+                _visit(item, depth=depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _visit(item, depth=depth + 1)
+            return
+        if isinstance(value, str):
+            stripped = value.lstrip()
+            if not stripped.startswith(("{", "[")):
+                return
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return
+            _visit(parsed, depth=depth + 1)
+
+    try:
+        for entry in entries:
+            _visit(entry.content)
+            _visit(entry.tool_calls)
+    except RecursionError as exc:
+        raise ValueError(
+            "Cannot fork history whose material-reference JSON is nested too deeply"
+        ) from exc
+
+    return attachment_hashes, artifact_ids
+
+
 class SessionManager:
     """
     Orchestrates session lifecycle: create, resume, append, branch, archive, prune.
@@ -482,6 +606,7 @@ class SessionManager:
         task_runtime: Any = None,
         checkpoint_workspace_dir: str | Path | None = None,
         media_root: str | Path | None = None,
+        model_routing_mode_provider: Callable[[], str] | None = None,
     ) -> None:
         self._storage = storage
         self._memory_sync_notify = memory_sync_notify
@@ -497,6 +622,7 @@ class SessionManager:
         # Attachment/artifact media root, used to carry material into forked
         # children; None disables the copy (e.g. in tests that never touch disk).
         self._media_root = Path(media_root).expanduser() if media_root is not None else None
+        self._model_routing_mode_provider = model_routing_mode_provider
         # In-process epoch cache so _emit_to_subscribers can
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
@@ -541,6 +667,58 @@ class SessionManager:
             now = datetime.now(tz=UTC)
             tz_name = "UTC"
         return _stamp_time_prefix(content, now, tz_name)
+
+    def _default_model_routing_mode(self) -> str:
+        """Return the global mode used to initialize a new session."""
+
+        provider = self._model_routing_mode_provider
+        raw = provider() if callable(provider) else "direct"
+        mode = str(raw or "").strip().lower()
+        if mode not in _MODEL_ROUTING_MODES:
+            # A malformed provider must not create a session with an implicit
+            # inherit state. Direct is the established safe global fallback.
+            return "direct"
+        return mode
+
+    def _prepare_new_session_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(kwargs)
+        supplied = prepared.get("model_routing_mode")
+        if supplied is None:
+            prepared["model_routing_mode"] = self._default_model_routing_mode()
+            return prepared
+        mode = str(supplied).strip().lower()
+        if mode not in _MODEL_ROUTING_MODES:
+            raise ValueError("model_routing_mode must be direct, router, or ensemble")
+        prepared["model_routing_mode"] = mode
+        return prepared
+
+    async def get_session_routing(
+        self,
+        session_key: str,
+        *,
+        fallback_mode: str,
+    ) -> dict[str, Any]:
+        """Resolve the durable session mode, materializing a legacy NULL once."""
+
+        return await self._storage.resolve_model_routing_mode(
+            canonicalize_session_key(session_key),
+            fallback_mode,
+        )
+
+    async def set_session_routing(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare-and-set the user-selected routing strategy for one session."""
+
+        return await self._storage.set_model_routing_mode(
+            canonicalize_session_key(session_key),
+            mode,
+            expected_revision=expected_revision,
+        )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -613,6 +791,7 @@ class SessionManager:
         if resolved is SessionIntent.NEW_CHAT and existing is not None:
             raise ValueError("session_key conflict")
         if existing is None:
+            create_kwargs = self._prepare_new_session_kwargs(create_kwargs)
             node = self._build_session_node(
                 session_key,
                 agent_id=agent_id,
@@ -651,7 +830,11 @@ class SessionManager:
         if existing is not None:
             raise ValueError(f"Session already exists: {session_key}")
 
-        node = self._build_session_node(session_key, agent_id=agent_id, **kwargs)
+        node = self._build_session_node(
+            session_key,
+            agent_id=agent_id,
+            **self._prepare_new_session_kwargs(kwargs),
+        )
         await self._storage.upsert_session(node)
         return node
 
@@ -904,12 +1087,6 @@ class SessionManager:
         self.set_cached_epoch(reset.session_key, int(reset.epoch or 0))
         return reset
 
-    async def _archive_session_identity(self, node: SessionNode) -> None:
-        """Persist the raw archive before a same-key transcript reset."""
-
-        entries, summaries = await self.capture_session_archive(node)
-        await self.write_session_archive(node, entries, summaries)
-
     async def capture_session_archive(
         self,
         node: SessionNode,
@@ -1054,6 +1231,10 @@ class SessionManager:
         """
         session_key = canonicalize_session_key(session_key)
         self._epoch_cache.pop(session_key, None)
+        goal_service = getattr(self._task_runtime, "goal_service", None)
+        revoke_goal_lease = getattr(goal_service, "revoke_session", None)
+        if callable(revoke_goal_lease):
+            revoke_goal_lease(session_key, session_id=session_id)
         try:
             from opensquilla.gateway.subagent_announce import _tracker as _spawn_tracker
 
@@ -1092,6 +1273,214 @@ class SessionManager:
             except Exception:
                 pass
 
+    async def _task_owner_is_verified_fork_ancestor(
+        self,
+        source: SessionNode,
+        task_session_key: str,
+    ) -> bool:
+        """Accept task ownership only from the source or its live fork ancestry."""
+
+        owner_key = canonicalize_session_key(task_session_key)
+        current = source
+        visited: set[str] = set()
+        for _ in range(256):
+            current_key = canonicalize_session_key(current.session_key)
+            if current_key == owner_key:
+                return True
+            if current_key in visited:
+                return False
+            visited.add(current_key)
+            if not current.forked_from_parent or not current.parent_session_key:
+                return False
+            parent_key = canonicalize_session_key(current.parent_session_key)
+            if parent_key in visited:
+                return False
+            if not current.spawned_by or canonicalize_session_key(current.spawned_by) != parent_key:
+                return False
+            ancestor = await self._storage.get_session(parent_key)
+            if ancestor is None:
+                return False
+            if int(ancestor.spawn_depth or 0) + 1 != int(current.spawn_depth or 0):
+                return False
+            current = ancestor
+        return False
+
+    @staticmethod
+    def _has_child_owned_outcome_authority(source: SessionNode) -> bool:
+        """Return whether this row is a durable, server-created fork identity."""
+
+        if (
+            not source.forked_from_parent
+            or int(source.schema_version or 0) < CANONICAL_FORK_PROOF_SCHEMA_VERSION
+            or int(source.spawn_depth or 0) <= 0
+            or not source.parent_session_key
+            or not source.spawned_by
+        ):
+            return False
+        try:
+            parent_key = canonicalize_session_key(source.parent_session_key)
+            spawned_by = canonicalize_session_key(source.spawned_by)
+        except (TypeError, ValueError):
+            return False
+        return parent_key == spawned_by
+
+    async def _resolve_fork_terminal_outcomes(
+        self,
+        source: SessionNode,
+        entries: Sequence[TranscriptEntry],
+        *,
+        target_session_id: str,
+        target_session_key: str,
+    ) -> _ForkTerminalOutcomeResolution:
+        """Resolve terminal turns and bind their snapshots to the target child."""
+
+        turn_ids = sorted(
+            {
+                turn_id
+                for entry in entries
+                if (turn_id := _entry_turn_id(entry)) is not None
+            }
+        )
+        if not turn_ids:
+            return _ForkTerminalOutcomeResolution({}, frozenset(), frozenset())
+
+        source_projections: dict[str, dict[str, Any]] = {}
+        invalid_turn_ids: set[str] = set()
+        if self._has_child_owned_outcome_authority(source):
+            for entry in entries:
+                turn_id = _entry_turn_id(entry)
+                if turn_id is None:
+                    continue
+                projection = extract_fork_terminal_outcome_projection(
+                    entry.turn_context,
+                    session_id=source.session_id,
+                    session_key=source.session_key,
+                    turn_id=turn_id,
+                )
+                if projection is None:
+                    continue
+                previous = source_projections.get(turn_id)
+                if previous is not None and previous != projection:
+                    source_projections.pop(turn_id, None)
+                    invalid_turn_ids.add(turn_id)
+                    continue
+                if turn_id not in invalid_turn_ids:
+                    source_projections[turn_id] = projection
+
+        exact_tasks = getattr(self._storage, "get_agent_tasks_by_ids", None)
+        get_task = getattr(self._storage, "get_agent_task", None)
+        if callable(exact_tasks):
+            rows = await exact_tasks(turn_ids)
+        elif callable(get_task):
+            rows = [
+                row
+                for turn_id in turn_ids
+                if (row := await get_task(turn_id)) is not None
+            ]
+        else:
+            rows = []
+        tasks_by_id = {
+            task_id: row
+            for row in rows
+            if isinstance((task_id := getattr(row, "task_id", None)), str)
+            and task_id
+        }
+
+        projections: dict[str, dict[str, Any]] = {}
+        active_turn_ids: set[str] = set()
+        owner_checks: dict[str, bool] = {}
+        for turn_id in turn_ids:
+            row = tasks_by_id.get(turn_id)
+            snapshot: dict[str, Any] | None = None
+            if row is not None:
+                task_session_key = getattr(row, "session_key", None)
+                if not isinstance(task_session_key, str) or not task_session_key:
+                    invalid_turn_ids.add(turn_id)
+                    continue
+                owner_verified = owner_checks.get(task_session_key)
+                if owner_verified is None:
+                    owner_verified = await self._task_owner_is_verified_fork_ancestor(
+                        source,
+                        task_session_key,
+                    )
+                    owner_checks[task_session_key] = owner_verified
+                if not owner_verified:
+                    # A deleted intermediate ancestor makes the live task owner
+                    # unverifiable, but does not invalidate a snapshot already
+                    # bound to this exact child identity.
+                    snapshot = source_projections.get(turn_id)
+                    if snapshot is None:
+                        invalid_turn_ids.add(turn_id)
+                        continue
+                if snapshot is not None:
+                    projections[turn_id] = build_fork_terminal_outcome_projection(
+                        session_id=target_session_id,
+                        session_key=target_session_key,
+                        turn_id=turn_id,
+                        task_id=str(snapshot["task_id"]),
+                        status=str(snapshot["status"]),
+                        started_at=snapshot.get("started_at"),
+                        finished_at=snapshot.get("finished_at"),
+                        outcome=snapshot["outcome"],
+                        accepted_routing_mode=snapshot.get("accepted_routing_mode"),
+                        activity_snapshot=snapshot.get("activity_snapshot"),
+                    )
+                    continue
+
+                details = getattr(row, "details", None)
+                details = details if isinstance(details, dict) else {}
+                details_turn_id = details.get("turn_id")
+                if (
+                    isinstance(details_turn_id, str)
+                    and details_turn_id.strip()
+                    and details_turn_id.strip() != turn_id
+                ):
+                    invalid_turn_ids.add(turn_id)
+                    continue
+                status = getattr(row, "status", None)
+                status = str(getattr(status, "value", status) or "")
+                outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
+                if outcome is None:
+                    active_turn_ids.add(turn_id)
+                    continue
+                snapshot = {
+                    "turn_id": turn_id,
+                    "task_id": str(getattr(row, "task_id", turn_id)),
+                    "status": status,
+                    "started_at": getattr(row, "started_at", None),
+                    "finished_at": getattr(row, "finished_at", None),
+                    "outcome": outcome,
+                }
+                accepted_routing_mode = _accepted_routing_mode_from_task_details(details)
+                if accepted_routing_mode is not None:
+                    snapshot["accepted_routing_mode"] = accepted_routing_mode
+                activity_snapshot = details.get("activity_snapshot")
+                if isinstance(activity_snapshot, dict):
+                    snapshot["activity_snapshot"] = activity_snapshot
+            elif turn_id not in invalid_turn_ids:
+                snapshot = source_projections.get(turn_id)
+
+            if snapshot is None:
+                continue
+            projections[turn_id] = build_fork_terminal_outcome_projection(
+                session_id=target_session_id,
+                session_key=target_session_key,
+                turn_id=turn_id,
+                task_id=str(snapshot["task_id"]),
+                status=str(snapshot["status"]),
+                started_at=snapshot.get("started_at"),
+                finished_at=snapshot.get("finished_at"),
+                outcome=snapshot["outcome"],
+                accepted_routing_mode=snapshot.get("accepted_routing_mode"),
+                activity_snapshot=snapshot.get("activity_snapshot"),
+            )
+
+        return _ForkTerminalOutcomeResolution(
+            projections=projections,
+            active_turn_ids=frozenset(active_turn_ids),
+            invalid_turn_ids=frozenset(invalid_turn_ids),
+        )
+
     async def branch(
         self,
         parent_session_key: str,
@@ -1100,6 +1489,8 @@ class SessionManager:
         max_fork_tokens: int | None = None,
         status: SessionStatus | str = SessionStatus.RUNNING,
         fork_before_message_id: str | None = None,
+        fork_through_turn_id: str | None = None,
+        display_name: str | None = None,
         *,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
     ) -> SessionNode:
@@ -1112,6 +1503,8 @@ class SessionManager:
                 max_fork_tokens=max_fork_tokens,
                 status=status,
                 fork_before_message_id=fork_before_message_id,
+                fork_through_turn_id=fork_through_turn_id,
+                display_name=display_name,
             )
 
     async def _branch_locked(
@@ -1122,6 +1515,8 @@ class SessionManager:
         max_fork_tokens: int | None = None,
         status: SessionStatus | str = SessionStatus.RUNNING,
         fork_before_message_id: str | None = None,
+        fork_through_turn_id: str | None = None,
+        display_name: str | None = None,
     ) -> SessionNode:
         """
         Create a child session branched from parent.
@@ -1129,15 +1524,33 @@ class SessionManager:
         as initial context in the child (forkedFromParent flag set).
         If fork_before_message_id is set, copy only the canonical transcript prefix
         before that message and skip parent compaction summaries/context states.
+        If fork_through_turn_id is set, copy the complete canonical prefix through
+        that terminal turn (inclusive) and likewise skip summaries/context states.
         ``status`` sets the child's initial lifecycle status; pass a resting
         status such as ``SessionStatus.DONE`` when the child should not appear
         as an active run until its first turn starts.
         """
         parent_session_key = canonicalize_session_key(parent_session_key)
         new_session_key = canonicalize_session_key(new_session_key)
+        if fork_through_turn_id is not None and not fork_through_turn_id.strip():
+            raise ValueError("fork_through_turn_id must not be empty")
+        fork_through_turn_id = (fork_through_turn_id or "").strip() or None
+        if fork_before_message_id and fork_through_turn_id:
+            raise ValueError(
+                "fork_before_message_id and fork_through_turn_id are mutually exclusive"
+            )
+        if fork_through_turn_id and not fork_transcript:
+            raise ValueError("fork_through_turn_id requires fork_transcript=True")
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        # A fork must never inherit a legacy NULL into the future.  Resolve the
+        # parent under its durable row first, then give the child an independent
+        # CAS generation for its copied concrete selection.
+        parent_routing = await self.get_session_routing(
+            parent_session_key,
+            fallback_mode=self._default_model_routing_mode(),
+        )
 
         now = _now_ms()
         child = SessionNode(
@@ -1155,17 +1568,22 @@ class SessionManager:
             model_provider=parent.model_provider,
             channel=parent.channel,
             chat_type=parent.chat_type,
+            display_name=display_name,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            model_routing_mode=str(parent_routing["mode"]),
+            model_routing_revision=0,
         )
 
         if fork_transcript:
-            is_prefix_fork = bool(fork_before_message_id)
+            is_prefix_fork = bool(fork_before_message_id or fork_through_turn_id)
             parent_coverage = await self._storage.get_canonical_transcript_coverage(
                 parent.session_id
             )
             parent_canonical_complete = parent_coverage.canonical_complete
             parent_compaction_count = parent_coverage.compaction_count
+            parent_summaries: list[SessionSummary]
+            parent_context_states: list[SessionContextState]
             if fork_before_message_id:
                 canonical_entries = await self._storage.get_canonical_transcript(parent.session_id)
                 fork_index = next(
@@ -1182,17 +1600,101 @@ class SessionManager:
                         f"{fork_before_message_id}"
                     )
                 parent_entries = canonical_entries[:fork_index]
+                outcome_entries = parent_entries
+                parent_summaries = []
+                parent_context_states = []
+            elif fork_through_turn_id:
+                if not parent_canonical_complete:
+                    raise ValueError(
+                        "Cannot fork through a turn because canonical transcript history "
+                        "is incomplete"
+                    )
+                canonical_entries = await self._storage.get_canonical_transcript(parent.session_id)
+                matching_indexes = [
+                    index
+                    for index, entry in enumerate(canonical_entries)
+                    if _entry_turn_id(entry) == fork_through_turn_id
+                ]
+                if not matching_indexes:
+                    raise KeyError(
+                        f"Transcript turn not found in {parent_session_key}: "
+                        f"{fork_through_turn_id}"
+                    )
+                first_index = matching_indexes[0]
+                last_index = matching_indexes[-1]
+                # The inclusive boundary is the last row with positive causal
+                # ownership by this turn. Trailing rows without a turn id are
+                # deliberately excluded; assigning them by physical adjacency
+                # would make legacy/system maintenance rows leak across turns.
+                earlier_turn_ids = {
+                    turn_id
+                    for entry in canonical_entries[:first_index]
+                    if (turn_id := _entry_turn_id(entry)) is not None
+                }
+                parent_entries = []
+                for index, entry in enumerate(canonical_entries[: last_index + 1]):
+                    turn_id = _entry_turn_id(entry)
+                    if first_index < index < last_index and turn_id is None:
+                        raise ValueError(
+                            "Cannot fork through a turn with unscoped canonical rows"
+                        )
+                    if index >= first_index and turn_id not in {
+                        None,
+                        fork_through_turn_id,
+                    }:
+                        # A promoted input is persisted while its predecessor is
+                        # still producing output. Its physical position is before
+                        # the predecessor's terminal row, but causally it belongs
+                        # to a later turn and must not leak into that earlier fork.
+                        if _is_promoted_turn_entry(entry):
+                            continue
+                        # Rows from a turn already underway before the selected
+                        # promoted input are earlier causal history and remain in
+                        # the prefix. A newly appearing unrelated turn is
+                        # ambiguous, so reject instead of guessing its order.
+                        if turn_id not in earlier_turn_ids:
+                            raise ValueError(
+                                "Cannot fork through a turn with interleaved canonical rows"
+                            )
+                    parent_entries.append(entry)
+                outcome_entries = parent_entries
                 parent_summaries = []
                 parent_context_states = []
             else:
                 parent_entries = await self._storage.get_transcript(parent.session_id)
+                outcome_entries = await self._storage.get_canonical_transcript(
+                    parent.session_id
+                )
                 parent_summaries = await self._storage.get_all_summaries(parent.session_id)
                 parent_context_states = await self._storage.get_context_states(parent_session_key)
+            outcome_resolution = await self._resolve_fork_terminal_outcomes(
+                parent,
+                outcome_entries,
+                target_session_id=child.session_id,
+                target_session_key=new_session_key,
+            )
+            if fork_through_turn_id in outcome_resolution.active_turn_ids:
+                raise ValueError(
+                    f"Cannot fork through active transcript turn: {fork_through_turn_id}"
+                )
+            if (
+                fork_through_turn_id is not None
+                and fork_through_turn_id not in outcome_resolution.projections
+            ):
+                raise KeyError(
+                    f"Completion state not found for transcript turn: "
+                    f"{fork_through_turn_id}"
+                )
             summary_tokens = sum(
                 estimate_tokens(summary.summary_text) for summary in parent_summaries
             )
             parent_tokens = sum(e.token_count or 0 for e in parent_entries) + summary_tokens
             if max_fork_tokens is None or parent_tokens <= max_fork_tokens:
+                material_references = (
+                    _fork_material_references(parent_entries)
+                    if fork_through_turn_id
+                    else None
+                )
                 if is_prefix_fork:
                     # A prefix fork rewrites every copied canonical row as active raw
                     # transcript, so a complete parent needs no inherited compaction
@@ -1224,6 +1726,7 @@ class SessionManager:
                         source_session_id=parent.session_id,
                         target_session_id=child.session_id,
                         target_session_key=new_session_key,
+                        terminal_outcome_projections=outcome_resolution.projections,
                     )
                 for entry in parent_entries:
                     forked = TranscriptEntry(
@@ -1235,7 +1738,10 @@ class SessionManager:
                         tool_call_id=entry.tool_call_id,
                         reasoning_content=entry.reasoning_content,
                         turn_usage=entry.turn_usage,
-                        turn_context=entry.turn_context,
+                        turn_context=attach_fork_terminal_outcome_projection(
+                            entry.turn_context,
+                            outcome_resolution.projections.get(_entry_turn_id(entry) or ""),
+                        ),
                         created_at=entry.created_at,
                         token_count=entry.token_count,
                         provenance_kind=entry.provenance_kind,
@@ -1290,7 +1796,10 @@ class SessionManager:
                     )
                 child.forked_from_parent = True
                 await self._copy_fork_materials(
-                    parent.session_id, child.session_id, new_session_key
+                    parent.session_id,
+                    child.session_id,
+                    new_session_key,
+                    material_references=material_references,
                 )
 
         await self._storage.upsert_session(child)
@@ -1311,6 +1820,10 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        parent_routing = await self.get_session_routing(
+            parent_session_key,
+            fallback_mode=self._default_model_routing_mode(),
+        )
         parent_coverage = await self._storage.get_canonical_transcript_coverage(
             parent.session_id
         )
@@ -1349,6 +1862,8 @@ class SessionManager:
             forked_from_parent=True,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            model_routing_mode=str(parent_routing["mode"]),
+            model_routing_revision=0,
         )
         child.compaction_count = (
             0
@@ -1358,6 +1873,13 @@ class SessionManager:
         child.schema_version = max(
             child.schema_version,
             CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+        )
+        prefix_entries = canonical_entries[:fork_index]
+        outcome_resolution = await self._resolve_fork_terminal_outcomes(
+            parent,
+            prefix_entries,
+            target_session_id=child.session_id,
+            target_session_key=new_session_key,
         )
         copied_entries = tuple(
             TranscriptEntry(
@@ -1369,7 +1891,10 @@ class SessionManager:
                 tool_call_id=entry.tool_call_id,
                 reasoning_content=entry.reasoning_content,
                 turn_usage=entry.turn_usage,
-                turn_context=entry.turn_context,
+                turn_context=attach_fork_terminal_outcome_projection(
+                    entry.turn_context,
+                    outcome_resolution.projections.get(_entry_turn_id(entry) or ""),
+                ),
                 created_at=entry.created_at,
                 token_count=entry.token_count,
                 provenance_kind=entry.provenance_kind,
@@ -1378,7 +1903,7 @@ class SessionManager:
                 provenance_source_channel=entry.provenance_source_channel,
                 provenance_source_tool=entry.provenance_source_tool,
             )
-            for entry in canonical_entries[:fork_index]
+            for entry in prefix_entries
         )
         return PreparedSessionIntent(
             node=child,
@@ -1394,14 +1919,16 @@ class SessionManager:
         source_session_id: str,
         target_session_id: str,
         target_session_key: str,
+        *,
+        material_references: tuple[set[str], set[str]] | None = None,
     ) -> None:
         """Carry a parent session's attachment/artifact material into a forked child.
 
-        ``branch`` copies transcript rows, but the artifact and attachment material
-        stores are keyed by session id, so without this the child's generated images,
-        generated files, and uploaded attachments resolve to an empty bucket and fail
-        to preview or replay. Runs off the event loop and never raises: a copy failure
-        must not abort the fork, whose session row is committed by the caller next.
+        ``branch`` copies transcript rows, but artifact and attachment material stores
+        are keyed by session id. ArtifactSession documents additionally need a new,
+        generation-one metadata lineage that points back to each parent's current head.
+        Runs off the event loop where appropriate and never raises: a copy failure must
+        not abort the fork, whose session row is committed by the caller next.
         """
         media_root = self._media_root
         if media_root is None:
@@ -1410,23 +1937,59 @@ class SessionManager:
 
         _log = _structlog.get_logger(__name__)
 
-        def _run() -> None:
-            from opensquilla.artifacts import ArtifactStore
-            from opensquilla.attachment_refs import copy_transcript_material
+        attachment_hashes: set[str] | None = None
+        transcript_artifact_ids: set[str] | None = None
+        if material_references is not None:
+            attachment_hashes, transcript_artifact_ids = material_references
 
-            ArtifactStore(media_root).copy_session_artifacts(
+        def _copy_files(head_artifact_ids: tuple[str, ...]) -> None:
+            from opensquilla.artifacts import ArtifactStore
+
+            store = ArtifactStore(media_root)
+            store.copy_session_artifacts(
                 source_session_id=source_session_id,
                 target_session_id=target_session_id,
                 target_session_key=target_session_key,
+                artifact_ids=transcript_artifact_ids,
             )
+            store.copy_artifact_heads_for_fork(
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+                target_session_key=target_session_key,
+                artifact_ids=head_artifact_ids,
+            )
+
+        def _copy_attachments() -> None:
+            from opensquilla.attachment_refs import copy_transcript_material
+
             copy_transcript_material(
                 media_root=media_root,
                 source_session_id=source_session_id,
                 target_session_id=target_session_id,
+                material_ids=attachment_hashes,
             )
 
         try:
-            await asyncio.to_thread(_run)
+            from opensquilla.artifact_session import (
+                Actor,
+                ActorKind,
+                ArtifactSessionService,
+            )
+
+            service = await ArtifactSessionService.from_session_storage(self._storage)
+            snapshots = await service.snapshot_session_heads(session_id=source_session_id)
+            await asyncio.to_thread(
+                _copy_files,
+                tuple(snapshot.revision.artifact_id for snapshot in snapshots),
+            )
+            await service.fork_session_heads(
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+                target_session_key=target_session_key,
+                snapshots=snapshots,
+                actor=Actor(ActorKind.SYSTEM, "session-fork"),
+            )
+            await asyncio.to_thread(_copy_attachments)
         except Exception:
             _log.warning(
                 "session.fork.material_copy_failed",
@@ -1437,12 +2000,38 @@ class SessionManager:
 
     # ── Transcript ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def reserve_assistant_message(
+        turn_id: str,
+        assistant_message_id: str,
+        session_key: str,
+        channel_id: str | None = None,
+    ) -> AssistantMessageReservation:
+        """Reserve an assistant identity without creating a transcript row.
+
+        The reservation is intentionally just a value object.  Materialization
+        happens on the first visible/final assistant write using the same id.
+        """
+
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must be a non-empty string")
+        if not isinstance(assistant_message_id, str) or not assistant_message_id.strip():
+            raise ValueError("assistant_message_id must be a non-empty string")
+        return AssistantMessageReservation(
+            turn_id=turn_id,
+            assistant_message_id=assistant_message_id,
+            session_key=canonicalize_session_key(session_key),
+            channel_id=channel_id,
+        )
+
     async def prepare_message(
         self,
         session_key: str,
         role: str,
         content: str,
         *,
+        message_id: str | None = None,
+        assistant_message_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
@@ -1463,7 +2052,16 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
 
+        if message_id is not None and assistant_message_id is not None:
+            if message_id != assistant_message_id:
+                raise ValueError("message_id and assistant_message_id must match")
+        message_id = assistant_message_id or message_id
         content = self._maybe_stamp_user_message(role, content)
+
+        if message_id is not None and (
+            not isinstance(message_id, str) or not message_id.strip()
+        ):
+            raise ValueError("message_id must be a non-empty string when supplied")
 
         if turn_context is None:
             from opensquilla.session.turn_context import current_turn_context
@@ -1473,6 +2071,7 @@ class SessionManager:
         entry = TranscriptEntry(
             session_id=node.session_id,
             session_key=session_key,
+            message_id=message_id or str(uuid.uuid4()),
             role=role,
             content=content,
             tool_calls=tool_calls,
@@ -1511,6 +2110,8 @@ class SessionManager:
         role: str,
         content: str,
         *,
+        message_id: str | None = None,
+        assistant_message_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
@@ -1520,10 +2121,15 @@ class SessionManager:
     ) -> TranscriptEntry:
         """Append a message and narrowly touch its session in one transaction."""
 
+        if message_id is not None and assistant_message_id is not None:
+            if message_id != assistant_message_id:
+                raise ValueError("message_id and assistant_message_id must match")
+        message_id = assistant_message_id or message_id
         entry, expected_epoch = await self.prepare_message(
             session_key,
             role,
             content,
+            message_id=message_id,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content,
@@ -1538,13 +2144,22 @@ class SessionManager:
             else None
         )
         if submitted_plan is None:
-            await self._storage.append_transcript_entry_and_touch(
-                entry,
-                expected_epoch=expected_epoch,
-                updated_at=_now_ms(),
-                token_delta=token_delta,
-                mark_total_tokens_stale=bool(token_delta),
-            )
+            if message_id is None:
+                await self._storage.append_transcript_entry_and_touch(
+                    entry,
+                    expected_epoch=expected_epoch,
+                    updated_at=_now_ms(),
+                    token_delta=token_delta,
+                    mark_total_tokens_stale=bool(token_delta),
+                )
+            else:
+                await self._storage.upsert_transcript_entry_and_touch(
+                    entry,
+                    expected_epoch=expected_epoch,
+                    updated_at=_now_ms(),
+                    token_delta=token_delta,
+                    mark_total_tokens_stale=bool(token_delta),
+                )
         else:
             node = await self._storage.get_session(session_key)
             if node is None:
@@ -1652,6 +2267,7 @@ class SessionManager:
         session_key: str,
         *,
         boundary_message_id: str | None = None,
+        transcript_entries: Sequence[TranscriptEntry] | None = None,
     ) -> CompactionSourceSnapshot:
         """Freeze the exact durable prefix visible to the active turn.
 
@@ -1660,7 +2276,11 @@ class SessionManager:
         boundary cannot be found.
         """
 
-        transcript = await self.get_transcript(session_key)
+        transcript = (
+            list(transcript_entries)
+            if transcript_entries is not None
+            else await self.get_transcript(session_key)
+        )
         source_entries = transcript
         if boundary_message_id is not None:
             boundary_index = next(
@@ -2060,6 +2680,7 @@ class SessionManager:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
         consumer_admission_fingerprint: str = "",
+        protected_boundary_message_id: str | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -2088,6 +2709,28 @@ class SessionManager:
                 effective_config,
                 phase="snapshotting",
             )
+            if protected_boundary_message_id is not None:
+                protected_boundary_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if entry.message_id == protected_boundary_message_id
+                    ),
+                    None,
+                )
+                if protected_boundary_index is None:
+                    return CompactionResult(
+                        summary="",
+                        kept_entries=_compaction_entry_payloads(entries),
+                        removed_count=0,
+                        chunks_processed=0,
+                        summary_source="skipped",
+                        skip_reason="protected_boundary_missing",
+                    )
+                effective_config.protected_recent_messages = max(
+                    effective_protected_recent_messages(effective_config),
+                    len(entries) - protected_boundary_index,
+                )
             summaries = await await_compaction_phase(
                 self._storage.get_all_summaries(node.session_id),
                 effective_config,
@@ -2718,7 +3361,13 @@ class SessionManager:
     async def prune_stale(self, max_age_ms: int) -> int:
         """Delete sessions older than max_age_ms. Returns number pruned."""
         cutoff = _now_ms() - max_age_ms
-        return await self._storage.prune_stale_sessions(cutoff)
+        stale = await self._storage.prune_stale_session_records(cutoff)
+        for session in stale:
+            self.evict_session_runtime_state(
+                session.session_key,
+                session_id=session.session_id,
+            )
+        return len(stale)
 
     async def cap_entries(self, max_entries: int = 500) -> int:
         """Delete oldest sessions beyond max_entries. Returns number deleted."""
@@ -2730,6 +3379,10 @@ class SessionManager:
         to_delete = sorted(sessions, key=lambda s: s.updated_at)[: total - max_entries]
         for s in to_delete:
             await self._storage.delete_session(s.session_key)
+            self.evict_session_runtime_state(
+                s.session_key,
+                session_id=s.session_id,
+            )
         return len(to_delete)
 
     async def archive(self, session_key: str) -> None:

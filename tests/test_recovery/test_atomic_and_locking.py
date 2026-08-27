@@ -379,6 +379,7 @@ def test_macos_primitive_collision_preserves_both_trees(tmp_path: Path) -> None:
     assert (destination / "value.txt").read_text(encoding="utf-8") == "destination"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows rename")
 def test_windows_primitive_collision_preserves_both_trees(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -395,6 +396,7 @@ def test_windows_primitive_collision_preserves_both_trees(tmp_path: Path) -> Non
     assert (destination / "value.txt").read_text(encoding="utf-8") == "destination"
 
 
+@pytest.mark.ci_serial
 def test_native_move_moves_a_regular_tree_between_real_parents(tmp_path: Path) -> None:
     source_parent = tmp_path / "source-parent"
     destination_parent = tmp_path / "destination-parent"
@@ -493,6 +495,7 @@ def test_move_manifest_allows_only_selected_lock_mtime_change() -> None:
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires two native Windows volumes")
 def test_windows_native_move_refuses_real_cross_volume_move() -> None:
     volume_a_value = os.environ.get("OPENSQUILLA_WINDOWS_TEST_VOLUME_A")
@@ -661,6 +664,7 @@ def test_profile_move_still_refuses_link_outside_workspace(tmp_path: Path) -> No
     assert not destination.exists()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows long paths")
 def test_windows_native_move_handles_real_path_longer_than_260_characters(
     tmp_path: Path,
@@ -687,6 +691,7 @@ def test_windows_native_move_handles_real_path_longer_than_260_characters(
         assert handle.read() == "long-path-preserved"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
 def test_windows_native_move_rejects_real_junction_in_source_tree(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -1134,6 +1139,7 @@ def test_windows_legacy_lock_handle_allows_share_delete_for_profile_swap(
     assert converted and converted[0][0] == 101
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows share-delete semantics")
 def test_windows_real_legacy_lock_survives_profile_move_and_rebind(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -1155,6 +1161,7 @@ def test_windows_real_legacy_lock_survives_profile_move_and_rebind(tmp_path: Pat
             assert queue.get(timeout=2) == "busy"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows lock handoff")
 def test_windows_real_replacement_locks_survive_two_profile_moves(tmp_path: Path) -> None:
     target = tmp_path / "target"
@@ -1179,6 +1186,7 @@ def test_windows_real_replacement_locks_survive_two_profile_moves(tmp_path: Path
             assert queue.get(timeout=2) == "busy"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows lock handoff")
 def test_windows_real_recent_locked_profile_tree_moves_without_metadata_false_positive(
     tmp_path: Path,
@@ -1905,6 +1913,7 @@ def test_windows_rename_info_rejects_invalid_leaf_names(destination_name: str) -
         _windows_rename_info(destination_name, 123)
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows sharing semantics")
 def test_windows_no_replace_pins_both_parents_during_real_mutation_window(
     tmp_path: Path,

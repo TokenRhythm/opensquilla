@@ -41,6 +41,16 @@ describe('artifactAccessUrl', () => {
       '/api/v1/artifacts/art-report',
     )
   })
+
+  it('treats only the exact Desktop proxy authority as same-origin', () => {
+    expect(artifactAccessUrl(artifact(), 'opensquilla-app://desktop')).toBe(
+      '/api/v1/artifacts/art-report',
+    )
+    expect(artifactAccessUrl(
+      artifact({ download_url: 'other-app://desktop/api/v1/artifacts/art-report?token=keep' }),
+      'opensquilla-app://desktop',
+    )).toBe('other-app://desktop/api/v1/artifacts/art-report?token=keep')
+  })
 })
 
 describe('artifactAccessHeaders', () => {
@@ -61,6 +71,22 @@ describe('artifactAccessHeaders', () => {
       sessionKey: 'agent:main:webchat:ok',
       authToken: 'secret',
     })).toEqual({})
+  })
+
+  it('attaches credentials to the exact Desktop artifact proxy only', () => {
+    const context = {
+      baseOrigin: 'opensquilla-app://desktop',
+      sessionKey: 'agent:main:webchat:ok',
+      authToken: 'secret',
+    }
+    expect(artifactAccessHeaders('/api/v1/artifacts/art-report', context)).toEqual({
+      'x-opensquilla-session-key': 'agent:main:webchat:ok',
+      Authorization: 'Bearer secret',
+    })
+    expect(artifactAccessHeaders(
+      'other-app://desktop/api/v1/artifacts/art-report',
+      context,
+    )).toEqual({})
   })
 })
 
@@ -138,6 +164,27 @@ describe('openArtifactViaGateway', () => {
 })
 
 describe('fetchArtifactBlob', () => {
+  it('allows authenticated same-origin fetches through the Desktop proxy', async () => {
+    const fetchImpl = vi.fn(async () => new Response('desktop preview', {
+      status: 200,
+      headers: { 'content-type': 'text/markdown' },
+    }))
+
+    const result = await fetchArtifactBlob(artifact(), {
+      baseOrigin: 'opensquilla-app://desktop',
+      sessionKey: 'agent:main:webchat:ok',
+      authToken: 'secret',
+      fetchImpl,
+      requireSameOrigin: true,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-report', expect.objectContaining({
+      credentials: 'same-origin',
+      redirect: 'error',
+    }))
+  })
+
   it('forwards an AbortSignal to the authenticated fetch', async () => {
     const controller = new AbortController()
     const fetchImpl = vi.fn(async () => new Response('hello', { status: 200 }))

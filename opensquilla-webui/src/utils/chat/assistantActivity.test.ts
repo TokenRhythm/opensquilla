@@ -15,6 +15,7 @@ import {
   isSemanticActivityStatusStep,
   projectAssistantActivity,
   projectAssistantActivityTimeline,
+  providerActivityRemainingSeconds,
   splitLiveAssistantTimeline,
 } from './assistantActivity'
 import type { AssistantActivityStatusStep } from './assistantActivity'
@@ -75,7 +76,56 @@ function toolGroup(
 }
 
 describe('projectAssistantActivity', () => {
-  it('separates an aggregated answer at a single ordinary tool boundary', () => {
+  it('hides persisted mutation protocol echoes while keeping structured activity', () => {
+    const leaked = (
+      'TheUserInstructions {"documentMutationOutcome":{"status":"applied"}} '
+      + 'User(internal control text)'
+    )
+    const projection = projectAssistantActivity(
+      message({
+        text: `${leaked}\n\nPage updated.`,
+        timelineItems: [
+          toolGroup([call('apply', { name: 'document_apply' })], 'apply'),
+          { type: 'text', key: 'leaked-answer', html: leaked, rawText: leaked },
+        ],
+        turnOutcome: {
+          turnId: 'turn-contained-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(JSON.stringify(projection)).not.toContain('TheUserInstructions')
+    expect(JSON.stringify(projection)).not.toContain('documentMutationOutcome')
+  })
+
+  it('keeps an ordinary localized mutation result visible', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Page updated.',
+        turnOutcome: {
+          turnId: 'turn-safe-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart?.rawText).toBe('Page updated.')
+  })
+
+  it('fails open when an ordinary tool group did not settle successfully', () => {
     const failed = call('failed', {
       status: 'error',
       isError: true,
@@ -95,15 +145,11 @@ describe('projectAssistantActivity', () => {
     )
 
     expect(projection.canSeparateActivity).toBe(true)
-    expect(projection.answerSource).toBe('terminal-timeline-boundary')
-    expect(projection.activityItems.map(item => item.type)).toEqual(['text', 'tool-group'])
-    expect(projection.activityItems[0]).toMatchObject({
-      key: 'prefix',
-      rawText: 'Canonical prefix',
-    })
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.activityItems.map(item => item.type)).toEqual(['tool-group'])
     expect(projection.answerPart).toMatchObject({
-      rawText: ' and suffix',
-      html: '<p> and suffix</p>',
+      rawText: 'Canonical prefix and suffix',
+      html: '<p>Canonical prefix and suffix</p>',
     })
     expect(projection.toolCount).toBe(2)
     expect(projection.failureCount).toBe(1)
@@ -224,7 +270,119 @@ describe('projectAssistantActivity', () => {
     ])
   })
 
-  it('folds the transition before a terminal Markdown answer boundary', () => {
+  it('keeps an explicit intermediate span out of the adjacent final answer', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting.Working note.Final answer.',
+        timelineItems: [
+          { type: 'text', key: 'opening', html: 'Inspecting.', rawText: 'Inspecting.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Working note.',
+            rawText: 'Working note.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'inspect',
+      'work',
+    ])
+  })
+
+  it.each([
+    ['dash thematic break', 'Summary before.\n\n---\n\nSummary after.'],
+    ['asterisk thematic break', 'Summary before.\n\n***\n\nSummary after.'],
+    ['underscore thematic break', 'Summary before.\n\n___\n\nSummary after.'],
+    ['fenced code containing a break', '```md\n---\n```\n\nSummary after.'],
+  ])('keeps the complete terminal Markdown answer across a %s', (_name, answer) => {
+    const projection = projectAssistantActivity(
+      message({
+        text: answer,
+        timelineItems: [
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: answer, rawText: answer },
+        ],
+      }),
+      text => `<rendered>${text}</rendered>`,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe(answer)
+    expect(projection.activityItems.map(item => item.key)).toEqual(['inspect'])
+  })
+
+  it.each([
+    ['leading code indentation', '    Final code', 'Final code'],
+    ['trailing hard-break spaces', 'Final line  \nNext line', 'Final line\nNext line'],
+  ])('fails open when comparison would erase %s', (_name, canonical, timelineText) => {
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: timelineText, rawText: timelineText },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('uses the readable aggregate for consecutive terminal text segments', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Work.\n\nFinal part one.\n\nFinal part two.',
+        timelineItems: [
+          { type: 'text', key: 'work', html: 'Work.', rawText: 'Work.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer-a', html: 'Final part one.', rawText: 'Final part one.' },
+          { type: 'text', key: 'answer-b', html: 'Final part two.', rawText: 'Final part two.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final part one.\n\nFinal part two.')
+    expect(projection.activityItems.map(item => item.key)).toEqual(['work', 'inspect'])
+  })
+
+  it('preserves terminal Markdown hard-break and trailing newline bytes', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Final line  \n',
+        timelineItems: [
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: 'Final line', rawText: 'Final line  ' },
+          { type: 'text', key: 'newline', html: '', rawText: '\n' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final line  \n')
+  })
+
+  it('treats a thematic break as terminal answer content, never as a protocol boundary', () => {
     const projection = projectAssistantActivity(
       message({
         text: 'Inspecting.\n\nPreparing the report.\n\n---\n\n## Final report\nResult.',
@@ -248,16 +406,13 @@ describe('projectAssistantActivity', () => {
     )
 
     expect(projection.answerSource).toBe('terminal-timeline-boundary')
-    expect(projection.answerPart?.rawText).toBe('## Final report\nResult.')
+    expect(projection.answerPart?.rawText).toBe(
+      'Preparing the report.\n\n---\n\n## Final report\nResult.',
+    )
     expect(projection.activityItems.map(item => item.key)).toEqual([
       'opening',
       'weather',
-      'terminal:activity-prefix',
     ])
-    expect(projection.activityItems[2]).toMatchObject({
-      rawText: 'Preparing the report.',
-      html: '<rendered>Preparing the report.</rendered>',
-    })
   })
 
   it('separates an aggregated PlanRun answer at a successful terminal control boundary', () => {
@@ -404,6 +559,149 @@ describe('projectAssistantActivity', () => {
       text => text,
       [],
       { lifecycle: 'interrupted' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('keeps repeated narration in activity and takes only the final run after multiple tools', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Repeat.\n\nMiddle.\n\nRepeat.',
+        timelineItems: [
+          { type: 'text', key: 'repeat-before', html: 'Repeat.', rawText: 'Repeat.' },
+          toolGroup([call('read', { name: 'read_file' })], 'read'),
+          { type: 'text', key: 'middle', html: 'Middle.', rawText: 'Middle.' },
+          toolGroup([call('verify', { name: 'execute_code' })], 'verify'),
+          { type: 'text', key: 'repeat-after', html: 'Repeat.', rawText: 'Repeat.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Repeat.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'repeat-before',
+      'read',
+      'middle',
+      'verify',
+    ])
+  })
+
+  it.each([
+    ['running tool', call('run', { isRunning: true, status: '' })],
+    ['pending tool', call('pending', { status: '' })],
+  ])('fails open for a %s', (_name, unsettledCall) => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          { type: 'text', key: 'narration', html: 'Narration.', rawText: 'Narration.' },
+          toolGroup([unsettledCall], 'unsettled'),
+          { type: 'text', key: 'answer', html: 'Final answer.', rawText: 'Final answer.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('fails open when a transparent control precedes rather than follows the answer', () => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          { type: 'text', key: 'narration', html: 'Narration.', rawText: 'Narration.' },
+          toolGroup([call('checkpoint', { name: 'plan_run_checkpoint' })], 'checkpoint'),
+          { type: 'text', key: 'answer', html: 'Final answer.', rawText: 'Final answer.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('uses explicit intermediate presentation across a preceding transparent control', () => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Narration.',
+            rawText: 'Narration.',
+            presentation: 'intermediate',
+          },
+          toolGroup([call('checkpoint', { name: 'plan_run_checkpoint' })], 'checkpoint'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-control-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration'])
+  })
+
+  it('keeps a terminal-tool turn with only explicit intermediate text out of the answer', () => {
+    const canonical = 'Work narration.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Work narration.',
+            rawText: 'Work narration.',
+            presentation: 'intermediate',
+          },
+          toolGroup([call('finish', { name: 'read_file' })], 'finish'),
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('explicit-no-answer')
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration', 'finish'])
+  })
+
+  it.each([
+    ['streaming', { isStreaming: true }, 'working' as const],
+    ['terminal failure', { terminalFailure: true }, 'failed' as const],
+  ])('fails open while the turn is %s', (_name, messageState, lifecycle) => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        ...messageState,
+        timelineItems: [
+          { type: 'text', key: 'narration', html: 'Narration.', rawText: 'Narration.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: 'Final answer.', rawText: 'Final answer.' },
+        ],
+      }),
+      text => text,
+      [],
+      { lifecycle },
     )
 
     expect(projection.answerSource).toBe('canonical')
@@ -828,6 +1126,103 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('secret')
   })
 
+  it('projects provider lifecycle actions from closed semantic codes', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'working',
+      statusHistory: [
+        { action: 'provider:requesting', label: 'raw provider request', at: 1_000 },
+        { action: 'provider:reasoning', label: 'raw reasoning body', at: 2_000 },
+        { action: 'provider:rate_limited:8', label: 'raw 429 response', at: 3_000 },
+        { action: 'provider:retry_wait:12', label: 'raw retry response', at: 4_000 },
+        { action: 'provider:retrying:2:3', label: 'raw retry response', at: 5_000 },
+        { action: 'provider:fallback', label: 'raw fallback response', at: 6_000 },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.label)).toEqual([
+      { code: 'chat.activity.provider.waiting', params: {} },
+      { code: 'chat.activity.provider.reasoning', params: {} },
+      { code: 'chat.activity.provider.rateLimited', params: { seconds: 8 } },
+      { code: 'chat.activity.provider.retryWait', params: { seconds: 12 } },
+      {
+        code: 'chat.activity.provider.retrying',
+        params: { attempt: 2, limit: 3 },
+      },
+      { code: 'chat.activity.provider.fallback', params: {} },
+    ])
+    expect(JSON.stringify(projection.statusSteps)).not.toContain('raw 429 response')
+    expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
+  })
+
+  it('derives each phase duration from the next transition and terminal boundary', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 12_000,
+      statusHistory: [
+        { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+        { action: 'provider:reasoning', label: 'Reasoning', at: 4_000 },
+        { action: 'write:1', label: 'Writing', at: 9_000 },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([3, 5, 3])
+  })
+
+  it('uses authoritative v2 phase endings without sorting by timestamps', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 99_000,
+      statusHistory: [
+        {
+          action: 'provider:requesting',
+          label: 'Waiting',
+          at: 9_000,
+          endedAt: 9_000,
+          activityOrder: 1,
+        },
+        {
+          action: 'provider:fallback',
+          label: 'Fallback',
+          at: 1_000,
+          endedAt: 12_000,
+          activityOrder: 2,
+        },
+      ],
+    })
+    expect(projection.statusSteps.map(step => step.activityOrder)).toEqual([1, 2])
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([0, 11])
+  })
+
+  it('counts down provider retry waits locally without changing other phases', () => {
+    const statusStep = (
+      overrides: Partial<AssistantActivityStatusStep>,
+    ): AssistantActivityStatusStep => ({
+      key: 'activity-status:provider',
+      at: 10_000,
+      isCurrent: true,
+      label: { code: 'chat.activity.provider.waiting', params: {} },
+      ...overrides,
+    })
+    const rateLimited = statusStep({
+      at: 10_000,
+      label: { code: 'chat.activity.provider.rateLimited', params: { seconds: 8 } },
+    })
+    const retryWait = statusStep({
+      at: 10_000,
+      label: { code: 'chat.activity.provider.retryWait', params: { seconds: 12 } },
+    })
+    const reasoning = statusStep({
+      at: 10_000,
+      label: { code: 'chat.activity.provider.reasoning', params: {} },
+    })
+
+    expect(providerActivityRemainingSeconds(rateLimited, 10_999)).toBe(8)
+    expect(providerActivityRemainingSeconds(rateLimited, 13_000)).toBe(5)
+    expect(providerActivityRemainingSeconds(rateLimited, 30_000)).toBe(0)
+    expect(providerActivityRemainingSeconds(retryWait, 15_000)).toBe(7)
+    expect(providerActivityRemainingSeconds(reasoning, 15_000)).toBeNull()
+  })
+
   it('projects skipped, stale, and cancelled compactions as settled outcomes', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
@@ -840,6 +1235,7 @@ describe('projectAssistantActivityTimeline', () => {
           category: 'maintenance',
           state: 'skipped',
           source: 'automatic',
+          reason: 'within_compaction_budget',
         },
         {
           action: 'context_compaction',
@@ -871,6 +1267,24 @@ describe('projectAssistantActivityTimeline', () => {
       ['stale', 'chat.compact.cancelled', false],
       ['cancelled', 'chat.compact.cancelled', false],
     ])
+  })
+
+  it('does not describe a non-benign compaction veto as within budget', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: [{
+        action: 'context_compaction',
+        label: '',
+        at: 1_000,
+        id: 'cmp-no-boundary',
+        category: 'maintenance',
+        state: 'skipped',
+        source: 'automatic',
+        reason: 'no_safe_turn_boundary',
+      }],
+    })
+
+    expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
   })
 
   it('merges adjacent automatic completions and keeps durable metadata', () => {
@@ -997,6 +1411,21 @@ describe('isSemanticActivityStatusStep', () => {
     expect(isSemanticActivityStatusStep(statusStep({
       label: { code: 'chat.activity.lifecycle.answering', params: {} },
     }))).toBe(false)
+  })
+
+  it('rejects routine provider phases while preserving exceptional transitions', () => {
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.waiting', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.reasoning', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.fallback', params: {} },
+    }))).toBe(true)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.retryWait', params: { seconds: 3 } },
+    }))).toBe(true)
   })
 
   it('rejects maintenance rows so compaction does not inflate semantic step counts', () => {

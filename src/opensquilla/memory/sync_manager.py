@@ -79,6 +79,7 @@ class MemorySyncManager:
         self._ttl_days = ttl_days
         self._ttl_sweep_interval_minutes = ttl_sweep_interval_minutes
         self._session_indexer = session_indexer
+        self._session_search_synced = False
 
         self._dirty = False
         self._warmed_sessions: set[str] = set()
@@ -153,7 +154,13 @@ class MemorySyncManager:
         """
         is_search_reason = reason == "search" or reason.startswith("search:")
         session_delta_pending = self._delta.has_pending()
-        if is_search_reason and not self._dirty and not force and not session_delta_pending:
+        if (
+            is_search_reason
+            and not self._dirty
+            and not force
+            and not session_delta_pending
+            and (self._session_indexer is None or self._session_search_synced)
+        ):
             return
         if reason == "session-delta" and not self._delta.should_sync() and not force:
             return
@@ -214,6 +221,7 @@ class MemorySyncManager:
     def notify_message(self, byte_count: int) -> None:
         """Trigger 5: accumulate session delta."""
         self._delta.record(byte_count=byte_count)
+        self._session_search_synced = False
 
     # --- Internal ---
 
@@ -311,6 +319,7 @@ class MemorySyncManager:
             return False
         try:
             result = await self._session_indexer.sync(force=force)
+            self._session_search_synced = True
             logger.info(
                 "sync_manager.sessions_synced",
                 reason=reason,

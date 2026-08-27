@@ -20,7 +20,17 @@ import structlog
 from starlette.websockets import WebSocketState
 
 import opensquilla.gateway.websocket as websocket_module
-from opensquilla.gateway.protocol import make_event, make_ok_res
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
+from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.protocol import (
+    make_event,
+    make_ok_res,
+    project_session_event_for_client,
+)
 from opensquilla.gateway.websocket import (
     _LOSSY_EVENTS,
     _SENTINEL_STOP,
@@ -75,6 +85,173 @@ async def _flush_writer(conn: WsConnection, *, deadline: float = 1.0) -> None:
         await asyncio.sleep(0.01)
 
 
+async def _block_writer(conn: WsConnection, fake: _FakeWebSocket) -> None:
+    """Park the writer in send_text so overflow tests model a genuinely slow socket."""
+
+    fake._send_event = asyncio.Event()
+    fake._send_unblock = asyncio.Event()
+    await conn.send_raw_text('{"type":"writer-test-probe"}')
+    await asyncio.wait_for(fake._send_event.wait(), timeout=1.0)
+
+
+def _turn_committed_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "session_key": "agent:main:committed",
+        "task_id": "task-committed",
+        "turn_id": "turn-committed",
+        "status": "succeeded",
+        "terminal_reason": "completed",
+        "finished_at": 1_234,
+        "stream_generation": "generation-committed",
+        "stream_seq": 7,
+        "emitted_at": 1_235,
+        "text": "must not cross the public boundary",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("client_capable", "principal_capable", "expected_event"),
+    [
+        (False, True, "session.event.error"),
+        (True, False, "session.event.answer_generation_reset"),
+    ],
+)
+async def test_terminal_reset_projection_uses_connect_caps_at_send_boundary(
+    writer_enabled: bool,
+    client_capable: bool,
+    principal_capable: bool,
+    expected_event: str,
+) -> None:
+    fake = _FakeWebSocket()
+    conn = WsConnection(
+        conn_id="cx-reset-projection",
+        ws=fake,  # type: ignore[arg-type]
+        client_caps=(
+            frozenset({ANSWER_GENERATION_RESET_CAPABILITY})
+            if client_capable
+            else frozenset()
+        ),
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.read"}),
+            is_owner=False,
+            authenticated=True,
+            capabilities=(
+                frozenset({ANSWER_GENERATION_RESET_CAPABILITY})
+                if principal_capable
+                else frozenset({"host.execute"})
+            ),
+        ),
+    )
+    conn._start_writer(maxsize=8, enabled=writer_enabled)
+    original = {
+        "kind": "answer_generation_reset",
+        "turn_id": "turn-reset",
+        "assistant_message_id": "assistant-reset",
+        "authoritative_text_snapshot": "partial fallback",
+        "terminal": True,
+        "terminal_text_snapshot": "The model could not complete this answer.",
+        "terminal_error_message": "INTERNAL_MESSAGE",
+        "terminal_error_code": "INTERNAL_CODE",
+        "terminal_failure_kind": "INTERNAL_KIND",
+        "session_key": "agent:main:reset",
+        "stream_seq": 17,
+    }
+    payload = dict(original)
+    try:
+        await conn.send_event(
+            "session.event.answer_generation_reset",
+            payload,
+            meta={"replayed": True},
+        )
+        if writer_enabled:
+            await _flush_writer(conn)
+        assert len(fake.sent) == 1
+        frame = json.loads(fake.sent[0])
+        assert frame["event"] == expected_event
+        assert frame["payload"]["stream_seq"] == 17
+        assert frame["meta"] == {"replayed": True}
+        assert "terminal_error_message" not in frame["payload"]
+        assert "terminal_error_code" not in frame["payload"]
+        assert "terminal_failure_kind" not in frame["payload"]
+        if expected_event == "session.event.error":
+            assert frame["payload"]["message"] == original["terminal_text_snapshot"]
+            assert frame["payload"]["code"] == "ensemble_fixed_error"
+        else:
+            assert "message" not in frame["payload"]
+        # Per-client projection must never rewrite the canonical replay payload.
+        assert payload == original
+    finally:
+        await conn._stop_writer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_enabled", [False, True])
+async def test_turn_committed_is_capability_gated_and_allowlisted(
+    writer_enabled: bool,
+) -> None:
+    payload = _turn_committed_payload()
+    legacy_socket = _FakeWebSocket()
+    legacy = WsConnection(conn_id="committed-legacy", ws=legacy_socket)  # type: ignore[arg-type]
+    capable_socket = _FakeWebSocket()
+    capable = WsConnection(
+        conn_id="committed-capable",
+        ws=capable_socket,  # type: ignore[arg-type]
+        client_caps=frozenset({TURN_COMMITTED_CAPABILITY}),
+    )
+    legacy._start_writer(maxsize=8, enabled=writer_enabled)
+    capable._start_writer(maxsize=8, enabled=writer_enabled)
+    try:
+        await legacy.send_event(TURN_COMMITTED_EVENT, payload)
+        await capable.send_event(TURN_COMMITTED_EVENT, payload)
+        if writer_enabled:
+            await _flush_writer(legacy)
+            await _flush_writer(capable)
+
+        assert legacy_socket.sent == []
+        frame = json.loads(capable_socket.sent[0])
+        assert frame["event"] == TURN_COMMITTED_EVENT
+        assert frame["payload"] == {
+            key: value for key, value in payload.items() if key != "text"
+        }
+    finally:
+        await legacy._stop_writer()
+        await capable._stop_writer()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("schema_version", None),
+        ("schema_version", True),
+        ("schema_version", 2),
+        ("status", "failed"),
+        ("finished_at", "1234"),
+        ("stream_seq", False),
+    ],
+)
+def test_turn_committed_projection_rejects_invalid_contract_fields(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    payload = _turn_committed_payload()
+    if invalid_value is None:
+        payload.pop(field_name)
+    else:
+        payload[field_name] = invalid_value
+
+    assert project_session_event_for_client(
+        TURN_COMMITTED_EVENT,
+        payload,
+        client_caps={TURN_COMMITTED_CAPABILITY},
+    ) is None
+
+
 # ---------------------------------------------------------------------------
 # seq is minted at dequeue and is strictly monotonic + contiguous.
 # ---------------------------------------------------------------------------
@@ -112,16 +289,13 @@ async def test_lossy_drop_log_has_full_field_set_for_tick() -> None:
     conn = WsConnection(conn_id="cx-tick", ws=fake)  # type: ignore[arg-type]
     conn._start_writer(maxsize=4, enabled=True)
 
-    # Block the writer's first send so it never drains the queue.
-    fake._send_event = asyncio.Event()
-    fake._send_unblock = asyncio.Event()
     try:
+        await _block_writer(conn, fake)
         with structlog.testing.capture_logs() as logs:
-            # Push 4 ticks synchronously (queue path has no inner await,
-            # so no yield → writer doesn't run yet).
+            # Push 4 ticks while the writer is blocked on the probe.
             for i in range(4):
                 await conn.send_event("tick", {"time_ms": i})
-            # Push 5th — queue is full (writer hasn't started). Triggers
+            # Push 5th — queue is full (writer cannot drain). Triggers
             # same-kind eviction.
             await conn.send_event("tick", {"time_ms": 999})
 
@@ -157,9 +331,8 @@ async def test_control_overflow_triggers_force_close_with_overflow_log() -> None
     conn = WsConnection(conn_id="cx-overflow", ws=fake)  # type: ignore[arg-type]
     conn._start_writer(maxsize=4, enabled=True)
 
-    fake._send_event = asyncio.Event()
-    fake._send_unblock = asyncio.Event()
     try:
+        await _block_writer(conn, fake)
         with structlog.testing.capture_logs() as logs:
             # Fill the queue with 4 CONTROL frames (text_delta).
             for i in range(4):
@@ -197,6 +370,74 @@ async def test_control_overflow_triggers_force_close_with_overflow_log() -> None
     # Force-close should have invoked ws.close with code 1011.
     assert fake.close_code == 1011
     assert fake.close_reason == "writer_backpressure"
+
+
+@pytest.mark.asyncio
+async def test_healthy_writer_drains_512_tool_delta_burst_before_terminal_frames() -> None:
+    """A healthy writer must not look slow just because the producer never yielded."""
+
+    fake = _FakeWebSocket()
+    conn = WsConnection(conn_id="cx-tool-pressure", ws=fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=512, enabled=True)
+    session_key = "agent:main:webchat:synthetic-pressure"
+    task_id = "task-synthetic-pressure"
+    tool_use_id = "tool-synthetic-pressure"
+    try:
+        for index in range(512):
+            await conn.send_event(
+                "session.event.tool_use_delta",
+                {
+                    "session_key": session_key,
+                    "task_id": task_id,
+                    "tool_use_id": tool_use_id,
+                    "json_fragment": "x",
+                    "stream_seq": index + 1,
+                },
+            )
+        await conn.send_event(
+            "session.event.tool_result",
+            {
+                "session_key": session_key,
+                "task_id": task_id,
+                "tool_use_id": tool_use_id,
+                "result": "synthetic-ok",
+                "stream_seq": 513,
+            },
+        )
+        await conn.send_event(
+            "session.event.provider_activity",
+            {
+                "session_key": session_key,
+                "task_id": task_id,
+                "phase": "fallback",
+                "reason": "primary_failed",
+                "stream_seq": 514,
+            },
+        )
+        await conn.send_event(
+            "session.event.done",
+            {
+                "session_key": session_key,
+                "task_id": task_id,
+                "status": "succeeded",
+                "stream_seq": 515,
+            },
+        )
+        await _flush_writer(conn)
+
+        frames = [json.loads(line) for line in fake.sent]
+        assert conn._closing is False
+        assert fake.close_code is None
+        assert len(frames) == 515
+        assert [frame["seq"] for frame in frames] == list(range(1, 516))
+        assert [frame["payload"]["stream_seq"] for frame in frames] == list(range(1, 516))
+        assert frames[-3]["event"] == "session.event.tool_result"
+        assert frames[-3]["payload"]["result"] == "synthetic-ok"
+        assert frames[-2]["event"] == "session.event.provider_activity"
+        assert frames[-2]["payload"]["phase"] == "fallback"
+        assert frames[-1]["event"] == "session.event.done"
+    finally:
+        await conn._stop_writer()
 
 
 # ---------------------------------------------------------------------------
@@ -416,11 +657,9 @@ async def test_same_kind_eviction_only_drops_same_kind() -> None:
     conn = WsConnection(conn_id="cx-evict", ws=fake)  # type: ignore[arg-type]
     conn._start_writer(maxsize=4, enabled=True)
 
-    fake._send_event = asyncio.Event()
-    fake._send_unblock = asyncio.Event()
     try:
-        # Synchronous fill: 3 text_delta + 1 tick = 4 items (queue full).
-        # No yield happens during these pushes (queue path is sync).
+        await _block_writer(conn, fake)
+        # Fill with 3 text_delta + 1 tick while the writer is blocked.
         await conn.send_event(
             "session.event.text_delta",
             {"chunk": "b", "session_key": "s", "stream_seq": 2},
@@ -473,9 +712,8 @@ async def test_drop_log_null_safe_for_tick_payload() -> None:
     conn = WsConnection(conn_id="cx-null", ws=fake)  # type: ignore[arg-type]
     conn._start_writer(maxsize=2, enabled=True)
 
-    fake._send_event = asyncio.Event()
-    fake._send_unblock = asyncio.Event()
     try:
+        await _block_writer(conn, fake)
         # Synchronous fill to maxsize=2, then 1 more triggers eviction.
         await conn.send_event("tick", {"time_ms": 1})
         await conn.send_event("tick", {"time_ms": 2})
@@ -580,9 +818,8 @@ async def test_principle2_text_delta_overflow_closes_not_drops() -> None:
     conn = WsConnection(conn_id="cx-p2", ws=fake)  # type: ignore[arg-type]
     conn._start_writer(maxsize=2, enabled=True)
 
-    fake._send_event = asyncio.Event()
-    fake._send_unblock = asyncio.Event()
     try:
+        await _block_writer(conn, fake)
         with structlog.testing.capture_logs() as logs:
             # Synchronous: fill queue (2) + 1 overflow.
             for i in range(3):

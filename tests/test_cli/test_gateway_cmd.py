@@ -10,9 +10,11 @@ import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from urllib.error import URLError
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from opensquilla.cli import gateway_cmd, gateway_lifecycle
@@ -720,13 +722,16 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start_gateway_server)
 
-    gateway_cmd.run_gateway(
-        port=None,
-        bind=None,
-        listen="",
-        debug=False,
-        config_path=str(custom_config),
-    )
+    with pytest.raises(typer.Exit) as exc_info:
+        gateway_cmd.run_gateway(
+            port=None,
+            bind=None,
+            listen="",
+            debug=False,
+            config_path=str(custom_config),
+        )
+
+    assert exc_info.value.exit_code == 1
 
     assert captured["config"].host == "127.0.0.2"
     assert captured["config"].port == 19999
@@ -763,13 +768,16 @@ def test_gateway_run_records_cli_flags_as_runtime_overrides(
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start_gateway_server)
 
-    gateway_cmd.run_gateway(
-        port=18888,
-        bind=None,
-        listen="0.0.0.0",
-        debug=True,
-        config_path=str(custom_config),
-    )
+    with pytest.raises(typer.Exit) as exc_info:
+        gateway_cmd.run_gateway(
+            port=18888,
+            bind=None,
+            listen="0.0.0.0",
+            debug=True,
+            config_path=str(custom_config),
+        )
+
+    assert exc_info.value.exit_code == 1
 
     overrides = captured["config"].runtime_field_overrides()
     assert overrides["host"] == ("127.0.0.1", "0.0.0.0")
@@ -810,13 +818,16 @@ def test_gateway_run_flags_do_not_leak_into_config_via_unrelated_persist(
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start_gateway_server)
 
-    gateway_cmd.run_gateway(
-        port=None,
-        bind=None,
-        listen="0.0.0.0",
-        debug=True,
-        config_path=str(custom_config),
-    )
+    with pytest.raises(typer.Exit) as exc_info:
+        gateway_cmd.run_gateway(
+            port=None,
+            bind=None,
+            listen="0.0.0.0",
+            debug=True,
+            config_path=str(custom_config),
+        )
+
+    assert exc_info.value.exit_code == 1
 
     boot_config = captured["config"]
     assert boot_config.host == "0.0.0.0"
@@ -872,13 +883,16 @@ def test_gateway_run_keeps_missing_explicit_config_path_for_setup(
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start_gateway_server)
 
-    gateway_cmd.run_gateway(
-        port=19876,
-        bind=None,
-        listen="",
-        debug=False,
-        config_path=str(custom_config),
-    )
+    with pytest.raises(typer.Exit) as exc_info:
+        gateway_cmd.run_gateway(
+            port=19876,
+            bind=None,
+            listen="",
+            debug=False,
+            config_path=str(custom_config),
+        )
+
+    assert exc_info.value.exit_code == 1
 
     assert captured["config"].config_path == str(custom_config)
     assert not custom_config.exists()
@@ -1260,10 +1274,12 @@ def test_gateway_run_drains_when_server_task_exits_on_its_own(
     _install_fake_start(_SelfExitingServer(), holder, monkeypatch)
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
 
-    gateway_cmd.run_gateway(
-        port=None, bind=None, listen="", debug=False, config_path=str(config)
-    )
+    with pytest.raises(typer.Exit) as exc_info:
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
 
+    assert exc_info.value.exit_code == 1
     assert holder["server"].closed == ["shutdown"]
 
 
@@ -1328,6 +1344,55 @@ def test_gateway_run_drains_via_http_shutdown_trigger(tmp_path, monkeypatch) -> 
     )
 
     assert holder["server"].closed == ["api_shutdown"]
+
+
+def test_gateway_run_force_exits_after_incomplete_shutdown(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+
+    class _IncompleteServer(_ShutdownProbeServer):
+        async def close(self, reason: str) -> Any:
+            await super().close(reason)
+            return SimpleNamespace(
+                clean=False,
+                remaining_driver_count=1,
+                remaining_reservation_count=0,
+                remaining_auxiliary_count=0,
+            )
+
+    server = _IncompleteServer(fire="api_shutdown", via="http")
+    holder: dict = {}
+    exits: list[int] = []
+    _install_fake_start(server, holder, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_force_process_exit", exits.append)
+
+    gateway_cmd.run_gateway(
+        port=None, bind=None, listen="", debug=False, config_path=str(config)
+    )
+
+    assert holder["server"].closed == ["api_shutdown"]
+    assert exits == [0]
+
+
+def test_gateway_shutdown_watchdog_can_be_disarmed_or_force_exit(monkeypatch) -> None:
+    exits: list[int] = []
+    fired = gateway_cmd.threading.Event()
+
+    def force_exit(exit_code: int) -> None:
+        exits.append(exit_code)
+        fired.set()
+
+    monkeypatch.setattr(gateway_cmd, "_force_process_exit", force_exit)
+    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=0.01, exit_code=0)
+    disarmed.start()
+    disarmed.disarm()
+    assert fired.wait(0.05) is False
+
+    armed = gateway_cmd._GatewayShutdownWatchdog(timeout=0.01, exit_code=1)
+    armed.start()
+    assert fired.wait(1.0) is True
+    assert exits == [1]
 
 
 # ---------------------------------------------------------------------------

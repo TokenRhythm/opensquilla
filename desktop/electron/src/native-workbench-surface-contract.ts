@@ -1,5 +1,16 @@
+import {
+  DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
+} from './desktop-artifact-bridge-contract.js'
+
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION = 1 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V2 = 2 as const
+export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V3 =
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
+export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V4 =
+  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4
 export const NATIVE_WORKBENCH_MAX_SURFACES = 8
 export const NATIVE_WORKBENCH_MAX_HTML_BYTES = 5 * 1024 * 1024
 export const NATIVE_WORKBENCH_ARTIFACT_SCHEME = 'opensquilla-artifact'
@@ -48,9 +59,44 @@ export type NativeWorkbenchCreateRequestV2 =
   | NativeWorkbenchArtifactPreviewCreateRequestV2
   | NativeWorkbenchUrlPreviewCreateRequestV2
 
+export type NativeWorkbenchArtifactPreviewCreateRequestV3 =
+  Omit<NativeWorkbenchArtifactPreviewCreateRequestV2, 'version'> & {
+    version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  }
+
+export type NativeWorkbenchUrlPreviewCreateRequestV3 =
+  Omit<NativeWorkbenchUrlPreviewCreateRequestV2, 'version'> & {
+    version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  }
+
+export type NativeWorkbenchCreateRequestV3 =
+  | NativeWorkbenchArtifactPreviewCreateRequestV3
+  | NativeWorkbenchUrlPreviewCreateRequestV3
+
+export type NativeWorkbenchArtifactPreviewCreateRequestV4 =
+  Omit<NativeWorkbenchArtifactPreviewCreateRequestV3, 'version'> & {
+    version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+  }
+
+export type NativeWorkbenchUrlPreviewCreateRequestV4 =
+  Omit<NativeWorkbenchUrlPreviewCreateRequestV3, 'version'> & {
+    version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+  }
+
+export type NativeWorkbenchCreateRequestV4 =
+  | NativeWorkbenchArtifactPreviewCreateRequestV4
+  | NativeWorkbenchUrlPreviewCreateRequestV4
+
 export type NativeWorkbenchCreateRequest =
   | NativeWorkbenchCreateRequestV1
   | NativeWorkbenchCreateRequestV2
+  | NativeWorkbenchCreateRequestV3
+  | NativeWorkbenchCreateRequestV4
+
+export type NativeWorkbenchInteractiveProtocolVersion =
+  | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+  | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+  | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
 
 export const NATIVE_WORKBENCH_NAVIGATION_ACTIONS = [
   'navigate',
@@ -65,50 +111,60 @@ export type NativeWorkbenchNavigationAction =
   typeof NATIVE_WORKBENCH_NAVIGATION_ACTIONS[number]
 
 export interface NativeWorkbenchNavigationRequest {
-  version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   action: NativeWorkbenchNavigationAction
   url?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
-  version: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   requestId: string
   allow: boolean
 }
 
 export interface NativeWorkbenchCapabilities {
-  latestVersion: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+  latestVersion: typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
   protocolVersions: readonly [
     typeof NATIVE_WORKBENCH_PROTOCOL_VERSION,
     typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+    typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   ]
   versions: readonly [
     typeof NATIVE_WORKBENCH_PROTOCOL_VERSION,
     typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+    typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   ]
   kinds: readonly ['artifact-html', 'artifact-preview', 'url-preview']
   modes: readonly ['full', 'offline']
   navigationActions: typeof NATIVE_WORKBENCH_NAVIGATION_ACTIONS
   permissionResponses: true
+  artifactBridge: typeof DESKTOP_ARTIFACT_BRIDGE_CONTRACT
   maxSurfaces: typeof NATIVE_WORKBENCH_MAX_SURFACES
 }
 
 export const NATIVE_WORKBENCH_CAPABILITIES: NativeWorkbenchCapabilities = {
-  latestVersion: NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+  latestVersion: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   protocolVersions: [
     NATIVE_WORKBENCH_PROTOCOL_VERSION,
     NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+    NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   ],
   versions: [
     NATIVE_WORKBENCH_PROTOCOL_VERSION,
     NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+    NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
+    NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   ],
   kinds: ['artifact-html', 'artifact-preview', 'url-preview'],
   modes: ['full', 'offline'],
   navigationActions: NATIVE_WORKBENCH_NAVIGATION_ACTIONS,
   permissionResponses: true,
+  artifactBridge: DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
   maxSurfaces: NATIVE_WORKBENCH_MAX_SURFACES,
 }
 
@@ -140,11 +196,19 @@ export type NativeWorkbenchSurfaceEventType =
   | 'blocked-action'
   | 'capability-expired'
   | 'unresponsive'
+  | 'annotation-selected'
+  | 'annotation-draft-change'
+  | 'annotation-submit'
+  | 'annotation-cancel'
+  | 'annotation-overlay-fallback'
+  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version:
     | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION
     | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+    | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+    | typeof NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
   surfaceId: string
   type: NativeWorkbenchSurfaceEventType
   detail?: {
@@ -161,7 +225,19 @@ export interface NativeWorkbenchSurfaceEvent {
     requestingOrigin?: string
     mediaTypes?: string[]
     action?: string
+    code?: string
+    surfaceInstanceId?: string
     targetUrl?: string
+    annotationId?: string
+    body?: string
+    selection?: {
+      selectionId: string
+      tagName: string
+      elementPath: string
+      domSha256?: string
+      elementProofSha256: string
+      rect: NativeWorkbenchSurfaceRect
+    }
   }
 }
 
@@ -273,11 +349,16 @@ export function parseNativeWorkbenchCreateRequest(
   if (!request || !payload) {
     throw new Error('Unsupported native Workbench request.')
   }
-  if (request.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V2) {
+  if (
+    request.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+    || request.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+    || request.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+  ) {
+    const version = request.version
     const surfaceId = parseNativeWorkbenchSurfaceId(request.surfaceId)
     if (request.kind === 'artifact-preview') {
       return {
-        version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+        version,
         surfaceId,
         kind: 'artifact-preview',
         payload: parseArtifactPreviewPayload(payload),
@@ -285,7 +366,7 @@ export function parseNativeWorkbenchCreateRequest(
     }
     if (request.kind === 'url-preview') {
       return {
-        version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+        version,
         surfaceId,
         kind: 'url-preview',
         payload: {
@@ -323,7 +404,11 @@ export function parseNativeWorkbenchNavigationRequest(
 ): NativeWorkbenchNavigationRequest {
   const request = objectRecord(value)
   if (
-    request?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+    (
+      request?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+      && request?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+      && request?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+    )
     || !NATIVE_WORKBENCH_NAVIGATION_ACTIONS.includes(
       request.action as NativeWorkbenchNavigationAction,
     )
@@ -338,7 +423,7 @@ export function parseNativeWorkbenchNavigationRequest(
     throw new Error('This native Workbench navigation action does not accept an address.')
   }
   return {
-    version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+    version: request.version,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
     action,
     ...(url ? { url } : {}),
@@ -350,7 +435,11 @@ export function parseNativeWorkbenchPermissionResponse(
 ): NativeWorkbenchPermissionResponse {
   const response = objectRecord(value)
   if (
-    response?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+    (
+      response?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V2
+      && response?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+      && response?.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+    )
     || typeof response.allow !== 'boolean'
     || typeof response.requestId !== 'string'
     || !/^[a-f0-9-]{36}$/.test(response.requestId)
@@ -358,7 +447,7 @@ export function parseNativeWorkbenchPermissionResponse(
     throw new Error('The native Workbench permission response is invalid.')
   }
   return {
-    version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V2,
+    version: response.version,
     surfaceId: parseNativeWorkbenchSurfaceId(response.surfaceId),
     requestId: response.requestId,
     allow: response.allow,
@@ -503,6 +592,29 @@ export function nativeWorkbenchV2NetworkUrlAllowed(
   }
 }
 
-export function nativeWorkbenchDownloadAllowed(hasUserGesture: unknown): boolean {
-  return hasUserGesture === true
+export function nativeWorkbenchMissingResourceIsLocal(
+  value: string,
+  expectedOrigin?: string,
+): boolean {
+  if (!expectedOrigin) return false
+  try {
+    const target = new URL(value)
+    return (
+      (target.protocol === 'http:' || target.protocol === 'https:')
+      && target.origin === expectedOrigin
+    )
+  } catch {
+    return false
+  }
+}
+
+export function nativeWorkbenchDownloadAllowed(
+  hasUserGesture: unknown,
+  candidatePreviewActive = false,
+): boolean {
+  // Canonical previews may still offer a user-confirmed native save dialog.
+  // Candidate bytes are an uncommitted, turn-local inspection surface and
+  // must never escape through a download, even when the page synthesizes a
+  // trusted user gesture.
+  return candidatePreviewActive !== true && hasUserGesture === true
 }

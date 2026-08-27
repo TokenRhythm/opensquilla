@@ -18,6 +18,7 @@ import {
   parseSidebarWidthPreference,
   type SidebarWidthPreference,
 } from '@/utils/sidebarLayout'
+import type { ChatLiveConnectionPhase } from '@/utils/chat/chatConnectionState'
 
 // 'system' or any registered value-theme id. The string branch keeps custom
 // themes typeable while preserving autocomplete for the built-ins.
@@ -36,6 +37,36 @@ function readPendingLocaleSync(): LocaleCode | null {
 
 type FeatureWindow = Window & {
   OPENSQUILLA_FEATURES?: Record<string, boolean>
+}
+
+// The release-default annotation surface is safe only when the renderer and
+// Desktop shell were shipped as one complete protocol-v3 unit. This is a
+// synchronous shape check by design: asynchronous runtime capability queries
+// still run when a preview opens and may fail closed for that document.
+const NATIVE_V3_ANNOTATION_BRIDGE_METHODS = [
+  'createArtifactPreviewLease',
+  'renewArtifactPreviewLease',
+  'revokeArtifactPreviewLease',
+  'createSurface',
+  'setSurfaceRect',
+  'activateSurface',
+  'destroySurface',
+  'onSurfaceEvent',
+  'getArtifactAnnotationCapabilities',
+  'setArtifactAnnotationMode',
+  'showArtifactAnnotationOverlay',
+  'closeArtifactAnnotationOverlay',
+  'screenshot',
+] as const
+
+function hasNativeV3AnnotationBridge(): boolean {
+  const platform = getPlatform()
+  const api = platform.workbench.native as unknown as Record<string, unknown> | undefined
+  return Boolean(
+    platform.capabilities.isDesktop
+    && api
+    && NATIVE_V3_ANNOTATION_BRIDGE_METHODS.every(method => typeof api[method] === 'function'),
+  )
 }
 
 function hydrateSidebarWidthPreference(): SidebarWidthPreference {
@@ -70,6 +101,7 @@ export const useAppStore = defineStore('app', () => {
   const locale = ref<LocaleCode>('en')
   const pendingChannelNoticeLocale = ref<LocaleCode | null>(readPendingLocaleSync())
   const sidebarOpen = ref(true)
+  const chatLivePhase = ref<ChatLiveConnectionPhase>('idle')
   // Browser-local layout preference, hydrated synchronously so the first
   // mounted frame uses the saved width. Viewport clamping is intentionally a
   // consumer concern: zooming or rotating must not overwrite this preference.
@@ -107,11 +139,17 @@ export const useAppStore = defineStore('app', () => {
     return systemDark.value ? 'dark' : 'light'
   })
 
-  const desktopNativeThemeSource = computed<'light' | 'dark'>(() => {
-    const colorScheme = getManifest(resolvedTheme.value)?.capabilities.colorScheme
+  const desktopNativeThemeSource = computed<'light' | 'dark' | 'system'>(() => {
+    // Keep Electron on its native system source while the UI is in system mode.
+    // Resolving that choice to a fixed light/dark source would override the OS,
+    // which in turn freezes the renderer's prefers-color-scheme media query.
+    if (theme.value === 'system') return 'system'
+    const colorScheme = getManifest(theme.value)?.capabilities.colorScheme
     if (colorScheme === 'light') return 'light'
     if (colorScheme === 'dark') return 'dark'
-    return systemDark.value ? 'dark' : 'light'
+    // A theme that supports both schemes (or omits the capability) should leave
+    // native chrome under OS control instead of snapshotting the current scheme.
+    return 'system'
   })
 
   let mq: MediaQueryList | null = null
@@ -128,7 +166,9 @@ export const useAppStore = defineStore('app', () => {
     // Lazily bring in the theme's global "world" layer (structure/type/texture)
     // if it has one; flat value themes have no world and this is a no-op.
     void ensureThemeWorld(resolvedTheme.value)
-    void platform.setNativeTheme({ source: desktopNativeThemeSource.value })
+    void platform
+      .setNativeTheme({ source: desktopNativeThemeSource.value })
+      .catch(() => undefined)
   }
 
   function initTheme() {
@@ -159,19 +199,33 @@ export const useAppStore = defineStore('app', () => {
       // ignore
     }
 
+    // Wire the OS listener before the immediate apply. On desktop, applying a
+    // fixed theme also changes Electron's prefers-color-scheme; listening first
+    // ensures that feedback cannot land between the initial apply and setup.
+    if (!mq) {
+      mq = window.matchMedia('(prefers-color-scheme: dark)')
+      mqHandler = (e: MediaQueryListEvent) => {
+        systemDark.value = e.matches
+      }
+      if (mq.addEventListener) mq.addEventListener('change', mqHandler)
+      else if (mq.addListener) mq.addListener(mqHandler)
+    }
+    // Re-snapshot on every init so destroy/re-init cannot retain a stale OS
+    // preference from the previous listener lifetime.
+    systemDark.value = mq.matches
+
     if (!themeWatchStop) {
-      themeWatchStop = watch(resolvedTheme, applyTheme, { immediate: true })
+      // Both axes matter: dark -> system can leave resolvedTheme at "dark" but
+      // must still send source:"system" to Electron. Conversely, an OS change
+      // in system mode changes resolvedTheme while the native source stays system.
+      themeWatchStop = watch(
+        [resolvedTheme, desktopNativeThemeSource],
+        applyTheme,
+        { immediate: true },
+      )
     } else {
       applyTheme()
     }
-
-    if (mq) return // idempotent
-    mq = window.matchMedia('(prefers-color-scheme: dark)')
-    mqHandler = (e: MediaQueryListEvent) => {
-      systemDark.value = e.matches
-    }
-    if (mq.addEventListener) mq.addEventListener('change', mqHandler)
-    else if (mq.addListener) mq.addListener(mqHandler)
   }
 
   function destroyTheme() {
@@ -310,6 +364,10 @@ export const useAppStore = defineStore('app', () => {
     sidebarOpen.value = open
   }
 
+  function setChatLivePhase(phase: ChatLiveConnectionPhase) {
+    chatLivePhase.value = phase
+  }
+
   function toggleSidebar() {
     sidebarOpen.value = !sidebarOpen.value
   }
@@ -417,6 +475,15 @@ export const useAppStore = defineStore('app', () => {
     // Application-level artifact Workbench. Operators can temporarily disable
     // it to retain the previous Drawer/lightbox flow for one release cycle.
     artifactWorkbench: true,
+    // Versioned HTML resource preview/edit is the V1 default on every client.
+    // Individual document capabilities still decide which actions are shown.
+    documentWorkbenchResources: true,
+    // DOM selection is Desktop-only and defaults on only for a shell exposing
+    // the complete native protocol-v3 annotation path. Older or partial shells
+    // fail closed while retaining the ordinary HTML Workbench.
+    artifactPromptAnnotations: hasNativeV3AnnotationBridge(),
+    // Keep operator/test overrides last. In particular, an explicit `false`
+    // remains the release emergency kill switch even on a complete Desktop.
     ...((window as FeatureWindow).OPENSQUILLA_FEATURES || {}),
   })
 
@@ -426,6 +493,7 @@ export const useAppStore = defineStore('app', () => {
     pendingChannelNoticeLocale,
     resolvedTheme,
     sidebarOpen,
+    chatLivePhase,
     sidebarWidthPreference,
     approvalCount,
     pendingApprovals,
@@ -440,6 +508,7 @@ export const useAppStore = defineStore('app', () => {
     setLocale,
     syncLocaleToGateway,
     setSidebarOpen,
+    setChatLivePhase,
     toggleSidebar,
     setSidebarWidthPreference,
     resetSidebarWidthPreference,

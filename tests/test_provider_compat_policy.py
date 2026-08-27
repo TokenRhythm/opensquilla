@@ -14,6 +14,10 @@ from opensquilla.provider.compat_policy import (
     compat_policy_for_kind,
     known_policy_kinds,
 )
+from opensquilla.provider.model_identity import (
+    DEEPSEEK_V4_MODEL_IDS,
+    is_deepseek_v4_model_id,
+)
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _should_replay_reasoning_content,
@@ -45,6 +49,11 @@ def test_registry_attaches_kind_policy() -> None:
     assert specs["openrouter"].compat.post_terminal_metadata_keys == frozenset(
         {"provider"}
     )
+    assert specs["zhipu"].compat.official_reasoning_dialect == "zai"
+    assert (
+        specs["zhipu"].compat.official_reasoning_api_root
+        == specs["zhipu"].default_base_url
+    )
     assert specs["volcengine"].compat.tool_schema_unsupported_keywords
     assert specs["vllm"].compat.display_name == "OpenAI"  # kind-aliased to openai
 
@@ -72,15 +81,55 @@ def test_api_url_absorbs_any_version_suffix() -> None:
         assert provider._api_url("/v1/chat/completions") == expected, base
 
 
-def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
-    """TokenRhythm rejects unknown request fields (a DeepSeek ``thinking``
-    toggle is an UNKNOWN_FIELD 400), so the policy must never declare toggle
-    ids or a default reasoning format; the V4 ids keep only the
-    reasoning_content replay requirement."""
+def test_tokenrhythm_v4_reasoning_is_exact_and_endpoint_scoped() -> None:
     policy = compat_policy_for_kind("tokenrhythm")
     assert policy.thinking_toggle_model_ids == frozenset()
     assert policy.default_reasoning_format == ""
     assert policy.replay_reasoning_format == ""
+    assert len(policy.reasoning_model_rules) == 2
+    official, custom = policy.reasoning_model_rules
+    assert official.matches(
+        "deepseek-v4-flash", "https://tokenrhythm.studio/v1"
+    )
+    assert official.matches(
+        "deepseek-v4-pro-0813", "https://tokenrhythm.studio"
+    )
+    assert official.matches(
+        "tokenrhythm/deepseek-v4-pro-0813",
+        "HTTPS://TOKENRHYTHM.STUDIO:443/v1/",
+    )
+    assert not official.matches(
+        "tokenrhythm/deepseek-v4-flash-0731",
+        "https://api.tokenrhythm.studio/v1",
+    )
+    assert not official.matches(
+        "untrusted/deepseek-v4-flash", "https://tokenrhythm.studio/v1"
+    )
+    assert not official.matches(
+        "deepseek-v4-flash", "https://tokenrhythm.studio.evil.example/v1"
+    )
+    assert not official.matches(
+        "deepseek-v4-pro-0813", "https://tokenrhythm.studio/v1/custom"
+    )
+    assert not official.matches(
+        "deepseek-v4-pro-0813-preview", "https://tokenrhythm.studio/v1"
+    )
+    assert not official.matches(
+        "deepseek-v4-pro-0813", "https://tokenrhythm.studio/v1?"
+    )
+    assert not official.matches(
+        "deepseek-v4-pro-0813", "https://tokenrhythm.studio/v1#"
+    )
+    assert official.replay_scope == "tool_call_assistant"
+    assert official.max_reasoning_content_utf16_units == 50_000
+    assert official.reasoning_format == "deepseek"
+    assert custom.matches("deepseek-v4-flash", "https://custom.example/v1")
+    assert not custom.matches("deepseek-v4-pro-0813", "https://custom.example/v1")
+    assert not custom.matches(
+        "tokenrhythm/deepseek-v4-pro-0813",
+        "https://tokenrhythm.studio/v1/custom",
+    )
+    assert custom.reasoning_format == ""
     assert policy.supports_native_json_schema_output is False
     # cost_cny is CNY — booking it as USD would corrupt cost rollups.
     assert policy.trust_billed_cost is False
@@ -94,14 +143,28 @@ def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
         }
     )
     assert _should_replay_reasoning_content(
-        policy=policy, model="deepseek-v4-flash", caps=None
+        policy=policy,
+        model="deepseek-v4-flash",
+        caps=None,
+        reasoning_rule=official,
     )
     assert _should_replay_reasoning_content(
-        policy=policy, model="deepseek-v4-flash-0731", caps=None
+        policy=policy,
+        model="deepseek-v4-flash-0731",
+        caps=None,
+        reasoning_rule=official,
     )
     assert not _should_replay_reasoning_content(
         policy=policy, model="glm-5", caps=None
     )
+
+
+def test_deepseek_v4_identity_includes_only_exact_0813_ids() -> None:
+    assert "deepseek-v4-pro-0813" in DEEPSEEK_V4_MODEL_IDS
+    assert is_deepseek_v4_model_id("deepseek-v4-pro-0813")
+    assert is_deepseek_v4_model_id("tokenrhythm/deepseek-v4-pro-0813")
+    assert not is_deepseek_v4_model_id("deepseek-v4-pro-0813-preview")
+    assert not is_deepseek_v4_model_id("tokenrhythm/deepseek-v4-pro-0813-preview")
 
 
 def test_native_json_schema_output_stays_enabled_by_default() -> None:
@@ -147,6 +210,8 @@ def test_dsml_policy_names_only_exact_packaged_model_ids() -> None:
             "tokenrhythm/deepseek-v4-flash",
             "tokenrhythm/deepseek-v4-flash-0731",
             "tokenrhythm/deepseek-v4-pro",
+            "deepseek-v4-pro-0813",
+            "tokenrhythm/deepseek-v4-pro-0813",
         },
         "openrouter": {
             "deepseek/deepseek-v4-flash",
@@ -161,11 +226,18 @@ def test_dsml_policy_names_only_exact_packaged_model_ids() -> None:
             for rule in profile.model_rules
             if TEXT_TOOL_DIALECT_DEEPSEEK_DSML in rule.dialects
         ]
-        assert len(dsml_rules) == 1
-        assert set(dsml_rules[0].model_patterns) == expected_models
+        expected_rule_count = 2 if provider_kind == "tokenrhythm" else 1
+        assert len(dsml_rules) == expected_rule_count
+        actual_models = {
+            model
+            for rule in dsml_rules
+            for model in rule.model_patterns
+        }
+        assert actual_models == expected_models
         assert not any(
             wildcard in pattern
-            for pattern in dsml_rules[0].model_patterns
+            for rule in dsml_rules
+            for pattern in rule.model_patterns
             for wildcard in "*?["
         )
 
@@ -199,6 +271,8 @@ def test_dsml_policy_rejects_near_misses_and_wrong_providers() -> None:
         ("deepseek", "vendor/deepseek-v4-flash"),
         ("tokenrhythm", "deepseek/deepseek-v4-flash"),
         ("tokenrhythm", "tokenrhythm/deepseek-v4-flash-preview"),
+        ("tokenrhythm", "deepseek-v4-pro-0813"),
+        ("tokenrhythm", "tokenrhythm/deepseek-v4-pro-0813-preview"),
         ("openrouter", "deepseek-v4-flash"),
         ("openrouter", "deepseek/deepseek-v4-flash-0731"),
         ("openrouter", "vendor/deepseek-v4-pro"),
@@ -212,6 +286,41 @@ def test_dsml_policy_rejects_near_misses_and_wrong_providers() -> None:
             model
         )
         assert TEXT_TOOL_DIALECT_DEEPSEEK_DSML not in dialects
+
+
+def test_tokenrhythm_0813_dsml_is_exact_and_endpoint_scoped() -> None:
+    profile = compat_policy_for_kind("tokenrhythm").text_tool_profile
+    for model in (
+        "deepseek-v4-pro-0813",
+        "tokenrhythm/deepseek-v4-pro-0813",
+    ):
+        for base_url in (
+            "https://tokenrhythm.studio",
+            "https://tokenrhythm.studio/v1",
+            "HTTPS://TOKENRHYTHM.STUDIO:443/v1/",
+        ):
+            assert TEXT_TOOL_DIALECT_DEEPSEEK_DSML in profile.dialects_for_model(
+                model,
+                base_url,
+            )
+
+    for base_url in (
+        "http://tokenrhythm.studio/v1",
+        "https://api.tokenrhythm.studio/v1",
+        "https://tokenrhythm.studio.evil.example/v1",
+        "https://customer-proxy.example/v1",
+        "https://tokenrhythm.studio/v1/custom",
+        "https://tokenrhythm.studio:8443/v1",
+        "https://user@tokenrhythm.studio/v1",
+        "https://tokenrhythm.studio/v1?tenant=x",
+        "https://tokenrhythm.studio/v1#fragment",
+        "https://tokenrhythm.studio/v1?",
+        "https://tokenrhythm.studio/v1#",
+    ):
+        assert TEXT_TOOL_DIALECT_DEEPSEEK_DSML not in profile.dialects_for_model(
+            "deepseek-v4-pro-0813",
+            base_url,
+        )
 
 
 def test_openrouter_replay_follows_capability_format() -> None:

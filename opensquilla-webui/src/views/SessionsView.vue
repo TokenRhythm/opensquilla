@@ -97,6 +97,19 @@
         @open="openSession"
         @remove="removeSession"
       />
+
+      <div v-if="allSessions.length > 0" class="sessions-page-state" role="status">
+        <button
+          v-if="hasMore || loadMoreError"
+          type="button"
+          class="btn btn--ghost"
+          :disabled="isLoadingMore"
+          @click="loadMoreSessions"
+        >
+          {{ isLoadingMore ? t('sessions.loading') : t('sessions.loadMore') }}
+        </button>
+        <span v-else>{{ t('shared.sidebar.allLoaded') }}</span>
+      </div>
     </section>
 
     <SessionInspectDrawer
@@ -121,6 +134,7 @@ import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useConfirm } from '@/composables/useConfirm'
+import { useFilteredSessionPaging } from '@/composables/useFilteredSessionPaging'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
 import SessionsTaskInput from '@/components/sessions/SessionsTaskInput.vue'
@@ -174,10 +188,21 @@ const { t } = useI18n()
 const router = useRouter()
 const rpc = useRpcStore()
 const { confirm } = useConfirm()
-const { sessionsList, allSessions, isLoading, sessionListError, loadSessions } = useSessions()
+const {
+  sessionsList,
+  allSessions,
+  isLoading,
+  isLoadingMore,
+  loadMoreError,
+  hasMore,
+  sessionListError,
+  loadSessions,
+  loadMoreSessions,
+} = useSessions()
 
 const filter = ref<FilterId>('all')
 const search = ref('')
+const filteredPagingActive = ref(false)
 const agentNames = ref<Map<string, string>>(new Map())
 const agentsLoaded = ref(false)
 let agentsRequestGeneration = 0
@@ -217,6 +242,17 @@ const ledgerEntries = computed(() => {
   const visible = allSessions.value.filter(item =>
     matchesFilter(item, byKey) && (!query || sessionMatches(item, query)))
   return arrangeSessionLedger(visible)
+})
+
+useFilteredSessionPaging({
+  active: () => filteredPagingActive.value
+    && (filter.value !== 'all' || search.value.trim().length > 0),
+  visibleCount: () => ledgerEntries.value.length,
+  hasMore: () => hasMore.value,
+  isLoading: () => isLoading.value,
+  isLoadingMore: () => isLoadingMore.value,
+  hasError: () => loadMoreError.value,
+  loadMore: loadMoreSessions,
 })
 
 // The inspected row tracks the live session list by key so status flips keep
@@ -359,6 +395,10 @@ function handleApprovalPush() {
   void refreshApprovals()
 }
 
+function handleConnectionState(state: unknown) {
+  if (state === 'connected') scheduleSessionRefresh()
+}
+
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
@@ -453,6 +493,7 @@ function teardownLive() {
 }
 
 onActivated(() => {
+  filteredPagingActive.value = true
   loadAll()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
@@ -462,12 +503,18 @@ onActivated(() => {
     rpc.on('exec.approval.resolved', handleApprovalPush),
     rpc.on('plugin.approval.requested', handleApprovalPush),
     rpc.on('plugin.approval.resolved', handleApprovalPush),
+    rpc.on('_state', handleConnectionState),
   ]
   pollTimer = setInterval(loadAll, FALLBACK_POLL_MS)
 })
 
-onDeactivated(teardownLive)
-onUnmounted(teardownLive)
+function deactivateView() {
+  filteredPagingActive.value = false
+  teardownLive()
+}
+
+onDeactivated(deactivateView)
+onUnmounted(deactivateView)
 </script>
 
 <style scoped>
@@ -582,6 +629,15 @@ onUnmounted(teardownLive)
 
 .hub-search__input::placeholder {
   color: var(--text-dim);
+}
+
+.sessions-page-state {
+  align-items: center;
+  color: var(--text-dim);
+  display: flex;
+  font-size: var(--fs-sm);
+  justify-content: center;
+  min-height: 44px;
 }
 
 

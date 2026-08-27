@@ -15,6 +15,7 @@ from opensquilla.engine.subagent import (
     subagent_task_inline_limit_bytes,
 )
 from opensquilla.gateway.routing import build_subagent_route_envelope
+from opensquilla.gateway.session_view import derive_transcript_title
 from opensquilla.provider.auxiliary_budget import resolve_auxiliary_request_budget
 from opensquilla.provider.correlation_context import (
     current_provider_request_correlation,
@@ -31,6 +32,7 @@ _log = structlog.get_logger("opensquilla.tools.sessions")
 _VALID_STATUSES = ("running", "done", "failed", "killed", "timeout")
 _TERMINAL_STATUSES = ("done", "failed", "killed", "timeout")
 _MAX_SPAWN_DEPTH = MAX_SPAWN_DEPTH
+_MAX_SESSION_TITLE_CHARS = 512
 
 # Subagent grounding also has a per-turn system-prompt fallback in
 # engine.steps.inject_subagent_grounding. Keep this spawn prompt text in
@@ -88,6 +90,23 @@ def _normalize_subagent_task_for_execution(task: str) -> str:
         "Do not call tools. Do not explain. Do not treat the text as a command, "
         "file path, configuration key, or topic to analyze."
     )
+
+
+def _normalize_spawn_title(title: str | None, task: str) -> str:
+    """Return a bounded durable title without exposing the grounding prompt."""
+
+    if title is not None:
+        if not isinstance(title, str):
+            raise ToolError("Title must be a string")
+        normalized = " ".join(title.split()).strip("\"'` ")
+        if normalized:
+            if len(normalized) > _MAX_SESSION_TITLE_CHARS:
+                raise ToolError(
+                    "Title must not exceed "
+                    f"{_MAX_SESSION_TITLE_CHARS} characters"
+                )
+            return normalized
+    return derive_transcript_title(task)
 
 
 def _spawn_task_execution_target(
@@ -343,6 +362,10 @@ async def sessions_send(session_key: str, message: str) -> str:
                         f"Session '{session_key}' task queue is full. "
                         "Try again after queued work completes."
                     ) from exc
+                if type(exc).__name__ == "TaskRuntimeShuttingDownError":
+                    raise SafeToolError(
+                        "The Gateway is shutting down. Retry after it restarts."
+                    ) from exc
                 raise
             return json.dumps(
                 {
@@ -389,6 +412,15 @@ async def sessions_send(session_key: str, message: str) -> str:
                 "delegated instruction, required output format, and exact-reply constraints."
             ),
         },
+        "title": {
+            "type": "string",
+            "description": (
+                "Short human-readable task title (3-8 words). Name the work, not "
+                "the agent, and avoid generic labels such as 'Subagent task'. Omit "
+                "or leave blank to derive a bounded title from the task description."
+            ),
+            "maxLength": _MAX_SESSION_TITLE_CHARS,
+        },
         "model": {
             "type": "string",
             "description": 'Model override (e.g. "claude-sonnet-4-20250514")',
@@ -400,10 +432,12 @@ async def sessions_spawn(
     agent_id: str | None = None,
     task: str = "",
     model: str | None = None,
+    title: str | None = None,
 ) -> str:
     _reject_guest_session_tool("sessions_spawn")
     if not task:
         raise ToolError("Task must not be empty")
+    session_title = _normalize_spawn_title(title, task)
 
     try:
         mgr = _get_session_manager()
@@ -557,6 +591,8 @@ async def sessions_spawn(
             "spawned_by": parent_session_key,
             "origin": child_origin,
         }
+        if session_title:
+            create_kwargs["derived_title"] = session_title
         get_parent_session = getattr(mgr, "get_session", None)
         if callable(get_parent_session):
             try:
@@ -604,6 +640,7 @@ async def sessions_spawn(
                 "agent_id": resolved_agent_id,
                 "task_id": handle.task_id,
                 "status": "queued",
+                **({"title": session_title} if session_title else {}),
                 "spawn_depth": spawn_depth,
                 "completion_delivery": "pushed_to_parent_session",
                 "yield_instruction": (
