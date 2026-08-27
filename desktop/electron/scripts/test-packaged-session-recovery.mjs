@@ -181,23 +181,29 @@ try {
     'the packaged client to return on the original transport',
     SESSION_RECOVERY_TIMEOUT_MS,
   )
+  const healthyNavigationSample = {
+    socketCount: healthyNavigationSocketIds.size,
+    newSocketCount: nextSocketIndex - healthySocketCountBaseline,
+    closeCount: healthyCloseCount - healthyCloseCountBaseline,
+    subscribeKeys: [...healthySubscribeKeys],
+  }
   assert.equal(
-    healthyNavigationSocketIds.size,
+    healthyNavigationSample.socketCount,
     1,
     'healthy packaged session navigation must keep exactly one WebSocket',
   )
   assert.equal(
-    nextSocketIndex,
-    healthySocketCountBaseline,
+    healthyNavigationSample.newSocketCount,
+    0,
     'healthy packaged session navigation must not create a replacement WebSocket',
   )
   assert.equal(
-    healthyCloseCount,
-    healthyCloseCountBaseline,
+    healthyNavigationSample.closeCount,
+    0,
     'healthy packaged session navigation must not close the active WebSocket',
   )
   assert.deepEqual(
-    healthySubscribeKeys,
+    healthyNavigationSample.subscribeKeys,
     [switchSessionKey, sessionKey],
     'healthy packaged session navigation must subscribe B and then acquire a fresh A2 lease',
   )
@@ -298,6 +304,31 @@ try {
   assert.equal(await composer.inputValue(), preservedDraft)
   assert.equal(await recoveredMessage.isVisible(), true)
   assert.equal(await thread.getAttribute('aria-busy'), 'false')
+  const recoveredViewportSample = await recoveredMessage.evaluate((message) => {
+    const threadElement = message.closest('.chat-thread')
+    if (!(threadElement instanceof HTMLElement)) return null
+    const threadRect = threadElement.getBoundingClientRect()
+    const messageRect = message.getBoundingClientRect()
+    return {
+      scrollTop: Math.round(threadElement.scrollTop),
+      scrollHeight: threadElement.scrollHeight,
+      clientHeight: threadElement.clientHeight,
+      distanceFromBottom: Math.round(
+        threadElement.scrollHeight - threadElement.clientHeight - threadElement.scrollTop,
+      ),
+      messageTop: Math.round(messageRect.top - threadRect.top),
+      messageBottom: Math.round(messageRect.bottom - threadRect.top),
+      intersectsViewport: (
+        messageRect.bottom > threadRect.top
+        && messageRect.top < threadRect.bottom
+      ),
+    }
+  })
+  assert.equal(
+    recoveredViewportSample?.intersectsViewport,
+    true,
+    'the retained message 0320 must remain inside the recovered conversation viewport',
+  )
 
   console.log(JSON.stringify({
     ok: true,
@@ -305,12 +336,16 @@ try {
     sessionKey,
     switchSessionKey,
     expectedLastMessage,
-    healthyNavigationSocketCount: healthyNavigationSocketIds.size,
+    healthyNavigationSocketCount: healthyNavigationSample.socketCount,
+    healthyNavigationNewSocketCount: healthyNavigationSample.newSocketCount,
+    healthyNavigationCloseCount: healthyNavigationSample.closeCount,
+    healthyNavigationSubscribeKeys: healthyNavigationSample.subscribeKeys,
     heldHistoryRequests,
     heldSubscribeRequests,
     socketCount,
     serverTickCount,
     terminalElapsedMs,
+    recoveredViewportSample,
   }, null, 2))
 } finally {
   await app?.close().catch(() => {})
