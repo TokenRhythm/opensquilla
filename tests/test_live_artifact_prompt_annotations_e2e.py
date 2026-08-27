@@ -44,6 +44,52 @@ def _load_module():
 e2e = _load_module()
 
 
+def _router_bundle_is_hydrated(bundle: Path | None = None) -> bool:
+    """Return whether the checked-out Router bundle contains real LFS assets."""
+
+    if bundle is None:
+        bundle = (
+            e2e.SRC_DIR
+            / "opensquilla"
+            / "squilla_router"
+            / "models"
+            / "v4.2_phase3_inference"
+        )
+    manifest_path = bundle / "artifact_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    pointer_prefix = b"version https://git-lfs.github.com/spec/v1"
+    for entry in manifest.get("files", []):
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        path = bundle / raw_path
+        try:
+            with path.open("rb") as handle:
+                if handle.read(len(pointer_prefix)) == pointer_prefix:
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def test_router_bundle_hydration_guard_detects_lfs_pointer(tmp_path: Path) -> None:
+    manifest = {"files": [{"path": "model.onnx"}]}
+    (tmp_path / "artifact_manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+    assert _router_bundle_is_hydrated(tmp_path) is False
+
+    model.write_bytes(b"hydrated-router-model")
+    assert _router_bundle_is_hydrated(tmp_path) is True
+
+
 class _DeterministicArtifactProvider:
     """Local OpenAI-compatible fixture for one real Direct mutation turn."""
 
@@ -1148,6 +1194,9 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
 async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     tmp_path: Path,
 ) -> None:
+    if not _router_bundle_is_hydrated():
+        pytest.skip("Squilla Router Git LFS assets are not hydrated in this checkout")
+
     provider = _DeterministicArtifactProvider()
     provider.start()
     driver = e2e.GatewayCertificationDriver(
