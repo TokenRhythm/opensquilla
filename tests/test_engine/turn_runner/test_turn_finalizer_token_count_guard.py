@@ -4,8 +4,8 @@ The finalizer must persist a token_count that describes the entry's own
 replayable content.  A whole turn's cumulative output (across every retried
 execution leg) must not be copied into the entry's token_count: it inflates
 the persistent token ledger and makes preflight compaction trigger on book
-value far above the real replay size (ref webchat:f4d2b4dc: token_count
-770,191 vs ~22K real replayable tokens).
+value far above the real replay size (observed as a 770k count on an entry
+whose replayable payload was ~22k tokens).
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.engine.types import DoneEvent
-
 from tests.test_engine.turn_runner.test_turn_finalizer_stage_unit import (
     _make_input,
     _make_stage,

@@ -821,15 +821,15 @@ class TurnFinalizerStage:
                 else:
                     # Fallback: account the entry's own replayable content.
                     # done_event.output_tokens may be this entry's real
-                    # single-leg output or a whole turn's cumulative sum over
-                    # every execution leg.  A cumulative value more than 4x
-                    # this entry's own replay size cannot describe this
-                    # entry and would inflate the persistent token ledger,
-                    # making preflight compaction trigger on book value far
-                    # above the real replay size (ref webchat:f4d2b4dc:
-                    # token_count 770,191 vs ~22K real replayable tokens).
-                    # Trust the replay estimate in that case; otherwise keep
-                    # the larger of the two so admission never under-reports.
+                    # single-leg output or a whole turn's cumulative sum
+                    # over every execution leg.  A cumulative value more
+                    # than 4x this entry's own replay size cannot describe
+                    # this entry: persisting it would inflate the token
+                    # ledger and make preflight compaction trigger on book
+                    # value far above the real replay size (observed as a
+                    # 770k count on an entry whose replayable payload was
+                    # ~22k tokens).  Trust the estimate in that case;
+                    # otherwise keep the larger of the two.
                     from opensquilla.session.compaction import (
                         estimate_entry_model_replay_tokens,
                     )
