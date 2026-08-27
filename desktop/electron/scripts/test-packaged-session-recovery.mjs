@@ -272,7 +272,12 @@ try {
   assert.equal(await sendButton.isDisabled(), true, 'live degraded state must fail closed')
 
   injectHang = false
-  await historyFailure.locator('[data-testid="chat-session-recovery-retry"]').click()
+  // These controls sit above the long transcript. A Playwright locator click
+  // would scroll an off-screen retry into view and manufacture reader-owned
+  // navigation to the top before activating it. Trigger the product action
+  // in-page so this gate measures recovery of the existing live-edge lease.
+  await historyFailure.locator('[data-testid="chat-session-recovery-retry"]')
+    .evaluate((button) => button.click())
   await waitFor(
     () => recoveredMessage.isVisible(),
     'the retained long-session history to recover from the packaged Gateway',
@@ -281,7 +286,8 @@ try {
   assert.equal(await historyFailure.count(), 0)
 
   if (await liveFailure.count()) {
-    await liveFailure.locator('[data-testid="chat-session-recovery-retry"]').click()
+    await liveFailure.locator('[data-testid="chat-session-recovery-retry"]')
+      .evaluate((button) => button.click())
   }
   await waitFor(
     async () => await liveFailure.count() === 0 && !await sendButton.isDisabled(),

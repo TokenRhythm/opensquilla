@@ -2274,6 +2274,7 @@ const chatHistory = useChatHistory({
   preserveLiveTail: preserveHistoryLiveTail,
   autoScroll,
   scrollEpoch,
+  canApplyViewportCorrection: () => !historyNavigationScrollLock.locked,
   stripTimePrefix,
   scrollToBottom,
   onTerminalTask: outcome => {
