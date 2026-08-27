@@ -33,7 +33,7 @@
     "model": "deepseek-v4-flash",
     "model_usage_breakdown": [],
     "output_tokens": 9,
-    "provider": "openai",
+    "provider": "tokenrhythm",
     "reasoning_content": "Reasoning about the reply.",
     "reasoning_tokens": 6,
     "stop_reason": "stop",

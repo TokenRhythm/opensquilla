@@ -3051,8 +3051,13 @@ class OpenAIProvider:
         # Keep configured deployment identity separate from the adapter family
         # (``provider_name``) and wire dialect (``_provider_kind``).  A
         # DashScope or DeepSeek instance still needs OpenAI-family behavior,
-        # but must never be attributed to OpenAI in telemetry.
-        self.provider_id = (provider_id or self.provider_name).strip()
+        # but must never be attributed to OpenAI in telemetry.  Direct
+        # construction (tests, ad-hoc embedding) falls back to the dialect
+        # rather than to ``provider_name``: this adapter serves every
+        # OpenAI-compatible dialect, so ``provider_name`` would attribute a
+        # DashScope or OpenRouter instance to OpenAI, which is exactly what
+        # this field exists to prevent.
+        self.provider_id = (provider_id or self._provider_kind).strip()
         self._compat = compat or compat_policy_for_kind(self._provider_kind)
         self._replay_provider_state = replay_provider_state
         self._provider_routing: Mapping[str, str] = provider_routing or {}
@@ -6190,7 +6195,7 @@ class OpenAIProvider:
                             reasoning = published_capabilities.reasoning
                         result.append(
                             ModelInfo(
-                                provider=self._provider_kind,
+                                provider=self.provider_id,
                                 model_id=model.model_id,
                                 display_name=model.display_name,
                                 context_window=(
@@ -6250,7 +6255,7 @@ class OpenAIProvider:
                 else:
                     models = [
                         ModelInfo(
-                            provider=self._provider_kind,
+                            provider=self.provider_id,
                             model_id=m["id"],
                             display_name=m.get("name", m.get("id", "")),
                             context_window=m.get("context_length", 0),

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from opensquilla.gateway.rpc import RpcContext
@@ -289,6 +290,48 @@ async def test_models_list_envelope_keys_are_frozen() -> None:
     assert envelope["errors"] == [
         {"provider": "test-provider", "kind": "auth_invalid", "detail": "invalid api key"}
     ]
+
+
+async def test_models_list_provider_filter_matches_the_configured_provider_id(
+    monkeypatch,
+) -> None:
+    # End-to-end shape of the ``models.list`` provider filter: rows carry the
+    # configured provider id, so ``--provider <configured id>`` matches and the
+    # underlying wire dialect does not. Real adapter, mock transport, no
+    # credentials.
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "listed-model", "object": "model"}]},
+        )
+    )
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="vllm",
+                model="listed-model",
+                base_url="http://127.0.0.1:8000/v1",
+            )
+        )
+    )
+    ctx = RpcContext(conn_id="test", provider_selector=selector)
+
+    unfiltered = await _handle_models_list({}, ctx)
+    assert [row["provider"] for row in unfiltered["models"]] == ["vllm"]
+
+    matched = await _handle_models_list({"provider": "vllm"}, ctx)
+    assert [row["id"] for row in matched["models"]] == ["listed-model"]
+
+    # "openai" is vllm's wire dialect, never its configured identity.
+    mismatched = await _handle_models_list({"provider": "openai"}, ctx)
+    assert mismatched["models"] == []
 
 
 async def test_tokenrhythm_models_list_is_snapshot_only(monkeypatch) -> None:
