@@ -82,6 +82,55 @@ def test_repetition_detection_is_chunk_invariant() -> None:
     assert detection.structured is False
 
 
+@pytest.mark.parametrize(
+    ("repetitions", "expected_detection"),
+    [
+        pytest.param(7, False, id="below-threshold"),
+        pytest.param(8, True, id="at-threshold"),
+    ],
+)
+def test_min_repetitions_is_an_exact_boundary(
+    repetitions: int,
+    expected_detection: bool,
+) -> None:
+    unit = _aperiodic_unit(512)
+    payload = unit * repetitions
+
+    results = [_feed_in_chunks(payload, chunk_size)[:2] for chunk_size in (1, 137, len(payload))]
+
+    assert {len(emitted) for emitted, _ in results} == {len(payload)}
+    assert {(detection is not None) for _, detection in results} == {expected_detection}
+    if expected_detection:
+        detections = {detection for _, detection in results}
+        assert len(detections) == 1
+        detection = detections.pop()
+        assert detection is not None
+        assert detection.period_chars == len(unit)
+        assert detection.repetitions == repetitions
+
+
+def test_new_content_breaks_repetition_before_the_threshold() -> None:
+    unit = _aperiodic_unit(512)
+    payload = unit * 7 + unit[::-1] + unit
+
+    emitted, detection, _ = _feed_in_chunks(payload, 137)
+
+    assert detection is None
+    assert emitted == payload
+
+
+def test_recent_divergence_blocks_aggregate_near_repetition() -> None:
+    unit = _aperiodic_unit(512)
+    divergent = "_" * 16 + unit[16:]
+    payload = unit * 7 + divergent
+
+    emitted, detection, guard = _feed_in_chunks(payload, 137)
+
+    assert 512 in guard._candidate_periods(guard._buffer_text())
+    assert detection is None
+    assert emitted == payload
+
+
 def test_highly_similar_repetition_with_small_changing_field_is_detected() -> None:
     rows = [
         (
@@ -567,6 +616,20 @@ async def test_tool_boundary_resets_repetition_budget() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_guard_preserves_prefix_shaped_provider_deltas() -> None:
+    async def stream() -> AsyncIterator[Any]:
+        for delta in ("A", "AB", "ABC"):
+            yield ProviderText(text=delta)
+        yield ProviderDone()
+
+    events = [event async for event in guard_provider_text_stream(stream())]
+    text_events = [event.text for event in events if isinstance(event, ProviderText)]
+
+    assert text_events == ["A", "AB", "ABC"]
+    assert "".join(text_events) == "AABABC"
+
+
 class _RecordingSink:
     def __init__(self) -> None:
         self.started: list[UsageCallStart] = []
@@ -604,6 +667,73 @@ class _RepeatingProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+class _LengthCappedRepeatingProvider:
+    provider_name = "synthetic"
+
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+        self.calls = 0
+        self.close_calls = 0
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        self.calls += 1
+
+        async def stream() -> AsyncIterator[Any]:
+            try:
+                yield ProviderText(text=self.payload)
+                yield ProviderDone(stop_reason="length")
+            finally:
+                self.close_calls += 1
+
+        return stream()
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_repetition_precedes_same_attempt_length_terminal_once() -> None:
+    sink = _RecordingSink()
+    unit = _aperiodic_unit(512)
+    provider = _LengthCappedRepeatingProvider(unit * 8)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            length_capped_continuations=1,
+            provider_id="synthetic",
+            model_id="looping-model",
+        ),
+        usage_event_sink=sink,
+        usage_execution_context=UsageExecutionContext(
+            execution_id="execution-length-loop",
+            agent_run_id="run-length-loop",
+            turn_id="turn-length-loop",
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("continue")]
+
+    assert [event.code for event in events if event.kind == "error"] == [
+        MODEL_REPETITION_LOOP_CODE
+    ]
+    assert not any(event.kind == "warning" for event in events)
+    assert not any(event.kind == "done" for event in events)
+    assert provider.calls == 1
+    assert provider.close_calls == 1
+    assert len(sink.started) == 1
+    assert sink.finalized == []
+    assert [(call.event_id, reason) for call, reason in sink.unknown] == [
+        (sink.started[0].event_id, MODEL_REPETITION_LOOP_CODE)
+    ]
 
 
 @pytest.mark.asyncio
