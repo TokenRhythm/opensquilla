@@ -480,6 +480,46 @@ def _json_text(value: Any) -> str:
         return str(value)
 
 
+# A token decodes to at least one character of payload, so a persisted
+# token_count above the entry's full serialized replay size (plus a margin
+# for special/control tokens) is provably describing something else -- e.g.
+# a whole turn's cumulative usage copied in by an older client (ref
+# webchat:f4d2b4dc: token_count 770,191 on an entry whose full serialized
+# payload is ~90K chars).
+_PERSISTED_TOKEN_COUNT_CHAR_MARGIN = 4096
+# Below this size a prior summary carries no structured state worth
+# protecting; replacing a stub checkpoint is not a regression.
+_FALLBACK_DEGRADED_MIN_PREV_SUMMARY_CHARS = 1000
+
+
+def _entry_serialized_replay_chars(entry: Any) -> int:
+    """Count the characters of every field that reaches model replay."""
+
+    total = 0
+    content = _entry_get(entry, "content")
+    if content:
+        total += len(str(content))
+    tool_calls = _entry_get(entry, "tool_calls")
+    if tool_calls:
+        total += len(_json_text(tool_calls))
+    tool_call_id = _entry_get(entry, "tool_call_id")
+    if tool_call_id:
+        total += len(str(tool_call_id))
+    reasoning_content = _entry_get(entry, "reasoning_content")
+    if reasoning_content:
+        total += len(str(reasoning_content))
+    return total
+
+
+def _capped_persisted_token_count(entry: Any, persisted_tokens: int) -> int:
+    """Bound a persisted token_count to this entry's own serialized size."""
+
+    return min(
+        persisted_tokens,
+        _entry_serialized_replay_chars(entry) + _PERSISTED_TOKEN_COUNT_CHAR_MARGIN,
+    )
+
+
 def estimate_entry_replay_tokens(entry: Any) -> int:
     """Estimate the compaction-input size of a persisted transcript entry."""
 
@@ -491,7 +531,10 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
         persisted_tokens = 0
     # Persisted counts can originate from provider usage accounting or older
     # clients and are not guaranteed to describe this exact serialized entry.
-    # Never let them under-report the tokenizer estimate used for admission.
+    # Never let them under-report the tokenizer estimate used for admission;
+    # symmetrically, never let an inflated count over-report the entry's own
+    # serialized size (see _capped_persisted_token_count).
+    persisted_tokens = _capped_persisted_token_count(entry, persisted_tokens)
     estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
     content_tokens = max(persisted_tokens, estimated_content_tokens)
 
@@ -522,6 +565,7 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
         persisted_tokens = int(token_count or 0)
     except (TypeError, ValueError):
         persisted_tokens = 0
+    persisted_tokens = _capped_persisted_token_count(entry, persisted_tokens)
     estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
     content_tokens = max(persisted_tokens, estimated_content_tokens)
 
@@ -2195,6 +2239,39 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     else:
         summary_source = "fallback"
 
+    # A pure deterministic fallback reduces each removed entry to a ~200-char
+    # preview.  When a substantive prior checkpoint summary exists, replacing
+    # it (and the durable history) with those previews is destructive -- ref
+    # webchat:f4d2b4dc: after two budget-guarded LLM failures the 170K
+    # structured checkpoint was committed as a ~68-token stub.  Refuse the
+    # commit so the caller's existing failure path (emergency request-scoped
+    # compaction / overflow recovery) relieves the pressure without
+    # destroying state.  First-time fallbacks (no prior summary) still
+    # commit: the preview is the best available recovery and the originals
+    # are archived in compacted_transcript_entries.
+    if (
+        summary_source == "fallback"
+        and prev_summary
+        and len(prev_summary) >= _FALLBACK_DEGRADED_MIN_PREV_SUMMARY_CHARS
+    ):
+        log.warning(
+            "compaction.fallback_degraded_skipped",
+            compaction_id=cfg.operation_id,
+            prev_summary_chars=len(prev_summary),
+            removed=len(to_compact),
+        )
+        return CompactionResult(
+            summary="",
+            kept_entries=entries,
+            removed_count=0,
+            chunks_processed=processed_chunk_count,
+            summary_source=summary_source,
+            tokens_before=total_tokens,
+            tokens_after=total_tokens,
+            remaining_budget_tokens=max(window - total_tokens, 0),
+            skip_reason="fallback_degraded_with_prior_summary",
+        )
+
     obligation_entries = list(to_compact)
     if prev_summary:
         obligation_entries.insert(
@@ -2455,7 +2532,10 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
     if degraded_reason:
         telemetry["degraded_reason"] = degraded_reason
     result.quality_report = telemetry
-    log.info(
+    # Degraded compaction outcomes (deterministic fallback, blocked coverage,
+    # ...) must stand out in the log: they are the ones that silently
+    # shrank user context in the past.
+    (log.warning if degraded_reason else log.info)(
         "compaction.operation_terminal",
         compaction_id=cfg.operation_id,
         pressure_kind=request.trigger,
