@@ -19,7 +19,11 @@ from opensquilla.session.models import (
     SessionNode,
     TranscriptEntry,
 )
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import (
+    SessionStorage,
+    WorkspaceNotFoundError,
+    WorkspaceRemovedError,
+)
 from opensquilla.session.usage_ledger import UsageEventStart
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -639,5 +643,196 @@ async def test_project_history_delete_cancellation_waits_for_commit_and_cleanup(
                 for key in expected_keys
             ]
         )
+    finally:
+        await storage.close()
+
+
+def _make_session(session_key: str) -> SessionNode:
+    return SessionNode(session_key=session_key, origin={"source": "test"})
+
+
+async def _open_storage_with_migrations(tmp_path) -> SessionStorage:
+    db_path = str(tmp_path / "sessions.db")
+    apply_pending(db_path, MIGRATIONS_DIR)
+    return await SessionStorage.open(db_path)
+
+
+@pytest.mark.asyncio
+async def test_bind_session_workspace_atomic_bind_unbind_and_idempotence(tmp_path) -> None:
+    storage = await _open_storage_with_migrations(tmp_path)
+    try:
+        session = _make_session("agent:main:webchat:atomic-1")
+        await storage.upsert_session(session)
+        workspace = await storage.create_or_restore_project_workspace(
+            path=str(tmp_path / "ws-a"),
+            path_key=str(tmp_path / "ws-a"),
+            display_name="ws-a",
+            trusted_at=None,
+            now_ms=100,
+        )
+
+        assert (
+            await storage.bind_session_workspace_atomic(
+                session.session_key, workspace.workspace_id
+            )
+            is True
+        )
+        # Same target again: unchanged, idempotent no-op.
+        assert (
+            await storage.bind_session_workspace_atomic(
+                session.session_key, workspace.workspace_id
+            )
+            is False
+        )
+        persisted = await storage.get_session(session.session_key)
+        assert persisted is not None
+        assert persisted.workspace_id == workspace.workspace_id
+
+        # Unbind, then unbind again (already unbound: no-op).
+        assert await storage.bind_session_workspace_atomic(session.session_key, None) is True
+        assert await storage.bind_session_workspace_atomic(session.session_key, None) is False
+        persisted = await storage.get_session(session.session_key)
+        assert persisted is not None
+        assert persisted.workspace_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_session_workspace_atomic_missing_session_raises_keyerror(tmp_path) -> None:
+    storage = await _open_storage_with_migrations(tmp_path)
+    try:
+        with pytest.raises(KeyError, match="Session not found"):
+            await storage.bind_session_workspace_atomic(
+                "agent:main:webchat:missing", None
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_session_workspace_atomic_missing_workspace_fails_closed(tmp_path) -> None:
+    storage = await _open_storage_with_migrations(tmp_path)
+    try:
+        session = _make_session("agent:main:webchat:atomic-2")
+        await storage.upsert_session(session)
+        before = await storage.get_session(session.session_key)
+        assert before is not None and before.workspace_id is None
+
+        with pytest.raises(WorkspaceNotFoundError):
+            await storage.bind_session_workspace_atomic(
+                session.session_key, "ws-does-not-exist"
+            )
+        # Failed bind must not change the stored binding.
+        after = await storage.get_session(session.session_key)
+        assert after is not None and after.workspace_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_session_workspace_atomic_removed_workspace_fails_closed(tmp_path) -> None:
+    storage = await _open_storage_with_migrations(tmp_path)
+    try:
+        session = _make_session("agent:main:webchat:atomic-3")
+        await storage.upsert_session(session)
+        workspace = await storage.create_or_restore_project_workspace(
+            path=str(tmp_path / "ws-r"),
+            path_key=str(tmp_path / "ws-r"),
+            display_name="ws-r",
+            trusted_at=None,
+            now_ms=100,
+        )
+        assert (
+            await storage.bind_session_workspace_atomic(
+                session.session_key, workspace.workspace_id
+            )
+            is True
+        )
+        await storage.remove_project_workspace(workspace.workspace_id)
+
+        # Removed target: rejected (fail closed) even though the row exists.
+        with pytest.raises(WorkspaceRemovedError):
+            await storage.bind_session_workspace_atomic(
+                session.session_key, workspace.workspace_id
+            )
+        # The previous binding is untouched by the failed attempt.
+        persisted = await storage.get_session(session.session_key)
+        assert persisted is not None
+        assert persisted.workspace_id == workspace.workspace_id
+
+        # Unbinding from a removed workspace stays allowed.
+        assert await storage.bind_session_workspace_atomic(session.session_key, None) is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_session_workspace_atomic_move_between_workspaces(tmp_path) -> None:
+    storage = await _open_storage_with_migrations(tmp_path)
+    try:
+        session = _make_session("agent:main:webchat:atomic-4")
+        await storage.upsert_session(session)
+        first = await storage.create_or_restore_project_workspace(
+            path=str(tmp_path / "ws-1"),
+            path_key=str(tmp_path / "ws-1"),
+            display_name="ws-1",
+            trusted_at=None,
+            now_ms=100,
+        )
+        second = await storage.create_or_restore_project_workspace(
+            path=str(tmp_path / "ws-2"),
+            path_key=str(tmp_path / "ws-2"),
+            display_name="ws-2",
+            trusted_at=None,
+            now_ms=100,
+        )
+        assert (
+            await storage.bind_session_workspace_atomic(
+                session.session_key, first.workspace_id
+            )
+            is True
+        )
+        assert (
+            await storage.bind_session_workspace_atomic(
+                session.session_key, second.workspace_id
+            )
+            is True
+        )
+        persisted = await storage.get_session(session.session_key)
+        assert persisted is not None
+        assert persisted.workspace_id == second.workspace_id
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_session_workspace_legacy_method_regression(tmp_path) -> None:
+    storage = await _open_storage_with_migrations(tmp_path)
+    try:
+        session = _make_session("agent:main:webchat:legacy-regression")
+        await storage.upsert_session(session)
+        workspace = await storage.create_or_restore_project_workspace(
+            path=str(tmp_path / "ws-l"),
+            path_key=str(tmp_path / "ws-l"),
+            display_name="ws-l",
+            trusted_at=None,
+            now_ms=100,
+        )
+        # Legacy method keeps its original behavior: blind UPDATE + session
+        # existence check, no workspace validation (scheduler callers depend
+        # on resolve_validated_project_workspace for that).
+        await storage.bind_session_workspace(session.session_key, workspace.workspace_id)
+        persisted = await storage.get_session(session.session_key)
+        assert persisted is not None
+        assert persisted.workspace_id == workspace.workspace_id
+
+        await storage.bind_session_workspace(session.session_key, None)
+        persisted = await storage.get_session(session.session_key)
+        assert persisted is not None
+        assert persisted.workspace_id is None
+
+        with pytest.raises(KeyError, match="Session not found"):
+            await storage.bind_session_workspace("agent:main:webchat:missing", None)
     finally:
         await storage.close()
