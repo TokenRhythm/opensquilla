@@ -1362,6 +1362,7 @@ def _done_usage_row(
 class EnsembleProvider:
     """G8 fusion provider: proposer candidates first, one aggregator stream after."""
 
+    accounts_physical_usage = True
     final_request_admission_guaranteed = True
     # Agent must pass the turn context through to this provider instead of
     # opening a second outer lease for the whole ensemble envelope.  The
@@ -2351,6 +2352,23 @@ class EnsembleProvider:
             execution_context=execution_context,
         )
 
+    @staticmethod
+    def _account_physical_stream(
+        stream_factory: Callable[[], AsyncIterator[StreamEvent]],
+        *,
+        provider: str,
+        model: str,
+    ) -> AsyncIterator[StreamEvent]:
+        # Keep the provider layer free of an import-time engine cycle while
+        # accounting each physical ensemble leg at its actual dispatch.
+        from opensquilla.engine.usage_accounting import account_provider_stream
+
+        return account_provider_stream(
+            stream_factory,
+            provider=provider,
+            model=model,
+        )
+
     async def _chat(
         self,
         messages: list[Message],
@@ -3055,7 +3073,11 @@ class EnsembleProvider:
             result.request_started = True
 
         provider_stream = _provider_stream_with_lifecycle(
-            lambda: provider.chat(messages, tools=tools, config=chat_cfg),
+            lambda: self._account_physical_stream(
+                lambda: provider.chat(messages, tools=tools, config=chat_cfg),
+                provider=member.provider_config.provider,
+                model=member.provider_config.model,
+            ),
             execution_context=execution_context,
             role=StickyExecutionRole.PROPOSER,
             logical_call_index=result.index,
@@ -3489,7 +3511,11 @@ class EnsembleProvider:
                     else None
                 )
                 heartbeat_stream = _provider_stream_with_lifecycle(
-                    lambda: provider.chat(messages, tools=tools, config=config),
+                    lambda: self._account_physical_stream(
+                        lambda: provider.chat(messages, tools=tools, config=config),
+                        provider=self.aggregator.provider_config.provider,
+                        model=self.aggregator.provider_config.model,
+                    ),
                     execution_context=execution_context,
                     role=StickyExecutionRole.PRIMARY_AGGREGATOR,
                     logical_call_index=logical_call_index,
@@ -4074,6 +4100,7 @@ class EnsembleProvider:
         while True:
             fixed_attempt += 1
             fixed_request_started = False
+            physical_provider, physical_model = executed_identity()
 
             async def mark_fixed_request_started() -> None:
                 nonlocal fixed_request_started
@@ -4089,7 +4116,15 @@ class EnsembleProvider:
             terminal_error: ErrorEvent | None = None
             try:
                 async for event in _provider_stream_with_lifecycle(
-                    lambda: provider.chat(fixed_messages, tools=tools, config=config),
+                    lambda: self._account_physical_stream(
+                        lambda: provider.chat(
+                            fixed_messages,
+                            tools=tools,
+                            config=config,
+                        ),
+                        provider=physical_provider,
+                        model=physical_model,
+                    ),
                     execution_context=execution_context,
                     role=role,
                     logical_call_index=logical_call_index,
