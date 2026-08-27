@@ -124,6 +124,7 @@
     "tests/test_channels/test_channel_delivery_store.py": 4.287,
     "tests/test_channels/test_channel_delivery_store_windows_long_paths.py": 0.126,
     "tests/test_channels/test_channel_manager_lifecycle.py": 0.029,
+    "tests/test_channels/test_channel_markdown_support.py": 0.01,
     "tests/test_channels/test_channel_mock_certification.py": 0.963,
     "tests/test_channels/test_channel_native_file_uploads.py": 0.053,
     "tests/test_channels/test_channel_pairing.py": 1.809,

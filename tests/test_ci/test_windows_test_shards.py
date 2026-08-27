@@ -86,6 +86,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_channels/test_channel_admission.py",
     "tests/test_channels/test_channel_certification.py",
     "tests/test_channels/test_channel_delivery_store.py",
+    "tests/test_channels/test_channel_markdown_support.py",
     "tests/test_channels/test_channel_mock_certification.py",
     "tests/test_channels/test_channel_pairing.py",
     "tests/test_channels/test_discord_gateway_lifecycle.py",

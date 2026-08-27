@@ -138,6 +138,12 @@ class OutgoingMessage(BaseModel):
     attachments: list[Attachment] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     reply_to: str | None = None
+    # Rich-text rendering hint. ``text`` sends plain text everywhere;
+    # ``markdown`` lets adapters that support rich text (Feishu post, WeCom
+    # markdown, Telegram parse_mode, Slack/Discord/Matrix native Markdown)
+    # render the content richly, while plain-text-only adapters fall back to
+    # the raw content.
+    format: Literal["text", "markdown"] = "text"
 
 
 # ---------------------------------------------------------------------------

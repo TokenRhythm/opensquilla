@@ -148,6 +148,7 @@ class WeComChannel:
     """
 
     config: WeComChannelConfig
+    markdown_capable: bool = True
     policy: ChannelAccessPolicy = field(
         default_factory=lambda: ChannelAccessPolicy(
             dm_allowed=True,
@@ -982,12 +983,20 @@ class WeComChannel:
         if not any((user_target, party_target, tag_target)):
             raise WeComApiError("an explicit touser, toparty, or totag target is required")
 
-        payload: dict[str, Any] = {
-            "msgtype": "text",
-            "agentid": self.config.agent_id_int,
-            "text": {"content": message.content},
-            "safe": 0,
-        }
+        if message.format == "markdown":
+            payload: dict[str, Any] = {
+                "msgtype": "markdown",
+                "agentid": self.config.agent_id_int,
+                "markdown": {"content": message.content},
+                "safe": 0,
+            }
+        else:
+            payload = {
+                "msgtype": "text",
+                "agentid": self.config.agent_id_int,
+                "text": {"content": message.content},
+                "safe": 0,
+            }
         if user_target:
             payload["touser"] = user_target
         if party_target:
@@ -1196,5 +1205,6 @@ class WeComChannel:
                 content=accumulated,
                 reply_to=target or "",
                 metadata=out_meta,
+                format="markdown",
             )
         )

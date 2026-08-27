@@ -21,9 +21,11 @@ from opensquilla.channels._attachment_io import (
     fetch_httpx_bytes_limited,
     preferred_attachment_mime,
 )
+from opensquilla.channels._markdown import markdown_to_telegram_html
 from opensquilla.channels._util import (
     ChannelAccessPolicy,
     EventDedupeCache,
+    split_markdown_for_channel,
     split_text_for_channel,
 )
 from opensquilla.channels.contract import (
@@ -87,6 +89,21 @@ class TelegramApiError(RuntimeError):
         super().__init__(message)
 
 
+def _is_entity_parse_failure(exc: TelegramApiError) -> bool:
+    """True when Telegram rejected a message for malformed entities.
+
+    The Bot API reports entity parse problems as 400 with a "can't parse
+    entities" description. Restricting the plain-text fallback to exactly
+    this failure keeps unrelated errors (flood, auth, missing target)
+    from being masked by a silent retry.
+    """
+    if exc.error_code != 400:
+        return False
+    description = str(exc.args[0]) if exc.args else ""
+    lowered = description.lower()
+    return "can't parse entities" in lowered or "cannot parse entities" in lowered
+
+
 class TelegramChannelConfig(BaseModel):
     """Adapter-level config for Telegram Bot API."""
 
@@ -123,6 +140,7 @@ class TelegramChannel:
     config: TelegramChannelConfig
 
     supports_slash_commands: bool = True
+    markdown_capable: bool = True
     policy: ChannelAccessPolicy = field(
         default_factory=lambda: ChannelAccessPolicy(
             dm_allowed=True,
@@ -691,16 +709,59 @@ class TelegramChannel:
         # Telegram counts the 4096 cap in UTF-16 code units, not code points:
         # an astral char (emoji, some CJK) is two units, so a code-point split
         # can still overflow and be rejected. Measure in the unit Telegram uses.
-        chunks = split_text_for_channel(
-            message.content,
-            _TELEGRAM_MAX_MESSAGE_CHARS,
-            unit=ChannelLengthUnit.UTF16_UNITS,
-        )
+        # Markdown replies are rendered to Telegram HTML per chunk; the
+        # markdown-aware splitter keeps paragraphs, lists and fences intact
+        # and balances inline delimiters across mid-span seams. An explicit
+        # metadata parse_mode keeps its precedence for callers opting into a
+        # specific mode (the rendered-HTML path then does not apply).
+        if message.format == "markdown" and not message.metadata.get("parse_mode"):
+            chunks = split_markdown_for_channel(
+                message.content,
+                _TELEGRAM_MAX_MESSAGE_CHARS,
+                unit=ChannelLengthUnit.UTF16_UNITS,
+            )
+            parse_mode = "HTML"
+        else:
+            chunks = split_text_for_channel(
+                message.content,
+                _TELEGRAM_MAX_MESSAGE_CHARS,
+                unit=ChannelLengthUnit.UTF16_UNITS,
+            )
+            parse_mode = None
         result: Any = None
         for chunk in chunks:
-            payload = self._build_send_payload(message)
-            payload["text"] = chunk
-            result = await self._api("sendMessage", payload)
+            if parse_mode == "HTML":
+                rendered = markdown_to_telegram_html(chunk)
+                # HTML escaping can inflate a chunk past the 4096-unit cap
+                # (e.g. a run of ampersands becomes &amp;). Telegram rejects
+                # over-long messages wholesale, so deliver such a chunk as
+                # plain markdown source instead of dropping it. The original
+                # chunk is always within the cap by construction.
+                if len(rendered.encode("utf-16-le")) // 2 > _TELEGRAM_MAX_MESSAGE_CHARS:
+                    plain_payload = self._build_send_payload(message, text=chunk)
+                    plain_payload.pop("parse_mode", None)
+                    result = await self._api("sendMessage", plain_payload)
+                    continue
+                text = rendered
+            else:
+                text = chunk
+            payload = self._build_send_payload(message, text=text, parse_mode=parse_mode)
+            try:
+                result = await self._api("sendMessage", payload)
+            except TelegramApiError as exc:
+                # Telegram's HTML entity parser rejects malformed output
+                # wholesale; only that failure falls back to plain text so
+                # the answer still lands. Every other error (auth, flood,
+                # missing target) must surface instead of being masked.
+                if parse_mode != "HTML" or not _is_entity_parse_failure(exc):
+                    raise
+                # Deliver the original chunk without parse_mode so the
+                # fallback is markdown source, not half-rendered HTML. The
+                # payload builder would re-add HTML for a markdown message,
+                # so strip the mode explicitly.
+                plain_payload = self._build_send_payload(message, text=chunk)
+                plain_payload.pop("parse_mode", None)
+                result = await self._api("sendMessage", plain_payload)
         return result if isinstance(result, dict) else {"result": result}
 
     async def send_typing(self, channel_id: str | None = None) -> ChannelSendResult:
@@ -770,7 +831,13 @@ class TelegramChannel:
             provider_file_id=str(document.get("file_id", "")),
         )
 
-    def _build_send_payload(self, message: OutgoingMessage) -> dict[str, Any]:
+    def _build_send_payload(
+        self,
+        message: OutgoingMessage,
+        *,
+        text: str | None = None,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
         chat_id = (
             message.metadata.get("chat_id")
             or message.metadata.get("channel_id")
@@ -787,8 +854,14 @@ class TelegramChannel:
             payload["reply_parameters"] = {
                 "message_id": _coerce_telegram_int(reply_message_id),
             }
-        if parse_mode := message.metadata.get("parse_mode"):
-            payload["parse_mode"] = str(parse_mode)
+        if text is not None:
+            payload["text"] = text
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        elif metadata_parse_mode := message.metadata.get("parse_mode"):
+            payload["parse_mode"] = str(metadata_parse_mode)
+        elif message.format == "markdown":
+            payload["parse_mode"] = "HTML"
         return payload
 
     async def edit(self, message_id: str, content: str) -> None:

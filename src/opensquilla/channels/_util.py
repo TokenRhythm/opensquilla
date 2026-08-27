@@ -444,6 +444,125 @@ def split_text_for_channel(
     return chunks
 
 
+# Inline markdown delimiter pairs whose balance must survive a word-boundary
+# split: (opener, closer). Splitting mid-span leaves an odd occurrence count
+# and the fragment would render as literal markers instead of formatting.
+_MARKDOWN_INLINE_DELIMITERS: tuple[tuple[str, str], ...] = (
+    ("**", "**"),  # bold
+    ("__", "__"),  # bold (CommonMark alternative)
+    ("~~", "~~"),  # strikethrough
+    ("*", "*"),  # italic
+    ("_", "_"),  # italic (CommonMark alternative)
+    ("`", "`"),  # inline code
+)
+
+
+def _open_markdown_delimiters(text: str) -> tuple[str, ...]:
+    """Inline delimiters still open at the end of text (odd occurrence)."""
+    counts = {pair: 0 for pair in _MARKDOWN_INLINE_DELIMITERS}
+    i = 0
+    while i < len(text):
+        matched = None
+        for opener, _closer in _MARKDOWN_INLINE_DELIMITERS:
+            if text.startswith(opener, i):
+                matched = opener
+                break
+        if matched is None:
+            i += 1
+            continue
+        counts[(matched, matched)] += 1
+        i += len(matched)
+    return tuple(
+        opener
+        for opener, _closer in _MARKDOWN_INLINE_DELIMITERS
+        if counts[(opener, opener)] % 2 == 1
+    )
+
+
+def _split_balancing_markdown(text: str, cut: int) -> tuple[str, str]:
+    """Split text at cut, keeping inline markdown renderable.
+
+    Any delimiter open at the seam is closed at the end of the first chunk
+    and reopened at the start of the second, so both fragments still render
+    (a bold seam becomes bold-close + reopen-tail).
+    """
+    piece = text[:cut]
+    rest = text[cut:]
+    openers = _open_markdown_delimiters(piece)
+    if not openers or not rest:
+        return piece, rest
+    # Close inner delimiters first so a **a *b seam closes as *b* then **.
+    closer = {opener: closer for opener, closer in reversed(_MARKDOWN_INLINE_DELIMITERS)}
+    close = "".join(closer[opener] for opener in openers)
+    reopen = "".join(openers)
+    return piece + close, reopen + rest
+
+
+def _split_markdown_seam(
+    text: str,
+    limit: int,
+    measure: Callable[[str], int],
+) -> tuple[str, str]:
+    """Split one over-long line at a word boundary within the cap.
+
+    The seam is placed at the best word boundary; when balancing inserts
+    synthetic closers that would overflow the cap, the seam moves earlier
+    (reserving the closers' length) and retries. Each retry strictly
+    shrinks the seam, so the loop terminates.
+    """
+    cut = _fit_cut(text, limit, measure)
+    end = _boundary_before(text, cut) or cut
+    while True:
+        piece, rest = _split_balancing_markdown(text, end)
+        if measure(piece) <= limit:
+            return piece, rest
+        extra = sum(len(opener) for opener in _open_markdown_delimiters(text[:end]))
+        if extra <= 0:
+            return piece, rest
+        cut = _fit_cut(text, max(1, limit - extra), measure)
+        next_end = _boundary_before(text, cut) or cut
+        if next_end >= end:
+            return piece, rest
+        end = next_end
+
+
+def split_markdown_for_channel(
+    text: str,
+    limit: int,
+    *,
+    unit: ChannelLengthUnit = ChannelLengthUnit.CODE_POINTS,
+) -> list[str]:
+    """Split text like split_text_for_channel without breaking markdown.
+
+    Paragraph (blank-line) and line boundaries are preferred, so fenced
+    code blocks and list items survive intact. When a single line exceeds
+    limit and only a word boundary is available, the split balances inline
+    markdown delimiters across the seam (see _split_balancing_markdown), so
+    every chunk still renders as valid markdown. Joining the chunks
+    reproduces the input except for the synthetic delimiters inserted to
+    keep a mid-span split renderable.
+    """
+    measure = _measure_for(unit)
+    if limit <= 0 or measure(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while measure(remaining) > limit:
+        cut = _fit_cut(remaining, limit, measure)
+        end = _boundary_before(remaining, cut) or cut
+        # A paragraph/line boundary keeps markdown blocks intact and needs
+        # no balancing; only word-boundary cuts can land inside a span.
+        if end < len(remaining) and remaining[end - 1] != "\n":
+            piece, remaining = _split_markdown_seam(remaining, limit, measure)
+            chunks.append(piece)
+        else:
+            chunks.append(remaining[:end])
+            remaining = remaining[end:]
+    chunks.append(remaining)
+    return chunks
+
+
 _TRUNCATE_FOOTER = "\n\n[message truncated to fit this channel's length limit]"
 
 

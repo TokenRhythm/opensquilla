@@ -120,6 +120,7 @@ class MatrixChannel:
     """
 
     config: MatrixChannelConfig
+    markdown_capable: bool = True
 
     _client: Any = field(default=None, init=False, repr=False)
     _sync_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
@@ -694,8 +695,11 @@ class MatrixChannel:
         room_id = message.reply_to or message.metadata.get("room_id", "")
         if not room_id:
             raise RuntimeError("Matrix outbound requires a room_id (reply_to)")
-        formatted = self._render_html(message.content)
-        content = self._build_text_content(message.content, formatted)
+        if message.format == "markdown":
+            formatted = self._render_html(message.content)
+            content = self._build_text_content(message.content, formatted)
+        else:
+            content = {"msgtype": "m.text", "body": message.content}
         reply_event_id = message.metadata.get("reply_event_id")
         if isinstance(reply_event_id, str) and reply_event_id:
             content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_event_id}}

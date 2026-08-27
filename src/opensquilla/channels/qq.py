@@ -137,6 +137,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     """
 
     config: QQChannelConfig
+    markdown_capable: bool = True
 
     def __init__(self, config: QQChannelConfig) -> None:
         # Lazy SDK import — keeps the adapter usable even when the
@@ -433,46 +434,119 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     async def send(self, message: OutgoingMessage) -> None:
         """Route by ``metadata['chat_type']`` to the right SDK call.
 
-        ``c2c``  → ``self.api.post_c2c_message(openid=..., msg_type=0, ...)``
-        ``group`` → ``self.api.post_group_message(group_openid=..., msg_type=0, ...)``
+        ``c2c``  → ``self.api.post_c2c_message(openid=..., msg_type=..., ...)``
+        ``group`` → ``self.api.post_group_message(group_openid=..., msg_type=..., ...)``
 
         ``msg_id`` (when supplied) and a per-inbound-message ``msg_seq`` counter
         satisfy the QQ API's passive-reply dedup rules.
+
+        ``format="markdown"``  → ``msg_type=2`` with ``markdown.content``
+        (official markdown passive message). ``format="text"`` (default) →
+        ``msg_type=0`` plain text.
         """
         meta = message.metadata or {}
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
 
+        markdown_content = message.content if message.format == "markdown" else None
         api = self.api
         if chat_type == "group":
             target = meta.get("group_openid", "")
             if not target:
                 raise ValueError("qq.send: metadata['group_openid'] required for group chat_type")
             seq = self._next_msg_seq(f"group:{msg_id or target}")
-            await api.post_group_message(
-                group_openid=target,
-                msg_type=0,
-                content=message.content,
-                msg_id=msg_id,
-                msg_seq=seq,
-            )
+            if markdown_content is not None:
+                await self._post_markdown(
+                    route_path="/v2/groups/{group_openid}/messages",
+                    target_key="group_openid",
+                    target=target,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                    markdown_content=markdown_content,
+                )
+            else:
+                await api.post_group_message(
+                    group_openid=target,
+                    msg_type=0,
+                    content=message.content,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                )
         elif chat_type == "c2c":
             target = meta.get("openid", "") or meta.get("user_openid", "")
             if not target:
                 raise ValueError("qq.send: metadata['openid'] required for c2c chat_type")
             seq = self._next_msg_seq(f"c2c:{msg_id or target}")
-            await api.post_c2c_message(
-                openid=target,
-                msg_type=0,
-                content=message.content,
-                msg_id=msg_id,
-                msg_seq=seq,
-            )
+            if markdown_content is not None:
+                await self._post_markdown(
+                    route_path="/v2/users/{openid}/messages",
+                    target_key="openid",
+                    target=target,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                    markdown_content=markdown_content,
+                )
+            else:
+                await api.post_c2c_message(
+                    openid=target,
+                    msg_type=0,
+                    content=message.content,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                )
         else:
             raise ValueError(
                 f"qq.send: metadata['chat_type'] must be 'c2c' or 'group', got {chat_type!r}"
             )
         log.debug("qq.outbound_sent", chat_type=chat_type, length=len(message.content))
+
+    async def _post_markdown(
+        self,
+        *,
+        route_path: str,
+        target_key: str,
+        target: str,
+        msg_id: str | None,
+        msg_seq: int,
+        markdown_content: str,
+    ) -> None:
+        """Send a QQ official markdown passive message.
+
+        QQ's markdown API rejects messages whose top-level ``content``
+        is present (even null), while botpy's ``post_*_message`` helpers
+        serialize every argument — including ``content=None`` — into the
+        JSON body. Build the payload directly so only the markdown fields
+        are sent.
+        """
+        if hasattr(self.api, "_http") and hasattr(self.api._http, "request"):
+            from botpy.http import Route
+
+            payload: dict[str, Any] = {
+                target_key: target,
+                "msg_type": 2,
+                "msg_seq": msg_seq,
+                "markdown": {"content": markdown_content},
+            }
+            if msg_id:
+                payload["msg_id"] = msg_id
+            route = Route("POST", route_path, **{target_key: target})
+            await self.api._http.request(route, json=payload)  # type: ignore[attr-defined]
+        elif target_key == "group_openid" and hasattr(self.api, "post_group_message"):
+            await self.api.post_group_message(
+                group_openid=target,
+                msg_type=2,
+                markdown={"content": markdown_content},
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
+        elif hasattr(self.api, "post_c2c_message"):
+            await self.api.post_c2c_message(
+                openid=target,
+                msg_type=2,
+                markdown={"content": markdown_content},
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
 
     async def edit(self, message_id: str, content: str) -> None:
         """Raise: QQ Bot Platform has no message-edit primitive."""
@@ -550,4 +624,10 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             elif ct == "c2c" and "openid" not in out_meta:
                 out_meta["openid"] = target
 
-        await self.send(OutgoingMessage(content=accumulated, metadata=out_meta))
+        await self.send(
+            OutgoingMessage(
+                content=accumulated,
+                metadata=out_meta,
+                format="markdown",
+            )
+        )

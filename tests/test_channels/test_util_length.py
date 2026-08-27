@@ -11,6 +11,7 @@ import pytest
 
 from opensquilla.channels._util import (
     measured_len,
+    split_markdown_for_channel,
     split_text_for_channel,
     truncate_to_limit,
 )
@@ -82,6 +83,32 @@ def test_split_prefers_boundaries_then_hard_splits() -> None:
     assert "".join(chunks) == token
     assert all(len(chunk) <= 10 for chunk in chunks)
     assert len(chunks) == 5
+
+
+def test_markdown_split_keeps_paragraph_blocks_whole() -> None:
+    # Blank-line boundaries keep markdown blocks intact and need no balancing.
+    text = "para one\n\npara two **with bold**"
+    chunks = split_markdown_for_channel(text, 25, unit=U.UTF8_BYTES)
+    assert "".join(chunks) == text
+    assert all(len(c.encode("utf-8")) <= 25 for c in chunks)
+    assert chunks[0] == "para one\n\n"
+
+
+def test_markdown_split_balances_bold_across_a_word_seam() -> None:
+    # A single over-long line must not leave ** open at a seam, and the
+    # synthetic closers must not push a chunk over the cap.
+    text = "word " * 8 + "**" + "B" * 60 + "**"
+    chunks = split_markdown_for_channel(text, 30, unit=U.UTF8_BYTES)
+    assert all(len(c.encode("utf-8")) <= 30 for c in chunks)
+    assert all(c.count("**") % 2 == 0 for c in chunks)
+    # The bold tail is delivered in balanced pieces, the first of which
+    # starts with a freshly reopened ** marker.
+    assert chunks[-1] == "**" + "B" * 8 + "**"
+
+
+def test_markdown_split_matches_plain_split_for_plain_text() -> None:
+    text = "one two three four five"
+    assert split_markdown_for_channel(text, 10) == split_text_for_channel(text, 10)
 
 
 def test_truncate_appends_a_footer_within_budget() -> None:

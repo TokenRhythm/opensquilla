@@ -130,6 +130,7 @@ class DiscordChannel:
     config: DiscordChannelConfig
     bot_user_id: str | None = None
     supports_slash_commands: bool = True
+    markdown_capable: bool = True
     # Discord mirrors slack/feishu: DMs admit, groups require mention.
     policy: ChannelAccessPolicy = field(
         default_factory=lambda: ChannelAccessPolicy(

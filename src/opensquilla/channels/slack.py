@@ -21,6 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from opensquilla.channels._markdown import markdown_to_slack_mrkdwn
 from opensquilla.channels._reactions import NULL_STATUS_REACTOR, SlackStatusReactor
 from opensquilla.channels._util import (
     ChannelAccessPolicy,
@@ -129,6 +130,7 @@ class SlackChannel:
     _socket_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     _socket_stop: asyncio.Event | None = field(default=None, init=False, repr=False)
     supports_slash_commands: bool = True
+    markdown_capable: bool = True
 
     @property
     def transport_name(self) -> str:
@@ -351,9 +353,13 @@ class SlackChannel:
         client = self._get_client()
         # Slack rejects text longer than 40000 chars; split so the full answer
         # is delivered across sequential messages instead of being dropped.
+        # Slack parses mrkdwn, not CommonMark: **bold** and [t](u) would
+        # render literally. Convert markdown replies so rich text lands.
         chunks = split_text_for_channel(message.content, _SLACK_MAX_MESSAGE_CHARS)
         for chunk in chunks:
-            payload["text"] = chunk
+            payload["text"] = (
+                markdown_to_slack_mrkdwn(chunk) if message.format == "markdown" else chunk
+            )
             resp = await client.post("/chat.postMessage", json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -496,7 +502,7 @@ class SlackChannel:
             nonlocal message_ts
             payload: dict[str, Any] = {
                 "channel": target,
-                "text": text,
+                "text": markdown_to_slack_mrkdwn(text),
             }
             if thread_ts:
                 payload["thread_ts"] = thread_ts
@@ -514,7 +520,7 @@ class SlackChannel:
                 json={
                     "channel": target,
                     "ts": message_ts,
-                    "text": text,
+                    "text": markdown_to_slack_mrkdwn(text),
                 },
             )
             resp.raise_for_status()

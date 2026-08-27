@@ -24,6 +24,7 @@
       "tests/test_channels/test_channel_attachment_metadata.py",
       "tests/test_channels/test_channel_capabilities.py",
       "tests/test_channels/test_channel_certification.py",
+      "tests/test_channels/test_channel_markdown_support.py",
       "tests/test_channels/test_channel_mock_certification.py",
       "tests/test_channels/test_dingtalk_auth_validation.py",
       "tests/test_channels/test_discord_routing.py",
