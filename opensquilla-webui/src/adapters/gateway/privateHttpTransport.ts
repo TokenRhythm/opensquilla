@@ -81,6 +81,7 @@ interface ResponseDecoder<T> {
 }
 
 interface ResponseBodyLifecycle {
+  readonly signal: AbortSignal
   release(): void
   assertActive(): void
   transportError(cause: unknown): HttpTransportError
@@ -278,6 +279,46 @@ function isFormBody(value: unknown): value is FormData | URLSearchParams {
   return false
 }
 
+function cancelReadableStream(
+  source: ReadableStream<Uint8Array> | null | undefined,
+  reason: unknown,
+): void {
+  if (!source) return
+  try {
+    void Promise.resolve(source.cancel(reason)).catch(() => undefined)
+  } catch {
+    // A body that is already disturbed, locked, or closed needs no further
+    // cleanup from this owner.
+  }
+}
+
+function lifecycleAbortError(lifecycle: ResponseBodyLifecycle): HttpTransportError {
+  try {
+    lifecycle.assertActive()
+  } catch (cause) {
+    if (cause instanceof HttpTransportError) return cause
+  }
+  return new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
+}
+
+async function awaitWithLifecycle<T>(
+  operation: PromiseLike<T>,
+  lifecycle: ResponseBodyLifecycle,
+): Promise<T> {
+  let removeAbortListener: (() => void) | undefined
+  const abortPromise = new Promise<never>((_, reject) => {
+    const onAbort = () => reject(lifecycleAbortError(lifecycle))
+    removeAbortListener = () => lifecycle.signal.removeEventListener('abort', onAbort)
+    lifecycle.signal.addEventListener('abort', onAbort, { once: true })
+    if (lifecycle.signal.aborted) onAbort()
+  })
+  try {
+    return await Promise.race([operation, abortPromise])
+  } finally {
+    removeAbortListener?.()
+  }
+}
+
 function managedBinaryStream(
   source: ReadableStream<Uint8Array>,
   lifecycle: ResponseBodyLifecycle,
@@ -285,26 +326,71 @@ function managedBinaryStream(
   const reader = source.getReader()
   let readerReleased = false
   let readerCancelPromise: Promise<void> | undefined
+  let signalListener: (() => void) | undefined
+  let finished = false
+  let outputController: ReadableStreamDefaultController<Uint8Array> | undefined
+  let outputSettled = false
   function releaseReader(): void {
     if (readerReleased) return
     readerReleased = true
-    reader.releaseLock()
+    try {
+      reader.releaseLock()
+    } catch {
+      // The underlying stream may have released the lock while cancelling.
+    }
   }
   async function cancelReader(reason: unknown): Promise<void> {
     if (!readerCancelPromise) {
-      readerCancelPromise = reader.cancel(reason).then(
-        () => {
-          releaseReader()
-        },
-        cause => {
-          releaseReader()
-          throw cause
-        },
-      )
+      try {
+        readerCancelPromise = Promise.resolve(reader.cancel(reason)).then(
+          () => {
+            releaseReader()
+          },
+          cause => {
+            releaseReader()
+            throw cause
+          },
+        )
+      } catch (cause) {
+        releaseReader()
+        readerCancelPromise = Promise.reject(cause)
+      }
     }
     return readerCancelPromise
   }
+  function detachSignalListener(): void {
+    if (!signalListener) return
+    lifecycle.signal.removeEventListener('abort', signalListener)
+    signalListener = undefined
+  }
+  function releaseLifecycle(): void {
+    if (finished) return
+    finished = true
+    detachSignalListener()
+    lifecycle.release()
+  }
+  function failOutput(error: unknown): void {
+    if (outputSettled || !outputController) return
+    try {
+      outputController.error(error)
+    } catch {
+      // The consumer may have cancelled/closed the wrapper concurrently.
+    }
+    outputSettled = true
+  }
+  const abortSource = () => {
+    const error = lifecycleAbortError(lifecycle)
+    failOutput(error)
+    releaseLifecycle()
+    void cancelReader(error).catch(() => undefined)
+  }
   return new ReadableStream<Uint8Array>({
+    start(controller) {
+      outputController = controller
+      signalListener = abortSource
+      lifecycle.signal.addEventListener('abort', signalListener, { once: true })
+      if (lifecycle.signal.aborted) abortSource()
+    },
     async pull(controller) {
       try {
         lifecycle.assertActive()
@@ -312,8 +398,9 @@ function managedBinaryStream(
         lifecycle.assertActive()
         if (next.done) {
           controller.close()
+          outputSettled = true
           releaseReader()
-          lifecycle.release()
+          releaseLifecycle()
         } else {
           controller.enqueue(next.value)
         }
@@ -321,14 +408,14 @@ function managedBinaryStream(
         const error = cause instanceof HttpTransportError
           ? cause
           : lifecycle.transportError(cause)
-        controller.error(error)
+        failOutput(error)
         try {
           await cancelReader(error)
         } catch {
           // The stream is already being failed; preserve the stable transport
           // error even if source cleanup rejects.
         }
-        lifecycle.release()
+        releaseLifecycle()
       }
     },
     async cancel(reason) {
@@ -338,7 +425,8 @@ function managedBinaryStream(
         if (cause instanceof HttpTransportError) throw cause
         throw lifecycle.transportError(cause)
       } finally {
-        lifecycle.release()
+        outputSettled = true
+        releaseLifecycle()
       }
     },
   })
@@ -359,18 +447,29 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
   let body = response.body
   response = null
   let consumed = false
+  let signalListener: (() => void) | undefined
+  function detachSignalListener(): void {
+    if (!signalListener) return
+    lifecycle.signal.removeEventListener('abort', signalListener)
+    signalListener = undefined
+  }
+  function releaseLifecycle(): void {
+    detachSignalListener()
+    lifecycle.release()
+  }
   function discardBody(reason: unknown, sourceOverride?: ReadableStream<Uint8Array> | null): void {
     const source = sourceOverride === undefined ? body : sourceOverride
     body = null
-    if (source) {
-      try {
-        void source.cancel(reason).catch(() => undefined)
-      } catch {
-        // A body that is already disturbed/closed needs no further cleanup.
-      }
-    }
+    detachSignalListener()
+    cancelReadableStream(source, reason)
     lifecycle.release()
   }
+  const abortBody = () => {
+    discardBody(lifecycleAbortError(lifecycle))
+  }
+  signalListener = abortBody
+  lifecycle.signal.addEventListener('abort', signalListener, { once: true })
+  if (lifecycle.signal.aborted) abortBody()
   function takeStream(): ReadableStream<Uint8Array> | null {
     try {
       lifecycle.assertActive()
@@ -388,8 +487,9 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
     consumed = true
     const source = body
     body = null
+    detachSignalListener()
     if (!source) {
-      lifecycle.release()
+      releaseLifecycle()
       return null
     }
     try {
@@ -407,11 +507,14 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
       const stream = takeStream()
       if (!stream) return new Blob([], contentType ? { type: contentType } : undefined)
       try {
-        return await new Response(
+        const blobResponse = new Response(
           stream,
           contentType ? { headers: { 'content-type': contentType } } : undefined,
-        ).blob()
+        )
+        return await awaitWithLifecycle(blobResponse.blob(), lifecycle)
       } catch (cause) {
+        cancelReadableStream(stream, cause)
+        releaseLifecycle()
         if (cause instanceof HttpTransportError) throw cause
         throw lifecycle.transportError(cause)
       }
@@ -419,14 +522,49 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
   }
 }
 
-async function errorPayload(response: Response): Promise<unknown> {
-  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+async function errorPayload(
+  response: Response,
+  lifecycle: ResponseBodyLifecycle,
+): Promise<unknown> {
+  let contentType = ''
   try {
+    contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  } catch {
+    // Treat malformed response metadata like an unreadable error body.
+  }
+
+  const payloadPromise = Promise.resolve().then(async () => {
     if (contentType.includes('json')) return await response.json()
     const text = await response.text()
     return text || undefined
-  } catch {
+  })
+  let reason: unknown
+  try {
+    return await awaitWithLifecycle(payloadPromise, lifecycle)
+  } catch (cause) {
+    if (
+      cause instanceof HttpTransportError
+      && (cause.kind === 'timeout' || cause.kind === 'aborted')
+    ) throw cause
+    try {
+      lifecycle.assertActive()
+    } catch (activeCause) {
+      throw activeCause
+    }
     return undefined
+  } finally {
+    try {
+      lifecycle.assertActive()
+    } catch (activeCause) {
+      reason = activeCause
+    }
+    let body: ReadableStream<Uint8Array> | null = null
+    try {
+      body = response.body
+    } catch {
+      // A malformed response body accessor cannot be cleaned up further.
+    }
+    cancelReadableStream(body, reason)
   }
 }
 
@@ -576,64 +714,61 @@ export function createPrivateHttpTransport(
         )
       }
 
+      const callerSignal = requestOptions.signal
+      const responseStatus = response.status
+      const lifecycle: ResponseBodyLifecycle = {
+        signal: linkedSignal.signal,
+        release: () => linkedSignal.dispose(),
+        assertActive() {
+          if (linkedSignal.timedOut()) {
+            throw new HttpTransportError('timeout', 'Gateway HTTP request timed out.')
+          }
+          if (callerSignal?.aborted || linkedSignal.signal.aborted) {
+            throw new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
+          }
+        },
+        transportError(cause) {
+          if (cause instanceof HttpTransportError) return cause
+          if (linkedSignal.timedOut()) {
+            return new HttpTransportError(
+              'timeout',
+              'Gateway HTTP request timed out.',
+              undefined,
+              undefined,
+              cause,
+            )
+          }
+          if (callerSignal?.aborted || linkedSignal.signal.aborted) {
+            return new HttpTransportError(
+              'aborted',
+              'Gateway HTTP request was aborted.',
+              undefined,
+              undefined,
+              cause,
+            )
+          }
+          return new HttpTransportError(
+            'network',
+            'Gateway HTTP response body failed.',
+            responseStatus,
+            undefined,
+            cause,
+          )
+        },
+      }
+
       if (!response.ok) {
-        const payload = await errorPayload(response)
-        if (linkedSignal.timedOut()) {
-          throw new HttpTransportError('timeout', 'Gateway HTTP request timed out.')
-        }
-        if (requestOptions.signal?.aborted || linkedSignal.signal.aborted) {
-          throw new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
-        }
+        const payload = await errorPayload(response, lifecycle)
+        lifecycle.assertActive()
         throw new HttpTransportError(
           'http-status',
-          `Gateway HTTP request failed with status ${response.status}.`,
-          response.status,
+          `Gateway HTTP request failed with status ${responseStatus}.`,
+          responseStatus,
           payload,
         )
       }
 
-      const responseStatus = response.status
       try {
-        const callerSignal = requestOptions.signal
-        const lifecycle: ResponseBodyLifecycle = {
-          release: () => linkedSignal.dispose(),
-          assertActive() {
-            if (linkedSignal.timedOut()) {
-              throw new HttpTransportError('timeout', 'Gateway HTTP request timed out.')
-            }
-            if (callerSignal?.aborted || linkedSignal.signal.aborted) {
-              throw new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
-            }
-          },
-          transportError(cause) {
-            if (cause instanceof HttpTransportError) return cause
-            if (linkedSignal.timedOut()) {
-              return new HttpTransportError(
-                'timeout',
-                'Gateway HTTP request timed out.',
-                undefined,
-                undefined,
-                cause,
-              )
-            }
-            if (callerSignal?.aborted || linkedSignal.signal.aborted) {
-              return new HttpTransportError(
-                'aborted',
-                'Gateway HTTP request was aborted.',
-                undefined,
-                undefined,
-                cause,
-              )
-            }
-            return new HttpTransportError(
-              'network',
-              'Gateway HTTP response body failed.',
-              responseStatus,
-              undefined,
-              cause,
-            )
-          },
-        }
         const decoded = await decoder.decode(response, lifecycle)
         lifecycle.assertActive()
         lifecycleTransferred = decoder.ownsBodyLifecycle === true

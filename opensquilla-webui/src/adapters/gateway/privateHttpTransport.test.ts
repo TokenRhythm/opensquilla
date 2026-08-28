@@ -172,6 +172,92 @@ describe('private Gateway HTTP transport', () => {
     expect(failure).not.toHaveProperty('response')
   })
 
+  it('does not hang on a 4xx body after transport timeout', async () => {
+    vi.useFakeTimers()
+    let cancelCalled = false
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalled = true
+      },
+    })
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 503,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      body,
+      json: () => new Promise<unknown>(() => undefined),
+    }) as Response)
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+      defaultTimeoutMs: 10,
+    })
+
+    const pending = transport.requestJson('/api/hanging-error')
+    const assertion = expect(pending).rejects.toMatchObject({ kind: 'timeout' })
+    await vi.advanceTimersByTimeAsync(10)
+
+    await assertion
+    expect(cancelCalled).toBe(true)
+  })
+
+  it('does not hang on a 4xx body after caller cancellation', async () => {
+    let cancelCalled = false
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalled = true
+      },
+    })
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 503,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      body,
+      json: () => new Promise<unknown>(() => undefined),
+    }) as Response)
+    const controller = new AbortController()
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+    })
+
+    const pending = transport.requestJson('/api/hanging-error-abort', {
+      signal: controller.signal,
+      timeoutMs: 0,
+    })
+    const assertion = expect(pending).rejects.toMatchObject({ kind: 'aborted' })
+    await Promise.resolve()
+    controller.abort('route-left')
+
+    await assertion
+    expect(cancelCalled).toBe(true)
+  })
+
+  it('cancels an unreadable 4xx body before returning its status error', async () => {
+    let cancelCalled = false
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalled = true
+      },
+    })
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: false,
+        status: 502,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        body,
+        json: () => { throw new Error('malformed body') },
+      }) as Response),
+    })
+
+    await expect(transport.requestJson('/api/unreadable-error')).rejects.toMatchObject({
+      kind: 'http-status',
+      status: 502,
+    })
+    expect(cancelCalled).toBe(true)
+  })
+
   it('classifies invalid JSON without leaking a native parsing exception', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => (
       new Response('not-json', { status: 200 })
@@ -458,6 +544,124 @@ describe('private Gateway HTTP transport', () => {
     controller.abort('route-left')
     expect(() => abortedBinary.stream()).toThrowError(HttpTransportError)
     await expect(abortedBinary.blob()).rejects.toMatchObject({ kind: 'aborted' })
+  })
+
+  it('cancels an unconsumed binary body when the caller aborts', async () => {
+    let cancelCalled = false
+    const source = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalled = true
+      },
+    })
+    const controller = new AbortController()
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: source,
+      }) as Response),
+    })
+
+    const binary = await transport.requestBinary('/api/unconsumed-abort', {
+      signal: controller.signal,
+      timeoutMs: 0,
+    })
+    controller.abort('route-left')
+    await Promise.resolve()
+
+    expect(cancelCalled).toBe(true)
+    await expect(binary.blob()).rejects.toMatchObject({ kind: 'aborted' })
+  })
+
+  it('cancels a binary body when blob wrapping fails', async () => {
+    let cancelCalled = false
+    const source = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalled = true
+      },
+    })
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: source,
+      }) as Response),
+    })
+    const binary = await transport.requestBinary('/api/blob-failure')
+    const blobSpy = vi.spyOn(Response.prototype, 'blob').mockRejectedValue(
+      new Error('blob wrapper failed'),
+    )
+
+    try {
+      await expect(binary.blob()).rejects.toMatchObject({
+        kind: 'network',
+        status: 200,
+      })
+      expect(cancelCalled).toBe(true)
+    } finally {
+      blobSpy.mockRestore()
+    }
+  })
+
+  it('aborts a hanging blob wrapper and cancels its source on timeout', async () => {
+    vi.useFakeTimers()
+    let cancelCalled = false
+    const source = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalled = true
+      },
+    })
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: source,
+      }) as Response),
+      defaultTimeoutMs: 10,
+    })
+    const binary = await transport.requestBinary('/api/blob-timeout')
+    const blobSpy = vi.spyOn(Response.prototype, 'blob').mockImplementation(
+      () => new Promise<Blob>(() => undefined),
+    )
+
+    try {
+      const pending = binary.blob()
+      const assertion = expect(pending).rejects.toMatchObject({ kind: 'timeout' })
+      await vi.advanceTimersByTimeAsync(10)
+      await assertion
+      expect(cancelCalled).toBe(true)
+    } finally {
+      blobSpy.mockRestore()
+    }
+  })
+
+  it('cancels a binary body when stream acquisition fails', async () => {
+    const cancel = vi.fn()
+    const source = {
+      getReader() {
+        throw new Error('reader unavailable')
+      },
+      cancel,
+    } as unknown as ReadableStream<Uint8Array>
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: source,
+      }) as Response),
+    })
+    const binary = await transport.requestBinary('/api/stream-failure')
+
+    expect(() => binary.stream()).toThrowError(HttpTransportError)
+    expect(cancel).toHaveBeenCalled()
   })
 
   it('releases the underlying binary reader after end-of-stream', async () => {
