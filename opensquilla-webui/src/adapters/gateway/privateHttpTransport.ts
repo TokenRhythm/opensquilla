@@ -82,6 +82,7 @@ interface ResponseDecoder<T> {
 
 interface ResponseBodyLifecycle {
   release(): void
+  assertActive(): void
   transportError(cause: unknown): HttpTransportError
 }
 
@@ -229,7 +230,9 @@ function managedBinaryStream(
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
+        lifecycle.assertActive()
         const next = await reader.read()
+        lifecycle.assertActive()
         if (next.done) {
           controller.close()
           lifecycle.release()
@@ -237,7 +240,9 @@ function managedBinaryStream(
           controller.enqueue(next.value)
         }
       } catch (cause) {
-        controller.error(lifecycle.transportError(cause))
+        controller.error(
+          cause instanceof HttpTransportError ? cause : lifecycle.transportError(cause),
+        )
         lifecycle.release()
       }
     },
@@ -263,6 +268,7 @@ function binaryResponse(response: Response, lifecycle: ResponseBodyLifecycle): H
   }
   let consumed = false
   function takeStream(): ReadableStream<Uint8Array> | null {
+    lifecycle.assertActive()
     if (consumed) {
       throw new HttpTransportError(
         'decode',
@@ -432,10 +438,22 @@ export function createPrivateHttpTransport(
       }
 
       try {
+        const isTimedOut = () => linkedSignal.timedOut()
+        const isAborted = () => requestOptions.signal?.aborted || linkedSignal.signal.aborted
+        const assertActive = () => {
+          if (isTimedOut()) {
+            throw new HttpTransportError('timeout', 'Gateway HTTP request timed out.')
+          }
+          if (isAborted()) {
+            throw new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
+          }
+        }
         const decoded = await decoder.decode(response, {
           release: () => linkedSignal.dispose(),
+          assertActive,
           transportError(cause) {
-            if (linkedSignal.timedOut()) {
+            if (cause instanceof HttpTransportError) return cause
+            if (isTimedOut()) {
               return new HttpTransportError(
                 'timeout',
                 'Gateway HTTP request timed out.',
@@ -444,7 +462,7 @@ export function createPrivateHttpTransport(
                 cause,
               )
             }
-            if (requestOptions.signal?.aborted || linkedSignal.signal.aborted) {
+            if (isAborted()) {
               return new HttpTransportError(
                 'aborted',
                 'Gateway HTTP request was aborted.',
@@ -462,6 +480,10 @@ export function createPrivateHttpTransport(
             )
           },
         })
+        // A fetch implementation may resolve headers immediately while its
+        // decoder ignores AbortSignal. Re-check before publishing the value so
+        // a timeout/cancellation cannot be turned into a successful result.
+        assertActive()
         lifecycleTransferred = decoder.ownsBodyLifecycle === true
         return decoded
       } catch (cause) {

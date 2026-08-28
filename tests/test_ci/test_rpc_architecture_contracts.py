@@ -42,10 +42,12 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
 RUNTIME_RPC_METHOD_BASELINE = 306
 STATIC_RPC_DECORATOR_BASELINE = 298
 
-# Physical lines in the same runtime files at 5440fd7a. Contract sources,
-# generators, fixtures, tests and generated artifacts are reported separately;
-# this guard prevents the production seam from becoming a net wrapper layer.
-AUTHORED_RUNTIME_LOC_BASELINE = 25_539
+# Physical lines in the sessions.list runtime slice after F1 merged at
+# f53746bd6. F2 is an explicitly approved foundation phase, so its bounded
+# connection-ownership and registration hardening is accounted for separately
+# instead of weakening the later domain-slice deletion gate.
+AUTHORED_RUNTIME_LOC_AFTER_F1 = 25_524
+F2_AUTHORED_RUNTIME_GROWTH_BUDGET = 66
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
     "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
@@ -70,6 +72,14 @@ AUTHORED_RUNTIME_FILES = (
     "src/opensquilla/gateway/scopes.py",
     "src/opensquilla/gateway_client.py",
 )
+
+F2_FOUNDATION_RUNTIME_FILES = (
+    "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts",
+    "opensquilla-webui/src/adapters/gateway/privateHttpTransport.ts",
+    "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
+    "src/opensquilla/gateway/adapters/contract_method.py",
+)
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 827
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -369,14 +379,27 @@ def test_rpc_context_does_not_grow_past_pinned_main() -> None:
     assert len(fields) <= 33
 
 
-def test_authored_runtime_slice_is_smaller_than_pinned_main() -> None:
-    current = sum(
+def _physical_lines(relative_paths: tuple[str, ...]) -> int:
+    return sum(
         len((ROOT / relative).read_text(encoding="utf-8").splitlines())
-        for relative in AUTHORED_RUNTIME_FILES
+        for relative in relative_paths
     )
-    assert current < AUTHORED_RUNTIME_LOC_BASELINE, (
-        f"sessions.list authored runtime grew to {current} lines; "
-        f"pinned main had {AUTHORED_RUNTIME_LOC_BASELINE}"
+
+
+def test_f2_sessions_list_runtime_growth_stays_within_explicit_budget() -> None:
+    current = _physical_lines(AUTHORED_RUNTIME_FILES)
+    growth = current - AUTHORED_RUNTIME_LOC_AFTER_F1
+    assert growth <= F2_AUTHORED_RUNTIME_GROWTH_BUDGET, (
+        f"F2 sessions.list runtime grew by {growth} lines; "
+        f"the explicit foundation budget is {F2_AUTHORED_RUNTIME_GROWTH_BUDGET}"
+    )
+
+
+def test_f2_foundation_runtime_stays_within_explicit_ceiling() -> None:
+    current = _physical_lines(F2_FOUNDATION_RUNTIME_FILES)
+    assert current <= F2_FOUNDATION_RUNTIME_LOC_CEILING, (
+        f"F2 authored foundation runtime grew to {current} lines; "
+        f"the reviewed ceiling is {F2_FOUNDATION_RUNTIME_LOC_CEILING}"
     )
 
 

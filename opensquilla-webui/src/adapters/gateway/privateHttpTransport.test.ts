@@ -157,6 +157,29 @@ describe('private Gateway HTTP transport', () => {
     })
   })
 
+  it('rejects a JSON value that resolves after the transport timed out', async () => {
+    vi.useFakeTimers()
+    let resolveJson!: (value: unknown) => void
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: () => new Promise<unknown>(resolve => { resolveJson = resolve }),
+    }) as Response)
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+      defaultTimeoutMs: 5,
+    })
+
+    const pending = transport.requestJson('/api/late-json')
+    await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(5)
+    resolveJson({ late: true })
+
+    await expect(pending).rejects.toMatchObject({ kind: 'timeout' })
+  })
+
   it('classifies JSON encoding failures before issuing a request', async () => {
     const fetchMock = vi.fn()
     const circular: { self?: unknown } = {}
@@ -295,6 +318,27 @@ describe('private Gateway HTTP transport', () => {
     const assertion = expect(blob).rejects.toMatchObject({ kind: 'timeout' })
     await vi.advanceTimersByTimeAsync(10)
     await assertion
+  })
+
+  it('does not publish buffered binary bytes after timeout or caller abort', async () => {
+    vi.useFakeTimers()
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => new Response('buffered-bytes')),
+      defaultTimeoutMs: 5,
+    })
+
+    const timedOutBinary = await transport.requestBinary('/api/buffered')
+    await vi.advanceTimersByTimeAsync(5)
+    await expect(timedOutBinary.blob()).rejects.toMatchObject({ kind: 'timeout' })
+
+    const controller = new AbortController()
+    const abortedBinary = await transport.requestBinary('/api/aborted', {
+      signal: controller.signal,
+      timeoutMs: 0,
+    })
+    controller.abort('route-left')
+    await expect(abortedBinary.blob()).rejects.toMatchObject({ kind: 'aborted' })
   })
 
   it('rejects cross-origin, credentialed, and non-HTTP endpoints before fetch', async () => {
