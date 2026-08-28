@@ -511,6 +511,62 @@ describe('HTTP symbol provenance', () => {
     ])
   })
 
+  it('expands a two-hop imported callable chain to a fixed point', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/consumer.ts': `
+          import { bridge } from './bridge'
+          void bridge(globalThis.fetch, '/api/two-hop', {})
+        `,
+        'src/bridge.ts': `
+          import { forward } from './forward'
+          export function bridge(client: (value: string, init: object) => unknown, value: string, init: object) {
+            return forward(client, value, init)
+          }
+        `,
+        'src/forward.ts': `
+          export function forward(client: (value: string, init: object) => unknown, value: string, init: object) {
+            return client(value, init)
+          }
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/forward.ts', kind: 'httpRequest' },
+      { rel: 'src/forward.ts', kind: 'httpApiEndpoint' },
+    ])
+  })
+
+  it('discovers a callable returned through an imported object property', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/consumer.ts': `
+          import { make } from './factory'
+          void make(globalThis.fetch).invoke('/api/object-wrapper', {})
+        `,
+        'src/factory.ts': `
+          export function make(client: (value: string, init: object) => unknown) {
+            return {
+              invoke(value: string, init: object) {
+                return client(value, init)
+              },
+            }
+          }
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/factory.ts', kind: 'httpRequest' },
+      { rel: 'src/factory.ts', kind: 'httpApiEndpoint' },
+    ])
+  })
+
   it('counts a Request-to-fetch pipeline once and follows cyclic RequestInit aliases', () => {
     const operations = collectHttpBoundaryOperations({
       ts,
