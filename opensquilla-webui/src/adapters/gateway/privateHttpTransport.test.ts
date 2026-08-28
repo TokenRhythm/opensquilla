@@ -44,6 +44,8 @@ describe('private Gateway HTTP transport', () => {
     const headers = new Headers(init.headers)
     expect(init.method).toBe('POST')
     expect(init.body).toBe(JSON.stringify({ limit: 25 }))
+    expect(init.credentials).toBe('same-origin')
+    expect(init.redirect).toBe('error')
     expect(headers.get('content-type')).toBe('application/json')
     expect(headers.get('authorization')).toBe('Bearer secret-token')
     expect(headers.get('x-opensquilla-session-key')).toBe('session-a')
@@ -84,6 +86,35 @@ describe('private Gateway HTTP transport', () => {
     const blob = await transport.requestBlob('/api/v1/diagnostics/bundle')
 
     expect(await blob.text()).toBe('archive-bytes')
+  })
+
+  it('exposes sanitized binary metadata and a one-shot body', async () => {
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => new Response('streamed-bytes', {
+        headers: {
+          'content-disposition': 'attachment; filename="../bundle.zip"',
+          'content-length': '14',
+          'content-type': 'application/zip',
+          'x-internal-gateway-detail': 'must-not-leak',
+        },
+      })),
+    })
+
+    const binary = await transport.requestBinary('/api/v1/diagnostics/bundle')
+
+    expect(binary.metadata).toEqual({
+      status: 200,
+      filename: '_bundle.zip',
+      contentLength: 14,
+      contentType: 'application/zip',
+    })
+    expect(binary).not.toHaveProperty('headers')
+    expect(binary).not.toHaveProperty('response')
+    const stream = binary.stream()
+    expect(stream).toBeInstanceOf(ReadableStream)
+    expect(await new Response(stream).text()).toBe('streamed-bytes')
+    await expect(binary.blob()).rejects.toMatchObject({ kind: 'decode' })
   })
 
   it('maps HTTP status and safe response payload into one stable error', async () => {
@@ -142,6 +173,48 @@ describe('private Gateway HTTP transport', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('requires an explicit non-GET method for request bodies at type and runtime boundaries', async () => {
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(),
+    })
+
+    if (false) {
+      // @ts-expect-error body-bearing requests require an explicit method
+      void transport.requestJson('/api/value', { json: { value: true } })
+      // @ts-expect-error GET cannot carry a JSON body
+      void transport.requestJson('/api/value', { method: 'GET', json: { value: true } })
+    }
+    await expect(transport.requestJson('/api/value', {
+      method: 'GET',
+      json: { value: true },
+    } as never)).rejects.toMatchObject({ kind: 'encode' })
+  })
+
+  it('normalizes auth-source and header construction failures', async () => {
+    const fetchMock = vi.fn()
+    const sourceFailure = new Error('credential source unavailable')
+    const throwingAuth = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      authToken: () => { throw sourceFailure },
+      fetch: fetchMock,
+    })
+    await expect(throwingAuth.requestJson('/api/value')).rejects.toMatchObject({
+      kind: 'encode',
+      transportCause: sourceFailure,
+    })
+
+    const invalidHeader = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      authToken: () => 'token\r\ninjected: value',
+      fetch: fetchMock,
+    })
+    await expect(invalidHeader.requestJson('/api/value')).rejects.toMatchObject({
+      kind: 'encode',
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('distinguishes caller cancellation from transport timeout', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>(
@@ -194,6 +267,32 @@ describe('private Gateway HTTP transport', () => {
 
     const decoding = transport.requestJson('/api/slow-body')
     const assertion = expect(decoding).rejects.toMatchObject({ kind: 'timeout' })
+    await vi.advanceTimersByTimeAsync(10)
+    await assertion
+  })
+
+  it('keeps timeout classification active while a binary stream is consumed', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/octet-stream' }),
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener('abort', () => {
+            controller.error(new DOMException('aborted', 'AbortError'))
+          }, { once: true })
+        },
+      }),
+    }) as Response)
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+      defaultTimeoutMs: 10,
+    })
+
+    const blob = transport.requestBlob('/api/slow-binary')
+    const assertion = expect(blob).rejects.toMatchObject({ kind: 'timeout' })
     await vi.advanceTimersByTimeAsync(10)
     await assertion
   })

@@ -33,23 +33,38 @@ export class HttpTransportError extends Error {
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 interface HttpRequestBase {
-  method?: HttpMethod
   sessionKey?: string
   timeoutMs?: number
   signal?: AbortSignal
 }
 
-type HttpRequestContent =
-  | { json?: never; form?: never }
-  | { json: unknown; form?: never }
-  | { json?: never; form: FormData | URLSearchParams }
+type HttpBodyMethod = Exclude<HttpMethod, 'GET'>
 
-export type HttpRequestOptions = HttpRequestBase & HttpRequestContent
+export type HttpRequestOptions = HttpRequestBase & (
+  | { method?: HttpMethod; json?: never; form?: never }
+  | { method: HttpBodyMethod; json: unknown; form?: never }
+  | { method: HttpBodyMethod; json?: never; form: FormData | URLSearchParams }
+)
 
 /** Raw HTTP capability private to Gateway Adapters and the composition root. */
 export interface HttpTransport {
   requestJson<T>(endpoint: string, options?: HttpRequestOptions): Promise<T>
+  requestBinary(endpoint: string, options?: HttpRequestOptions): Promise<HttpBinaryResponse>
   requestBlob(endpoint: string, options?: HttpRequestOptions): Promise<Blob>
+}
+
+export interface HttpBinaryMetadata {
+  readonly status: number
+  readonly filename?: string
+  readonly contentLength?: number
+  readonly contentType?: string
+}
+
+/** One-shot binary body without exposing native Response or Headers. */
+export interface HttpBinaryResponse {
+  readonly metadata: HttpBinaryMetadata
+  blob(): Promise<Blob>
+  stream(): ReadableStream<Uint8Array> | null
 }
 
 interface PrivateHttpTransportOptions {
@@ -60,8 +75,14 @@ interface PrivateHttpTransportOptions {
 }
 
 interface ResponseDecoder<T> {
-  decode(response: Response): Promise<T>
+  decode(response: Response, lifecycle: ResponseBodyLifecycle): Promise<T>
   readonly failureMessage: string
+  readonly ownsBodyLifecycle?: boolean
+}
+
+interface ResponseBodyLifecycle {
+  release(): void
+  transportError(cause: unknown): HttpTransportError
 }
 
 function defaultAuthToken(): string {
@@ -143,23 +164,134 @@ interface RequestSignal {
 function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): RequestSignal {
   const controller = new AbortController()
   let didTimeOut = false
-  const abortFromCaller = () => controller.abort(signal?.reason)
+  let disposed = false
+  let timeout: ReturnType<typeof globalThis.setTimeout> | undefined
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    if (timeout !== undefined) globalThis.clearTimeout(timeout)
+    signal?.removeEventListener('abort', abortFromCaller)
+  }
+  const abortFromCaller = () => {
+    controller.abort(signal?.reason)
+    dispose()
+  }
   if (signal?.aborted) abortFromCaller()
   else signal?.addEventListener('abort', abortFromCaller, { once: true })
 
-  const timeout = timeoutMs > 0
+  timeout = !disposed && timeoutMs > 0
     ? globalThis.setTimeout(() => {
       didTimeOut = true
       controller.abort()
+      dispose()
     }, timeoutMs)
     : undefined
 
   return {
     signal: controller.signal,
     timedOut: () => didTimeOut,
-    dispose() {
-      if (timeout !== undefined) globalThis.clearTimeout(timeout)
-      signal?.removeEventListener('abort', abortFromCaller)
+    dispose,
+  }
+}
+
+function binaryContentLength(value: string | null): number | undefined {
+  if (value === null || !/^\d+$/.test(value.trim())) return undefined
+  const length = Number(value)
+  return Number.isSafeInteger(length) && length >= 0 ? length : undefined
+}
+
+function binaryFilename(value: string | null): string | undefined {
+  if (!value) return undefined
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(value)?.[1]
+  const quoted = /filename="([^"]*)"/i.exec(value)?.[1]
+  const plain = /filename=([^;]+)/i.exec(value)?.[1]
+  let candidate = encoded || quoted || plain
+  if (!candidate) return undefined
+  try {
+    if (encoded) candidate = decodeURIComponent(candidate)
+  } catch {
+    return undefined
+  }
+  const sanitized = candidate
+    .replace(/[\\/]/g, '_')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+    .replace(/^\.+/, '')
+    .slice(0, 255)
+  return sanitized || undefined
+}
+
+function managedBinaryStream(
+  source: ReadableStream<Uint8Array>,
+  lifecycle: ResponseBodyLifecycle,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader()
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read()
+        if (next.done) {
+          controller.close()
+          lifecycle.release()
+        } else {
+          controller.enqueue(next.value)
+        }
+      } catch (cause) {
+        controller.error(lifecycle.transportError(cause))
+        lifecycle.release()
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason)
+      } finally {
+        lifecycle.release()
+      }
+    },
+  })
+}
+
+function binaryResponse(response: Response, lifecycle: ResponseBodyLifecycle): HttpBinaryResponse {
+  const contentType = response.headers.get('content-type')?.trim() || undefined
+  const filename = binaryFilename(response.headers.get('content-disposition'))
+  const contentLength = binaryContentLength(response.headers.get('content-length'))
+  const metadata: HttpBinaryMetadata = {
+    status: response.status,
+    ...(filename ? { filename } : {}),
+    ...(contentLength !== undefined ? { contentLength } : {}),
+    ...(contentType ? { contentType } : {}),
+  }
+  let consumed = false
+  function takeStream(): ReadableStream<Uint8Array> | null {
+    if (consumed) {
+      throw new HttpTransportError(
+        'decode',
+        'Gateway HTTP binary response has already been consumed.',
+        response.status,
+      )
+    }
+    consumed = true
+    if (!response.body) {
+      lifecycle.release()
+      return null
+    }
+    return managedBinaryStream(response.body, lifecycle)
+  }
+  return {
+    metadata,
+    stream: takeStream,
+    async blob() {
+      const stream = takeStream()
+      if (!stream) return new Blob([], contentType ? { type: contentType } : undefined)
+      try {
+        return await new Response(
+          stream,
+          contentType ? { headers: { 'content-type': contentType } } : undefined,
+        ).blob()
+      } catch (cause) {
+        if (cause instanceof HttpTransportError) throw cause
+        throw lifecycle.transportError(cause)
+      }
     },
   }
 }
@@ -196,15 +328,34 @@ export function createPrivateHttpTransport(
     decoder: ResponseDecoder<T>,
   ): Promise<T> {
     const url = resolveEndpoint(baseUrl, endpoint)
-    const headers = new Headers()
-    const token = authToken()?.trim() ?? ''
-    if (token) headers.set('Authorization', `Bearer ${token}`)
-    const sessionKey = requestOptions.sessionKey?.trim() ?? ''
-    if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
+    let headers: Headers
+    try {
+      headers = new Headers()
+      const token = authToken()?.trim() ?? ''
+      if (token) headers.set('Authorization', `Bearer ${token}`)
+      const sessionKey = requestOptions.sessionKey?.trim() ?? ''
+      if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
+      if ('json' in requestOptions) headers.set('Content-Type', 'application/json')
+    } catch (cause) {
+      throw new HttpTransportError(
+        'encode',
+        'Gateway HTTP request headers could not be constructed.',
+        undefined,
+        undefined,
+        cause,
+      )
+    }
 
     let body: BodyInit | undefined
+    const hasBody = 'json' in requestOptions || 'form' in requestOptions
+    const method = requestOptions.method ?? 'GET'
+    if (hasBody && method === 'GET') {
+      throw new HttpTransportError(
+        'encode',
+        'Gateway HTTP GET requests cannot include a body.',
+      )
+    }
     if ('json' in requestOptions) {
-      headers.set('Content-Type', 'application/json')
       try {
         body = JSON.stringify(requestOptions.json)
       } catch (cause) {
@@ -224,13 +375,16 @@ export function createPrivateHttpTransport(
       requestOptions.signal,
       requestTimeout(requestOptions.timeoutMs, defaultTimeoutMs),
     )
+    let lifecycleTransferred = false
     try {
       let response: Response
       try {
         response = await fetchImpl(url, {
-          method: requestOptions.method ?? 'GET',
+          method,
           headers,
           body,
+          credentials: 'same-origin',
+          redirect: 'error',
           signal: linkedSignal.signal,
         })
       } catch (cause) {
@@ -278,7 +432,38 @@ export function createPrivateHttpTransport(
       }
 
       try {
-        return await decoder.decode(response)
+        const decoded = await decoder.decode(response, {
+          release: () => linkedSignal.dispose(),
+          transportError(cause) {
+            if (linkedSignal.timedOut()) {
+              return new HttpTransportError(
+                'timeout',
+                'Gateway HTTP request timed out.',
+                undefined,
+                undefined,
+                cause,
+              )
+            }
+            if (requestOptions.signal?.aborted || linkedSignal.signal.aborted) {
+              return new HttpTransportError(
+                'aborted',
+                'Gateway HTTP request was aborted.',
+                undefined,
+                undefined,
+                cause,
+              )
+            }
+            return new HttpTransportError(
+              'network',
+              'Gateway HTTP response body failed.',
+              response.status,
+              undefined,
+              cause,
+            )
+          },
+        })
+        lifecycleTransferred = decoder.ownsBodyLifecycle === true
+        return decoded
       } catch (cause) {
         if (linkedSignal.timedOut()) {
           throw new HttpTransportError(
@@ -307,9 +492,18 @@ export function createPrivateHttpTransport(
         )
       }
     } finally {
-      linkedSignal.dispose()
+      if (!lifecycleTransferred) linkedSignal.dispose()
     }
   }
+
+  const requestBinary = async (
+    endpoint: string,
+    requestOptions?: HttpRequestOptions,
+  ): Promise<HttpBinaryResponse> => request(endpoint, requestOptions, {
+    decode: async (response, lifecycle) => binaryResponse(response, lifecycle),
+    failureMessage: 'Gateway HTTP response could not be decoded as binary data.',
+    ownsBodyLifecycle: true,
+  })
 
   return {
     async requestJson<T>(endpoint: string, requestOptions?: HttpRequestOptions) {
@@ -321,11 +515,10 @@ export function createPrivateHttpTransport(
         failureMessage: 'Gateway HTTP response is not valid JSON.',
       })
     },
+    requestBinary,
     async requestBlob(endpoint: string, requestOptions?: HttpRequestOptions) {
-      return request(endpoint, requestOptions, {
-        decode: response => response.blob(),
-        failureMessage: 'Gateway HTTP response could not be decoded as a blob.',
-      })
+      const binary = await requestBinary(endpoint, requestOptions)
+      return binary.blob()
     },
   }
 }

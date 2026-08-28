@@ -1,39 +1,31 @@
 export const lane = 'session-chat'
 
 export const debt = {
-  'src/components/chat/ArtifactImageLightbox.vue': {
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
-  },
-  'src/components/chat/ChatArtifactList.vue': {
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
-  },
-  'src/components/chat/DeliverablesDrawer.vue': {
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
-  },
   'src/components/CommandPalette.vue': { call: 1 },
-  'src/components/chat/VideoArtifactCard.vue': {
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
-  },
   'src/components/chat/PromptCacheKeepaliveDialog.vue': { call: 2 },
   'src/composables/chat/sessionBootstrapAdmission.ts': { waitForConnection: 2 },
   'src/composables/chat/useChatApprovals.ts': {
     call: 3,
     on: 8,
+    httpRequest: 3,
     httpApiEndpoint: 3,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
+    httpAuthToken: 3,
+    httpAuthorizationHeader: 3,
   },
   'src/composables/chat/useChatAttachments.ts': {
+    httpRequest: 1,
     httpApiEndpoint: 1,
     httpAuthToken: 1,
     httpAuthorizationHeader: 1,
   },
-  'src/composables/chat/useChatElevatedMode.ts': { httpApiEndpoint: 1 },
+  'src/composables/chat/useArtifactPreview.ts': {
+    httpRequest: 1,
+    httpApiEndpoint: 1,
+  },
+  'src/composables/chat/useChatElevatedMode.ts': {
+    httpRequest: 1,
+    httpApiEndpoint: 1,
+  },
   'src/composables/chat/useChatFeatureToggles.ts': {
     call: 7,
     on: 1,
@@ -63,6 +55,7 @@ export const debt = {
   'src/composables/chat/useChatSlashCommands.ts': { call: 6 },
   'src/composables/chat/useChatUsageWidget.ts': { call: 2 },
   'src/composables/chat/useVoiceInput.ts': {
+    httpRequest: 1,
     httpApiEndpoint: 1,
     httpAuthToken: 1,
     httpAuthorizationHeader: 1,
@@ -76,12 +69,16 @@ export const debt = {
   'src/composables/sessions/useSessionInspect.ts': { call: 3, waitForConnection: 1 },
   'src/composables/useSessionListSubscription.ts': { call: 4, on: 2 },
   'src/utils/chat/artifactAccess.ts': {
+    httpRequest: 2,
     httpApiEndpoint: 2,
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
+    httpAuthToken: 2,
+    httpAuthorizationHeader: 2,
+    httpSessionKeyHeader: 2,
   },
-  'src/utils/chat/artifacts.ts': { httpApiEndpoint: 1 },
   'src/utils/chat/attachmentAccess.ts': {
+    httpRequest: 1,
+    httpApiEndpoint: 1,
+    httpAuthToken: 1,
     httpAuthorizationHeader: 1,
     httpSessionKeyHeader: 1,
   },
@@ -91,6 +88,8 @@ export const debt = {
     supportsEvent: 1,
     supportsMethod: 14,
     waitForConnection: 2,
+    httpRequest: 1,
+    httpApiEndpoint: 1,
     httpAuthToken: 1,
     httpAuthorizationHeader: 1,
     httpSessionKeyHeader: 1,
@@ -98,6 +97,7 @@ export const debt = {
   'src/views/SessionsView.vue': {
     call: 2,
     on: 6,
+    httpRequest: 1,
     httpApiEndpoint: 1,
     httpAuthToken: 1,
     httpAuthorizationHeader: 1,
