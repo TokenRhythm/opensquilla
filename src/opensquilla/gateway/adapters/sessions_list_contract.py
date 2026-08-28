@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any, Protocol, cast
-
-import structlog
+from typing import Any
 
 from opensquilla.contracts.adapters.sessions_list_contract import (
     SESSIONS_LIST_METHOD,
@@ -14,45 +12,39 @@ from opensquilla.contracts.adapters.sessions_list_contract import (
     validate_sessions_list_result,
 )
 from opensquilla.contracts.generated.v4.sessions_list_metadata import SESSIONS_LIST_SCOPE
+from opensquilla.gateway.adapters.contract_method import (
+    GatewayContractBinding,
+    MethodRegistry,
+    StaticGatewayMethodDescriptor,
+    register_gateway_contract_method,
+)
 
-log = structlog.get_logger(__name__)
-
-Implementation = Callable[[Any, Any], Awaitable[dict[str, Any]]]
 ErrorFactory = Callable[[str, str], Exception]
 
+_SESSIONS_LIST_DESCRIPTOR = StaticGatewayMethodDescriptor(
+    name=SESSIONS_LIST_METHOD,
+    scope=SESSIONS_LIST_SCOPE,
+)
+_SESSIONS_LIST_BINDING = GatewayContractBinding(
+    descriptor=_SESSIONS_LIST_DESCRIPTOR,
+    observe_params=sessions_list_params_contract_errors,
+    validate_result=validate_sessions_list_result,
+    result_validation_errors=(SessionsListContractError,),
+    response_error_message="sessions.list response violated its v4 contract",
+    request_mismatch_event="sessions.list.request_contract_mismatch",
+    response_violation_event="sessions.list.contract_violation",
+)
 
-class MethodRegistry(Protocol):
-    """Minimal registration port required by this Gateway Adapter."""
 
-    def method(self, name: str, scope: str) -> Callable[[Implementation], Implementation]: ...
-
-
-def register_sessions_list_contract(
-    registry: MethodRegistry,
-    implementation: Implementation,
+def register_sessions_list_contract[ContextT](
+    registry: MethodRegistry[ContextT],
+    implementation: Callable[[Any, ContextT], Awaitable[dict[str, Any]]],
     *,
     internal_error: ErrorFactory,
-) -> Implementation:
-    @registry.method(SESSIONS_LIST_METHOD, scope=SESSIONS_LIST_SCOPE)
-    async def handle_sessions_list(params: Any, ctx: Any) -> dict[str, Any]:
-        request_errors = sessions_list_params_contract_errors(params)
-        if request_errors:
-            log.warning(
-                "sessions.list.request_contract_mismatch",
-                params_type=type(params).__name__,
-                errors=request_errors,
-            )
-        result = await implementation(params, ctx)
-        try:
-            return validate_sessions_list_result(result)
-        except SessionsListContractError as exc:
-            log.error(
-                "sessions.list.contract_violation",
-                error=str(exc),
-            )
-            raise internal_error(
-                "INTERNAL_ERROR",
-                "sessions.list response violated its v4 contract",
-            ) from exc
-
-    return cast(Implementation, handle_sessions_list)
+) -> Callable[[Any, ContextT], Awaitable[dict[str, Any]]]:
+    return register_gateway_contract_method(
+        registry,
+        _SESSIONS_LIST_BINDING,
+        implementation,
+        internal_error=internal_error,
+    )

@@ -1,0 +1,52 @@
+export const lane = 'session-chat'
+
+export const debt = {
+  'src/components/CommandPalette.vue': { call: 1 },
+  'src/components/chat/PromptCacheKeepaliveDialog.vue': { call: 2 },
+  'src/composables/chat/sessionBootstrapAdmission.ts': { waitForConnection: 2 },
+  'src/composables/chat/useChatApprovals.ts': { call: 3, on: 8 },
+  'src/composables/chat/useChatFeatureToggles.ts': {
+    call: 7,
+    on: 1,
+    supportsMethod: 1,
+    waitForConnection: 2,
+  },
+  'src/composables/chat/useChatGoals.ts': { call: 5, on: 1 },
+  'src/composables/chat/useChatHistory.ts': { call: 1, waitForConnection: 1 },
+  'src/composables/chat/useChatMetaDraftRecovery.ts': {
+    call: 1,
+    markMethodUnavailable: 1,
+    supportsMethod: 1,
+    waitForConnection: 1,
+  },
+  'src/composables/chat/useChatPendingQueue.ts': { call: 6 },
+  'src/composables/chat/useChatPlans.ts': { call: 4, on: 6 },
+  'src/composables/chat/useChatRouteFeedback.ts': { call: 1 },
+  'src/composables/chat/useChatRpcSubscriptions.ts': { on: 28 },
+  'src/composables/chat/useChatRunModePreference.ts': { call: 5, waitForConnection: 1 },
+  'src/composables/chat/useChatSend.ts': { call: 9 },
+  'src/composables/chat/useChatSessionRouting.ts': {
+    call: 2,
+    on: 1,
+    waitForConnection: 1,
+  },
+  'src/composables/chat/useChatSessionSubscription.ts': { call: 7, waitForConnection: 3 },
+  'src/composables/chat/useChatSlashCommands.ts': { call: 6 },
+  'src/composables/chat/useChatUsageWidget.ts': { call: 2 },
+  'src/composables/chat/useMetaRuns.ts': { call: 5, on: 4 },
+  'src/composables/chat/useMetaSkillSetup.ts': {
+    call: 1,
+    waitForConnection: 1,
+    waitForConnectionReference: 1,
+  },
+  'src/composables/sessions/useSessionInspect.ts': { call: 3, waitForConnection: 1 },
+  'src/composables/useSessionListSubscription.ts': { call: 4, on: 2 },
+  'src/views/ChatView.vue': {
+    call: 8,
+    on: 1,
+    supportsEvent: 1,
+    supportsMethod: 14,
+    waitForConnection: 2,
+  },
+  'src/views/SessionsView.vue': { call: 2, on: 6 },
+}

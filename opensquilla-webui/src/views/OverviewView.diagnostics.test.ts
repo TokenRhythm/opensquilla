@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
-import type { SessionDirectoryRpc } from '@/adapters/gateway/sessionDirectoryV4'
+import type { SessionDirectoryTransport } from '@/adapters/gateway/sessionDirectoryV4'
 
 // Mounted coverage for the Overview diagnostics actions: the conditional
 // "diagnose with agent" hand-off, finding→settings deep links, and the
@@ -172,9 +172,9 @@ async function mountOverview(options: MountOptions = {}) {
   app.use(pinia)
   app.use(i18n)
   app.provide(SESSION_DIRECTORY_KEY, createV4SessionDirectory({
-    call: rpcCall,
-    waitForConnection: vi.fn(async () => {}),
-  } as unknown as SessionDirectoryRpc))
+    request: rpcCall,
+    ready: vi.fn(async () => {}),
+  } as unknown as SessionDirectoryTransport))
   app.mount(el)
   mountedApps.push({ app, el })
 

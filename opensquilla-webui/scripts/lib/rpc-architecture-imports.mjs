@@ -5,11 +5,11 @@ function normalized(path) {
 }
 
 function isTestFile(importer) {
-  return /\.(test|spec)\.(ts|tsx)$/.test(importer)
+  return /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(importer)
 }
 
-function isAdapter(importer) {
-  return importer.startsWith('src/adapters/')
+function isGatewayAdapter(importer) {
+  return importer.startsWith('src/adapters/gateway/')
 }
 
 function isGeneratedContract(importer) {
@@ -40,11 +40,99 @@ export function generatedContractImportViolation({ root, importer, specifier }) 
   const generatedRoot = resolve(root, 'src/contracts/generated')
   if (!target || !isWithin(generatedRoot, target)) return null
   if (
-    isAdapter(normalizedImporter)
+    isGatewayAdapter(normalizedImporter)
     || isTestFile(normalizedImporter)
     || isGeneratedContract(normalizedImporter)
   ) return null
-  return `${normalizedImporter}: generated wire Contract import "${specifier}" is allowed only in an Adapter or test.`
+  return `${normalizedImporter}: generated wire Contract import "${specifier}" is allowed only in a Gateway Adapter or test.`
+}
+
+/** Keep generic transports private to Gateway Adapters. */
+export function privateGatewayTransportImportViolation({ root, importer, specifier }) {
+  const normalizedImporter = normalized(importer)
+  const target = resolveSourceImport(root, normalizedImporter, specifier)
+  const transportModule = resolve(root, 'src/adapters/gateway/privateTransports')
+  const normalizedTarget = target?.replace(/\.(?:[cm]?[jt]s)$/, '')
+  if (!normalizedTarget || normalizedTarget !== transportModule) return null
+  if (
+    isGatewayAdapter(normalizedImporter)
+    || isTestFile(normalizedImporter)
+  ) return null
+  return `${normalizedImporter}: private Gateway transports may be imported only by a Gateway Adapter or test.`
+}
+
+export function boundaryModuleKind({ root, importer, specifier }) {
+  const normalizedImporter = normalized(importer)
+  const target = resolveSourceImport(root, normalizedImporter, specifier)
+  if (!target) return null
+  const generatedRoot = resolve(root, 'src/contracts/generated')
+  if (isWithin(generatedRoot, target)) return 'generated Contract'
+  const transportModule = resolve(root, 'src/adapters/gateway/privateTransports')
+  const normalizedTarget = target.replace(/\.(?:[cm]?[jt]s)$/, '')
+  if (normalizedTarget === transportModule) return 'private Gateway transport'
+  return null
+}
+
+export function boundaryReexportViolation({ root, importer, specifier }) {
+  const kind = boundaryModuleKind({ root, importer, specifier })
+  if (!kind) return null
+  if (
+    kind === 'generated Contract'
+    && isGeneratedContract(normalized(importer))
+  ) return null
+  return `${normalized(importer)}: ${kind} modules must not be re-exported through a barrel.`
+}
+
+/**
+ * Track boundary symbols imported into a module so alias re-exports can be
+ * rejected as strictly as direct ``export ... from`` declarations.
+ */
+export function importedBoundarySymbols(ts, source, { root, importer }) {
+  const symbols = new Map()
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement)
+      || !ts.isStringLiteralLike(statement.moduleSpecifier)
+      || !statement.importClause
+    ) continue
+    const kind = boundaryModuleKind({
+      root,
+      importer,
+      specifier: statement.moduleSpecifier.text,
+    })
+    if (!kind) continue
+    if (statement.importClause.name) symbols.set(statement.importClause.name.text, kind)
+    const bindings = statement.importClause.namedBindings
+    if (bindings && ts.isNamespaceImport(bindings)) {
+      symbols.set(bindings.name.text, kind)
+    } else if (bindings && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) symbols.set(element.name.text, kind)
+    }
+  }
+  return symbols
+}
+
+export function localBoundaryReexportViolations(ts, source, { root, importer }) {
+  const imported = importedBoundarySymbols(ts, source, { root, importer })
+  const failures = []
+  for (const statement of source.statements) {
+    if (
+      !ts.isExportDeclaration(statement)
+      || statement.moduleSpecifier
+      || !statement.exportClause
+      || !ts.isNamedExports(statement.exportClause)
+    ) continue
+    for (const element of statement.exportClause.elements) {
+      const local = (element.propertyName ?? element.name).text
+      const kind = imported.get(local)
+      if (kind) {
+        failures.push(
+          `${normalized(importer)}: ${kind} symbol ${local} must not be re-exported through a barrel.`,
+        )
+      }
+    }
+  }
+  return failures
 }
 
 /** Return a statically knowable module reference from TypeScript module syntax. */
@@ -115,6 +203,33 @@ function callMemberReceiver(ts, expression, source) {
   return null
 }
 
+function namedMemberReceiver(ts, expression, source, memberName) {
+  const member = unwrapExpression(ts, expression)
+  if (ts.isPropertyAccessExpression(member) && member.name.text === memberName) {
+    return member.expression.getText(source).replace(/\s/g, '')
+  }
+  if (
+    ts.isElementAccessExpression(member)
+    && member.argumentExpression
+    && ts.isStringLiteralLike(member.argumentExpression)
+    && member.argumentExpression.text === memberName
+  ) {
+    return member.expression.getText(source).replace(/\s/g, '')
+  }
+  return null
+}
+
+/** Return the receiver text for a direct named member invocation. */
+export function namedMemberCallReceiverText(ts, node, source, memberName) {
+  if (!ts.isCallExpression(node)) return null
+  return namedMemberReceiver(ts, node.expression, source, memberName)
+}
+
+/** Return the receiver of a named member reference, invoked or extracted. */
+export function namedMemberReferenceReceiverText(ts, node, source, memberName) {
+  return namedMemberReceiver(ts, node, source, memberName)
+}
+
 /** Return the receiver text for a direct `.call(...)` or `["call"](...)`. */
 export function callMemberReceiverText(ts, node, source) {
   if (!ts.isCallExpression(node)) return null
@@ -150,13 +265,18 @@ export function isDirectCallMemberReference(ts, node) {
 
 /** Return the source/type of an object binding that extracts `call`. */
 export function destructuredCallSourceText(ts, node, source) {
+  return destructuredMemberSourceText(ts, node, source, 'call')
+}
+
+/** Return the source/type of an object binding that extracts a named member. */
+export function destructuredMemberSourceText(ts, node, source, memberName) {
   if (!ts.isBindingElement(node)) return null
   const property = node.propertyName ?? node.name
-  const isCall = (
+  const isMatch = (
     (ts.isIdentifier(property) || ts.isStringLiteralLike(property))
-    && property.text === 'call'
+    && property.text === memberName
   )
-  if (!isCall || !ts.isObjectBindingPattern(node.parent)) return null
+  if (!isMatch || !ts.isObjectBindingPattern(node.parent)) return null
   const owner = node.parent.parent
   if (ts.isVariableDeclaration(owner) && owner.initializer) {
     return owner.initializer.getText(source).replace(/\s/g, '')

@@ -40,7 +40,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 299
+STATIC_RPC_DECORATOR_BASELINE = 298
 
 # Physical lines in the same runtime files at 5440fd7a. Contract sources,
 # generators, fixtures, tests and generated artifacts are reported separately;
@@ -346,9 +346,11 @@ def test_sessions_list_gateway_adapter_does_not_join_a_gateway_cycle() -> None:
         for dependency in graph[adapter]
         if dependency.startswith("opensquilla.gateway")
     )
-    assert gateway_dependencies == [], (
-        "sessions.list Gateway Adapter must depend on its registration port, "
-        f"not Gateway implementation modules: {gateway_dependencies}"
+    assert gateway_dependencies == [
+        "opensquilla.gateway.adapters.contract_method"
+    ], (
+        "sessions.list Gateway Adapter may depend only on the generic "
+        f"registration Adapter: {gateway_dependencies}"
     )
     assert cycle_edges == [], (
         "sessions.list Gateway Adapter joined a Python import cycle: "
@@ -403,20 +405,14 @@ def _method_registration_sites() -> list[tuple[str, str, str]]:
     return sites
 
 
-def test_static_rpc_decorator_sites_are_exact_and_sessions_list_has_one_adapter() -> None:
+def test_static_rpc_decorator_sites_are_exact_and_sessions_list_is_generic_registered() -> None:
     sites = _method_registration_sites()
     assert len(sites) == STATIC_RPC_DECORATOR_BASELINE
     assert [
         site
         for site in sites
         if site[2] in {"sessions.list", "SESSIONS_LIST_METHOD"}
-    ] == [
-        (
-            "src/opensquilla/gateway/adapters/sessions_list_contract.py",
-            "handle_sessions_list",
-            "SESSIONS_LIST_METHOD",
-        )
-    ]
+    ] == []
 
 
 def test_runtime_rpc_surface_is_exact_and_sessions_list_uses_contract_adapter() -> None:
@@ -435,10 +431,8 @@ def test_runtime_rpc_surface_is_exact_and_sessions_list_uses_contract_adapter() 
     assert entry is not None
     assert entry.name == SESSIONS_LIST_METHOD
     assert entry.required_scope == SESSIONS_LIST_SCOPE
-    assert entry.handler.__module__ == (
-        "opensquilla.gateway.adapters.sessions_list_contract"
-    )
-    assert entry.handler.__name__ == "handle_sessions_list"
+    assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    assert entry.handler.__name__ == "handle_contract_method"
 
 
 def test_cross_rpc_private_import_debt_is_exact() -> None:

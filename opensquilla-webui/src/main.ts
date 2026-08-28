@@ -5,9 +5,8 @@ import { router } from './router'
 import i18n from './i18n'
 import { useAppStore } from './stores/app'
 import { useRpcStore } from './stores/rpc'
-import { createV4SessionDirectory } from './adapters/gateway/sessionDirectoryV4'
+import { createGatewayAdapters } from './adapters/gateway/gatewayAdapters'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
-import { optionalSessionRpcCallOptions } from './composables/chat/sessionBootstrapAdmission'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -27,9 +26,10 @@ appStore.initTheme()
 
 const rpcStore = useRpcStore()
 rpcStore.init()
+const gatewayAdapters = createGatewayAdapters(rpcStore)
 app.provide(
   SESSION_DIRECTORY_KEY,
-  createV4SessionDirectory(rpcStore, optionalSessionRpcCallOptions),
+  gatewayAdapters.sessionDirectory,
 )
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()

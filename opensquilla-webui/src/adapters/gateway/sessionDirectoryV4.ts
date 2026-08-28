@@ -1,5 +1,5 @@
 import i18n from '@/i18n'
-import type { RpcCallOptions, RpcClient } from '@/lib/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 import {
   SESSIONS_LIST_METHOD,
   type SessionListEntry,
@@ -19,12 +19,19 @@ import {
   sessionRunStatusLabel,
   summarizeSessionTask,
 } from '@/modules/sessionRunStatus'
+import type { RpcTransport } from './privateTransports'
 
 const SESSION_LIST_VIEW = 'session-list-v1'
 const SESSION_COUNT_VIEW = 'session-count-v1'
+const SESSION_DIRECTORY_TIMEOUT_MS = 10_000
+const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
+  timeoutMs: SESSION_DIRECTORY_TIMEOUT_MS,
+  timeoutAction: 'reconnect',
+  abortAction: 'reject',
+}
 
-export type SessionDirectoryRpc = Pick<RpcClient, 'call'>
-  & Partial<Pick<RpcClient, 'waitForConnection'>>
+export type SessionDirectoryTransport = Pick<RpcTransport, 'request'>
+  & Partial<Pick<RpcTransport, 'ready'>>
 
 const hasOwn = (obj: unknown, field: string) =>
   !!obj && Object.prototype.hasOwnProperty.call(obj, field)
@@ -188,22 +195,21 @@ export function normalizeV4SessionItem(item: SessionListEntry | unknown): Sessio
 }
 
 export function createV4SessionDirectory(
-  rpc: SessionDirectoryRpc,
-  callOptions?: RpcCallOptions,
+  transport: SessionDirectoryTransport,
 ): SessionDirectory {
   async function call(params: SessionsListParams, signal?: AbortSignal) {
-    const options = signal ? { ...callOptions, signal } : callOptions
-    await rpc.waitForConnection?.(
-      options?.timeoutMs,
-      options?.signal,
-      options ? {
+    const options = signal
+      ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal }
+      : SESSION_DIRECTORY_CALL_OPTIONS
+    await transport.ready?.(
+      {
+        timeoutMs: options.timeoutMs,
+        signal: options.signal,
         timeoutAction: 'reject', abortAction: 'reject',
-      } : undefined,
+      },
     )
     if (signal?.aborted) throw signal.reason || new Error('Session directory request aborted')
-    const result = options
-      ? await rpc.call(SESSIONS_LIST_METHOD, params, options)
-      : await rpc.call(SESSIONS_LIST_METHOD, params)
+    const result = await transport.request(SESSIONS_LIST_METHOD, params, options)
     return objectValue(result) as Partial<SessionsListResult> || {}
   }
 
