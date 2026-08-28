@@ -289,6 +289,11 @@ METHOD_SCOPES: dict[str, str] = {
     # 0.0.0.0 listen, where even a 127.0.0.1 peer is not the local owner and so gets
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
+    
+    # 【新增】将 session 移动到另一个 workspace 属于常规的用户级状态变更，
+    # 与 sessions.create / sessions.delete 同属 WRITE_SCOPE 级别。
+    "sessions.moveToWorkspace": WRITE_SCOPE,  # OpenSquilla-only; session workspace transfer.
+
     "sessions.delete": WRITE_SCOPE,
     # Display-name-only session rename. Deployment/model rebinding remains on
     # the separately admin-gated sessions.patch surface.
@@ -452,6 +457,7 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.llmProfile.models.discover": ADMIN_SCOPE,
     "onboarding.llmProfile.draft.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.draft.models.discover": ADMIN_SCOPE,
+    "onboarding.customProvider.models.discover": ADMIN_SCOPE,
     # Model discovery is read-shaped but admin-scoped for the same reason as
     # the probe: its params accept candidate credentials (apiKey/apiKeyEnv),
     # which must never be acceptable from a read/write-tier caller.

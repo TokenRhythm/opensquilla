@@ -5500,6 +5500,142 @@ class Agent:
         ) + len(replacements)
         return compacted_messages
 
+    def _compact_history_tool_results_for_provider(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        """Project bulky historical tool results in the provider request view.
+
+        The absolute and aggregate passes above only act once request-level
+        budget pressure appears, and ``_remember_provider_visible_tool_results``
+        then freezes every block that was already delivered full-text, so a
+        long session can grow monotonically until even the largest routed
+        window cannot admit the request (ref incidents h8m7rtg1 / 7bf7fefe).
+        This waterline pass closes that gap deterministically: once history
+        spans more than ``tool_result_history_projection_keep_recent_turns``
+        completed assistant turns, successful non-artifact results larger than
+        the per-result provider cap are projected in the request view without
+        requiring aggregate pressure and regardless of frozen state.  Original
+        content stays recoverable through the projection handle, persisted
+        transcript history is never mutated, and recent turns stay untouched.
+        """
+
+        if not self._tool_result_recovery_available():
+            return messages
+        keep_turns = max(
+            0,
+            int(getattr(self.config, "tool_result_history_projection_keep_recent_turns", 3)),
+        )
+        if keep_turns <= 0:
+            return messages
+        assistant_indexes = [
+            index for index, message in enumerate(messages) if message.role == "assistant"
+        ]
+        if len(assistant_indexes) <= keep_turns:
+            return messages
+        protected_floor = assistant_indexes[-keep_turns]
+        result_cap = self._tool_result_provider_request_max_chars(ToolResultBudgetClass.LOCAL)
+        if result_cap <= 0:
+            return messages
+
+        tool_name_by_use_id: dict[str, str] = {}
+        for message in messages:
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if isinstance(block, ContentBlockToolUse):
+                    tool_name_by_use_id[block.id] = block.name
+
+        replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
+        chars_saved = 0
+        for message_index, message in enumerate(messages):
+            if message_index >= protected_floor:
+                break
+            if not isinstance(message.content, list):
+                continue
+            for block_index, block in enumerate(message.content):
+                if not isinstance(block, ContentBlockToolResult):
+                    continue
+                content = block.content if isinstance(block.content, str) else str(block.content)
+                if len(content) <= result_cap:
+                    continue
+                if _tool_result_content_is_provider_projection(content):
+                    continue
+                if _pending_approval_payload(content) is not None:
+                    continue
+                if _tool_result_content_has_artifact(content):
+                    continue
+                tool_name = tool_name_by_use_id.get(block.tool_use_id, "")
+                # Semantic protection (read_file/git_diff source context) is a
+                # reasoning-quality preference, not a survival guarantee. Once
+                # history is old enough to cross the waterline, an oversized
+                # protected block still gets projected - with head/tail preview
+                # and a recovery handle - instead of growing every future
+                # request without bound.
+                replacement_content = self._tool_result_projection_for_provider(
+                    content,
+                    tool_use_id=block.tool_use_id,
+                    tool_name=tool_name or "tool",
+                    reason="historical tool result projected by context waterline",
+                    max_preview_chars=min(result_cap, 4_000),
+                )
+                if replacement_content is None or len(replacement_content) >= len(content):
+                    continue
+                replacements[(message_index, block_index)] = ContentBlockToolResult(
+                    tool_use_id=block.tool_use_id,
+                    content=replacement_content,
+                    is_error=block.is_error,
+                )
+                chars_saved += len(content) - len(replacement_content)
+
+        if not replacements:
+            return messages
+
+        compacted_messages: list[Message] = []
+        for message_index, message in enumerate(messages):
+            if message_index >= protected_floor:
+                compacted_messages.append(message)
+                continue
+            if not isinstance(message.content, list):
+                compacted_messages.append(message)
+                continue
+            next_content: list[Any] = []
+            message_changed = False
+            for block_index, content_block in enumerate(message.content):
+                replacement = replacements.get((message_index, block_index))
+                if replacement is None:
+                    next_content.append(content_block)
+                    continue
+                next_content.append(replacement)
+                message_changed = True
+            if not message_changed:
+                compacted_messages.append(message)
+                continue
+            compacted_messages.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+            )
+
+        self.config.metadata["history_waterline_projection_applied"] = True
+        self.config.metadata["history_waterline_projection_blocks"] = (
+            self.config.metadata.get("history_waterline_projection_blocks", 0)
+            + len(replacements)
+        )
+        self.config.metadata["history_waterline_projection_chars_saved"] = (
+            self.config.metadata.get("history_waterline_projection_chars_saved", 0)
+            + chars_saved
+        )
+        self._write_turn_call_log(
+            "history_tool_result_waterline",
+            projected_blocks=len(replacements),
+            chars_saved=chars_saved,
+            keep_recent_turns=keep_turns,
+        )
+        return compacted_messages
+
     def _semantic_provider_tool_result_projection_skip_reason(
         self,
         *,
@@ -19905,6 +20041,7 @@ class Agent:
         if not preview:
             source_messages = self._dedup_repeated_tool_results_for_provider(source_messages)
             source_messages = self._compact_aggregate_tool_results_for_provider(source_messages)
+            source_messages = self._compact_history_tool_results_for_provider(source_messages)
         source_messages = self._sanitize_projected_tool_use_arguments_for_provider(
             source_messages,
             record=not preview,

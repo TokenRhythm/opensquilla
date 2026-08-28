@@ -816,11 +816,43 @@ class TurnFinalizerStage:
                     "message_output_tokens",
                     None,
                 )
-                token_count = (
-                    message_output_tokens
-                    if message_output_tokens is not None
-                    else done_event.output_tokens
-                )
+                if message_output_tokens is not None:
+                    token_count = message_output_tokens
+                else:
+                    # Fallback: account the entry's own replayable content.
+                    # done_event.output_tokens may be this entry's real
+                    # single-leg output or a whole turn's cumulative sum
+                    # over every execution leg.  A cumulative value more
+                    # than 4x this entry's own replay size cannot describe
+                    # this entry: persisting it would inflate the token
+                    # ledger and make preflight compaction trigger on book
+                    # value far above the real replay size (observed as a
+                    # 770k count on an entry whose replayable payload was
+                    # ~22k tokens).  Trust the estimate in that case;
+                    # otherwise keep the larger of the two.
+                    from opensquilla.session.compaction import (
+                        estimate_entry_model_replay_tokens,
+                    )
+
+                    replay_tokens = estimate_entry_model_replay_tokens(
+                        {
+                            "content": persisted_content,
+                            "tool_calls": turn_segments
+                            if turn_segments
+                            else None,
+                            "reasoning_content": reasoning_content,
+                        }
+                    )
+                    cumulative_output = max(
+                        0, int(getattr(done_event, "output_tokens", 0) or 0)
+                    )
+                    if (
+                        replay_tokens > 0
+                        and cumulative_output > 4 * replay_tokens
+                    ):
+                        token_count = replay_tokens
+                    else:
+                        token_count = max(cumulative_output, replay_tokens)
             append_kwargs: dict[str, Any] = {
                 "role": "assistant",
                 "content": persisted_content,

@@ -480,6 +480,32 @@ def _json_text(value: Any) -> str:
         return str(value)
 
 
+# A persisted ``token_count`` may describe one leg's message-level output
+# while the entry also carries other replayable payload (tool calls,
+# reasoning).  Estimators therefore choose between the persisted count and
+# the entry's own projection estimate -- never stack the two, which would
+# double-count the same payload.
+
+
+def _reconciled_persisted_token_count(
+    persisted_tokens: int,
+    natural_total: int,
+) -> int:
+    """Choose between a message-level count and the entry-level estimate.
+
+    ``persisted_tokens`` describes the entry's own output; ``natural_total``
+    is the projection estimate for its full replayable payload.  Return the
+    larger of the two so admission never under-reports, and never return a
+    value in which the same payload is counted twice.
+    """
+
+    try:
+        persisted_int = int(persisted_tokens)
+    except (TypeError, ValueError):
+        persisted_int = 0
+    return max(persisted_int, max(0, int(natural_total)))
+
+
 def estimate_entry_replay_tokens(entry: Any) -> int:
     """Estimate the compaction-input size of a persisted transcript entry."""
 
@@ -489,11 +515,7 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
         persisted_tokens = int(token_count or 0)
     except (TypeError, ValueError):
         persisted_tokens = 0
-    # Persisted counts can originate from provider usage accounting or older
-    # clients and are not guaranteed to describe this exact serialized entry.
-    # Never let them under-report the tokenizer estimate used for admission.
     estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
-    content_tokens = max(persisted_tokens, estimated_content_tokens)
 
     extra_parts: list[str] = []
     tool_calls = _entry_get(entry, "tool_calls")
@@ -510,7 +532,12 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
             f"{len(str(reasoning_content))} chars]"
         )
     extra_tokens = _estimate_tokens("\n".join(extra_parts)) if extra_parts else 0
-    return content_tokens + extra_tokens
+
+    # Choose between the persisted count and the natural projection for this
+    # payload (content plus extras); never add the persisted count on top of
+    # projections that already cover overlapping payload.
+    natural_total = estimated_content_tokens + extra_tokens
+    return _reconciled_persisted_token_count(persisted_tokens, natural_total)
 
 
 def estimate_entry_model_replay_tokens(entry: Any) -> int:
@@ -523,7 +550,6 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
     except (TypeError, ValueError):
         persisted_tokens = 0
     estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
-    content_tokens = max(persisted_tokens, estimated_content_tokens)
 
     extra_parts: list[str] = []
     tool_calls = _entry_get(entry, "tool_calls")
@@ -536,7 +562,11 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
     if reasoning_content:
         extra_parts.append(str(reasoning_content))
     extra_tokens = _estimate_tokens("\n".join(extra_parts)) if extra_parts else 0
-    return content_tokens + extra_tokens
+
+    # Same selection contract as the compaction-input estimator, with the
+    # full model-replay projection as the reference size.
+    natural_total = estimated_content_tokens + extra_tokens
+    return _reconciled_persisted_token_count(persisted_tokens, natural_total)
 
 
 def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
@@ -1284,6 +1314,28 @@ def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
             )
         lines.append("\n".join(part for part in rendered_parts if part))
     return "\n\n".join(lines)
+
+
+def _strip_deterministic_header(text: str) -> str:
+    """Strip the deterministic-rolling header so checks see only the body."""
+
+    header = "[Deterministic rolling context]"
+    stripped = text.strip()
+    while stripped.startswith(header):
+        stripped = stripped[len(header) :].lstrip()
+    return stripped
+
+
+def _fallback_preserves_previous_summary(
+    previous_summary: str,
+    merged: str,
+) -> bool:
+    """Verify verbatim survival of the prior checkpoint in fallback output."""
+
+    body = _strip_deterministic_header(previous_summary)
+    if not body:
+        return True
+    return body in _strip_deterministic_header(merged)
 
 
 def _summarize_chunk_fallback(chunk: list[dict[str, Any]], policy: str) -> str:
@@ -2195,6 +2247,36 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     else:
         summary_source = "fallback"
 
+    # A pure deterministic fallback reduces each removed entry to a ~200-char
+    # preview.  Replacing an existing prior checkpoint summary with those
+    # previews would be destructive, so the fallback is required to MERGE:
+    # ``rolling_summary`` already contains ``prev_summary`` verbatim via
+    # ``_merge_rolling_fallback``.  Commit only when that survival is
+    # verified; otherwise refuse so the caller's existing failure paths
+    # (emergency request-scoped compaction / overflow recovery) relieve
+    # pressure without destroying state.  First-time fallbacks (no prior
+    # summary) still commit.
+    if summary_source == "fallback" and prev_summary:
+        if not _fallback_preserves_previous_summary(prev_summary, merged):
+            log.warning(
+                "compaction.fallback_degraded_skipped",
+                compaction_id=cfg.operation_id,
+                prev_summary_chars=len(prev_summary),
+                merged_chars=len(merged),
+                removed=len(to_compact),
+            )
+            return CompactionResult(
+                summary="",
+                kept_entries=entries,
+                removed_count=0,
+                chunks_processed=processed_chunk_count,
+                summary_source=summary_source,
+                tokens_before=total_tokens,
+                tokens_after=total_tokens,
+                remaining_budget_tokens=max(window - total_tokens, 0),
+                skip_reason="fallback_degraded_with_prior_summary",
+            )
+
     obligation_entries = list(to_compact)
     if prev_summary:
         obligation_entries.insert(
@@ -2455,7 +2537,10 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
     if degraded_reason:
         telemetry["degraded_reason"] = degraded_reason
     result.quality_report = telemetry
-    log.info(
+    # Degraded compaction outcomes (deterministic fallback, blocked coverage,
+    # ...) must stand out in the log: they are the ones that silently
+    # shrank user context in the past.
+    (log.warning if degraded_reason else log.info)(
         "compaction.operation_terminal",
         compaction_id=cfg.operation_id,
         pressure_kind=request.trigger,

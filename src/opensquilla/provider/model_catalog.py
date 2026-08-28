@@ -460,9 +460,24 @@ class ModelCatalog:
             declared_by_authority={},
         )
         self._warned_max_token_overrides: set[tuple[str, str, int, int]] = set()
+        self._profile_default_windows: dict[str, int] = {}
 
     def __len__(self) -> int:
         return len(self._models)
+
+    def set_profile_default_windows(self, windows: Mapping[str, int]) -> None:
+        cleaned: dict[str, int] = {}
+        for provider_id, window in (windows or {}).items():
+            pid = str(provider_id or "").strip().lower()
+            if not pid:
+                continue
+            try:
+                value = int(window)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                cleaned[pid] = value
+        self._profile_default_windows = cleaned
 
     def _populate_from_data(self, models: list[dict]) -> None:
         """Parse a list of OpenRouter model dicts into ModelInfo entries."""

@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive } from 'vue'
+import { createPinia } from 'pinia'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import SetupProviderPanel from './SetupProviderPanel.vue'
@@ -145,6 +146,7 @@ async function mountPanel(props: Record<string, unknown> = {}, listeners: Record
   const panelState = reactive(panel(props))
   const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
+  app.use(createPinia())
   app.mount(el)
   await nextTick()
   return { app, el, panelState }

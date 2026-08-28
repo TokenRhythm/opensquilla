@@ -6,8 +6,6 @@ name: CI
     types: [checks_requested]
   push:
     branches: [main]
-  schedule:
-    - cron: "23 18 * * *"
   workflow_dispatch:
 
 permissions:

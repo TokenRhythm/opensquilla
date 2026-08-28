@@ -10,6 +10,8 @@ from typing import Any
 from opensquilla.chat.flattened_tool_markers import is_flattened_tool_result_dump
 from opensquilla.session.keys import derive_chat_type, parse_agent_id
 
+# LOCAL-FORK(openai-bridge): "openai-bridge" 为本地新增 surface，
+# 使 bridge 会话在侧边栏 Channels 分组显示；上游无此值。
 _CHANNEL_SURFACES = frozenset(
     {
         "slack",
@@ -20,6 +22,7 @@ _CHANNEL_SURFACES = frozenset(
         "qq",
         "matrix",
         "telegram",
+        "openai-bridge",
     }
 )
 _TIME_PREFIX_RE = re.compile(
