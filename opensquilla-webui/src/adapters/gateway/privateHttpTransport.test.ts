@@ -262,6 +262,20 @@ describe('private Gateway HTTP transport', () => {
       { method: 'POST', json: undefined },
       { method: 'POST', form: Object.create(FormData.prototype) },
       { method: 'POST', form: { [Symbol.toStringTag]: 'FormData' } },
+      {
+        method: 'POST',
+        form: Object.create({
+          has: () => false,
+          [Symbol.toStringTag]: 'FormData',
+        }),
+      },
+      {
+        method: 'POST',
+        form: Object.create({
+          toString: () => '',
+          [Symbol.toStringTag]: 'URLSearchParams',
+        }),
+      },
     ]) {
       await expect(transport.requestJson('/api/value', requestOptions as never))
         .rejects.toMatchObject({ kind: 'encode' })

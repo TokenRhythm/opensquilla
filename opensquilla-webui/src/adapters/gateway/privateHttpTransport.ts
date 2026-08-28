@@ -247,34 +247,25 @@ function isHttpMethod(value: unknown): value is HttpMethod {
 function isFormBody(value: unknown): value is FormData | URLSearchParams {
   if (value === null || typeof value !== 'object') return false
   try {
-    const ownPrototype = Object.getPrototypeOf(value)
-    const tag = Object.prototype.toString.call(value)
     if (typeof FormData === 'function' && FormData.prototype) {
-      const prototypes = [FormData.prototype]
-      if (tag === '[object FormData]' && ownPrototype && ownPrototype !== Object.prototype) {
-        prototypes.push(ownPrototype as typeof FormData.prototype)
-      }
-      for (const prototype of prototypes) {
-        const has = prototype.has
-        if (typeof has !== 'function') continue
+      // Calling a native method performs the platform's internal-slot brand
+      // check. Do not trust Symbol.toStringTag or an object's own prototype:
+      // both are user-controlled and can make a plain object look like a form.
+      const get = FormData.prototype.get
+      if (typeof get === 'function') {
         try {
-          has.call(value, '')
+          get.call(value, '')
           return true
         } catch {
-          // Try the next realm's prototype or URLSearchParams below.
+          // Not a FormData instance; try URLSearchParams below.
         }
       }
     }
     if (typeof URLSearchParams === 'function' && URLSearchParams.prototype) {
-      const prototypes = [URLSearchParams.prototype]
-      if (tag === '[object URLSearchParams]' && ownPrototype && ownPrototype !== Object.prototype) {
-        prototypes.push(ownPrototype as typeof URLSearchParams.prototype)
-      }
-      for (const prototype of prototypes) {
-        const toString = prototype.toString
-        if (typeof toString !== 'function') continue
+      const get = URLSearchParams.prototype.get
+      if (typeof get === 'function') {
         try {
-          toString.call(value)
+          get.call(value, '')
           return true
         } catch {
           // A spoofed prototype/tag is not a supported form body.
