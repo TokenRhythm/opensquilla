@@ -79,7 +79,8 @@ F2_FOUNDATION_RUNTIME_FILES = (
     "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
     "src/opensquilla/gateway/adapters/contract_method.py",
 )
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 827
+# Includes the reviewed one-shot binary lifecycle and cancellation checks.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 849
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
