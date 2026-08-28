@@ -4,9 +4,9 @@
 > server required — the FastAPI gateway boots inside the app via Chaquopy and
 > serves the Vue web UI in a local WebView on 127.0.0.1:18790.
 
-[![Download APK](https://img.shields.io/badge/download-OpenSquilla--mobile--debug.apk-%233DDC84)](https://github.com/lzhhhhc/opensquilla/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
+[![Download APK](https://img.shields.io/badge/download-OpenSquilla--mobile--debug.apk-%233DDC84)](https://github.com/lzhhhhc/OpenSquilla-mobile/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
 
-- **Download APK (recommended, GitHub Release):** [OpenSquilla-mobile-debug.apk](https://github.com/lzhhhhc/opensquilla/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
+- **Download APK (recommended, GitHub Release):** [OpenSquilla-mobile-debug.apk](https://github.com/lzhhhhc/OpenSquilla-mobile/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
 - **APK also tracked in repo:** [releases/OpenSquilla-mobile-debug.apk](releases/OpenSquilla-mobile-debug.apk)
 - Min Android: 8.0 (API 26), ABI: arm64-v8a
 - Configuration example: [config.example.toml](config.example.toml)
