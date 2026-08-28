@@ -1,8 +1,12 @@
 # OpenSquilla mobile
-
 > Android packaging of the OpenSquilla gateway. One APK, no companion app, no
 > server required — the FastAPI gateway boots inside the app via Chaquopy and
 > serves the Vue web UI in a local WebView on 127.0.0.1:18790.
+
+**Latest update: 2026-08-28** — background keep-alive (foreground service),
+launch fix (stale gateway.pid auto-clear), loading screen; see
+[Releases](https://github.com/lzhhhhc/OpenSquilla-mobile/releases) for the
+changelog.
 
 [![Download APK](https://img.shields.io/badge/download-OpenSquilla--mobile--debug.apk-%233DDC84)](https://github.com/lzhhhhc/OpenSquilla-mobile/releases/download/v0.1.0-mobile/OpenSquilla-mobile-debug.apk)
 
