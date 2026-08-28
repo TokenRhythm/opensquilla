@@ -470,6 +470,7 @@
       "tests/test_gateway/test_config_version.py",
       "tests/test_gateway/test_config_ws_writer_queue.py",
       "tests/test_gateway/test_context_overflow.py",
+      "tests/test_gateway/test_contract_method_adapter.py",
       "tests/test_gateway/test_control_ui_locale.py",
       "tests/test_gateway/test_cron_result_payload.py",
       "tests/test_gateway/test_debug_file_logging.py",

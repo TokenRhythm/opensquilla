@@ -9,6 +9,7 @@ import pytest
 import structlog
 from starlette.testclient import TestClient
 
+import opensquilla.gateway.adapters.sessions_list_contract as sessions_list_gateway_adapter
 import opensquilla.gateway.rpc_sessions as rpc_sessions
 from opensquilla.contracts.adapters.sessions_list_contract import (
     SESSIONS_LIST_METHOD,
@@ -17,6 +18,9 @@ from opensquilla.contracts.adapters.sessions_list_contract import (
     sessions_list_params_contract_errors,
     validate_sessions_list_result,
 )
+from opensquilla.contracts.generated.v4.gateway_contract_registry import (
+    GATEWAY_METHOD_CONTRACTS,
+)
 from opensquilla.contracts.generated.v4.sessions_list_metadata import SESSIONS_LIST_SCOPE
 from opensquilla.gateway.adapters.sessions_list_contract import (
     register_sessions_list_contract,
@@ -24,6 +28,7 @@ from opensquilla.gateway.adapters.sessions_list_contract import (
 from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry, get_dispatcher
 from opensquilla.gateway.rpc_sessions import (
     _handle_sessions_list,
@@ -128,6 +133,13 @@ def test_production_registry_uses_contract_adapter_as_sole_handler() -> None:
     assert entry.required_scope == SESSIONS_LIST_SCOPE
     assert entry.handler is _handle_sessions_list_contract
     assert entry.handler is not _handle_sessions_list
+
+
+def test_gateway_adapter_uses_the_full_generated_method_descriptor() -> None:
+    descriptor = GATEWAY_METHOD_CONTRACTS[SESSIONS_LIST_METHOD]
+
+    assert sessions_list_gateway_adapter._SESSIONS_LIST_DESCRIPTOR is descriptor
+    assert descriptor.guest_allowed is True
 
 
 def test_every_behavior_fixture_case_has_an_executable_oracle() -> None:
@@ -469,6 +481,7 @@ async def test_gateway_adapter_delegates_once_and_preserves_result_identity() ->
         registry,
         implementation,
         internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
     params = {"limit": "5", "future": True}
     result = await handler(params, cast(RpcContext, object()))
@@ -492,6 +505,7 @@ async def test_gateway_adapter_observes_request_drift_but_preserves_legacy_behav
         registry,
         implementation,
         internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
     params = {"limit": {"legacy": True}}
     with structlog.testing.capture_logs() as logs:
@@ -518,6 +532,7 @@ async def test_gateway_adapter_maps_invalid_implementation_result() -> None:
         registry,
         implementation,
         internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
 
     with pytest.raises(RpcHandlerError) as error:

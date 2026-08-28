@@ -64,6 +64,15 @@ class GuestRpcPolicyError(PermissionError):
     """Raised when an anonymous guest crosses the RPC ownership boundary."""
 
 
+def is_guest_rpc_method_allowed(method: str) -> bool:
+    """Return the legacy allowlist decision used for Contract drift checks.
+
+    Ownership and sanitization stay in ``GuestRpcPolicy`` until contracted.
+    """
+
+    return method in GUEST_RPC_ALLOWLIST
+
+
 def _guest_namespace_parts(session_key: object) -> tuple[str, str] | None:
     key = canonicalize_session_key(str(session_key or ""))
     parts = key.split(":")
@@ -137,7 +146,7 @@ class GuestRpcPolicy:
 
         if not cls.is_guest(ctx):
             return params
-        if method not in GUEST_RPC_ALLOWLIST:
+        if not is_guest_rpc_method_allowed(method):
             raise GuestRpcPolicyError("Anonymous guest RPC method is not allowed")
 
         owner_id = getattr(ctx.principal, "guest_owner_id", None)
@@ -213,4 +222,5 @@ __all__ = [
     "GuestRpcPolicyError",
     "guest_owned_session_key",
     "guest_owns_session_key",
+    "is_guest_rpc_method_allowed",
 ]

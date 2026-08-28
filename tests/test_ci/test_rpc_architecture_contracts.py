@@ -15,13 +15,13 @@ RPC_CONTEXT = GATEWAY_ROOT / "rpc" / "registry.py"
 GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_list_contract.py",
+        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_list_contract.py",
         "src/opensquilla/engine/commands.py",
-        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/guest_rpc_policy.py",
         "src/opensquilla/gateway/rpc_system.py",
@@ -40,12 +40,14 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 299
+STATIC_RPC_DECORATOR_BASELINE = 298
 
-# Physical lines in the same runtime files at 5440fd7a. Contract sources,
-# generators, fixtures, tests and generated artifacts are reported separately;
-# this guard prevents the production seam from becoming a net wrapper layer.
-AUTHORED_RUNTIME_LOC_BASELINE = 25_539
+# Physical lines in the sessions.list runtime slice after F1 merged at
+# f53746bd6. F2 is an explicitly approved foundation phase, so its bounded
+# connection-ownership and registration hardening is accounted for separately
+# instead of weakening the later domain-slice deletion gate.
+AUTHORED_RUNTIME_LOC_AFTER_F1 = 25_524
+F2_AUTHORED_RUNTIME_GROWTH_BUDGET = 66
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
     "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
@@ -70,6 +72,22 @@ AUTHORED_RUNTIME_FILES = (
     "src/opensquilla/gateway/scopes.py",
     "src/opensquilla/gateway_client.py",
 )
+
+F2_FOUNDATION_RUNTIME_FILES = (
+    "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts",
+    "opensquilla-webui/src/adapters/gateway/privateHttpTransport.ts",
+    "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
+    "src/opensquilla/gateway/adapters/contract_method.py",
+)
+# F2 adds three explicitly reviewed HTTP hardening slices on top of the
+# initial 849-line foundation: 58 lines for body lifecycle ownership, 103
+# lines for filename/method/body validation (less 9 lines from native brand
+# tightening), 135 lines for cancellation-safe response-body ownership, and
+# 3 lines for hostile request-option normalization and 3 lines for endpoint
+# input normalization.
+# Keep the allowance explicit so later domain slices cannot hide authored
+# growth behind this infrastructure exception.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_142
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -346,9 +364,11 @@ def test_sessions_list_gateway_adapter_does_not_join_a_gateway_cycle() -> None:
         for dependency in graph[adapter]
         if dependency.startswith("opensquilla.gateway")
     )
-    assert gateway_dependencies == [], (
-        "sessions.list Gateway Adapter must depend on its registration port, "
-        f"not Gateway implementation modules: {gateway_dependencies}"
+    assert gateway_dependencies == [
+        "opensquilla.gateway.adapters.contract_method"
+    ], (
+        "sessions.list Gateway Adapter may depend only on the generic "
+        f"registration Adapter: {gateway_dependencies}"
     )
     assert cycle_edges == [], (
         "sessions.list Gateway Adapter joined a Python import cycle: "
@@ -367,14 +387,27 @@ def test_rpc_context_does_not_grow_past_pinned_main() -> None:
     assert len(fields) <= 33
 
 
-def test_authored_runtime_slice_is_smaller_than_pinned_main() -> None:
-    current = sum(
+def _physical_lines(relative_paths: tuple[str, ...]) -> int:
+    return sum(
         len((ROOT / relative).read_text(encoding="utf-8").splitlines())
-        for relative in AUTHORED_RUNTIME_FILES
+        for relative in relative_paths
     )
-    assert current < AUTHORED_RUNTIME_LOC_BASELINE, (
-        f"sessions.list authored runtime grew to {current} lines; "
-        f"pinned main had {AUTHORED_RUNTIME_LOC_BASELINE}"
+
+
+def test_f2_sessions_list_runtime_growth_stays_within_explicit_budget() -> None:
+    current = _physical_lines(AUTHORED_RUNTIME_FILES)
+    growth = current - AUTHORED_RUNTIME_LOC_AFTER_F1
+    assert growth <= F2_AUTHORED_RUNTIME_GROWTH_BUDGET, (
+        f"F2 sessions.list runtime grew by {growth} lines; "
+        f"the explicit foundation budget is {F2_AUTHORED_RUNTIME_GROWTH_BUDGET}"
+    )
+
+
+def test_f2_foundation_runtime_stays_within_explicit_ceiling() -> None:
+    current = _physical_lines(F2_FOUNDATION_RUNTIME_FILES)
+    assert current <= F2_FOUNDATION_RUNTIME_LOC_CEILING, (
+        f"F2 authored foundation runtime grew to {current} lines; "
+        f"the reviewed ceiling is {F2_FOUNDATION_RUNTIME_LOC_CEILING}"
     )
 
 
@@ -403,20 +436,14 @@ def _method_registration_sites() -> list[tuple[str, str, str]]:
     return sites
 
 
-def test_static_rpc_decorator_sites_are_exact_and_sessions_list_has_one_adapter() -> None:
+def test_static_rpc_decorator_sites_are_exact_and_sessions_list_is_generic_registered() -> None:
     sites = _method_registration_sites()
     assert len(sites) == STATIC_RPC_DECORATOR_BASELINE
     assert [
         site
         for site in sites
         if site[2] in {"sessions.list", "SESSIONS_LIST_METHOD"}
-    ] == [
-        (
-            "src/opensquilla/gateway/adapters/sessions_list_contract.py",
-            "handle_sessions_list",
-            "SESSIONS_LIST_METHOD",
-        )
-    ]
+    ] == []
 
 
 def test_runtime_rpc_surface_is_exact_and_sessions_list_uses_contract_adapter() -> None:
@@ -435,10 +462,8 @@ def test_runtime_rpc_surface_is_exact_and_sessions_list_uses_contract_adapter() 
     assert entry is not None
     assert entry.name == SESSIONS_LIST_METHOD
     assert entry.required_scope == SESSIONS_LIST_SCOPE
-    assert entry.handler.__module__ == (
-        "opensquilla.gateway.adapters.sessions_list_contract"
-    )
-    assert entry.handler.__name__ == "handle_sessions_list"
+    assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    assert entry.handler.__name__ == "handle_contract_method"
 
 
 def test_cross_rpc_private_import_debt_is_exact() -> None:

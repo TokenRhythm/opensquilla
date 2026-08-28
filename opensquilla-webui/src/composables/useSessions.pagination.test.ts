@@ -4,6 +4,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
 import type { SessionListEntry } from '@/contracts/generated/v4/sessionsList'
 import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
+import { createPrivateGatewayTransports } from '@/adapters/gateway/privateTransports'
 import { sessionMatches, useSessions } from './useSessions'
 
 interface SessionPageFixture {
@@ -42,7 +43,12 @@ describe('useSessions pagination', () => {
       if (!response) throw new Error('unexpected sessions.list call')
       return await response
     })
-    return { rpc, call, sessions: useSessions(createV4SessionDirectory(rpc)) }
+    const transports = createPrivateGatewayTransports(rpc)
+    return {
+      rpc,
+      call,
+      sessions: useSessions(createV4SessionDirectory(transports.rpc)),
+    }
   }
 
   it('loads all 401 sessions across three pages and de-duplicates page boundaries', async () => {

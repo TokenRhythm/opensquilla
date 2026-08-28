@@ -1,8 +1,10 @@
 import i18n from '@/i18n'
-import type { RpcCallOptions, RpcClient } from '@/lib/rpc'
+import type {
+  RpcCallOptions,
+  RpcConnectionWaitOptions,
+} from '@/lib/rpc'
 import {
   SESSIONS_LIST_METHOD,
-  type SessionListEntry,
   type SessionRow,
   type SessionsListParams,
   type SessionsListResult,
@@ -22,9 +24,24 @@ import {
 
 const SESSION_LIST_VIEW = 'session-list-v1'
 const SESSION_COUNT_VIEW = 'session-count-v1'
+const SESSION_DIRECTORY_TIMEOUT_MS = 10_000
+const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
+  timeoutMs: SESSION_DIRECTORY_TIMEOUT_MS,
+  timeoutAction: 'reject',
+  abortAction: 'reject',
+}
 
-export type SessionDirectoryRpc = Pick<RpcClient, 'call'>
-  & Partial<Pick<RpcClient, 'waitForConnection'>>
+interface SessionDirectoryTransport {
+  request<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ): Promise<T>
+  ready?(options?: RpcConnectionWaitOptions & {
+    timeoutMs?: number
+    signal?: AbortSignal
+  }): Promise<void>
+}
 
 const hasOwn = (obj: unknown, field: string) =>
   !!obj && Object.prototype.hasOwnProperty.call(obj, field)
@@ -122,7 +139,7 @@ function normalizeParent(row: SessionRow): SessionItem['parent'] {
   return key || spawnDepth > 0 ? { key, spawnDepth } : null
 }
 
-export function normalizeV4SessionItem(item: SessionListEntry | unknown): SessionItem | null {
+export function normalizeV4SessionItem(item: unknown): SessionItem | null {
   const candidate = typeof item === 'string' ? { key: item } : objectValue(item)
   if (!candidate) return null
   const row = candidate as SessionRow
@@ -188,22 +205,21 @@ export function normalizeV4SessionItem(item: SessionListEntry | unknown): Sessio
 }
 
 export function createV4SessionDirectory(
-  rpc: SessionDirectoryRpc,
-  callOptions?: RpcCallOptions,
+  transport: SessionDirectoryTransport,
 ): SessionDirectory {
   async function call(params: SessionsListParams, signal?: AbortSignal) {
-    const options = signal ? { ...callOptions, signal } : callOptions
-    await rpc.waitForConnection?.(
-      options?.timeoutMs,
-      options?.signal,
-      options ? {
+    const options = signal
+      ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal }
+      : SESSION_DIRECTORY_CALL_OPTIONS
+    await transport.ready?.(
+      {
+        timeoutMs: options.timeoutMs,
+        signal: options.signal,
         timeoutAction: 'reject', abortAction: 'reject',
-      } : undefined,
+      },
     )
     if (signal?.aborted) throw signal.reason || new Error('Session directory request aborted')
-    const result = options
-      ? await rpc.call(SESSIONS_LIST_METHOD, params, options)
-      : await rpc.call(SESSIONS_LIST_METHOD, params)
+    const result = await transport.request(SESSIONS_LIST_METHOD, params, options)
     return objectValue(result) as Partial<SessionsListResult> || {}
   }
 
@@ -229,8 +245,11 @@ export function createV4SessionDirectory(
       }
     },
 
-    async count(): Promise<SessionCount | null> {
-      const result = await call({ limit: 200, view: SESSION_COUNT_VIEW })
+    async count(options = {}): Promise<SessionCount | null> {
+      const result = await call(
+        { limit: 200, view: SESSION_COUNT_VIEW },
+        options.signal,
+      )
       const exact = numberValue(result.totalCount, result.total_count)
       if (exact != null && Number.isInteger(exact) && exact >= 0) return { value: exact, exact: true }
       const entries = Array.isArray(result.sessions)

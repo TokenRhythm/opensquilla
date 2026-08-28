@@ -1,7 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
-import type { SessionDirectoryRpc } from '@/adapters/gateway/sessionDirectoryV4'
 
 // Mounted coverage for the Overview diagnostics actions: the conditional
 // "diagnose with agent" hand-off, finding→settings deep links, and the
@@ -19,7 +18,10 @@ interface MountOptions {
   ) => Record<string, unknown> | Promise<Record<string, unknown>>
   /** Response for sessions.list; null makes the call reject. */
   sessionsList?: unknown | null
-  sessionsListHandler?: (callIndex: number) => unknown | Promise<unknown>
+  sessionsListHandler?: (
+    callIndex: number,
+    callOptions?: { signal?: AbortSignal },
+  ) => unknown | Promise<unknown>
 }
 
 interface PushArg {
@@ -74,7 +76,11 @@ async function mountOverview(options: MountOptions = {}) {
   const rpcOn = vi.fn(() => () => {})
   let doctorCallIndex = 0
   let sessionsListCallIndex = 0
-  const rpcCall = vi.fn(async (method: string, params?: unknown) => {
+  const rpcCall = vi.fn(async (
+    method: string,
+    params?: unknown,
+    callOptions?: { signal?: AbortSignal },
+  ) => {
     if (method === 'doctor.status') {
       if (options.report === null) throw new Error('doctor unavailable')
       if (options.doctorHandler) {
@@ -99,7 +105,7 @@ async function mountOverview(options: MountOptions = {}) {
     }
     if (method === 'sessions.list') {
       if (options.sessionsListHandler) {
-        return options.sessionsListHandler(sessionsListCallIndex++)
+        return options.sessionsListHandler(sessionsListCallIndex++, callOptions)
       }
       if (options.sessionsList === null) throw new Error('sessions unavailable')
       return options.sessionsList ?? { sessions: [], count: 0 }
@@ -152,6 +158,7 @@ async function mountOverview(options: MountOptions = {}) {
 
   const Component = (await import('./OverviewView.vue')).default
   const { createV4SessionDirectory } = await import('@/adapters/gateway/sessionDirectoryV4')
+  type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
   const active = ref(true)
   const TestHost = defineComponent({
@@ -172,9 +179,9 @@ async function mountOverview(options: MountOptions = {}) {
   app.use(pinia)
   app.use(i18n)
   app.provide(SESSION_DIRECTORY_KEY, createV4SessionDirectory({
-    call: rpcCall,
-    waitForConnection: vi.fn(async () => {}),
-  } as unknown as SessionDirectoryRpc))
+    request: rpcCall,
+    ready: vi.fn(async () => {}),
+  } as unknown as SessionDirectoryTransport))
   app.mount(el)
   mountedApps.push({ app, el })
 
@@ -189,6 +196,14 @@ async function mountOverview(options: MountOptions = {}) {
     await flush()
   }
 
+  async function unmount() {
+    const index = mountedApps.findIndex(entry => entry.app === app)
+    if (index >= 0) mountedApps.splice(index, 1)
+    app.unmount()
+    el.remove()
+    await flush()
+  }
+
   return {
     el,
     push,
@@ -199,6 +214,7 @@ async function mountOverview(options: MountOptions = {}) {
     useRequestMethods,
     flush,
     setActive,
+    unmount,
   }
 }
 
@@ -396,6 +412,56 @@ describe('OverviewView status lifecycle', () => {
     await flush()
     calls = doctorParams()
     expect(calls[calls.length - 1]).toEqual({ agentId: 'main', deep: true })
+  })
+
+  it('aborts an inactive count and ignores its late result after reactivation', async () => {
+    let resolveFirst!: (value: unknown) => void
+    const firstCount = new Promise<unknown>((resolve) => {
+      resolveFirst = resolve
+    })
+    const countSignals: AbortSignal[] = []
+    const { el, flush, setActive } = await mountOverview({
+      sessionsListHandler: (callIndex, callOptions) => {
+        if (callOptions?.signal) countSignals.push(callOptions.signal)
+        return callIndex === 0
+          ? firstCount
+          : { sessions: [], totalCount: 2 }
+      },
+    })
+
+    expect(countSignals).toHaveLength(1)
+    expect(countSignals[0].aborted).toBe(false)
+
+    await setActive(false)
+    expect(countSignals[0].aborted).toBe(true)
+
+    await setActive(true)
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('2')
+
+    resolveFirst({ sessions: [], totalCount: 99 })
+    await flush()
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('2')
+  })
+
+  it('aborts an in-flight count when Overview unmounts', async () => {
+    let resolveCount!: (value: unknown) => void
+    const pendingCount = new Promise<unknown>((resolve) => {
+      resolveCount = resolve
+    })
+    let countSignal: AbortSignal | undefined
+    const { unmount } = await mountOverview({
+      sessionsListHandler: (_callIndex, callOptions) => {
+        countSignal = callOptions?.signal
+        return pendingCount
+      },
+    })
+
+    expect(countSignal?.aborted).toBe(false)
+    await unmount()
+    expect(countSignal?.aborted).toBe(true)
+    resolveCount({ sessions: [], totalCount: 1 })
   })
 })
 

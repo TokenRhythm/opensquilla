@@ -1,0 +1,109 @@
+import type {
+  RpcCallOptions,
+  RpcConnectionWaitOptions,
+  RpcEventHandler,
+} from '@/lib/rpc'
+
+/**
+ * Raw v4 transport capabilities.
+ *
+ * These interfaces are intentionally private to Gateway Adapters. Domain
+ * Modules must expose typed operations instead of forwarding method names,
+ * event names, URLs, or wire payloads to Vue code.
+ */
+export interface RpcTransport {
+  request<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ): Promise<T>
+  ready(options?: TransportReadyOptions): Promise<void>
+  supports(method: string): boolean
+  markUnsupported(method: string): void
+  readonly generation: number
+}
+
+export interface EventTransport {
+  subscribe(event: string, handler: RpcEventHandler): TransportSubscription
+  supports(event: string): boolean
+}
+
+export interface TransportReadyOptions extends RpcConnectionWaitOptions {
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+export interface TransportSubscription {
+  close(): void
+}
+
+export interface GatewayTransports {
+  readonly rpc: RpcTransport
+  readonly events: EventTransport
+}
+
+interface RpcStoreTransportSource {
+  readonly connectionGeneration: number
+  call<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ): Promise<T>
+  on(event: string, handler: RpcEventHandler): () => void
+  supportsMethod(method: string): boolean
+  supportsEvent(event: string): boolean
+  markMethodUnavailable(method: string): void
+  waitForConnection(
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ): Promise<void>
+}
+
+/** Create the only generic wire-level capabilities exposed to v4 Adapters. */
+export function createPrivateGatewayTransports(
+  source: RpcStoreTransportSource,
+): GatewayTransports {
+  return {
+    rpc: {
+      request(method, params, options) {
+        return source.call(method, params, options)
+      },
+      ready(options) {
+        return source.waitForConnection(
+          options?.timeoutMs,
+          options?.signal,
+          options ? {
+            timeoutAction: options.timeoutAction,
+            abortAction: options.abortAction,
+          } : undefined,
+        )
+      },
+      supports(method) {
+        return source.supportsMethod(method)
+      },
+      markUnsupported(method) {
+        source.markMethodUnavailable(method)
+      },
+      get generation() {
+        return source.connectionGeneration
+      },
+    },
+    events: {
+      subscribe(event, handler) {
+        const unsubscribe = source.on(event, handler)
+        let closed = false
+        return {
+          close() {
+            if (closed) return
+            closed = true
+            unsubscribe()
+          },
+        }
+      },
+      supports(event) {
+        return source.supportsEvent(event)
+      },
+    },
+  }
+}

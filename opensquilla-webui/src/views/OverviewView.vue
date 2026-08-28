@@ -309,6 +309,34 @@ const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
 const usageData = ref<UsageData | null>(null)
 const usageSnapshot = ref<UsageSnapshot | null>(null)
 
+interface UsageLoadEpoch {
+  id: number
+  signal: AbortSignal
+}
+
+let usageLoadEpochId = 0
+let usageLoadController: AbortController | null = null
+
+function beginUsageLoadEpoch(): UsageLoadEpoch {
+  usageLoadController?.abort()
+  const controller = new AbortController()
+  usageLoadController = controller
+  usageLoadEpochId += 1
+  return { id: usageLoadEpochId, signal: controller.signal }
+}
+
+function cancelUsageLoadEpoch() {
+  usageLoadEpochId += 1
+  usageLoadController?.abort()
+  usageLoadController = null
+}
+
+function isCurrentUsageLoadEpoch(epoch: UsageLoadEpoch): boolean {
+  return usageLoadEpochId === epoch.id
+    && usageLoadController?.signal === epoch.signal
+    && !epoch.signal.aborted
+}
+
 // Derived display values from status panel
 const uptime = computed<string>(() => {
   const ms = statusData.value?.uptime_ms
@@ -340,7 +368,7 @@ const costLine = computed<string>(() => {
   return cur === 'CNY' ? `${cny} · ${usd}` : `${usd} · ${cny}`
 })
 
-async function refreshUsage(): Promise<UsageData | null> {
+async function refreshUsage(epoch: UsageLoadEpoch): Promise<UsageData | null> {
   try {
     const snapshot = await requestUsageSnapshot(rpc, 'all', {
       days: false,
@@ -348,7 +376,7 @@ async function refreshUsage(): Promise<UsageData | null> {
       sessions: false,
       cachedSnapshot: usageSnapshot.value,
     })
-    usageSnapshot.value = snapshot
+    if (!isCurrentUsageLoadEpoch(epoch)) return null
     // "Total sessions" counts every session the storage knows about, matching
     // the Sessions page. The ledger's sessionCount only covers sessions that
     // produced usage records, so a session created without a provider call
@@ -358,7 +386,8 @@ async function refreshUsage(): Promise<UsageData | null> {
       snapshot.totals.sessions,
     )
     try {
-      const directoryCount = await sessionDirectory.count()
+      const directoryCount = await sessionDirectory.count({ signal: epoch.signal })
+      if (!isCurrentUsageLoadEpoch(epoch)) return null
       if (directoryCount?.exact) {
         // The count view is authoritative and may legitimately decrease after
         // deletion. Do not pin it to a stale cached or usage-ledger value.
@@ -369,17 +398,21 @@ async function refreshUsage(): Promise<UsageData | null> {
         totalSessions = Math.max(totalSessions, directoryCount.value)
       }
     } catch {
+      if (!isCurrentUsageLoadEpoch(epoch)) return null
       // Preserve the last exact total while the ledger remains a lower-bound
       // fallback during a transient session-directory failure.
     }
+    if (!isCurrentUsageLoadEpoch(epoch)) return null
     const result = {
       totalSessions,
       totalTokens: snapshot.totals.totalTokens,
       totalCostUsd: snapshot.totals.cost,
     }
+    usageSnapshot.value = snapshot
     usageData.value = result
     return result
   } catch {
+    if (!isCurrentUsageLoadEpoch(epoch)) return null
     // Overview usage is an optional KPI. Preserve the last good value while
     // the primary Usage page provides a retryable error state.
     return null
@@ -575,10 +608,12 @@ async function loadChannelStats() {
 
 onDeactivated(() => {
   stopTimers()
+  cancelUsageLoadEpoch()
 })
 
 onUnmounted(() => {
   stopTimers()
+  cancelUsageLoadEpoch()
   clearCopiedCommandTimer()
 })
 
@@ -763,9 +798,10 @@ interface DataLoadOptions {
 }
 
 async function loadData({ deep, silentHealth }: DataLoadOptions) {
+  const usageEpoch = beginUsageLoadEpoch()
   await Promise.all([
     refreshStatus(),
-    refreshUsage(),
+    refreshUsage(usageEpoch),
     loadHealth({ deep, silent: silentHealth }),
   ])
 }
